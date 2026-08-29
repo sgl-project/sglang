@@ -2839,24 +2839,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 running_batch.req_pool_indices.long(),
                 tail_base,
             ].to(self.out_cache_loc.dtype)
+            # The spec relay is unresolved at schedule time, so merge_batch
+            # would null seq_lens_cpu; rebuild the tails from request state.
+            running_seq_lens_cpu = torch.tensor(
+                [int(r.seqlen) for r in running_batch.reqs], dtype=torch.int64
+            )
+            if self.seq_lens_cpu is None:
+                merged_seq_lens_cpu = running_seq_lens_cpu
+            else:
+                merged_seq_lens_cpu = torch.cat(
+                    [self.seq_lens_cpu, running_seq_lens_cpu]
+                )
         else:
+            # Non-spec: the running batch carries prepared seq_lens_cpu
+            # (r.seqlen lags it under overlap); merge_batch concats it.
             tail_base = None
             running_out_cache_loc = running_batch.out_cache_loc
+            merged_seq_lens_cpu = None
         out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
-
-        # merge_batch nulls seq_lens_cpu when either side lacks it; rebuild from
-        # request state, since a .cpu() here would stall the overlap pipeline.
-        running_seq_lens_cpu = torch.tensor(
-            [int(r.seqlen) for r in running_batch.reqs], dtype=torch.int64
-        )
-        if self.seq_lens_cpu is None:
-            merged_seq_lens_cpu = running_seq_lens_cpu
-        else:
-            merged_seq_lens_cpu = torch.cat([self.seq_lens_cpu, running_seq_lens_cpu])
 
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
-        self.seq_lens_cpu = merged_seq_lens_cpu
+        if merged_seq_lens_cpu is not None:
+            self.seq_lens_cpu = merged_seq_lens_cpu
         if tail_base is not None:
             # Spec seq_lens sit at the committed base (bonus token pending);
             # this step commits it, so tails carry base + 1 or attention drops the row.
