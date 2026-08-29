@@ -11,6 +11,8 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup, ReduceOp
 
+from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
+
 
 def _ipc_all_to_all_4d(group, input_, scatter_dim):
     """2-rank IPC path for AllToAll4D; None when the transport is unavailable."""
@@ -103,7 +105,7 @@ class DistributedAutograd:
                 output_size, dtype=input_.dtype, device=input_.device
             )
 
-            dist.all_gather_into_tensor(output_tensor, input_, group=group)
+            all_gather_single(output_tensor, input_, group=group)
 
             output_tensor = output_tensor.reshape((world_size,) + input_size)
             output_tensor = output_tensor.movedim(0, dim)

@@ -63,8 +63,7 @@ _DTYPE_MISMATCH_EXAMPLE_LIMIT = 3
 def _is_bitsandbytes_quant_config(quant_config: Any | None) -> bool:
     if quant_config is None:
         return False
-    quant_name_getter = getattr(type(quant_config), "get_name", None)
-    return bool(callable(quant_name_getter) and quant_name_getter() == "bitsandbytes")
+    return quant_config.get_name() == "bitsandbytes"
 
 
 def _format_dtype_mismatch_summary(
@@ -205,6 +204,13 @@ def _maybe_dequantize_fp8(
             scale_key,
         )
     return full_tensor
+
+
+def _move_to_device_preserving_meta(model: nn.Module, device: torch.device) -> None:
+    # Buffers absent from the checkpoint (e.g. cosmos3's RoPE inv_freq) are
+    # still on the meta device here and .to() cannot copy out of meta; leave
+    # them for the model's post_load_weights() to rebuild on the real device.
+    model._apply(lambda t: t if t.is_meta else t.to(device))
 
 
 def register_fsdp_entrypoints(model: torch.nn.Module) -> None:
@@ -436,7 +442,7 @@ def maybe_load_fsdp_model(
     # 3. postprocessing
     if weight_postprocess_device is not None:
         # move to device to perform postprocessing
-        model.to(weight_postprocess_device)
+        _move_to_device_preserving_meta(model, weight_postprocess_device)
 
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)

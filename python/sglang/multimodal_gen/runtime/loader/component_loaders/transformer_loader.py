@@ -25,9 +25,9 @@ from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     TransformerQuantLoadSpec,
+    resolve_transformer_checkpoint_files,
     resolve_transformer_gguf_to_load,
     resolve_transformer_quant_load_spec,
-    resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
@@ -100,15 +100,33 @@ def _server_args_for_transformer_component(
 ) -> ServerArgs:
     """Mask global quantized override flags for secondary transformer components."""
     component_weights_path = server_args.component_weights_paths.get(component_name)
-    if component_weights_path is not None:
+    component_quantization = server_args.component_quantizations.get(component_name)
+    component_ignored_layers = server_args.component_quantization_ignored_layers.get(
+        component_name
+    )
+    if (
+        component_weights_path is not None
+        or component_quantization is not None
+        or component_ignored_layers is not None
+    ):
         component_server_args = copy.copy(server_args)
-        component_server_args.transformer_weights_path = component_weights_path
-        component_server_args.nunchaku_config = None
-        logger.info(
-            "Using transformer_weights_path override for %s: %s",
-            component_name,
-            component_weights_path,
-        )
+        if component_weights_path is not None:
+            component_server_args.transformer_weights_path = component_weights_path
+            component_server_args.nunchaku_config = None
+            logger.info(
+                "Using transformer_weights_path override for %s: %s",
+                component_name,
+                component_weights_path,
+            )
+        if component_quantization is not None:
+            component_server_args.quantization = component_quantization
+            logger.info(
+                "Using quantization override %s for %s",
+                component_quantization,
+                component_name,
+            )
+        if component_ignored_layers is not None:
+            component_server_args.quantization_ignored_layers = component_ignored_layers
         return component_server_args
 
     if component_name not in ("transformer_2", "unconditional_transformer"):
@@ -135,6 +153,7 @@ class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
     allow_global_attention_backend_fallback = False
+    supports_online_quantization_override = True
 
     component_names = [
         "transformer",
@@ -195,10 +214,13 @@ class TransformerLoader(ComponentLoader):
             # A GGUF file holds the whole transformer; the remaining components
             # still load from the base model path.
             safetensors_list = []
+            transformer_override_config_path = None
         else:
-            safetensors_list = resolve_transformer_safetensors_to_load(
+            checkpoint_files = resolve_transformer_checkpoint_files(
                 component_server_args, component_model_path
             )
+            safetensors_list = list(checkpoint_files.safetensors)
+            transformer_override_config_path = checkpoint_files.config_path
 
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
@@ -219,9 +241,14 @@ class TransformerLoader(ComponentLoader):
 
         cls_name = config.pop("_class_name")
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
+        is_minimax_h3 = model_cls.__name__ == "MiniMaxH3DiTModel"
+        if is_minimax_h3:
+            dit_config.arch_config.checkpoint_uses_diffusers_layout = (
+                cls_name != model_cls.__name__
+            )
 
         checkpoint_quant_config = None
-        if cls_name == "MiniMaxH3DiTModel":
+        if is_minimax_h3:
             selected_variant = str(component_server_args.model_variant or "fl2va")
             if gguf_file is not None:
                 validate_minimax_h3_checkpoint_variant([gguf_file], selected_variant)
@@ -233,7 +260,10 @@ class TransformerLoader(ComponentLoader):
                     safetensors_list
                 )
                 checkpoint_quant_config = resolve_minimax_h3_checkpoint_quantization(
-                    layer_markers
+                    layer_markers,
+                    safetensors_list,
+                    dit_config.arch_config.param_names_mapping,
+                    dit_config.arch_config.reverse_param_names_mapping,
                 )
                 if adaln_curve_shape is not None:
                     (
@@ -259,8 +289,9 @@ class TransformerLoader(ComponentLoader):
             component_name=component_name,
             gguf_file=gguf_file,
             checkpoint_quant_config=checkpoint_quant_config,
+            transformer_override_config_path=transformer_override_config_path,
         )
-        if quant_spec.gguf_file is not None and cls_name == "MiniMaxH3DiTModel":
+        if quant_spec.gguf_file is not None and is_minimax_h3:
             assert quant_spec.quant_config is not None
             curve = quant_spec.quant_config.tensor_meta.get("adaln_t_table")
             if curve is not None:
@@ -284,6 +315,15 @@ class TransformerLoader(ComponentLoader):
             raise ValueError(
                 "Comfy quantized checkpoints do not support FSDP "
                 "inference; use TP and/or sequence parallelism instead"
+            )
+        if (
+            use_fsdp
+            and quant_spec.quant_config is not None
+            and quant_spec.quant_config.get_name() == "auto-round"
+        ):
+            raise ValueError(
+                "AutoRound checkpoints do not support diffusion FSDP inference; "
+                "use TP and/or sequence parallelism instead"
             )
 
         if quant_spec.gguf_file is not None:
@@ -312,7 +352,7 @@ class TransformerLoader(ComponentLoader):
         )
         adaln_cache_path = component_server_args.minimax_h3_adaln_cache_path
         if adaln_cache_path is not None:
-            if cls_name != "MiniMaxH3DiTModel":
+            if not is_minimax_h3:
                 raise ValueError(
                     "--minimax-h3-adaln-cache-path is only supported by MiniMax H3"
                 )
@@ -326,7 +366,7 @@ class TransformerLoader(ComponentLoader):
             )
             checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
         if component_server_args.minimax_h3_adaln_online:
-            if cls_name != "MiniMaxH3DiTModel":
+            if not is_minimax_h3:
                 raise ValueError(
                     "--minimax-h3-adaln-online is only supported by MiniMax H3"
                 )
@@ -343,16 +383,16 @@ class TransformerLoader(ComponentLoader):
             )
             checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
 
-        if (
-            init_params["quant_config"] is None
-            and component_server_args.transformer_weights_path is not None
-        ):
+        runtime_quant_config = init_params["quant_config"]
+        if runtime_quant_config is not None:
+            logger.debug(
+                "Runtime quantization: %s", type(runtime_quant_config).__name__
+            )
+        elif component_server_args.transformer_weights_path is not None:
             logger.info(
                 "Using an unquantized transformer weight override from %s",
                 component_server_args.transformer_weights_path,
             )
-        else:
-            logger.debug("quantization config: %s", init_params["quant_config"])
 
         local_torch_device = get_local_torch_device()
         checkpoint_load_device = (
@@ -365,6 +405,7 @@ class TransformerLoader(ComponentLoader):
                 quantized_cpu_load_supported=(
                     quant_spec.gguf_file is not None
                     or quant_spec.is_serialized_kitchen_int8
+                    or quant_spec.is_serialized_kitchen_w4a8
                 ),
             )
         )

@@ -13,6 +13,8 @@ from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
 from sglang.kernels.ops.diffusion import try_fused_scaled_residual_add_exact
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from .attention import Attention
 from .vit_utils import _env_flag, _vit_torch_compile_kwargs
@@ -62,6 +64,12 @@ class FeedForward(nn.Module):
         else:
             raise ValueError(f"Unsupported activation function: {activation_fn}")
 
+        self.silu_and_mul = (
+            SiluAndMul()
+            if use_gated and activation_fn == "silu" and current_platform.is_npu()
+            else None
+        )
+
         self.w2 = nn.Linear(inner_dim, dim_out, bias=bias)
         self._compile_forward_enabled = _env_flag(
             "MINIMAX_H3_VAE_DECODER_VIT_FF_TORCH_COMPILE", "0"
@@ -83,6 +91,8 @@ class FeedForward(nn.Module):
                 and hidden_states.shape[-1] % 32 == 0
             ):
                 hidden_states = silu_and_mul_with_activation_rounding(hidden_states)
+            elif self.silu_and_mul is not None:
+                hidden_states = self.silu_and_mul(hidden_states)
             else:
                 gate, hidden_states = hidden_states.chunk(2, dim=-1)
                 hidden_states = self.act_fn(gate).mul_(hidden_states)
