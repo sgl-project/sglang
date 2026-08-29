@@ -12,6 +12,7 @@ from unittest.mock import patch
 from sglang.srt.disaggregation.encoder.receiver import (
     MMReceiverBase,
     WaitingMMRequestStatus,
+    WaitingRDMARequest,
     WaitingZmqRequest,
     WaitingZmqRequestGrpc,
     _ReceiveRegistrationRunner,
@@ -205,6 +206,97 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
 
         self.assertEqual(req.extra_key, "classification")
         self.assertEqual(req.cache_salt, "tenant-a")
+
+    def test_rdma_worker_error_is_released_on_scheduler_thread(self):
+        scheduler_thread = threading.get_ident()
+
+        class ThreadCheckedSocket:
+            closed_by = None
+
+            def close(self):
+                self.closed_by = threading.get_ident()
+
+        recv_socket = ThreadCheckedSocket()
+        request = WaitingRDMARequest.__new__(WaitingRDMARequest)
+        request.rid = "request-1"
+        request.status = WaitingMMRequestStatus.PENDING
+        request.error_msg = None
+        request.error_code = None
+        request.recv_socket = recv_socket
+        request._receive_error = None
+        request._receive_error_lock = threading.Lock()
+        request._buffer_lock = threading.Lock()
+        request._terminal = False
+        request._receive_running = False
+        request.embeddings_buffer = None
+        request._pool_slot_id = None
+        request.embedding_pool = None
+        request._mm_finalizer = None
+
+        worker = threading.Thread(
+            target=lambda: asyncio.run(
+                request._check_encoder_responses(
+                    [ConnectionError("encoder unavailable")], "/send"
+                )
+            )
+        )
+        worker.start()
+        worker.join(timeout=1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(request.status, WaitingMMRequestStatus.PENDING)
+        self.assertIsNone(request.recv_socket.closed_by)
+
+        request._try_recv_mm_data()
+
+        self.assertEqual(request.status, WaitingMMRequestStatus.FAIL)
+        self.assertIsNone(request.recv_socket)
+        self.assertTrue(request._terminal)
+        self.assertEqual(recv_socket.closed_by, scheduler_thread)
+
+    def test_tp_peer_failure_closes_local_receive_socket(self):
+        class WaitingRequest:
+            rid = "request-1"
+            recv_req = SimpleNamespace(rid=rid)
+            status = WaitingMMRequestStatus.PENDING
+            error_msg = "peer failed"
+            error_code = None
+            start_time = 0
+            released = False
+            closed = False
+
+            def _try_recv_mm_data(self):
+                pass
+
+            def release_resources(self):
+                self.released = True
+
+            def close_recv_socket(self):
+                self.closed = True
+
+        waiting_req = WaitingRequest()
+        receiver = SimpleNamespace(
+            waiting_list=[waiting_req],
+            waiting_by_rid={waiting_req.rid: waiting_req},
+            scheduler_recv_socket=None,
+            wait_timeout=float("inf"),
+            tp_group=SimpleNamespace(cpu_group=object()),
+            _drain_scheduler_embeddings=lambda: None,
+            _sync_fail_info_across_tp=lambda request: None,
+            create_req=lambda request: request,
+        )
+
+        def force_peer_failure(status, **kwargs):
+            status.fill_(WaitingMMRequestStatus.FAIL)
+
+        with patch("torch.distributed.all_reduce", force_peer_failure):
+            _, abort_reqs = MMReceiverBase._process_waiting_requests(
+                receiver, [], waiting_cls=None
+            )
+
+        self.assertTrue(waiting_req.released)
+        self.assertTrue(waiting_req.closed)
+        self.assertEqual(len(abort_reqs), 1)
 
 
 if __name__ == "__main__":
