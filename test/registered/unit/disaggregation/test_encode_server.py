@@ -1,5 +1,6 @@
 import asyncio
 import pickle
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -269,6 +270,116 @@ class TestEncoderDelivery(CustomTestCase):
                 ZmqDelivery,
             },
         )
+
+    @staticmethod
+    def _make_mooncake_send(engine):
+        embedding = torch.zeros((2, 4), dtype=torch.float32)
+        mm_data = EmbeddingData(
+            "req",
+            1,
+            0,
+            None,
+            Modality.IMAGE,
+            embedding=embedding,
+        )
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder._element_size = embedding.element_size()
+        encoder.engine = engine
+        return encoder, embedding, mm_data
+
+    def test_mooncake_fallback_registration_is_released_after_transfer_error(self):
+        async def run():
+            events = []
+
+            def register(*_):
+                events.append("register")
+
+            def transfer_sync(*_):
+                events.append("transfer")
+                raise RuntimeError("transfer failed")
+
+            def deregister(*_):
+                events.append("deregister")
+
+            engine = SimpleNamespace(
+                register=register,
+                transfer_sync=transfer_sync,
+                deregister=deregister,
+            )
+            encoder, embedding, mm_data = self._make_mooncake_send(engine)
+
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.server.get_disagg",
+                    return_value=SimpleNamespace(encoder_transfer_backend="mooncake"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "transfer failed"),
+            ):
+                await encoder._send(
+                    embedding,
+                    mm_data,
+                    session_id="session",
+                    buffer_address=1,
+                )
+
+            self.assertEqual(events, ["register", "transfer", "deregister"])
+
+        asyncio.run(run())
+
+    def test_mooncake_cancel_waits_before_releasing_fallback_registration(self):
+        async def run():
+            events = []
+            transfer_started = threading.Event()
+            finish_transfer = threading.Event()
+
+            def register(*_):
+                events.append("register")
+
+            def transfer_sync(*_):
+                events.append("transfer-start")
+                transfer_started.set()
+                finish_transfer.wait(timeout=2)
+                events.append("transfer-finish")
+                return 0
+
+            def deregister(*_):
+                events.append("deregister")
+
+            engine = SimpleNamespace(
+                register=register,
+                transfer_sync=transfer_sync,
+                deregister=deregister,
+            )
+            encoder, embedding, mm_data = self._make_mooncake_send(engine)
+
+            with patch(
+                "sglang.srt.disaggregation.encoder.server.get_disagg",
+                return_value=SimpleNamespace(encoder_transfer_backend="mooncake"),
+            ):
+                send_task = asyncio.create_task(
+                    encoder._send(
+                        embedding,
+                        mm_data,
+                        session_id="session",
+                        buffer_address=1,
+                    )
+                )
+                self.assertTrue(await asyncio.to_thread(transfer_started.wait, 1))
+                send_task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(send_task.done())
+                self.assertNotIn("deregister", events)
+
+                finish_transfer.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await send_task
+
+            self.assertEqual(
+                events,
+                ["register", "transfer-start", "transfer-finish", "deregister"],
+            )
+
+        asyncio.run(run())
 
     def test_zmq_delivery_cleanup_is_configurable(self):
         async def run():

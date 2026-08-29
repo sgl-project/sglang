@@ -1629,21 +1629,35 @@ class MMEncoder:
             mr_already_registered = mm_data._mr_ptr == embedding.data_ptr()
             if not mr_already_registered:
                 self.engine.register(embedding.data_ptr(), embedding.nbytes)
-            _t_xfer_start = time.monotonic()
-            xfer_ret = await asyncio.to_thread(
-                self.engine.transfer_sync,
-                session_id,
-                embedding.data_ptr(),
-                buffer_address,
-                embedding.nbytes,
-            )
+            transfer_error = None
+            try:
+                _t_xfer_start = time.monotonic()
+                xfer_ret = await self._run_mooncake_transfer(
+                    session_id,
+                    embedding.data_ptr(),
+                    buffer_address,
+                    embedding.nbytes,
+                )
+            except BaseException as error:
+                transfer_error = error
+                raise
+            finally:
+                if not mr_already_registered:
+                    try:
+                        self.engine.deregister(embedding.data_ptr())
+                    except Exception:
+                        if transfer_error is None:
+                            raise
+                        logger.exception(
+                            "Per-send MR deregistration also failed for %s; "
+                            "preserving the transfer error",
+                            req_id,
+                        )
             xfer_ms = (time.monotonic() - _t_xfer_start) * 1000.0
             if encoder_metrics_collector is not None:
                 encoder_metrics_collector.observe_transfer(
                     xfer_ms / 1000.0, backend="mooncake"
                 )
-            if not mr_already_registered:
-                self.engine.deregister(embedding.data_ptr())
             if xfer_ret < 0:
                 raise InternalError(
                     f"Mooncake transfer_sync failed for {req_id} "
@@ -1761,6 +1775,32 @@ class MMEncoder:
                 time.perf_counter() - transfer_start,
                 backend=get_disagg().encoder_transfer_backend,
             )
+
+    async def _run_mooncake_transfer(
+        self,
+        session_id,
+        source_address: int,
+        destination_address: int,
+        size: int,
+    ) -> int:
+        """Keep the send active until its blocking transfer stops using the MR."""
+        transfer_task = asyncio.create_task(
+            asyncio.to_thread(
+                self.engine.transfer_sync,
+                session_id,
+                source_address,
+                destination_address,
+                size,
+            )
+        )
+        try:
+            return await asyncio.shield(transfer_task)
+        except asyncio.CancelledError:
+            try:
+                await transfer_task
+            except Exception:
+                pass
+            raise
 
     def _register_shared_mr(self, mm_data: EmbeddingData, embedding: torch.Tensor):
         """Register one MR shared by every rank's /send; _send re-registers on failure."""
