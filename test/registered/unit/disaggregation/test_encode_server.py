@@ -246,7 +246,10 @@ class TestEncoderDelivery(CustomTestCase):
         except Exception as e:
             # Generated protobuf modules raise VersionError when the runner's
             # protobuf runtime is older than the code generator.
-            if type(e).__name__ != "VersionError":
+            if not (
+                type(e).__module__ == "google.protobuf.runtime_version"
+                and type(e).__name__ == "VersionError"
+            ):
                 raise
             raise unittest.SkipTest(f"gRPC test dependencies unavailable: {e}") from e
 
