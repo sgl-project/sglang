@@ -54,7 +54,6 @@ from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
 )
 from sglang.srt.speculative.domino_utils import (
-    DominoRolloutWorkspace,
     domino_greedy_rollout,
     validate_domino_runtime,
 )
@@ -297,17 +296,6 @@ class _DominoDraftSampler:
         self.shift_label = bool(shift_label)
         self.candidate_pool_size = int(candidate_pool_size)
         max_tokens = int(max_bs) * (self.block_size - 1)
-        self.workspace = None
-        if 0 < self.candidate_pool_size < self.vocab_size:
-            self.workspace = DominoRolloutWorkspace(
-                max_batch_size=int(max_bs),
-                num_feedback_steps=self.block_size - 2,
-                candidate_pool_size=self.candidate_pool_size,
-                vocab_size=self.vocab_size,
-                emb_dim=int(embed_proj[0].out_features),
-                device=lm_head_weight.device,
-                dtype=lm_head_weight.dtype,
-            )
         self.out = torch.empty(
             (max_tokens,), dtype=torch.int64, device=lm_head_weight.device
         )
@@ -328,7 +316,6 @@ class _DominoDraftSampler:
             vocab_size=self.vocab_size,
             shift_label=self.shift_label,
             candidate_pool_size=self.candidate_pool_size,
-            workspace=self.workspace,
         )
         self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
 

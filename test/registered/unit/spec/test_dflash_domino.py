@@ -8,7 +8,6 @@ from torch import nn
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.srt.speculative.domino_utils import (
-    DominoRolloutWorkspace,
     domino_greedy_rollout,
     validate_domino_runtime,
 )
@@ -332,113 +331,6 @@ class TestDFlashDominoRollout(CustomTestCase):
                 )
                 torch.testing.assert_close(actual[:, 0], first_expected, rtol=0, atol=0)
 
-    def test_preallocated_workspace_matches_reference_and_reuses_capacity(self):
-        block_size = 7
-        draft_hidden = torch.randn(
-            3, block_size, self.hidden_size, device=self.device, dtype=self.dtype
-        )
-        verified_ids = torch.tensor([1, 4, 9], device=self.device)
-        workspace = DominoRolloutWorkspace(
-            max_batch_size=4,
-            num_feedback_steps=block_size - 2,
-            candidate_pool_size=5,
-            vocab_size=self.vocab_size,
-            emb_dim=self.embed_proj[0].out_features,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        expected = domino_greedy_rollout(
-            draft_hidden=draft_hidden,
-            verified_ids=verified_ids,
-            target_embedding=self.embedding,
-            lm_head_weight=self.lm_head_weight,
-            prefix_gru=self.prefix_gru,
-            embed_proj=self.embed_proj,
-            vocab_size=self.vocab_size,
-            shift_label=True,
-            candidate_pool_size=5,
-        )
-        actual = domino_greedy_rollout(
-            draft_hidden=draft_hidden,
-            verified_ids=verified_ids,
-            target_embedding=self.embedding,
-            lm_head_weight=self.lm_head_weight,
-            prefix_gru=self.prefix_gru,
-            embed_proj=self.embed_proj,
-            vocab_size=self.vocab_size,
-            shift_label=True,
-            candidate_pool_size=5,
-            workspace=workspace,
-        )
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        # A smaller batch must use the same storage without changing results.
-        smaller = domino_greedy_rollout(
-            draft_hidden=draft_hidden[:2],
-            verified_ids=verified_ids[:2],
-            target_embedding=self.embedding,
-            lm_head_weight=self.lm_head_weight,
-            prefix_gru=self.prefix_gru,
-            embed_proj=self.embed_proj,
-            vocab_size=self.vocab_size,
-            shift_label=True,
-            candidate_pool_size=5,
-            workspace=workspace,
-        )
-        reference = domino_greedy_rollout(
-            draft_hidden=draft_hidden[:2],
-            verified_ids=verified_ids[:2],
-            target_embedding=self.embedding,
-            lm_head_weight=self.lm_head_weight,
-            prefix_gru=self.prefix_gru,
-            embed_proj=self.embed_proj,
-            vocab_size=self.vocab_size,
-            shift_label=True,
-            candidate_pool_size=5,
-        )
-        torch.testing.assert_close(smaller, reference, rtol=0, atol=0)
-
-    def test_workspace_rejects_incompatible_shape(self):
-        draft_hidden = torch.randn(
-            2, 7, self.hidden_size, device=self.device, dtype=self.dtype
-        )
-        verified_ids = torch.tensor([2, 7], device=self.device)
-        workspace = DominoRolloutWorkspace(
-            max_batch_size=1,
-            num_feedback_steps=5,
-            candidate_pool_size=5,
-            vocab_size=self.vocab_size,
-            emb_dim=self.embed_proj[0].out_features,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        args = dict(
-            draft_hidden=draft_hidden,
-            verified_ids=verified_ids,
-            target_embedding=self.embedding,
-            lm_head_weight=self.lm_head_weight,
-            prefix_gru=self.prefix_gru,
-            embed_proj=self.embed_proj,
-            vocab_size=self.vocab_size,
-            shift_label=True,
-            candidate_pool_size=5,
-            workspace=workspace,
-        )
-        with self.assertRaisesRegex(ValueError, "batch capacity"):
-            domino_greedy_rollout(**args)
-        workspace = DominoRolloutWorkspace(
-            max_batch_size=2,
-            num_feedback_steps=5,
-            candidate_pool_size=5,
-            vocab_size=self.vocab_size,
-            emb_dim=self.embed_proj[0].out_features,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        args["workspace"] = workspace
-        args["candidate_pool_size"] = 4
-        with self.assertRaisesRegex(ValueError, "candidate-pool size"):
-            domino_greedy_rollout(**args)
-
     def test_candidate_pool_boundaries(self):
         draft_hidden = torch.randn(
             2, 7, self.hidden_size, device=self.device, dtype=self.dtype
@@ -572,15 +464,6 @@ class TestDFlashDominoRollout(CustomTestCase):
             dtype=self.dtype,
         )
         static_ids = torch.tensor([1, 4, 9], device=self.device)
-        workspace = DominoRolloutWorkspace(
-            max_batch_size=batch_size,
-            num_feedback_steps=block_size - 2,
-            candidate_pool_size=5,
-            vocab_size=self.vocab_size,
-            emb_dim=self.embed_proj[0].out_features,
-            device=self.device,
-            dtype=self.dtype,
-        )
 
         def rollout():
             return domino_greedy_rollout(
@@ -593,7 +476,6 @@ class TestDFlashDominoRollout(CustomTestCase):
                 vocab_size=self.vocab_size,
                 shift_label=True,
                 candidate_pool_size=5,
-                workspace=workspace,
             )
 
         rollout()
