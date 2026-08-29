@@ -62,7 +62,7 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
 
         with mock.patch(
             "sglang.kernels.ops.attention.fla.l2norm.l2norm_fwd",
-            side_effect=lambda tensor: tensor,
+            side_effect=lambda tensor, eps: tensor,
         ):
             result, _, checkpoints = kernel.extend(
                 q,
