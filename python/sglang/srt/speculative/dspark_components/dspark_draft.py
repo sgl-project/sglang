@@ -154,7 +154,7 @@ def sample_draft_block(
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
             return tp_sync.sync(
-                SpecTpSyncSite.DRAFT_GREEDY, torch.argmax(step_logits, dim=-1)
+                SpecTpSyncSite.DSPARK_DRAFT_GREEDY, torch.argmax(step_logits, dim=-1)
             )
 
     else:
@@ -166,7 +166,7 @@ def sample_draft_block(
                     step_logits.shape, dtype=torch.float32, device=step_logits.device
                 ).exponential_(1)
                 return tp_sync.sync(
-                    SpecTpSyncSite.DRAFT_SAMPLE,
+                    SpecTpSyncSite.DSPARK_DRAFT_SAMPLE,
                     SampleStepTokens.execute(
                         step_logits=step_logits,
                         temperatures=temperatures,
@@ -182,7 +182,7 @@ def sample_draft_block(
                 argmax_tokens = torch.argmax(step_logits, dim=-1)
                 sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
                 return tp_sync.sync(
-                    SpecTpSyncSite.DRAFT_SAMPLE,
+                    SpecTpSyncSite.DSPARK_DRAFT_MULTINOMIAL,
                     torch.where(greedy_mask, argmax_tokens, sampled_tokens),
                 )
 

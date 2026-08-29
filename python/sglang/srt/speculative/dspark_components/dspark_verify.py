@@ -144,9 +144,9 @@ class TargetVerifyExecutor:
         # accept_draft_tokens dispatches on is_all_greedy: the greedy kernel is
         # deterministic, the sampling one draws rejection coins.
         site = (
-            SpecTpSyncSite.VERIFY_GREEDY
+            SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
             if sampling_info is None or sampling_info.is_all_greedy
-            else SpecTpSyncSite.VERIFY_SAMPLE
+            else SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
         )
         self._tp_sync.sync(site, correct_len)
         self._tp_sync.sync(site, bonus)
@@ -653,9 +653,9 @@ class DsparkVerifyEpilogue:
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=verify_lens,
         )
-        self._tp_sync.sync(SpecTpSyncSite.VERIFY_GREEDY, correct_len)
-        self._tp_sync.sync(SpecTpSyncSite.VERIFY_GREEDY, bonus)
-        self._tp_sync.sync(SpecTpSyncSite.VERIFY_GREEDY, cap_trim_lens)
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, cap_trim_lens)
         finalized = finalize_accept_lens_triton(
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,

@@ -1196,10 +1196,10 @@ class Envs:
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
     # Which speculative decisions rank 0 broadcasts to its TP group. Comma
-    # separated presets ("all", "rng", "off") or site names, each negatable with
-    # a leading "-": e.g. "all,-plan". See speculative/spec_tp_sync.py for what
-    # each site covers. Narrowing this under live traffic isolates which kind of
-    # divergence a deployment actually has.
+    # separated presets ("all", "rng", "init", "off"), site slugs or site
+    # numbers, each negatable with a leading "-": e.g. "all,-dspark-plan,-6".
+    # SpecTpSyncSite in speculative/spec_tp_sync.py enumerates the sites.
+    # Narrowing this under live traffic isolates where ranks actually diverge.
     SGLANG_SPEC_TP_SYNC = EnvStr("all")
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more

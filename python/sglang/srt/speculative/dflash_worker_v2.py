@@ -468,7 +468,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = self._tp_sync.available_memory_gb(
-                self.device, self.gpu_id, group=get_tp_group()
+                SpecTpSyncSite.DFLASH_MEM,
+                self.device,
+                self.gpu_id,
+                group=get_tp_group(),
             )
             if available_mem < 1.0:
                 capture_decode_cuda_graph = False
@@ -1645,8 +1648,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_input=draft_input,
             )
-            self._tp_sync.sync(SpecTpSyncSite.VERIFY_SAMPLE, accept_len)
-            self._tp_sync.sync(SpecTpSyncSite.VERIFY_SAMPLE, bonus)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         elif (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
@@ -1658,14 +1661,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
-            self._tp_sync.sync(SpecTpSyncSite.VERIFY_SAMPLE, accept_len)
-            self._tp_sync.sync(SpecTpSyncSite.VERIFY_SAMPLE, bonus)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, accept_len)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
             target_predict = torch.argmax(next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
             )
-            self._tp_sync.sync(SpecTpSyncSite.VERIFY_GREEDY, target_predict)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
             if self._use_triton_accept_bonus:
                 try:
                     (
@@ -1765,7 +1768,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch_output.logits_output,
                 batch_output.next_token_ids,
             )
-            self._tp_sync.sync(SpecTpSyncSite.TARGET, next_token_ids)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, next_token_ids)
             batch_output.new_seq_lens = batch.seq_lens
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)

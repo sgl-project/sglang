@@ -147,7 +147,7 @@ class DsparkDraftSampler:
                     # and redraws.
                     noise = self.exp_noise[:bs].exponential_()
                     return self._tp_sync.sync(
-                        SpecTpSyncSite.DRAFT_SAMPLE,
+                        SpecTpSyncSite.DSPARK_GRAPH_SAMPLE,
                         SampleStepTokens.execute(
                             step_logits=step_logits,
                             temperatures=self.temperatures[:bs],
@@ -160,7 +160,7 @@ class DsparkDraftSampler:
 
                 def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
                     return self._tp_sync.sync(
-                        SpecTpSyncSite.DRAFT_GREEDY,
+                        SpecTpSyncSite.DSPARK_GRAPH_GREEDY,
                         greedy_step_sampler(step_logits, step_idx),
                     )
 

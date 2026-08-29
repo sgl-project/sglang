@@ -388,7 +388,10 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = self._decode_graph_allowed
         available_mem = self._tp_sync.available_memory_gb(
-            self.device, self.gpu_id, group=self._draft_graph_group
+            SpecTpSyncSite.DSPARK_MEM,
+            self.device,
+            self.gpu_id,
+            group=self._draft_graph_group,
         )
         if is_cuda_alike() and capture_decode_cuda_graph:
             if available_mem < 1.0:
@@ -487,7 +490,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
-        self._tp_sync.sync(SpecTpSyncSite.TARGET, next_token_ids)
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
         batch_output.new_seq_lens = batch.seq_lens
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)

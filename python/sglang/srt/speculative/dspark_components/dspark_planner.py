@@ -585,7 +585,7 @@ class DSparkVerifyPlanner:
             budget=budget,
             cfg=self._schedule_cfg,
         ).to(device=device, dtype=torch.int32)
-        self._tp_sync.sync(SpecTpSyncSite.PLAN, verify_lens)
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_PLAN, verify_lens)
 
         if resolve_level() >= InvariantCheckLevel.WARN:
             verify_lens_64 = verify_lens.to(torch.int64)
