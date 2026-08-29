@@ -1,6 +1,7 @@
 """Unit tests for ModelSlim MoE checkpoint projection-name resolution."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -15,7 +16,16 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestModelSlimMoEPrefixes(CustomTestCase):
-    def test_projection_name_families_resolve_to_fused_weight_groups(self):
+    # ModelSlimW8A8Int8MoE.__init__ builds NPUW8A8Int8MoEMethod, which resolves
+    # torch.ops.npu.npu_dynamic_quant - absent on the CPU runner. Only that
+    # construction is mocked; prefix resolution and scheme selection stay real.
+    @patch(
+        "sglang.srt.layers.quantization.modelslim.schemes."
+        "modelslim_w8a8_int8_moe.NPUW8A8Int8MoEMethod"
+    )
+    def test_projection_name_families_resolve_to_fused_weight_groups(
+        self, _mock_npu_moe_method
+    ):
         """Bug regression: ModelSlim checkpoints may describe experts with
         gate_proj/up_proj/down_proj or MiniMax-style w1/w3/w2 names. Both must
         select the W13 and W2 schemes instead of reporting missing metadata.
