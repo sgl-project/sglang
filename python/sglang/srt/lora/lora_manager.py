@@ -51,6 +51,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_parallel,
+    get_schedule,
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
@@ -1095,6 +1096,12 @@ def init_lora_cuda_graph_moe_buffers(
     from sglang.srt.lora.layers import FusedMoEWithLoRA
 
     max_bs = get_exec().graph.cuda_graph_config.decode.max_bs
+    max_running_requests = get_schedule().max_running_requests
+    if max_running_requests is not None:
+        max_bs = min(
+            max_bs,
+            max_running_requests // get_parallel().attn_dp_size,
+        )
     # With spec on, the decode graph captures TARGET_VERIFY batches of
     # num_draft_tokens per request, and the buffers below are per-token, so
     # they must be sized in tokens rather than requests.
