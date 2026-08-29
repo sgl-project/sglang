@@ -80,6 +80,11 @@ def handle_ssl_validation(server_args: Any):
             raise ValueError(
                 "--http2-max-concurrent-streams must be between 1 and " "4294967295."
             )
+        if not 1024 <= cfg.http2_initial_connection_window_size < 2**31:
+            raise ValueError(
+                "--http2-initial-connection-window-size must be between "
+                "1024 and 2147483647."
+            )
 
         try:
             import granian  # noqa: F401

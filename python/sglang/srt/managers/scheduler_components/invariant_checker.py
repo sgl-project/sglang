@@ -252,7 +252,7 @@ class SchedulerInvariantChecker:
         swa_uncached = 0
         for batch in batches:
             for req in batch.reqs:
-                if req.kv is None:
+                if not req.is_holding_kv:
                     continue
 
                 allocated_len = req.kv.kv_allocated_len
@@ -324,7 +324,7 @@ class SchedulerInvariantChecker:
         batch = self.get_last_batch()
         if batch is not None:
             for req in batch.reqs:
-                if req.kv is None:
+                if not req.is_holding_kv:
                     continue
                 _add_owner(
                     req,
