@@ -190,8 +190,11 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
                 )
 
     def test_runner_mode_cuda_graph_decode_cases(self):
-        for case in self.CUDA_GRAPH_DECODE_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
+        for case_index, case in enumerate(self.CUDA_GRAPH_DECODE_CASES):
+            splits = 2 if case_index == 0 else 1
+            with self.subTest(
+                case=case.name, backend=case.backend
+            ), envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.override(splits):
                 run_dense_cuda_graph_decode_case(
                     self,
                     case,

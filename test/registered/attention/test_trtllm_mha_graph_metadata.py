@@ -86,6 +86,26 @@ def test_cuda_graph_metadata_launch_runs_in_graph_hook(monkeypatch):
     assert backend.forward_metadata is backend.decode_cuda_graph_metadata[2]
 
 
+def test_single_request_skips_decode_split_preparation():
+    backend = _make_backend_for_hook_test(decode_seq_len_splits=2)
+    metadata = SimpleNamespace(
+        is_ragged_verify=False,
+        cache_seqlens_int32=torch.tensor([7], dtype=torch.int32),
+        page_table=torch.tensor([[1, 2]], dtype=torch.int32),
+        swa_page_table=None,
+        decode_seq_len_order=None,
+        decode_sorted_seq_lens=None,
+        decode_sorted_page_table=None,
+        decode_sorted_swa_page_table=None,
+    )
+
+    backend._prepare_decode_seq_len_splits(metadata)
+
+    assert metadata.decode_seq_len_order is None
+    assert metadata.decode_sorted_seq_lens is None
+    assert metadata.decode_sorted_page_table is None
+
+
 def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
     calls = []
 
