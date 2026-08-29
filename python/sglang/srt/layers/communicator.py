@@ -809,6 +809,17 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
+        return self._should_fuse_mlp_allreduce(forward_batch, final_norm_consumer=False)
+
+    # NOTE: This function will cause torch recompilation
+    def should_fuse_mlp_allreduce_with_final_norm(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        return self._should_fuse_mlp_allreduce(forward_batch, final_norm_consumer=True)
+
+    def _should_fuse_mlp_allreduce(
+        self, forward_batch: ForwardBatch, *, final_norm_consumer: bool
+    ) -> bool:
         # When MOE_FULL is active (moe_cp allgather), fusion must be disabled because
         # the fusion path skips postprocess_layer which contains the moe_cp scatter.
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at
@@ -826,6 +837,12 @@ class LayerCommunicator:
         # silently return under-reduced activations.
         parallel = get_parallel()
         if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
+            return False
+        # The NextN final norm consumes a plain TP all-reduce.  Do not let it
+        # absorb an EP reduction or a TP1 no-op under the same marker.
+        if final_norm_consumer and (
+            parallel.moe_ep_size != 1 or parallel.moe_tp_size <= 1
+        ):
             return False
 
         if (
@@ -861,7 +878,7 @@ class LayerCommunicator:
                     and get_exec().comm.enable_aiter_allreduce_fusion
                 )
             )
-            and (not self.is_last_layer)
+            and (self.is_last_layer == final_norm_consumer)
             and (self._context.tp_size > 1)
         )
 

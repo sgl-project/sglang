@@ -11,13 +11,19 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _fake_communicator():
-    return types.SimpleNamespace(
+def _fake_communicator(
+    *, is_last_layer=False, mlp_mode=ScatterMode.TP_ATTN_FULL, tp_size=4
+):
+    fake = types.SimpleNamespace(
         _speculative_algo=None,
-        layer_scatter_modes=types.SimpleNamespace(mlp_mode=ScatterMode.TP_ATTN_FULL),
-        is_last_layer=False,
-        _context=types.SimpleNamespace(tp_size=4),
+        layer_scatter_modes=types.SimpleNamespace(mlp_mode=mlp_mode),
+        is_last_layer=is_last_layer,
+        _context=types.SimpleNamespace(tp_size=tp_size),
     )
+    fake._should_fuse_mlp_allreduce = types.MethodType(
+        LayerCommunicator._should_fuse_mlp_allreduce, fake
+    )
+    return fake
 
 
 class TestFuseMlpAllReduceGate(CustomTestCase):
@@ -31,24 +37,62 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
     Qwen3-30B-A3B with --tp-size 4 --ep-size 2.
     """
 
-    def _should_fuse(self, *, moe_ep_size, moe_tp_size):
+    def _should_fuse(
+        self,
+        *,
+        moe_ep_size,
+        moe_tp_size,
+        is_last_layer=False,
+        final_norm_consumer=False,
+        backend_available=True,
+        input_scattered=False,
+        moe_cp_allgather=False,
+        mlp_mode=ScatterMode.TP_ATTN_FULL,
+        tp_size=4,
+    ):
         forward_batch = types.SimpleNamespace(
             input_ids=types.SimpleNamespace(shape=(8,))
         )
         with (
-            patch.object(comm, "is_enable_moe_cp_allgather", return_value=False),
-            patch.object(comm, "apply_flashinfer_allreduce_fusion", return_value=True),
+            patch.object(
+                comm,
+                "is_enable_moe_cp_allgather",
+                return_value=moe_cp_allgather,
+            ),
+            patch.object(
+                comm,
+                "apply_flashinfer_allreduce_fusion",
+                return_value=backend_available,
+            ),
             patch.object(
                 comm,
                 "get_attn_tp_context",
-                return_value=types.SimpleNamespace(input_scattered=False),
+                return_value=types.SimpleNamespace(input_scattered=input_scattered),
             ),
             get_parallel().override(
-                moe_ep_size=moe_ep_size, moe_tp_size=moe_tp_size, tp_size=4
+                moe_ep_size=moe_ep_size,
+                moe_tp_size=moe_tp_size,
+                tp_size=tp_size,
             ),
         ):
+            fake = _fake_communicator(
+                is_last_layer=is_last_layer,
+                mlp_mode=mlp_mode,
+                tp_size=tp_size,
+            )
+            if final_norm_consumer:
+                method = getattr(
+                    LayerCommunicator,
+                    "should_fuse_mlp_allreduce_with_final_norm",
+                    None,
+                )
+                self.assertIsNotNone(
+                    method,
+                    "final MTP norm needs an explicit fusion-eligibility API",
+                )
+                return method(fake, forward_batch)
             return LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer(
-                _fake_communicator(), forward_batch
+                fake, forward_batch
             )
 
     def test_hybrid_ep_tp_does_not_fuse(self):
@@ -59,6 +103,43 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
 
     def test_pure_ep_still_fuses(self):
         self.assertTrue(self._should_fuse(moe_ep_size=4, moe_tp_size=1))
+
+    def test_last_layer_still_does_not_claim_a_next_layer_consumer(self):
+        self.assertFalse(
+            self._should_fuse(
+                moe_ep_size=1,
+                moe_tp_size=4,
+                is_last_layer=True,
+            )
+        )
+
+    def test_final_norm_consumer_gate(self):
+        cases = {
+            "eligible_last_layer": ({}, True),
+            "middle_layer": ({"is_last_layer": False}, False),
+            "hybrid_ep_tp": ({"moe_ep_size": 2, "moe_tp_size": 2}, False),
+            "pure_ep_not_in_first_scope": (
+                {"moe_ep_size": 4, "moe_tp_size": 1},
+                False,
+            ),
+            "backend_unavailable": ({"backend_available": False}, False),
+            "tp1": ({"moe_tp_size": 1, "tp_size": 1}, False),
+            "scattered_input": ({"input_scattered": True}, False),
+            "moe_cp_allgather": ({"moe_cp_allgather": True}, False),
+            "scattered_mlp": ({"mlp_mode": ScatterMode.SCATTERED}, False),
+        }
+        defaults = {
+            "moe_ep_size": 1,
+            "moe_tp_size": 4,
+            "is_last_layer": True,
+            "final_norm_consumer": True,
+        }
+        for name, (overrides, expected) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self._should_fuse(**(defaults | overrides)),
+                    expected,
+                )
 
 
 if __name__ == "__main__":

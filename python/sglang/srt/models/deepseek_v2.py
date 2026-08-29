@@ -2519,11 +2519,18 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
+        if self.is_nextn:
+            fuse_mlp_allreduce = (
+                self.layer_communicator.should_fuse_mlp_allreduce_with_final_norm(
+                    forward_batch
+                )
             )
-        )
+        else:
+            fuse_mlp_allreduce = (
+                self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                    forward_batch
+                )
+            )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
         mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(

@@ -274,8 +274,22 @@ class DeepseekModelNextN(nn.Module):
                 )
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:
-                    hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+                    if getattr(hidden_states, "_sglang_needs_allreduce_fusion", False):
+                        hidden_states, _ = (
+                            self.shared_head.norm.forward_with_allreduce_fusion(
+                                hidden_states,
+                                residual,
+                                use_attn_tp_group=False,
+                            )
+                        )
+                    else:
+                        hidden_states, _ = self.shared_head.norm(
+                            hidden_states, residual
+                        )
                 else:
+                    assert not getattr(
+                        hidden_states, "_sglang_needs_allreduce_fusion", False
+                    )
                     hidden_states = self.shared_head.norm(hidden_states)
 
                 if use_cp_v1:
