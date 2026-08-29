@@ -177,10 +177,15 @@ class ComponentLoader(ABC):
         return component_name in native_only_components
 
     def validate_native_fallback(
-        self, _server_args: ServerArgs, _component_name: str
+        self, server_args: ServerArgs, component_name: str
     ) -> None:
         """Validate that fallback preserves the exact component's runtime contract."""
-        pass
+        if server_args.should_use_fsdp_for_component(component_name):
+            raise RuntimeError(
+                f"Native fallback for component {component_name!r} cannot honor "
+                "requested FSDP. Use an SGLang-native implementation or disable "
+                "FSDP for this component."
+            )
 
     def _load_customized_with_context(
         self,

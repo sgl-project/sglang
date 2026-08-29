@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentLoader,
     NativeComponentLoaderRequired,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
@@ -15,6 +16,7 @@ class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
     @staticmethod
     def _server_args(*, fsdp_requested=False, **overrides):
         values = {
+            "component_precisions": {},
             "component_quantizations": {},
             "component_weights_paths": {},
             "component_quantization_ignored_layers": {},
@@ -109,6 +111,25 @@ class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
         native.assert_called_once()
         server_args.should_use_fsdp_for_component.assert_called_once_with(
             "transformer_2"
+        )
+
+    def test_generic_native_fallback_rejects_component_fsdp(self):
+        loader = ComponentLoader()
+        server_args = self._server_args(fsdp_requested=True)
+        customized_load, native_load, available_memory = self._mocked_load(loader)
+
+        with customized_load, native_load as native, available_memory:
+            with self.assertRaisesRegex(RuntimeError, "FSDP"):
+                loader.load(
+                    "/model/condition_image_encoder",
+                    server_args,
+                    "condition_image_encoder",
+                    "diffusers",
+                )
+
+        native.assert_not_called()
+        server_args.should_use_fsdp_for_component.assert_called_once_with(
+            "condition_image_encoder"
         )
 
 

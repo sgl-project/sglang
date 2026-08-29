@@ -195,6 +195,7 @@ class TransformerLoader(ComponentLoader):
     def validate_native_fallback(
         self, server_args: ServerArgs, component_name: str
     ) -> None:
+        super().validate_native_fallback(server_args, component_name)
         requested_distributed_execution = []
         if server_args.tp_size is not None and server_args.tp_size > 1:
             requested_distributed_execution.append(f"tp_size={server_args.tp_size}")
@@ -215,15 +216,13 @@ class TransformerLoader(ComponentLoader):
             requested_distributed_execution.append(
                 f"kv_gather_degree={server_args.kv_gather_degree}"
             )
-        if server_args.should_use_fsdp_for_component(component_name):
-            requested_distributed_execution.append("FSDP")
         if requested_distributed_execution:
             raise RuntimeError(
                 f"Native Diffusers fallback for transformer component "
                 f"{component_name!r} cannot honor requested distributed execution: "
                 f"{', '.join(requested_distributed_execution)}. Use an SGLang-native "
                 "transformer implementation or set tp_size, sp_degree, "
-                "ulysses_degree, ring_degree, and kv_gather_degree to 1 without FSDP."
+                "ulysses_degree, ring_degree, and kv_gather_degree to 1."
             )
 
     def load_customized(
