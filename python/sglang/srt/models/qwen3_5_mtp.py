@@ -154,12 +154,14 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        if not self.config.tie_word_embeddings:
+        # A last-stage draft can share only the target lm_head under PP; retain its
+        # own embedding for the first-stage half it cannot receive.
+        if embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        if head is not None and not self.config.tie_word_embeddings:
             del self.lm_head.weight
-
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+            self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
@@ -214,6 +216,16 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if not forward_batch.forward_mode.is_idle():
                 input_embeds = self.pre_fc_norm_embedding(input_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            # Captured prefill gives padded embeddings but real-height target states;
+            # place the real rows in an equal-height slot whose padding stays unread.
+            if hidden_states.shape[0] != input_embeds.shape[0]:
+                rows = min(hidden_states.shape[0], input_embeds.shape[0])
+                slot = hidden_states.new_zeros(
+                    (input_embeds.shape[0], hidden_states.shape[1])
+                )
+                slot[:rows] = hidden_states[:rows]
+                hidden_states = slot
+
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
             hidden_states = self.fc(hidden_states)

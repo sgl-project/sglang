@@ -1233,6 +1233,35 @@ class TestOffloadDefaults(unittest.TestCase):
         args.disable_fsdp_for_component("text_encoder")
         self.assertFalse(args.should_use_fsdp_for_component("text_encoder"))
 
+    def test_resident_requirement_rejects_every_explicit_offload_surface(self):
+        cases = (
+            {"component_residency": ["text_encoder=component-offload"]},
+            {"component_residency": ["text_encoder=layerwise-offload"]},
+            {"cpu_offload_components": ["text_encoder"]},
+            {"text_encoder_cpu_offload": True},
+            {"layerwise_offload_components": ["text_encoder"]},
+        )
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                args = self._from_dict_with_task_type(
+                    ModelTaskType.T2V,
+                    kwargs={"performance_mode": "manual", **kwargs},
+                )
+
+                with self.assertRaisesRegex(ValueError, "explicit residency option"):
+                    args.require_component_resident(
+                        "text_encoder", feature_name="test backend"
+                    )
+
+    def test_resident_requirement_can_override_automatic_placement(self):
+        args = self._from_dict_with_task_type(ModelTaskType.T2V, memory_gb=16)
+        self.assertIsNone(args.explicit_residency_mode("text_encoder"))
+        self.assertNotEqual(args.residency_mode("text_encoder"), RESIDENT)
+
+        args.require_component_resident("text_encoder", feature_name="test backend")
+
+        self.assertEqual(args.residency_mode("text_encoder"), RESIDENT)
+
     def test_diffusers_component_residency_is_pipeline_wide(self):
         self.assertFalse(resolve_diffusers_pipeline_offload({"all": RESIDENT}))
         self.assertTrue(resolve_diffusers_pipeline_offload({"all": COMPONENT_OFFLOAD}))
@@ -1538,7 +1567,9 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertEqual(sana_wm_deployment.dit_layerwise_offload_modes, ("memory",))
         self.assertEqual(sana_wm_deployment.keep_resident_min_available_gb, 70)
-        self.assertEqual(sana_wm_deployment.keep_resident_components, ("text_encoder",))
+        self.assertEqual(
+            sana_wm_deployment.keep_resident_components, ("text_encoder", "vae")
+        )
 
         fast_hunyuan_deployment = FastHunyuanConfig().get_model_deployment_config()
         self.assertEqual(fast_hunyuan_deployment.keep_resident_min_available_gb, 60)
@@ -1589,7 +1620,7 @@ class TestOffloadDefaults(unittest.TestCase):
         )
         high_memory_offload = high_memory_args.layerwise_offload_components or []
         self.assertNotIn("text_encoder", high_memory_offload)
-        self.assertIn("vae", high_memory_offload)
+        self.assertNotIn("vae", high_memory_offload)
 
         constrained_args = self._from_dict_with_pipeline_config(
             SanaWMPipelineConfig(),

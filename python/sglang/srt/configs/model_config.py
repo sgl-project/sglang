@@ -25,6 +25,7 @@ from typing import Any, List, Optional, Set, Union
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
@@ -604,7 +605,6 @@ class ModelConfig:
         context_length: Optional[int] = None,
         **kwargs,
     ):
-        from sglang.srt.arg_groups.overrides import resolving_view
 
         cfg = resolving_view(server_args)
         quantization = (

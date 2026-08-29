@@ -8,9 +8,15 @@ import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    _data_parallelism_defaults,
+    _dp_lm_head_validation,
+    _tp_lm_head_all_to_all_default,
     declare_resolution,
+    model_config_of,
     resolved_view,
     resolving_view,
+    run_post_process_pass,
+    should_report_expert_balancedness,
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -21,12 +27,13 @@ logger = logging.getLogger(__name__)
 
 
 def handle_context_parallelism(server_args: Any):
+
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
         from sglang.srt.configs.model_config import is_deepseek_dsa
         from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
 
-        model_config = server_args.get_model_config()
+        model_config = model_config_of(server_args)
         hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
         if model_arch in CP_V2_DEFAULT_MODEL_CLASSES:
@@ -154,11 +161,11 @@ def handle_dcp_validation(server_args: Any):
 def handle_data_parallelism(server_args: Any):
     # The dp_size==1 resets moved to the resolution pipeline
     # (arg_groups/overrides.py: _data_parallelism_defaults).
-    cfg = resolving_view(server_args)
-    from sglang.srt.arg_groups.overrides import (
-        _data_parallelism_defaults,
-        run_post_process_pass,
+    from sglang.srt.arg_groups.cuda_graph_hook import (
+        generate_prefill_cuda_graph_batch_sizes,
     )
+
+    cfg = resolving_view(server_args)
 
     run_post_process_pass(server_args, _data_parallelism_defaults)
 
@@ -213,7 +220,7 @@ def handle_data_parallelism(server_args: Any):
         ):
             clamped = {"max_bs": cfg.chunked_prefill_size}
             if (Phase.PREFILL, "bs") not in server_args._cuda_graph_config_locked:
-                clamped["bs"] = server_args._generate_prefill_cuda_graph_batch_sizes(
+                clamped["bs"] = generate_prefill_cuda_graph_batch_sizes(
                     clamped["max_bs"]
                 )
             declare_resolution(
@@ -226,10 +233,6 @@ def handle_data_parallelism(server_args: Any):
 
     # Resolve the phase-aware TP LM-head default before validating the
     # resulting DP/TP LM-head configuration.
-    from sglang.srt.arg_groups.overrides import (
-        _dp_lm_head_validation,
-        _tp_lm_head_all_to_all_default,
-    )
 
     run_post_process_pass(server_args, _tp_lm_head_all_to_all_default)
     run_post_process_pass(server_args, _dp_lm_head_validation)
@@ -363,9 +366,7 @@ def handle_elastic_ep(server_args: Any):
             declare_resolution(
                 server_args,
                 "_handle_elastic_ep",
-                mooncake_ib_device=validate_ib_devices(
-                    server_args, cfg.mooncake_ib_device
-                ),
+                mooncake_ib_device=validate_ib_devices(cfg.mooncake_ib_device),
             )
     if cfg.ep_join_mode is not None:
         assert (
@@ -636,7 +637,7 @@ def handle_expert_distribution_metrics(server_args: Any):
             "prometheus, both."
         )
 
-    if server_args.should_report_expert_balancedness() and (
+    if should_report_expert_balancedness(server_args) and (
         cfg.expert_distribution_recorder_mode is None
     ):
         declare_resolution(
