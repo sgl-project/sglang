@@ -427,6 +427,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             or metadata.page_table is None
         ):
             return
+        if metadata.cache_seqlens_int32.shape[0] <= 1:
+            return
         if metadata.decode_seq_len_order is None:
             sorted_seq_lens, order = torch.sort(metadata.cache_seqlens_int32)
             metadata.decode_seq_len_order = order
