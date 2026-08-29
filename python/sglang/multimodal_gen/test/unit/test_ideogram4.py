@@ -536,6 +536,7 @@ class TestIdeogram4(unittest.TestCase):
             component_quantization_ignored_layers={
                 "unconditional_transformer": ["lm_head"]
             },
+            component_weights_revision=lambda _component: None,
         )
 
         component_args = _server_args_for_transformer_component(

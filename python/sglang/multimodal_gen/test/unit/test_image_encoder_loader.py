@@ -41,6 +41,7 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
             component_quantizations={},
             encoder_parallel="replicate",
             revision=None,
+            component_revision=lambda _component: None,
             resolve_component_attention_backend=lambda _name: (None, None),
         )
 
@@ -186,6 +187,7 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
             require_component_resident=mock.Mock(),
             should_use_fsdp_for_component=mock.Mock(return_value=False),
             revision=None,
+            component_revision=lambda _component: None,
             trust_remote_code=False,
         )
         loader = ImageEncoderLoader()
@@ -237,6 +239,7 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
             should_use_fsdp_for_component=lambda _name: False,
             should_start_component_on_cpu=lambda _name: False,
             revision=None,
+            component_revision=lambda _component: None,
             trust_remote_code=False,
         )
         loader = ImageEncoderLoader()
