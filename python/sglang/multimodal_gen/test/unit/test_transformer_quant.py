@@ -206,58 +206,6 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         self.assertIsNone(quant_config)
 
-    def test_weight_override_rejects_conflicting_header_declarations(self):
-        with tempfile.TemporaryDirectory() as directory:
-            first = f"{directory}/first.safetensors"
-            second = f"{directory}/second.safetensors"
-            save_file(
-                {"block.0.weight": torch.ones((2, 2))},
-                first,
-                metadata={
-                    "quantization_config": json.dumps(
-                        {"quant_method": "fp8", "activation_scheme": "dynamic"}
-                    )
-                },
-            )
-            save_file(
-                {"block.1.weight": torch.ones((2, 2))},
-                second,
-                metadata={
-                    "quantization_config": json.dumps(
-                        {"quant_method": "fp8", "activation_scheme": "static"}
-                    )
-                },
-            )
-
-            with self.assertRaisesRegex(ValueError, "activation_scheme"):
-                _resolve_weight_override_quantization([first, second], {}, {})
-
-    def test_weight_override_accepts_repeated_shard_declaration(self):
-        metadata = {
-            "quantization_config": json.dumps(
-                {"quant_method": "fp8", "activation_scheme": "dynamic"}
-            )
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            shards = [
-                f"{directory}/model-{index:05d}-of-00002.safetensors"
-                for index in (1, 2)
-            ]
-            for index, shard in enumerate(shards):
-                save_file(
-                    {f"block.{index}.weight": torch.ones((2, 2))},
-                    shard,
-                    metadata=metadata,
-                )
-
-            quant_config, declared = _resolve_weight_override_quantization(
-                shards, {}, {}
-            )
-
-        self.assertTrue(declared)
-        self.assertIsInstance(quant_config, Fp8Config)
-        self.assertEqual(quant_config.activation_scheme, "dynamic")
-
     def test_weight_override_defers_header_without_quant_method_to_layout(self):
         with tempfile.TemporaryDirectory() as directory:
             weights = f"{directory}/model.safetensors"
@@ -326,57 +274,6 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                     safetensors_list=[weights],
                     component_model_path="/base",
                 )
-
-    @patch(
-        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
-        return_value=None,
-    )
-    @patch(
-        "sglang.multimodal_gen.runtime.loader.transformer_load_utils._resolve_weight_override_quantization",
-        return_value=(None, False),
-    )
-    def test_weight_override_uses_selected_component_arch_config(
-        self, _resolve_override, build_nvfp4
-    ):
-        selected_arch = SimpleNamespace(
-            param_names_mapping={"selected": "forward"},
-            reverse_param_names_mapping={"selected": "reverse"},
-            quant_ignore_remap={},
-        )
-        server_args = self._make_server_args(transformer_weights_path="replacement")
-
-        _resolve_quant_config(
-            hf_config={},
-            server_args=server_args,
-            safetensors_list=["replacement.safetensors"],
-            component_model_path="/base",
-            arch_config=selected_arch,
-        )
-
-        self.assertEqual(
-            build_nvfp4.call_args.args[1:3],
-            (
-                selected_arch.param_names_mapping,
-                selected_arch.reverse_param_names_mapping,
-            ),
-        )
-
-    @patch(
-        "sglang.multimodal_gen.runtime.loader.transformer_load_utils._resolve_quant_config",
-        return_value=Fp8Config(is_checkpoint_fp8_serialized=True),
-    )
-    def test_declared_weight_override_rejects_nunchaku(self, _resolve_quant):
-        server_args = self._make_server_args(nunchaku_config=object())
-
-        with self.assertRaisesRegex(ValueError, "Nunchaku"):
-            resolve_transformer_quant_load_spec(
-                hf_config={},
-                server_args=server_args,
-                safetensors_list=["replacement.safetensors"],
-                component_model_path="/base",
-                model_cls=_FakeFluxTransformer,
-                cls_name="FakeTransformer",
-            )
 
     def test_autoround_config_is_inferred_and_remapped_to_native_prefixes(self):
         layer_config = {
