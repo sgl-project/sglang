@@ -243,14 +243,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     kv_events: Optional[KVCacheEventRecorder] = None
 
     def init_metrics_collector(self):
-        from sglang.srt.runtime_context import get_server_args
-
-        server_args = get_server_args()
         labels = {"cache_type": self.__class__.__name__}
         if get_observability().extra_metric_labels:
             labels.update(get_observability().extra_metric_labels)
         radix_cache_cls = resolve_collector_class(
-            server_args,
             STAT_LOGGER_ROLE_RADIX_CACHE,
             RadixCacheMetricsCollector,
         )
@@ -323,6 +319,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     @abstractmethod
     def evict(self, params: EvictParams) -> EvictResult:
         pass
+
+    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+        """Evict cache entries to cover allocator shortfalls.
+
+        The default implementation preserves the component-count semantics of
+        :meth:`evict`. Multi-component caches backed by shared memory can
+        override this entry point to stop once collateral frees make the
+        requested allocation feasible.
+        """
+        return self.evict(params)
 
     @abstractmethod
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:

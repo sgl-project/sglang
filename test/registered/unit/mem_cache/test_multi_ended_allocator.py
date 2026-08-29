@@ -744,6 +744,33 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         )
         self.assertIn(tgt, free_full)
 
+    def test_swa_free_full_defers_inside_a_free_group(self):
+        """The full-only release joins the barrier, like `free`."""
+        _, allocator, kvcache = self._build()
+        v = self._alloc(allocator, kvcache, 3)
+        target = v[1:2]
+        tgt = int(target.item())
+        # Tombstone the swa side, erasing each marker before its release
+        # (compaction runs inside both).
+        target_swa = allocator.swa_attn_allocator.virtual_to_physical[target]
+        kvcache.swa_kv_pool.buf[target_swa] = -1
+        allocator.free_swa(target)
+        full_phys = int(allocator.full_attn_allocator.virtual_to_physical[tgt].item())
+        kvcache.full_kv_pool.buf[full_phys] = -1
+
+        allocator.free_group_begin()
+        allocator.free_full(target)
+        deferred = set(
+            int(x) for x in allocator.full_attn_allocator.free_virtual_ids.tolist()
+        )
+        self.assertNotIn(tgt, deferred)
+
+        allocator.free_group_end()
+        drained = set(
+            int(x) for x in allocator.full_attn_allocator.free_virtual_ids.tolist()
+        )
+        self.assertIn(tgt, drained)
+
     # 4. Compaction diverges between the two sub-pools (each runs its own).
     def test_swa_compaction_diverges_physical_layout(self):
         _, allocator, kvcache = self._build()
