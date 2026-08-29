@@ -84,38 +84,95 @@ def msa_available() -> bool:
         return False
 
 
-def _build_page_table(
-    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len], physical slot per logical pos
-    slot_ids: torch.Tensor,  # [batch]
+def _pack_page_table(
+    page_table: torch.Tensor,  # [batch, max_pages] physical page ids
     seq_lens: torch.Tensor,  # [batch] total K length (prefix + chunk)
     page_size: int,
 ) -> torch.Tensor:
-    """Flattened physical page ids per request (MSA `kv_indices`).
-
-    sglang's paged allocator stores page_size contiguous physical slots per page, so the
-    physical page of logical position p is ``req_to_token[req, p] // page_size`` and is the
-    same for every p within a page. We read one slot per logical page to recover the table.
-
-    Vectorized (no per-request Python loop): pages are packed contiguously by request in the
-    same order MSA's planner expects (``kv_page_indptr = cumsum(ceil(seq_lens/page_size))``).
-    ``searchsorted`` maps each packed page slot back to its request; one ``.item()`` recovers
-    the total page count (this runs eagerly, outside CUDA-graph capture).
-    """
-    P = page_size
-    n_pages = (seq_lens.to(torch.int64) + (P - 1)) // P  # [batch]
-    offsets = (
-        torch.cumsum(n_pages, 0) - n_pages
-    )  # [batch] exclusive page offset per request
+    """Pack the batch-local physical page table into MSA ``kv_indices``."""
+    n_pages = (seq_lens.to(torch.int64) + page_size - 1) // page_size
+    offsets = torch.cumsum(n_pages, 0) - n_pages
     total = int(n_pages.sum().item())
-    idx = torch.arange(
-        total, device=req_to_token.device
-    )  # packed page slot -> (req, page)
-    req = torch.searchsorted(
-        offsets + n_pages, idx, right=True
-    )  # request id per packed slot
-    logical_first = (idx - offsets[req]) * P  # first logical position of that page
-    rows = slot_ids[req].to(torch.int64)
-    return (req_to_token[rows, logical_first] // P).to(torch.int32)
+    idx = torch.arange(total, device=page_table.device)
+    req = torch.searchsorted(offsets + n_pages, idx, right=True)
+    logical_page = idx - offsets[req]
+    return page_table[req, logical_page].to(torch.int32)
+
+
+def _prefill_kv_indices(
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_size: int,
+    meta_cache: Optional[dict],
+) -> torch.Tensor:
+    if meta_cache is not None and "kv_indices" in meta_cache:
+        return meta_cache["kv_indices"]
+    kv_indices = _pack_page_table(page_table, seq_lens, page_size)
+    if meta_cache is not None:
+        meta_cache["kv_indices"] = kv_indices
+    return kv_indices
+
+
+def msa_sparse_prefill_index_score(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    block_size_k: int,
+    sm_scale: Optional[float] = None,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    meta_cache: Optional[dict] = None,
+) -> torch.Tensor:
+    """Return MSA block-max scores as a zero-copy ``[H, Q, blocks]`` view."""
+    fmha_sm100, _ = _load_fmha_sm100()
+    _check_msa_dtypes(q, k_cache, k_cache)
+    max_slots, num_kv_heads, head_dim = k_cache.shape
+    num_q_heads = q.shape[1]
+    if max_slots % block_size_k != 0:
+        raise ValueError(
+            f"max_slots={max_slots} not divisible by page_size={block_size_k}"
+        )
+
+    n_phys_pages = max_slots // block_size_k
+    k_paged = k_cache.view(n_phys_pages, block_size_k, num_kv_heads, head_dim).permute(
+        0, 2, 1, 3
+    )
+    kv_indices = _prefill_kv_indices(page_table, seq_lens, block_size_k, meta_cache)
+    plan = meta_cache.get("index_plan") if meta_cache is not None else None
+    if plan is None:
+        plan = _run_fmha_sm100_plan(
+            (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32),
+            seq_lens.to(torch.int32),
+            num_q_heads,
+            num_kv_heads=num_kv_heads,
+            page_size=block_size_k,
+            causal=True,
+            qo_offset=prefix_lens.to(torch.int32),
+            output_maxscore=True,
+            use_fp8_kvcache=q.dtype == torch.float8_e4m3fn,
+        )
+        if meta_cache is not None:
+            meta_cache["index_plan"] = plan
+    max_score = meta_cache.get("index_score") if meta_cache is not None else None
+    _, max_score = fmha_sm100(
+        q,
+        k_paged,
+        k_paged,
+        plan,
+        kv_indices=kv_indices,
+        max_score=max_score,
+        output_o=False,
+        output_maxscore=True,
+        sm_scale=head_dim**-0.5 if sm_scale is None else sm_scale,
+        q_scale=unit_scale(q_scale),
+        k_scale=unit_scale(k_scale),
+    )
+    if meta_cache is not None:
+        meta_cache["index_score"] = max_score
+    return max_score.permute(0, 2, 1)
 
 
 def msa_sparse_prefill_main(
@@ -123,8 +180,7 @@ def msa_sparse_prefill_main(
     k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (slot-major NHD)
     v_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim]
     topk_idx: torch.Tensor,  # [num_kv_heads, total_q, topk] (0-based, -1 pad) -- step1/2 output
-    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
-    slot_ids: torch.Tensor,  # [batch]
+    page_table: torch.Tensor,  # [batch, max_pages] physical page ids
     cu_seqlens: torch.Tensor,  # [batch+1] cumulative Q lengths
     seq_lens: torch.Tensor,  # [batch] total K length (prefix + chunk)
     prefix_lens: torch.Tensor,  # [batch]
@@ -133,6 +189,7 @@ def msa_sparse_prefill_main(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    meta_cache: Optional[dict] = None,
 ) -> torch.Tensor:
     """Drop-in for flash_prefill_with_gqa_share_sparse using MSA fmha_sm100.
 
@@ -163,24 +220,30 @@ def msa_sparse_prefill_main(
     k_paged = k_cache.view(n_phys_pages, P, num_kv_heads, head_dim).permute(0, 2, 1, 3)
     v_paged = v_cache.view(n_phys_pages, P, num_kv_heads, head_dim).permute(0, 2, 1, 3)
 
-    # Per-request Q lengths (extend) and physical page table.
-    qo_segment_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
-    kv_indices = _build_page_table(req_to_token, slot_ids, seq_lens, P)
+    cached_meta = meta_cache.get("prefill") if meta_cache is not None else None
+    if cached_meta is not None:
+        kv_indices, plan = cached_meta
+    else:
+        # Per-request Q lengths and physical page table are layer-invariant.
+        # Build them on the first sparse layer and reuse them for this forward.
+        qo_segment_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
+        kv_indices = _prefill_kv_indices(page_table, seq_lens, P, meta_cache)
+        plan = _run_fmha_sm100_plan(
+            qo_segment_lens,
+            seq_lens.to(torch.int32),
+            num_q_heads,
+            num_kv_heads=num_kv_heads,
+            page_size=P,
+            kv_block_num=topk,
+            causal=True,
+            qo_offset=prefix_lens.to(torch.int32),
+            use_fp8_kvcache=is_fp8,
+        )
+        if meta_cache is not None:
+            meta_cache["prefill"] = (kv_indices, plan)
 
     # topk_idx [Hkv, total_q, topk] -> kv_block_indexes [total_q, Hkv, topk].
     kv_block_indexes = topk_idx.permute(1, 0, 2).contiguous().to(torch.int32)
-
-    plan = _run_fmha_sm100_plan(
-        qo_segment_lens,
-        seq_lens.to(torch.int32),
-        num_q_heads,
-        num_kv_heads=num_kv_heads,
-        page_size=P,
-        kv_block_num=topk,
-        causal=True,
-        qo_offset=prefix_lens.to(torch.int32),
-        use_fp8_kvcache=is_fp8,
-    )
     o, _ = fmha_sm100(
         q,
         k_paged,
@@ -199,8 +262,7 @@ def msa_sparse_prefill_main(
 
 def build_msa_decode_meta(
     k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim]
-    req_to_token: torch.Tensor,
-    slot_ids: torch.Tensor,  # [batch]
+    page_table: torch.Tensor,  # [batch, max_pages] physical page ids
     seq_lens: torch.Tensor,  # [batch] cached KV length per request
     num_q_heads: int,
     block_size_k: int,
@@ -222,8 +284,8 @@ def build_msa_decode_meta(
     P = block_size_k
     if max_slots % P != 0:
         raise ValueError(f"max_slots={max_slots} not divisible by page_size={P}")
-    B = slot_ids.shape[0]
-    kv_indices = _build_page_table(req_to_token, slot_ids, seq_lens, P)
+    B = page_table.shape[0]
+    kv_indices = _pack_page_table(page_table, seq_lens, P)
     seq_lens_i32 = seq_lens.to(torch.int32)
     plan = _run_fmha_sm100_plan(
         torch.ones(B, dtype=torch.int32),
@@ -324,8 +386,7 @@ def build_msa_decode_cg_plan(
 def update_msa_decode_cg_meta(
     plan,
     kv_indices_buf: torch.Tensor,  # persistent page-table buffer [batch * max_pages]
-    req_to_token: torch.Tensor,
-    slot_ids: torch.Tensor,  # [batch]
+    page_table: torch.Tensor,  # [batch, max_pages] physical page ids
     seq_lens: torch.Tensor,  # [batch] cached KV length per request
     block_size_k: int,
     topk: int,
@@ -376,9 +437,8 @@ def update_msa_decode_cg_meta(
     ends = torch.cumsum(n_pages.to(torch.int64), 0)
     req = torch.searchsorted(ends, idx, right=True).clamp_max_(B - 1)
     starts = ends - n_pages
-    logical_first = ((idx - starts[req]) * P).clamp_(0, req_to_token.shape[1] - 1)
-    rows = slot_ids[req].to(torch.int64)
-    kv_indices_buf.copy_((req_to_token[rows, logical_first] // P).to(torch.int32))
+    logical_page = (idx - starts[req]).clamp_(0, page_table.shape[1] - 1)
+    kv_indices_buf.copy_(page_table[req, logical_page].to(torch.int32))
 
 
 def msa_sparse_decode_main(
@@ -386,8 +446,7 @@ def msa_sparse_decode_main(
     k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (slot-major NHD)
     v_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim]
     topk_idx: torch.Tensor,  # [num_kv_heads, batch, topk] (0-based, -1 pad)
-    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
-    slot_ids: torch.Tensor,  # [batch]
+    page_table: torch.Tensor,  # [batch, max_pages] physical page ids
     seq_lens: torch.Tensor,  # [batch] cached KV length per request
     block_size_k: int,  # == page_size == 128
     sm_scale: Optional[float] = None,
@@ -433,8 +492,7 @@ def msa_sparse_decode_main(
     if kv_indices is None or plan is None:
         kv_indices, plan = build_msa_decode_meta(
             k_cache,
-            req_to_token,
-            slot_ids,
+            page_table,
             seq_lens,
             H,
             P,
