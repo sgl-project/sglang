@@ -105,13 +105,14 @@ class JITAllReduceBackend:
         )
 
         device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-        # tuned workspace sizes, capped at the sweep maximum
-        self.comm = CustomAllReduceV2(_init_cpu_group(), device, max_size=MAX_BYTES)
+        # tuned workspace sizes, capped at the sweep maximum; uncap_pull keeps
+        # the whole sweep on the custom-AR path (the tuned crossovers would
+        # otherwise send the largest sizes back to NCCL)
+        self.comm = CustomAllReduceV2(
+            _init_cpu_group(), device, max_size=MAX_BYTES, uncap_pull=True
+        )
         if self.comm.disabled:
             raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
-        # keep the whole sweep on the custom-AR path: the tuned config would
-        # otherwise send the largest sizes back to NCCL
-        self.comm.uncap_pull_thresholds()
         register_comm_cleanup(self.comm)
 
     def graph_context(self):

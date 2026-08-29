@@ -26,6 +26,9 @@ class AllReduceAlgo(enum.Enum):
     def is_push(self) -> bool:
         return self == AllReduceAlgo.ONE_SHOT_PUSH
 
+    def is_pull(self) -> bool:
+        return self in (AllReduceAlgo.ONE_SHOT_PULL, AllReduceAlgo.TWO_SHOT_PULL)
+
     @property
     def algo_name(self) -> str:
         return _ALGO_NAMES[self]
@@ -87,14 +90,7 @@ class PushPlane(tvm_ffi.Object):
 
 @lazy_register_class("sgl.distributed.PullPlane", _init_communicator)
 class PullPlane(tvm_ffi.Object):
-    """Symmetric per-rank buffers plus the per-block semaphores guarding them.
-
-    Either half may be omitted; the plane then holds a 0-element tensor in its
-    place and any kernel needing that half fails with a clear message. The K3
-    fused collectives take semaphores only -- they reduce in place on the
-    caller's own symmetric input -- while the generic all-reduce takes both,
-    since it stages plain tensors through the buffers before reducing.
-    """
+    """Symmetric per-rank buffers plus the per-block semaphores guarding them."""
 
     # C++ interface
     if TYPE_CHECKING:

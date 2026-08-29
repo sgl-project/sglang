@@ -330,7 +330,7 @@ def gemm_ag_up_fits(num_tokens: int) -> bool:
         # The GEMV producer reads a single phase counter, so its grid is not
         # bound to the counter array; the spin consumer still needs one block
         # per counter slot plus the cleanup block.
-        and comm.config.num_push_blocks >= 2
+        and comm.num_push_blocks >= 2
     )
 
 

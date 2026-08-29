@@ -142,7 +142,7 @@ def _init_fused_comm() -> CustomAllReduceV2:
         device,
         max_pull_size=0,
         max_push_size=MAX_PUSH_SIZE,
-        max_push_blocks=props.multi_processor_count * max_occupancy,
+        num_push_blocks=props.multi_processor_count * max_occupancy,
     )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")

@@ -25,8 +25,9 @@ the kernel captured in the graph dereferences its row at replay time.
 """
 
 import logging
+import math
 from contextlib import contextmanager
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Any, Final, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -51,10 +52,7 @@ from sglang.srt.utils.cuda_vmm_utils import (
     is_vmm_pointer,
 )
 
-from .configs.custom_all_reduce_v2 import (
-    get_all_reduce_config,
-    get_supported_world_sizes,
-)
+from .config import Dispatch, get_supported_world_sizes, get_tuning
 from .custom_all_reduce_utils import (
     can_use_custom_all_reduce_with_nvlink,
     is_one_nvlink_clique,
@@ -63,21 +61,22 @@ from .custom_all_reduce_utils import (
 
 logger = logging.getLogger(__name__)
 
-MB = 1024 * 1024
+
+def _kb_to_b(size_kb: Optional[int]) -> Optional[int]:
+    return None if size_kb is None else int(size_kb) * 1024
+
+
+_DEFAULT_MAX_SIZE = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.get() * 1024
+_FORCED_PULL_SIZE = _kb_to_b(envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB.get())
+_FORCED_PUSH_SIZE = _kb_to_b(envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB.get())
 
 _ALIGN_BYTES = 1024
 _SEMAPHORE_BYTES = 128
 _MAX_GRAPH_INPUTS = 131072
-# resolved once at import time; explicit constructor sizes take precedence
-_DEFAULT_MAX_SIZE = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.get() * 1024
-# forced per-direction workspace sizes; highest priority, override both the
-# tuned config and explicit constructor sizes (None = not forced)
-_FORCE_PULL_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB.get()
-_FORCE_PUSH_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB.get()
 
 
-def _ceil_align(nbytes: int, align: int) -> int:
-    return (nbytes + align - 1) // align * align
+def _align_up(nbytes: int) -> int:
+    return (nbytes + _ALIGN_BYTES - 1) // _ALIGN_BYTES * _ALIGN_BYTES
 
 
 def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: ProcessGroup):
@@ -98,10 +97,83 @@ def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: Process
     return tensor, symm_mem
 
 
-class AllReduceConfig(NamedTuple):
-    algo: AllReduceAlgo
-    use_graph: bool = False
-    use_multicast: bool = False
+def _probe_multicast(group: ProcessGroup, device: torch.device) -> bool:
+    _, symm_mem = _allocate_symmetric_memory(_ALIGN_BYTES, device=device, group=group)
+    return int(symm_mem.multicast_ptr) != 0
+
+
+def _allocate_workspace(
+    *,
+    group: ProcessGroup,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    max_push_size: int,
+    max_pull_size: int,
+    num_push_blocks: int,
+    num_pull_blocks: int,
+    num_multicast_blocks: Optional[int],
+) -> tuple[Communicator, int, int, Any]:
+    """Slice one symmetric-memory allocation into every shared buffer.
+
+    Layout per rank: ``[2 * world_size push slots | pull buffer | pull
+    semaphores]``. One allocation rather than three keeps it to a single
+    rendezvous and a single multicast base to offset from. The push counter is
+    rank-local, so it lives in a plain CUDA tensor.
+
+    Collective: every rank must call it.
+    """
+    push_num_slots = 2 * world_size  # 2 phases x world_size peers
+    push_bytes = push_num_slots * max_push_size
+    pull_offset = push_bytes
+    pull_bytes = max_pull_size
+    sem_offset = push_bytes + pull_bytes
+    sem_bytes = _SEMAPHORE_BYTES * num_pull_blocks
+
+    total_bytes = push_bytes + pull_bytes + sem_bytes
+    symm_slab, symm_mem = _allocate_symmetric_memory(total_bytes, device, group)
+    slabs = [
+        symm_mem.get_buffer(i, [total_bytes], torch.uint8) for i in range(world_size)
+    ]
+    # The push slots (lamport pos-zero markers) and the semaphores must start
+    # zeroed; the pull buffer need not, but it rides along in the one-shot memset.
+    slabs[rank].zero_()
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+
+    def slice_all(shape: List[int], offset: int) -> List[torch.Tensor]:
+        """The same sub-range of every rank's slab, one view per rank."""
+        nbytes = math.prod(shape)
+        assert offset + nbytes <= total_bytes
+        return [slab[offset : offset + nbytes].view(shape) for slab in slabs]
+
+    def slice_mc_ptr(offset: int) -> Optional[int]:
+        return multicast_ptr + offset if multicast_ptr != 0 else None
+
+    multicast_ptr = int(symm_mem.multicast_ptr)
+    push_counter = torch.zeros((num_push_blocks,), dtype=torch.uint32, device=device)
+    push_plane = PushPlane(
+        rank,
+        world_size,
+        workspaces=slice_all([push_num_slots, max_push_size], 0),
+        counter=push_counter.view(-1, 1).view(torch.uint8),
+        mc_workspace=slice_mc_ptr(0),
+    )
+    # A push-only caller passes max_pull_size=0 and num_pull_blocks=0, which
+    # leaves both halves empty; the plane is then an inert placeholder.
+    pull_plane = PullPlane(
+        rank,
+        world_size,
+        workspaces=slice_all([pull_bytes], pull_offset),
+        semaphores=slice_all([num_pull_blocks, _SEMAPHORE_BYTES], sem_offset),
+        mc_workspace=slice_mc_ptr(pull_offset),
+        mc_semaphore=slice_mc_ptr(sem_offset),
+    )
+    comm = Communicator(push=push_plane, pull=pull_plane)
+    if num_multicast_blocks is not None:
+        comm.set_pull_multicast_blocks(min(num_multicast_blocks, num_pull_blocks))
+    dist.barrier(group=group)
+    return comm, total_bytes, push_counter.nbytes, (symm_slab, push_counter)
 
 
 class CustomAllReduceV2:
@@ -111,10 +183,11 @@ class CustomAllReduceV2:
         device: torch.device,
         max_size: int = _DEFAULT_MAX_SIZE,
         *,
-        max_pull_size: Optional[int] = None,
-        max_push_size: Optional[int] = None,
-        max_pull_blocks: Optional[int] = None,
-        max_push_blocks: Optional[int] = None,
+        max_pull_size: Optional[int] = _FORCED_PULL_SIZE,
+        max_push_size: Optional[int] = _FORCED_PUSH_SIZE,
+        num_pull_blocks: Optional[int] = None,
+        num_push_blocks: Optional[int] = None,
+        uncap_pull: bool = False,
     ) -> None:
         """
         :param max_size: direction-agnostic memory cap. Each workspace is
@@ -126,82 +199,85 @@ class CustomAllReduceV2:
                               push-only instance.
         :param max_push_size: explicit per-slot push workspace size;
                               overrides both the tuned size and ``max_size``.
-        :param max_pull_blocks: cap on the barrier plane's block count; ``0``
-                                builds a push-only instance.
+        :param num_push_blocks: explicit override the number of push blocks;
+        :param num_pull_blocks: explicit override the number of pull blocks;
+        :param uncap_pull: run ``2shot_pull`` up to the pull workspace
+                           capacity instead of stopping at the tuned NCCL
+                           crossover. The only way to lift that ceiling -- an
+                           explicit ``max_pull_size`` sizes the buffer without
+                           widening the bands. For sweeps that must keep every
+                           size on the custom-AR path.
 
         ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB`` /
-        ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB`` take the highest
-        priority and override all of the size parameters above.
+        ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB`` supply the default
+        for the two size parameters above
         """
         self.disabled = True
-        if not can_use_custom_all_reduce_v2(group=group, device=device):
+        if not can_use_custom_all_reduce_v2(group, device):
             return
 
         self.group = group
         self.device = device
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
-        base_config = get_all_reduce_config(self.world_size)
-        if max_pull_size is None:
-            max_pull_size = min(base_config.max_pull_bytes, max_size)
-        if max_push_size is None:
-            max_push_size = min(base_config.max_push_bytes, max_size)
-        if _FORCE_PULL_SIZE_KB is not None:
-            max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024
-        if _FORCE_PUSH_SIZE_KB is not None:
-            max_push_size = int(_FORCE_PUSH_SIZE_KB) * 1024
-
-        def force_thresholds(heuristic):
-            # forced sizes bypass the tuned NCCL-crossover heuristics: lift
-            # each direction's ceiling to the forced workspace capacity (the
-            # clip() below only ever lowers thresholds)
-            if _FORCE_PULL_SIZE_KB is not None:
-                heuristic = heuristic._replace(two_shot_pull_threshold=max_pull_size)
-            if _FORCE_PUSH_SIZE_KB is not None:
-                heuristic = heuristic._replace(one_shot_push_threshold=max_push_size)
-            return heuristic
-
-        base_config = base_config._replace(
-            graph=force_thresholds(base_config.graph),
-            eager=force_thresholds(base_config.eager),
+        self.has_multicast = _probe_multicast(group=self.group, device=self.device)
+        init_tuning = get_tuning(self.world_size, self.has_multicast)
+        max_push_size, max_pull_size = init_tuning.get_workspace_sizes(
+            max_size=max_size,
+            max_push_size=max_push_size,
+            max_pull_size=max_pull_size,
         )
-        # Zero on either pull knob opts out of the pull half entirely: no
-        # pull plane at all, and every pull algo disabled below by clipping
-        # its threshold to 0. Push-only callers (the fused qk-norm instances)
-        # take this path rather than allocating a placeholder buffer just to
-        # satisfy a constructor.
-        self.pull_enabled = max_pull_blocks != 0 and max_pull_size > 0
-        self.max_pull_size = (
-            _ceil_align(max(max_pull_size, _ALIGN_BYTES), _ALIGN_BYTES)
-            if self.pull_enabled
-            else 0
+        max_push_size = _align_up(max_push_size)
+        max_pull_size = _align_up(max_pull_size)
+        self._tuning: Final = init_tuning.recompile(
+            max_push_size=max_push_size,
+            max_pull_size=max_pull_size,
+            uncap_pull=uncap_pull,
         )
-        self.max_push_size = _ceil_align(max(max_push_size, _ALIGN_BYTES), _ALIGN_BYTES)
-        self.max_size = max(self.max_pull_size, self.max_push_size)
-        num_pull_blocks = base_config.num_pull_blocks
-        num_push_blocks = base_config.num_push_blocks
-        if max_pull_blocks:
-            num_pull_blocks = max(min(num_pull_blocks, max_pull_blocks), 1)
-        if max_push_blocks is not None:
-            num_push_blocks = max(max_push_blocks, 1)
-        self.config = base_config.clip(
-            max_push_bytes=self.max_push_size, max_pull_bytes=self.max_pull_size
-        )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
-        self.override_algo: Optional[AllReduceAlgo] = None
+        del init_tuning
+        self.max_push_size: Final = max_push_size
+        self.max_pull_size: Final = max_pull_size
+        self.max_size = max(max_push_size, max_pull_size)
+        if num_push_blocks is None:
+            num_push_blocks = self._tuning.num_push_blocks
+        if num_pull_blocks is None:
+            num_pull_blocks = self._tuning.num_pull_blocks
+        self.num_push_blocks: Final = num_push_blocks
+        self.num_pull_blocks: Final = num_pull_blocks
         # On a multi-node (MNNVL) group the symm-mem workspace plane works
         # across nodes, but graph zero-copy input registration (cudaIpc /
-        # node-local VMM remap) does not — force eager pull inside graphs.
+        # node-local VMM remap) does not -- force eager pull inside graphs.
         is_multinode = not all(in_the_same_node_as(group, source_rank=0))
         tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-        self._is_graph_mode_supported = not tms_cudagraph and not is_multinode
-        # device-side pointer table: one row of world_size pointers per
-        # graph-captured all-reduce input
-        self.graph_params = torch.zeros(
-            (_MAX_GRAPH_INPUTS, self.world_size),
+        self._is_graph_mode_supported: Final = not tms_cudagraph and not is_multinode
+        # device-side pointer table: one row of world_size pointers per captured input
+        graph_entries = _MAX_GRAPH_INPUTS if self._is_graph_mode_supported else 0
+        self._graph_params = torch.zeros(
+            (graph_entries, self.world_size),
             dtype=torch.uint64,
             device=self.device,
         )
-        self._init_workspace()
+        # NOTE: storage is just to keep alive counter & symm-mem
+        self.obj, total_bytes, local_bytes, self._storage = _allocate_workspace(
+            group=self.group,
+            device=self.device,
+            rank=self.rank,
+            world_size=self.world_size,
+            max_push_size=max_push_size,
+            max_pull_size=max_pull_size,
+            num_push_blocks=num_push_blocks,
+            num_pull_blocks=num_pull_blocks,
+            num_multicast_blocks=self._tuning.num_multicast_blocks,
+        )
+        if self.rank == 0:
+            MB = 1024 * 1024
+            logger.info(
+                "All Reduce config: symmetric_memory = %.2f MiB, "
+                "local_buffer = %.2f MiB, use_multicast = %s",
+                total_bytes / MB,
+                (self._graph_params.nbytes + local_bytes) / MB,
+                self._tuning.num_multicast_blocks is not None,
+            )
         self._ipc_manager = IPCManager()
         self._vmm_graph_input_manager = VmmGraphInputManager(
             obj=self,
@@ -212,183 +288,60 @@ class CustomAllReduceV2:
         self._graph_inputs: List[Tuple[int, int]] = []  # (data_ptr, nbytes)
         self._graph_counter = 0
         self._graph_mode_allowed = False
+        self._override_algo = None
         self.disabled = False
 
-    def _init_workspace(self) -> None:
-        """Slice one symmetric-memory allocation into every shared buffer.
-
-        Layout per rank: ``[2 * world_size push slots | pull buffer | pull
-        semaphores]``. One allocation rather than three keeps it to a single
-        rendezvous and a single multicast base to offset from. The push
-        counter is rank-local, so it lives in a plain CUDA tensor.
-        """
-        cfg = self.config
-        push_num_slots = 2 * self.world_size  # 2 phases x world_size peers
-        push_bytes = push_num_slots * self.max_push_size
-        pull_bytes = self.max_pull_size  # 0 when the pull half is disabled
-        sem_bytes = _SEMAPHORE_BYTES * cfg.num_pull_blocks if self.pull_enabled else 0
-        total_bytes = push_bytes + pull_bytes + sem_bytes
-        pull_offset = push_bytes
-        sem_offset = push_bytes + pull_bytes
-
-        self._symm_tensor, symm_mem = _allocate_symmetric_memory(
-            total_bytes, device=self.device, group=self.group
-        )
-        slabs = [
-            symm_mem.get_buffer(i, [total_bytes], torch.uint8)
-            for i in range(self.world_size)
-        ]
-        # The push slots (lamport pos-zero markers) and the semaphores must
-        # start zeroed; the pull buffer need not, but it rides along in the
-        # one-shot memset.
-        slabs[self.rank].zero_()
-        torch.cuda.synchronize()
-        dist.barrier(group=self.group)
-
-        def slice_all(shape: List[int], offset: int) -> List[torch.Tensor]:
-            """The same sub-range of every rank's slab, one view per rank."""
-            nbytes = 1
-            for dim in shape:
-                nbytes *= dim
-            assert offset + nbytes <= total_bytes
-            return [slab[offset : offset + nbytes].view(shape) for slab in slabs]
-
-        multicast_ptr = int(symm_mem.multicast_ptr)
-        self.has_multicast = multicast_ptr != 0
-
-        def mc_at(offset: int) -> Optional[int]:
-            return multicast_ptr + offset if self.has_multicast else None
-
-        self._push_counter = torch.zeros(
-            (cfg.num_push_blocks,), dtype=torch.uint32, device=self.device
-        )
-        push_plane = PushPlane(
-            self.rank,
-            self.world_size,
-            workspaces=slice_all([push_num_slots, self.max_push_size], 0),
-            counter=self._push_counter.view(-1, 1).view(torch.uint8),
-            mc_workspace=mc_at(0),
-        )
-        pull_plane = None
-        if self.pull_enabled:
-            pull_plane = PullPlane(
-                self.rank,
-                self.world_size,
-                workspaces=slice_all([pull_bytes], pull_offset),
-                semaphores=slice_all(
-                    [cfg.num_pull_blocks, _SEMAPHORE_BYTES], sem_offset
-                ),
-                mc_workspace=mc_at(pull_offset),
-                mc_semaphore=mc_at(sem_offset),
-            )
-        if not self.has_multicast or not self.pull_enabled:
-            self.config = self.config._replace(num_mc_blocks=None)
-
-        self.obj = Communicator(push=push_plane, pull=pull_plane)
-        if self.config.num_mc_blocks is not None:
-            self.obj.set_pull_multicast_blocks(self.config.num_mc_blocks)
-        if self.rank == 0:
-            logger.info(
-                "All Reduce config: symmetric_memory = %.2f MB, "
-                "local_buffer = %.2f MB, multicast = %s, pull = %s",
-                total_bytes / MB,
-                (self.graph_params.nbytes + self._push_counter.nbytes) / MB,
-                self.config.num_mc_blocks is not None,
-                self.pull_enabled,
-            )
-        dist.barrier(group=self.group)
-
-    # ------------------------------------------------------------------
-    # Algo selection
-    # ------------------------------------------------------------------
-
-    def uncap_pull_thresholds(self) -> None:
-        """Raise the 2-shot ceiling to the workspace capacity.
-
-        The tuned config caps ``2shot_pull`` at the size where NCCL takes
-        over; benchmarks and tests that must keep every sweep size on the
-        custom-AR path can lift that cap up to ``max_pull_size``.
-        """
-
-        if not self.pull_enabled:
-            return
-
-        def uncap(heuristic):
-            return heuristic._replace(two_shot_pull_threshold=self.max_pull_size)
-
-        self.config = self.config._replace(
-            graph=uncap(self.config.graph),
-            eager=uncap(self.config.eager),
-        )
-
-    def _can_use_graph(self) -> bool:
-        # `_graph_mode_allowed` is only set inside `capture()`, so the eager
-        # hot path never reaches the cudart capture query. During capture,
-        # warm-up runs execute immediately and must not consume a
-        # graph_params row (it would be dereferenced before registration).
-        return (
-            self._graph_mode_allowed
+    def _select_dispatch(self, nbytes: int) -> Optional[Dispatch]:
+        use_graph = (
+            self._graph_mode_allowed  # only set when in graph + supported
             and not is_in_tc_piecewise_cuda_graph()
             and torch.cuda.is_current_stream_capturing()
         )
+        if self._override_algo is not None:
+            algo, use_multicast = self._override_algo
+            return Dispatch(
+                algo=algo,
+                use_graph=use_graph and not use_multicast and algo.is_pull(),
+                use_multicast=use_multicast,
+            )
+        return self._tuning.select(nbytes, in_graph=use_graph)
 
-    def _pick_config(self, nbytes: int, can_use_graph: bool) -> AllReduceConfig | None:
-        # TODO: refactor this along with the config file
-        heuristic = self.config.graph if can_use_graph else self.config.eager
-        can_use_multicast = self.config.num_mc_blocks is not None
-        if nbytes <= heuristic.one_shot_push_threshold:
-            return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
-        if nbytes <= heuristic.one_shot_pull_threshold:
-            return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PULL, use_graph=can_use_graph)
-        if can_use_multicast and heuristic.mc.contains(nbytes):
-            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PULL, use_multicast=True)
-        if nbytes <= heuristic.two_shot_pull_threshold:
-            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PULL, use_graph=can_use_graph)
-        return None
+    def force_algo(self, algo: AllReduceAlgo, use_multicast: bool = False) -> None:
+        self._override_algo = (algo, use_multicast)
 
-    def should_custom_ar(self, inp: torch.Tensor) -> bool:
+    def should_custom_ar(self, input: torch.Tensor) -> bool:
         """Check if the input tensor is suitable for custom all-reduce."""
         if self.disabled:
             return False
-        inp_size = inp.numel() * inp.element_size()
-        # custom allreduce requires input byte size to be multiples of 16
-        if inp_size % 16 != 0:
+        nbytes = input.nbytes
+        if nbytes % 16 != 0 or not is_weak_contiguous(input):
             return False
-        if not is_weak_contiguous(inp):
-            return False
-        if self.override_algo is not None:
-            return inp_size <= self.max_size
-        return self._pick_config(inp_size, self._can_use_graph()) is not None
+        return self._select_dispatch(nbytes) is not None
 
     # ------------------------------------------------------------------
     # All-reduce
     # ------------------------------------------------------------------
 
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor:
-        nbytes = input.numel() * input.element_size()
-        if self.override_algo is not None:
-            # TODO: enhance this override pattern
-            algo = self.override_algo
-            use_graph = self._can_use_graph() and not algo.is_push()
-            use_multicast = False
-        else:
-            config = self._pick_config(nbytes, self._can_use_graph())
-            assert config is not None, f"No config for {nbytes = }"
-            algo, use_graph, use_multicast = config
-        graph_params = self._allocate_graph_row(input, nbytes) if use_graph else None
+        nbytes = input.nbytes
+        dispatch = self._select_dispatch(nbytes)
+        assert dispatch is not None, f"No dispatch band for {nbytes = }"
+        graph_params = (
+            self._allocate_graph_row(input, nbytes) if dispatch.use_graph else None
+        )
         return custom_all_reduce(
             self.obj,
             input,
-            algo=algo,
+            algo=dispatch.algo,
             graph_params=graph_params,
-            use_multicast=use_multicast,
+            use_multicast=dispatch.use_multicast,
         )
 
     def _allocate_graph_row(self, input: torch.Tensor, nbytes: int) -> torch.Tensor:
         index = self._graph_counter + len(self._graph_inputs)
         assert index < _MAX_GRAPH_INPUTS, "Graph input table overflow"
         self._graph_inputs.append((input.data_ptr(), nbytes))
-        return self.graph_params[index]
+        return self._graph_params[index]
 
     # ------------------------------------------------------------------
     # CUDA-graph input registration
@@ -450,8 +403,8 @@ class CustomAllReduceV2:
         """Write per-input peer pointers into the device-side pointer table."""
         assert len(peer_ptrs) == len(self._graph_inputs)
         count = len(peer_ptrs)
-        rows = torch.tensor(peer_ptrs, dtype=torch.uint64, device=self.device)
-        self.graph_params[self._graph_counter : self._graph_counter + count].copy_(rows)
+        row = torch.tensor(peer_ptrs, dtype=torch.uint64, device=self.device)
+        self._graph_params[self._graph_counter : self._graph_counter + count].copy_(row)
         # the rows must be visible before any (PDL-chained) graph replay
         torch.cuda.synchronize()
         self._graph_counter += count
@@ -466,6 +419,7 @@ class CustomAllReduceV2:
             self._ipc_manager.destroy()
             dist.barrier(group=self.group)
             del self.obj  # drop the pointer holder before the workspace tensors
+            del self._storage, self._graph_params
         if hasattr(self, "_vmm_graph_input_manager"):
             self._vmm_graph_input_manager.close()
 
@@ -479,10 +433,7 @@ def _is_vmm_backed_allocator(device: torch.device) -> bool:
     return is_vmm_pointer(probe.data_ptr())
 
 
-def can_use_custom_all_reduce_v2(
-    group: ProcessGroup,
-    device: torch.device,
-) -> bool:
+def can_use_custom_all_reduce_v2(group: ProcessGroup, device: torch.device) -> bool:
     supported = get_supported_world_sizes()
     if dist.get_world_size(group=group) not in supported:
         return False
