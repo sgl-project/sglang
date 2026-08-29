@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from unittest.mock import patch
 
 import torch
 
@@ -74,6 +75,23 @@ class TestMamba(unittest.TestCase):
         self.assertIn(
             "layer_id=1 not in full attention layers:", str(context.exception)
         )
+
+    def test_hybrid_linear_kv_pool_layer_ids_match_buffer_groups(self):
+        pool = object.__new__(HybridLinearKVPool)
+        pool.full_attention_layer_id_mapping = {3: 0, 7: 1}
+
+        # Existing non-NPU layouts remain unchanged.
+        with patch("sglang.srt.mem_cache.memory_pool._is_npu", False):
+            pool.use_mla = True
+            self.assertEqual(pool.get_kv_layer_ids(), [3, 7])
+
+            pool.use_mla = False
+            self.assertEqual(pool.get_kv_layer_ids(), [3, 7, 3, 7])
+
+        # NPU MLA exposes separate latent KV and RoPE key buffers per layer.
+        with patch("sglang.srt.mem_cache.memory_pool._is_npu", True):
+            pool.use_mla = True
+            self.assertEqual(pool.get_kv_layer_ids(), [3, 7, 3, 7])
 
     def test_mamba_pool(self):
         max_num_reqs = 10
