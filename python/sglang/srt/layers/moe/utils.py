@@ -704,14 +704,17 @@ def speculative_moe_a2a_backend_context():
     moe = get_flags().moe
     original_backend = moe.a2a_backend
     original_disable_fp4_allgather = moe.disable_fp4_allgather
+    original_speculative_context = moe.speculative_context
     try:
         moe.a2a_backend = get_speculative_moe_a2a_backend()
         # Disable FP4 allgather for spec decode since MTP layers are unquantized
         moe.disable_fp4_allgather = True
+        moe.speculative_context = True
         yield
     finally:
         moe.a2a_backend = original_backend
         moe.disable_fp4_allgather = original_disable_fp4_allgather
+        moe.speculative_context = original_speculative_context
 
 
 # The type of method in top-K routing, for use in torch custom op
