@@ -50,6 +50,9 @@ def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int:
     req.mamba_branching_seqlen = None
 
     batch = ScheduleBatch(reqs=[req])
+    batch.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(mamba_chunk_size=CHUNK)
+    )
     batch.tree_cache = SimpleNamespace(page_size=tree_page)
     batch.req_to_token_pool = MagicMock()
     batch.req_to_token_pool.get_mamba_ping_pong_other_idx.return_value = 1

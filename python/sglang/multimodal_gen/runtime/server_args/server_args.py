@@ -414,6 +414,7 @@ class ServerArgs(DisaggServerArgsMixin):
     warmup_mode: str | None = None
 
     warmup_resolutions: list[str] = None
+    warmup_num_frames: int | None = None
     warmup_steps: int = 1
 
     disable_autocast: bool | None = None
@@ -755,9 +756,10 @@ class ServerArgs(DisaggServerArgsMixin):
         # propose the fold group from the parallelism alone; the loader keeps it
         # only for encoders worth folding at their real post-load size
         # (finalize_encoder_folding)
-        encoder_configs = list(self.pipeline_config.text_encoder_configs) + list(
-            getattr(self.pipeline_config, "image_encoder_configs", ()) or ()
-        )
+        encoder_configs = [
+            *self.pipeline_config.text_encoder_configs,
+            self.pipeline_config.image_encoder_config,
+        ]
         for encoder_config in encoder_configs:
             encoder_config.parallel_folding_mode = mode
 
@@ -953,6 +955,23 @@ class ServerArgs(DisaggServerArgsMixin):
                         text_backend,
                     )
                 self.component_attention_backends["text_encoder"] = "torch_sdpa"
+        from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+            MiniMaxH3PipelineConfig,
+        )
+
+        if (
+            self.backend != Backend.DIFFUSERS
+            and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
+            and self.attention_backend == "laser_attn"
+            and "text_encoder" not in self.component_attention_backends
+        ):
+            # Laser Attention is used only by the MiniMax-H3 transformer.
+            # SDPA is faster than Ascend FA for its Qwen3-VL text encoder.
+            logger.info(
+                "Automatically set torch_sdpa backend for the MiniMax H3 text "
+                "encoder; laser_attn applies to the transformer"
+            )
+            self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
         if self.ring_degree > 1:
             if (
@@ -1145,6 +1164,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"Invalid --warmup-mode {self.warmup_mode!r}; "
                 f"expected one of {WARMUP_MODES}."
             )
+        if self.warmup_num_frames is not None and self.warmup_num_frames <= 0:
+            raise ValueError("--warmup-num-frames must be a positive integer.")
 
         if self.enable_torch_compile and self.warmup_mode is None:
             self.warmup_mode = "server"
@@ -1154,9 +1175,11 @@ class ServerArgs(DisaggServerArgsMixin):
                 "to disable this behavior."
             )
 
-        # Explicit resolutions need a request path unless an existing server
+        # Explicit warmup shapes need a request path unless an existing server
         # default already supplies the synthetic startup request.
-        if self.warmup_resolutions is not None and self.warmup_mode in (None, "off"):
+        if (
+            self.warmup_resolutions is not None or self.warmup_num_frames is not None
+        ) and self.warmup_mode in (None, "off"):
             self.warmup_mode = "request"
 
         # BCG captures every graph during a synthetic warmup forward at startup
@@ -1518,11 +1541,11 @@ class ServerArgs(DisaggServerArgsMixin):
     def require_component_resident(
         self, component_name: str, *, feature_name: str
     ) -> None:
-        configured_mode = self.canonical_residency_mode(component_name)
+        configured_mode = self.explicit_residency_mode(component_name)
         if configured_mode is not None and configured_mode != RESIDENT:
             raise ValueError(
                 f"{feature_name} requires {component_name!r} to be resident; "
-                f"got {configured_mode!r} from --component-residency"
+                f"got {configured_mode!r} from an explicit residency option"
             )
         self._required_resident_components.add(component_name)
 
@@ -2216,6 +2239,16 @@ class ServerArgs(DisaggServerArgsMixin):
             nargs="+",
             default=ServerArgs.warmup_resolutions,
             help="Specify explicit warmup resolutions. e.g., `--warmup-resolutions 256x256 720x720`",
+        )
+        parser.add_argument(
+            "--warmup-num-frames",
+            type=int,
+            default=ServerArgs.warmup_num_frames,
+            help=(
+                "Override the synthetic video warmup frame count. Use this with "
+                "breakable CUDA graphs when serving a non-default frame count so "
+                "the captured latent shape matches the request."
+            ),
         )
         parser.add_argument(
             "--warmup-steps",
