@@ -164,7 +164,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             pp_proxy_tensors = (
                 _allocate_pp_proxy_tensors(
                     max_num_tokens=max_num_token,
-                    max_hidden_tokens=max_bs,
+                    max_hidden_tokens=max_num_token,
                     hidden_size=hidden_size,
                     dtype=dtype,
                     hc_hidden_size=hc_hidden_size,
@@ -378,8 +378,8 @@ class PrefillInputBuffers(ForwardInputBuffers):
         hidden_size: int,
         dtype: torch.dtype,
         enable_mamba_track: bool,
-        pp_size: int,
-        is_first_pp_rank: bool,
+        pp_size: int = 1,
+        is_first_pp_rank: bool = False,
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,

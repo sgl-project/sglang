@@ -80,15 +80,6 @@ ENV PATH=/usr/local/cuda/bin:${PATH} \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
-# nvidia-cutlass-dsl 4.6.2 has no sm_107 in its Arch enum, so on Rubin every
-# CuTe DSL kernel dies with `KeyError: 'sm_107a'` at JIT compile. sm_100f is the
-# family target covering all sm_10x; sm_100a would be arch-specific. Both DSL
-# singletons need setting -- CUTE_DSL_ARCH for CuTeDSL and
-# CUTE_EXPERIMENTAL_DSL_ARCH for CuteExperimentalDSL (the default bf16 GEMM) --
-# since either alone leaves the other half failing.
-# Drop both once a cutlass-dsl release knows sm_107 natively.
-ENV CUTE_DSL_ARCH=sm_100f \
-    CUTE_EXPERIMENTAL_DSL_ARCH=sm_100f
 
 ########################################################
 # Base stage
@@ -107,15 +98,17 @@ ARG NCCL_VERSION=2.30.7
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
-ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.17
+ARG INSTALL_FLASHINFER_JIT_CACHE=1
+ARG FLASHINFER_VERSION=0.6.18rc10
+ARG CUTLASS_DSL_VERSION=4.8.0.dev0
 ARG MOONCAKE_VERSION=0.3.12.post1
 ARG MSCCLPP_VERSION=sglang-v0.9.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    FLASHINFER_VERSION=${FLASHINFER_VERSION}
+    FLASHINFER_VERSION=${FLASHINFER_VERSION} \
+    CUTLASS_DSL_VERSION=${CUTLASS_DSL_VERSION}
 
 # Add GKE default lib and bin locations
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
@@ -567,6 +560,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
        fi \
     && if [ "$CUDA_VERSION" = "13.4.0" ]; then \
+           sed -i "s|^  \"flashinfer_python\[cu13\]==.*|  \"flashinfer_python[cu13]==${FLASHINFER_VERSION}\",|" pyproject.toml; \
+       fi \
+    && if [ "$CUDA_VERSION" = "13.4.0" ]; then \
            TORCH_INDEX="${TORCH_NIGHTLY_INDEX}"; \
            python3 -m pip install --index-url "${TORCH_NIGHTLY_INDEX}" \
                "torch==${TORCH_NIGHTLY_VERSION}" \
@@ -576,7 +572,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i "s|^  \"torchaudio==.*|  \"torchaudio==${TORCHAUDIO_NIGHTLY_VERSION}\",|" pyproject.toml && \
            sed -i "s|^  \"torchvision\",\$|  \"torchvision==${TORCHVISION_NIGHTLY_VERSION}\",|" pyproject.toml && \
            sed -i 's|"torchcodec==[0-9.]*|"torchcodec|' pyproject.toml && \
-           # Locally built sgl-* wheels already installed above, drop here. \
            sed -i 's|^  "sglang-kernel==.*|  "sglang-kernel",|' pyproject.toml && \
            sed -i 's|^  "sgl-deep-ep==.*|  "sgl-deep-ep",|' pyproject.toml && \
            sed -i 's|^  "sgl-deep-gemm==.*|  "sgl-deep-gemm",|' pyproject.toml; \
@@ -594,6 +589,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
                torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 --force-reinstall; \
            python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
+       fi \
+    && if [ "$CUDA_VERSION" = "13.4.0" ]; then \
+           python3 -m pip install --force-reinstall --no-deps /tmp/cu134_wheels/*.whl; \
        fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
@@ -965,6 +963,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' python/pyproject.toml && \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' python/pyproject.toml; \
        fi \
+    && if [ "$CUDA_VERSION" = "13.4.0" ]; then \
+           sed -i "s|^  \"flashinfer_python\[cu13\]==.*|  \"flashinfer_python[cu13]==${FLASHINFER_VERSION}\",|" python/pyproject.toml; \
+       fi \
     && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
     && kernels lock python \
     && ( success=0; \
@@ -1000,6 +1001,19 @@ COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl \
     && rm -rf /tmp/gateway_wheels
+
+# quack-kernels hard-pins nvidia-cutlass-dsl==4.6.2, override.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$CUDA_VERSION" = "13.4.0" ]; then \
+        python3 -m pip uninstall -y \
+            nvidia-cutlass-dsl \
+            nvidia-cutlass-dsl-libs-base \
+            nvidia-cutlass-dsl-libs-core \
+            nvidia-cutlass-dsl-libs-cu12 \
+            nvidia-cutlass-dsl-libs-cu13 \
+        && python3 -m pip install "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" \
+        && python3 -c "from cutlass.base_dsl.enums import Arch; assert Arch['sm_107a']"; \
+    fi
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang

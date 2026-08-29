@@ -38,6 +38,7 @@ Backend selection comes from cuda_graph_config.prefill:
 from __future__ import annotations
 
 import copy
+import dataclasses
 import inspect
 import logging
 from collections.abc import Sequence
@@ -725,11 +726,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         set_is_extend_in_batch(False)
 
         with self._prefill_forward_context(forward_batch):
+            pp_proxy_tensors = self._capture_pp_proxy_tensors(num_tokens)
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
                 input_ids = forward_batch.input_ids
-                pp_proxy_tensors = self._capture_pp_proxy_tensors(num_tokens)
                 kwargs = _build_layer_model_forward_kwargs(
                     self.layer_model, forward_batch, pp_proxy_tensors
                 )
@@ -746,10 +747,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     **kwargs,
                 )
             # tc_piecewise: compile/capture the outer model.forward path.
+            pp_kwargs = self.model_runner._pp_kwargs(pp_proxy_tensors)
             return self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
+                **pp_kwargs,
             )
 
     def _run_dummy_forward(self, num_tokens: int) -> None:
@@ -1591,6 +1594,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             else forward_batch.global_forward_mode
         )
 
+        # The draft tail concatenates hidden states with padded input embeddings;
+        # expose the bucket-sized static view and refresh its live prefix below.
+        padded_spec_info = forward_batch.spec_info
+        if (
+            self.static_draft_hidden_states is not None
+            and padded_spec_info is not None
+            and getattr(padded_spec_info, "hidden_states", None) is not None
+        ):
+            padded_spec_info = dataclasses.replace(
+                padded_spec_info,
+                hidden_states=self.static_draft_hidden_states[:static_num_tokens],
+            )
+
         static_forward_batch = ForwardBatch(
             forward_mode=pcg_forward_mode,
             batch_size=bs,
@@ -1634,7 +1650,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             mrope_positions=mrope_positions,
             spec_algorithm=forward_batch.spec_algorithm,
-            spec_info=forward_batch.spec_info,
+            spec_info=padded_spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             num_token_non_padded=num_token_non_padded,
             num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
@@ -1642,6 +1658,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
+            # Multimodal preparation consumes mm_inputs but retains embeddings for
+            # later MTP draft extend, so copy that side channel into the replay view.
+            mm_input_embeds=forward_batch.mm_input_embeds,
             temperature=forward_batch.temperature,
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
