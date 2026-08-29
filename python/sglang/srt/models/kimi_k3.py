@@ -149,6 +149,13 @@ def _uses_modelopt_fp8_pb_wo(
     return resolver is not None and resolver(prefix) == "FP8_PB_WO"
 
 
+def _uses_split_gguf_kv_b(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Whether a K3 checkpoint stores MLA K/V as separate GGUF tensors."""
+    return bool(getattr(quant_config, "supports_kimi_k3_split_gguf_kv_b", False))
+
+
 def _maybe_map_fp8_pb_scale_name(name: str, params_dict: dict) -> str:
     """Map ModelOpt FP8_PB_WO scale keys to SGLang block-FP8 params."""
     if name.endswith(".weight_scale"):
@@ -296,7 +303,7 @@ class KimiK3MLP(nn.Module):
         # but allow the NPU launcher to retain the proven attention-TP layout
         # without a device-type branch in shared model code.
         self._dense_attn_tp = (
-            get_parallel().config.enable_dense_mlp_attn_tp
+            get_parallel().enable_dense_mlp_attn_tp
             and is_dp_attention_enabled()
             and tp_rank is None
             and tp_size is None
@@ -524,15 +531,17 @@ class KimiK3MoE(nn.Module):
                 "got a checkpoint with different constants"
             )
 
-        # EP a2a backends (megamoe / DeepEP / MoRI) move each row to its
-        # experts directly, so the MoE region can consume whatever rows this
-        # rank holds — an SP-MoE token shard (attn_tp > 1) or the DP-local
-        # batch (DP attention) — with every global token dispatched exactly
-        # once. No DP gather and no TP reduce is needed anywhere in the region.
+        # EP a2a backends (megamoe / DeepEP / Mooncake / Ascend-FuseEP / MoRI)
+        # move each row to its experts directly, so the MoE region can consume
+        # whatever rows this rank holds — an SP-MoE token shard (attn_tp > 1) or
+        # the DP-local batch (DP attention) — with every global token dispatched
+        # exactly once. No DP gather and no TP reduce is needed anywhere in the
+        # region.
         _a2a_backend = get_moe_a2a_backend()
         self._ep_a2a = (
             _a2a_backend.is_megamoe()
             or _a2a_backend.is_deepep()
+            or _a2a_backend.is_mooncake()
             or _a2a_backend.is_ascend_fuseep()
             or _a2a_backend.is_mori()
         )
@@ -554,13 +563,13 @@ class KimiK3MoE(nn.Module):
         # a TP-sharded partial sum could never be reduced across ranks that
         # hold different tokens.
         self._shared_experts_tp1 = (
-            self._ep_a2a and not get_parallel().config.enable_shared_experts_attn_tp
+            self._ep_a2a and not get_parallel().enable_shared_experts_attn_tp
         )
         # NPU compatibility mode keeps DeepEP's DP-local token dispatch but
         # uses the original TP-sharded shared MLP. Gather only that branch's
         # inputs, then reduce-scatter its output back to the DP-local rows.
         self._shared_experts_attn_tp_comm = (
-            get_parallel().config.enable_shared_experts_attn_tp
+            get_parallel().enable_shared_experts_attn_tp
             and self._ep_a2a
             and self._dp_attention
             and get_parallel().attn_tp_size > 1
@@ -771,7 +780,10 @@ class KimiK3MoE(nn.Module):
         from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
         from sglang.srt.distributed.parallel_state import get_moe_ep_group
         from sglang.srt.environ import envs
-        from sglang.srt.layers.moe.mega_moe import _get_mega_moe_symm_buffer
+        from sglang.srt.layers.moe.mega_moe import (
+            _configure_mega_moe_deep_gemm_num_sms,
+            _get_mega_moe_symm_buffer,
+        )
 
         # In SP-MoE mode (KimiK3DecoderLayer reduce-scatters the o_proj
         # output) the incoming rows are already this rank's token shard, so
@@ -824,15 +836,16 @@ class KimiK3MoE(nn.Module):
             dtype=torch.bfloat16,
             device=routed_input.device,
         )
-        deep_gemm.fp8_fp4_mega_moe(
-            y,
-            self.experts.mega_l1_weights,
-            self.experts.mega_l2_weights,
-            buf,
-            recipe=(1, 1, 32),
-            activation="situ",
-            fast_math=True,
-        )
+        with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+            deep_gemm.fp8_fp4_mega_moe(
+                y,
+                self.experts.mega_l1_weights,
+                self.experts.mega_l2_weights,
+                buf,
+                recipe=(1, 1, 32),
+                activation="situ",
+                fast_math=True,
+            )
         y = y[:num_tokens]
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             if (
@@ -1898,9 +1911,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         alt_stream: Optional[torch.cuda.Stream] = None,
         gate_alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        split_gguf_kv_b = getattr(
-            quant_config, "supports_kimi_k3_quantized_latent_projections", False
-        )
+        # ModelSlim can quantize K3 latent projections while still storing
+        # MLA kv_b_proj as one dense tensor; only GGUF expert packs split K/V.
+        split_gguf_kv_b = _uses_split_gguf_kv_b(quant_config)
         self.all_reduce_fusion = all_reduce_fusion
         self.use_output_gate = getattr(config, "mla_use_output_gate", False)
         # The fused Ascend split+RMSNorm path is not numerically equivalent for
@@ -2155,8 +2168,9 @@ class KimiK3DecoderLayer(nn.Module):
             and layer_idx >= config.first_k_dense_replace
             and layer_idx % config.moe_layer_freq == 0
         )
-        # SP-MoE (EP a2a backend — megamoe, DeepEP or MoRI): o_proj defers its
-        # attention-TP reduction; this layer completes it as a reduce-scatter
+        # SP-MoE (EP a2a backend — megamoe, DeepEP, Mooncake, Ascend-FuseEP or
+        # MoRI): o_proj defers its attention-TP reduction; this layer completes
+        # it as a reduce-scatter
         # so the whole MoE region (agg2, norms, gate, latent projs, tp1
         # shared experts, EP a2a dispatch) runs on 1/attn_tp of the rows,
         # then all-gathers rows back after the MoE tail add. RS+AG moves the
@@ -2177,6 +2191,7 @@ class KimiK3DecoderLayer(nn.Module):
             (
                 _a2a_backend.is_megamoe()
                 or _a2a_backend.is_deepep()
+                or _a2a_backend.is_mooncake()
                 or _a2a_backend.is_ascend_fuseep()
                 or _a2a_backend.is_mori()
             )
@@ -2870,7 +2885,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
-                use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()
@@ -3228,6 +3243,24 @@ class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
     supports_cuda_vmm_feature_transport = True
+
+    # Fused runtime module -> checkpoint shard names, so quant configs can
+    # match fused prefixes against per-shard exclude_modules
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "qkv_conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
+        "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
+        "fused_qkvbfg_a_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+            "g_a_proj",
+        ],
+        "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
+    }
     encoder_media_processor_config = EncoderMediaProcessorConfig(
         image_decode_mode="nvjpeg_fancy",
         preserve_media_metadata=True,
@@ -3382,7 +3415,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             # Match the configured TP consumer count captured when the
             # tokenizer creates MmItemMemoryPool. A live attention subgroup
             # size could leave acknowledgements missing and strand the lease.
-            ipc_consumer_count = max(get_parallel().config.tp_size, 1)
+            ipc_consumer_count = max(get_parallel().tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()

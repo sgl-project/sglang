@@ -14,6 +14,10 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     styles_css = (
         repo_root / "python/sglang/multimodal_gen/apps/realtime_webui/styles.css"
     ).read_text()
+    playback_js = (
+        repo_root
+        / "python/sglang/multimodal_gen/apps/realtime_webui/playback_controller.js"
+    ).read_text()
 
     assert "preset.actions" not in app_js
     assert "repeatActions" not in app_js
@@ -48,9 +52,11 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "Info" not in index_html
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
-    assert "styles.css?v=realtime-sr-v38" in index_html
-    assert "app.js?v=realtime-sr-v38" in index_html
-    assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";' in app_js
+    assert "styles.css?v=realtime-record-v49" in index_html
+    assert "app.js?v=realtime-record-v75" in index_html
+    assert (
+        'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v10";' in app_js
+    )
     assert "const DEFAULT_TARGET_FPS = 25;" in app_js
     assert "const DEFAULT_FRAME_INTERPOLATION_EXP = 1;" in app_js
     assert "const DEFAULT_FRAME_INTERPOLATION_SCALE = 1.0;" in app_js
@@ -73,18 +79,16 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "setPreviewScale(DEFAULT_PREVIEW_SCALE)" in app_js
     assert "preview_scale" in app_js
     assert "sr_scale" in app_js
-    assert "elapsedMs % targetMs" in app_js
-    assert "liveQueueFrameFloor(header, chunkFrameCount)" in app_js
+    assert "elapsedMs < targetMs" in playback_js
+    assert "queuedDecodeFrames > maxQueuedFrames" in app_js
     assert (
         'const REACTOR_PRESET_BASE_URL = "https://www.reactor.inc/lingbot-world-fast-v1";'
         in app_js
     )
     assert "Dragon Dolly" in app_js
     assert "no creature morphing" in app_js
-    assert "A static locked-off view of the back side of Plastic Beach" in app_js
-    assert "clouds slowly drifting behind the island" in app_js
-    assert "occasional shooting star" in app_js
-    assert "tiny distant pigeons" in app_js
+    assert "the Plastic Beach island stays centered" in app_js
+    assert "no camera descent, no push-in, no orbit" in app_js
     assert "Ziggy Stardust" in app_js
     assert "blue K. West sign" in app_js
     assert "wet pavement reflecting a yellow streetlamp" in app_js
@@ -95,8 +99,8 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert app_js.index("Dragon Dolly") < app_js.index("Kid A")
     assert "dragon-ride.jpg" in app_js
     assert "stageRenderFps" not in app_js
-    assert 'setStatus("Receiving"' not in app_js
-    assert "decodeChain = decodeChain" in app_js
+    assert 'setStatus("Receiving", "live")' in app_js
+    assert "decodeQueue.push(" in app_js
     assert "receiveChain" not in app_js
     assert 'message.type === "chunk_stats"' in app_js
     assert "chunkTotal > 0 ? numFrames / chunkTotal" in app_js
@@ -104,6 +108,5 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert ".workspace" in styles_css
     assert ".preview-frame" in styles_css
     assert ".preview-overlay" in styles_css
-    assert "@keyframes previewSweep" in styles_css
     assert ".preview-scale-control" in styles_css
     assert "--preview-scale" in styles_css

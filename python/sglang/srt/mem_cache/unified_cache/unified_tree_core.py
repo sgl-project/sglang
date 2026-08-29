@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     CacheAction,
     ComponentAction,
     FreeDeviceKV,
+    FreeDeviceKVFullOnly,
     ReplaceWriteThroughOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -939,7 +940,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     @staticmethod
     def _is_deferrable_action(action: CacheAction | ComponentAction) -> bool:
         """Fire-and-forget actions safe to batch until the next barrier."""
-        return isinstance(action, (FreeDeviceKV, ReplaceWriteThroughOnNodeSplit))
+        return isinstance(
+            action,
+            (FreeDeviceKV, FreeDeviceKVFullOnly, ReplaceWriteThroughOnNodeSplit),
+        )
 
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
         """Process one walked node, appending its barrier actions to the state."""
@@ -1537,47 +1541,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ):
         """Cascade eviction from trigger to lower-or-equal priority components."""
 
-        is_leaf = False
-        if target == EvictLayer.DEVICE:
-            is_leaf = node in self.evictable_device_leaves
-        elif target == EvictLayer.HOST:
-            is_leaf = node in self.evictable_host_leaves
-
-        trigger_priority = trigger.eviction_priority(is_leaf)
+        is_leaf = self._is_cascade_evict_leaf(node, target)
         base_evicted = False
 
         for comp in self.components:
-            if comp.eviction_priority(is_leaf) <= trigger_priority:
-                if comp is not trigger and comp.node_has_component_data(node, target):
-                    cd = node.component_data[comp.component_type]
-                    # A comp whose TRUE internal priority outranks the trigger
-                    # is only in this loop because leaf-collapse flattened
-                    # priorities; a lock on it is a legit pin and must be
-                    # spared. A lock on a strictly-lower-priority tier is a
-                    # real strand — fall through to the assert below.
-                    if comp.eviction_priority(
-                        is_leaf=False
-                    ) >= trigger.eviction_priority(is_leaf=False):
-                        if EvictLayer.DEVICE in target and cd.lock_ref != 0:
-                            continue
-                        if EvictLayer.HOST in target and cd.host_lock_ref != 0:
-                            continue
-                        if cd.session_ref > 0 and trigger.session_ref(node) == 0:
-                            continue
-                    if EvictLayer.DEVICE in target:
-                        assert cd.lock_ref == 0
-                    if EvictLayer.HOST in target:
-                        assert cd.host_lock_ref == 0
-                    self._evict_component_and_detach_lru(
-                        node,
-                        comp,
-                        target=target,
-                        tracker=tracker,
-                        device_frees=device_frees,
-                        host_frees=host_frees,
-                    )
-                    if comp.component_type == BASE_COMPONENT_TYPE:
-                        base_evicted = True
+            if self._should_cascade_evict_component(
+                node, trigger, comp, target, is_leaf
+            ):
+                self._evict_component_and_detach_lru(
+                    node,
+                    comp,
+                    target=target,
+                    tracker=tracker,
+                    device_frees=device_frees,
+                    host_frees=host_frees,
+                )
+                if comp.component_type == BASE_COMPONENT_TYPE:
+                    base_evicted = True
 
         # Now that all components (including SWA which depends on Full.value)
         # have been freed, we can safely tombstone Full.value.
@@ -1592,6 +1572,48 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node.component_data[BASE_COMPONENT_TYPE].value = None
 
         self._update_evictable_leaf_sets(node)
+
+    def _is_cascade_evict_leaf(self, node: UnifiedTreeNode, target: EvictLayer) -> bool:
+        if target == EvictLayer.DEVICE:
+            return node in self.evictable_device_leaves
+        if target == EvictLayer.HOST:
+            return node in self.evictable_host_leaves
+        return False
+
+    @staticmethod
+    def _should_cascade_evict_component(
+        node: UnifiedTreeNode,
+        trigger: TreeComponent,
+        comp: TreeComponent,
+        target: EvictLayer,
+        is_leaf: bool,
+    ) -> bool:
+        """Return whether a component is an unlocked cascade-eviction target."""
+        trigger_priority = trigger.eviction_priority(is_leaf)
+        if comp.eviction_priority(is_leaf) > trigger_priority:
+            return False
+        if comp is trigger or not comp.node_has_component_data(node, target):
+            return False
+
+        cd = node.component_data[comp.component_type]
+        # A comp whose TRUE internal priority outranks the trigger is only a
+        # candidate because leaf-collapse flattened priorities; a lock on it is
+        # a legitimate pin and must be spared. A lock on a strictly-lower-
+        # priority tier is a real strand and must trip the assertions below.
+        if comp.eviction_priority(is_leaf=False) >= trigger.eviction_priority(
+            is_leaf=False
+        ):
+            if EvictLayer.DEVICE in target and cd.lock_ref != 0:
+                return False
+            if EvictLayer.HOST in target and cd.host_lock_ref != 0:
+                return False
+            if cd.session_ref > 0 and trigger.session_ref(node) == 0:
+                return False
+        if EvictLayer.DEVICE in target:
+            assert cd.lock_ref == 0
+        if EvictLayer.HOST in target:
+            assert cd.host_lock_ref == 0
+        return True
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
         for component in self.components:
@@ -1648,8 +1670,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
           - Full host present    → keep as H-leaf
           - neither              → evict all remaining data, delete, continue up
         """
+        self._iteratively_delete_tombstone_ancestors(
+            deleted_node.parent, tracker, device_frees, host_frees
+        )
+
+    def _iteratively_delete_tombstone_ancestors(
+        self,
+        cur: UnifiedTreeNode,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        """Delete childless tombstone ancestors until a live or locked node is reached."""
         ct = BASE_COMPONENT_TYPE
-        cur = deleted_node.parent
         while cur != self.root_node and len(cur.children) == 0:
             if any(
                 cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
@@ -1894,6 +1927,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
             if t:
                 comp_xfers[comp.component_type] = t
+        # Reject transfers that would claim a node pinned by another load-back
+        # anchor; the empty spec makes the caller back off and recompute.
+        if any(
+            self.node_by_id(nid).load_back_pending_id not in (None, node_id)
+            for xfers in ([kv_xfer], *comp_xfers.values())
+            for xfer in xfers
+            for nid in xfer.nodes_to_load or ()
+        ):
+            empty_kv = PoolTransfer(
+                name=PoolName.KV,
+                host_indices=torch.empty((0,), dtype=torch.int64, device="cpu"),
+                nodes_to_load=[],
+            )
+            return empty_kv, {}
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(

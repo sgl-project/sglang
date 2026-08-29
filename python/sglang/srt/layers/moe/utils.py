@@ -4,6 +4,7 @@ import logging
 import os
 from contextlib import contextmanager
 from enum import Enum, IntEnum
+from typing import NamedTuple
 
 import torch
 
@@ -40,6 +41,7 @@ class MoeA2ABackend(Enum):
     ASCEND_TP = "ascend_tp"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
+    DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
     CUSTOMIZED = "customized"
 
@@ -79,6 +81,9 @@ class MoeA2ABackend(Enum):
     def is_megamoe(self):
         return self == MoeA2ABackend.MEGAMOE
 
+    def is_deepep_v2(self):
+        return self == MoeA2ABackend.DEEPEP_V2
+
     def is_pplx(self):
         return self == MoeA2ABackend.PPLX
 
@@ -114,6 +119,7 @@ class MoeRunnerBackend(Enum):
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
+    INTEL_XPU = "intel_xpu"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -176,6 +182,16 @@ class MoeRunnerBackend(Enum):
 
     def is_aiter(self):
         return self == MoeRunnerBackend.AITER
+
+    def is_intel_xpu(self):
+        return self == MoeRunnerBackend.INTEL_XPU
+
+
+class DeepEPv2Fp8ScaleFormat(NamedTuple):
+    """DeepGEMM FP8 activation-scale layout expected from DeepEP v2."""
+
+    tma_aligned: bool
+    ue8m0: bool
 
 
 class DeepEPMode(Enum):
@@ -309,6 +325,19 @@ def get_ascend_dispatcher_output_dtype(dispatcher):
 
     # 2. Ascend dispatch defaults to BF16
     return DispatcherOutputDtype.BF16
+
+
+def get_deepep_v2_fp8_scale_format() -> DeepEPv2Fp8ScaleFormat:
+    """Resolve the FP8 scale layout DeepEP v2 must pre-quantize into."""
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    return DeepEPv2Fp8ScaleFormat(
+        tma_aligned=(
+            deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+            or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ),
+        ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
 
 
 def initialize_moe_config():
@@ -502,9 +531,15 @@ def is_sbo_enabled() -> bool:
 
 
 def is_deepep_class_backend() -> bool:
-    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, Mori, or PPLX)."""
+    """Return whether A2A combine occurs inside a DeepEP-family dispatcher."""
     b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori() or b.is_pplx()
+    return (
+        b.is_deepep()
+        or b.is_deepep_v2()
+        or b.is_mooncake()
+        or b.is_mori()
+        or b.is_pplx()
+    )
 
 
 def uses_per_rank_fused_shared_slots() -> bool:
@@ -557,6 +592,15 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         and is_dp_attention_enabled()
         and get_flags().moe.quantization == "modelopt_fp4"
         and get_parallel().moe_ep_size == get_parallel().attn_dp_size
+    )
+
+
+def is_moe_input_scattered_across_dp_ranks() -> bool:
+    """Whether sparse MoE routing runs on a DP-local token shard."""
+    return (
+        not get_moe_a2a_backend().is_none()
+        or should_use_flashinfer_cutlass_moe_fp4_allgather()
+        or get_parallel().dwdp_size > 1
     )
 
 
@@ -620,7 +664,7 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     """
     if should_skip_mlp_all_reduce():
         return True
-    if get_parallel().config.dwdp_size > 1:
+    if get_parallel().dwdp_size > 1:
         return True
     if should_use_dp_reduce_scatterv():
         return True
