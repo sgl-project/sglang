@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +20,124 @@ logger = logging.getLogger(__name__)
 DSV4_REASONING_EFFORT_PROFILE_OVERRIDE = "dsv4_reasoning_effort_profile"
 _DSV4_REASONING_EFFORT_ENCODER = "encoding/encoding_dsv4.py"
 _MAX_DSV4_ENCODER_BYTES = 1 << 20
+
+_GLM_TOOL_RESULT_SORT_START = "    {%- set ns_a = namespace(tool_calls=none) -%}"
+_GLM_TOOL_RESULT_SORT_END = "\n{% endif -%}\n{%- elif m.role == 'system' -%}"
+_GLM_LINEAR_TOOL_RESULT_RENDER = """    {%- for k in range(block_start, ns_blk.end + 1) -%}
+        {{- render_tool_response(messages[k]) -}}
+    {%- endfor -%}"""
+
+
+def _tool_call_id(item: Any) -> Optional[str]:
+    if not isinstance(item, Mapping):
+        return None
+    value = item.get("tool_call_id") or item.get("id")
+    return str(value) if value else None
+
+
+def _is_list_of_tool_outputs(message: Mapping[str, Any]) -> bool:
+    content = message.get("content")
+    return bool(
+        isinstance(content, list)
+        and content
+        and isinstance(content[0], Mapping)
+        and "output" in content[0]
+    )
+
+
+def _order_tool_result_block(
+    tool_calls: List[Dict[str, Any]],
+    tool_results: List[Dict[str, Any]],
+) -> Optional[List[Dict[str, Any]]]:
+    call_ids = []
+    seen_call_ids = set()
+    for tool_call in tool_calls:
+        call_id = _tool_call_id(tool_call)
+        if call_id is None or call_id in seen_call_ids:
+            return None
+        call_ids.append(call_id)
+        seen_call_ids.add(call_id)
+
+    results_by_id = {}
+    for message in tool_results:
+        if _is_list_of_tool_outputs(message):
+            result_items = message["content"]
+            units = [
+                ({"role": "tool", "content": [item]}, item) for item in result_items
+            ]
+        else:
+            units = [(message, message)]
+
+        for unit, item in units:
+            result_id = _tool_call_id(item)
+            if (
+                result_id is None
+                or result_id in results_by_id
+                or result_id not in seen_call_ids
+            ):
+                return None
+            results_by_id[result_id] = unit
+
+    return [results_by_id[call_id] for call_id in call_ids if call_id in results_by_id]
+
+
+def order_glm_tool_results(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Order valid GLM tool-result blocks by their declared tool calls."""
+    ordered_messages = list(messages)
+    index = 0
+    while index + 1 < len(ordered_messages):
+        message = ordered_messages[index]
+        tool_calls = message.get("tool_calls")
+        if message.get("role") != "assistant" or not isinstance(tool_calls, list):
+            index += 1
+            continue
+
+        block_start = index + 1
+        block_end = block_start
+        while (
+            block_end < len(ordered_messages)
+            and ordered_messages[block_end].get("role") == "tool"
+        ):
+            block_end += 1
+        if block_end == block_start:
+            index += 1
+            continue
+
+        ordered_block = _order_tool_result_block(
+            tool_calls, ordered_messages[block_start:block_end]
+        )
+        if ordered_block is not None:
+            ordered_messages[block_start:block_end] = ordered_block
+            block_end = block_start + len(ordered_block)
+        index = block_end
+
+    return ordered_messages
+
+
+def resolve_glm_tool_result_template(
+    *, hf_config: Any, tokenizer: Any
+) -> Optional[str]:
+    """Replace GLM's quadratic Jinja result ordering with a linear render."""
+    architectures = hf_config.architectures
+    if not any(
+        arch in ("Glm5NextForConditionalGeneration", "GlmMoeDsaForCausalLM")
+        for arch in architectures or []
+    ):
+        return None
+
+    template = getattr(tokenizer, "chat_template", None)
+    if not isinstance(template, str) or "has_dup_tool_result_id" not in template:
+        return None
+    if template.count(_GLM_TOOL_RESULT_SORT_START) != 1:
+        return None
+
+    start = template.index(_GLM_TOOL_RESULT_SORT_START)
+    end = template.find(_GLM_TOOL_RESULT_SORT_END, start)
+    if end < 0:
+        return None
+    return template[:start] + _GLM_LINEAR_TOOL_RESULT_RENDER + template[end:]
 
 
 def _detect_dsv4_reasoning_effort_profile(
