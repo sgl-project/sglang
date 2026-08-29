@@ -1452,6 +1452,17 @@ class MMEncoder:
                         time.perf_counter() - forward_start, modality=modality_str
                     )
 
+            try:
+                self._validate_embedding_token_count(ctx, mm_embedding)
+            except InternalError:
+                # Old releases could cache a malformed result before the
+                # outer validation ran. Do not make that entry permanently
+                # poison every request for the same media.
+                if cache_hit:
+                    async with self.mm_cache_lock:
+                        self.mm_cache.free(mm_hash, None)
+                raise
+
             # Per-request cache hit metrics: tokens = embedding rows.
             if use_mm_cache and encoder_metrics_collector is not None:
                 total_tokens = int(mm_embedding.shape[0])
@@ -1530,18 +1541,21 @@ class MMEncoder:
             mm_embedding = await self._compute_global_cache_embedding(
                 ctx, keep_on_gpu=keep_on_gpu
             )
-        else:
-            mm_embedding = await self._compute_direct_embedding(
-                ctx, keep_on_gpu=keep_on_gpu
-            )
+            if mm_embedding is not None:
+                self._validate_embedding_token_count(ctx, mm_embedding)
+            return mm_embedding
+        return await self._compute_direct_embedding(ctx, keep_on_gpu=keep_on_gpu)
 
+    @staticmethod
+    def _validate_embedding_token_count(
+        ctx: EncodeContext, mm_embedding: torch.Tensor
+    ) -> None:
         expected_tokens = sum(ctx.preprocess_result.token_counts)
-        if mm_embedding is not None and mm_embedding.shape[0] != expected_tokens:
+        if mm_embedding.shape[0] != expected_tokens:
             raise InternalError(
                 f"Encoder produced {mm_embedding.shape[0]} tokens, but "
                 f"preprocessor metadata expected {expected_tokens}"
             )
-        return mm_embedding
 
     async def _publish_preprocess_metadata(
         self, ctx: EncodeContext, requests: List[dict]
