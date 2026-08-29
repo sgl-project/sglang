@@ -31,7 +31,7 @@ const COOKBOOK_MODEL_TEMPLATE = join(
   SNIPPETS, "..", "..", "..", ".claude", "skills", "cookbook-add-model",
   "templates", "config.jsx.tmpl");
 const LEGACY_DIMS = ["variants", "quantizations", "strategies", "nodesOptions"];
-const QWEN38_GFX942_IMAGE = "aigmkt/qwen3.8-flash-next-gfx950-260827@sha256:89f79a33f48cc0f99c95902507643a86a181a5fffdcd9d8c61b66d9aacc44673";
+const QWEN38_GFX942_IMAGE = "aigmkt/qwen3.8-flash-next-gfx942-260827@sha256:89f79a33f48cc0f99c95902507643a86a181a5fffdcd9d8c61b66d9aacc44673";
 const QWEN38_GFX950_IMAGE = "aigmkt/qwen3.8-flash-next-gfx950-260827@sha256:51e4be1fde02780a5c39b37c464ebbceeffed5f6d307586f871611209a905828";
 
 const failures = [];
