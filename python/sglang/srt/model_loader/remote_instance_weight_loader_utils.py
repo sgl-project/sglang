@@ -16,6 +16,18 @@ _DEREGISTER_MAX_ATTEMPTS = 5
 _DEREGISTER_BACKOFF_S = 0.5
 
 
+def _iter_manifest_parameters(model):
+    """Every name a parameter answers to, not just the canonical one.
+
+    post_load_weights aliases parameters onto their parent
+    (`self._bfa_f_b_w = self.f_b_proj.weight` in kimi_k3), and
+    named_parameters() de-duplicates by identity keeping the parent's name, so
+    the child's vanishes. The client is a fresh skeleton that has run neither
+    the aliasing nor post_load_weights, and looks the child name up.
+    """
+    return model.named_parameters(remove_duplicate=False)
+
+
 class RemoteInstanceWeightLoaderBackend(str, enum.Enum):
     NCCL = "nccl"
     TRANSFER_ENGINE = "transfer_engine"
@@ -174,14 +186,20 @@ def register_memory_region_v1(model, transfer_engine):
 
     weight_mr_dict = {}
     registered_blocks = []
-    for name, weight in model.named_parameters():
+    seen_blocks = set()
+    for name, weight in _iter_manifest_parameters(model):
         size = weight.numel() * weight.element_size()
-        ret = transfer_engine.register_memory(weight.data_ptr(), size)
-        if ret != 0:
-            raise RuntimeError(
-                f"register memory failed for weight {name}, error: {ret}"
-            )
-        registered_blocks.append((weight.data_ptr(), size))
+        block = (weight.data_ptr(), size)
+        # One registration per byte range; aliases would otherwise register
+        # twice, and the second unregister_memory would fail.
+        if block not in seen_blocks:
+            ret = transfer_engine.register_memory(weight.data_ptr(), size)
+            if ret != 0:
+                raise RuntimeError(
+                    f"register memory failed for weight {name}, error: {ret}"
+                )
+            seen_blocks.add(block)
+            registered_blocks.append(block)
         weight_mr_dict[name] = (
             weight.data_ptr(),
             weight.numel(),
@@ -198,7 +216,7 @@ def register_memory_region_v2(model, transfer_engine):
 
     weight_mr_dict = {}
     weight_addr_set = set()
-    for name, weight in model.named_parameters():
+    for name, weight in _iter_manifest_parameters(model):
         weight_mr_dict[name] = (
             weight.data_ptr(),
             weight.numel(),
