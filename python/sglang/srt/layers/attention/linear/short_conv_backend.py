@@ -73,9 +73,12 @@ class ShortConvMetadata(NamedTuple):
     query_start_loc: Optional[torch.Tensor] = None
     # Per-request "resumes a cached prefix" mask (device bool). None on decode.
     has_initial_state: Optional[torch.Tensor] = None
-    # Host mirror of cache_indices for extend host loops. None on decode.
+    # Host mirror of cache_indices for extend host loops. None on decode, and
+    # None on extend until the backend's extend_host_mirrors() resolved it --
+    # the mirror costs a device sync, so a fallback caller asks for it lazily.
     slot_ids_cpu: Optional[List[int]] = None
-    # Host mirror of has_initial_state for extend host loops. None on decode.
+    # Host mirror of has_initial_state for extend host loops. Same lifecycle
+    # as slot_ids_cpu.
     has_prefix_cpu: Optional[List[bool]] = None
 
 
@@ -90,8 +93,10 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
     # int64 is canonical (the CUDA causal_conv1d narrows at its own boundary); a
     # subclass whose kernels take int32 sets int32 to skip that per-layer cast.
     cache_indices_dtype: torch.dtype = torch.int64
-    # The host mirrors below cost a device->host sync per extend step, so only
-    # models with a host extend loop (ZAYA1 v1) ask for them.
+    # Whether extend steps STAGE host mirrors of the slot ids / prefix mask for
+    # extend_host_mirrors(). Resolving them costs a device->host sync, so it is
+    # deferred until a caller with a host extend loop (ZAYA1's reference
+    # fallback) actually asks.
     needs_extend_host_mirrors: bool = True
     # Pure short conv: ``temporal`` is a zero-element tensor, so the radix
     # track never snapshots an SSM state and the base skips building its
@@ -116,6 +121,9 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         self._has_initial_state: Optional[torch.Tensor] = None
         self._slot_ids_cpu: Optional[List[int]] = None
         self._has_prefix_cpu: Optional[List[bool]] = None
+        # Staged by init_forward_metadata on extend; consumed (with the slot-id
+        # sync) only if extend_host_mirrors() is actually called.
+        self._extend_prefix_lens_cpu: Optional[List[int]] = None
         self._cache_indices: Optional[torch.Tensor] = None
         self._cache_indices_buf: Optional[torch.Tensor] = None
         self._has_initial_state_buf: Optional[torch.Tensor] = None
@@ -212,6 +220,7 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         self._has_initial_state = None
         self._slot_ids_cpu = None
         self._has_prefix_cpu = None
+        self._extend_prefix_lens_cpu = None
         self._track_conv_indices = None
         self._track_dst = None
 
@@ -328,10 +337,13 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         ):
             self._has_initial_state = self._resolve_has_initial_state(forward_batch)
             if self.needs_extend_host_mirrors and self._cache_indices is not None:
-                self._slot_ids_cpu = self._cache_indices.tolist()
-                self._has_prefix_cpu = [
-                    int(p) > 0 for p in forward_batch.extend_prefix_lens_cpu
-                ]
+                # Only STAGE the mirrors: extend_prefix_lens_cpu is already a
+                # host list, but mirroring the slot ids costs a device->host
+                # sync (`.tolist()`), and the fused prefill conv -- the default
+                # path -- never reads them. extend_host_mirrors() resolves the
+                # sync lazily, so only a step that actually falls back to the
+                # reference host loop pays it.
+                self._extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
         # Extend-side radix track: the base only populates track_conv_indices
         # on the plain-extend branch and only when some row is tracked, so its
         # presence is the gate. mamba_track_indices was translated
@@ -358,6 +370,27 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         super().init_forward_metadata_capture_cpu_graph(*args, **kwargs)
         self._reset_step_state()
         self._refresh_cache_indices()
+
+    def extend_host_mirrors(
+        self,
+    ) -> tuple[Optional[List[int]], Optional[List[bool]]]:
+        """Host mirrors of the slot ids / prefix mask, resolved lazily.
+
+        The first call in a step pays the device->host sync (``.tolist()`` on
+        the slot indices); later calls in the same step return the memo. Only
+        the reference extend host loop (:func:`cca_extend
+        <sglang.srt.models.zaya.cca_extend>`) needs these, so the default fused
+        prefill path never triggers the sync. Returns ``(None, None)`` outside
+        an extend step.
+        """
+        if (
+            self._slot_ids_cpu is None
+            and self._cache_indices is not None
+            and self._extend_prefix_lens_cpu is not None
+        ):
+            self._slot_ids_cpu = self._cache_indices.tolist()
+            self._has_prefix_cpu = [int(p) > 0 for p in self._extend_prefix_lens_cpu]
+        return self._slot_ids_cpu, self._has_prefix_cpu
 
     def conv_state_metadata(
         self, layer_id: int, forward_batch: ForwardBatch

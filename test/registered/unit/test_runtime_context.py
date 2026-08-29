@@ -581,9 +581,11 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
             self.assertTrue(get_moe_a2a_backend().is_none())
             # MTP layers are unquantized: fp4 allgather is forced off
             self.assertTrue(get_flags().moe.disable_fp4_allgather)
+            self.assertTrue(get_flags().moe.speculative_context)
         self.assertEqual(get_moe_runner_backend().name, "TRITON")
         self.assertTrue(get_moe_a2a_backend().is_deepep())
         self.assertFalse(get_flags().moe.disable_fp4_allgather)
+        self.assertFalse(get_flags().moe.speculative_context)
 
     def test_swap_restores_on_exception(self):
         from sglang.srt.layers.moe.utils import (
