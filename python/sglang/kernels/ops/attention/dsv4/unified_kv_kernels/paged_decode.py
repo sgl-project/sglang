@@ -235,6 +235,7 @@ def _paged_decode_fused_kernel(
     out_stride_d,
     qk_scale,  # = softmax_scale * LOG2E
     log2e,  # = LOG2E, to lift natural-log sink into log2 domain
+    attn_sink_logit_shift,  # natural-log scalar applied only to the virtual sink
     H: tl.constexpr,
     H_LOCAL: tl.constexpr,
     D: tl.constexpr,
@@ -350,8 +351,9 @@ def _paged_decode_fused_kernel(
 
     # Fold attn_sink as a virtual K of weight 1. sink is a natural-log bias;
     # multiply by log2e so it lives in the same log2 domain as our online m_i.
-    sink_raw = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(
-        tl.float32
+    sink_raw = (
+        tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
+        + attn_sink_logit_shift
     )
     sink = sink_raw * log2e
     m_final = tl.maximum(m_i, sink)
@@ -553,6 +555,7 @@ def _paged_decode_reduce_kernel(
     out_stride_h,
     out_stride_d,
     log2e,  # = LOG2E, used to convert natural-log sink → log2 domain
+    attn_sink_logit_shift,  # natural-log scalar applied only to the virtual sink
     H: tl.constexpr,
     D: tl.constexpr,
     KV_SPLITS: tl.constexpr,
@@ -615,7 +618,10 @@ def _paged_decode_reduce_kernel(
             mask=d_mask,
         )
         if STORE_LSE and dc == 0:
-            tl.store(lse_out_ptr + t * H + h, tl.load(attn_sink_ptr + h))
+            tl.store(
+                lse_out_ptr + t * H + h,
+                tl.load(attn_sink_ptr + h) + attn_sink_logit_shift,
+            )
         return
     tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
     act_num_segments = tl.cdiv(kv_len, tl.maximum(tiles_per_segment, 1) * BLOCK_K)
@@ -651,7 +657,7 @@ def _paged_decode_reduce_kernel(
     acc_combined = tl.sum(a_p * alpha_split[:, None], axis=0)  # [D_CHUNK]
 
     # Fold attn_sink (recomputed across dc — scalar work, negligible).
-    sink_raw = tl.load(attn_sink_ptr + h).to(tl.float32)
+    sink_raw = tl.load(attn_sink_ptr + h).to(tl.float32) + attn_sink_logit_shift
     sink = sink_raw * log2e
     m_final = tl.maximum(m_max, sink)
     alpha_kv = tl.exp2(m_max - m_final)
@@ -699,6 +705,7 @@ def _sparse_attn_v4_paged_decode_triton(
     kv_splits: int | None = None,
     block_k: int | None = None,
     return_lse: bool = False,
+    attn_sink_logit_shift: float = 0.0,
 ):
     """V4 sparse decode Triton implementation: split-K with FUSED fast path,
     exp2 softmax, CG-safe heuristic. Q may be contiguous ``[T,H,D]`` or the
@@ -843,6 +850,7 @@ def _sparse_attn_v4_paged_decode_triton(
             out.stride(2),
             qk_scale,
             LOG2E,
+            attn_sink_logit_shift,
             H,
             h_local,
             D,
@@ -955,6 +963,7 @@ def _sparse_attn_v4_paged_decode_triton(
         out.stride(1),
         out.stride(2),
         LOG2E,
+        attn_sink_logit_shift,
         H,
         D,
         kv_splits,
@@ -976,6 +985,7 @@ def sparse_attn_v4_paged_decode(
     softmax_scale: float,
     kv_scales: torch.Tensor | None = None,
     return_lse: bool = False,
+    attn_sink_logit_shift: float = 0.0,
 ):
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
@@ -1006,4 +1016,5 @@ def sparse_attn_v4_paged_decode(
         softmax_scale,
         kv_scales=kv_scales,
         return_lse=return_lse,
+        attn_sink_logit_shift=attn_sink_logit_shift,
     )

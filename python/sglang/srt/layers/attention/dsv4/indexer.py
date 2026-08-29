@@ -963,7 +963,12 @@ class C4IndexerBackendMixin:
                     raise RuntimeError(
                         "SGLANG_DSV4_DCP_PACKED_TOPK requires dcp_size in {2, 4, 8}"
                     )
-                local_lens = core_metadata.c4_sparse_topk_lengths_raw[:query_rows]
+                direct_topk_lengths = envs.SGLANG_DSV4_DCP_DIRECT_TOPK_LENGTHS.get()
+                local_lens = (
+                    core_metadata.c4_sparse_topk_lengths[:query_rows]
+                    if direct_topk_lengths
+                    else core_metadata.c4_sparse_topk_lengths_raw[:query_rows]
+                )
                 page_indices = core_metadata.c4_sparse_page_indices[:query_rows]
                 combined_workspace_matches = (
                     combined_q_topk_workspace is not None
@@ -1032,7 +1037,8 @@ class C4IndexerBackendMixin:
                         dcp_group=group,
                         out_local_raw_indices=raw_indices,
                     )
-                core_metadata.c4_sparse_topk_lengths[:query_rows].copy_(local_lens)
+                if not direct_topk_lengths:
+                    core_metadata.c4_sparse_topk_lengths[:query_rows].copy_(local_lens)
             else:
                 local_scores, global_ids = local_c4_topk_candidates(
                     logits,

@@ -1390,21 +1390,26 @@ class DeepseekV4HipRadixBackend(
             else:
                 local_num_heads = q.shape[1]
                 q = group.all_gather(q.contiguous(), dim=1).contiguous()
-            shifted_sink = select_dcp_attn_sink(
+            dcp_sink = select_dcp_attn_sink(
                 attn_sink,
                 local_num_heads,
                 get_parallel().attn_tp_rank,
                 self.dsv4_dcp_size,
                 self.dsv4_dcp_rank,
-            ) - math.log(float(self.dsv4_dcp_size))
+            )
+            sink_logit_shift = -math.log(float(self.dsv4_dcp_size))
+            if not envs.SGLANG_DSV4_DCP_INLINE_SINK_SHIFT.get():
+                dcp_sink = dcp_sink + sink_logit_shift
+                sink_logit_shift = 0.0
             partial_out, partial_lse = runtime.decode(
                 q=q,
                 unified_kv=unified,
                 kv_indices=kv_indices,
                 kv_indptr=kv_indptr,
-                attn_sink=shifted_sink,
+                attn_sink=dcp_sink,
                 softmax_scale=self.softmax_scale,
                 return_lse=True,
+                attn_sink_logit_shift=sink_logit_shift,
             )
             comm_backend = get_parallel().dcp_comm_backend
             if comm_backend in ("a2a", "fi_a2a"):

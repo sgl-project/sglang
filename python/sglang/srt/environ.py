@@ -1128,6 +1128,12 @@ class Envs:
     # Experimental gfx950 decode-only PoC: transport the C4 packed candidates
     # and attention Q in one bf16 DCP all-gather.
     SGLANG_DSV4_DCP_COMBINED_Q_TOPK = EnvBool(False)
+    # Write packed merge lengths directly to the attention-visible buffer,
+    # avoiding one tiny device copy per C4 layer.
+    SGLANG_DSV4_DCP_DIRECT_TOPK_LENGTHS = EnvBool(True)
+    # Apply the replicated DCP sink compensation inside paged decode instead
+    # of materializing one shifted sink tensor per layer.
+    SGLANG_DSV4_DCP_INLINE_SINK_SHIFT = EnvBool(True)
 
     # ===================================================================
     # Kernel selection and fused backends

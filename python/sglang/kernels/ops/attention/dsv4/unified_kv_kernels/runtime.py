@@ -348,6 +348,7 @@ def decode(
     attn_sink: torch.Tensor,  # [H] fp32
     softmax_scale: float,
     return_lse: bool = False,
+    attn_sink_logit_shift: float = 0.0,
 ):
     return sparse_attn_v4_paged_decode(
         q,
@@ -357,6 +358,7 @@ def decode(
         attn_sink,
         softmax_scale,
         return_lse=return_lse,
+        attn_sink_logit_shift=attn_sink_logit_shift,
     )
 
 

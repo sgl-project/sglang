@@ -8,6 +8,7 @@ kernel, and both DCP reduction backends.
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import sys
@@ -261,9 +262,8 @@ def _worker_test(rank: int, world_size: int, device, coordinator) -> None:
     )
     reference_local = reference_out[:, rank * local_heads : (rank + 1) * local_heads]
 
-    shifted_sink = sink - torch.log(
-        torch.tensor(float(world_size), dtype=torch.float32, device=device)
-    )
+    sink_logit_shift = -math.log(float(world_size))
+    shifted_sink = sink + sink_logit_shift
     partial_out, partial_lse = _sparse_attn_v4_paged_decode_triton(
         rank_major_q,
         local_kv,
@@ -273,6 +273,45 @@ def _worker_test(rank: int, world_size: int, device, coordinator) -> None:
         scale,
         return_lse=True,
     )
+    inline_shift_out, inline_shift_lse = _sparse_attn_v4_paged_decode_triton(
+        rank_major_q,
+        local_kv,
+        local_indices,
+        local_indptr,
+        sink,
+        scale,
+        return_lse=True,
+        attn_sink_logit_shift=sink_logit_shift,
+    )
+    torch.testing.assert_close(
+        inline_shift_out.float(), partial_out.float(), atol=1e-6, rtol=0
+    )
+    torch.testing.assert_close(inline_shift_lse, partial_lse, atol=1e-6, rtol=0)
+    fused_shifted_out, fused_shifted_lse = _sparse_attn_v4_paged_decode_triton(
+        rank_major_q,
+        local_kv,
+        local_indices,
+        local_indptr,
+        shifted_sink,
+        scale,
+        kv_splits=1,
+        return_lse=True,
+    )
+    fused_inline_out, fused_inline_lse = _sparse_attn_v4_paged_decode_triton(
+        rank_major_q,
+        local_kv,
+        local_indices,
+        local_indptr,
+        sink,
+        scale,
+        kv_splits=1,
+        return_lse=True,
+        attn_sink_logit_shift=sink_logit_shift,
+    )
+    torch.testing.assert_close(
+        fused_inline_out.float(), fused_shifted_out.float(), atol=1e-6, rtol=0
+    )
+    torch.testing.assert_close(fused_inline_lse, fused_shifted_lse, atol=1e-6, rtol=0)
 
     ag_rs = (
         cp_lse_ag_out_rs_mla(
