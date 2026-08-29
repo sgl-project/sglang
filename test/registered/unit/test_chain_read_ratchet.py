@@ -195,15 +195,18 @@ def _declared_by_late_resolution():
     It forwards `**fields` to `declare_late_resolution`, so the keywords sit at
     its call sites and a scan for the declarer's own name finds none of them.
     """
-    tree = ast.parse((_SRT / "server_args.py").read_text(encoding="utf-8-sig"))
+    # The record plus `arg_groups/`: a hook calls it on the record it was
+    # handed, so scanning the record's file alone finds nothing.
+    sources = [_SRT / "server_args.py", *sorted((_SRT / "arg_groups").rglob("*.py"))]
     fields = set()
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_late_resolution"
-        ):
-            fields |= {keyword.arg for keyword in node.keywords if keyword.arg}
+    for source in sources:
+        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8-sig"))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_late_resolution"
+            ):
+                fields |= {keyword.arg for keyword in node.keywords if keyword.arg}
     return fields
 
 

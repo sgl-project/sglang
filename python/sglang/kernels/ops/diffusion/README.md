@@ -90,6 +90,7 @@ Several norms look interchangeable and are not. Start here.
 
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
+| `fuse_scale_shift_kernel` | Triton | close | contiguous BLC; scalar/row/token modulation plus causal-video `[B, F, 1, C]`, using a static capped power-of-two tile to avoid request-time autotuning |
 | `fused_rmsnorm_scale_shift_bitexact` | Triton | bit-exact vs flashinfer CuTe RMSNorm + aten modulate | bf16, contiguous rows, `H == 64 * threads_per_row` |
 | `fused_scale_residual_rmsnorm_scale_shift_bitexact` | Triton | bit-exact, incl. the preceding residual-gate add | as above |
 | `fused_layernorm_modulate` | Triton | bit-exact vs aten `vectorized_layer_norm` | bf16, `N % 4 == 0`, 16B-aligned |
@@ -109,6 +110,18 @@ Several norms look interchangeable and are not. Start here.
 | `zimage_qk_rmsnorm_native` | Triton | bit-exact | Z-Image per-head QK RMSNorm |
 | `fused_qk_head_layernorm` | Triton | bit-exact | per-head LN on q/k, `dim_head % 4 == 0`, `<= 128` |
 | `triton_one_pass_rms_norm` | Triton | close | standalone RMSNorm, one pass |
+
+### Residual gating
+
+| Entry point | Backend | Contract | Applies to |
+|---|---|---|---|
+| `residual_gate_add` | JIT CUDA | bit-exact `residual + update * gate` | contiguous tensors, or a transposed-dense `[B, tokens, hidden]` residual/output with contiguous update and row-broadcast gate (SANA-Video) |
+
+The transposed-dense path uses a shared-memory tile to read the update in
+logical row-major order while keeping residual reads and output writes
+coalesced in their `[B, hidden, tokens]` backing layout. Do not insert a
+`.contiguous()` merely to reach the ordinary path; that restores an entire
+tensor copy per residual site.
 
 ### RoPE / QK-norm
 
