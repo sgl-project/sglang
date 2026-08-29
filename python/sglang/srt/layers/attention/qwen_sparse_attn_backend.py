@@ -505,9 +505,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         # width comes from a host-side length bound, so check the invariant
         # on device (async assert: no sync, still loud) rather than reading
         # past the row.
-        torch._assert_async(
-            (end_blocks * compress_ratio <= token_slot_table.shape[1]).all()
-        )
+        # torch_npu has no device kernel for aten::_assert_async and falls back
+        # to a host-side check, introducing a synchronization in every decode
+        # step. Keep the asynchronous guard on backends that implement it;
+        # QSA metadata validation on NPU must not add a host sync to this path.
+        if device.type != "npu":
+            torch._assert_async(
+                (end_blocks * compress_ratio <= token_slot_table.shape[1]).all()
+            )
         counts = (end_blocks - start_blocks).clamp_min(0)
         ends = torch.cumsum(counts, 0)
         starts = ends - counts
@@ -571,7 +576,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         # Prefix sharing is page-granular and the page is a ratio
         # multiple, so a matched prefix always covers whole groups. A
         # misaligned prefix would leave a shared group half-written.
-        torch._assert_async((prefix_lens % ratio == 0).all())
+        # See _qsa_write_plan: this is a diagnostic invariant, while the NPU
+        # fallback turns it into a device-to-host synchronization.
+        if prefix_lens.device.type != "npu":
+            torch._assert_async((prefix_lens % ratio == 0).all())
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
         capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())

@@ -1724,6 +1724,28 @@ def test_qsa_block_expansion_adds_only_incomplete_tail():
     assert torch.all(result[1, 11:] == -1)
 
 
+def test_qsa_torch_block_expansion_sorts_float32_position_keys(monkeypatch):
+    original_argsort = torch.argsort
+    sort_key_dtypes = []
+
+    def record_argsort_dtype(sort_key, *args, **kwargs):
+        sort_key_dtypes.append(sort_key.dtype)
+        return original_argsort(sort_key, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "argsort", record_argsort_dtype)
+    blocks = torch.tensor([[0, -1]], dtype=torch.int32)
+    result = torch_expand_qsa_block_indices(
+        blocks,
+        query_positions=torch.tensor([5]),
+        sequence_lengths=torch.tensor([6]),
+        compress_ratio=4,
+        token_topk=8,
+    )
+
+    assert sort_key_dtypes == [torch.float32]
+    assert result[0, :6].tolist() == [0, 1, 2, 3, 4, 5]
+
+
 def test_qsa_triton_block_expansion_matches_torch_reference():
     if not torch.cuda.is_available():
         return

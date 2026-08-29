@@ -153,7 +153,14 @@ def torch_expand_qsa_block_indices(
 
     result = torch.cat([expanded, tail], dim=1)
     # Keep all valid entries contiguous. This is required by the FA2 packing path.
-    order = torch.arange(final_topk, device=device).unsqueeze(0).expand(rows, -1)
+    # Ascend dispatches int32/int64 argsort to AiCpu.  These bounded positional
+    # keys are exactly representable in float32, which keeps NPU sorting on
+    # AiCore without changing the gathered integer token indices.
+    order = (
+        torch.arange(final_topk, device=device, dtype=torch.float32)
+        .unsqueeze(0)
+        .expand(rows, -1)
+    )
     sort_key = torch.where(result >= 0, order, order + final_topk)
     return result.gather(1, torch.argsort(sort_key, dim=1, stable=True)).to(torch.int32)
 
