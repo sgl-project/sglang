@@ -1,15 +1,18 @@
 """Runtime glue for the unified_kv backend.
 
 Builds unified_kv-style flat ``kv_indices`` / ``kv_indptr`` from SGLang's already-computed
-DSV4 metadata, scatters SWA K into the bf16 ``unified_kv`` ring, and dispatches the
+DSV4 metadata, scatters SWA K into the ``unified_kv`` ring, and dispatches the
 vendored paged decode/prefill kernels.
 
-unified_kv[L] layout (page_size 1, bf16, row-major):
+unified_kv[L] layout (page_size 1, row-major):
   - rows ``[0, swa_pages)``    = SWA ring (``state_slot * win + pos % win``);
   - rows ``[swa_pages, ...)``  = compressed K (``swa_pages + page_index``), where
     SGLang metadata already encodes the compressed slot id:
       HCA (ratio 128): ``c128_page_indices``      (== phys_block, k_per_block=1)
       CSA (ratio   4): ``c4_sparse_page_indices``  (== phys_block*32 + slot)
+
+Under SGLANG_DSV4_UNIFIED_KV_FP8 each row is split over two pools (512 B packed fp8
+nope + 128 B bf16 rope); row indexing and every index builder below are unchanged.
 
 Index layout: RAGGED-PACKED. Each token's segment is tightly packed
 (``kv_indptr`` is a true prefix sum of per-token valid lengths) so the
@@ -31,6 +34,9 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.layout import (
+    check_two_pool_pair,
+)
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
     sparse_attn_v4_paged_decode,
 )
@@ -77,15 +83,32 @@ def _swa_scatter_kernel(
 
 def store_swa_into_unified(
     *,
-    kv: torch.Tensor,  # [T, head_dim] bf16
+    kv: torch.Tensor,  # [T, head_dim] bf16, or [T, nope_row_bytes] packed fp8
     state_slot: torch.Tensor,  # [T] int
     positions: torch.Tensor,  # [T] int
-    unified_kv: torch.Tensor,  # [pages, head_dim] bf16
+    unified_kv: torch.Tensor,  # [pages, ...] same dtype and row width as kv
     win: int,  # SWA attention window length
     ring_stride: int,  # SWA ring stride
     final_pos: Optional[torch.Tensor] = None,  # [T] req's last position
+    kv_rope: Optional[torch.Tensor] = None,  # [T, rope_dim] bf16, fp8 layout only
+    unified_kv_rope: Optional[torch.Tensor] = None,  # [pages, rope_dim] bf16
 ) -> None:
-    n_rows, D = kv.shape
+    """Scatter SWA K into ring row ``state_slot * ring_stride + pos % ring_stride``.
+
+    Under the fp8 layout the latent is split over two pools, so ``kv`` carries the
+    already-packed nope row (DSV4_FP8_NOPE_ROW_BYTES wide: values + E8M0 scales +
+    pad; nothing is quantized here) and ``kv_rope`` the bf16 rope half. That width
+    is a byte count that happens to equal the bf16 head_dim in elements -- the two
+    are not the same thing. The scatter itself takes the row width off the tensor;
+    only the pair check reads the constant.
+
+    Both scatters recompute the row index from the same ``state_slot`` /
+    ``positions``, so the two pools stay in lockstep with each other and with the
+    bf16 layout. What a caller can still get wrong is passing two pools that aren't
+    a pair, so the pair goes through ``check_two_pool_pair`` before the first launch
+    -- shared with the fused store, which has the same coupling.
+    """
+    n_rows = kv.shape[0]
     if n_rows == 0:
         return
 
@@ -94,20 +117,47 @@ def store_swa_into_unified(
     assert kv.is_contiguous() and kv.dtype == unified_kv.dtype
     assert state_slot.is_contiguous() and positions.is_contiguous()
     assert fp_arg.is_contiguous()
-    _swa_scatter_kernel[(n_rows,)](
-        kv,
-        state_slot,
-        positions,
-        fp_arg,
-        unified_kv,
-        n_rows,
-        ring_stride,
-        win=win,
-        D=D,
-        HAS_FINAL=has_final,
-        BLOCK_D=triton.next_power_of_2(D),
-        num_warps=8,
-    )
+    two_pool = kv_rope is not None
+    assert two_pool == (
+        unified_kv_rope is not None
+    ), "kv_rope and unified_kv_rope come together"
+    if two_pool:
+        assert kv_rope.is_contiguous() and kv_rope.shape[0] == n_rows
+        check_two_pool_pair(
+            unified_kv,
+            unified_kv_rope,
+            rope_width=kv_rope.shape[1],
+            rope_dtype=kv_rope.dtype,
+        )
+
+    def _scatter(src: torch.Tensor, dst: torch.Tensor) -> None:
+        D = src.shape[1]
+        assert dst.shape[1] == D, f"row width {D} does not fit pool {dst.shape[1]}"
+        _swa_scatter_kernel[(n_rows,)](
+            src,
+            state_slot,
+            positions,
+            fp_arg,
+            dst,
+            n_rows,
+            ring_stride,
+            win=win,
+            D=D,
+            HAS_FINAL=has_final,
+            BLOCK_D=triton.next_power_of_2(D),
+            num_warps=8,
+        )
+
+    if kv.element_size() == 1:
+        # single-byte rows (any fp8 variant) are a pure byte move, and the E8M0
+        # scale bytes aren't floats -- uint8 avoids a triton convert for `other=`
+        assert unified_kv.is_contiguous()
+        _scatter(kv.view(torch.uint8), unified_kv.view(torch.uint8))
+    else:
+        _scatter(kv, unified_kv)
+
+    if two_pool:
+        _scatter(kv_rope, unified_kv_rope)
 
 
 @triton.jit
