@@ -1011,7 +1011,8 @@ def test_epd_tokenizer_ignores_foreign_part_before_current_embedding():
         receiver = MMReceiverHTTP.__new__(MMReceiverHTTP)
         receiver.model_type = None
         processor = SimpleNamespace(
-            get_mm_data=lambda _prompt, embeddings, **_kwargs: embeddings
+            get_mm_data=lambda _prompt, embeddings, **_kwargs: embeddings,
+            get_validated_mm_data=lambda _prompt, embeddings, **_kwargs: embeddings,
         )
 
         result = await receiver._recv_mm_data("current", socket, processor, "prompt")

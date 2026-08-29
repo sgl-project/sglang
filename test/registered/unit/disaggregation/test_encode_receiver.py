@@ -228,6 +228,7 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         request._buffer_lock = threading.Lock()
         request._terminal = False
         request._receive_running = False
+        request.registration_future = None
         request.embeddings_buffer = None
         request._pool_slot_id = None
         request.embedding_pool = None
