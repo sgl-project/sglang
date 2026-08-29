@@ -17,6 +17,7 @@ __all__ = [
     "register_xpu_ci",
     "register_musa_ci",
     "register_mlx_ci",
+    "register_mps_ci",
     "ut_parse_one_file",
 ]
 
@@ -37,6 +38,7 @@ class HWBackend(Enum):
     XPU = auto()
     MUSA = auto()
     MLX = auto()
+    MPS = auto()
 
 
 @dataclass
@@ -150,6 +152,19 @@ def register_musa_ci(
     return None
 
 
+def register_mps_ci(
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
+):
+    """Marker for Apple MPS CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
 def register_mlx_ci(
     est_time: float,
     suite: Optional[str] = None,
@@ -172,6 +187,7 @@ REGISTER_MAPPING = {
     "register_xpu_ci": HWBackend.XPU,
     "register_musa_ci": HWBackend.MUSA,
     "register_mlx_ci": HWBackend.MLX,
+    "register_mps_ci": HWBackend.MPS,
 }
 
 
