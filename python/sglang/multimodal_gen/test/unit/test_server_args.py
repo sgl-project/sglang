@@ -1538,7 +1538,9 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertEqual(sana_wm_deployment.dit_layerwise_offload_modes, ("memory",))
         self.assertEqual(sana_wm_deployment.keep_resident_min_available_gb, 70)
-        self.assertEqual(sana_wm_deployment.keep_resident_components, ("text_encoder",))
+        self.assertEqual(
+            sana_wm_deployment.keep_resident_components, ("text_encoder", "vae")
+        )
 
         fast_hunyuan_deployment = FastHunyuanConfig().get_model_deployment_config()
         self.assertEqual(fast_hunyuan_deployment.keep_resident_min_available_gb, 60)
@@ -1589,7 +1591,7 @@ class TestOffloadDefaults(unittest.TestCase):
         )
         high_memory_offload = high_memory_args.layerwise_offload_components or []
         self.assertNotIn("text_encoder", high_memory_offload)
-        self.assertIn("vae", high_memory_offload)
+        self.assertNotIn("vae", high_memory_offload)
 
         constrained_args = self._from_dict_with_pipeline_config(
             SanaWMPipelineConfig(),
