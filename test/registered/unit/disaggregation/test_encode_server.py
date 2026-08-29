@@ -12,6 +12,7 @@ from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
 from sglang.srt.disaggregation.encoder.runtime import execute_encode_pipeline
 from sglang.srt.disaggregation.encoder.server import (
     EncoderDelivery,
+    EncoderMetaRegistry,
     InternalError,
     MMEncoder,
     MooncakeDelivery,
@@ -29,6 +30,79 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class TestEncoderMetaRegistry(CustomTestCase):
+    def test_stale_releases_do_not_block_each_other(self):
+        async def run():
+            registry = EncoderMetaRegistry(wait_timeout=1, sweep_timeout=0.04)
+            registry._pending_at = {"blocked": 0, "fast": 0}
+            blocked_started = asyncio.Event()
+            unblock = asyncio.Event()
+            fast_released = asyncio.Event()
+
+            async def release(req_id):
+                if req_id == "blocked":
+                    blocked_started.set()
+                    await unblock.wait()
+                else:
+                    fast_released.set()
+
+            registry.on_release = release
+            sweeper = asyncio.create_task(registry._sweep_loop())
+            try:
+                await asyncio.wait_for(blocked_started.wait(), timeout=1)
+                await asyncio.wait_for(fast_released.wait(), timeout=1)
+                await asyncio.sleep(0)
+
+                self.assertIn("blocked", registry._pending_at)
+                self.assertNotIn("fast", registry._pending_at)
+                self.assertFalse(sweeper.done())
+
+                unblock.set()
+                while "blocked" in registry._pending_at:
+                    await asyncio.sleep(0)
+            finally:
+                unblock.set()
+                sweeper.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await sweeper
+
+        asyncio.run(run())
+
+    def test_stale_release_error_is_retried(self):
+        async def run():
+            registry = EncoderMetaRegistry(wait_timeout=1, sweep_timeout=0.04)
+            registry._pending_at = {"retry": 0}
+            released = asyncio.Event()
+            attempts = 0
+
+            async def release(req_id):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("transient cleanup failure")
+                released.set()
+
+            registry.on_release = release
+            sweeper = asyncio.create_task(registry._sweep_loop())
+            try:
+                with patch(
+                    "sglang.srt.disaggregation.encoder.server.logger.exception"
+                ) as log_exception:
+                    await asyncio.wait_for(released.wait(), timeout=1)
+                while "retry" in registry._pending_at:
+                    await asyncio.sleep(0)
+
+                self.assertEqual(attempts, 2)
+                log_exception.assert_called_once()
+                self.assertFalse(sweeper.done())
+            finally:
+                sweeper.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await sweeper
+
+        asyncio.run(run())
 
 
 class TestEncoderPreprocessorKimiGrid(CustomTestCase):

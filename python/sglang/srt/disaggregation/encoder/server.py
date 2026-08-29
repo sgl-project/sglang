@@ -120,6 +120,7 @@ class EncoderMetaRegistry:
         self._rid_to_send_done: Dict[str, int] = {}
         self._pending_at: Dict[str, float] = {}
         self._sweeper_task: Optional[asyncio.Task] = None
+        self._stale_release_tasks: Dict[str, asyncio.Task] = {}
         # Set only where the embedding also lives; None in the DP main process.
         self.on_release: Optional[Callable[[str], Awaitable[None]]] = None
 
@@ -148,7 +149,23 @@ class EncoderMetaRegistry:
                 if now - ts > self.sweep_timeout
             ]
             for rid in stale:
-                await self._release(rid)
+                if rid in self._stale_release_tasks:
+                    continue
+                self._stale_release_tasks[rid] = asyncio.create_task(
+                    self._release_stale(rid)
+                )
+
+    async def _release_stale(self, req_id: str) -> None:
+        """Release one stale request without blocking the registry sweeper."""
+        try:
+            await self._release(req_id)
+        except Exception:
+            logger.exception("Failed to release stale encoder request %s", req_id)
+            async with rid_lock:
+                if req_id in self._pending_at:
+                    self._pending_at[req_id] = time.monotonic()
+        finally:
+            self._stale_release_tasks.pop(req_id, None)
 
     async def publish(
         self,
