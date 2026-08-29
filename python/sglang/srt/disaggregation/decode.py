@@ -2552,6 +2552,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         pass
 
 
+def _matches_fixed_demotion_rule(
+    req: Req, *, max_input_len: int, min_output_len: int
+) -> bool:
+    """Fixed demotion rule: short-input requests whose output has grown long."""
+    return (
+        len(req.origin_input_ids) <= max_input_len
+        and len(req.output_ids) >= min_output_len
+    )
+
+
 class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
@@ -2760,28 +2770,32 @@ class SchedulerDisaggregationDecodeMixin:
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
 
-        p50_output_len, _ = self.decode_metric_collector.get_output_len()
+        # A demoted-recovered request re-enters the running batch only after
+        # it stops matching the fixed demotion rule; otherwise it would be
+        # demoted again on the next pressure wave.
+        max_input_len = self.server_args.proactive_demotion_max_input_len
+        min_output_len = self.server_args.proactive_demotion_min_output_len
         for i in range(len(self.waiting_queue)):
             req = self.waiting_queue[i]
             # we can only add at least `num_not_used_batch` new batch to the running queue
-            if (num_remain_used_batch > 0 
+            if (num_remain_used_batch > 0
                 and (
-                    not req.is_demoted_recovered 
-                    or (
-                        p50_output_len is not None 
-                        and len(req.output_ids)
-                        <= self.server_args.candidate_demotion_output_len_threthold 
-                        * p50_output_len))):
+                    not req.is_demoted_recovered
+                    or not _matches_fixed_demotion_rule(
+                        req,
+                        max_input_len=max_input_len,
+                        min_output_len=min_output_len,
+                    ))):
                 can_run_list.append(req)
                 num_remain_used_batch -= 1
             else:
                 waiting_queue.append(req)
                 if req.is_demoted_recovered:
                     logger.warning(
-                        "Demoted request is promoted again, rid=%s, output_len=%s, p50_output_len=%s",
+                        "Demoted request is promoted again, rid=%s, input_len=%s, output_len=%s",
                         req.rid,
+                        len(req.origin_input_ids),
                         len(req.output_ids),
-                        p50_output_len,
                     )
                 
         # Need to double check the promoted demote recovered req if there are slots.
@@ -2839,33 +2853,17 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def need_to_proactive_retract_request(self: Scheduler) -> bool:
-        # Experimental: strategy to proactively demote the longest request when
-        # the output length distribution is imbalanced and the cache usage is high.
-        collector = getattr(self, "decode_metric_collector", None)
+        # Experimental fixed-rule demotion: trigger on cache pressure alone,
+        # with no output-length imbalance gate.
+        collector = self.decode_metric_collector
         if collector is None:
             return False
 
-        updated = collector.maybe_update()
-        if updated is not None:
-            p50_output_len, p95_output_len = updated
-            self.if_output_len_imbalance = (
-                p50_output_len is not None
-                and p95_output_len is not None
-                and p50_output_len > 0
-                and p95_output_len
-                >= p50_output_len
-                * self.server_args.proactive_decode_demotion_output_len_threthold
-            )
-            logger.warning(
-                "Proactive decode demotion: p50_output_len=%s p95_output_len=%s",
-                p50_output_len,
-                p95_output_len,
-            )
+        # The fixed rule no longer consumes quantiles; keep them ticking only
+        # so the collector stays warm for observability.
+        collector.maybe_update()
 
         if self.remain_cpu_demote_tokens <= 0:
-            return False
-
-        if not self.if_output_len_imbalance:
             return False
 
         cache_usage = self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
@@ -2876,30 +2874,30 @@ class SchedulerDisaggregationDecodeMixin:
         if batch is None or batch.is_empty():
             return False
 
-        collector = getattr(self, "decode_metric_collector", None)
-        p50_output_len = getattr(collector, "p50_output_len", None)
-        if p50_output_len is None or p50_output_len <= 0:
-            return False
+        max_input_len = self.server_args.proactive_demotion_max_input_len
+        min_output_len = self.server_args.proactive_demotion_min_output_len
 
-        candidate_threshold = (
-            self.server_args.candidate_demotion_output_len_threthold
-        )
+        def is_demotion_candidate(req: Req) -> bool:
+            return (
+                not req.finished()
+                and not req.is_retracted
+                and not req.is_demoted
+                and _matches_fixed_demotion_rule(
+                    req,
+                    max_input_len=max_input_len,
+                    min_output_len=min_output_len,
+                )
+            )
+
         demoted_any = False
-        candidates = [
-            req
-            for req in batch.reqs
-            if not req.finished()
-            and not req.is_retracted
-            and not req.is_demoted
-            and len(req.output_ids) > candidate_threshold * p50_output_len
-        ]
+        candidates = [req for req in batch.reqs if is_demotion_candidate(req)]
         candidates.sort(key=lambda req: req.seqlen, reverse=True)
         # Put demoted_recovered requests in the waiting queue to the front of
         # the candidates list to be demoted first.
-        p50_output_len, _ = self.decode_metric_collector.get_output_len()
         demoted_recovered_candidates = [
-            req for req in self.waiting_queue if req.is_demoted_recovered
-            and len(req.output_ids) > candidate_threshold * p50_output_len
+            req
+            for req in self.waiting_queue
+            if req.is_demoted_recovered and is_demotion_candidate(req)
         ]
         candidates = demoted_recovered_candidates + candidates
         demoted_reqs = []

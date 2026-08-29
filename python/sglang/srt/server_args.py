@@ -3223,19 +3223,19 @@ class ServerArgs:
     ] = None
     enable_proactive_decode_promotion: A[
         bool,
-        "Enable scheduler-local proactive decode demotion based on output-length imbalance.",
+        "Enable scheduler-local proactive decode demotion of short-input, long-output requests under cache pressure.",
         NS("disagg"),
     ] = False
     proactive_decode_demotion_output_len_threthold: A[
         int,
-        "P95/P50 output-length ratio that enables proactive decode demotion.",
+        "P95/P50 output-length ratio gate; unused by the fixed-rule demotion path.",
         NS("disagg"),
     ] = 8
     proactive_decode_demotion_cache_usage: A[
         float,
         "KV pool usage ratio that enables proactive decode demotion.",
         NS("disagg"),
-    ] = 0.95
+    ] = 0.70
     proactive_safe_cpu_demote_cache_usage: A[
         float,
         "Total KV that proactive demotion may keep offloaded to CPU, as a ratio of the GPU KV pool size.",
@@ -3243,9 +3243,19 @@ class ServerArgs:
     ] = 0.2
     candidate_demotion_output_len_threthold: A[
         float,
-        "Output-length multiplier over P50 for proactive demotion candidates.",
+        "Output-length multiplier over P50; unused by the fixed-rule demotion path.",
         NS("disagg"),
     ] = 2.0
+    proactive_demotion_max_input_len: A[
+        int,
+        "Maximum input length in tokens for a proactive demotion candidate.",
+        NS("disagg"),
+    ] = 4096
+    proactive_demotion_min_output_len: A[
+        int,
+        "Minimum generated output length in tokens for a proactive demotion candidate.",
+        NS("disagg"),
+    ] = 8192
     proactive_demotion_recovery_duration: A[
         float,
         "Minimum seconds a proactively demoted request stays offloaded.",
@@ -4154,6 +4164,14 @@ class ServerArgs:
         if self.candidate_demotion_output_len_threthold <= 0.0:
             raise ValueError(
                 "--candidate-demotion-output-len-threthold must be positive."
+            )
+        if self.proactive_demotion_max_input_len <= 0:
+            raise ValueError(
+                "--proactive-demotion-max-input-len must be positive."
+            )
+        if self.proactive_demotion_min_output_len <= 0:
+            raise ValueError(
+                "--proactive-demotion-min-output-len must be positive."
             )
         if self.proactive_demotion_recovery_duration < 0.0:
             raise ValueError(

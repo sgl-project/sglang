@@ -77,9 +77,9 @@ def _make_demotion_scheduler(batch, *, budget, waiting_queue=(), enable_metrics=
         waiting_queue=list(waiting_queue),
         enable_overlap=False,
         remain_cpu_demote_tokens=budget,
-        server_args=SimpleNamespace(candidate_demotion_output_len_threthold=1.0),
-        decode_metric_collector=SimpleNamespace(
-            p50_output_len=10, get_output_len=lambda: (10, 32)
+        server_args=SimpleNamespace(
+            proactive_demotion_max_input_len=10,
+            proactive_demotion_min_output_len=11,
         ),
         disagg_decode_prealloc_queue=prealloc_queue,
         new_token_ratio_tracker=SimpleNamespace(current=0.0),
@@ -140,10 +140,11 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         args = ServerArgs(model_path="dummy")
         args.resolve_once()
         self.assertFalse(args.enable_proactive_decode_promotion)
-        self.assertEqual(args.proactive_decode_demotion_output_len_threthold, 8)
-        self.assertEqual(args.proactive_decode_demotion_cache_usage, 0.95)
+        self.assertEqual(args.proactive_decode_demotion_cache_usage, 0.70)
         self.assertEqual(args.proactive_safe_cpu_demote_cache_usage, 0.2)
         self.assertEqual(args.candidate_demotion_output_len_threthold, 2.0)
+        self.assertEqual(args.proactive_demotion_max_input_len, 4096)
+        self.assertEqual(args.proactive_demotion_min_output_len, 8192)
         self.assertEqual(args.proactive_demotion_recovery_duration, 180.0)
 
         with self.assertRaises(ValueError):
@@ -158,6 +159,20 @@ class TestProactiveDecodeDemotion(CustomTestCase):
                 model_path="dummy",
                 disaggregation_mode="decode",
                 proactive_safe_cpu_demote_cache_usage=0.0,
+            ).resolve_once()
+
+        with self.assertRaises(ValueError):
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="decode",
+                proactive_demotion_max_input_len=0,
+            ).resolve_once()
+
+        with self.assertRaises(ValueError):
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="decode",
+                proactive_demotion_min_output_len=0,
             ).resolve_once()
 
     def _make_demoted_queue(self, req, recovery_duration):
@@ -225,7 +240,6 @@ class TestProactiveDecodeDemotion(CustomTestCase):
     def _make_retract_check_scheduler(self, remain_cpu_demote_tokens):
         return SimpleNamespace(
             decode_metric_collector=SimpleNamespace(maybe_update=lambda: None),
-            if_output_len_imbalance=True,
             remain_cpu_demote_tokens=remain_cpu_demote_tokens,
             pool_stats_observer=SimpleNamespace(
                 get_pool_stats=lambda: SimpleNamespace(
@@ -233,8 +247,7 @@ class TestProactiveDecodeDemotion(CustomTestCase):
                 )
             ),
             server_args=SimpleNamespace(
-                proactive_decode_demotion_output_len_threthold=8,
-                proactive_decode_demotion_cache_usage=0.95,
+                proactive_decode_demotion_cache_usage=0.70,
             ),
         )
 
@@ -248,19 +261,18 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         # Budget remaining allows a new wave even mid-recovery.
         self.assertTrue(check(self._make_retract_check_scheduler(100)))
 
-    def test_empty_window_clears_stale_imbalance_flag(self):
-        """An early return on an empty quantile window left a stale
-        if_output_len_imbalance=True driving demotion waves forever."""
+    def test_triggers_without_output_len_quantiles(self):
+        """The fixed rule must fire on cache pressure alone; an empty quantile
+        window (no completed requests yet) must not suppress demotion."""
         scheduler = self._make_retract_check_scheduler(100)
         scheduler.decode_metric_collector = SimpleNamespace(
             maybe_update=lambda: (None, None)
         )
-        self.assertFalse(
+        self.assertTrue(
             SchedulerDisaggregationDecodeMixin.need_to_proactive_retract_request(
                 scheduler
             )
         )
-        self.assertFalse(scheduler.if_output_len_imbalance)
 
     def test_proactive_demotion_filters_and_spends_budget(self):
         short = _make_demotion_candidate("short", 10, 5)
