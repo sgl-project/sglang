@@ -21,7 +21,7 @@ class DsparkTpSync:
     def sync(self, values: torch.Tensor) -> torch.Tensor:
         if not self._enabled:
             return values
-        return self._tp_group.broadcast_capture_safe(values, src=0)
+        return self._tp_group.broadcast(values, src=0)
 
     def broadcast_optional_int(self, value: Optional[int]) -> Optional[int]:
         if not self._enabled:

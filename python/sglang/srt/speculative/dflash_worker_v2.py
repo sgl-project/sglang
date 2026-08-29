@@ -1649,8 +1649,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_input=draft_input,
             )
-            self._tp_group.broadcast_capture_safe(accept_len, src=0)
-            self._tp_group.broadcast_capture_safe(bonus, src=0)
+            self._tp_group.broadcast(accept_len, src=0)
+            self._tp_group.broadcast(bonus, src=0)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         elif (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
@@ -1662,14 +1662,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
-            self._tp_group.broadcast_capture_safe(accept_len, src=0)
-            self._tp_group.broadcast_capture_safe(bonus, src=0)
+            self._tp_group.broadcast(accept_len, src=0)
+            self._tp_group.broadcast(bonus, src=0)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
             target_predict = torch.argmax(next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
             )
-            self._tp_group.broadcast_capture_safe(target_predict, src=0)
+            self._tp_group.broadcast(target_predict, src=0)
             if self._use_triton_accept_bonus:
                 try:
                     (
@@ -1769,7 +1769,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch_output.logits_output,
                 batch_output.next_token_ids,
             )
-            self._tp_group.broadcast_capture_safe(next_token_ids, src=0)
+            self._tp_group.broadcast(next_token_ids, src=0)
             batch_output.new_seq_lens = batch.seq_lens
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)

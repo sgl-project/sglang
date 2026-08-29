@@ -1473,24 +1473,6 @@ class GroupCoordinator:
         )
         return input_
 
-    def broadcast_capture_safe(self, input_: torch.Tensor, src: int = 0):
-        assert 0 <= src < self.world_size, f"Invalid src rank ({src})"
-
-        if self.world_size == 1:
-            return input_
-        if input_.device.type != "cuda" or not torch.cuda.is_current_stream_capturing():
-            return self.broadcast(input_, src=src)
-
-        # PyNCCL is the faster path under capture, but not a precondition:
-        # a split attention-TP group is built without one, and the
-        # process-group broadcast captures and replays correctly.
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is None or not pynccl_comm.available:
-            return self.broadcast(input_, src=src)
-        with pynccl_comm.change_state(enable=True):
-            pynccl_comm.broadcast(input_, src=src)
-        return input_
-
     def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
         """Broadcast the input object.
         NOTE: `src` is the local rank of the source rank.
