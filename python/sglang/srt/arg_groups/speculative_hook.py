@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _speculative_moe_runner_default,
+    attention_backends_of,
     declare_direct_writes,
     declare_resolution,
     model_config_of,
@@ -578,7 +579,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
 
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:
-        from sglang.srt.arg_groups.overrides import attention_backends_of
 
         draft_backend, _ = attention_backends_of(resolved_view(server_args))
     if draft_backend is None:
@@ -660,7 +660,6 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
 def _handle_eagle_family(server_args: ServerArgs) -> None:
 
     cfg = resolving_view(server_args)
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     if (
         cfg.speculative_algorithm == "STANDALONE"

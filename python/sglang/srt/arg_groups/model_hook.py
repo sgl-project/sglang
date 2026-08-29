@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     _hrm_text_attention_force,
     _mamba_radix_cache_resolution,
     _sparse_head_overlap_disable,
+    attention_backends_of,
     collect_model_override_declarations,
     declare_resolution,
     mamba_cache_chunk_size,
@@ -50,7 +51,6 @@ logger = logging.getLogger(__name__)
 
 
 def handle_model_specific_adjustments(server_args: Any):
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (

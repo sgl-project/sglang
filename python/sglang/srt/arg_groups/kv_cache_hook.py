@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
     declare_resolution,
     resolved_view,
     resolving_view,
@@ -38,7 +39,6 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
 
 def handle_kv4_compatibility(server_args: Any) -> None:
     """Check FP4 KV cache compatibility with the attention backend"""
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
 
@@ -123,7 +123,6 @@ def handle_prefill_only_disable_kv_cache(server_args: Any) -> None:
     still None, backends haven't settled yet and the resolved (prefill,
     decode) pair would be a stale (None, None).
     """
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
 
@@ -199,7 +198,6 @@ def handle_cache_compatibility(server_args: Any) -> None:
 
 
 def handle_unified_memory_pool(server_args: Any) -> None:
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     if not cfg.enable_unified_memory:
@@ -280,7 +278,6 @@ def handle_page_major_kv_layout(server_args: Any):
     # The unified pool stores state in the page-major envelope-strided layout, so
     # enabling it implies --enable-page-major-kv-layout — routing it through the
     # single page-major path + stride-aware Triton asserts (set before the guard).
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     if cfg.enable_unified_memory:

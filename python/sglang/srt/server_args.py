@@ -58,6 +58,7 @@ from sglang.srt.arg_groups.overrides import (
     remote_instance_transfer_engine_of,
     resolution_projection,
     resolving_view,
+    supports_mamba_cache_extra_buffer,
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -3776,7 +3777,6 @@ class ServerArgs:
         return reserved_mem
 
     def _support_mamba_cache_extra_buffer(self, model_arch: str):
-        from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
 
         return supports_mamba_cache_extra_buffer(self, model_arch)
 

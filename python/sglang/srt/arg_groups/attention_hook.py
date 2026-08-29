@@ -20,6 +20,7 @@ from sglang.srt.arg_groups.overrides import (
     _intel_xpu_page_constraint,
     _mla_backend_page_constraints,
     _mla_kv_cache_dtype_checks,
+    attention_backends_of,
     declare_resolution,
     mamba_extra_buffer_of,
     model_config_of,
@@ -45,7 +46,6 @@ logger = logging.getLogger(__name__)
 
 
 def handle_attention_backend_compatibility(server_args: Any):
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     model_config = model_config_of(server_args)
@@ -454,7 +454,6 @@ def handle_multi_item_scoring(server_args: Any):
     changing it silently could surprise users who intentionally picked
     a non-flashinfer backend.
     """
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     if not cfg.enable_mis:

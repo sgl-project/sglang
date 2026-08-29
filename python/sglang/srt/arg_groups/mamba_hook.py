@@ -8,6 +8,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     resolving_view,
+    supports_mamba_cache_extra_buffer,
 )
 from sglang.srt.utils.common import (
     is_cuda,
@@ -103,7 +104,6 @@ def handle_int8_mamba_checkpoint(server_args: Any):
 
 
 def validate_mamba_extra_buffer(view, model_arch: str, *, mamba_cache_chunk_size_of):
-    from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
 
     assert supports_mamba_cache_extra_buffer(
         view, model_arch
