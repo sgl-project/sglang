@@ -67,9 +67,15 @@ class TestBadInputIsClientError(CustomTestCase):
         image = base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJSwAAAABJRU5ErkJggg=="
         )
-        with self.assertRaises(ValueError) as ctx:
-            _StubProcessor._load_single_item(image, Modality.IMAGE)
-        self.assertIsInstance(ctx.exception.__cause__.__cause__, OSError)
+        for discard_alpha_channel in (True, False):
+            with self.subTest(discard_alpha_channel=discard_alpha_channel):
+                with self.assertRaises(ValueError) as ctx:
+                    _StubProcessor._load_single_item(
+                        image,
+                        Modality.IMAGE,
+                        discard_alpha_channel=discard_alpha_channel,
+                    )
+                self.assertIsInstance(ctx.exception.__cause__.__cause__, OSError)
 
     def test_undecodable_audio_bytes(self):
         # soundfile raises LibsndfileError, a RuntimeError -- not a ValueError.
