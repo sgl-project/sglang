@@ -182,9 +182,6 @@ class DecodeHiCacheTransferMixin:
             and decode_req.prefix_match.prefetch_registered
         ):
             self.tree_cache.release_aborted_request(decode_req.req.rid)
-        if decode_req.hicache_restored_node is not None:
-            self.tree_cache.dec_lock_ref(decode_req.hicache_restored_node)
-            decode_req.hicache_restored_node = None
 
     def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
         """Queue one L2->L1 load_back op for ``dr``; True iff a DMA was queued.
@@ -231,13 +228,21 @@ class DecodeHiCacheTransferMixin:
                 pm.l3_storage_hit_length,
             )
             dr.hicache_restore_status = HiCacheRestoreResult.FAILED
+            # First abort scenario: match_prefix_for_req reassigns req.last_node. If last_node matches 
+            # more tokens than pm.last_device_node, the excess matched portion is unlocked without 
+            # being locked first, ultimately causing a memory leak. Therefore, ensure it always equals pm.last_device_node.            
+            dr.req.last_node = pm.last_device_node
             return False
 
         dr.hicache_restored_kv_indices = torch.cat(
             [rematch.device_indices[pm.l1_prefix_len :], new_indices]
         )
+        # Second abort scenario: If poll == KVPoll.Failed, similar to the first abort scenario, 
+        # req.last_node may not equal pm.last_device_node. Freeing req.last_node would result in a memory leak.        
+        self.tree_cache.dec_lock_ref(pm.last_device_node)
         dr.hicache_restored_node = restored_node
         self.tree_cache.inc_lock_ref(restored_node)
+        dr.req.last_node = restored_node
 
         if len(new_indices) == 0:
             # Whole prefix already on device; no DMA needed.
@@ -301,8 +306,6 @@ class DecodeHiCacheTransferMixin:
         prefix_match = decode_req.prefix_match
         if prefix_match is None or not prefix_match.needs_local_restore:
             return
-
-        self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
 
         self.tree_cache.req_to_token_pool.write(
             (
