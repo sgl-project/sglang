@@ -271,7 +271,8 @@ class Lfm2ShortConv(nn.Module):
         # The backend owns the per-request conv-state plumbing (slot indices,
         # prefix mask, cu-seqlens, cuda-graph buffers); this layer just runs its
         # depthwise conv against the returned handle.
-        meta = get_attn_backend().conv_state_metadata(self.layer_idx, forward_batch)
+        backend = get_attn_backend()
+        meta = backend.conv_state_metadata(self.layer_idx, forward_batch)
         conv_state = meta.layer_cache.conv[0]
 
         # Project and split into gates: B (pre-conv), C (post-conv), x (input)
@@ -302,6 +303,11 @@ class Lfm2ShortConv(nn.Module):
                 conv_states=conv_state,
                 activation=None,
             ).transpose(0, 1)
+            # Radix mamba-cache checkpoint (extra_buffer strategy only): the
+            # conv state is the last ``conv_L_cache - 1`` rows of ``Bx``, so
+            # the snapshot at the chunk-aligned track position is a gather over
+            # it. No-op under ``no_buffer`` (LFM2's current default).
+            backend.track_conv_states_extend((conv_state,), (Bx,))
 
         output, _ = self.out_proj(C_gate * conv_out)
         return output
@@ -488,6 +494,11 @@ class Lfm2Model(nn.Module):
                 residual=residual,
                 forward_batch=forward_batch,
             )
+
+        # Radix mamba-cache checkpoint, decode side (extra_buffer strategy
+        # only): one launch for every conv layer, after the last has updated
+        # its state. See ShortConvAttnBackend.track_conv_states_decode.
+        get_attn_backend().track_conv_states_decode(forward_batch)
 
         return self.embedding_norm(hidden_states)
 

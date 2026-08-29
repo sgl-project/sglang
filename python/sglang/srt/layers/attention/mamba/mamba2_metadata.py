@@ -49,7 +49,9 @@ class ForwardMetadata:
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
     retrieve_parent_token: Optional[torch.Tensor] = None
-    # For prefill radix cache
+    # For prefill radix cache. One tensor for a single-conv backend (GDN /
+    # KDA / Mamba2); ShortConvAttnBackend overrides the builder and puts a
+    # LIST here, one entry per conv state (ZAYA1 has two).
     track_conv_indices: Optional[torch.Tensor] = None
     track_ssm_h_src: Optional[torch.Tensor] = None
     track_ssm_h_dst: Optional[torch.Tensor] = None

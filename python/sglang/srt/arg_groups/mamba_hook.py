@@ -103,11 +103,38 @@ def handle_int8_mamba_checkpoint(server_args: Any):
 
 
 def validate_mamba_extra_buffer(view, model_arch: str, *, mamba_cache_chunk_size_of):
-    from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
+    from sglang.srt.arg_groups.overrides import (
+        requires_short_conv_track_limits,
+        supports_mamba_cache_extra_buffer,
+    )
 
     assert supports_mamba_cache_extra_buffer(
         view, model_arch
     ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
+    if requires_short_conv_track_limits(model_arch):
+        # The extend snapshot's data-dependent row count is the symptom; the
+        # cause is that no prefill graph backend this model can reach fixes the
+        # request axis. Only Full pads it (PhaseConfig.full_prefill_max_req);
+        # Breakable / TcPiecewise bake the capture batch's request count, and
+        # PrefillCudaGraphRunner.capture_prepare builds ONE synthetic request,
+        # so a bs=3 extend replays a graph shaped for bs=1. Full is out of reach
+        # anyway: ShortConvAttnBackend.init_forward_metadata_out_graph returns
+        # decode-shaped metadata (MambaAttnBackendBase._replay_metadata).
+        assert view.cuda_graph_backend_prefill in (None, "disabled"), (
+            f"extra_buffer for {model_arch} is not supported together with a "
+            "prefill CUDA graph: the captured extend path has no fixed request "
+            "axis, so the track snapshot (and every other per-request tensor) "
+            "freezes at the capture batch's one request. Use "
+            "--mamba-radix-cache-strategy no_buffer, or "
+            "--cuda-graph-backend-prefill disabled."
+        )
+        # The snapshot has to land on the accepted step, and the decode graph
+        # runner drops its mamba-track buffers outright when a spec algorithm is
+        # set, so it would silently never fire.
+        assert view.speculative_algorithm is None, (
+            f"extra_buffer for {model_arch} does not support speculative "
+            "decoding; use --mamba-radix-cache-strategy no_buffer."
+        )
     assert (
         is_cuda() or is_musa() or is_npu() or is_hip() or is_xpu()
     ), "extra_buffer needs CUDA/MUSA/NPU/ROCm/XPU (FLA)."

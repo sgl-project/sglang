@@ -1834,8 +1834,27 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        # Short-conv hybrid served by ShortConvAttnBackend, which implements the
+        # track snapshot for both of ZAYA1's conv entries. LFM2 rides the same
+        # backend and derivation but is deliberately NOT listed: unvalidated on
+        # hardware, and no_buffer is a safe default for it.
+        "ZayaForCausalLM",
     }
 )
+
+
+# Archs whose extra_buffer track is implemented by ShortConvAttnBackend. Its
+# extend-side snapshot rides a captured prefill graph's request axis, which
+# Breakable / TcPiecewise freeze at the capture batch's single request, and it
+# has no per-draft-token verify hook -- so it refuses a prefill CUDA graph and
+# speculative decoding; see requires_short_conv_track_limits and the reasoning
+# in mamba_hook.validate_mamba_extra_buffer.
+_SHORT_CONV_TRACK_ARCHS = frozenset({"ZayaForCausalLM"})
+
+
+def requires_short_conv_track_limits(model_arch: str) -> bool:
+    """Whether extra_buffer on ``model_arch`` is served by the short-conv track."""
+    return model_arch in _SHORT_CONV_TRACK_ARCHS
 
 
 def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
@@ -3278,6 +3297,59 @@ def max_prefill_buffer_tokens(server_args: Any) -> int:
     return tokens
 
 
+try:
+    from sglang.kernels.ops.attention.fla.chunk_delta_h import (
+        CHUNK_SIZE as FLA_CHUNK_SIZE,
+    )
+except ImportError:
+    # Kept guarded so this module stays importable without the kernel package.
+    # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE.
+    FLA_CHUNK_SIZE = 64
+
+
+def _max_conv_state_window(hf_config: Any) -> int:
+    """Widest conv sliding window over a hybrid model's conv states, or 0.
+
+    The window is the trailing axis of each ``mamba2_cache_params.shape.conv``
+    entry, and deliberately the ONLY thing read here: it is the one part of the
+    conv-state shape that does not depend on the TP width, so a memoized answer
+    is the same either side of distributed init.
+
+    Returns 0 when there is no conv state or the shape cannot be built yet;
+    callers must treat 0 as "unknown" and fall back to the generic chunk, never
+    to a smaller one.
+    """
+    for cfg in (hf_config, getattr(hf_config, "text_config", None)):
+        if cfg is None:
+            continue
+        try:
+            params = getattr(cfg, "mamba2_cache_params", None)
+        except (AttributeError, AssertionError, RuntimeError, ValueError):
+            continue
+        conv_shapes = getattr(getattr(params, "shape", None), "conv", None)
+        if conv_shapes:
+            return max(int(shape[-1]) for shape in conv_shapes)
+    return 0
+
+
+def _short_conv_cache_chunk_size(hf_config: Any) -> int:
+    """Radix caching granularity for a model with no chunked recurrence.
+
+    A short-conv model reports ``mamba_chunk_size == 1``, honest about the model
+    but useless as a caching granularity: it makes every token a caching point,
+    and it is below the conv window, so a checkpoint cannot even be built.
+
+    Use the generic FLA chunk instead, raised to clear the widest conv window --
+    the extend-side snapshot gathers ``window`` rows ending at the aligned
+    position -- and rounded up to a whole number of ``FLA_CHUNK_SIZE`` so the
+    caller's page-size divisibility assert still holds.
+    """
+    fla_chunk_size = FLA_CHUNK_SIZE
+    floor = _max_conv_state_window(hf_config) + 1
+    num_chunks = max(1, -(-floor // fla_chunk_size))
+    return fla_chunk_size * num_chunks
+
+
 def mamba_cache_chunk_size(server_args: Any) -> int:
     # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE
     # (or mamba_chunk_size if it is defined in the model's config) and page_size.
@@ -3290,16 +3362,17 @@ def mamba_cache_chunk_size(server_args: Any) -> int:
 
     if not hasattr(server_args, "_mamba_cache_chunk_size"):
 
-        try:
-            from sglang.kernels.ops.attention.fla.chunk_delta_h import (
-                CHUNK_SIZE as FLA_CHUNK_SIZE,
-            )
-        except ImportError:
-            # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE
-            FLA_CHUNK_SIZE = 64
-
         hf_config = model_config_of(server_args).hf_config
-        chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
+        # The *caching* chunk, not the model's chunk-scan length. For an SSM
+        # the two coincide (a scan checkpoints at chunk boundaries anyway).
+        # A conv-only model reports mamba_chunk_size == 1 -- "no chunked
+        # recurrence", not "cache every token" -- so it takes the short-conv
+        # derivation instead.
+        scan_chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
+        if scan_chunk_size > 1:
+            chunk_size = scan_chunk_size
+        else:
+            chunk_size = _short_conv_cache_chunk_size(hf_config)
         page_size = resolved_view(server_args).page_size
         assert (
             max(chunk_size, page_size) % min(chunk_size, page_size) == 0
