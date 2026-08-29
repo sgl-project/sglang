@@ -44,6 +44,7 @@ class _FakeServerArgs:
         self.trust_remote_code = True
         self.layerwise_components = set()
         self.component_quantizations = {}
+        self.component_precisions = {}
 
     def resolve_component_attention_backend(self, _component_name):
         return None, None

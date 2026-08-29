@@ -59,6 +59,12 @@ def resolve_decode_precision(
 
 
 def resolve_component_precision(server_args, module_name: str) -> Optional[torch.dtype]:
+    exact_precision = server_args.component_precisions.get(module_name)
+    if exact_precision is not None:
+        return precision_to_dtype(
+            exact_precision, f"component_precisions.{module_name}"
+        )
+
     pipeline_config = getattr(server_args, "pipeline_config", None)
     if pipeline_config is None:
         return None

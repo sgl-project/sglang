@@ -168,6 +168,18 @@ class ComponentLoader(ABC):
     ) -> dict[str, Any]:
         return {}
 
+    def component_load_precision(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        """Return an exact precision override or reject an unsupported one."""
+        precision = server_args.component_precisions.get(component_name)
+        if precision is not None:
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} does not support an exact component precision "
+                "override"
+            )
+        return None
+
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
@@ -236,6 +248,7 @@ class ComponentLoader(ABC):
 
         """
         self._native_load_manages_placement = False
+        self.component_load_precision(server_args, component_name)
         component_quantization = server_args.component_quantizations.get(component_name)
         if (
             component_quantization is not None
