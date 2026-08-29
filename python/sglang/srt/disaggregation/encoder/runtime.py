@@ -186,6 +186,16 @@ class EncoderScheduler:
         await self.pending_queue.put(pending)
         try:
             return await asyncio.wait_for(pending.future, timeout=self.request_timeout)
+        except asyncio.CancelledError:
+            pending.future.cancel()
+            req_id = request.get("req_id")
+            try:
+                await asyncio.shield(self.encoder.release_request(req_id))
+            except Exception:
+                logger.exception(
+                    "Failed to release cancelled encoder request %s", req_id
+                )
+            raise
         except asyncio.TimeoutError:
             if not pending.future.done():
                 pending.future.cancel()

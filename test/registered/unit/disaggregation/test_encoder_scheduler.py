@@ -211,6 +211,81 @@ def test_video_request_is_validated_before_tp_broadcast():
     asyncio.run(run_test())
 
 
+def test_cancelled_queued_request_is_retired():
+    class FakeEncoder:
+        def __init__(self):
+            self.released = []
+
+        async def release_request(self, req_id):
+            self.released.append(req_id)
+
+    async def run_test():
+        encoder = FakeEncoder()
+        scheduler = EncoderScheduler(
+            encoder=encoder,
+            send_sockets=[],
+            max_batch_size=1,
+        )
+        task = asyncio.create_task(scheduler.submit({"req_id": "cancelled"}))
+        await asyncio.sleep(0)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        pending = scheduler.pending_queue.get_nowait()
+        assert pending.future.cancelled()
+        assert encoder.released == ["cancelled"]
+
+    asyncio.run(run_test())
+
+
+def test_cancelled_active_request_is_retired_without_stopping_encode():
+    class FakeEncoder:
+        def __init__(self):
+            self.encode_dispatch_lock = asyncio.Lock()
+            self.encode_started = asyncio.Event()
+            self.finish_encode = asyncio.Event()
+            self.released = asyncio.Event()
+
+        async def batch_encode(self, requests, _modality):
+            self.encode_started.set()
+            await self.finish_encode.wait()
+            return [(1, 2, 3, None, None) for _ in requests]
+
+        async def release_request(self, _req_id):
+            self.released.set()
+
+    async def run_test():
+        encoder = FakeEncoder()
+        scheduler = EncoderScheduler(
+            encoder=encoder,
+            send_sockets=[],
+            max_batch_size=1,
+        )
+        scheduler.start()
+        request = {
+            "req_id": "cancelled",
+            "modality": "image",
+            "mm_items": [object()],
+            "num_parts": 1,
+            "part_idx": 0,
+        }
+        task = asyncio.create_task(scheduler.submit(request))
+        await encoder.encode_started.wait()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert encoder.released.is_set()
+        assert not scheduler._worker_task.done()
+        encoder.finish_encode.set()
+        await scheduler.stop()
+
+    asyncio.run(run_test())
+
+
 @pytest.mark.parametrize(
     ("model_type", "configured", "explicit", "expected"),
     [
