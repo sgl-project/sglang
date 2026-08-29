@@ -27,6 +27,7 @@ class ReqDllmMixin:
             else None
         )
         self.dllm_block_offset = 0
+        self.dllm_canvas_output_len = 0
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
@@ -74,6 +75,12 @@ class ReqDllmMixin:
 
     def _init_fill_ids_for_dllm(self: Req):
         if self.dllm_config.needs_full_prefill:
+            if (
+                self.dllm_initialized
+                and len(self.output_ids) == self.dllm_canvas_output_len
+            ):
+                return
+
             remaining = max(
                 self.sampling_params.max_new_tokens - len(self.output_ids), 0
             )
@@ -83,6 +90,7 @@ class ReqDllmMixin:
                 + self.output_ids
                 + array("q", [self.dllm_config.mask_id] * remaining)
             )
+            self.dllm_canvas_output_len = len(self.output_ids)
             self.dllm_initialized = True
             return
 
