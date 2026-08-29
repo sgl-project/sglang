@@ -1038,9 +1038,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         state.phase = _InsertPhase.TAIL
 
     def _needs_incremental_component_backup(self, node: UnifiedTreeNode) -> bool:
+        components = self.components
+        if self.is_write_back:
+            swa = self.components_by_type.get(ComponentType.SWA)
+            components = () if swa is None else (swa,)
         return any(
             component.needs_incremental_backup(node)
-            for component in self.components
+            for component in components
             if component.component_type != BASE_COMPONENT_TYPE
         )
 
@@ -1054,7 +1058,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node = state.target_node
         return (
             self.enable_hicache
-            and not self.is_write_back
             and node.backuped
             and node.write_through_pending_id is None
             and self._needs_incremental_component_backup(node)
@@ -1853,7 +1856,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for comp in self.components:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
-            if node.component_data[comp.component_type].host_value is not None:
+            cd = node.component_data[comp.component_type]
+            if cd.host_value is not None and not comp.needs_incremental_backup(node):
                 continue
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
@@ -2063,10 +2067,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self._update_duplicate_tracking(node)
             node = node.parent
 
-    def mark_write_through_pending(self, node_id: NodeId) -> None:
-        """Mark a node as having an in-flight write-through backup."""
-        node = self.node_by_id(node_id)
-        node.write_through_pending_id = node_id
+    def mark_write_through_pending(
+        self, node_ids: list[NodeId], ack_id: NodeId
+    ) -> None:
+        """Mark every node covered by one in-flight write-through backup."""
+        for node_id in node_ids:
+            node = self.node_by_id(node_id)
+            assert node.write_through_pending_id in (None, ack_id)
+            node.write_through_pending_id = ack_id
 
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the

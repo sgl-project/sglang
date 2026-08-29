@@ -80,13 +80,29 @@ class SWAComponent(TreeComponent):
 
     component_type = ComponentType.SWA
 
+    def _dirty_backup_window(self, node: UnifiedTreeNode) -> list[UnifiedTreeNode]:
+        if not self.tree_core.has_swa_host_pool:
+            return []
+
+        ct = self.component_type
+        covered = 0
+        dirty: list[UnifiedTreeNode] = []
+        cur = node
+        while (
+            cur is not self.tree_core.root_node and covered < self.sliding_window_size
+        ):
+            cd = cur.component_data[ct]
+            value = cd.value if cd.value is not None else cd.host_value
+            if value is None:
+                break
+            covered += len(value)
+            if cd.value is not None and cd.host_value is None:
+                dirty.append(cur)
+            cur = cur.parent
+        return dirty
+
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
-        data = node.component_data[self.component_type]
-        return (
-            self.tree_core.has_swa_host_pool
-            and data.value is not None
-            and data.host_value is None
-        )
+        return bool(self._dirty_backup_window(node))
 
     def reset_session_state(self) -> None:
         super().reset_session_state()
@@ -881,15 +897,22 @@ class SWAComponent(TreeComponent):
             return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:
-            cd = node.component_data[ct]
-            if cd.value is None:
+            if self.cache.host_memory_mode == "buffer_only":
+                # Buffer mode stages one node/hash span per FIFO backup intent.
+                cd = node.component_data[ct]
+                dirty = [node] if cd.value is not None else []
+            else:
+                dirty = self._dirty_backup_window(node)
+            if not dirty:
                 return None
-            # cd.value already holds SWA-pool indices (translated at insert time).
-            # Host pool indexing wants int64.
+            dirty.reverse()
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    device_indices=cd.value.to(torch.int64),
+                    device_indices=torch.cat(
+                        [n.component_data[ct].value for n in dirty]
+                    ).to(torch.int64),
+                    nodes_to_load=[n.id for n in dirty],
                 )
             ]
 
@@ -975,10 +998,18 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
 
         if phase == CacheTransferPhase.BACKUP_HOST:
-            if transfers and transfers[0].host_indices is not None:
-                cd = node.component_data[ct]
-                if cd.host_value is None:
-                    cd.host_value = transfers[0].host_indices.clone()
+            if not transfers or transfers[0].host_indices is None:
+                return
+            xfer = transfers[0]
+            offset = 0
+            for node_id in xfer.nodes_to_load or [node.id]:
+                target = self.tree_core.node_by_id(node_id)
+                cd = target.component_data[ct]
+                assert cd.value is not None and cd.host_value is None
+                size = len(cd.value)
+                cd.host_value = xfer.host_indices[offset : offset + size].clone()
+                offset += size
+            assert offset == len(xfer.host_indices)
             return
 
         if phase == CacheTransferPhase.LOAD_BACK:
