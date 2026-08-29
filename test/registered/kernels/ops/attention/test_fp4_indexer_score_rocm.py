@@ -83,13 +83,19 @@ def _build_paged_fp4_kv(batch_size: int, seq_len: int, device: torch.device):
         (1, 16, 1),  # single kv position (degenerate)
     ],
 )
+# The indexer hands the kernel the pool as a raw [pages, page_size*68] buffer or
+# a reshaped [pages, 64, 1, 68] view (indexer.py); the kernel must derive the
+# per-page stride identically for both, so exercise both layouts.
+@pytest.mark.parametrize("cache_4d", [False, True], ids=["flat", "paged4d"])
 def test_fp4_paged_mqa_logits_matches_reference(
-    batch_size: int, num_heads: int, seq_len: int
+    batch_size: int, num_heads: int, seq_len: int, cache_4d: bool
 ) -> None:
     torch.manual_seed(batch_size * 1000 + num_heads * 10 + seq_len)
     device = get_device()
 
     cache, page_table = _build_paged_fp4_kv(batch_size, seq_len, device)
+    if cache_4d:
+        cache = cache.view(cache.shape[0], PAGE_SIZE, 1, FP4_DIM + SCALE_BYTES)
     seq_lens = torch.full((batch_size,), seq_len, device=device, dtype=torch.int32)
     # q kept fp8 on the ROCm path (only KV is fp4); shape [B, 1, H, HEAD].
     q_fp8 = torch.randn(

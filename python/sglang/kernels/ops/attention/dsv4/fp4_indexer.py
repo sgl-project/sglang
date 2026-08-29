@@ -208,17 +208,6 @@ def store_fp4_index_k_cache(
 
 
 @triton.jit
-def _e2m1_mag(c):
-    # E2M1 magnitude for code low 3 bits (ee=c>>1, m=c&1): {0,.5,1,1.5,2,3,4,6}.
-    # Branchless: build the fp32 bits directly (normal exp=126+ee, mantissa=m<<22),
-    # one fixup for the ee==0 subnormal {0, 0.5}.
-    ee = (c >> 1) & 3
-    m = c & 1
-    mag = (((126 + ee) << 23) | (m << 22)).to(tl.float32, bitcast=True)
-    return tl.where(ee == 0, m.to(tl.float32) * 0.5, mag)
-
-
-@triton.jit
 def _fp4_paged_mqa_logits_kernel(
     q_fp8,        # [B, H, HEAD] fp8_e4m3 (q kept fp8; only KV is fp4)
     kv,           # [pages, page_stride] uint8, blocked [PAGE_SIZE*64 fp4 | PAGE_SIZE*4 sf]
@@ -301,7 +290,11 @@ def fp4_paged_mqa_logits_triton(
     q_fp8 = q[0] if isinstance(q, tuple) else q  # [B, 1, H, HEAD] fp8
     B, _, H, HEAD = q_fp8.shape
     PAGE_SIZE = 64
-    page_stride = kvcache_raw.shape[1]
+    # Callers pass the pool as [pages, page_size*68] or a reshaped [pages, 64, 1,
+    # 68] view; flatten to per-page uint8 bytes so page_stride is the true stride
+    # (page_size*(64+4)), not an inner view dim.
+    kv_u8 = kvcache_raw.reshape(kvcache_raw.shape[0], -1).view(torch.uint8)
+    page_stride = kv_u8.shape[1]
     out = torch.zeros(B, max_seq_len, device=q_fp8.device, dtype=torch.float32)
     BH = max(16, triton.next_power_of_2(H))
     # Occupancy-aware tiling: pick the largest NP (biggest mxfp4 MFMA per program)
@@ -313,7 +306,7 @@ def fp4_paged_mqa_logits_triton(
     grid = (B, triton.cdiv(max_seq_len, PAGE_SIZE * NP))
     _fp4_paged_mqa_logits_kernel[grid](
         q_fp8.reshape(B, H, HEAD),
-        kvcache_raw.view(torch.uint8),
+        kv_u8,
         weight.reshape(B, H).to(torch.float32),
         seq_lens.reshape(B).to(torch.int32),
         page_table,
