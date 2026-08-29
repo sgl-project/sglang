@@ -2819,11 +2819,9 @@ class TestShortConvTrackStateGuards(CustomTestCase):
         return view
 
     def _validate(self, view, arch="ZayaForCausalLM"):
-        from sglang.srt.server_args import ServerArgs
+        from sglang.srt.arg_groups.mamba_hook import validate_mamba_extra_buffer
 
-        ServerArgs._validate_mamba_extra_buffer(
-            ServerArgs.__new__(ServerArgs), view, arch
-        )
+        validate_mamba_extra_buffer(view, arch, mamba_cache_chunk_size_of=lambda: 64)
 
     def test_prefill_cuda_graph_is_refused(self):
         # The extend gather's row count is mamba_track_mask.sum(), so a

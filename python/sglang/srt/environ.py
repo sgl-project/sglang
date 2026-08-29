@@ -1542,10 +1542,11 @@ class Envs:
     SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL = EnvBool(True)
     # Run the prefill CCA conv as one varlen Triton kernel pair instead of the
     # per-request host loop in cca_extend. The loop issues O(batch) launches per
-    # layer and reads CPU sequence lengths; the fused path is driven entirely by
-    # device tensors. Not compatible with a captured prefill graph -- CCA
-    # resolves that conflict in the graph's favour and logs it.
-    SGLANG_OPT_ZAYA_FUSED_CCA_PREFILL = EnvBool(False)
+    # layer and reads CPU sequence lengths, which a captured prefill graph
+    # freezes at the capture batch's single request -- so the fused path is
+    # REQUIRED, not merely faster, whenever that graph is on. Set 0 only with
+    # --cuda-graph-backend-prefill disabled.
+    SGLANG_OPT_ZAYA_FUSED_CCA_PREFILL = EnvBool(True)
 
     # ===================================================================
     # Symmetric memory

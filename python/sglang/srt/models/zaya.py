@@ -789,6 +789,17 @@ class CCA(nn.Module):
         # resolved (it reads server args, which do not exist this early).
         self._fused_prefill_conv_ok: Optional[bool] = None
 
+        # Under BCG the extend conv's per-request metadata (cu-seqlens, prefix
+        # mask, slot ids) and its launch grid are baked at capture, which runs a
+        # SINGLE synthetic request -- so a captured conv replays frozen at one
+        # request for any multi-request prefill batch. Running it as an eager
+        # break makes it re-read the LIVE metadata off the backend at replay.
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            eager_on_graph,
+        )
+
+        self._eager_extend_conv = eager_on_graph(True)(self._extend_conv_impl)
+
         # Per-K-head learnable temperature scalar (per-rank slice).
         self.temp = nn.Parameter(torch.zeros(self.num_k_heads))
 
@@ -1171,31 +1182,72 @@ class CCA(nn.Module):
     def _fused_prefill_conv_allowed(self) -> bool:
         """Whether the fused varlen prefill conv may run, resolved once.
 
-        The fused conv and the prefill CUDA graph are each correct alone and
-        corrupt together: under capture the fused path yields all-zero logits.
-        Cause not yet understood; the graph is the larger win and works with the
-        reference host loop, so it takes precedence.
+        Always true now. The fused conv is not merely compatible with the
+        prefill CUDA graph -- under a captured graph it is the ONLY correct
+        extend conv. :func:`cca_extend`'s trip count comes from
+        ``extend_seq_lens_cpu``, a host list, so an eager break replays it frozen
+        at capture's single synthetic request and every request past the first
+        gets stale conv state. The fused kernel is driven entirely by device
+        tensors the backend refreshes in place before each replay, so it is the
+        device-driven replacement its own docstring calls for.
+
+        So the one combination that must not run is a captured prefill graph with
+        the fused conv switched off: that is the host loop inside the graph, and
+        it is silently wrong for every request past the first. Refuse it rather
+        than serve corrupt state.
 
         Resolved lazily because the config bag it reads is not published in
-        ``__init__``, and only once the env flag is on, so a module built outside
-        a server never touches it. Reads the resolved leaf from the exec bag, NOT
-        the published ServerArgs record, where ``cuda_graph_config`` is whatever
-        the operator typed (``None`` unless they passed the flag explicitly).
+        ``__init__``.
         """
         if self._fused_prefill_conv_ok is None:
             from sglang.srt.model_executor.cuda_graph_config import Backend
 
-            prefill_graph_on = (
-                get_exec().graph.cuda_graph_config.prefill.backend != Backend.DISABLED
-            )
-            self._fused_prefill_conv_ok = not prefill_graph_on
-            if prefill_graph_on:
-                _log_dataflow_decision(
-                    "cca prefill: fused kernel disabled because the prefill CUDA "
-                    "graph is enabled; the two are not yet compatible (the fused "
-                    "conv under capture produces zero logits)"
+            try:
+                prefill_graph_on = (
+                    get_exec().graph.cuda_graph_config.prefill.backend
+                    != Backend.DISABLED
                 )
+            except (AssertionError, RuntimeError, ValueError):
+                # No published exec bag: a module built outside a server (a CPU
+                # unit test) is not running under a captured graph.
+                prefill_graph_on = False
+            if prefill_graph_on and not envs.SGLANG_OPT_ZAYA_FUSED_CCA_PREFILL.get():
+                raise NotImplementedError(
+                    "ZAYA1 cannot serve a captured prefill CUDA graph with "
+                    "SGLANG_OPT_ZAYA_FUSED_CCA_PREFILL=0: the reference conv "
+                    "reads per-request lengths from a host list, which the graph "
+                    "freezes at the capture batch's single request, so every "
+                    "request past the first reads stale conv state. Either leave "
+                    "the fused conv on (the default) or pass "
+                    "--cuda-graph-backend-prefill disabled."
+                )
+            self._fused_prefill_conv_ok = True
         return self._fused_prefill_conv_ok
+
+    def _extend_conv_impl(
+        self,
+        qk: torch.Tensor,
+        lag_now: Optional[torch.Tensor],
+        conv_state: torch.Tensor,
+        lag_state: Optional[torch.Tensor],
+        extend_seq_lens_cpu: List[int],
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Extend conv with the metadata resolved HERE, not passed in.
+
+        The eager-break wrapper replays this body with the argument tensors it
+        saw at capture; anything read through those arguments would be frozen at
+        capture's single synthetic request. The backend's per-step handle is
+        rebuilt out-of-graph before every replay, so fetching it inside the body
+        is what makes multi-request prefill correct under a captured graph.
+        """
+        # ``forward_batch`` is frozen by the wrapper, which is fine: the real
+        # backend ignores it and answers from per-step state it rebuilds
+        # out-of-graph. Only the CPU test mock reads it.
+        meta = get_attn_backend().conv_state_metadata(self.layer_id, forward_batch)
+        return self._run_extend_conv(
+            qk, lag_now, meta, conv_state, lag_state, extend_seq_lens_cpu
+        )
 
     def _run_extend_conv(
         self,
@@ -1522,13 +1574,13 @@ class CCA(nn.Module):
                 decode_conv_groups=self.decode_conv_groups,
             )
         else:
-            qk_out, lag_prev = self._run_extend_conv(
+            qk_out, lag_prev = self._eager_extend_conv(
                 qk,
                 lag_now,
-                meta,
                 conv_state,
                 lag_state,
                 forward_batch.extend_seq_lens_cpu,
+                forward_batch,
             )
             # Radix mamba-cache checkpoint (extra_buffer strategy only). Both
             # conv entries are trailing windows of the streams the conv just
