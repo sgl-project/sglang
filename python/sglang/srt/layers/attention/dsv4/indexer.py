@@ -26,6 +26,7 @@ from sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer import (
     aiter_fp4_paged_mqa_logits,
     aiter_q_indexer_rope_hadamard_fp4_quant,
     prepare_aiter_fp4_indexer_cos_sin,
+    prepare_aiter_fp4_paged_mqa_prefill_metadata,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -669,6 +670,9 @@ class C4IndexerBackendMixin:
         use_aiter_fp4_indexer = (
             c4_indexer.use_fp4_indexer and indexer_metadata.uses_aiter_fp4_layout
         )
+        cache_aiter_fp4_prefill = use_aiter_fp4_indexer and getattr(
+            metadata, "aiter_fp4_logits_prefill_cache_enabled", False
+        )
 
         positions = (
             getattr(metadata, "aiter_fp4_q_positions", None)
@@ -684,6 +688,12 @@ class C4IndexerBackendMixin:
             q_lora = q_lora[:num_queries]
         if positions.shape[0] != num_queries:
             positions = positions[:num_queries]
+        if (
+            cache_aiter_fp4_prefill
+            and getattr(metadata, "aiter_fp4_q_positions", None) is None
+        ):
+            positions = positions.to(torch.int64).contiguous()
+            metadata.aiter_fp4_q_positions = positions
 
         if enable_multi_stream:
             q_indexer, weights = self._forward_prepare_multi_stream(
@@ -823,6 +833,17 @@ class C4IndexerBackendMixin:
             )
             if decode_metadata is not None:
                 logits_kwargs["decode_metadata"] = decode_metadata
+            prefill_metadata = getattr(
+                metadata, "aiter_fp4_logits_prefill_metadata", None
+            )
+            if prefill_metadata is None and cache_aiter_fp4_prefill:
+                prefill_metadata = prepare_aiter_fp4_paged_mqa_prefill_metadata(
+                    page_table=page_table,
+                    c4_seq_lens=c4_seq_lens,
+                )
+                metadata.aiter_fp4_logits_prefill_metadata = prefill_metadata
+            if prefill_metadata is not None:
+                logits_kwargs["prefill_metadata"] = prefill_metadata
             logits = aiter_fp4_paged_mqa_logits(
                 q_fp4=q_fp4,
                 q_scale=q_scale,

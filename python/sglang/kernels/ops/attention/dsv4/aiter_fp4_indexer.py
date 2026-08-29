@@ -29,6 +29,16 @@ class AiterFP4PagedMQADecodeMetadata(NamedTuple):
     logical_max_seq_len: int
 
 
+class AiterFP4PagedMQAPrefillMetadata(NamedTuple):
+    padded_page_table: torch.Tensor
+    row_to_batch: torch.Tensor
+    local_starts: torch.Tensor
+    cta_info: torch.Tensor
+    n_ctas: int
+    out: torch.Tensor
+    logical_max_seq_len: int
+
+
 def _get_aiter_fp4_decode_parallel_unit_num(num_tokens: int, max_seq_len: int) -> int:
     chunks_per_seq = max(1, (max_seq_len + 255) // 256)
     auto_parallel_units = num_tokens * chunks_per_seq
@@ -216,6 +226,61 @@ def prepare_aiter_fp4_paged_mqa_decode_metadata(
     )
 
 
+def prepare_aiter_fp4_paged_mqa_prefill_metadata(
+    *,
+    page_table: torch.Tensor,
+    c4_seq_lens: torch.Tensor,
+) -> AiterFP4PagedMQAPrefillMetadata:
+    if page_table.ndim != 2:
+        raise ValueError(
+            "AITER FP4 C4Indexer requires row-expanded page_table; "
+            f"got {tuple(page_table.shape)}"
+        )
+    num_tokens = page_table.shape[0]
+    c4_seq_lens = c4_seq_lens.reshape(-1).to(dtype=torch.int32).contiguous()
+    if c4_seq_lens.shape != (num_tokens,):
+        raise ValueError(
+            "AITER FP4 C4Indexer requires row-expanded c4_seq_lens "
+            f"shape [T]; got {tuple(c4_seq_lens.shape)} for T={num_tokens}"
+        )
+    padded_page_table, logical_width, padded_width = (
+        _prepare_aiter_fp4_guarded_page_table(page_table)
+    )
+    logical_max_seq_len = logical_width * _KV_BLOCK_SIZE
+    max_seq_len = padded_width * _KV_BLOCK_SIZE
+    row_to_batch = torch.arange(num_tokens, device=page_table.device, dtype=torch.int32)
+    local_starts = torch.zeros(num_tokens, device=page_table.device, dtype=torch.int32)
+    parallel_unit_num = max(512, num_tokens)
+
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        compute_prefill_schedule,
+    )
+
+    _, cta_info, n_ctas = compute_prefill_schedule(
+        row_to_batch,
+        local_starts,
+        c4_seq_lens,
+        block_k=256,
+        parallel_unit_num=parallel_unit_num,
+        max_seq_len=max_seq_len,
+    )
+    out = torch.full(
+        (num_tokens, max_seq_len),
+        float("-inf"),
+        dtype=torch.float32,
+        device=page_table.device,
+    )
+    return AiterFP4PagedMQAPrefillMetadata(
+        padded_page_table=padded_page_table,
+        row_to_batch=row_to_batch,
+        local_starts=local_starts,
+        cta_info=cta_info,
+        n_ctas=n_ctas,
+        out=out,
+        logical_max_seq_len=logical_max_seq_len,
+    )
+
+
 def aiter_fp4_paged_mqa_logits(
     *,
     q_fp4: torch.Tensor,
@@ -228,6 +293,7 @@ def aiter_fp4_paged_mqa_logits(
     weight_scale: float,
     is_decode: bool,
     decode_metadata: AiterFP4PagedMQADecodeMetadata | None = None,
+    prefill_metadata: AiterFP4PagedMQAPrefillMetadata | None = None,
 ) -> torch.Tensor:
     num_tokens = q_fp4.shape[0]
     if q_fp4.ndim != 3 or tuple(q_fp4.shape[1:]) != (_Q_HEADS, _Q_HEAD_DIM // 2):
@@ -281,13 +347,9 @@ def aiter_fp4_paged_mqa_logits(
             "AITER FP4 C4Indexer logits requires row-expanded c4_seq_lens "
             f"shape [T]; got {tuple(c4_seq_lens.shape)}"
         )
-    if decode_metadata is None:
-        padded_page_table, logical_page_table_width, padded_page_table_width = (
-            _prepare_aiter_fp4_guarded_page_table(page_table)
-        )
-        logical_max_seq_len = logical_page_table_width * _KV_BLOCK_SIZE
-        max_seq_len = padded_page_table_width * _KV_BLOCK_SIZE
-    else:
+    if decode_metadata is not None and prefill_metadata is not None:
+        raise ValueError("AITER FP4 logits accepts only one metadata mode")
+    if decode_metadata is not None:
         if not is_decode:
             raise ValueError("AITER FP4 prefill cannot use decode metadata")
         padded_page_table = decode_metadata.padded_page_table
@@ -304,6 +366,33 @@ def aiter_fp4_paged_mqa_logits(
             or decode_metadata.out.dtype != torch.float32
         ):
             raise ValueError("AITER FP4 decode metadata does not match logits inputs")
+    elif prefill_metadata is not None:
+        if is_decode:
+            raise ValueError("AITER FP4 decode cannot use prefill metadata")
+        padded_page_table = prefill_metadata.padded_page_table
+        logical_max_seq_len = page_table.shape[1] * _KV_BLOCK_SIZE
+        max_seq_len = prefill_metadata.out.shape[1]
+        if (
+            prefill_metadata.logical_max_seq_len != logical_max_seq_len
+            or padded_page_table.shape
+            != (num_tokens, max_seq_len // _KV_BLOCK_SIZE + 4)
+            or padded_page_table.dtype != torch.int32
+            or prefill_metadata.row_to_batch.shape != (num_tokens,)
+            or prefill_metadata.row_to_batch.dtype != torch.int32
+            or prefill_metadata.local_starts.shape != (num_tokens,)
+            or prefill_metadata.local_starts.dtype != torch.int32
+            or prefill_metadata.cta_info.shape != (prefill_metadata.n_ctas, 6)
+            or prefill_metadata.cta_info.dtype != torch.int32
+            or prefill_metadata.out.shape != (num_tokens, max_seq_len)
+            or prefill_metadata.out.dtype != torch.float32
+        ):
+            raise ValueError("AITER FP4 prefill metadata does not match logits inputs")
+    else:
+        padded_page_table, logical_page_table_width, padded_page_table_width = (
+            _prepare_aiter_fp4_guarded_page_table(page_table)
+        )
+        logical_max_seq_len = logical_page_table_width * _KV_BLOCK_SIZE
+        max_seq_len = padded_page_table_width * _KV_BLOCK_SIZE
 
     # AITER FlyDSL is intentionally imported only after the HIP FP4 path is selected.
     from aiter.ops.flydsl import (
@@ -345,8 +434,22 @@ def aiter_fp4_paged_mqa_logits(
             **common_kwargs,
         )
     else:
-        row_to_batch = torch.arange(num_tokens, device=q_fp4.device, dtype=torch.int32)
-        local_starts = torch.zeros(num_tokens, device=q_fp4.device, dtype=torch.int32)
+        prefill_kwargs = {}
+        if prefill_metadata is None:
+            row_to_batch = torch.arange(
+                num_tokens, device=q_fp4.device, dtype=torch.int32
+            )
+            local_starts = torch.zeros(
+                num_tokens, device=q_fp4.device, dtype=torch.int32
+            )
+        else:
+            row_to_batch = prefill_metadata.row_to_batch
+            local_starts = prefill_metadata.local_starts
+            prefill_kwargs = {
+                "out": prefill_metadata.out,
+                "cta_info": prefill_metadata.cta_info,
+                "n_ctas": prefill_metadata.n_ctas,
+            }
         # This eager grid depends only on T, avoids sequence-value synchronization,
         # and guarantees at least one persistent unit for every query row.
         parallel_unit_num = max(512, num_tokens)
@@ -362,6 +465,7 @@ def aiter_fp4_paged_mqa_logits(
             c4_seq_lens,
             max_seq_len,
             parallel_unit_num=parallel_unit_num,
+            **prefill_kwargs,
             **common_kwargs,
         )
 

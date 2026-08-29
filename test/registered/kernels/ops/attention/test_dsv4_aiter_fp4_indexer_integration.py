@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer import (
     aiter_q_indexer_rope_hadamard_fp4_quant,
     prepare_aiter_fp4_indexer_cos_sin,
     prepare_aiter_fp4_paged_mqa_decode_metadata,
+    prepare_aiter_fp4_paged_mqa_prefill_metadata,
 )
 from sglang.kernels.ops.attention.dsv4.compress import CompressorDecodePlan
 from sglang.srt.utils import is_hip
@@ -797,6 +798,10 @@ def test_dsv4_aiter_fp4_indexer_q_k_decode_prefill_integration() -> None:
     prefill_weights = torch.stack(
         (extra_weights[0], weights[0], extra_weights[1], weights[1])
     ).contiguous()
+    prefill_metadata = prepare_aiter_fp4_paged_mqa_prefill_metadata(
+        page_table=prefill_page_table,
+        c4_seq_lens=prefill_c4_seq_lens,
+    )
     prefill_logits = aiter_fp4_paged_mqa_logits(
         q_fp4=prefill_q_fp4,
         q_scale=prefill_q_scale,
@@ -807,7 +812,9 @@ def test_dsv4_aiter_fp4_indexer_q_k_decode_prefill_integration() -> None:
         c4_seq_lens=prefill_c4_seq_lens,
         weight_scale=weight_scale,
         is_decode=False,
+        prefill_metadata=prefill_metadata,
     )
+    assert prefill_logits.data_ptr() == prefill_metadata.out.data_ptr()
     prefill_reference = _reference_logits(
         prefill_q_fp4,
         prefill_q_scale,
@@ -828,6 +835,36 @@ def test_dsv4_aiter_fp4_indexer_q_k_decode_prefill_integration() -> None:
         )
         assert cosine.item() > 0.99
         assert torch.isneginf(prefill_logits[prefill_row, seq_len:]).all()
+
+    previous_prefill = prefill_logits.clone()
+    prefill_weights.mul_(0.5)
+    for row, seq_len in enumerate(prefill_c4_seq_lens.tolist()):
+        prefill_metadata.out[row, :seq_len].fill_(float("nan"))
+    reused_prefill_logits = aiter_fp4_paged_mqa_logits(
+        q_fp4=prefill_q_fp4,
+        q_scale=prefill_q_scale,
+        k_payload=k_payload,
+        k_scale=k_scale,
+        weights=prefill_weights,
+        page_table=prefill_page_table,
+        c4_seq_lens=prefill_c4_seq_lens,
+        weight_scale=weight_scale,
+        is_decode=False,
+        prefill_metadata=prefill_metadata,
+    )
+    reused_prefill_reference = _reference_logits(
+        prefill_q_fp4,
+        prefill_q_scale,
+        k_payload,
+        k_scale,
+        prefill_weights,
+        prefill_page_table,
+        prefill_c4_seq_lens,
+        weight_scale,
+    )
+    assert reused_prefill_logits.data_ptr() == prefill_metadata.out.data_ptr()
+    _assert_logits(reused_prefill_logits, reused_prefill_reference, prefill_c4_seq_lens)
+    assert not torch.allclose(previous_prefill[:, :63], reused_prefill_logits[:, :63])
 
 
 @torch.inference_mode()

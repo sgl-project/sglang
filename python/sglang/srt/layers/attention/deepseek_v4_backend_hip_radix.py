@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
     from sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer import (
         AiterFP4PagedMQADecodeMetadata,
+        AiterFP4PagedMQAPrefillMetadata,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -364,6 +365,10 @@ class DSV4Metadata:
     aiter_fp4_logits_decode_metadata: Optional[AiterFP4PagedMQADecodeMetadata] = field(
         default=None, repr=False
     )
+    aiter_fp4_logits_prefill_metadata: Optional[AiterFP4PagedMQAPrefillMetadata] = (
+        field(default=None, repr=False)
+    )
+    aiter_fp4_logits_prefill_cache_enabled: bool = field(default=False, repr=False)
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -890,9 +895,10 @@ class DeepseekV4HipRadixBackend(
 
             c4_out_loc = metadata.core_attn_metadata.c4_out_loc
             assert c4_out_loc is not None
-            metadata.aiter_fp4_q_positions = metadata.core_attn_metadata.positions.to(
-                torch.int64
-            ).contiguous()
+            if not metadata.aiter_fp4_logits_prefill_cache_enabled:
+                metadata.aiter_fp4_q_positions = (
+                    metadata.core_attn_metadata.positions.to(torch.int64).contiguous()
+                )
             metadata.aiter_fp4_k_write_metadata = (
                 prepare_aiter_k_indexer_fp4_cache_write_metadata(
                     plan=metadata.c4_compress_metadata,
@@ -1111,6 +1117,24 @@ class DeepseekV4HipRadixBackend(
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 need_compress=not is_draft,
             )
+            if isinstance(metadata, DSV4Metadata):
+                from sglang.srt.model_executor.cuda_graph_config import (
+                    Backend,
+                    Phase,
+                    check_cuda_graph_backend,
+                )
+
+                metadata.aiter_fp4_logits_prefill_cache_enabled = (
+                    self.enable_deepseek_v4_fp4_indexer
+                    and forward_batch.forward_mode
+                    in (
+                        ForwardMode.EXTEND,
+                        ForwardMode.MIXED,
+                        ForwardMode.SPLIT_PREFILL,
+                    )
+                    and forward_batch.tbo_children is None
+                    and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+                )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
 

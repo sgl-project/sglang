@@ -431,6 +431,107 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
         arange.assert_called_once_with(2, device=case.q_fp4.device, dtype=torch.int32)
         zeros.assert_called_once_with(2, device=case.q_fp4.device, dtype=torch.int32)
 
+    def test_prefill_dispatch_reuses_cached_logits_metadata(self):
+        case = self._make_dispatch(
+            mode=ForwardMode.EXTEND,
+            num_tokens=2,
+            metadata_rows=2,
+            batch_size=1,
+        )
+        cached_metadata = aiter_fp4_indexer.AiterFP4PagedMQAPrefillMetadata(
+            padded_page_table=torch.tensor(
+                [[0, 1, 0, 0, 0, 0, 0, 0], [2, 3, 0, 0, 0, 0, 0, 0]],
+                dtype=torch.int32,
+            ),
+            row_to_batch=torch.arange(2, dtype=torch.int32),
+            local_starts=torch.zeros(2, dtype=torch.int32),
+            cta_info=torch.empty((512, 6), dtype=torch.int32),
+            n_ctas=512,
+            out=torch.full((2, 256), float("-inf"), dtype=torch.float32),
+            logical_max_seq_len=128,
+        )
+        case.backend.forward_metadata.aiter_fp4_logits_prefill_metadata = (
+            cached_metadata
+        )
+        flydsl, modules = _fake_flydsl()
+        flydsl.flydsl_pa_mqa_logits_fp4_prefill.return_value = cached_metadata.out
+
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(aiter_fp4_indexer.torch, "arange") as arange,
+            patch.object(aiter_fp4_indexer.torch, "zeros") as zeros,
+            patch.object(aiter_fp4_indexer.torch, "full") as full,
+        ):
+            case.backend.forward_c4_indexer(
+                x=torch.empty(2, 1),
+                q_lora=torch.empty(2, 1),
+                c4_indexer=case.c4_indexer,
+                forward_batch=case.forward_batch,
+            )
+
+        arange.assert_not_called()
+        zeros.assert_not_called()
+        full.assert_not_called()
+        call = flydsl.flydsl_pa_mqa_logits_fp4_prefill.call_args
+        self.assertIs(call.args[4], cached_metadata.padded_page_table)
+        self.assertIs(call.args[6], cached_metadata.row_to_batch)
+        self.assertIs(call.args[7], cached_metadata.local_starts)
+        self.assertIs(call.kwargs["out"], cached_metadata.out)
+        self.assertIs(call.kwargs["cta_info"], cached_metadata.cta_info)
+        self.assertEqual(call.kwargs["n_ctas"], cached_metadata.n_ctas)
+
+    def test_prefill_cache_is_built_once_after_row_reindex(self):
+        case = self._make_dispatch(
+            mode=ForwardMode.EXTEND,
+            num_tokens=1,
+            metadata_rows=2,
+            batch_size=1,
+        )
+        reindexed_page_table = case.page_table[1:].contiguous()
+        reindexed_seq_lens = case.c4_seq_lens[1:].contiguous()
+        case.backend.forward_metadata.indexer_metadata.page_table = reindexed_page_table
+        case.backend.forward_metadata.indexer_metadata.c4_seq_lens = reindexed_seq_lens
+        case.backend.forward_metadata.core_metadata.page_table = reindexed_page_table
+        case.backend.forward_metadata.aiter_fp4_logits_prefill_cache_enabled = True
+        case.backend.forward_metadata.aiter_fp4_q_positions = None
+        cached_metadata = object()
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsv4.indexer."
+                "prepare_aiter_fp4_paged_mqa_prefill_metadata",
+                return_value=cached_metadata,
+            ) as prepare,
+            patch(
+                "sglang.srt.layers.attention.dsv4.indexer."
+                "aiter_fp4_paged_mqa_logits",
+                return_value=torch.empty((1, 128), dtype=torch.float32),
+            ) as logits,
+        ):
+            for _ in range(2):
+                case.backend.forward_c4_indexer(
+                    x=torch.empty(1, 1),
+                    q_lora=torch.empty(1, 1),
+                    c4_indexer=case.c4_indexer,
+                    forward_batch=case.forward_batch,
+                )
+
+        prepare.assert_called_once_with(
+            page_table=reindexed_page_table,
+            c4_seq_lens=reindexed_seq_lens,
+        )
+        self.assertIs(
+            case.backend.forward_metadata.aiter_fp4_logits_prefill_metadata,
+            cached_metadata,
+        )
+        self.assertIs(
+            case.backend._forward_prepare_normal.call_args.kwargs["positions"],
+            case.backend.forward_metadata.aiter_fp4_q_positions,
+        )
+        self.assertEqual(logits.call_count, 2)
+        for call in logits.call_args_list:
+            self.assertIs(call.kwargs["prefill_metadata"], cached_metadata)
+
     def test_cuda_fp4_dispatch_remains_deep_gemm_combined(self):
         num_tokens = 3
         page_table = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
