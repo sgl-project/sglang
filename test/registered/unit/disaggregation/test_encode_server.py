@@ -430,6 +430,59 @@ class TestEncoderDelivery(CustomTestCase):
 
         asyncio.run(run())
 
+    def test_cancelled_tp_pipeline_drains_encode_before_release(self):
+        async def run():
+            encode_started = asyncio.Event()
+            finish_encode = asyncio.Event()
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.transfer_backend = "zmq_to_tokenizer"
+            encoder.encode_dispatch_lock = asyncio.Lock()
+
+            async def encode(**_kwargs):
+                encode_started.set()
+                await finish_encode.wait()
+                self.assertTrue(encoder.encode_dispatch_lock.locked())
+                return 16, 2, 4, None, None
+
+            encoder.encode = AsyncMock(side_effect=encode)
+            encoder.release_request = AsyncMock()
+            request = {
+                "req_id": "cancelled",
+                "mm_items": ["item"],
+                "modality": "video",
+                "num_parts": 1,
+                "part_idx": 0,
+            }
+
+            with patch("sglang.srt.disaggregation.encoder.runtime.sock_send") as send:
+                task = asyncio.create_task(
+                    execute_encode_pipeline(
+                        encoder, None, request, send_sockets=[object()]
+                    )
+                )
+                await encode_started.wait()
+                task.cancel()
+                await asyncio.sleep(0)
+
+                self.assertFalse(task.done())
+                self.assertTrue(encoder.encode_dispatch_lock.locked())
+                encoder.release_request.assert_not_awaited()
+                send.assert_called_once()
+
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                self.assertTrue(encoder.encode_dispatch_lock.locked())
+
+                finish_encode.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            encoder.release_request.assert_awaited_once_with("cancelled")
+            self.assertFalse(encoder.encode_dispatch_lock.locked())
+
+        asyncio.run(run())
+
     def test_send_waits_for_embedding_published_by_encode(self):
         async def run():
             encoder = MMEncoder.__new__(MMEncoder)

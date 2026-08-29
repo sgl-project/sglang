@@ -146,16 +146,6 @@ class EncoderScheduler:
         await self.pending_queue.put(pending)
         try:
             return await asyncio.wait_for(pending.future, timeout=self.request_timeout)
-        except asyncio.CancelledError:
-            pending.future.cancel()
-            req_id = request.get("req_id")
-            try:
-                await asyncio.shield(self.encoder.release_request(req_id))
-            except Exception:
-                logger.exception(
-                    "Failed to release cancelled encoder request %s", req_id
-                )
-            raise
         except asyncio.TimeoutError:
             if not pending.future.done():
                 pending.future.cancel()
@@ -1074,6 +1064,44 @@ def _record_pipeline_result(modality: Modality, status: str) -> None:
         )
 
 
+async def _run_dispatched_encode(
+    enc: MMEncoder, request: dict, modality: Modality
+) -> Tuple:
+    """Finish TP encode collectives before propagating caller cancellation."""
+    encode_task = asyncio.create_task(
+        enc.encode(
+            mm_items=request["mm_items"],
+            modality=modality,
+            req_id=request["req_id"],
+            num_parts=request["num_parts"],
+            part_idx=request["part_idx"],
+            hashes=request.get("hashes"),
+        )
+    )
+    try:
+        return await asyncio.shield(encode_task)
+    except asyncio.CancelledError:
+        # The TP followers have already received the request. Let every rank
+        # finish the same collective sequence while the dispatch lock is held.
+        while not encode_task.done():
+            try:
+                await asyncio.shield(encode_task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        try:
+            encode_task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception(
+                "Encoder request %s failed while draining cancellation",
+                request["req_id"],
+            )
+        raise
+
+
 async def execute_encode_pipeline(
     enc: MMEncoder,
     sched: Optional[EncoderScheduler],
@@ -1116,14 +1144,7 @@ async def execute_encode_pipeline(
             async with enc.encode_dispatch_lock:
                 for socket in send_sockets:
                     sock_send(socket, wrap_as_pickle(request))
-                result = await enc.encode(
-                    mm_items=request["mm_items"],
-                    modality=modality,
-                    req_id=request["req_id"],
-                    num_parts=request["num_parts"],
-                    part_idx=request["part_idx"],
-                    hashes=request.get("hashes"),
-                )
+                result = await _run_dispatched_encode(enc, request, modality)
         else:
             result = await enc.encode(
                 mm_items=request["mm_items"],
@@ -1133,6 +1154,15 @@ async def execute_encode_pipeline(
                 part_idx=request["part_idx"],
                 hashes=request.get("hashes"),
             )
+    except asyncio.CancelledError:
+        error_msg = "encoder request cancelled"
+        time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        try:
+            await asyncio.shield(enc.release_request(req_id))
+        except Exception:
+            logger.exception("Failed to release cancelled encoder request %s", req_id)
+        _record_pipeline_result(modality, "error")
+        raise
     except asyncio.TimeoutError:
         error_msg = "encoder batch timed out"
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
