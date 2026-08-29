@@ -103,6 +103,19 @@ ENCODER_MAX_BATCH_SIZE_EXPLICIT = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.is_set()
 ENCODER_REQ_TIMEOUT = envs.SGLANG_ENCODER_REQ_TIMEOUT.get()
 
 
+async def _await_transfer_completion(awaitable, operation: str):
+    """Do not let cancellation outlive a zero-copy transfer using its buffer."""
+    task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await asyncio.shield(task)
+        except Exception:
+            logger.exception("%s failed while draining cancellation", operation)
+        raise
+
+
 class EncoderMetaRegistry:
     """Per-part metadata shared by every encoder request lifecycle.
 
@@ -1551,20 +1564,25 @@ class MMEncoder:
             if not mr_already_registered:
                 self.engine.register(embedding.data_ptr(), embedding.nbytes)
             _t_xfer_start = time.monotonic()
-            xfer_ret = await asyncio.to_thread(
-                self.engine.transfer_sync,
-                session_id,
-                embedding.data_ptr(),
-                buffer_address,
-                embedding.nbytes,
-            )
+            try:
+                xfer_ret = await _await_transfer_completion(
+                    asyncio.to_thread(
+                        self.engine.transfer_sync,
+                        session_id,
+                        embedding.data_ptr(),
+                        buffer_address,
+                        embedding.nbytes,
+                    ),
+                    f"Mooncake transfer for req_id={req_id}",
+                )
+            finally:
+                if not mr_already_registered:
+                    self.engine.deregister(embedding.data_ptr())
             xfer_ms = (time.monotonic() - _t_xfer_start) * 1000.0
             if encoder_metrics_collector is not None:
                 encoder_metrics_collector.observe_transfer(
                     xfer_ms / 1000.0, backend="mooncake"
                 )
-            if not mr_already_registered:
-                self.engine.deregister(embedding.data_ptr())
             if xfer_ret < 0:
                 raise InternalError(
                     f"Mooncake transfer_sync failed for {req_id} "
@@ -1638,7 +1656,10 @@ class MMEncoder:
             # Queue sends in order under the lock, then wait for buffer
             # ownership independently so libzmq can pipeline the connection.
             try:
-                await asyncio.to_thread(tracker.wait, self.send_timeout)
+                await _await_transfer_completion(
+                    asyncio.to_thread(tracker.wait, self.send_timeout),
+                    f"ZMQ transfer for req_id={mm_data.req_id}",
+                )
             except Exception:
                 if self.scheduler_send_sockets.get(endpoint) is sock:
                     self.scheduler_send_sockets.pop(endpoint, None)
@@ -1673,7 +1694,10 @@ class MMEncoder:
             finally:
                 sock.close(linger=5000)
 
-        await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
+        await _await_transfer_completion(
+            asyncio.get_running_loop().run_in_executor(self.executor, send_with_socket),
+            f"ZMQ transfer for req_id={mm_data.req_id}",
+        )
         if (
             encoder_metrics_collector is not None
             and get_disagg().encoder_transfer_backend != "mooncake"
