@@ -94,6 +94,7 @@ class TestEncoderDPErrorHandling(CustomTestCase):
             dispatcher = encoder_runtime.DPDispatcher(
                 dp_size=1,
                 dispatch_sockets=[object()],
+                release_sockets=[object()],
                 result_socket=object(),
                 worker_processes=[],
             )
