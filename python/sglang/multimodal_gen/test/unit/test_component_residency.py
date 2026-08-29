@@ -210,7 +210,10 @@ def test_realtime_text_encoder_use_starts_at_call_site():
     stage.text_encoders = [None]
     stage._registered_stage_name = None
 
-    uses = stage.component_uses(SimpleNamespace(), "RealtimeTextEncodingStage")
+    uses = stage.component_uses(
+        SimpleNamespace(component_precisions={}, pipeline_config=None),
+        "RealtimeTextEncodingStage",
+    )
 
     assert len(uses) == 1
     assert uses[0].component_name == "text_encoder"
