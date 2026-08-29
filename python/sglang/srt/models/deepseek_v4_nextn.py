@@ -262,7 +262,18 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if self.dsa_enable_prefill_cp and not is_cp_v2_active(forward_batch):
-            if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+            attn_backend = get_attn_backend()
+            # Mirrors DeepseekV4ForCausalLM.forward: only the Ascend DSV4
+            # backend rebuilds uneven-split attention metadata.
+            if can_dsa_cp_split(
+                len(input_ids),
+                self.cp_size,
+                True,
+                forward_batch,
+                require_divisible=not hasattr(
+                    attn_backend, "prepare_dsv4_cp_metadata"
+                ),
+            ):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
                     self.cp_rank,
@@ -270,13 +281,18 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
                     forward_batch.seq_lens_cpu.tolist(),
                     extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
-                if is_dsa_prefill_cp_round_robin_split():
-                    attn_backend = get_attn_backend()
+                if hasattr(attn_backend, "prepare_dsv4_cp_metadata"):
+                    attn_backend.prepare_dsv4_cp_metadata(forward_batch)
+                elif is_dsa_prefill_cp_round_robin_split():
                     metadata = attn_backend.forward_metadata
-                    core_meta = metadata.core_attn_metadata
-                    core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related(is_prefill=True)
-                    if metadata.indexer_metadata is not None:
+                    core_meta = getattr(metadata, "core_attn_metadata", None)
+                    if core_meta is not None:
+                        core_meta.apply_cp_reindex()
+                        core_meta.init_flashmla_related(is_prefill=True)
+                    if (
+                        core_meta is not None
+                        and getattr(metadata, "indexer_metadata", None) is not None
+                    ):
                         metadata.indexer_metadata = (
                             attn_backend.init_forward_metadata_indexer(core_meta)
                         )

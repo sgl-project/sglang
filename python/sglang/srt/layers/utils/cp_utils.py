@@ -129,11 +129,33 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     return True
 
 
+def _get_strategy_for_metadata(forward_batch):
+    """Return the CP strategy only for metadata created by the strategy API.
+
+    DSV4 CP-v1 still builds the legacy ``ContextParallelMetadata`` below.  It
+    intentionally does not carry the CP-v2 logical/physical padding contract,
+    so passing it to a target-branch strategy would mix the two protocols.
+    """
+    from sglang.srt.layers.cp.base import (
+        BaseContextParallelMetadata,
+        get_cp_strategy,
+    )
+
+    metadata = getattr(forward_batch, "attn_cp_metadata", None)
+    if not isinstance(metadata, BaseContextParallelMetadata):
+        return None
+    return get_cp_strategy()
+
+
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     from sglang.srt.layers.attention.dsa.utils import (
         dsa_cp_round_robin_split_data,
         is_dsa_prefill_cp_round_robin_split,
     )
+
+    strategy = _get_strategy_for_metadata(forward_batch)
+    if strategy is not None:
+        return strategy.shard_hidden_states(input_, forward_batch)
 
     if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_parallel().attn_cp_size
@@ -147,7 +169,7 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     )
     result = torch.cat(
         [input_list[i] for i in forward_batch.attn_cp_metadata.zigzag_index], dim=0
-    ).view(-1, input_.shape[-1])
+    )
     return result
 
 
@@ -156,6 +178,10 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         dsa_cp_round_robin_split_data,
         is_dsa_prefill_cp_round_robin_split,
     )
+
+    strategy = _get_strategy_for_metadata(forward_batch)
+    if strategy is not None:
+        return strategy.shard_position_ids(positions, forward_batch)
 
     if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_parallel().attn_cp_size
@@ -193,7 +219,7 @@ def cp_round_robin_input_ids(input_ids):
     cp_size = get_parallel().attn_cp_size
     cp_rank = get_parallel().attn_cp_rank
     if get_moe_a2a_backend().is_none():
-        input_ids = input_ids.reshape(-1, cp_size).T.flatten()
+        input_ids = torch.cat([input_ids[rank::cp_size] for rank in range(cp_size)])
     else:
         input_ids = input_ids[cp_rank::cp_size].contiguous()
     return input_ids
@@ -202,6 +228,8 @@ def cp_round_robin_input_ids(input_ids):
 def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, stream):
     """
     Allgather communication for context_parallel(kv_cache, index_k, hidden_states).
+    Handles tensors with arbitrary trailing dimensions, including DSV4 mHC
+    hidden states shaped as [num_tokens, hc_mult, hidden_size].
     This implementation mainly consists of three parts:
     Step 1, padding the input shape to unify the shape for allgather communication (the shape must be the same).
     Step 2, synchronized allgather communication.
@@ -210,14 +238,13 @@ def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, 
     max_len = forward_batch.attn_cp_metadata.max_rank_len[0]
     pad_size = max_len - input_tensor.shape[0]
     if pad_size > 0:
-        input_tensor = F.pad(
-            input_tensor, (0, 0, 0, pad_size), mode="constant", value=0
-        )
+        padding = [0, 0] * (input_tensor.ndim - 1) + [0, pad_size]
+        input_tensor = F.pad(input_tensor, padding, mode="constant", value=0)
     group = get_parallel().attn_cp_group
     with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
         input_tensor_full = torch.empty(
             max_len * cp_size,
-            input_tensor.shape[1],
+            *input_tensor.shape[1:],
             device=input_tensor.device,
             dtype=input_tensor.dtype,
         )
@@ -367,6 +394,10 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         is_dsa_prefill_cp_round_robin_split,
     )
 
+    strategy = _get_strategy_for_metadata(forward_batch)
+    if strategy is not None:
+        return strategy.gather_hidden_states(input_tensor, forward_batch, stream)
+
     if is_dsa_prefill_cp_round_robin_split():
         with use_symmetric_memory(
             get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
@@ -387,7 +418,6 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         return output_tensor
 
     # TODO: Do we need to remove the padding here?
-    bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_all_gather_reorganized_into_tensor(
         input_tensor,
         cp_size,
@@ -403,7 +433,6 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         [outputs_list[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index],
         dim=0,
     )
-    output_tensor = output_tensor.view(-1, hidden_size)
     return output_tensor
 
 
@@ -425,6 +454,10 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
     |   +-------------------------+
     """
+    strategy = _get_strategy_for_metadata(forward_batch)
+    if strategy is not None:
+        return strategy.gather_kv_cache(input_tensor, forward_batch, stream)
+
     output_tensor = cp_all_gather_reorganized_into_tensor_kv_cache(
         input_tensor,
         cp_size,
