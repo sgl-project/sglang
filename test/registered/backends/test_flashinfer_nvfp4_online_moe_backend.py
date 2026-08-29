@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=2400, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1200, stage="nightly", runner_config="4-gpu-b200")
 
 
 class FlashinferNvFp4OnlineMoeBackendBase:

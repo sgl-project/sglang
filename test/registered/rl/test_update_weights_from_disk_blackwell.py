@@ -295,8 +295,6 @@ class TestServerUpdateWeightsFromDiskNVFP4W4A16CuteDSL(
                 "flashinfer_cutedsl",
                 "--moe-runner-backend",
                 "flashinfer_cutedsl",
-                "--moe-a2a-backend",
-                "flashinfer",
                 "--enable-deterministic-inference",
             ),
         },

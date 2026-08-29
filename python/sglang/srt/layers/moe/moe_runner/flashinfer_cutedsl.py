@@ -349,14 +349,6 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     # _dummy_run which runs under inference_mode(); inference tensors cannot
     # be inplace-updated during later CUDA graph capture (which runs outside
     # inference_mode), so we must opt out here.
-    activation_type = _cutedsl_wrapper_activation_type(
-        layer.moe_runner_config.activation, ActivationType
-    )
-    use_fused_finalize = envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
-    if quant_mode == "w4a16" and activation_type == ActivationType.Swiglu:
-        # FlashInfer's gated W4A16 epilogue uses two-stage finalize.
-        use_fused_finalize = False
-
     with torch.inference_mode(False):
         layer._cutedsl_wrapper = CuteDslMoEWrapper(
             num_experts=layer.num_experts,
@@ -369,8 +361,10 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             output_dtype=layer.moe_runner_config.params_dtype,
             device=str(layer.w13_weight.device),
-            use_fused_finalize=use_fused_finalize,
-            activation_type=activation_type,
+            use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+            activation_type=_cutedsl_wrapper_activation_type(
+                layer.moe_runner_config.activation, ActivationType
+            ),
             quant_mode=quant_mode,
         )
 
@@ -466,11 +460,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
 
-    if quant_info.quant_mode == "w4a16":
-        x_fp4 = hidden_states
-        x_sf = None
-        per_token_scale = None
-    elif quant_info.use_per_token_activation:
+    if quant_info.use_per_token_activation:
         from flashinfer import SfLayout, nvfp4_quantize
 
         x_fp4, x_sf, per_token_scale = nvfp4_quantize(
@@ -480,6 +470,10 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
             per_token_activation=True,
             backend="cute-dsl",
         )
+    elif quant_info.quant_mode == "w4a16":
+        x_fp4 = hidden_states
+        x_sf = None
+        per_token_scale = None
     else:
         x_fp4, x_sf = fp4_quantize(
             hidden_states,
@@ -554,16 +548,16 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
 
-    if quant_info.quant_mode == "w4a16":
-        x_fp4 = hidden_states
-        per_token_scale = None
-    elif x_sf is not None:
+    if x_sf is not None:
         if quant_info.use_per_token_activation:
             raise ValueError(
                 "flashinfer_cutedsl per-token activation requires BF16 dispatch "
                 "so the runner can forward per_token_scale to FlashInfer."
             )
         # NVFP4 dispatch, inputs are already quantized.
+        x_fp4 = hidden_states
+        per_token_scale = None
+    elif quant_info.quant_mode == "w4a16":
         x_fp4 = hidden_states
         per_token_scale = None
     else:
