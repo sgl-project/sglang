@@ -117,15 +117,15 @@ impl ChatResponseProcessor {
             parallel_tool_calls,
             choices: (0..choice_count)
                 .map(|_| ChoiceResponseProcessor {
-                    reasoning: ReasoningStreamSplitter::new(reasoning_parser.as_deref(), false),
+                    reasoning: ReasoningStreamSplitter::new(reasoning_parser.as_deref(), None),
                 })
                 .collect(),
         }
     }
 
-    pub(crate) fn with_initial_reasoning(mut self, initial_reasoning: bool) -> Self {
+    pub(crate) fn with_reasoning_state(mut self, reasoning_state: Option<bool>) -> Self {
         for choice in &mut self.choices {
-            choice.reasoning.initial_reasoning = initial_reasoning;
+            choice.reasoning.initial_reasoning = reasoning_state;
         }
         self
     }
@@ -249,10 +249,13 @@ impl ChatResponseProcessor {
             yield annotated_usage(prompt_tokens, completion_tokens);
         };
 
-        let suppress_post_tool_content = self
-            .tool_parser
-            .as_deref()
-            .is_some_and(|parser| matches!(dynamo_parser_name(parser), "qwen25" | "glm47"));
+        let post_tool_terminal_markers = self.tool_parser.as_deref().map_or(&[][..], |parser| {
+            match dynamo_parser_name(parser) {
+                "qwen25" => &["<|im_end|>"],
+                "glm47" => &["<|user|>", "<|endoftext|>", "<|observation|>"],
+                _ => &[],
+            }
+        });
         let parsed: Pin<
             Box<dyn Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
         > = if let Some(parser) = self.tool_parser {
@@ -310,7 +313,11 @@ impl ChatResponseProcessor {
                             Some(ChatCompletionMessageContent::Text(text)) => Some(text),
                             _ => None,
                         };
-                        if suppress_post_tool_content && had_tool_calls {
+                        if had_tool_calls
+                            && content.as_ref().is_some_and(|text| {
+                                post_tool_terminal_markers.contains(&text.trim())
+                            })
+                        {
                             content = None;
                         }
                         if choice.delta.role.is_some()
@@ -456,11 +463,11 @@ fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrapper {
 struct ReasoningStreamSplitter {
     name: Option<String>,
     parser: Option<ReasoningParserWrapper>,
-    initial_reasoning: bool,
+    initial_reasoning: Option<bool>,
 }
 
 impl ReasoningStreamSplitter {
-    fn new(name: Option<&str>, initial_reasoning: bool) -> Self {
+    fn new(name: Option<&str>, initial_reasoning: Option<bool>) -> Self {
         Self {
             name: name.map(str::to_owned),
             parser: None,
@@ -475,7 +482,9 @@ impl ReasoningStreamSplitter {
         let initial_reasoning = self.initial_reasoning;
         let parser = self.parser.get_or_insert_with(|| {
             let mut parser = build_reasoning_parser(name);
-            parser.set_in_reasoning(initial_reasoning);
+            if let Some(initial_reasoning) = initial_reasoning {
+                parser.set_in_reasoning(initial_reasoning);
+            }
             parser
         });
         let token_ids = token_ids
@@ -599,13 +608,49 @@ mod tests {
                 true,
                 1,
             )
-            .with_initial_reasoning(true)
+            .with_reasoning_state(Some(true))
             .process_stream(stream::iter(vec![chunk(
                 0,
                 "reasoning</think>answer",
                 true,
             )]))
             .collect::<Vec<_>>(),
+        );
+
+        let reasoning = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(ChatEvent::Delta {
+                    reasoning_content: Some(text),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let content = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(ChatEvent::Delta {
+                    content: Some(text),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(reasoning, "reasoning");
+        assert_eq!(content, "answer");
+    }
+
+    #[test]
+    fn unknown_reasoning_state_preserves_parser_default() {
+        let events = futures::executor::block_on(
+            processor(None, Some("deepseek-r1"), 1)
+                .process_stream(stream::iter(vec![chunk(
+                    0,
+                    "reasoning</think>answer",
+                    true,
+                )]))
+                .collect::<Vec<_>>(),
         );
 
         let reasoning = events
@@ -699,18 +744,23 @@ mod tests {
                         "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>",
                         false,
                     ),
+                    chunk(0, "Follow-up text", false),
                     chunk(0, "<|user|>", true),
                 ]))
                 .collect::<Vec<_>>(),
         );
 
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            Ok(ChatEvent::Delta {
-                content: Some(text),
-                ..
-            }) if text.contains("<|user|>")
-        )));
+        let content = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(ChatEvent::Delta {
+                    content: Some(text),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(content, "Follow-up text");
         assert!(events.iter().any(|event| matches!(
             event,
             Ok(ChatEvent::Delta {

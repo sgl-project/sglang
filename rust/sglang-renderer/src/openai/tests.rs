@@ -47,7 +47,7 @@ mod suite {
             "stop_regex": "END[0-9]",
             "ignore_eos": true,
             "skip_special_tokens": false,
-            "return_meta_info": true,
+            "return_meta_info": false,
             "bootstrap_host": "prefill",
             "bootstrap_port": 8998,
             "bootstrap_room": 42
@@ -68,7 +68,7 @@ mod suite {
         assert_eq!(request.sampling_overrides.min_tokens, Some(3));
         assert_eq!(request.sampling_overrides.ignore_eos, Some(true));
         assert_eq!(request.sampling_overrides.skip_special_tokens, Some(false));
-        assert_eq!(request.extensions.return_meta_info, Some(true));
+        assert_eq!(request.extensions.return_meta_info, Some(false));
 
         let (response_id, request) = lower_chat_request(&renderer_config(), request).unwrap();
 
@@ -77,6 +77,22 @@ mod suite {
         assert_eq!(request.metadata.bootstrap_port, Some(8998));
         assert_eq!(request.metadata.bootstrap_room, Some(42));
         assert_eq!(request.sampling_params.top_k, 17);
+    }
+
+    #[test]
+    fn chat_lowering_rejects_return_meta_info_until_supported() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "return_meta_info": true
+        }))
+        .unwrap();
+
+        let error = match lower_chat_request(&renderer_config(), request) {
+            Ok(_) => panic!("return_meta_info=true must not be silently ignored"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("return_meta_info"));
     }
 
     #[test]

@@ -355,10 +355,6 @@ pub(crate) fn lower_chat_request(
     )?;
     // Accepted OpenAI metadata fields do not affect SGLang generation.
     let _ = (&request.store, &request.metadata, &request.user);
-    // This SGLang extension only requests scheduler diagnostics in the response.
-    // The renderer accepts it for client compatibility but has no scheduler-local
-    // diagnostics to attach when forwarding generation to an external engine.
-    let _ = request.extensions.return_meta_info;
     reject_unsupported_fields(&request.unsupported_fields)?;
     request.extensions.validate()?;
     validate_chat_request(config, &request)?;
@@ -461,6 +457,9 @@ fn validate_chat_request(
     }
     if request.n == Some(0) {
         return Err("n must be at least 1".into());
+    }
+    if request.extensions.return_meta_info == Some(true) {
+        return Err("return_meta_info=true is not supported by the renderer".into());
     }
     #[allow(deprecated)]
     let max_tokens = request.max_completion_tokens.or(request.max_tokens);

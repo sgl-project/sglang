@@ -196,6 +196,7 @@ pub(crate) struct LoweredChat {
 
 struct RenderPreparation {
     require_reasoning: bool,
+    reasoning_state: Option<bool>,
     tools_enabled: bool,
 }
 
@@ -278,7 +279,7 @@ impl ChatPreprocessor {
             request.parallel_tool_calls,
             request.choice_count,
         )
-        .with_initial_reasoning(preparation.require_reasoning);
+        .with_reasoning_state(preparation.reasoning_state);
         Ok(LoweredChat {
             text_requests,
             response_processor,
@@ -324,6 +325,7 @@ impl ChatPreprocessor {
         });
         Ok(RenderPreparation {
             require_reasoning: self.reasoning_parser.is_some() && thinking == Some(true),
+            reasoning_state: thinking,
             tools_enabled,
         })
     }
