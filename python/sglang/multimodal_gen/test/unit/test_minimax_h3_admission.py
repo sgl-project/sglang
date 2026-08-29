@@ -336,6 +336,7 @@ def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
             _explicit_fields={"quality"},
             enable_cache_dit=None,
             cache_dit_params=None,
+            enable_spectrum=False,
         )
     )
 
