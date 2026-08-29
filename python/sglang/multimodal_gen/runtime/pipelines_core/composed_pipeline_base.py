@@ -257,6 +257,7 @@ class ComposedPipelineBase(ABC):
                 "QwenImageEditPipeline": {"vae"},
                 "QwenImageEditPlusPipeline": {"vae"},
                 "QwenImageLayeredPipeline": {"vae", "transformer"},
+                "LongCatImageEditPipeline": {"vae"},
                 "GlmImagePipeline": {"vae", "transformer"},
                 "WanImageToVideoPipeline": {"vae"},
                 "WanImageToVideoDmdPipeline": {"vae"},
@@ -269,6 +270,12 @@ class ComposedPipelineBase(ABC):
         extra_allowed_modules = set(
             role_to_pipeline_modules.get(role, {}).get(self.pipeline_name, set())
         )
+        if (
+            role == RoleType.DENOISER
+            and self.pipeline_name == "GlmImagePipeline"
+            and getattr(self.server_args, "srt_encoder_url", None) is not None
+        ):
+            extra_allowed_modules.update({"text_encoder", "tokenizer", "vae"})
 
         if role == RoleType.DENOISER and task_name == "ti2v":
             if self.pipeline_name in {
@@ -1063,6 +1070,10 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
         return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
         )

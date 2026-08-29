@@ -15,16 +15,10 @@ from typing import Any, Dict, Optional
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import safe_pickle_loads
 
 logger = logging.getLogger(__name__)
-
-# Socket path template for weight cache daemons (keyed by global rank
-# = tp_size * pp_rank + tp_rank, so multi-node / multi-PP don't collide)
-WEIGHT_CACHE_SOCKET_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.sock"
-
-# Ready file template — daemon writes this after loading completes
-WEIGHT_CACHE_READY_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.ready"
 
 
 class CacheConfig(msgspec.Struct):
@@ -308,12 +302,30 @@ def compute_local_gpu_id(
     )
 
 
+def _format_daemon_path(env_field, global_rank: int) -> str:
+    """Fill in a daemon path template, rejecting one that drops the rank.
+
+    The template is user-overridable, and ``str.format`` silently ignores a
+    missing placeholder. Every rank would then derive the same path and map the
+    shard belonging to whichever daemon got there first, so refuse up front
+    rather than serve wrong weights.
+    """
+    template = env_field.get()
+    if "{global_rank}" not in template:
+        raise ValueError(
+            f"{env_field.name}={template!r} must contain '{{global_rank}}': each "
+            f"rank needs its own path, and a rank-independent one would point "
+            f"every rank at a single daemon."
+        )
+    return template.format(global_rank=global_rank)
+
+
 def get_socket_path(global_rank: int) -> str:
     """Get the Unix socket path for a weight cache daemon.
 
     global_rank = tp_size * pp_rank + tp_rank
     """
-    return WEIGHT_CACHE_SOCKET_TEMPLATE.format(global_rank=global_rank)
+    return _format_daemon_path(envs.SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE, global_rank)
 
 
 def get_ready_path(global_rank: int) -> str:
@@ -321,7 +333,7 @@ def get_ready_path(global_rank: int) -> str:
 
     global_rank = tp_size * pp_rank + tp_rank
     """
-    return WEIGHT_CACHE_READY_TEMPLATE.format(global_rank=global_rank)
+    return _format_daemon_path(envs.SGLANG_WEIGHT_CACHE_READY_TEMPLATE, global_rank)
 
 
 def _read_ready_pid(ready_path: str) -> Optional[int]:
