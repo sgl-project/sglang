@@ -22,7 +22,7 @@ class ReqDllmMixin:
         self.dllm_phase: Optional[DllmReqPhase] = None
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = (
-            {"prompt_len": len(self.origin_input_ids)}
+            {"prompt_len": len(self.origin_input_ids), "step": 0}
             if dllm_config is not None and dllm_config.needs_full_prefill
             else None
         )

@@ -56,7 +56,7 @@ class TestDreamRequestCanvas(CustomTestCase):
         req = self._make_req(_config(mask_id=151666))
 
         self.assertEqual(req.dllm_phase, DllmReqPhase.INCOMING_DECODE)
-        self.assertEqual(req.dllm_algo_state, {"prompt_len": 2})
+        self.assertEqual(req.dllm_algo_state, {"prompt_len": 2, "step": 0})
 
         req.init_next_round_input()
 
@@ -169,11 +169,31 @@ class TestDreamAlgorithm(CustomTestCase):
         self.assertEqual(first[1][1], [20, 99])
 
         second_batch = self._forward_batch(torch.tensor([20, 99]), [2], top_k=1)
+        second_batch.sampling_info.original_temperatures[:] = 0
+        second_batch.sampling_info.top_ps[:] = 1
         second = dream._run_fdfo_full_prefill(model_runner, second_batch, [first[3][1]])
 
         self.assertEqual(second[5], [True])
         self.assertEqual(second[3], [None])
         self.assertEqual(second[1], [[20, 0]])
+
+    def test_dream_fdfo_preserves_cuda_graph_capability(self):
+        dream = Dream(_config(algorithm_config={"steps": 1}))
+        forward_batch = self._forward_batch(torch.tensor([10, 99]), [2])
+        logits_output = SimpleNamespace(full_logits=torch.zeros((2, 5)))
+        model_runner = MagicMock()
+        model_runner.forward.return_value = SimpleNamespace(
+            logits_output=logits_output,
+            can_run_graph=True,
+        )
+
+        result = dream._run_fdfo_full_prefill(
+            model_runner,
+            forward_batch,
+            [{"prompt_len": 1, "step": 0}],
+        )
+
+        self.assertTrue(result[4])
 
     def test_dream_confidence_algorithms_resolve_final_canvas(self):
         for alg in ("maskgit_plus", "topk_margin", "entropy"):
@@ -465,12 +485,17 @@ class TestDreamSchedulerAdmission(CustomTestCase):
 
 class TestDreamFDFOResultProcessing(CustomTestCase):
     def test_unresolved_canvas_and_state_survive_scheduler_round(self):
-        config = _config(algorithm_config={"steps": 3})
+        config = _config(
+            algorithm_config={"steps": 3},
+            first_done_first_out_mode=True,
+        )
+        sampling_params = SamplingParams(max_new_tokens=3)
+        sampling_params.normalize(None)
         req = Req(
             rid="req",
             origin_input_text="prompt",
             origin_input_ids=array("q", [10]),
-            sampling_params=SamplingParams(max_new_tokens=3),
+            sampling_params=sampling_params,
             dllm_config=config,
         )
         req.init_next_round_input()
@@ -504,7 +529,9 @@ class TestDreamFDFOResultProcessing(CustomTestCase):
             next_token_ids=[[10, 20, 99, 99]],
             can_run_cuda_graph=False,
         )
-        SchedulerDllmMixin.process_batch_result_dllm(scheduler, batch, unresolved)
+        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache") as release:
+            SchedulerDllmMixin.process_batch_result_dllm(scheduler, batch, unresolved)
+        release.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
 
         self.assertEqual(list(req.full_untruncated_fill_ids), [10, 20, 99, 99])
         self.assertEqual(req.dllm_algo_state, {"prompt_len": 1, "step": 1})

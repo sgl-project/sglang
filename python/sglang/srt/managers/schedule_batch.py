@@ -2518,9 +2518,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             multimodal_inputs.append(req.multimodal_inputs)
 
-            # Only calculate cached_tokens once. Once retracted, the 'retracted_stain'
-            # flag will always True
-            if not req.retracted_stain:
+            # Dream full-prefill has no reusable prefix: every denoising round
+            # recomputes the complete canvas from scratch.
+            if (
+                not (req.dllm_config is not None and req.dllm_config.needs_full_prefill)
+                and not req.retracted_stain
+            ):
+                # Only calculate cached_tokens once. Once retracted, the
+                # 'retracted_stain' flag will always be True.
                 new_cached = pre_len - req.already_computed
                 req.cached_tokens += new_cached
 
