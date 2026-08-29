@@ -5,6 +5,7 @@ import dataclasses
 import multiprocessing as mp
 import os
 import re
+import threading
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import (
@@ -364,13 +365,8 @@ class BaseMultimodalProcessor(ABC):
                 self.mm_processor_worker_num,
                 "auto" if requested_mm_processor_worker_num == 0 else "explicit",
             )
-        cpu_worker_start_method = (
-            "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
-        )
-        self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
-            mp_context=mp.get_context(cpu_worker_start_method),
-            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
-        )
+        self._cpu_executor_lock = threading.Lock()
+        self.cpu_executor = self._create_cpu_executor()
 
         # Mapping from attribute names to modality types
         self.ATTR_NAME_TO_MODALITY = {
@@ -489,6 +485,24 @@ class BaseMultimodalProcessor(ABC):
         self.cpu_executor.shutdown(wait=False, cancel_futures=True)
         if self.mm_processor_executor is not None:
             self.mm_processor_executor.shutdown()
+
+    def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
+        start_method = "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
+        return concurrent.futures.ProcessPoolExecutor(
+            mp_context=mp.get_context(start_method),
+            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+        )
+
+    def _replace_broken_cpu_executor(
+        self, failed_executor: concurrent.futures.ProcessPoolExecutor
+    ) -> None:
+        """Replace a failed preprocess pool once across concurrent requests."""
+        with self._cpu_executor_lock:
+            if self.cpu_executor is not failed_executor:
+                return
+            self.cpu_executor = self._create_cpu_executor()
+        failed_executor.shutdown(wait=False, cancel_futures=True)
+        logger.warning("Replaced a broken multimodal CPU preprocess pool")
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.

@@ -1,5 +1,6 @@
 import asyncio
 import os
+from concurrent.futures.process import BrokenProcessPool
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -137,17 +138,22 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
 
         if self.cpu_executor is not None:
             loop = asyncio.get_running_loop()
-            fut = loop.run_in_executor(
-                self.cpu_executor,
-                LlavaImageProcessor._preprocess_image_task,
-                image_input,
-                image_hash,
-                aspect_ratio,
-                grid_pinpoints,
-                self._processor,
-            )
-            timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
-            return await asyncio.wait_for(fut, timeout=timeout)
+            executor = self.cpu_executor
+            try:
+                fut = loop.run_in_executor(
+                    executor,
+                    LlavaImageProcessor._preprocess_image_task,
+                    image_input,
+                    image_hash,
+                    aspect_ratio,
+                    grid_pinpoints,
+                    self._processor,
+                )
+                timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
+                return await asyncio.wait_for(fut, timeout=timeout)
+            except BrokenProcessPool:
+                self._replace_broken_cpu_executor(executor)
+                raise
         else:
             return LlavaImageProcessor._preprocess_image_task(
                 image_input,
