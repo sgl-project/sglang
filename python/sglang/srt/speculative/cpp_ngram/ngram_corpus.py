@@ -22,6 +22,7 @@ class NgramCorpus:
         capacity=1000000,
         external_sam_budget=0,
         external_corpus_max_tokens=10000000,
+        max_sam_match_depth=0,
     ) -> None:
         cls = get_ngram_corpus_cls()
         self._obj = cls(
@@ -33,6 +34,7 @@ class NgramCorpus:
             match_type=match_type,
             external_sam_budget=external_sam_budget,
             external_corpus_max_tokens=external_corpus_max_tokens,
+            max_sam_match_depth=max_sam_match_depth,
         )
         self.draft_token_num = draft_token_num
         self.external_corpus_max_tokens = external_corpus_max_tokens

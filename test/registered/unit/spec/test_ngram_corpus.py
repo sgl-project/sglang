@@ -975,5 +975,47 @@ class TestMultiSamHttpMock(CustomTestCase):
         self.assertEqual(data["corpus_token_counts"], {"a": 100, "b": 200})
 
 
+class TestNgramCorpusSamMatchDepth(CustomTestCase):
+    """Verify how far back the external SAM is allowed to match."""
+
+    # Two documents that share a six-token tail and only differ before it, so
+    # nothing shorter than the shared tail can tell them apart.
+    BOILERPLATE = [700, 701, 702, 703, 704, 705]
+    DOC_A = [901, 902, 903] + BOILERPLATE + [801, 802]
+    DOC_B = [911, 912, 913] + BOILERPLATE + [811, 812]
+    QUERY = [901, 902, 903] + BOILERPLATE
+
+    def _leaf_paths(self, **kwargs):
+        corpus = _make_corpus(
+            "BFS",
+            max_trie_depth=len(self.BOILERPLATE),
+            draft_token_num=4,
+            external_sam_budget=3,
+            external_corpus_documents=[self.DOC_A, self.DOC_B],
+            **kwargs,
+        )
+        ids, masks = _batch_get(corpus, [self.QUERY])
+        return corpus.leaf_paths_from_mask(ids.tolist(), masks.reshape(4, 4).tolist())
+
+    def test_default_caps_sam_at_max_trie_depth(self):
+        # The query only sees the shared tail, so it cannot tell DOC_A from
+        # DOC_B and the more recent document wins.
+        leaf_paths = self._leaf_paths()
+        self.assertIn([705, 811, 812], leaf_paths)
+        self.assertNotIn([705, 801, 802], leaf_paths)
+
+    def test_longer_match_depth_reaches_older_context(self):
+        # Matching past the shared tail identifies DOC_A, so its continuation
+        # is drafted instead.
+        leaf_paths = self._leaf_paths(max_sam_match_depth=len(self.QUERY))
+        self.assertIn([705, 801, 802], leaf_paths)
+
+    def test_zero_is_equivalent_to_max_trie_depth(self):
+        self.assertEqual(
+            self._leaf_paths(),
+            self._leaf_paths(max_sam_match_depth=len(self.BOILERPLATE)),
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=3)

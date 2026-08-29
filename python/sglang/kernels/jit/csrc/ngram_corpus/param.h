@@ -23,6 +23,9 @@ struct Param {
   size_t draft_token_num;
   size_t external_sam_budget = 0;
   size_t external_corpus_max_tokens = 10000000;
+  // The SAM stores the whole corpus, so it can match a suffix longer than the
+  // trie's structural depth limit. 0 keeps it capped at max_trie_depth.
+  size_t max_sam_match_depth = 0;
   std::string match_type;
 
   std::vector<size_t> batch_draft_token_num;
@@ -96,7 +99,7 @@ struct Param {
     ss << "enable = " << enable << ", enable_router_mode = " << enable_router_mode
        << ", min_bfs_breadth = " << min_bfs_breadth << ", max_bfs_breadth = " << max_bfs_breadth
        << ", max_trie_depth = " << max_trie_depth << ", draft_token_num = " << draft_token_num
-       << ", external_sam_budget = " << external_sam_budget
+       << ", external_sam_budget = " << external_sam_budget << ", max_sam_match_depth = " << max_sam_match_depth
        << ", external_corpus_max_tokens = " << external_corpus_max_tokens << ", match_type = " << match_type;
     ss << ", batch_draft_token_num(" << batch_draft_token_num.size() << ") = ";
     for (int i = 0; i < batch_draft_token_num.size(); ++i) {

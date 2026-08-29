@@ -27,7 +27,8 @@ struct NgramCorpusObj : public tvm::ffi::Object {
       int64_t draft_token_num,
       int64_t match_type,
       int64_t external_sam_budget,
-      int64_t external_corpus_max_tokens) {
+      int64_t external_corpus_max_tokens,
+      int64_t max_sam_match_depth) {
     ngram::Param param;
     param.enable = true;
     param.enable_router_mode = false;
@@ -38,6 +39,7 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     param.match_type = (match_type == 0) ? "BFS" : "PROB";
     param.external_sam_budget = static_cast<size_t>(external_sam_budget);
     param.external_corpus_max_tokens = static_cast<size_t>(external_corpus_max_tokens);
+    param.max_sam_match_depth = static_cast<size_t>(max_sam_match_depth);
     ngram_ = std::make_unique<ngram::Ngram>(static_cast<size_t>(capacity), param);
   }
 
@@ -155,7 +157,7 @@ struct NgramCorpusObj : public tvm::ffi::Object {
 void register_ngram_corpus() {
   namespace refl = tvm::ffi::reflection;
   refl::ObjectDef<NgramCorpusObj>()
-      .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
+      .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
       .def("async_insert", &NgramCorpusObj::async_insert)
       .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
       .def("erase_match_state", &NgramCorpusObj::erase_match_state)
