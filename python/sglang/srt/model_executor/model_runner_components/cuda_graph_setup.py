@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 
@@ -48,7 +48,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+from sglang.srt.utils import get_available_gpu_memory
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -57,66 +57,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _align_pipeline_layers(layers: list, layer_model) -> list:
-    has_start_layer = hasattr(layer_model, "start_layer")
-    has_end_layer = hasattr(layer_model, "end_layer")
-    assert (
-        has_start_layer == has_end_layer
-    ), "pipeline layer ranges must define start_layer and end_layer together"
-    start_layer = layer_model.start_layer if has_start_layer else 0
-    end_layer = layer_model.end_layer if has_end_layer else len(layer_model.layers)
-    assert isinstance(start_layer, int) and isinstance(
-        end_layer, int
-    ), "pipeline layer ranges must define integer start_layer and end_layer"
-    assert 0 <= start_layer <= end_layer <= len(layer_model.layers), (
-        f"invalid pipeline layer range [{start_layer}, {end_layer}) for "
-        f"{len(layer_model.layers)} layers"
-    )
-    assert (
-        len(layers) <= end_layer - start_layer
-    ), f"found {len(layers)} layers in PP range [{start_layer}, {end_layer})"
-    return (
-        [None] * start_layer + layers + [None] * (len(layer_model.layers) - end_layer)
-    )
+def _unmapped_attention_layers(
+    model, attention_layers: list, mha_companion_layers: list
+) -> list[str]:
+    """Names of the model's RadixAttention modules that the per-layer lists do
+    not address, i.e. ``attention_layers[m.layer_id] is not m`` and the MLA
+    companion list does not hold it either."""
+    from sglang.srt.layers.radix_attention import RadixAttention
 
-
-def has_standard_gqa_for_all_local_layers(
-    *, attention_layer_count: int, start_layer: int, end_layer: int
-) -> bool:
-    """Check the layers materialized on this pipeline rank, not the full model."""
-    return attention_layer_count >= end_layer - start_layer
-
-
-def index_attention_layers_by_global_id(
-    attention_layers: list[Any],
-    mha_companion_layers: list[Any],
-    layer_model=None,
-) -> tuple[list[Any], list[Any]]:
-    """Pad PP-local attention metadata so global layer_id remains a valid index."""
-    if len(attention_layers) != len(mha_companion_layers):
-        raise ValueError("attention and MHA companion metadata must be parallel")
-    populated = [layer for layer in attention_layers if layer is not None]
-    if not populated or any(not hasattr(layer, "layer_id") for layer in populated):
-        if layer_model is not None:
-            return (
-                _align_pipeline_layers(attention_layers, layer_model),
-                _align_pipeline_layers(mha_companion_layers, layer_model),
-            )
-        return attention_layers, mha_companion_layers
-    max_layer_id = max(int(layer.layer_id) for layer in populated)
-    indexed_attention = [None] * (max_layer_id + 1)
-    indexed_companions = [None] * (max_layer_id + 1)
-    for attention, companion in zip(attention_layers, mha_companion_layers):
-        if attention is None:
-            if companion is not None:
-                raise ValueError("MHA companion has no primary attention layer")
+    unmapped = []
+    for name, module in model.named_modules():
+        if not isinstance(module, RadixAttention):
             continue
-        layer_id = int(attention.layer_id)
-        if layer_id < 0 or indexed_attention[layer_id] is not None:
-            raise ValueError(f"invalid or duplicate attention layer_id: {layer_id}")
-        indexed_attention[layer_id] = attention
-        indexed_companions[layer_id] = companion
-    return indexed_attention, indexed_companions
+        layer_id = module.layer_id
+        if not isinstance(layer_id, int) or not 0 <= layer_id < len(attention_layers):
+            unmapped.append(f"{name} (layer_id={layer_id})")
+            continue
+        if attention_layers[layer_id] is module:
+            continue
+        if mha_companion_layers[layer_id] is module:
+            continue
+        unmapped.append(f"{name} (layer_id={layer_id})")
+    return unmapped
 
 
 class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
@@ -431,26 +393,24 @@ def capture_prefill_graph(
         model_runner.dsa_indexers,
         model_runner.mha_companion_layers,
     ) = compute_attention_and_moe_layers(layer_model)
-    (
-        model_runner.attention_layers,
-        model_runner.mha_companion_layers,
-    ) = index_attention_layers_by_global_id(
-        model_runner.attention_layers,
-        model_runner.mha_companion_layers,
-        layer_model,
-    )
 
-    if not has_standard_gqa_for_all_local_layers(
-        attention_layer_count=sum(
-            layer is not None for layer in model_runner.attention_layers
-        ),
-        start_layer=model_runner.layer_info.start_layer,
-        end_layer=model_runner.layer_info.end_layer,
-    ):
-        # TODO(yuwei): support Non-Standard GQA
-        log_info_on_rank0(
-            logger,
-            "Disable prefill CUDA graph because some layers do not apply Standard GQA",
+    unmapped = _unmapped_attention_layers(
+        language_model,
+        model_runner.attention_layers,
+        model_runner.mha_companion_layers,
+    )
+    if unmapped:
+        # ``radix_attention`` indexes ``attention_layers[layer_id]`` under a
+        # captured prefill graph, so a layer whose module the ladder in
+        # ``compute_attention_and_moe_layers`` could not reach -- or whose
+        # layer_id does not address this list at all, as with a model that
+        # packs several attention modules per decoder layer -- would read None
+        # or run off the end. Those models keep the eager path.
+        logger.warning(
+            "Disable prefill CUDA graph because %d attention module(s) are not "
+            "reachable as attention_layers[layer_id]; first: %s",
+            len(unmapped),
+            unmapped[0],
         )
         return result(None)
 
