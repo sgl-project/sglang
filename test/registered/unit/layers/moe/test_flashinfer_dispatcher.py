@@ -20,6 +20,7 @@ def test_empty_mxfp8_dispatch_uses_same_payload_dtype_as_nonempty_rank():
     dispatcher = object.__new__(FlashinferDispatcher)
     dispatcher.dispatch_type = FlashinferA2ADispatchType.MXFP8
     dispatcher.hidden_size = 128
+    dispatcher.max_num_tokens = 0
     dispatcher.ep_size = 1
     dispatcher.invalid_token_expert_id = 8
     dispatcher.payload_in_workspace = False
