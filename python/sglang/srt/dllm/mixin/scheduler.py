@@ -123,6 +123,7 @@ class SchedulerDllmMixin:
                             req.time_stats.set_completion_time()
                     else:
                         req.dllm_algo_state = algo_states[idx]
+                        release_kv_cache(req, self.tree_cache, is_insert=False)
                     continue
 
                 if not fdfo_mode:
