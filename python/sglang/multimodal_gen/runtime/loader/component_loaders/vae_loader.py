@@ -276,6 +276,19 @@ class VAELoader(ComponentLoader):
     component_names = ["vae", "audio_vae", "video_vae"]
     expected_library = "diffusers"
 
+    def component_load_precision(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        precision = server_args.component_precisions.get(component_name)
+        if precision is None:
+            return None
+        if component_name in ("vae", "video_vae"):
+            return precision
+        raise ComponentCheckpointUnsupportedError(
+            f"{component_name!r} does not yet support an exact component precision "
+            "override"
+        )
+
     @staticmethod
     def resolve_model_weights_path(
         component_model_path: str,

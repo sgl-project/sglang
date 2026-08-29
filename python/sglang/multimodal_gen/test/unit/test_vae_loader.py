@@ -125,6 +125,19 @@ class TestMatchCheckpointDtypes(unittest.TestCase):
 
 
 class TestVAELoader(unittest.TestCase):
+    def test_exact_precision_is_admitted_only_for_standard_vae_components(self):
+        loader = vae_loader.VAELoader()
+        server_args = _FakeServerArgs(QwenImagePipelineConfig())
+        server_args.component_precisions = {"vae": "bf16"}
+
+        self.assertEqual(loader.component_load_precision(server_args, "vae"), "bf16")
+
+        server_args.component_precisions = {"audio_vae": "bf16"}
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError, "audio_vae.*exact component precision"
+        ):
+            loader.component_load_precision(server_args, "audio_vae")
+
     def test_weights_override_keeps_base_component_config(self):
         loader = vae_loader.VAELoader()
         server_args = _FakeServerArgs(QwenImagePipelineConfig())

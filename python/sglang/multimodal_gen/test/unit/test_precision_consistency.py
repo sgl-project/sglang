@@ -165,6 +165,24 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
                 self._server_args(vae_decode_precision_high="fp8"), quality="high"
             )
 
+    def test_exact_vae_precision_overrides_load_and_decode_defaults(self):
+        server_args = self._server_args(vae_decode_precision="bf16")
+        server_args.component_precisions["vae"] = "fp16"
+        server_args.component_precisions["video_vae"] = "bf16"
+
+        self.assertEqual(
+            resolve_precision(server_args, "vae", precision_attr="vae_precision"),
+            torch.float16,
+        )
+        self.assertEqual(resolve_decode_precision(server_args, "vae"), torch.float16)
+        self.assertEqual(
+            resolve_precision(server_args, "video_vae", precision_attr="vae_precision"),
+            torch.bfloat16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(server_args, "video_vae"), torch.bfloat16
+        )
+
     def test_component_precision_mapping(self):
         server_args = self._server_args()
         server_args.component_precisions["text_encoder_2"] = "fp32"
