@@ -3,6 +3,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import torch
 
+from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
 from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
 from sglang.srt.layers.attention.linear.kernels.kda_helion import HelionKDAKernel
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
@@ -159,15 +160,18 @@ class TestHelionKDADispatcher(unittest.TestCase):
 
     def test_replayssm_accepts_helion_and_rejects_other_backends(self):
         with (
-            patch("sglang.srt.server_args.is_sm100_supported", return_value=False),
-            patch("sglang.srt.server_args.is_cuda", return_value=False),
+            patch(
+                "sglang.srt.arg_groups.attention_hook.is_sm100_supported",
+                return_value=False,
+            ),
+            patch("sglang.srt.arg_groups.attention_hook.is_cuda", return_value=False),
         ):
             helion_args = ServerArgs(
                 model_path="dummy",
                 linear_attn_decode_backend="helion",
                 enable_linear_replayssm=True,
             )
-            helion_args._handle_linear_attn_backend()
+            handle_linear_attn_backend(helion_args)
 
             flashinfer_args = ServerArgs(
                 model_path="dummy",
@@ -175,7 +179,7 @@ class TestHelionKDADispatcher(unittest.TestCase):
                 enable_linear_replayssm=True,
             )
             with self.assertRaisesRegex(ValueError, "Triton, or Helion"):
-                flashinfer_args._handle_linear_attn_backend()
+                handle_linear_attn_backend(flashinfer_args)
 
     def test_explicit_base_backend_is_not_replaced_by_flashinfer(self):
         args = ServerArgs(
@@ -184,10 +188,13 @@ class TestHelionKDADispatcher(unittest.TestCase):
             mamba_ssm_dtype="bfloat16",
         )
         with (
-            patch("sglang.srt.server_args.is_sm100_supported", return_value=True),
-            patch("sglang.srt.server_args.is_cuda", return_value=False),
+            patch(
+                "sglang.srt.arg_groups.attention_hook.is_sm100_supported",
+                return_value=True,
+            ),
+            patch("sglang.srt.arg_groups.attention_hook.is_cuda", return_value=False),
         ):
-            args._handle_linear_attn_backend()
+            handle_linear_attn_backend(args)
 
         self.assertIsNone(args.linear_attn_decode_backend)
         self.assertEqual(args.linear_attn_backend, "helion")
