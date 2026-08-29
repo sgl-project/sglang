@@ -711,10 +711,10 @@ install_extra_deps() {
     MOONCAKE_WHEEL_ZIP_URL=""
     if [ "$(uname -m)" = "x86_64" ]; then
         case "${CU_MAJOR}:${SYS_PYTHON_VER}" in
-            12:3.10) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/9569938165.zip" ;;
-            12:3.12) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/9569941441.zip" ;;
-            13:3.10) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/9569917014.zip" ;;
-            13:3.12) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/9569868858.zip" ;;
+            12:3.10) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/9684900766.zip" ;;
+            12:3.12) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/9684882498.zip" ;;
+            13:3.10) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/9684879545.zip" ;;
+            13:3.12) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/9684916333.zip" ;;
         esac
     fi
     if [ -n "$MOONCAKE_WHEEL_ZIP_URL" ]; then
