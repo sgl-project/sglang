@@ -141,13 +141,29 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             ), "True log-probability computation requires a non-zero noise level."
 
         dt = next_sigma - current_sigma
+
+        # step_index comes from the denoising-loop counter stashed by
+        # DenoisingStage — scheduler._step_index would differ when
+        # _begin_index != 0 (e.g. partial denoising).
+        sde_step_indices = getattr(batch, "rollout_sde_step_indices", None)
+        loop_step_index = getattr(batch, "_rollout_loop_step_index", None)
+        if (
+            sde_type != "ode"
+            and sde_step_indices is not None
+            and loop_step_index is not None
+            and loop_step_index not in sde_step_indices
+        ):
+            effective_sde_type = "ode"
+        else:
+            effective_sde_type = sde_type
+
         # sde/cps: cast to fp32 to match flowGRPO semantics and avoid the
         # 0-dim-fp32 wrapped-scalar promotion demoting log-prob to bf16.
         # ode: keep dtypes unchanged so rollout(ode) stays bit-exact with
         # rollout=False (scheduling_flow_match_euler_discrete.step()).
         # log_prob is computed on the full pre-shard noise buffer so SP ranks
         # produce identical sums — see collect_rollout_log_probs().
-        if sde_type == "sde":
+        if effective_sde_type == "sde":
             model_output = model_output.float()
             sample = sample.float()
             variance_noise = self._rollout_variance_noise(
@@ -180,7 +196,7 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             prev_sample = prev_sample_mean + weighted_variance_noise
             log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
 
-        elif sde_type == "cps":
+        elif effective_sde_type == "cps":
             model_output = model_output.float()
             sample = sample.float()
             variance_noise = self._rollout_variance_noise(
@@ -199,7 +215,7 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             prev_sample = prev_sample_mean + weighted_variance_noise
             log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
 
-        elif sde_type == "ode":
+        elif effective_sde_type == "ode":
             prev_sample = sample + dt * model_output
             prev_sample_mean = prev_sample
             variance_noise = torch.zeros_like(model_output)
@@ -211,9 +227,12 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
                 device=model_output.device,
                 dtype=torch.float32,
             )
-            assert (
-                log_prob_no_const
-            ), "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
+            # Only enforce the "no full log-prob with ODE" constraint when the
+            # user explicitly chose ODE globally.
+            if sde_type == "ode":
+                assert (
+                    log_prob_no_const
+                ), "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
 
         else:
             raise ValueError(f"Unsupported sde_type: {sde_type}")
@@ -224,7 +243,7 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             float(math.prod(log_prob_no_const_val.shape[1:])),
         )
 
-        if log_prob_no_const:
+        if log_prob_no_const or effective_sde_type == "ode":
             log_prob_local_sum = log_prob_no_const_val.sum(dim=reduce_dims)
         else:
             log_prob_local_sum = (

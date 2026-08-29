@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # Copyright 2024 xDiT team.
@@ -7,7 +9,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import pickle
 from collections import namedtuple
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -22,6 +24,7 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_
 from sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator import (
     CpuCommunicator,
 )
+from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
@@ -121,6 +124,18 @@ class GraphCaptureContext:
     stream: torch.cuda.Stream | None
 
 
+def new_device_group(ranks, backend=None):
+    """Create a process group for device collectives.
+
+    A single-rank group never runs one: every collective short-circuits on
+    world_size == 1. NCCL would still allocate its per-channel device buffers
+    for it, which costs ~390 MiB a group.
+    """
+    return torch.distributed.new_group(
+        ranks, backend="gloo" if len(ranks) == 1 else backend
+    )
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -156,6 +171,7 @@ class GroupCoordinator:
         local_rank: int,
         torch_distributed_backend: Union[str, Backend],
         use_device_communicator: bool = True,
+        use_srt_custom_allreduce: bool = False,
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
     ):
@@ -166,9 +182,7 @@ class GroupCoordinator:
         self.cpu_group = None
 
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
+            device_group = new_device_group(ranks, torch_distributed_backend)
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             with suppress_stdout():
@@ -211,10 +225,28 @@ class GroupCoordinator:
                 )
 
         self.mq_broadcaster = None
+        self.srt_custom_allreduce = None
+        if (
+            use_srt_custom_allreduce
+            and current_platform.is_cuda_alike()
+            and self.world_size > 1
+        ):
+            # srt owns topology, dtype, contiguity, and size dispatch for custom ar
+            self._init_srt_custom_allreduce()
 
         # TODO(will): check if this is needed
         # self.use_custom_op_call = current_platform.is_cuda_alike()
         self.use_custom_op_call = False
+
+    def _init_srt_custom_allreduce(self) -> None:
+        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+            CustomAllreduce,
+        )
+
+        self.srt_custom_allreduce = CustomAllreduce(
+            group=self.cpu_group,
+            device=self.device,
+        )
 
     @property
     def first_rank(self):
@@ -293,7 +325,16 @@ class GroupCoordinator:
             if curr_stream != stream:
                 stream.wait_stream(curr_stream)
 
-            with torch.cuda.stream(stream):
+            # Custom all-reduce has an eager path and a graph path; only inside
+            # capture() does all_reduce pick the graph one, and only capture()
+            # exit registers the graph-pool buffers with the peers. Capturing the
+            # eager path instead faults on replay (unmapped peer IPC address).
+            custom_ar = self.srt_custom_allreduce
+            maybe_ca_context = (
+                nullcontext() if custom_ar is None else custom_ar.capture()
+            )
+
+            with torch.cuda.stream(stream), maybe_ca_context:
                 yield graph_capture_context
         else:
             # For non-CUDA platforms (MPS, CPU), just yield the context without stream management
@@ -324,6 +365,18 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
         else:
+            custom_ar = self.srt_custom_allreduce
+            if (
+                not async_op
+                and custom_ar is not None
+                and op == torch.distributed.ReduceOp.SUM
+                and not input_.is_cpu
+                and not custom_ar.disabled
+                and custom_ar.should_custom_ar(input_)
+            ):
+                if custom_ar._IS_CAPTURING:
+                    return custom_ar.custom_all_reduce(input_)
+                return custom_ar._all_reduce_impl(input_, registered=False)
             if (
                 current_platform.is_cpu()
                 and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
@@ -365,9 +418,7 @@ class GroupCoordinator:
         ):
             return torch.ops.sgl_kernel.shm_allgather(input_, dim)
         else:
-            torch.distributed.all_gather_into_tensor(
-                output_tensor, input_, group=self.device_group
-            )
+            all_gather_single(output_tensor, input_, group=self.device_group)
 
         if dim != 0:
             input_size[0] //= world_size
@@ -435,6 +486,8 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
         # Broadcast.
+        if not input_.is_contiguous():
+            input_ = input_.contiguous()
         torch.distributed.broadcast(
             input_,
             src=self.ranks[src],
@@ -567,10 +620,11 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
         assert src < self.world_size, f"Invalid src rank ({src})"
-        src = self.ranks[src]
+        src_rank_in_group = src
+        src_global_rank = self.ranks[src_rank_in_group]
 
         rank = self.rank
-        if rank == src:
+        if rank == src_global_rank:
             metadata_list: List[Tuple[Any, Any]] = []
             assert isinstance(
                 tensor_dict, dict
@@ -579,7 +633,7 @@ class GroupCoordinator:
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
             # all happening on CPU. Therefore, we can use the CPU group.
-            self.broadcast_object(metadata_list, src=src)
+            self.broadcast_object(metadata_list, src=src_rank_in_group)
             async_handles = []
             for tensor in tensor_list:
                 if tensor.numel() == 0:
@@ -588,19 +642,22 @@ class GroupCoordinator:
                 if tensor.is_cpu:
                     # use metadata_group for CPU tensors
                     handle = torch.distributed.broadcast(
-                        tensor, src=src, group=metadata_group, async_op=True
+                        tensor,
+                        src=src_global_rank,
+                        group=metadata_group,
+                        async_op=True,
                     )
                 else:
                     # use group for GPU tensors
                     handle = torch.distributed.broadcast(
-                        tensor, src=src, group=group, async_op=True
+                        tensor, src=src_global_rank, group=group, async_op=True
                     )
                 async_handles.append(handle)
             for async_handle in async_handles:
                 async_handle.wait()
 
         else:
-            metadata_list = self.broadcast_object(None, src=src)
+            metadata_list = self.broadcast_object(None, src=src_rank_in_group)
             tensor_dict = {}
             async_handles = []
             for key, value in metadata_list:
@@ -615,12 +672,15 @@ class GroupCoordinator:
                     if tensor.is_cpu:
                         # use metadata_group for CPU tensors
                         handle = torch.distributed.broadcast(
-                            tensor, src=src, group=metadata_group, async_op=True
+                            tensor,
+                            src=src_global_rank,
+                            group=metadata_group,
+                            async_op=True,
                         )
                     else:
                         # use group for GPU tensors
                         handle = torch.distributed.broadcast(
-                            tensor, src=src, group=group, async_op=True
+                            tensor, src=src_global_rank, group=group, async_op=True
                         )
                     async_handles.append(handle)
                     _update_nested_dict(tensor_dict, key, tensor)
@@ -765,6 +825,9 @@ class GroupCoordinator:
             self.cpu_group = None
         if self.device_communicator is not None:
             self.device_communicator.destroy()
+        if self.srt_custom_allreduce is not None:
+            self.srt_custom_allreduce.close()
+            self.srt_custom_allreduce = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
@@ -809,9 +872,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.device_groups = []
         if len(group_ranks[0]) > 2 or len(group_ranks[0]) == 1:
             for ranks in group_ranks:
-                device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
-                )
+                device_group = new_device_group(ranks, torch_distributed_backend)
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
                 with suppress_stdout():
@@ -873,9 +934,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         ] = None
         self.skip_device_group = None
         for ranks in group_ranks:
-            skip_device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
+            skip_device_group = new_device_group(ranks, torch_distributed_backend)
             if self.rank in ranks:
                 self.skip_device_group = skip_device_group
         assert self.skip_device_group is not None
@@ -1224,11 +1283,11 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         ring_group = kwargs.get("ring_group", None)
         if ulysses_group is None:
             raise RuntimeError(
-                f"Please pass argument 'ulysses_group' when calling init func of SequenceParallelGroupCoordinator"
+                "Please pass argument 'ulysses_group' when calling init func of SequenceParallelGroupCoordinator"
             )
         if ring_group is None:
             raise RuntimeError(
-                f"Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
+                "Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
             )
         self.ulysses_group = ulysses_group
         self.ring_group = ring_group

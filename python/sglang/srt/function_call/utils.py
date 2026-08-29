@@ -1,3 +1,6 @@
+import ast
+import threading
+import warnings
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
@@ -7,6 +10,168 @@ import partial_json_parser
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+
+_STANDARD_JSON_SCHEMA_TYPES = {
+    "null",
+    "boolean",
+    "object",
+    "array",
+    "number",
+    "string",
+    "integer",
+}
+
+# Non-standard ``type`` values commonly emitted by DB/ORM-driven tool-schema
+# generators. Mapped to the closest JSON Schema 2020-12 primitive so that
+# ``Draft202012Validator.check_schema`` does not reject an otherwise-usable
+# tool definition.
+_JSON_SCHEMA_TYPE_ALIASES: Dict[str, str] = {
+    "str": "string",
+    "text": "string",
+    "varchar": "string",
+    "char": "string",
+    "enum": "string",
+    "uuid": "string",
+    "date": "string",
+    "datetime": "string",
+    "time": "string",
+    "timestamp": "string",
+    "binary": "string",
+    "blob": "string",
+    "bytea": "string",
+    "bytes": "string",
+    "varbinary": "string",
+    "bool": "boolean",
+    "bigint": "integer",
+    "smallint": "integer",
+    "tinyint": "integer",
+    "double": "number",
+    "decimal": "number",
+    "real": "number",
+    "numeric": "number",
+    "arr": "array",
+    "tuple": "array",
+    "set": "array",
+    "map": "object",
+}
+
+# Prefix-based matching so that parameterised names like ``int32`` /
+# ``float64`` / ``list[str]`` / ``dict[str, int]`` resolve. A prefix only
+# matches when it spans the entire token or is followed by a non-identifier
+# char, so "int" does not swallow "internal" and "list" does not swallow
+# "list_price".
+_PREFIX_BOUNDARY_CHARS = frozenset("0123456789[<( \t")
+_PREFIX_RULES: Tuple[Tuple[Tuple[str, ...], str], ...] = (
+    (("int", "uint", "long", "short", "unsigned"), "integer"),
+    (("num", "float"), "number"),
+    (("list",), "array"),
+    (("dict",), "object"),
+)
+
+
+def _matches_type_prefix(base: str, prefixes: Tuple[str, ...]) -> bool:
+    for p in prefixes:
+        if base == p:
+            return True
+        if (
+            len(base) > len(p)
+            and base.startswith(p)
+            and base[len(p)] in _PREFIX_BOUNDARY_CHARS
+        ):
+            return True
+    return False
+
+
+def _normalize_single_type(raw: Any) -> Any:
+    if not isinstance(raw, str):
+        return raw
+    if raw in _STANDARD_JSON_SCHEMA_TYPES:
+        return raw
+    # ``split("(", 1)[0]`` strips parenthesized params like ``varchar(255)``
+    # or ``decimal(10,2)`` without the overhead of a regex per call.
+    base = raw.split("(", 1)[0].strip().lower()
+    if base in _STANDARD_JSON_SCHEMA_TYPES:
+        return base
+    mapped = _JSON_SCHEMA_TYPE_ALIASES.get(base)
+    if mapped is not None:
+        return mapped
+    for prefixes, target in _PREFIX_RULES:
+        if _matches_type_prefix(base, prefixes):
+            return target
+    return raw
+
+
+def _normalize_type_list(raw_items: List[Any]) -> List[Any]:
+    normalized_items: List[Any] = []
+    for item in raw_items:
+        normalized_item = _normalize_single_type(item)
+        if normalized_item not in normalized_items:
+            normalized_items.append(normalized_item)
+    return normalized_items
+
+
+def normalize_json_schema_types(schema: Any) -> None:
+    """
+    Walk a JSON Schema in place and rewrite non-standard ``"type"`` values
+    (e.g. ``"varchar"``, ``"enum"``, ``"int"``) to their standard JSON Schema
+    equivalents.
+
+    Acts as a compatibility layer for tool ``parameters`` schemas exported
+    from database / ORM tooling, which often uses DB type names rather than
+    JSON Schema types. Unknown types are left untouched so that downstream
+    validation can still surface genuine errors.
+
+    Mutates the input dict in place; the rewritten schema is also what gets
+    rendered into the model prompt, so e.g. a user-supplied ``"varchar"``
+    reaches the model as ``"string"``. ``$ref`` values are not resolved;
+    callers pass tree-shaped schemas (HTTP JSON input is always a tree).
+    """
+    if isinstance(schema, list):
+        for item in schema:
+            normalize_json_schema_types(item)
+        return
+    if not isinstance(schema, dict):
+        return
+
+    if "type" in schema:
+        t = schema["type"]
+        if isinstance(t, str):
+            schema["type"] = _normalize_single_type(t)
+        elif isinstance(t, list):
+            schema["type"] = _normalize_type_list(t)
+
+    for key in (
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+    ):
+        nested = schema.get(key)
+        if isinstance(nested, dict):
+            for v in nested.values():
+                normalize_json_schema_types(v)
+
+    for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
+        nested = schema.get(key)
+        if isinstance(nested, list):
+            for v in nested:
+                normalize_json_schema_types(v)
+
+    for key in (
+        "items",
+        "additionalProperties",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contains",
+        "propertyNames",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    ):
+        if key in schema:
+            normalize_json_schema_types(schema[key])
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:
@@ -47,6 +212,15 @@ def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
             obj, end = JSONDecoder().raw_decode(input_str, start)
             return obj, end
         raise
+    except AssertionError as e:
+        # partial_json_parser.fix_fast() asserts on some partial/ambiguous inputs
+        # (e.g. trailing non-whitespace after an otherwise-fixable prefix) instead
+        # of signaling "incomplete". Convert to JSONDecodeError so streaming
+        # callers treat it as not-yet-complete (wait for more tokens) rather than
+        # raising and failing the request.
+        raise JSONDecodeError(
+            "partial_json_parser assertion (treat as incomplete)", input_str, 0
+        ) from e
 
 
 def _is_complete_json(input_str: str) -> bool:
@@ -55,6 +229,35 @@ def _is_complete_json(input_str: str) -> bool:
         return True
     except JSONDecodeError:
         return False
+
+
+# ``warnings.catch_warnings`` mutates the *process-global* warning filters and
+# is therefore not thread-safe (CPython docs). Tool-call parsing runs on the
+# request path and may execute concurrently, so the enter/eval/restore window
+# is serialized. These helpers are microsecond-cheap; the lock has no perf impact.
+_safe_ast_lock = threading.Lock()
+
+
+def _run_ast_quiet(fn, *args):
+    """Run an ``ast`` function with invalid-escape warnings suppressed.
+
+    CPython parses invalid escapes (e.g. ``"\\d+"``) with the backslash kept
+    and only emits a warning, so the parsed value is already correct —
+    promoting the warning to an error would drop otherwise-valid tool calls.
+
+    Holds ``_safe_ast_lock`` because ``catch_warnings`` touches global state."""
+    with _safe_ast_lock, warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=SyntaxWarning)
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        return fn(*args)
+
+
+def safe_literal_eval(value: str) -> Any:
+    return _run_ast_quiet(ast.literal_eval, value)
+
+
+def safe_ast_parse(source: str) -> ast.Module:
+    return _run_ast_quiet(ast.parse, source)
 
 
 def _get_tool_schema_defs(tools: List[Tool]) -> dict:
@@ -99,6 +302,25 @@ def _get_tool_schema(tool: Tool) -> dict:
         },
         "required": ["name", "parameters"],
     }
+
+
+def get_schema_properties(schema: Any) -> Dict[str, Any]:
+    """Top-level ``properties`` of a tool ``parameters`` schema, descending
+    into ``anyOf``/``oneOf``/``allOf`` branches when the top level declares
+    none (legal JSON Schema, e.g. discriminated-union arguments)."""
+    if not isinstance(schema, dict):
+        return {}
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        return properties
+    merged: Dict[str, Any] = {}
+    for keyword in ("anyOf", "oneOf", "allOf"):
+        branches = schema.get(keyword)
+        if isinstance(branches, list):
+            for branch in branches:
+                for key, value in get_schema_properties(branch).items():
+                    merged.setdefault(key, value)
+    return merged
 
 
 def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
@@ -149,6 +371,9 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
                 # If all types are the same, return unified type
                 if len(set(types)) == 1:
                     return types[0]
+                # If it's an optional type, return original type.
+                if len(set(types)) == 2 and "null" in types:
+                    return [t for t in types if t != "null"][0]
                 # When types differ, prioritize string (safest)
                 if "string" in types:
                     return "string"

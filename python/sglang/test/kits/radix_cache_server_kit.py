@@ -11,7 +11,9 @@ def gen_radix_tree(num_nodes=400, chunk_len=256):
         parent = random.choice(nodes)
         unique_len = random.randint(0, chunk_len)
         decode_len = random.randint(0, chunk_len)
-        token_id = random.randint(0, 32000)
+        token_id = random.randint(
+            0, 31999
+        )  # randint is inclusive; vocab_size-1 = 31999
         child = {
             "input_ids": parent["input_ids"] + [token_id] * unique_len,
             "decode_len": decode_len,
@@ -24,7 +26,9 @@ def gen_radix_tree(num_nodes=400, chunk_len=256):
         for _ in range(num_branch):
             unique_len = random.randint(0, chunk_len)
             decode_len = random.randint(0, chunk_len)
-            token_id = random.randint(0, 32000)
+            token_id = random.randint(
+                0, 31999
+            )  # randint is inclusive; vocab_size-1 = 31999
             child = {
                 "input_ids": parent["input_ids"] + [token_id] * unique_len,
                 "decode_len": decode_len,

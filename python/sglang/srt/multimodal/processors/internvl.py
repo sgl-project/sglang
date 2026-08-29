@@ -310,7 +310,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
                 videos=videos,
             )
         else:
-            base_output = self.load_mm_data(
+            base_output = await self.load_mm_data(
                 prompt=prompt,
                 image_data=image_data,
                 video_data=video_data,
@@ -318,7 +318,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
                 discard_alpha_channel=True,
             )
 
-        mm_items, input_ids_tensor, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids_tensor, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 
@@ -423,7 +423,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
             prompt.count(self.VIDEO_PLACEHOLDER_TOKEN),
         )
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=prompt,
             image_data=image_data,
             video_data=video_data,
@@ -644,7 +644,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
             prompt.count(self.IMG_CONTEXT),
         )
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=prompt,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens_internlm2,  # expects <IMG_CONTEXT>

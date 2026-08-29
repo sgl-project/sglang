@@ -5,8 +5,10 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda_alike
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_cuda, is_cuda_alike
 
+_is_cuda = is_cuda()
 _is_cuda_alike = is_cuda_alike()
 
 if _is_cuda_alike:
@@ -15,22 +17,29 @@ if _is_cuda_alike:
         get_cutlass_w4a8_moe_mm_data,
     )
 
-from sgl_kernel import silu_and_mul
-from triton.experimental.gluon import language as gl
+if _is_cuda:
+    from sglang.kernels.ops.activation.activation import silu_and_mul
+else:
+    from sgl_kernel import silu_and_mul
 
-from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
-from sglang.srt.distributed import get_moe_expert_parallel_world_size
-from sglang.srt.layers.moe.ep_moe.kernels import (
+from sglang.kernels.ops.moe.ep_moe_kernels import (
     cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
     deepep_permute_triton_kernel,
     deepep_post_reorder_gluon_kernel,
+    deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
     fp8_per_token_to_per_tensor_quant_triton,
+    gluon_post_reorder_layout,
     post_reorder_for_cutlass_moe,
     pre_reorder_for_cutlass_moe,
     silu_and_mul_masked_post_per_tensor_quant_fwd,
+    silu_mul_dynamic_tensorwise_quant_for_cutlass_moe,
     silu_mul_static_tensorwise_quant_for_cutlass_moe,
+)
+from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
+    per_tensor_absmax_fp8,
+    per_tensor_quant_fp8,
 )
 
 
@@ -121,7 +130,7 @@ def cutlass_w4a8_moe(
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
 
     device = a.device
-    if get_moe_expert_parallel_world_size() > 1:
+    if get_parallel().moe_ep_size > 1:
         topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
 
     src2dst = cutlass_w4_run_moe_ep_preproess(
@@ -133,6 +142,11 @@ def cutlass_w4a8_moe(
         device=device,
         dtype=torch.float8_e4m3fn,
     )
+
+    # TODO: fuse per_tensor_absmax_fp8 and pre_reorder_for_cutlass_moe
+    if a1_scale is None:
+        a1_scale = torch.zeros(1, dtype=torch.float32, device=device)
+        per_tensor_absmax_fp8(a, a1_scale)
 
     pre_reorder_for_cutlass_moe(
         a,
@@ -185,9 +199,16 @@ def cutlass_w4a8_moe(
     intermediate_q = torch.empty(
         (m * topk, n), dtype=torch.float8_e4m3fn, device=device
     )
-    silu_mul_static_tensorwise_quant_for_cutlass_moe(
-        c1, intermediate_q, a2_scale.float(), expert_offsets[-1:], m * topk, n
-    )
+
+    if a2_scale is None:
+        a2_scale = torch.zeros(1, dtype=torch.float32, device=device)
+        silu_mul_dynamic_tensorwise_quant_for_cutlass_moe(
+            c1, intermediate_q, a2_scale, expert_offsets[-1:], m * topk, n
+        )
+    else:
+        silu_mul_static_tensorwise_quant_for_cutlass_moe(
+            c1, intermediate_q, a2_scale.float(), expert_offsets[-1:], m * topk, n
+        )
 
     cutlass_w4a8_moe_mm(
         c2,
@@ -398,23 +419,37 @@ def cutlass_w4a8_moe_deepep_normal(
         device=c2.device,
         dtype=torch.bfloat16,
     )
-    BLOCK_SIZE = 1024
-    hidden_size = c2.shape[1]
-    num_warps = 8
-    ept = BLOCK_SIZE // (32 * num_warps)
-    layout = gl.BlockedLayout([ept], [32], [num_warps], [0])
-    deepep_post_reorder_gluon_kernel[(num_tokens,)](
-        c2,
-        output,
-        src2dst,
-        topk_weights,
-        topk,
-        hidden_size,
-        BLOCK_SIZE=BLOCK_SIZE,
-        TOPK=topk,
-        layout=layout,
-        num_warps=num_warps,
-    )
+    # DeepEP models apply routed_scaling_factor after the cross-rank
+    # combine, so this rank-local reduction must remain unscaled.
+    if _is_cuda and deepep_post_reorder_gluon_kernel is not None:
+        # Tuned on H200 (hidden 7168, bf16); see PR #22426 for the sweep.
+        BLOCK_SIZE = 1024
+        NUM_WARPS = 8
+        deepep_post_reorder_gluon_kernel[(num_tokens,)](
+            c2,
+            output,
+            src2dst,
+            topk_weights,
+            topk,
+            c2.shape[1],
+            1.0,
+            BLOCK_SIZE=BLOCK_SIZE,
+            TOPK=topk,
+            layout=gluon_post_reorder_layout(BLOCK_SIZE, NUM_WARPS),
+            num_warps=NUM_WARPS,
+        )
+    else:
+        deepep_post_reorder_triton_kernel[(num_tokens,)](
+            c2,
+            output,
+            src2dst,
+            topk_ids_,
+            topk_weights,
+            topk,
+            c2.shape[1],
+            1.0,
+            BLOCK_SIZE=512,
+        )
 
     return output
 
@@ -441,6 +476,7 @@ def cutlass_w4a8_moe_deepep_ll(
     problem_sizes2: torch.Tensor,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    expected_m: Optional[int] = None,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -477,6 +513,8 @@ def cutlass_w4a8_moe_deepep_ll(
         Shape: scalar or [1, N]
     - apply_router_weight_on_input (bool): When true, the topk weights are
         applied directly on the inputs. This is only applicable when topk is 1.
+    - expected_m (Optional[int]): Dispatcher's expected rows per expert; a
+        requant launch hint only, any value is correct.
 
     Returns:
     - torch.Tensor: The fp8 output tensor after applying the MoE layer.
@@ -517,6 +555,7 @@ def cutlass_w4a8_moe_deepep_ll(
         masked_m=masked_m,
         output_scale=a1_scale,
         output=gateup_input,
+        expected_rows=expected_m,
     )
     c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)

@@ -1,0 +1,21 @@
+---
+title: Overview
+mode: wide
+description: Practical guides for deploying and using Vision-Language-Action policies with SGLang.
+metatags:
+    description: "Explore SGLang Vision-Language-Action policy cookbooks for robot action serving, OpenPI compatibility, caching, and performance tuning."
+---
+
+Vision-Language-Action policies map camera observations, language instructions, and robot state into continuous action chunks. They share some runtime machinery with diffusion pipelines, but the user-facing workload is robot action inference rather than image or video generation.
+
+This section keeps VLA policies separate from the diffusion model cookbook so robot deployments can document their own input schemas, policy endpoints, cache behavior, and control-loop performance targets.
+
+## OpenPI
+
+<CardGroup cols={2}>
+  <Card
+    title="Pi0.5"
+    mode="card"
+    href="/cookbook/vla/OpenPI/Pi0.5"
+  />
+</CardGroup>

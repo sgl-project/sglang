@@ -11,20 +11,27 @@ python3 -m sglang.test.send_one --stop "<|separator|>" "<|eos|>" --max-new-token
 import argparse
 import dataclasses
 import json
+import random
 from typing import Optional
 
 import requests
 import tabulate
 
 from sglang.profiler import run_profile
+from sglang.srt.utils.network import resolve_base_url
+
+JSON_OBJECT_SCHEMA = json.dumps({"type": "object"})
 
 
 @dataclasses.dataclass
 class BenchArgs:
     host: str = "localhost"
     port: int = 30000
+    base_url: str = ""
     batch_size: int = 1
     different_prompts: bool = False
+    random_input_len: Optional[int] = None
+    random_input_vocab_size: int = 32768
     seed: Optional[int] = None
     temperature: float = 0.0
     max_new_tokens: int = 512
@@ -48,11 +55,32 @@ class BenchArgs:
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--host", type=str, default=BenchArgs.host)
         parser.add_argument("--port", type=int, default=BenchArgs.port)
+        parser.add_argument(
+            "--base-url",
+            type=str,
+            default=BenchArgs.base_url,
+            help="Server base url. Overrides --host/--port when set.",
+        )
         parser.add_argument("--batch-size", type=int, default=BenchArgs.batch_size)
         parser.add_argument(
             "--different-prompts",
             action="store_true",
             default=BenchArgs.different_prompts,
+        )
+        parser.add_argument(
+            "--random-input-len",
+            type=int,
+            default=BenchArgs.random_input_len,
+            help="Generate a random prompt of exactly this many tokens (random token IDs). "
+            "Each request in the batch gets unique random IDs, avoiding radix cache hits. "
+            "Useful for profiling to ensure the full prefill is captured.",
+        )
+        parser.add_argument(
+            "--random-input-vocab-size",
+            type=int,
+            default=BenchArgs.random_input_vocab_size,
+            help="Vocab size for --random-input-len. Token IDs are sampled from "
+            "[0, vocab_size). Default: 32768.",
         )
         parser.add_argument("--seed", type=int, default=BenchArgs.seed)
         parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
@@ -87,11 +115,43 @@ class BenchArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
 
-def send_one_prompt(args: BenchArgs):
-    base_url = f"http://{args.host}:{args.port}"
+def send_one_prompt(
+    args: BenchArgs,
+    label: Optional[str] = None,
+    print_output: bool = True,
+):
+    base_url = resolve_base_url(args.base_url, args.host, args.port)
 
     # Construct the input
+    if args.random_input_len is not None:
+        # Generate random input ids within the vocab size
+        n = args.random_input_len
+        v = args.random_input_vocab_size
+        if args.batch_size == 1:
+            input_ids = random.choices(range(v), k=n)
+        else:
+            if args.different_prompts:
+                input_ids = [
+                    random.choices(range(v), k=n) for _ in range(args.batch_size)
+                ]
+            else:
+                input_ids = [random.choices(range(v), k=n)] * args.batch_size
+    else:
+        # Use the user inputs
+        input_ids = None
+        if args.batch_size == 1:
+            prompt = args.prompt
+        else:
+            if args.different_prompts:
+                prompt = [
+                    f"Test case {i+1}: " + args.prompt for i in range(args.batch_size)
+                ]
+            else:
+                prompt = [args.prompt] * args.batch_size
+
+    # If need image
     if args.image:
+        assert args.batch_size == 1 and not args.random_input_len
         args.prompt = (
             "Human: Describe this image in a very short sentence.\n\nAssistant:"
         )
@@ -110,26 +170,20 @@ def send_one_prompt(args: BenchArgs):
     else:
         image_data = None
 
-    prompt = args.prompt
-
+    # If need json output
     if args.json:
+        assert args.batch_size == 1 and not args.random_input_len
         prompt = (
             "Human: What is the capital of France and how is that city like. "
             "Give me 3 trivial information about that city. "
             "Write in a format of json.\nAssistant:"
         )
-        json_schema = "$$ANY$$"
+        json_schema = JSON_OBJECT_SCHEMA
     else:
         json_schema = None
 
-    if args.batch_size > 1:
-        if not args.different_prompts:
-            prompt = [prompt] * args.batch_size
-        else:
-            prompt = [f"Test case {i+1}: " + prompt for i in range(args.batch_size)]
-
     json_data = {
-        "text": prompt,
+        **({"input_ids": input_ids} if input_ids is not None else {"text": prompt}),
         "image_data": image_data,
         "sampling_params": {
             "sampling_seed": args.seed,
@@ -195,10 +249,12 @@ def send_one_prompt(args: BenchArgs):
     speed = ret["meta_info"]["completion_tokens"] / latency
     tokens = ret["meta_info"]["completion_tokens"]
 
-    if not args.stream:
+    if not args.stream and print_output:
         print(ret["text"])
 
     print()
+    if label is not None:
+        print(label)
     headers = ["Latency (s)", "Tokens", "Acc Length", "Speed (token/s)"]
     rows = [[f"{latency:.3f}", f"{tokens}", f"{acc_length:.3f}", f"{speed:.2f}"]]
     msg = tabulate.tabulate(rows, headers=headers, tablefmt="pretty")

@@ -118,7 +118,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
                 audios=audios,
             )
         else:
-            base_output = self.load_mm_data(
+            base_output = await self.load_mm_data(
                 prompt=prompt,
                 image_data=normalized_images,
                 audio_data=audio_data,
@@ -128,7 +128,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         if base_output is None:
             return None
 
-        mm_items, input_ids_tensor, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids_tensor, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 
@@ -190,7 +190,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
                 **kwargs,
             )
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             audio_data=audio_data,
             image_data=image_data,

@@ -1,3 +1,8 @@
+---
+name: sglang-bisect-ci-regression
+description: Investigate consistently failing SGLang CI tests by extracting the failure signature from scheduled or rerun workflows, bisecting the passing/failing commit window, checking runner or hardware specificity, and optionally reproducing on a remote GPU host.
+---
+
 # SGLang Bisect CI Regression
 
 Investigate a consistently failing CI test to find the root cause - whether it's a code regression from a specific PR, a hardware/runner-specific issue, or an environment change. Optionally reproduce the failure on a remote GPU server.

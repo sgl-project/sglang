@@ -1,9 +1,11 @@
-from typing import Any, Iterable, List, Optional, Tuple
+from __future__ import annotations
+
+from array import array
+from typing import Any, Iterable, Optional, Tuple
 
 import torch
 from transformers import WhisperConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -17,6 +19,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 
 
 class WhisperAttention(torch.nn.Module):
@@ -38,7 +41,7 @@ class WhisperAttention(torch.nn.Module):
         self.is_cross_attention = is_cross_attention
         self.is_encoder = is_encoder
 
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         assert (
             num_heads % tp_size == 0
         ), f"num_heads ({num_heads}) must be divisible by tp_size ({tp_size})"
@@ -418,14 +421,15 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(
+        self, input_ids: array[int], mm_inputs: MultimodalInputs
+    ) -> array[int]:
         # Prepend dummy encoder tokens so that prepare_encoder_info_extend
         # correctly allocates encoder KV cache locations in the KV pool.
         # These dummy tokens are stripped before the model forward receives input_ids.
         encoder_len = self.config.max_source_positions
         mm_inputs.num_image_tokens = encoder_len
-        pad_ids = [0] * encoder_len
-        return pad_ids + input_ids
+        return array("q", [0]) * encoder_len + input_ids
 
     def forward(
         self,

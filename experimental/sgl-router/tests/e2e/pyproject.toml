@@ -1,0 +1,26 @@
+# Pytest configuration for sgl-router tests/e2e/.
+# Lives next to conftest.py so `pytest experimental/sgl-router/tests/e2e/`
+# picks it up automatically.
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+# Default discovery: top-level test_*.py files and the
+# multi-worker chat_completions suite. k8s_integration is intentionally
+# not in the default set — it requires a kind/k8s cluster and is
+# invoked explicitly.
+testpaths = [
+    ".",
+    "chat_completions",
+]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "real_gpu: requires at least one NVIDIA GPU (skipped on CPU-only hosts)",
+    "pd_mode: requires the router started in PD-disaggregation mode",
+    "slow: takes >30s (model load, multi-request convergence checks)",
+]
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+log_cli_date_format = "%H:%M:%S"

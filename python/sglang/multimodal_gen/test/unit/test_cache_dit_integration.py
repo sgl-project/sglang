@@ -8,14 +8,32 @@ from unittest.mock import patch
 
 
 class _FakeDBCacheConfig:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
     def reset(self, **kwargs):
         return kwargs
 
 
+class _FakeForwardPattern:
+    # A class (not a SimpleNamespace instance) so it is a valid type in
+    # annotations like List[ForwardPattern], matching the real Enum.
+    Pattern_2 = "Pattern_2"
+    Pattern_3 = "Pattern_3"
+
+
 def _install_cache_dit_stub():
     cache_dit = types.ModuleType("cache_dit")
+    cache_dit.enable_calls = []
+    cache_dit.disable_calls = []
     cache_dit.refresh_calls = []
     cache_dit.steps_mask_calls = []
+
+    def enable_cache(target, **kwargs):
+        cache_dit.enable_calls.append({"target": target, **kwargs})
+
+    def disable_cache(target):
+        cache_dit.disable_calls.append(target)
 
     def refresh_context(transformer, cache_config, verbose=False):
         cache_dit.refresh_calls.append(
@@ -32,20 +50,24 @@ def _install_cache_dit_stub():
         )
         return [1] * total_steps
 
+    cache_dit.enable_cache = enable_cache
+    cache_dit.disable_cache = disable_cache
     cache_dit.refresh_context = refresh_context
     cache_dit.steps_mask = steps_mask
-    cache_dit.BlockAdapter = object
+    cache_dit.BlockAdapter = types.SimpleNamespace
     cache_dit.DBCacheConfig = _FakeDBCacheConfig
-    cache_dit.ForwardPattern = object
+    cache_dit.ForwardPattern = _FakeForwardPattern
     cache_dit.ParamsModifier = object
     cache_dit.TaylorSeerCalibratorConfig = object
 
     block_adapters = types.ModuleType("cache_dit.caching.block_adapters")
 
     class _FakeBlockAdapterRegister:
-        @staticmethod
-        def is_supported(_transformer):
-            return True
+        supported = True
+
+        @classmethod
+        def is_supported(cls, _transformer):
+            return cls.supported
 
     block_adapters.BlockAdapterRegister = _FakeBlockAdapterRegister
 
@@ -125,28 +147,29 @@ def _install_torch_stub():
     }
 
 
-class TestCacheDitRefreshContext(unittest.TestCase):
-    def _import_module_with_stub(self):
-        stub_modules = _install_cache_dit_stub()
-        stub_modules.update(_install_sglang_dependency_stubs())
-        stub_modules.update(_install_torch_stub())
-        module_path = (
-            Path(__file__).resolve().parents[2]
-            / "runtime"
-            / "cache"
-            / "cache_dit_integration.py"
+def _import_module_with_stub():
+    stub_modules = _install_cache_dit_stub()
+    stub_modules.update(_install_sglang_dependency_stubs())
+    stub_modules.update(_install_torch_stub())
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "runtime"
+        / "cache"
+        / "cache_dit_integration.py"
+    )
+    with patch.dict(sys.modules, stub_modules):
+        spec = importlib.util.spec_from_file_location(
+            "test_cache_dit_integration_target", module_path
         )
-        with patch.dict(sys.modules, stub_modules):
-            spec = importlib.util.spec_from_file_location(
-                "test_cache_dit_integration_target", module_path
-            )
-            module = importlib.util.module_from_spec(spec)
-            assert spec.loader is not None
-            spec.loader.exec_module(module)
-        return module
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+    return module
 
+
+class TestCacheDitRefreshContext(unittest.TestCase):
     def test_refresh_context_without_scm_preset_skips_steps_mask(self):
-        module = self._import_module_with_stub()
+        module = _import_module_with_stub()
         module.refresh_context_on_transformer(
             transformer="transformer",
             num_inference_steps=50,
@@ -166,7 +189,7 @@ class TestCacheDitRefreshContext(unittest.TestCase):
         )
 
     def test_refresh_context_with_scm_preset_uses_steps_mask(self):
-        module = self._import_module_with_stub()
+        module = _import_module_with_stub()
         module.refresh_context_on_transformer(
             transformer="transformer",
             num_inference_steps=8,
@@ -187,7 +210,7 @@ class TestCacheDitRefreshContext(unittest.TestCase):
         )
 
     def test_dual_refresh_without_scm_preset_skips_steps_mask(self):
-        module = self._import_module_with_stub()
+        module = _import_module_with_stub()
         module.refresh_context_on_dual_transformer(
             transformer="transformer",
             transformer_2="transformer_2",
@@ -214,6 +237,91 @@ class TestCacheDitRefreshContext(unittest.TestCase):
                 "steps_computation_policy": None,
             },
         )
+
+
+def _make_transformer(class_name, layers=None):
+    transformer = type(class_name, (), {})()
+    if layers is not None:
+        transformer.layers = layers
+    return transformer
+
+
+class TestBuildCustomBlockAdapter(unittest.TestCase):
+    def test_builds_adapter_for_registered_class(self):
+        module = _import_module_with_stub()
+        blocks = ["block_0", "block_1"]
+        transformer = _make_transformer("ErnieImageTransformer2DModel", blocks)
+
+        adapter = module._build_custom_block_adapter(transformer, has_separate_cfg=True)
+
+        self.assertIsNotNone(adapter)
+        self.assertEqual(adapter.blocks, blocks)
+        self.assertEqual(adapter.forward_pattern, "Pattern_3")
+        self.assertTrue(adapter.has_separate_cfg)
+
+    def test_returns_none_for_unknown_class(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer("SomeUnregisteredTransformer", ["b0"])
+
+        self.assertIsNone(module._build_custom_block_adapter(transformer))
+
+    def test_raises_when_blocks_attr_missing(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer("ErnieImageTransformer2DModel")
+
+        with self.assertRaises(ValueError):
+            module._build_custom_block_adapter(transformer)
+
+    def test_has_separate_cfg_follows_runtime(self):
+        # No model pins the mode; has_separate_cfg always follows the run's CFG mode
+        # (Krea-2 Raw -> True, Krea-2 Turbo -> False).
+        module = _import_module_with_stub()
+        blocks = ["block_0", "block_1"]
+
+        transformer_raw = _make_transformer("Krea2Transformer2DModel")
+        transformer_raw.transformer_blocks = blocks
+        adapter_raw = module._build_custom_block_adapter(
+            transformer_raw, has_separate_cfg=True
+        )
+        self.assertEqual(adapter_raw.blocks, blocks)
+        self.assertEqual(adapter_raw.forward_pattern, "Pattern_3")
+        self.assertTrue(adapter_raw.has_separate_cfg)
+
+        transformer_turbo = _make_transformer("Krea2Transformer2DModel")
+        transformer_turbo.transformer_blocks = blocks
+        adapter_turbo = module._build_custom_block_adapter(
+            transformer_turbo, has_separate_cfg=False
+        )
+        self.assertFalse(adapter_turbo.has_separate_cfg)
+
+    def test_minimax_h3_uses_main_blocks_with_hidden_state_pattern(self):
+        module = _import_module_with_stub()
+        blocks = ["block_0", "block_1"]
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = blocks
+
+        adapter = module._build_custom_block_adapter(transformer)
+
+        self.assertEqual(adapter.blocks, blocks)
+        self.assertEqual(adapter.forward_pattern, "Pattern_3")
+        self.assertFalse(adapter.has_separate_cfg)
+
+    def test_custom_adapter_is_retained_until_disable(self):
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = False
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = ["block_0"]
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=50)
+
+        returned = module.enable_cache_on_transformer(transformer, config)
+
+        self.assertIs(returned, transformer)
+        adapter = transformer._sglang_cache_dit_adapter
+        self.assertIs(module.cache_dit.enable_calls[0]["target"], adapter)
+
+        self.assertIs(module.disable_cache_on_transformer(transformer), transformer)
+        self.assertEqual(module.cache_dit.disable_calls, [adapter])
+        self.assertFalse(hasattr(transformer, "_sglang_cache_dit_adapter"))
 
 
 if __name__ == "__main__":

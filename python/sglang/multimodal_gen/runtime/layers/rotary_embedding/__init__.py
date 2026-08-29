@@ -28,20 +28,28 @@
 
 from .base import RotaryEmbedding
 from .factory import get_rope, get_rotary_pos_embed
-from .mrope import NDRotaryEmbedding
+from .mrope import (
+    NDRotaryEmbedding,
+    Qwen3VLTextRotaryEmbedding,
+    qwen3_apply_rotary_pos_emb,
+)
 from .utils import (
     _apply_rotary_emb,
+    _apply_rotary_emb_complex,
     apply_flashinfer_rope_qk_inplace,
 )
 
 __all__ = [
     # _utils
     "_apply_rotary_emb",
+    "_apply_rotary_emb_complex",
     "apply_flashinfer_rope_qk_inplace",
     # _base
     "RotaryEmbedding",
     # _mrope
     "NDRotaryEmbedding",
+    "Qwen3VLTextRotaryEmbedding",
+    "qwen3_apply_rotary_pos_emb",
     # _factory
     "get_rope",
     "get_rotary_pos_embed",

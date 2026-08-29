@@ -7,18 +7,18 @@ import openai
 import requests
 from transformers import AutoTokenizer
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
 )
 
-register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-35x-disaggregation-amd")
+register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-mi35x-disaggregation-amd")
 
 
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):
@@ -36,7 +36,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = "Qwen/Qwen3-8B"
         # DEFAULT_MODEL_NAME_FOR_TEST
 
         # Non blocking start servers
@@ -232,10 +232,12 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        # set DISAGGREGATION_TEST_FAILURE_PROB to simulate failure
-        os.environ["DISAGGREGATION_TEST_FAILURE_PROB"] = "0.05"
+        # Inject transfer failures so the retry path is actually exercised.
+        # Entered before the servers start so they inherit it.
+        cls._disagg_failure_ctx = envs.SGLANG_TEST_DISAGG_FAILURE_PROB.override(0.05)
+        cls._disagg_failure_ctx.__enter__()
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = "Qwen/Qwen3-8B"
 
         # Non blocking start servers
         cls.start_prefill()
@@ -249,7 +251,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
 
     @classmethod
     def tearDownClass(cls):
-        os.environ.pop("DISAGGREGATION_TEST_FAILURE_PROB")
+        cls._disagg_failure_ctx.__exit__(None, None, None)
         super().tearDownClass()
 
     @classmethod
@@ -347,7 +349,7 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
             cls.rdma_devices = []
 
         os.environ["SGLANG_TEST_RETRACT"] = "true"
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = "Qwen/Qwen3-8B"
 
         # Non blocking start servers
         cls.start_prefill()

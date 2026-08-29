@@ -13,7 +13,7 @@ from sglang.multimodal_gen.runtime.post_training.sp_utils import (
 
 class ZImageRolloutPipelineMixin:
 
-    def gather_dit_env_static_for_sp(self, batch, cond_kwargs: dict | None):
+    def gather_denoising_env_static_for_sp(self, batch, cond_kwargs: dict | None):
         if cond_kwargs is None:
             return None
         out = dict(cond_kwargs)

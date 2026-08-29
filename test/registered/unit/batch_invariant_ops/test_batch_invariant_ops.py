@@ -11,7 +11,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # Note: MI300 (gfx942) has 64KB shared memory limit but kernel needs 66KB
 # MI35x (gfx950/CDNA4) may have different limits - testing on MI35x only
-register_cuda_ci(est_time=10, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="nightly-amd-1-gpu-mi35x", nightly=True)
 
 device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
@@ -157,21 +157,6 @@ class TestBatchInvariantOps(CustomTestCase):
                                 iters=5, M=M, K=K, N=N, dtype=dtype
                             )
                             self._assert_batch_invariant_results(difflist, dtype, name)
-
-    def test_without_batch_invariant_mode(self):
-        """
-        Test that without batch-invariant mode, results may differ.
-        This test demonstrates the difference batch-invariant mode makes.
-        """
-        M, K, N = 32, 128, 1024
-        dtype = torch.float32
-
-        # Run without batch-invariant mode
-        with set_batch_invariant_mode(False):
-            difflist = self._run_multiple_iterations(
-                iters=5, M=M, K=K, N=N, dtype=dtype
-            )
-            print(f"Without batch-invariant mode, we get diffs: {difflist}")
 
     def _test_bmm_batch_invariance(self, B, M, K, N, dtype):
         """

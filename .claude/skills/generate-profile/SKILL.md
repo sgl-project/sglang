@@ -46,11 +46,13 @@ Typical startup time: 30-90 seconds depending on model size and whether CUDA gra
 ### Step 3: Validate accuracy (sanity check)
 
 ```bash
-python3 -m sglang.test.few_shot_gsm8k --num-q 20
+python3 -m sglang.test.run_eval --host 127.0.0.1 --port <port> --eval-name gsm8k --num-examples 20
 ```
 
 - Expected accuracy: **> 0.8** for capable models (Qwen3-8B, Llama-3.1-8B-Instruct, etc.)
 - This is a quick sanity check, not a rigorous benchmark.
+- `sglang.test.few_shot_gsm8k` is deprecated; use the unified `run_eval` entrypoint.
+- If you intentionally need the old completion-style GSM8K path, add `--api completion`.
 - If accuracy is unexpectedly low, something is wrong — do not proceed to profiling.
 
 ### Step 4: Generate the profile
@@ -108,7 +110,7 @@ for i in $(seq 1 120); do
 done
 
 # 3. Accuracy check
-python3 -m sglang.test.few_shot_gsm8k --num-q 20
+python3 -m sglang.test.run_eval --host 127.0.0.1 --port 30000 --eval-name gsm8k --num-examples 20
 # Expected: Accuracy > 0.8
 
 # 4. Profile
