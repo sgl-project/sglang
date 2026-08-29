@@ -1,5 +1,6 @@
 import asyncio
 import sys
+from unittest.mock import patch
 
 import pytest
 
@@ -7,7 +8,9 @@ from sglang.srt.disaggregation.encoder.runtime import (
     EncoderScheduler,
     PendingRequest,
     _resolve_encoder_batch_policy,
+    execute_encode_pipeline,
 )
+from sglang.srt.disaggregation.encoder.server import BadRequestError
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -104,6 +107,28 @@ def test_scheduler_coalesces_concurrent_submissions():
 
         assert encoder.batches == [["image-0", "image-1"]]
         assert results == [(1, 2, 3, None, None)] * 2
+
+    asyncio.run(run_test())
+
+
+def test_pipeline_rejects_malformed_video_before_tp_dispatch():
+    async def run_test():
+        request = {
+            "req_id": "bad-video",
+            "modality": "video",
+            "num_parts": 1,
+            "part_idx": 0,
+        }
+        with patch("sglang.srt.disaggregation.encoder.runtime.sock_send") as send_mock:
+            with pytest.raises(BadRequestError, match="missing or empty mm_items"):
+                await execute_encode_pipeline(
+                    enc=object(),
+                    sched=None,
+                    request=request,
+                    send_sockets=[object()],
+                )
+
+        send_mock.assert_not_called()
 
     asyncio.run(run_test())
 

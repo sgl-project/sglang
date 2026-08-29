@@ -78,6 +78,22 @@ _BATCHABLE_MODALITIES = {Modality.IMAGE, Modality.AUDIO}
 _KIMI_K3_DEFAULT_ENCODER_MAX_BATCH_SIZE = 2
 
 
+def _validate_encode_request(req: dict) -> Optional[str]:
+    """Reject malformed requests before any encoder TP rank sees them."""
+    if not isinstance(req, dict):
+        return f"request is not a dict: {type(req).__name__}"
+    if not req.get("req_id"):
+        return "missing req_id"
+    if not req.get("mm_items"):
+        return "missing or empty mm_items"
+    if "num_parts" not in req or "part_idx" not in req:
+        return "missing num_parts / part_idx"
+    hashes = req.get("hashes")
+    if hashes is not None and not isinstance(hashes, (list, tuple, str, int, bytes)):
+        return f"hashes must be list/scalar, got {type(hashes).__name__}"
+    return None
+
+
 def _resolve_encoder_batch_policy(
     model_type: str,
     configured_max_batch_size: int,
@@ -203,25 +219,6 @@ class EncoderScheduler:
                     if not p.future.done():
                         p.future.set_exception(e)
 
-    @staticmethod
-    def _validate_request_shape(req: dict) -> Optional[str]:
-        # Cheap pre-broadcast checks: shape errors that don't require running
-        # the HF processor. Once a request reaches TP workers they enter
-        # batch_encode and expect to join its collectives — a malformed batch
-        # that makes rank-0 bail mid-flight would deadlock the workers.
-        if not isinstance(req, dict):
-            return f"request is not a dict: {type(req).__name__}"
-        if not req.get("req_id"):
-            return "missing req_id"
-        if not req.get("mm_items"):
-            return "missing or empty mm_items"
-        if "num_parts" not in req or "part_idx" not in req:
-            return "missing num_parts / part_idx"
-        h = req.get("hashes")
-        if h is not None and not isinstance(h, (list, tuple, str, int, bytes)):
-            return f"hashes must be list/scalar, got {type(h).__name__}"
-        return None
-
     async def _dispatch_group(
         self, group: List[PendingRequest], modality: Modality
     ) -> None:
@@ -241,7 +238,7 @@ class EncoderScheduler:
         # abandoned.
         valid: List[PendingRequest] = []
         for p in group:
-            err = self._validate_request_shape(p.request)
+            err = _validate_encode_request(p.request)
             if err is None:
                 valid.append(p)
                 continue
@@ -1077,6 +1074,9 @@ async def execute_encode_pipeline(
     and keeps the result until follow-up /send calls complete. ZMQ has no early
     consumer: it waits for encode, sends the embedding, releases it, then returns.
     """
+    if error := _validate_encode_request(request):
+        raise server_module.BadRequestError(error)
+
     req_id = request["req_id"]
     time_stats_json = request.pop("time_stats_json", None)
     time_stats = EncoderReqTimeStats()
