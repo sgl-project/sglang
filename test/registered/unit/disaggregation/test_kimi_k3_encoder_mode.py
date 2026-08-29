@@ -7,7 +7,7 @@ import time
 from array import array
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import torch
@@ -575,6 +575,49 @@ def test_epd_receiver_keeps_content_hash_aligned_with_image():
         "preprocess_kwargs": {"crop": False},
         "content_hash": digest,
     }
+
+
+def test_epd_tokenizer_receiver_timeout_cancels_tasks_and_closes_socket():
+    async def run():
+        receiver = MMReceiverHTTP.__new__(MMReceiverHTTP)
+        receiver.encode_urls = ["http://encoder"]
+        receiver.context = object()
+        receiver.host = "127.0.0.1"
+        receiver.recv_timeout = 0.01
+        receiver._extract_url_data = Mock(return_value=[{"modality": Modality.IMAGE}])
+        encode_cancelled = asyncio.Event()
+        recv_cancelled = asyncio.Event()
+
+        async def wait_until_cancelled(event, *_args, **_kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                event.set()
+
+        receiver.encode = lambda *args, **kwargs: wait_until_cancelled(
+            encode_cancelled, *args, **kwargs
+        )
+        receiver._recv_mm_data = lambda *args, **kwargs: wait_until_cancelled(
+            recv_cancelled, *args, **kwargs
+        )
+        recv_socket = SimpleNamespace(close=Mock())
+
+        with patch(
+            "sglang.srt.disaggregation.encoder.receiver.get_zmq_socket_on_host",
+            return_value=(12345, recv_socket),
+        ):
+            result = await receiver.recv_mm_data(
+                SimpleNamespace(),
+                mm_processor=object(),
+                prompt="prompt",
+            )
+
+        assert result is None
+        assert encode_cancelled.is_set()
+        assert recv_cancelled.is_set()
+        recv_socket.close.assert_called_once_with(linger=0)
+
+    asyncio.run(run())
 
 
 def test_kimi_k3_epd_aggregates_original_image_sizes_in_part_order():

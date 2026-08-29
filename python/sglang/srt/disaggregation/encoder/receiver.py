@@ -1888,6 +1888,10 @@ class MMReceiverBase(ABC):
         self, request_obj, mm_processor, prompt, need_wait_for_mm_inputs=True
     ):
         req_id = None
+        recv_socket = None
+        encode_task = None
+        recv_task = None
+        send_time = time.monotonic()
         try:
             # ``self.encode_urls`` is shared by reference with the bootstrap
             # server (when running) so it always reflects the current set.
@@ -1938,7 +1942,6 @@ class MMReceiverBase(ABC):
                 logger.warning(
                     f"[{req_id}] Encoder dispatch failed; skipping embedding wait"
                 )
-                recv_task.cancel()
                 return None
             result = await asyncio.wait_for(
                 recv_task,
@@ -1951,6 +1954,15 @@ class MMReceiverBase(ABC):
             elapsed = time.monotonic() - send_time
             logger.warning(f"[{req_id}] Embedding recv timeout after {elapsed:.3f}s")
             return None
+        finally:
+            tasks = [task for task in (encode_task, recv_task) if task is not None]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if recv_socket is not None:
+                recv_socket.close(linger=0)
 
     async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
         """zmq_to_tokenizer receive: embedding parts arrive as 2-frame ZMQ
