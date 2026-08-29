@@ -507,9 +507,11 @@ class SWARadixCache(BasePrefixCache):
         )
         req.swa_prefix_lock_released = False
 
-    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
+    def cache_unfinished_req(
+        self, req: Req, chunked=False, is_insert: bool = True
+    ) -> None:
         """Cache request when it is unfinished."""
-        if self.disable:
+        if not is_insert or self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, : req.extend_range.end
             ]

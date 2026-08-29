@@ -193,7 +193,12 @@ class RadixCacheCpp(BasePrefixCache):
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
-        old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
+        if is_insert:
+            old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
+        else:
+            # Skipped unfinished inserts advance prefix_indices for scheduling,
+            # but cache_protected_len remains the tree-owned boundary.
+            old_prefix_len = req.cache_protected_len
         page_aligned_overall_len = kv_len_to_handle // self.page_size * self.page_size
 
         if is_insert:
@@ -220,7 +225,7 @@ class RadixCacheCpp(BasePrefixCache):
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
 
-    def cache_unfinished_req(self, req: Req, chunked=False):
+    def cache_unfinished_req(self, req: Req, chunked=False, is_insert: bool = True):
         """Cache request when it is unfinished."""
         self._reject_cache_salt(req.cache_salt)
         assert req.kv.holds_kv
@@ -229,6 +234,13 @@ class RadixCacheCpp(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :prefill_len
         ].to(dtype=torch.int64, copy=True)
+
+        if not is_insert:
+            # Keep chunked-prefill progress request-owned without publishing it
+            # to the C++ radix tree. cache_finished_req later frees everything
+            # after cache_protected_len.
+            req.prefix_indices = kv_indices
+            return
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
