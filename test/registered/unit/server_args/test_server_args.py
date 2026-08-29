@@ -73,7 +73,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     PhaseConfig,
 )
-from sglang.srt.runtime_context import get_context, get_serving, override_platform
+from sglang.srt.runtime_context import (
+    describe_kv_events_publisher,
+    get_context,
+    get_serving,
+    override_platform,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -646,7 +651,7 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
 
     @patch("sglang.srt.arg_groups.mamba_hook.is_cuda", return_value=True)
     @override_platform(is_sm100=False)
-    def test_rejects_triton_without_sm100(self, _mock_sm100, _mock_is_cuda):
+    def test_rejects_triton_without_sm100(self, _mock_is_cuda):
         server_args = ServerArgs(
             model_path="dummy",
             mamba_ssm_dtype="float16",
@@ -979,7 +984,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         return args
 
     @override_platform(is_sm100=True)
-    def test_combined_attention_backend_fa4_forces_page_size_128(self, _mock_sm100):
+    def test_combined_attention_backend_fa4_forces_page_size_128(self):
         # `--attention-backend fa4` (combined): prefill/decode fields stay None.
         args = self._make_args(attention_backend="fa4")
 
@@ -991,7 +996,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         self.assertEqual(resolved_view(args).page_size, 128)
 
     @override_platform(is_sm100=True)
-    def test_explicit_prefill_fa4_forces_page_size_128(self, _mock_sm100):
+    def test_explicit_prefill_fa4_forces_page_size_128(self):
         # `--prefill-attention-backend fa4`: the previously-covered path.
         args = self._make_args(attention_backend=None, prefill="fa4", page_size=1)
 
@@ -2602,8 +2607,20 @@ class TestGrpcServerArgs(CustomTestCase):
             ],
             host="127.0.0.1",
         )
-        # The port the sidecar dials is the resolved one, off the bag.
-        override = get_context_for_config().override_server_args(grpc_port=50051)
+        # Every value the sidecar reads is resolved config, so the case states
+        # them all through the context rather than half here and half in a
+        # stand-in the readers no longer consult.
+        override = get_context_for_config().override_server_args(
+            grpc_port=50051,
+            sidecar="example.sidecar",
+            sidecar_args=[
+                "--sidecar-shutdown-timeout",
+                "42",
+                "--grpc-connections",
+                "2",
+            ],
+            host="127.0.0.1",
+        )
         override.install()
         self.addCleanup(override.restore)
         with (
@@ -2826,11 +2843,11 @@ class TestDcpKvEventContract(CustomTestCase):
             page_size=64,
             kv_events_config=self.KV_EVENTS,
         )
-        self.assertEqual(args.describe_kv_events_publisher()["block_size"], 256)
+        self.assertEqual(describe_kv_events_publisher(args)["block_size"], 256)
         args = ServerArgs(
             model_path="dummy", page_size=64, kv_events_config=self.KV_EVENTS
         )
-        self.assertEqual(args.describe_kv_events_publisher()["block_size"], 64)
+        self.assertEqual(describe_kv_events_publisher(args)["block_size"], 64)
 
     def test_kv_event_block_size_widens_a_single_token_page(self):
         # page_size=1 + DCP is a real deployment shape: the allocator is still

@@ -54,7 +54,7 @@ import math
 import os
 import sys
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -1851,6 +1851,23 @@ class _PlatformOverride:
     def __exit__(self, *exc: Any) -> None:
         self.restore()
 
+    def __call__(self, fn: Any) -> Any:
+        """Also usable as a decorator, like the `patch` it replaces.
+
+        A fresh scope per call: the same object decorating two tests must not
+        share one saved state.
+        """
+        import functools
+
+        facts = dict(self._facts)
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with _PlatformOverride(**facts):
+                return fn(*args, **kwargs)
+
+        return wrapper
+
 
 def override_platform(**facts: Any) -> _PlatformOverride:
     """Say what kind of machine this is, once, for every reader."""
@@ -2007,3 +2024,124 @@ def is_ep_joiner() -> bool:
 def is_ep_scale_joiner() -> bool:
     """True in a process launched as an elastic-EP scale-up joiner."""
     return get_exec().moe.ep_join_mode == "scale"
+
+
+def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
+    """Return a structured description of this server's KV-event
+    publisher, or `None` if publishing is disabled / misconfigured.
+
+    This is the wire contract surfaced under the `kv_events` key on
+    `/server_info` so KV-aware routers (e.g. the SGLang model
+    gateway) can subscribe per-worker without operator-supplied port
+    coordination. The router constructs the per-DP-rank SUB endpoint
+    as tcp://<worker_host>:<endpoint_port_base + dp_rank> for
+    every rank reported in dp_size.
+
+    Returned descriptor shape:
+
+        {
+            "publisher": "zmq",
+            "endpoint_host": "*",             # may be a ZMQ wildcard
+                                              # ("*", "0.0.0.0", "::");
+                                              # subscribers MUST substitute
+                                              # the worker URL's host when
+                                              # dialing
+            "endpoint_port_base": 5557,       # base TCP port; per-rank
+                                              # port = base + dp_rank
+            "topic": "",                      # ZMQ topic prefix on the
+                                              # SUB filter (empty =
+                                              # subscribe-all)
+            "block_size": <kv_event_block_size>,  # subscribers MUST
+                                              # hash prompts at this size
+            "dp_size": <dp_size>,             # number of SUB sockets to
+                                              # open; not DCP-scaled, as
+                                              # DCP shards within a rank
+                                              # rather than adding
+                                              # publishers
+            "load_endpoint_port_base": <resolved>,
+                                              # base TCP port of the load
+                                              # range (load rank r = base
+                                              # + r). Consumers MUST read
+                                              # this key, not re-derive
+                                              # it; present only when
+                                              # --load-publish-endpoint
+                                              # opted in and a range
+                                              # resolved
+            "load_topic": "load",             # SUB filter for the load
+                                              # socket; present iff
+                                              # load_endpoint_port_base
+                                              # is present
+        }
+
+    Returns None (i.e. "no publisher to describe") when any of:
+
+    * --kv-events-config is unset / empty / malformed JSON,
+    * the configured publisher is "null",
+    * page_size is missing or non-positive (a placeholder
+      block_size would cause silent KV-cache misses by hashing
+      prompts at the wrong granularity on the router side),
+    * the endpoint is not a routable TCP address (inproc:// /
+      ipc://, missing port, non-integer port, port outside
+      1..65535, or a bare unbracketed IPv6 host, which is
+      ambiguous).
+
+    NOTE for load-socket consumers: pair the load port with the worker's
+    own URL host, as with the KV SUB endpoints — endpoint_host is a
+    wildcard ("*", "0.0.0.0", "::") whenever the default packing applies,
+    so splicing it yields tcp://*:PORT and connects to nothing.
+
+    Reuses parse_advertisable_tcp and resolve_load_pub_range — the same
+    helpers the scheduler binds through — so the advertisement cannot
+    drift from the sockets.
+    """
+    from sglang.srt.arg_groups.overrides import resolving_view
+
+    # Lazy import so loading server_args doesn't pull in
+    # disaggregation / msgspec / zmq at module top level.
+    from sglang.srt.disaggregation.kv_events import (
+        LOAD_TOPIC,
+        KVEventsConfig,
+        parse_advertisable_tcp,
+        resolve_load_pub_range,
+    )
+
+    resolved = resolving_view(server_args)
+    raw = resolved.kv_events_config
+    page_size = resolved.page_size
+    if not raw or page_size is None or page_size <= 0:
+        return None
+    try:
+        cfg = KVEventsConfig.from_cli(raw)
+    except Exception:
+        # Malformed JSON / schema mismatch. The publisher would
+        # have failed at server startup; /server_info must
+        # keep working, so just report "no publisher" to consumers.
+        return None
+    if cfg.publisher == "null" or not cfg.endpoint:
+        return None
+    resolved_kv = parse_advertisable_tcp(cfg.endpoint)
+    if resolved_kv is None:
+        return None
+    host, port = resolved_kv
+
+    descriptor = {
+        "publisher": cfg.publisher,
+        "endpoint_host": host,
+        "endpoint_port_base": port,
+        "topic": cfg.topic,
+        "block_size": resolved.kv_event_block_size,
+        "dp_size": resolved.dp_size,
+    }
+    # Load range, from the same resolver SchedulerLoadPublisher binds
+    # with (so the two can't drift). The decline reason is logged once at
+    # startup, not here — this runs per /server_info request.
+    resolved_range, _reason = resolve_load_pub_range(
+        kv_endpoint=cfg.endpoint,
+        replay_endpoint=cfg.replay_endpoint,
+        dp_size=resolved.dp_size,
+        load_publish_endpoint=resolved.load_publish_endpoint,
+    )
+    if resolved_range is not None:
+        descriptor["load_endpoint_port_base"] = resolved_range[1]
+        descriptor["load_topic"] = LOAD_TOPIC
+    return descriptor
