@@ -321,6 +321,30 @@ def _plain(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
+def pre_capture_activation_reserve_mb_of(cfg: Any, gpu_mem: Optional[float]) -> float:
+    """The activation working-set reserve held back before cuda-graph capture.
+
+    The config-shaped half of the pair; `runtime_context` carries the
+    published-bag half, and `TestDerivedPredicatesAgreeAcrossTiers` pins the
+    two equal.
+    """
+    if cfg.disaggregation_mode == "decode":
+        running_requests = (
+            cfg.max_running_requests or cfg.cuda_graph_config.decode.max_bs or 1
+        )
+        activation_tokens = max(
+            running_requests * (cfg.speculative_num_draft_tokens or 1), 2048
+        )
+    elif cfg.chunked_prefill_size > 0:
+        activation_tokens = max(cfg.chunked_prefill_size, 2048)
+    else:
+        activation_tokens = max(cfg.max_prefill_tokens, 2048)
+    reserved_mem = 512 + activation_tokens * 1.5 + cfg.tp_size * cfg.pp_size / 8 * 1024
+    if gpu_mem is not None and gpu_mem > 60 * 1024:
+        reserved_mem = max(reserved_mem, 10 * 1024)
+    return reserved_mem
+
+
 def kv_event_block_size_of(cfg: Any) -> int:
     """Width KV events are emitted at.
 

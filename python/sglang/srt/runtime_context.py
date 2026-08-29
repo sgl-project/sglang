@@ -1717,8 +1717,8 @@ def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
 
     Derived from published leaves across four bags (``disagg`` / ``schedule`` /
     ``exec.graph`` / ``spec``) plus the configured parallel sizes, so it follows
-    a post-publish override; ``ServerArgs.pre_capture_activation_reserve_mb`` is
-    the pre-publish equivalent and
+    a post-publish override; ``pre_capture_activation_reserve_mb_of`` in
+    ``arg_groups.overrides`` is the config-shaped equivalent and
     ``TestDerivedPredicatesAgreeAcrossTiers`` pins the two equal.
     """
     schedule = get_schedule()
