@@ -1,9 +1,12 @@
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.layers import hc_mix_triton
+from sglang.srt.layers.hyperconnection import _is_cuda_jit_tensor
 from sglang.srt.layers.hc_mix_triton import (
     _FUSED_MIX_MAX_ROWS,
     fused_hc_mix,
@@ -50,6 +53,17 @@ _TOLERANCES = {
     torch.bfloat16: dict(rtol=1e-2, atol=5e-3),
     torch.float16: dict(rtol=2e-3, atol=1e-3),
 }
+
+
+def test_npu_cuda_compat_shim_does_not_enable_cuda_kernels(monkeypatch):
+    npu_tensor = SimpleNamespace(
+        is_cuda=True,
+        device=SimpleNamespace(type="npu"),
+    )
+
+    assert not _is_cuda_jit_tensor(npu_tensor)
+    monkeypatch.setattr(hc_mix_triton, "_deterministic_inference_cached", False)
+    assert not fused_hc_mix_supported(npu_tensor, npu_tensor, npu_tensor)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

@@ -8,6 +8,11 @@ import torch.nn.functional as F
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
 
 
+def _is_cuda_jit_tensor(x: torch.Tensor) -> bool:
+    """Use the real device type; transfer_to_npu may make ``is_cuda`` true."""
+    return x.device.type == "cuda"
+
+
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
     hc_count: int = 4
     hidden_size: int = 64
@@ -45,7 +50,7 @@ class GroupedGemmaRMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
             self._jit_group_size is not None
-            and x.is_cuda
+            and _is_cuda_jit_tensor(x)
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
             from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
@@ -244,7 +249,7 @@ class GatedResidual(HyperConnectionBase):
             ).flatten(-2)
         if (
             self._jit_mix_ok
-            and hyper_input_normed.is_cuda
+            and _is_cuda_jit_tensor(hyper_input_normed)
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
             and hyper_input_normed.shape[0] <= 24
         ):
@@ -295,7 +300,7 @@ class GatedResidual(HyperConnectionBase):
 
         if (
             self._jit_combine_ok
-            and block_output.is_cuda
+            and _is_cuda_jit_tensor(block_output)
             and block_output.dtype in (torch.bfloat16, torch.float16)
             and hyper_input.dtype == block_output.dtype
             and hyper_input_normed.dtype == block_output.dtype

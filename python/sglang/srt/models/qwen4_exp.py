@@ -37,6 +37,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.hyperconnection import (
     GatedResidual,
     HyperConnectionConfig,
+    _is_cuda_jit_tensor,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -425,7 +426,7 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
             self._jit_group_size is not None
-            and x.is_cuda
+            and _is_cuda_jit_tensor(x)
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
             from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (

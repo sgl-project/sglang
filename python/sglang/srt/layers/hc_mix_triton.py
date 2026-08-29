@@ -190,7 +190,7 @@ def fused_hc_mix_supported(
     if _deterministic_inference():
         return False
     return (
-        hyper_input_normed.is_cuda
+        hyper_input_normed.device.type == "cuda"
         and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
         and w_down.dtype == hyper_input_normed.dtype
         and w_up.dtype == hyper_input_normed.dtype
