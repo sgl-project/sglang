@@ -434,6 +434,41 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         self.assertEqual(future_map.dsa_topk_indices_buf.shape, (4, 3))
         self.assertEqual(future_map.dsa_topk_indices_buf.dtype, torch.int32)
 
+    @patch(
+        "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+        return_value=False,
+    )
+    def test_future_map_initializes_topk_after_prefill_payload(self, _):
+        future_map = object.__new__(FutureMap)
+        future_map.spec_algo = SimpleNamespace(
+            is_some=Mock(return_value=True),
+            need_topk=Mock(return_value=True),
+        )
+        future_map.req_pool_size = 4
+        future_map.device = "cpu"
+        future_map.need_topk = False
+        future_map.need_hidden_states = False
+        future_map.topk_p_buf = None
+        future_map.topk_index_buf = None
+        future_map.hidden_states_buf = None
+        future_map.draft_probs_buf = None
+
+        future_map._maybe_init_forward_bufs(
+            RelayPayload(bonus_tokens=torch.zeros((2,), dtype=torch.int64))
+        )
+        self.assertFalse(future_map.need_topk)
+
+        future_map._maybe_init_forward_bufs(
+            RelayPayload(
+                bonus_tokens=torch.zeros((2,), dtype=torch.int64),
+                topk_p=torch.zeros((2, 3), dtype=torch.float32),
+                topk_index=torch.zeros((2, 3), dtype=torch.int64),
+            )
+        )
+        self.assertTrue(future_map.need_topk)
+        self.assertEqual(future_map.topk_p_buf.shape, (4, 3))
+        self.assertEqual(future_map.topk_index_buf.shape, (4, 3))
+
 
 class TestDSV4C128StateIndices(unittest.TestCase):
     def test_online_aligned_boundary_has_no_partial_state(self):

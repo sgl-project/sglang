@@ -244,6 +244,71 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
 
         torch.testing.assert_close(metadata.conv_states_mask_indices, torch.tensor([7]))
 
+    def test_fused_prefill_receives_canonical_preallocated_output(self):
+        backend = object.__new__(GDNAttnBackend)
+        dispatcher = MagicMock()
+        dispatcher.try_fused_extend.return_value = (sentinel.core_attn_out, None, None)
+        backend.kernel_dispatcher = dispatcher
+        backend.forward_metadata = SimpleNamespace(
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+            mamba_cache_indices=torch.tensor([0], dtype=torch.int32),
+            retrieve_next_token=None,
+            retrieve_next_sibling=None,
+            retrieve_parent_token=None,
+            has_mamba_track_mask=False,
+        )
+        layer_cache = SimpleNamespace(
+            conv=[torch.zeros((1, 6, 3))],
+            temporal=torch.zeros((1, 1, 2, 2)),
+        )
+        backend.req_to_token_pool = SimpleNamespace(
+            mamba2_layer_cache=lambda _layer_id: layer_cache
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            num_q_heads=1,
+            num_k_heads=1,
+            num_v_heads=1,
+            head_q_dim=2,
+            head_k_dim=2,
+            head_v_dim=2,
+            A_log=torch.zeros(1),
+            dt_bias=torch.zeros(1),
+            conv_weights=torch.zeros((6, 3)),
+            bias=None,
+            activation="silu",
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+            extend_prefix_lens=torch.tensor([0]),
+            extend_prefix_lens_cpu=[0],
+            extend_seq_lens_cpu=[2],
+        )
+        linear_attn_output = torch.empty((1, 2, 1, 2))
+
+        with (
+            patch.object(gdn_backend, "is_cpu", return_value=True),
+            patch.object(
+                gdn_backend,
+                "causal_conv1d_fn",
+                side_effect=lambda tensor, *args, **kwargs: tensor,
+            ),
+        ):
+            result = backend.forward_extend(
+                layer,
+                forward_batch,
+                torch.zeros((2, 6)),
+                torch.zeros((2, 1)),
+                torch.zeros((2, 1)),
+                linear_attn_output=linear_attn_output,
+            )
+
+        self.assertIs(result, sentinel.core_attn_out)
+        self.assertIs(
+            dispatcher.try_fused_extend.call_args.kwargs["out"],
+            linear_attn_output,
+        )
+
     def test_tree_verify_uses_triton_kernel(self):
         flashinfer_kernel = MagicMock(supports_target_verify=True)
         with (
