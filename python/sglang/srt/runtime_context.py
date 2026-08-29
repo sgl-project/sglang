@@ -54,7 +54,7 @@ import math
 import os
 import sys
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Dict
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -1742,6 +1742,119 @@ def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
     if gpu_mem is not None and gpu_mem > 60 * 1024:
         reserved_mem = max(reserved_mem, 10 * 1024)
     return reserved_mem
+
+
+# --- Platform facts -----------------------------------------------------------
+#
+# One address for what kind of machine this is, so a reader asks
+# `get_platform().is_sm100` and an override is stated once instead of patched
+# into every module that imported a probe. True before publish, so the context
+# probes when no override is installed; `utils.common` holds the implementation.
+
+_PLATFORM_PROBES: Dict[str, str] = {
+    "is_cuda": "is_cuda",
+    "is_hip": "is_hip",
+    "is_npu": "is_npu",
+    "is_xpu": "is_xpu",
+    "is_musa": "is_musa",
+    "is_sm90": "is_sm90_supported",
+    "is_sm100": "is_sm100_supported",
+    "is_sm100_or_sm110": "is_sm100_or_sm110_supported",
+    "is_sm120": "is_sm120_supported",
+    "is_blackwell": "is_blackwell_supported",
+    "is_hopper_with_cuda_12_3": "is_hopper_with_cuda_12_3",
+    "has_amx": "cpu_has_amx_support",
+    "has_flashinfer": "is_flashinfer_available",
+}
+
+
+class PlatformContext:
+    """The machine's own facts, with one place to override them.
+
+    Every name maps to a probe in `utils.common`; the probes are
+    `lru_cache`-d, so reading through here costs a call and a dict lookup
+    (~26 ns) rather than a device query.
+    """
+
+    __slots__ = ("_overrides",)
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "_overrides", {})
+
+    def __getattr__(self, name: str) -> Any:
+        probe = _PLATFORM_PROBES.get(name)
+        if probe is None:
+            raise AttributeError(
+                f"unknown platform fact {name!r}; known: "
+                f"{', '.join(sorted(_PLATFORM_PROBES))}"
+            )
+        overrides = object.__getattribute__(self, "_overrides")
+        if name in overrides:
+            return overrides[name]
+        from sglang.srt.utils import common as _common
+
+        return getattr(_common, probe)()
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(
+            "platform facts are not assigned; use "
+            "`sglang.srt.runtime_context.override_platform(...)` so every "
+            "reader agrees"
+        )
+
+    def _install(self, **facts: Any) -> Dict[str, Any]:
+        unknown = set(facts) - set(_PLATFORM_PROBES)
+        if unknown:
+            raise ValueError(f"unknown platform fact(s): {sorted(unknown)}")
+        overrides = object.__getattribute__(self, "_overrides")
+        previous = {k: overrides[k] for k in facts if k in overrides}
+        missing = [k for k in facts if k not in overrides]
+        overrides.update(facts)
+        return {"previous": previous, "missing": missing}
+
+    def _restore(self, saved: Dict[str, Any]) -> None:
+        overrides = object.__getattribute__(self, "_overrides")
+        overrides.update(saved["previous"])
+        for k in saved["missing"]:
+            overrides.pop(k, None)
+
+
+_PLATFORM = PlatformContext()
+
+
+def get_platform() -> PlatformContext:
+    """The machine's facts. Answers before publish, unlike a config bag."""
+    return _PLATFORM
+
+
+class _PlatformOverride:
+    """Scoped platform override: `with override_platform(is_sm100=True): ...`"""
+
+    __slots__ = ("_facts", "_saved")
+
+    def __init__(self, **facts: Any) -> None:
+        self._facts = facts
+        self._saved = None
+
+    def install(self) -> PlatformContext:
+        self._saved = _PLATFORM._install(**self._facts)
+        return _PLATFORM
+
+    def restore(self) -> None:
+        if self._saved is not None:
+            _PLATFORM._restore(self._saved)
+            self._saved = None
+
+    def __enter__(self) -> PlatformContext:
+        return self.install()
+
+    def __exit__(self, *exc: Any) -> None:
+        self.restore()
+
+
+def override_platform(**facts: Any) -> _PlatformOverride:
+    """Say what kind of machine this is, once, for every reader."""
+    return _PlatformOverride(**facts)
 
 
 # --- Derived config accessors ------------------------------------------------
