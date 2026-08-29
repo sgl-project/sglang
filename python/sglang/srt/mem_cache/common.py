@@ -200,7 +200,6 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-    # Row and KV bookkeeping are released together (ReqKvInfo.mark_released).
     assert (not req.is_holding_kv) == req.kv.is_released
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if not req.is_holding_kv:

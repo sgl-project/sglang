@@ -44,7 +44,7 @@ class SessionSlot:
 
     virtual_node: _VirtualNode = field(default_factory=_VirtualNode)
 
-    # KV pool state; the slot holds KV iff req_pool_idx is not None
+    # KV pool state
     req_pool_idx: Optional[int] = None
     kv_committed_len: int = 0
     kv: ReqKvInfo = field(default_factory=ReqKvInfo)

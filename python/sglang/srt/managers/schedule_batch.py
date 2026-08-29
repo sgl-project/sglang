@@ -815,13 +815,8 @@ class ReqLogprob:
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqKvInfo:
-    """Device KV held by a request outside the prefix cache.
-
-    Lives on the `Req` for its whole lifetime. Whether the request holds KV is
-    `req.req_pool_idx is not None`: the row is the register for the slots, so
-    the two are allocated and released together and share one presence flag.
-    """
-
+    # Device KV a request holds outside the prefix cache. Always present on the Req;
+    # whether any KV is held is `req.req_pool_idx is not None` (Req.is_holding_kv).
     kv_allocated_len: int = 0
     # The length of KV that have been removed in swa cache.
     # SWA KV cache eviction behavior differs by cache type:
@@ -1282,7 +1277,6 @@ class Req(ReqDllmMixin):
 
     @property
     def is_holding_kv(self) -> bool:
-        """Whether this request holds device KV (row + slots)."""
         return self.req_pool_idx is not None
 
     def effective_kv_committed_len(self) -> int:
