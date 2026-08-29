@@ -139,19 +139,29 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         if self.cpu_executor is not None:
             loop = asyncio.get_running_loop()
             executor = self.cpu_executor
+            timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
+            deadline = loop.time() + timeout
             try:
-                fut = loop.run_in_executor(
-                    executor,
-                    LlavaImageProcessor._preprocess_image_task,
-                    image_input,
-                    image_hash,
-                    aspect_ratio,
-                    grid_pinpoints,
-                    self._processor,
+                # ProcessPoolExecutor.submit() can itself block after a worker
+                # exits. Keep submission off the request event loop so the
+                # timeout can still replace the failed pool.
+                process_future = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        executor.submit,
+                        LlavaImageProcessor._preprocess_image_task,
+                        image_input,
+                        image_hash,
+                        aspect_ratio,
+                        grid_pinpoints,
+                        self._processor,
+                    ),
+                    timeout=timeout,
                 )
-                timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
-                return await asyncio.wait_for(fut, timeout=timeout)
-            except BrokenProcessPool:
+                remaining = max(0.0, deadline - loop.time())
+                return await asyncio.wait_for(
+                    asyncio.wrap_future(process_future), timeout=remaining
+                )
+            except (BrokenProcessPool, asyncio.TimeoutError):
                 self._replace_broken_cpu_executor(executor)
                 raise
         else:

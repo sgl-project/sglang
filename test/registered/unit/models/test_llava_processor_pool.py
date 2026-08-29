@@ -18,6 +18,15 @@ class _BrokenExecutor(concurrent.futures.Executor):
         raise BrokenProcessPool("worker exited")
 
 
+class _BlockingExecutor(concurrent.futures.Executor):
+    def __init__(self):
+        self.release = threading.Event()
+
+    def submit(self, _fn, /, *_args, **_kwargs):
+        self.release.wait(timeout=5)
+        return concurrent.futures.Future()
+
+
 def _exit_worker_process():
     os._exit(1)
 
@@ -31,6 +40,35 @@ def test_llava_replaces_broken_pool_without_replaying_request():
     with pytest.raises(BrokenProcessPool, match="worker exited"):
         asyncio.run(processor._process_single_image(b"image", "pad", None))
 
+    processor._replace_broken_cpu_executor.assert_called_once_with(
+        processor.cpu_executor
+    )
+
+
+def test_llava_times_out_blocked_pool_submission_without_freezing_loop(monkeypatch):
+    monkeypatch.setenv("REQUEST_TIMEOUT", "1")
+    processor = object.__new__(LlavaImageProcessor)
+    processor.cpu_executor = _BlockingExecutor()
+    processor._processor = Mock()
+    processor._replace_broken_cpu_executor = Mock()
+
+    async def run_test():
+        heartbeat = asyncio.Event()
+
+        async def keep_loop_responsive():
+            await asyncio.sleep(0.01)
+            heartbeat.set()
+
+        heartbeat_task = asyncio.create_task(keep_loop_responsive())
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await processor._process_single_image(b"image", "pad", None)
+            assert heartbeat.is_set()
+        finally:
+            processor.cpu_executor.release.set()
+            await heartbeat_task
+
+    asyncio.run(run_test())
     processor._replace_broken_cpu_executor.assert_called_once_with(
         processor.cpu_executor
     )
