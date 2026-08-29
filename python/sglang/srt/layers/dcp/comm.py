@@ -150,6 +150,41 @@ def cp_lse_ag_out_rs_mla(
     return out.to(cp_attn_out.dtype)
 
 
+def cp_lse_ag_out_rs_mla_npu(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+) -> torch.Tensor:
+    """Merge NPU DCP partial outputs and return the local head slice."""
+    if cp_group.world_size == 1:
+        return cp_attn_out
+
+    import torch_npu
+
+    batch_size, total_heads, head_dim = cp_attn_out.shape
+    world_size = cp_group.world_size
+    local_heads = total_heads // world_size
+    packed = torch.cat([cp_attn_out.float(), cp_attn_lse.float().unsqueeze(-1)], dim=-1)
+    packed = packed.permute(1, 2, 0).contiguous()
+    gathered = torch.empty_like(packed)
+    cp_group.all_to_all_single(gathered, packed)
+    # all_to_all_single splits the leading head dimension. After the exchange,
+    # the heads are grouped by source rank inside every token. Move that source
+    # rank in front before flattening tokens and local heads for the update op.
+    gathered = gathered.permute(2, 0, 1).contiguous()
+    gathered = (
+        gathered.view(batch_size, world_size, local_heads, head_dim + 1)
+        .permute(1, 0, 2, 3)
+        .contiguous()
+        .view(world_size, batch_size * local_heads, head_dim + 1)
+    )
+    out_flat, lse_flat = torch.split(gathered, [head_dim, 1], dim=-1)
+    merged, _ = torch_npu.npu_attention_update(
+        lse_flat.squeeze(-1).unbind(0), out_flat.unbind(0), 0
+    )
+    return merged.view(batch_size, local_heads, head_dim).to(cp_attn_out.dtype)
+
+
 def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
     parallel = get_parallel()
     dcp_world_size = parallel.dcp_size
