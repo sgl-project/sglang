@@ -475,6 +475,7 @@ class ModelSlimConfig(QuantizationConfig):
 class ModelSlimLinearMethod(_NPULinearMethodBase):
 
     def __init__(self, quantization_config: ModelSlimConfig):
+        super().__init__(quantization_config)
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
