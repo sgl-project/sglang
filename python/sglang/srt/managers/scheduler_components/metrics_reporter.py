@@ -23,11 +23,13 @@ from sglang.srt.observability.metrics_collector import (
     compute_routing_key_stats,
 )
 from sglang.srt.runtime_context import (
+    exports_expert_balancedness_to_prometheus,
     get_context,
     get_disagg,
     get_observability,
     get_parallel,
     get_spec,
+    logs_expert_balancedness_to_server_log,
 )
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
@@ -1009,9 +1011,7 @@ class SchedulerMetricsReporter:
         if (m := result.expert_distribution_metrics) is not None:
             balancedness = m.eplb_balancedness.item()
 
-            if (
-                self.scheduler.server_args.should_log_expert_balancedness_to_server_log()
-            ):
+            if logs_expert_balancedness_to_server_log():
                 if m.reset_server_log_history:
                     for history in self._eplb_balancedness_history:
                         history.clear()
@@ -1033,10 +1033,7 @@ class SchedulerMetricsReporter:
                     f"gpu_physical_count_sum={gpu_physical_count_sum}"
                 )
 
-            if (
-                self.enable_metrics
-                and self.scheduler.server_args.should_export_expert_balancedness_to_prometheus()
-            ):
+            if self.enable_metrics and exports_expert_balancedness_to_prometheus():
                 assert self.metrics_collector is not None
                 self.metrics_collector.increment_eplb_balancedness(
                     forward_mode=batch.forward_mode.name.lower(),

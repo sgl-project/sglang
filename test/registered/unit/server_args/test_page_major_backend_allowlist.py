@@ -30,8 +30,10 @@ under its own default configuration.
 """
 
 import unittest
+from types import SimpleNamespace
 
 from sglang.srt.arg_groups.kv_cache_hook import handle_page_major_kv_layout
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -66,8 +68,13 @@ def _accepts(
         "mamba_backend": "triton",
     }.items():
         object.__setattr__(sa, name, value)
-    sa.use_mla_backend = lambda: use_mla
-    sa._resolved_attention_backends = lambda: [backend]
+    object.__setattr__(
+        sa,
+        "_model_config",
+        SimpleNamespace(
+            attention_arch=AttentionArch.MLA if use_mla else AttentionArch.MHA
+        ),
+    )
     try:
         handle_page_major_kv_layout(sa)
         return True
