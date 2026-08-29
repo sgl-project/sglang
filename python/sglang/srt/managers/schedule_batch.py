@@ -509,6 +509,22 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
             )
             self.feature.acknowledge_consumption(consumer_count)
 
+    def release_transport_proxies(self, consumer_count: int = 1) -> None:
+        """Best-effort release of proxies left by an abandoned request."""
+        values = [self.feature, self.precomputed_embeddings]
+        values.extend(self.model_specific_data.values())
+        for value in values:
+            if not isinstance(value, CudaIpcTensorTransportProxy):
+                continue
+            count = self._resolve_transport_consumer_count(value, consumer_count)
+            try:
+                value.release_without_reconstruction(count)
+            except Exception:
+                logger.warning(
+                    "Failed to release an abandoned multimodal transport proxy",
+                    exc_info=True,
+                )
+
     @staticmethod
     def _resolve_transport_consumer_count(proxy, requested_count: int) -> int:
         """Clamp a group acknowledgement to the proxy's actual consumer set."""
@@ -653,14 +669,19 @@ class MultimodalInputs:
 
         # try reconstructing from cuda-ipc
         reconstruct_device = None
-        for mm_item in mm_items:
-            if (
-                mm_item.has_cuda_ipc_proxy()
-                and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
-            ):
-                if reconstruct_device is None:
-                    reconstruct_device = torch.cuda.current_device()
-                mm_item.reconstruct(reconstruct_device)
+        try:
+            for mm_item in mm_items:
+                if (
+                    mm_item.has_cuda_ipc_proxy()
+                    and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
+                ):
+                    if reconstruct_device is None:
+                        reconstruct_device = torch.cuda.current_device()
+                    mm_item.reconstruct(reconstruct_device)
+        except BaseException:
+            for mm_item in mm_items:
+                mm_item.release_transport_proxies()
+            raise
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             # Multi-modal feature hashing optimization:

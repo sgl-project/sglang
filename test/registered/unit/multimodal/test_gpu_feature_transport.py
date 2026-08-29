@@ -11,6 +11,86 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestCudaVmmFeatureTransport(unittest.TestCase):
+    def test_failed_consumer_reconstruction_releases_remaining_proxies(self):
+        from sglang.srt.managers.schedule_batch import (
+            Modality,
+            MultimodalDataItem,
+            MultimodalInputs,
+            MultimodalProcessorOutput,
+        )
+        from sglang.srt.multimodal.transport.cuda_ipc import (
+            CudaIpcTensorTransportProxy,
+        )
+
+        class FakeProxy(CudaIpcTensorTransportProxy):
+            def __init__(self, *, fail_reconstruct=False, fail_release=False):
+                self.fail_reconstruct = fail_reconstruct
+                self.fail_release = fail_release
+                self.released = False
+
+            def reconstruct_on_target_device(self, _device, consumer_count=1):
+                if self.fail_reconstruct:
+                    raise RuntimeError("reconstruct failed")
+                return torch.ones(1)
+
+            def release_without_reconstruction(self, consumer_count=1):
+                self.released = True
+                if self.fail_release:
+                    raise RuntimeError("release failed")
+
+        reconstructed = FakeProxy()
+        failed = FakeProxy(fail_reconstruct=True, fail_release=True)
+        remaining = FakeProxy()
+        items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                hash=1,
+                pad_value=1,
+                feature=reconstructed,
+            ),
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                hash=2,
+                pad_value=2,
+                feature=failed,
+            ),
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                hash=3,
+                pad_value=3,
+                feature=remaining,
+            ),
+        ]
+        output = MultimodalProcessorOutput(input_ids=[1], mm_items=items)
+
+        with (
+            patch(
+                "sglang.srt.managers.schedule_batch.torch.cuda.current_device",
+                return_value=0,
+            ),
+            self.assertRaisesRegex(RuntimeError, "reconstruct failed"),
+        ):
+            MultimodalInputs.from_processor_output(output)
+
+        self.assertIsInstance(items[0].feature, torch.Tensor)
+        self.assertTrue(failed.released)
+        self.assertTrue(remaining.released)
+
+    def test_abandoned_packed_proxy_releases_shared_owner(self):
+        from sglang.srt.utils.cuda_vmm_transport_utils import (
+            CudaVmmPackedTensorTransportProxy,
+        )
+
+        owner = MagicMock()
+        proxy = object.__new__(CudaVmmPackedTensorTransportProxy)
+        proxy._packed_owner = owner
+        proxy._consumer_acknowledged = False
+
+        proxy.release_without_reconstruction(consumer_count=2)
+
+        owner.acknowledge_consumption.assert_called_once_with(2)
+        self.assertTrue(proxy._consumer_acknowledged)
+
     def test_partial_pool_release_can_be_retried(self):
         from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 

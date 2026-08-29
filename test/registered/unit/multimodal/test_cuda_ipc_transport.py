@@ -14,6 +14,12 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
@@ -106,6 +112,74 @@ class TestCudaIpcTransport(CustomTestCase):
             # consumer exits quickly, so it must close the mapping before the
             # producer destroys the shared allocation.
             del reconstructed, proxy
+            _pool_handle_cache_clear()
+            gc.collect()
+            torch.cuda.ipc_collect()
+            consumer_done.set()
+            producer.join(timeout=60)
+            try:
+                if producer_result is None:
+                    producer_result = producer_results.get(timeout=5)
+                status, payload = producer_result
+                self.assertEqual(status, "ok", payload)
+            finally:
+                if producer.is_alive():
+                    producer.terminate()
+                    producer.join(timeout=10)
+            self.assertEqual(producer.exitcode, 0)
+
+    def test_failed_reconstruction_releases_pooled_tensor(self):
+        ctx = mp.get_context("spawn")
+        proxy_queue = ctx.Queue()
+        producer_results = ctx.Queue()
+        consumer_done = ctx.Event()
+        producer = ctx.Process(
+            target=_produce_pooled_tensor,
+            args=(proxy_queue, consumer_done, producer_results),
+        )
+        producer.start()
+        proxy = None
+        producer_result = None
+        original_empty = torch.empty
+        try:
+            try:
+                proxy, _expected = proxy_queue.get(timeout=60)
+            except queue.Empty:
+                producer_result = producer_results.get(timeout=5)
+                _status, payload = producer_result
+                self.fail(
+                    f"CUDA IPC producer failed before sending its proxy: {payload}"
+                )
+
+            output_shape = proxy.proxy_state["ipc_extra"]["recons_shape"]
+
+            def fail_destination_allocation(size, *args, **kwargs):
+                if isinstance(size, (tuple, torch.Size)) and tuple(size) == tuple(
+                    output_shape
+                ):
+                    raise RuntimeError("forced reconstruction failure")
+                return original_empty(size, *args, **kwargs)
+
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                hash=1,
+                pad_value=1,
+                feature=proxy,
+            )
+            output = MultimodalProcessorOutput(input_ids=[1], mm_items=[item])
+            with (
+                patch(
+                    "sglang.srt.multimodal.transport.cuda_ipc.torch.empty",
+                    side_effect=fail_destination_allocation,
+                ),
+                self.assertRaisesRegex(RuntimeError, "forced reconstruction failure"),
+            ):
+                MultimodalInputs.from_processor_output(output)
+
+            torch.cuda.synchronize()
+            self.assertTrue(proxy._consumer_acknowledged)
+        finally:
+            del proxy
             _pool_handle_cache_clear()
             gc.collect()
             torch.cuda.ipc_collect()

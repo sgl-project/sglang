@@ -310,6 +310,10 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             )
         self._retain_storage_until_stream_completes(storage, device_id)
 
+    def release_without_reconstruction(self, consumer_count: int = 1) -> None:
+        """Release a pool slice when its request abandons this proxy."""
+        self.acknowledge_consumption(consumer_count)
+
     def reconstruct_on_target_device(
         self,
         rebuild_device_idx,
