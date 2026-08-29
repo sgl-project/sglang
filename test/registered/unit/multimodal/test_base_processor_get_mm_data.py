@@ -29,7 +29,7 @@ class TestGetMmData(unittest.TestCase):
         processor = _StubProcessor(num_tokens=4010)
         embeddings = {Modality.IMAGE: torch.empty(877, 16)}
 
-        with self.assertRaisesRegex(ValueError, "expected 4010.*got 877"):
+        with self.assertRaisesRegex(RuntimeError, "expected 4010.*got 877"):
             processor.get_mm_data([], embeddings)
 
     def test_accepts_exact_length_precomputed_embeddings(self):
