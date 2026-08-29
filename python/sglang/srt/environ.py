@@ -1134,6 +1134,9 @@ class Envs:
     # Apply the replicated DCP sink compensation inside paged decode instead
     # of materializing one shifted sink tensor per layer.
     SGLANG_DSV4_DCP_INLINE_SINK_SHIFT = EnvBool(True)
+    # Override DCP paged-decode head tiling for full-model tuning. Zero keeps
+    # the backend heuristic.
+    SGLANG_DSV4_DCP_BLOCK_H = EnvInt(16)
 
     # ===================================================================
     # Kernel selection and fused backends

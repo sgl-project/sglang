@@ -1401,6 +1401,7 @@ class DeepseekV4HipRadixBackend(
             if not envs.SGLANG_DSV4_DCP_INLINE_SINK_SHIFT.get():
                 dcp_sink = dcp_sink + sink_logit_shift
                 sink_logit_shift = 0.0
+            dcp_block_h = envs.SGLANG_DSV4_DCP_BLOCK_H.get()
             partial_out, partial_lse = runtime.decode(
                 q=q,
                 unified_kv=unified,
@@ -1410,6 +1411,7 @@ class DeepseekV4HipRadixBackend(
                 softmax_scale=self.softmax_scale,
                 return_lse=True,
                 attn_sink_logit_shift=sink_logit_shift,
+                block_h=dcp_block_h or None,
             )
             comm_backend = get_parallel().dcp_comm_backend
             if comm_backend in ("a2a", "fi_a2a"):

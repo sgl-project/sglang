@@ -984,6 +984,7 @@ def sparse_attn_v4_paged_decode(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     kv_scales: torch.Tensor | None = None,
+    block_h: int | None = None,
     return_lse: bool = False,
     attn_sink_logit_shift: float = 0.0,
 ):
@@ -1015,6 +1016,7 @@ def sparse_attn_v4_paged_decode(
         attn_sink,
         softmax_scale,
         kv_scales=kv_scales,
+        block_h=block_h,
         return_lse=return_lse,
         attn_sink_logit_shift=attn_sink_logit_shift,
     )
