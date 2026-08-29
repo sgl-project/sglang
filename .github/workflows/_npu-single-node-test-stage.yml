@@ -338,6 +338,15 @@ jobs:
           mv ${ascend_test_util_path} ${ascend_test_util_path}_bak
           cp -r ${sglang_source_path}/python/sglang/test/ascend ${ascend_test_util_path}
 
+          # Copy the checked-out CI utility code as well, so the source run_suite.py
+          # and its sglang.test.ci imports stay in sync instead of depending on the
+          # sglang version baked into the docker image.
+          ci_test_util_path=${sglang_pkg_path}/sglang/test/ci
+          if [ -d ${ci_test_util_path} ]; then
+            mv ${ci_test_util_path} ${ci_test_util_path}_bak
+          fi
+          cp -r ${sglang_source_path}/python/sglang/test/ci ${ci_test_util_path}
+
           # External env scripts may reference unset shell vars (e.g. ZSH_VERSION),
           # which abort the whole script under `set -u`. Temporarily disable -u.
           set +u

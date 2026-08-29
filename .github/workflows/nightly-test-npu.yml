@@ -359,7 +359,7 @@ jobs:
 #      skip_pr_test_health_check: 'true'
 #      image: ${{ needs.set-image-config.outputs.image_a5 }}
 #      install_sglang_deps: false
-#      device_type_for_deps: 'a3'
+#      device_type_for_deps: 'a5'
 #      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
   nightly-acc-8-npu-a5:
@@ -375,7 +375,7 @@ jobs:
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a5 }}
       install_sglang_deps: false
-      device_type_for_deps: 'a3'
+      device_type_for_deps: 'a5'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
 #  nightly-poc-multi-node-tests:
