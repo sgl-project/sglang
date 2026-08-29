@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.encoder.runtime import (
     DPDispatcher,
     _retire_abandoned_encode,
     execute_encode_pipeline,
+    send_staged_embedding,
 )
 from sglang.srt.disaggregation.encoder.server import (
     BadRequestError,
@@ -509,6 +510,87 @@ class TestEncoderDelivery(CustomTestCase):
                 ZmqDelivery,
             },
         )
+
+    def test_failed_staged_send_releases_request(self):
+        async def run():
+            encoder = SimpleNamespace(
+                send=AsyncMock(side_effect=RuntimeError("transfer failed")),
+                release_request=AsyncMock(),
+            )
+            request = {
+                "req_id": "req",
+                "prefill_host": "127.0.0.1",
+                "embedding_port": 1,
+                "session_id": "session",
+                "buffer_address": 2,
+            }
+
+            with self.assertRaisesRegex(RuntimeError, "transfer failed"):
+                await send_staged_embedding(
+                    encoder, request, release_without_count=False
+                )
+
+            encoder.release_request.assert_awaited_once_with("req")
+
+        asyncio.run(run())
+
+    def test_cancelled_staged_send_releases_request(self):
+        async def run():
+            encoder = SimpleNamespace(
+                send=AsyncMock(side_effect=asyncio.CancelledError()),
+                release_request=AsyncMock(),
+            )
+            request = {
+                "req_id": "req",
+                "prefill_host": "127.0.0.1",
+                "embedding_port": 1,
+                "session_id": "session",
+                "buffer_address": 2,
+            }
+
+            with self.assertRaises(asyncio.CancelledError):
+                await send_staged_embedding(
+                    encoder, request, release_without_count=False
+                )
+
+            encoder.release_request.assert_awaited_once_with("req")
+
+        asyncio.run(run())
+
+    def test_staged_send_uses_refcount_or_legacy_release_policy(self):
+        async def run():
+            request = {
+                "req_id": "req",
+                "prefill_host": "127.0.0.1",
+                "embedding_port": 1,
+                "session_id": "session",
+                "buffer_address": 2,
+                "receive_count": 2,
+            }
+            encoder = SimpleNamespace(
+                send=AsyncMock(return_value=True),
+                release_request=AsyncMock(),
+            )
+
+            note_send_done = AsyncMock()
+            with patch.object(meta_registry, "note_send_done", note_send_done):
+                self.assertTrue(
+                    await send_staged_embedding(
+                        encoder, request, release_without_count=True
+                    )
+                )
+            note_send_done.assert_awaited_once_with("req", 2, "127.0.0.1:1")
+            encoder.release_request.assert_not_awaited()
+
+            request.pop("receive_count")
+            self.assertTrue(
+                await send_staged_embedding(
+                    encoder, request, release_without_count=True
+                )
+            )
+            encoder.release_request.assert_awaited_once_with("req")
+
+        asyncio.run(run())
 
     def test_zmq_delivery_cleanup_is_configurable(self):
         async def run():
