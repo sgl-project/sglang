@@ -77,6 +77,12 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             if cfg.speculative_algorithm is not None
             else None
         )
+        supported_native_spec_algorithms = {
+            "EAGLE",
+            "EAGLE3",
+            "NEXTN",
+            "NGRAM",
+        }
         if uses_sm100_native_nvfp4 and speculative_algorithm in (
             "DFLASH",
             "DSPARK",
@@ -87,6 +93,34 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             raise ValueError(
                 "SM100 native NVFP4 speculative decoding does not yet support "
                 f"{speculative_algorithm}; use EAGLE/NEXTN or NGRAM."
+            )
+        if (
+            uses_sm100_native_nvfp4
+            and speculative_algorithm is not None
+            and speculative_algorithm not in supported_native_spec_algorithms
+        ):
+            # Do not silently treat STANDALONE, FROZEN_KV_MTP, or a custom
+            # plugin algorithm as EAGLE. Their draft/cache-commit contracts may
+            # differ, and none currently has native-layout coverage here.
+            raise ValueError(
+                "SM100 native NVFP4 speculative decoding supports EAGLE, "
+                "EAGLE3, NEXTN, and breadth-1 NGRAM; got "
+                f"{speculative_algorithm}."
+            )
+        if (
+            uses_sm100_native_nvfp4
+            and speculative_algorithm == "NGRAM"
+            and cfg.speculative_ngram_max_bfs_breadth != 1
+        ):
+            # TRT-LLM MHA's target-verify metadata supports a linear chain
+            # only. NGRAM defaults to a breadth-10 tree, so reject that default
+            # explicitly rather than reaching the later generic paged-backend
+            # assertion with a misleading compatibility message.
+            raise ValueError(
+                "SM100 native NVFP4 NGRAM speculative decoding requires "
+                "--speculative-ngram-max-bfs-breadth=1 because trtllm_mha "
+                "supports linear target verification only; got "
+                f"{cfg.speculative_ngram_max_bfs_breadth}."
             )
         uses_draft_model = speculative_algorithm not in (None, "NGRAM")
         if uses_sm100_native_nvfp4 and uses_draft_model:

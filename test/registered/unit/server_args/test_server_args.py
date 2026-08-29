@@ -660,64 +660,95 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
 
 
 class TestKV4Compatibility(unittest.TestCase):
+    def setUp(self):
+        self._use_mla_backend_patcher = patch(
+            "sglang.srt.arg_groups.kv_cache_hook.use_mla_backend",
+            return_value=False,
+        )
+        self._use_mla_backend_patcher.start()
+        self.addCleanup(self._use_mla_backend_patcher.stop)
+
     @staticmethod
     def _make_nvfp4_args(**overrides):
-        args = ServerArgs(
+        return ServerArgs(
             model_path="dummy",
             kv_cache_dtype="nvfp4",
             attention_backend="trtllm_mha",
             **overrides,
         )
-        args.use_mla_backend = lambda: False
-        return args
 
     def test_sm100_native_nvfp4_allows_topk_one_speculative_decoding(self):
-        for prefill_backend, decode_backend in (
-            (None, None),
-            ("flashinfer", "trtllm_mha"),
-        ):
-            for speculative_attention_mode in ("prefill", "decode"):
-                with self.subTest(
-                    prefill_backend=prefill_backend,
-                    decode_backend=decode_backend,
-                    speculative_attention_mode=speculative_attention_mode,
-                ):
-                    args = self._make_nvfp4_args(
-                        prefill_attention_backend=prefill_backend,
-                        decode_attention_backend=decode_backend,
-                        speculative_algorithm="EAGLE",
-                        speculative_eagle_topk=1,
+        for algorithm in ("EAGLE", "EAGLE3", "NEXTN"):
+            for prefill_backend, decode_backend in (
+                (None, None),
+                ("flashinfer", "trtllm_mha"),
+            ):
+                for speculative_attention_mode in ("prefill", "decode"):
+                    with self.subTest(
+                        algorithm=algorithm,
+                        prefill_backend=prefill_backend,
+                        decode_backend=decode_backend,
                         speculative_attention_mode=speculative_attention_mode,
-                    )
-                    with (
-                        patch(
-                            "sglang.srt.arg_groups.kv_cache_hook.is_cuda",
-                            return_value=True,
-                        ),
-                        patch(
-                            "sglang.srt.arg_groups.kv_cache_hook.is_sm100_supported",
-                            return_value=True,
-                        ),
-                        patch(
-                            "sglang.srt.arg_groups.kv_cache_hook.is_sm120_supported",
-                            return_value=False,
-                        ),
                     ):
-                        handle_kv4_compatibility(args)
-                    expected_mode = (
-                        "decode"
-                        if prefill_backend == "flashinfer"
-                        and speculative_attention_mode == "prefill"
-                        else speculative_attention_mode
-                    )
-                    self.assertEqual(
-                        resolution_result(args, "speculative_attention_mode"),
-                        expected_mode,
-                    )
-                    self.assertEqual(
-                        resolution_result(args, "speculative_draft_attention_backend"),
-                        "trtllm_mha",
-                    )
+                        args = self._make_nvfp4_args(
+                            prefill_attention_backend=prefill_backend,
+                            decode_attention_backend=decode_backend,
+                            speculative_algorithm=algorithm,
+                            speculative_eagle_topk=1,
+                            speculative_attention_mode=speculative_attention_mode,
+                        )
+                        with (
+                            patch(
+                                "sglang.srt.arg_groups.kv_cache_hook.is_cuda",
+                                return_value=True,
+                            ),
+                            patch(
+                                "sglang.srt.arg_groups.kv_cache_hook.is_sm100_supported",
+                                return_value=True,
+                            ),
+                            patch(
+                                "sglang.srt.arg_groups.kv_cache_hook.is_sm120_supported",
+                                return_value=False,
+                            ),
+                        ):
+                            handle_kv4_compatibility(args)
+                        expected_mode = (
+                            "decode"
+                            if prefill_backend == "flashinfer"
+                            and speculative_attention_mode == "prefill"
+                            else speculative_attention_mode
+                        )
+                        self.assertEqual(
+                            resolution_result(args, "speculative_attention_mode"),
+                            expected_mode,
+                        )
+                        self.assertEqual(
+                            resolution_result(
+                                args, "speculative_draft_attention_backend"
+                            ),
+                            "trtllm_mha",
+                        )
+
+    def test_sm100_native_nvfp4_rejects_unvalidated_spec_algorithms(self):
+        for algorithm in ("STANDALONE", "FROZEN_KV_MTP", "CUSTOM_SPEC"):
+            with self.subTest(algorithm=algorithm):
+                args = self._make_nvfp4_args(speculative_algorithm=algorithm)
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.kv_cache_hook.is_cuda",
+                        return_value=True,
+                    ),
+                    patch(
+                        "sglang.srt.arg_groups.kv_cache_hook.is_sm100_supported",
+                        return_value=True,
+                    ),
+                    patch(
+                        "sglang.srt.arg_groups.kv_cache_hook.is_sm120_supported",
+                        return_value=False,
+                    ),
+                    self.assertRaisesRegex(ValueError, "supports EAGLE"),
+                ):
+                    handle_kv4_compatibility(args)
 
     def test_sm100_native_nvfp4_rejects_non_native_draft_backend(self):
         args = self._make_nvfp4_args(
@@ -740,7 +771,10 @@ class TestKV4Compatibility(unittest.TestCase):
             handle_kv4_compatibility(args)
 
     def test_sm100_native_nvfp4_ngram_needs_no_draft_backend(self):
-        args = self._make_nvfp4_args(speculative_algorithm="NGRAM")
+        args = self._make_nvfp4_args(
+            speculative_algorithm="NGRAM",
+            speculative_ngram_max_bfs_breadth=1,
+        )
         with (
             patch("sglang.srt.arg_groups.kv_cache_hook.is_cuda", return_value=True),
             patch(
@@ -756,6 +790,25 @@ class TestKV4Compatibility(unittest.TestCase):
         self.assertIsNone(
             resolution_result(args, "speculative_draft_attention_backend")
         )
+
+    def test_sm100_native_nvfp4_rejects_branched_ngram(self):
+        args = self._make_nvfp4_args(
+            speculative_algorithm="NGRAM",
+            speculative_ngram_max_bfs_breadth=2,
+        )
+        with (
+            patch("sglang.srt.arg_groups.kv_cache_hook.is_cuda", return_value=True),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.is_sm100_supported",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.is_sm120_supported",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(ValueError, "speculative-ngram-max-bfs-breadth=1"),
+        ):
+            handle_kv4_compatibility(args)
 
     def test_sm100_native_nvfp4_rejects_prefix_commit_spec_algorithms(self):
         for algorithm in ("DFLASH", "DSPARK"):
