@@ -47,6 +47,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
 
@@ -65,8 +66,6 @@ def maybe_register_hicache_draft(
     *,
     tree_cache,
     draft_plan: HiCacheDraftPlan,
-    server_args: ServerArgs,
-    page_size: int,
 ) -> None:
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 
@@ -76,13 +75,7 @@ def maybe_register_hicache_draft(
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     if not isinstance(tree_cache, UnifiedRadixCache):
-        _register_legacy_hicache_draft(
-            tree_cache=tree_cache,
-            draft_pool=draft_plan.device_pools[0],
-            server_args=server_args,
-            page_size=page_size,
-        )
-        return
+        raise NotImplementedError("HiCache draft pools require UnifiedRadixCache.")
 
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         build_hicache_draft_sidecars,
@@ -91,53 +84,9 @@ def maybe_register_hicache_draft(
     specs, entries = build_hicache_draft_sidecars(
         draft_device_pools=draft_plan.device_pools,
         tree_cache=tree_cache,
-        server_args=server_args,
     )
-    tree_cache.register_hicache_draft_pools(specs, entries)
-
-
-def _register_legacy_hicache_draft(
-    *,
-    tree_cache,
-    draft_pool,
-    server_args: ServerArgs,
-    page_size: int,
-) -> None:
-    from sglang.srt.mem_cache.memory_pool import (
-        MHATokenToKVPool,
-        MLATokenToKVPool,
-    )
-    from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
-    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-
-    pool = draft_pool
-    if pool.layer_num == 0:
-        return
-
-    # Create host pool for draft with the same slot count as the target host pool,
-    # so that host indices stay 1-to-1 between target and draft KV caches.
-    primary_host_pool = tree_cache.cache_controller.mem_pool_host
-    host_pool_kwargs = dict(
-        host_to_device_ratio=primary_host_pool.logical_size / pool.size,
-        host_size=0,
-        page_size=page_size,
-        layout=get_memory().hicache_mem_layout,
-        allocator_type=server_args.hicache_storage_backend,
-        pool_label="draft",
-    )
-    if isinstance(pool, MHATokenToKVPool):
-        draft_host_pool = get_mha_host_pool_cls(pool)(pool, **host_pool_kwargs)
-    elif isinstance(pool, MLATokenToKVPool):
-        draft_host_pool = MLATokenToKVPoolHost(pool, **host_pool_kwargs)
-    else:
-        logger.warning(
-            "Draft pool type %s is not supported by the legacy HiCache path; "
-            "skipping draft KV registration.",
-            type(pool).__name__,
-        )
-        return
-
-    tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
+    for spec, entry in zip(specs, entries, strict=True):
+        tree_cache.register_sidecar_pool(spec, entry)
 
 
 # Host slots a backup-only retraction pool gets, as a fraction of the device
@@ -193,6 +142,9 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         backend = (
             "host_pool"
             if disagg.disaggregation_mode == "decode"
+            # Large ROCm retraction restores can fault the GPU process. Keep
+            # host_pool opt-in on HIP until the retraction path is safe at scale.
+            and not is_hip()
             and not get_parallel().dcp_enabled
             and not disagg.disaggregation_decode_enable_radix_cache
             # KV offload already owns a host pool; a second one double-books host memory.
@@ -368,8 +320,6 @@ def build_kv_cache(
         maybe_register_hicache_draft(
             tree_cache=tree_cache,
             draft_plan=hicache_draft_plan,
-            server_args=server_args,
-            page_size=page_size,
         )
 
     if retraction_backup == "host_pool":

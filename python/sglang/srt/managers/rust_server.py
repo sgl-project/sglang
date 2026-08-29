@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Optional, Tuple
 
 import msgspec
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.utils import (
@@ -29,6 +30,8 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.runtime_context import (
     get_mm,
+    get_observability,
+    get_parallel,
     get_serving,
 )
 from sglang.srt.utils.flatten import (
@@ -184,7 +187,7 @@ class NativeMmHost:
         import_processors("sglang.srt.multimodal.processors")
         if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
             import_processors(mm_process_pkg, overwrite=True)
-        self._processor = processor or get_processor_wrapper(self.server_args)
+        self._processor = processor or get_processor_wrapper()
 
     def resolve_native_spec(self) -> Optional[NativeMmSpec]:
         """The :class:`NativeMmSpec` for this model, or ``None`` when it has no
@@ -267,13 +270,13 @@ class NativeMmHost:
         map in parallel — the transport the Python TokenizerManager already uses.
         Single-rank serving stays inline, where shm would only add a copy.
         """
-        from sglang.srt.managers.tokenizer_manager import (
+        from sglang.srt.multimodal.transport import (
             determine_tensor_transport_mode,
         )
 
         return (
-            self.server_args.tp_size > 1
-            and determine_tensor_transport_mode(self.server_args) != "default"
+            get_parallel().tp_size > 1
+            and determine_tensor_transport_mode() != "default"
             and not self.server_args.skip_tokenizer_init
         )
 
@@ -395,13 +398,13 @@ class RustServer:
                 "ingress has no equivalent). Launch without SGLANG_RUST_SERVER, or "
                 "drop --preferred-sampling-params and send those values per request."
             )
-        http_addr = f"{server_args.host}:{server_args.port}"
+        http_addr = f"{get_serving().host}:{server_args.port}"
 
         # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
         # so the rank is not conflated with rank 0 of a one-rank group.
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
         if dp_rank is not None:
-            http_addr = f"{server_args.host}:{server_args.port + dp_rank}"
+            http_addr = f"{get_serving().host}:{server_args.port + dp_rank}"
 
         launch_cores, server_cores = cls._partition_cores(
             mm_workers=(
@@ -754,7 +757,7 @@ class RustServer:
 
         ext = load_rust_extension("sglang.srt.rust_extensions._server")
 
-        sa = scheduler.server_args
+        sa = resolving_view(scheduler.server_args)
         mc = scheduler.model_config
         disaggregation_mode = {
             "null": ext.DisaggregationMode.Null,
@@ -768,9 +771,9 @@ class RustServer:
             revision=sa.revision,
             load_format=sa.load_format,
             weight_version=sa.weight_version,
-            host=sa.host,
+            host=get_serving().host,
             port=sa.port,
-            log_level=sa.log_level,
+            log_level=get_observability().log_level,
             log_level_http=sa.log_level_http,
             chat_template=sa.chat_template,
             tool_call_parser=sa.tool_call_parser,
