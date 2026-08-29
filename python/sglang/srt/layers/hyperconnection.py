@@ -6,6 +6,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 
 def _is_cuda_jit_tensor(x: torch.Tensor) -> bool:
@@ -230,8 +233,10 @@ class GatedResidual(HyperConnectionBase):
             )
             return (R + injection).flatten(-2)
 
-        self._mix_compute = torch.compile(_mix_compute)
-        self._combine_compute = torch.compile(_combine_compute)
+        # Inductor has no NPU codegen backend. Keep these small generic
+        # fallbacks eager on NPU; an outer TorchAir graph may still capture them.
+        self._mix_compute = torch.compile(_mix_compute, disable=_is_npu)
+        self._combine_compute = torch.compile(_combine_compute, disable=_is_npu)
 
     def mix(self, hyper_input: torch.Tensor):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
