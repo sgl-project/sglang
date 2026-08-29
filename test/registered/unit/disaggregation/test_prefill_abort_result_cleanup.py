@@ -16,7 +16,7 @@ class _Req:
         self.rid = "aborted-prefill"
         self.inflight_middle_chunks = inflight_middle_chunks
         self.req_pool_idx = 1 if allocated else None
-        self.kv = object() if allocated else None
+        self.kv = object()
         self.mamba_pool_idx = object() if allocated else None
         self.metadata_buffer_index = 7 if allocated else -1
         self.pending_bootstrap = allocated
@@ -37,6 +37,10 @@ class _Req:
 
     def finished(self):
         return self.finished_reason is not None
+
+    @property
+    def is_holding_kv(self):
+        return self.req_pool_idx is not None
 
     def update_finish_state(self):
         self.finished_reason = self.to_finish
@@ -78,7 +82,6 @@ def _result():
 def _free_req(req, _tree_cache, *, is_insert):
     assert is_insert is False
     req.req_pool_idx = None
-    req.kv = None
     req.mamba_pool_idx = None
 
 
@@ -104,6 +107,20 @@ def test_aborted_final_result_releases_hybrid_cache(
     assert req.to_finish is None
     assert req.metadata_buffer_index == -1
     assert req.rid not in scheduler.disagg_prefill_pending_chunk_rids
+
+
+@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+def test_transport_abort_failure_does_not_bypass_local_cleanup(release_kv_cache):
+    scheduler = _Scheduler()
+    req = _Req(inflight_middle_chunks=0)
+    req.disagg_kv_sender.abort.side_effect = RuntimeError("transport unavailable")
+
+    scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+
+    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
+    scheduler.tree_cache.release_aborted_request.assert_called_once_with(req.rid)
+    scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)

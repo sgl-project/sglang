@@ -1044,26 +1044,28 @@ class SchedulerDisaggregationPrefillMixin:
         """
         self.clear_pending_chunk_send(req)
         owns_resources = (
-            req.req_pool_idx is not None
-            or req.kv is not None
+            req.is_holding_kv
             or req.mamba_pool_idx is not None
             or req.metadata_buffer_index >= 0
         )
         if not owns_resources:
             return False
 
-        req.disagg_kv_sender.abort()
+        try:
+            req.disagg_kv_sender.abort()
+        except Exception:
+            logger.warning(
+                "Failed to abort KV transfer while retiring request %s",
+                req.rid,
+                exc_info=True,
+            )
         if req.to_finish is not None and not req.finished():
             req.update_finish_state()
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
-        if (
-            req.req_pool_idx is not None
-            or req.kv is not None
-            or req.mamba_pool_idx is not None
-        ):
+        if req.is_holding_kv or req.mamba_pool_idx is not None:
             release_kv_cache(req, self.tree_cache, is_insert=False)
         return True
 
