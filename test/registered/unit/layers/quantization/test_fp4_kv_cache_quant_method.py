@@ -206,6 +206,47 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
             4096 + 512 + 512 + 2048,
         )
 
+    def test_server_args_backend_selection_uses_resolution_projection(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            KVCacheAttentionAccessKind,
+            NVFP4KVCacheMethod,
+        )
+
+        # Model/backend hooks declare overrides without mutating the raw
+        # ServerArgs fields. Pool sizing and allocation must observe the same
+        # resolved pair, and must not depend on a private ServerArgs method.
+        server_args = SimpleNamespace(
+            attention_backend="triton",
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            _resolved_overrides=[
+                (
+                    "test_model_override",
+                    {
+                        "prefill_attention_backend": "flashinfer",
+                        "decode_attention_backend": "trtllm_mha",
+                    },
+                )
+            ],
+        )
+        method = NVFP4KVCacheMethod(
+            num_layers=1,
+            device="cpu",
+            page_size=16,
+            native_scale_layout=True,
+        )
+
+        method.configure_attention_backends_from_server_args(server_args)
+
+        accesses = method.active_attention_accesses()
+        self.assertEqual(
+            [access.kind for access in accesses],
+            [
+                KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
+                KVCacheAttentionAccessKind.NATIVE_FP4,
+            ],
+        )
+
     def test_xqa_recipe_retains_linear_scales(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVCacheMethod,

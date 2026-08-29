@@ -140,6 +140,24 @@ class KVCacheQuantMethodBase(ABC):
                 selected.append(access)
         self._active_attention_accesses = tuple(selected)
 
+    def configure_attention_backends_from_server_args(self, server_args) -> None:
+        """Select accesses from the resolved per-phase attention backends.
+
+        Attention backend resolution is declaration based: model hooks can
+        override a pristine ``ServerArgs`` without mutating its raw fields.
+        Always use the public resolution projection here instead of depending
+        on a private ``ServerArgs`` helper, and keep pool sizing/allocation on
+        the same selection path.
+        """
+        from sglang.srt.arg_groups.overrides import (
+            attention_backends_of,
+            resolved_view,
+        )
+
+        self.configure_attention_backends(
+            *attention_backends_of(resolved_view(server_args))
+        )
+
     def active_attention_accesses(self) -> tuple[KVCacheAttentionAccess, ...]:
         return getattr(self, "_active_attention_accesses", self.attention_accesses())
 

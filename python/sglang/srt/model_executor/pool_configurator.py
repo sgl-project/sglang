@@ -354,11 +354,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     device=kvc.device,
                     page_size=kvc.page_size,
                 )
-                prefill_backend, decode_backend = (
-                    kvc.server_args._resolved_attention_backends()
-                )
-                quant_method.configure_attention_backends(
-                    prefill_backend, decode_backend
+                quant_method.configure_attention_backends_from_server_args(
+                    kvc.server_args
                 )
                 cell_size = quant_method.compute_cell_size(
                     n,
