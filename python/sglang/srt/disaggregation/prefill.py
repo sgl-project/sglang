@@ -45,8 +45,11 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    get_dflash_draft_kv_transfer_locs,
+    get_dflash_draft_kv_transfer_spec,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_legacy_draft_kv_buf_infos,
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
@@ -169,6 +172,9 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
+        self.draft_kv_transfer_spec = get_dflash_draft_kv_transfer_spec(
+            scheduler, draft_token_to_kv_pool, transfer_backend
+        )
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -240,22 +246,43 @@ class PrefillBootstrapQueue:
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
 
-        draft_kv_pool = self.draft_token_to_kv_pool if transfer_draft_cache else None
+        draft_kv_pool = None
         num_draft_entries = 0
-        if draft_kv_pool is not None:
+        legacy_draft_infos = (
+            get_legacy_draft_kv_buf_infos(
+                self.draft_token_to_kv_pool, self.draft_kv_transfer_spec
+            )
+            if transfer_draft_cache
+            else None
+        )
+        if legacy_draft_infos is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                draft_kv_pool.get_contiguous_buf_infos()
+                legacy_draft_infos
             )
+            draft_kv_pool = self.draft_token_to_kv_pool
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
             num_draft_entries = len(draft_kv_data_ptrs)
 
+        if self.draft_kv_transfer_spec is not None and not transfer_draft_cache:
+            raise RuntimeError(
+                "DFlash PD draft suffix state cannot be omitted by layer sharding"
+            )
+
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.draft_swa_suffix_enabled = bool(
+            self.draft_kv_transfer_spec and self.draft_kv_transfer_spec.suffix_enabled
+        )
+        kv_args.draft_swa_window_size = (
+            self.draft_kv_transfer_spec.window_size
+            if self.draft_kv_transfer_spec
+            else 0
+        )
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
             draft_token_to_kv_pool=draft_kv_pool,
@@ -280,7 +307,10 @@ class PrefillBootstrapQueue:
             kv_args,
             self.token_to_kv_pool,
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
-            self.scheduler.model_config.num_hidden_layers,
+            draft_kv_transfer_spec=(
+                self.draft_kv_transfer_spec if transfer_draft_cache else None
+            ),
+            total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
         )
 
@@ -1242,6 +1272,23 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
 
+            def _draft_swa_payload():
+                if not req.disagg_kv_sender.can_send_draft_swa_suffix():
+                    return None
+                spec = self.disagg_prefill_bootstrap_queue.draft_kv_transfer_spec
+                if spec is None:
+                    raise RuntimeError(
+                        "draft SWA suffix was negotiated without a local transfer spec"
+                    )
+                draft_indices = get_dflash_draft_kv_transfer_locs(
+                    self.draft_worker,
+                    int(req.req_pool_idx),
+                    seq_len,
+                    spec,
+                    page_size,
+                )
+                return kv_to_page_indices(draft_indices, page_size)
+
             def _swa_ring_payload():
                 # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
                 # for the last `window` positions, in ascending position order so
@@ -1283,6 +1330,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.C128_STATE: _c128_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
+                StateType.DRAFT_SWA: _draft_swa_payload,
             }
             if _is_npu and isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(),

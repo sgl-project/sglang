@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
+    # DFlash draft K/V addressed by the visible absolute-position suffix.
+    DRAFT_SWA = "draft_swa"
     DSA = "dsa"
     MINIMAX_INDEX_K = "minimax_index_k"
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
@@ -42,6 +44,8 @@ class KVTransferMetric:
 
 class KVArgs:
     engine_rank: int
+    draft_swa_suffix_enabled: bool
+    draft_swa_window_size: int
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
@@ -152,6 +156,9 @@ class BaseKVSender(ABC):
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
+
+    def can_send_draft_swa_suffix(self) -> bool:
+        return False
 
     @abstractmethod
     def get_transfer_metric(self) -> KVTransferMetric:
