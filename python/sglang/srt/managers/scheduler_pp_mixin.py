@@ -723,7 +723,7 @@ class SchedulerPPMixin:
                 latencies.append(latency_ms)
 
                 # Release KV and Mamba cache
-                if req.req_pool_idx is not None:
+                if req.is_holding_kv:
                     kv_indices = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx, : req.extend_range.end
                     ]
@@ -731,7 +731,7 @@ class SchedulerPPMixin:
                     if req.mamba_pool_idx is not None:
                         self.req_to_token_pool.free_mamba_cache(req)
                     self.req_to_token_pool.free(req)
-                    req.kv = None
+                    req.kv.mark_released()
 
             logger.info(
                 f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
@@ -1025,6 +1025,14 @@ class SchedulerPPMixin:
             "next_token_ids": result.next_token_ids,
         }
 
+        # Draft extend runs only on the last stage, but every rank needs its relayed
+        # output to fill PD auxiliary buffers.
+        draft_input = result.next_draft_input
+        if draft_input is not None and draft_input.topk_p is not None:
+            tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
+            tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
+            tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
+
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
             tensor_dict = {
@@ -1172,17 +1180,45 @@ class SchedulerPPMixin:
                     logits_output = LogitsProcessorOutput(next_token_logits=None)
                 logits_output.auxiliary_device_output = auxiliary_output
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+
+        # Rebind the last stage's ring proposal as batch.spec_info so the PD result
+        # processor sees the same object on every rank.
+        next_draft_input = None
+        if "draft_topk_p" in pp_outputs.tensors:
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            next_draft_input = EagleDraftInput(
+                topk_p=pp_outputs["draft_topk_p"],
+                topk_index=pp_outputs["draft_topk_index"],
+                hidden_states=pp_outputs["draft_hidden_states"],
+                bonus_tokens=next_token_ids,
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+            )
+            batch.spec_info = next_draft_input
+
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
         self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
+            batch.req_pool_indices,
+            RelayPayload(
+                bonus_tokens=next_token_ids,
+                topk_p=None if next_draft_input is None else next_draft_input.topk_p,
+                topk_index=(
+                    None if next_draft_input is None else next_draft_input.topk_index
+                ),
+                hidden_states=(
+                    None if next_draft_input is None else next_draft_input.hidden_states
+                ),
+            ),
         )
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
             next_token_ids=pp_outputs["next_token_ids"],
+            next_draft_input=next_draft_input,
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,

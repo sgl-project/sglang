@@ -161,6 +161,28 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER = 1
 
+
+def _pp_local_per_request_bytes(
+    total_bytes: int,
+    layer_ids: list[int],
+    start_layer: int,
+    end_layer: int,
+) -> int:
+    # BaseLinearStateParams reports global bytes, but PP pools allocate only local
+    # layers; charge this stage its proportional per-request share.
+    if not layer_ids:
+        return 0
+    if total_bytes % len(layer_ids) != 0:
+        raise ValueError(
+            "Linear-state bytes must be uniform per layer: "
+            f"total_bytes={total_bytes}, num_layers={len(layer_ids)}"
+        )
+    local_layer_count = sum(
+        start_layer <= layer_id < end_layer for layer_id in layer_ids
+    )
+    return total_bytes // len(layer_ids) * local_layer_count
+
+
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.mem_cache.unified_memory_pool import (
