@@ -1954,11 +1954,12 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
-        if get_mm().mm_feature_transport == "cuda_vmm":
-            for recv_req in recv_reqs:
-                self._materialize_cuda_vmm_inputs(recv_req)
 
         for recv_req in recv_reqs:
+            vmm_errors = None
+            if get_mm().mm_feature_transport == "cuda_vmm":
+                vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
+
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
@@ -1966,6 +1967,10 @@ class Scheduler(
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
                 )
+                continue
+
+            if vmm_errors is not None and any(vmm_errors):
+                self._dispatch_tokenized_mm_requests(recv_req, vmm_errors)
                 continue
 
             output = self._request_dispatcher(recv_req)
@@ -1985,26 +1990,87 @@ class Scheduler(
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
-    def _materialize_cuda_vmm_inputs(self, recv_req):
-        """Release VMM slices before request handling can reject the request."""
+    @staticmethod
+    def _tokenized_requests(recv_req):
         if isinstance(
             recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
         ):
-            tokenized_reqs = (recv_req,)
-        elif isinstance(
+            return (recv_req,)
+        if isinstance(
             recv_req,
             (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput),
         ):
-            tokenized_reqs = recv_req
-        else:
-            return
+            return tuple(recv_req)
+        return ()
 
+    def _gather_vmm_materialization_errors(
+        self, local_error: Optional[str]
+    ) -> List[Optional[str]]:
+        if not (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and self.dp_tp_cpu_group is not None
+        ):
+            return [local_error]
+
+        world_size = torch.distributed.get_world_size(group=self.dp_tp_cpu_group)
+        errors = [None] * world_size
+        torch.distributed.all_gather_object(
+            errors,
+            local_error,
+            group=self.dp_tp_cpu_group,
+        )
+        return errors
+
+    def _materialize_cuda_vmm_inputs(self, recv_req) -> Optional[List[Optional[str]]]:
+        """Materialize each request and agree on failures across TP ranks."""
+        tokenized_reqs = self._tokenized_requests(recv_req)
+        if not tokenized_reqs:
+            return None
+
+        request_errors = []
         for tokenized_req in tokenized_reqs:
-            if tokenized_req.mm_inputs is not None and not isinstance(
-                tokenized_req.mm_inputs, MultimodalInputs
-            ):
-                tokenized_req.mm_inputs = MultimodalInputs.from_processor_output(
-                    tokenized_req.mm_inputs
+            local_error = None
+            try:
+                if tokenized_req.mm_inputs is not None and not isinstance(
+                    tokenized_req.mm_inputs, MultimodalInputs
+                ):
+                    tokenized_req.mm_inputs = MultimodalInputs.from_processor_output(
+                        tokenized_req.mm_inputs
+                    )
+            except Exception as error:
+                local_error = f"{type(error).__name__}: {error}"
+
+            rank_errors = self._gather_vmm_materialization_errors(local_error)
+            failed_ranks = [
+                rank for rank, error in enumerate(rank_errors) if error is not None
+            ]
+            if failed_ranks:
+                details = "; ".join(
+                    f"rank {rank}: {rank_errors[rank]}" for rank in failed_ranks
+                )
+                error_msg = f"Multimodal feature reconstruction failed ({details})"
+                logger.error(error_msg)
+                tokenized_req.mm_inputs = None
+                request_errors.append(error_msg)
+            else:
+                request_errors.append(None)
+        return request_errors
+
+    def _dispatch_tokenized_mm_requests(
+        self, recv_req, errors: List[Optional[str]]
+    ) -> None:
+        tokenized_reqs = self._tokenized_requests(recv_req)
+        if len(tokenized_reqs) != len(errors):
+            raise RuntimeError("VMM materialization results do not match requests")
+        for tokenized_req, error in zip(tokenized_reqs, errors, strict=True):
+            if isinstance(tokenized_req, TokenizedGenerateReqInput):
+                self.handle_generate_request(tokenized_req, mm_input_error=error)
+            elif isinstance(tokenized_req, TokenizedEmbeddingReqInput):
+                self.handle_embedding_request(tokenized_req, mm_input_error=error)
+            else:
+                raise TypeError(
+                    f"Unsupported tokenized request type: {type(tokenized_req).__name__}"
                 )
 
     def init_profiler(self) -> None:
@@ -2486,6 +2552,8 @@ class Scheduler(
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
+        *,
+        mm_input_error: Optional[str] = None,
     ):
         # Route: normal request / session request / session-not-found
         session_id = (
@@ -2633,6 +2701,16 @@ class Scheduler(
             return
 
         self._maybe_namespace_elastic_radix_cache(req)
+
+        if mm_input_error is not None:
+            req.set_finish_with_abort(
+                mm_input_error,
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                err_type="InternalServerError",
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
 
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)
@@ -3024,6 +3102,8 @@ class Scheduler(
     def handle_embedding_request(
         self,
         recv_req: TokenizedEmbeddingReqInput,
+        *,
+        mm_input_error: Optional[str] = None,
     ):
         req = Req(
             recv_req.rid,
@@ -3043,6 +3123,15 @@ class Scheduler(
         )
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
+
+        if mm_input_error is not None:
+            req.set_finish_with_abort(
+                mm_input_error,
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                err_type="InternalServerError",
+            )
+            self._add_request_to_queue(req)
+            return
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:

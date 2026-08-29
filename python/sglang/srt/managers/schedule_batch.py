@@ -1897,7 +1897,12 @@ class Req(ReqDllmMixin):
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
 
-    def set_finish_with_abort(self, error_msg: str):
+    def set_finish_with_abort(
+        self,
+        error_msg: str,
+        status_code: int = HTTPStatus.BAD_REQUEST,
+        err_type: str = "BadRequestError",
+    ):
         if get_parallel().tp_rank == 0:
             logger.error(f"{error_msg}, {self.rid=}")
         self.multimodal_inputs = None
@@ -1907,9 +1912,7 @@ class Req(ReqDllmMixin):
         )  # set it to one token to skip the long prefill
         self.return_logprob = False
         self.logprob_start_len = -1
-        self.to_finish = FINISH_ABORT(
-            error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
-        )
+        self.to_finish = FINISH_ABORT(error_msg, status_code, err_type)
 
     def update_reasoning_tokens(self, token_id, think_end_ids):
         if self._is_reasoning_over:

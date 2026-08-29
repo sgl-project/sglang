@@ -600,6 +600,58 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
         scheduler.flush_wrapper = SimpleNamespace(check_pending=MagicMock())
         scheduler.external_corpus_manager = None
 
+    @staticmethod
+    def _materialize_with_rank_errors(local_exception=None, remote_error=None):
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        class TokenizedRequest:
+            def __init__(self):
+                self.mm_inputs = object()
+
+        scheduler = object.__new__(scheduler_module.Scheduler)
+        scheduler.dp_tp_cpu_group = object()
+        request = TokenizedRequest()
+
+        def gather_errors(errors, local_error, **_kwargs):
+            errors[:] = [local_error, remote_error]
+
+        materialize = MagicMock(
+            side_effect=local_exception,
+            return_value=object(),
+        )
+        with (
+            patch.object(
+                scheduler_module, "TokenizedGenerateReqInput", TokenizedRequest
+            ),
+            patch.object(
+                scheduler_module, "TokenizedEmbeddingReqInput", TokenizedRequest
+            ),
+            patch.object(
+                scheduler_module.MultimodalInputs,
+                "from_processor_output",
+                materialize,
+            ),
+            patch.object(
+                scheduler_module.torch.distributed, "is_available", return_value=True
+            ),
+            patch.object(
+                scheduler_module.torch.distributed,
+                "is_initialized",
+                return_value=True,
+            ),
+            patch.object(
+                scheduler_module.torch.distributed, "get_world_size", return_value=2
+            ),
+            patch.object(
+                scheduler_module.torch.distributed,
+                "all_gather_object",
+                side_effect=gather_errors,
+            ),
+        ):
+            errors = scheduler._materialize_cuda_vmm_inputs(request)
+
+        return request, errors
+
     def test_materializes_inputs_directly_before_base_dispatch(self):
         from sglang.srt.managers import scheduler as scheduler_module
 
@@ -707,6 +759,107 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
             self.assertIs(scheduler._get_multimodal_inputs(mm_inputs), mm_inputs)
 
         process_and_broadcast.assert_not_called()
+
+    def test_vmm_materialization_consensus_rejects_any_rank_failure(self):
+        cases = (
+            (None, "RuntimeError: remote failure", "rank 1: RuntimeError"),
+            (ValueError("bad proxy"), None, "rank 0: ValueError: bad proxy"),
+        )
+        for local_exception, remote_error, expected in cases:
+            with self.subTest(expected=expected):
+                request, errors = self._materialize_with_rank_errors(
+                    local_exception, remote_error
+                )
+                self.assertIn(expected, errors[0])
+                self.assertIsNone(request.mm_inputs)
+
+    def test_vmm_batch_dispatches_good_and_failed_requests_individually(self):
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        class TokenizedRequest:
+            pass
+
+        class EmbeddingRequest:
+            pass
+
+        class BatchRequest:
+            def __init__(self, requests):
+                self.requests = requests
+
+            def __iter__(self):
+                return iter(self.requests)
+
+        scheduler = object.__new__(scheduler_module.Scheduler)
+        self._publish(mm_feature_transport="cuda_vmm")
+        self._prepare_scheduler(scheduler)
+        scheduler.is_fully_idle = MagicMock(return_value=True)
+        scheduler.return_health_check_ipcs = []
+        scheduler.handle_generate_request = MagicMock()
+        scheduler.handle_embedding_request = MagicMock()
+        scheduler._materialize_cuda_vmm_inputs = MagicMock(
+            return_value=[None, "reconstruction failed"]
+        )
+        requests = [TokenizedRequest(), TokenizedRequest()]
+        batch = BatchRequest(requests)
+
+        with (
+            patch.object(
+                scheduler_module, "TokenizedGenerateReqInput", TokenizedRequest
+            ),
+            patch.object(
+                scheduler_module, "TokenizedEmbeddingReqInput", EmbeddingRequest
+            ),
+            patch.object(
+                scheduler_module, "BatchTokenizedGenerateReqInput", BatchRequest
+            ),
+            patch.object(scheduler_module, "BatchTokenizedEmbeddingReqInput", tuple),
+            patch.object(
+                scheduler_module, "is_health_check_generate_req", return_value=False
+            ),
+        ):
+            scheduler.process_input_requests([batch])
+
+        self.assertEqual(
+            scheduler.handle_generate_request.call_args_list,
+            [
+                call(requests[0], mm_input_error=None),
+                call(requests[1], mm_input_error="reconstruction failed"),
+            ],
+        )
+        scheduler.handle_embedding_request.assert_not_called()
+        scheduler._request_dispatcher.assert_not_called()
+
+    def test_vmm_materialization_abort_reports_internal_error(self):
+        from sglang.srt.managers import schedule_batch
+
+        req = object.__new__(schedule_batch.Req)
+        req.rid = "request-id"
+        req.multimodal_inputs = object()
+        req.grammar = object()
+        req.origin_input_ids = [1, 2]
+        req.return_logprob = True
+        req.logprob_start_len = 0
+        req.to_finish = None
+
+        with patch.object(
+            schedule_batch, "get_parallel", return_value=SimpleNamespace(tp_rank=1)
+        ):
+            req.set_finish_with_abort(
+                "reconstruction failed",
+                status_code=500,
+                err_type="InternalServerError",
+            )
+
+        self.assertEqual(
+            req.to_finish.to_json(),
+            {
+                "type": "abort",
+                "message": "reconstruction failed",
+                "status_code": 500,
+                "err_type": "InternalServerError",
+            },
+        )
+        self.assertIsNone(req.multimodal_inputs)
 
 
 class TestVmmConsumerCount(unittest.TestCase):
