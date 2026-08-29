@@ -194,6 +194,87 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     return backend
 
 
+def _validate_decode_radix_cache_prebuild_compatibility(
+    *,
+    model_config: ModelConfig,
+    token_to_kv_pool_allocator: object,
+    is_hybrid_swa: bool,
+    is_hybrid_ssm: bool,
+    enable_hierarchical_cache: bool,
+) -> None:
+    """Reject flag/pool combinations before tree or host-cache construction."""
+    if is_hybrid_ssm:
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache is incompatible "
+            "with Mamba/SSM models"
+        )
+
+    if not is_hybrid_swa:
+        return
+
+    if enable_hierarchical_cache:
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache with sliding window "
+            "attention (SWA) models currently supports only device-resident "
+            "cache and is incompatible with --enable-hierarchical-cache."
+        )
+
+    if getattr(model_config, "is_hybrid_swa_compress", False):
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache does not support "
+            "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
+        )
+
+    tail_allocator = getattr(token_to_kv_pool_allocator, "alloc_extend_swa_tail", None)
+    page_size = getattr(token_to_kv_pool_allocator, "page_size", 1)
+    if page_size > 1 and not callable(tail_allocator):
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache with sliding window "
+            "attention (SWA) models and page_size > 1 requires an allocator "
+            "that implements alloc_extend_swa_tail; got "
+            f"{type(token_to_kv_pool_allocator).__name__} with page_size={page_size}."
+        )
+
+    if getattr(model_config, "is_deepseek_v4_arch", False):
+        kv_cache = token_to_kv_pool_allocator.get_kvcache()
+        if not getattr(kv_cache, "_unified_kv", False):
+            raise ValueError(
+                "--disaggregation-decode-enable-radix-cache with DeepSeek-V4 "
+                "currently requires the ROCm unified-KV path "
+                "(SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton)."
+            )
+
+
+def _validate_decode_radix_cache_compatibility(
+    *,
+    model_config: ModelConfig,
+    tree_cache: object,
+    is_hybrid_swa: bool,
+) -> None:
+    """Validate properties that are known only after selecting the tree cache."""
+    if not is_hybrid_swa:
+        return
+
+    if not isinstance(tree_cache, UnifiedRadixCache):
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache with sliding window "
+            "attention (SWA) models requires UnifiedRadixCache; selected "
+            f"{type(tree_cache).__name__}."
+        )
+
+    if getattr(model_config, "is_deepseek_v4_arch", False):
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+
+        expected_components = {ComponentType.FULL, ComponentType.SWA}
+        actual_components = set(tree_cache.tree_components)
+        if actual_components != expected_components:
+            raise ValueError(
+                "--disaggregation-decode-enable-radix-cache with DeepSeek-V4 "
+                "currently supports only a FULL+SWA UnifiedRadixCache; got "
+                f"{sorted(component.name for component in actual_components)}."
+            )
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -245,43 +326,18 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
-    # Decode-side radix cache supports SWA only through the unified tree, whose
-    # component pools preserve the full-attention prefix while transferring the
-    # SWA window fresh. The legacy SWA cache and hybrid SSM pools remain
-    # incompatible with the prefix-match-and-lock allocation path.
-    if (
+    decode_radix_cache_enabled = (
         get_disagg().disaggregation_decode_enable_radix_cache
         and get_disagg().disaggregation_mode == "decode"
-    ):
-        if is_hybrid_swa:
-            if not (envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx()):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache with sliding "
-                    "window attention (SWA) models requires the unified radix "
-                    "tree (set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1)."
-                )
-            if enable_hierarchical_cache:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache with sliding "
-                    "window attention (SWA) models currently supports only "
-                    "device-resident cache and is incompatible with "
-                    "--enable-hierarchical-cache."
-                )
-            if getattr(model_config, "is_deepseek_v4_arch", False):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache does not support "
-                    "DeepSeek-V4 (DSA) compressed KV (c4/c128/indexer) yet."
-                )
-            if getattr(model_config, "is_hybrid_swa_compress", False):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache does not support "
-                    "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
-                )
-        if is_hybrid_ssm:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with Mamba/SSM models"
-            )
+    )
+    if decode_radix_cache_enabled:
+        _validate_decode_radix_cache_prebuild_compatibility(
+            model_config=model_config,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            is_hybrid_swa=is_hybrid_swa,
+            is_hybrid_ssm=is_hybrid_ssm,
+            enable_hierarchical_cache=enable_hierarchical_cache,
+        )
 
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
@@ -337,6 +393,13 @@ def build_kv_cache(
             tp_group=tp_group,
         )
     )
+
+    if decode_radix_cache_enabled:
+        _validate_decode_radix_cache_compatibility(
+            model_config=model_config,
+            tree_cache=tree_cache,
+            is_hybrid_swa=is_hybrid_swa,
+        )
 
     if (
         enable_hierarchical_cache or retraction_backup == "host_pool"
