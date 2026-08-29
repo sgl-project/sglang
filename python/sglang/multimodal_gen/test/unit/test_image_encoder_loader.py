@@ -145,6 +145,7 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
             from_pretrained=mock.Mock(return_value=loaded_encoder)
         )
         server_args = SimpleNamespace(
+            component_precisions={},
             pipeline_config=SimpleNamespace(image_encoder_precision="bf16"),
             explicit_residency_mode=mock.Mock(return_value=None),
             require_component_resident=mock.Mock(),
@@ -196,6 +197,7 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
         )
         model_class = SimpleNamespace(from_pretrained=mock.Mock())
         server_args = SimpleNamespace(
+            component_precisions={},
             pipeline_config=SimpleNamespace(image_encoder_precision="bf16"),
             explicit_residency_mode=mock.Mock(return_value=COMPONENT_OFFLOAD),
             require_component_resident=mock.Mock(),
