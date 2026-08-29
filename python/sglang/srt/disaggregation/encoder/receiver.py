@@ -1200,6 +1200,12 @@ class WaitingZmqRequestGrpc(WaitingZmqRequest):
                     logger.error(f"Request {i} failed: {result}")
                 else:
                     logger.debug(f"Request {i} succeeded.")
+            failed = [result for result in results if isinstance(result, BaseException)]
+            if failed:
+                self._fail_and_release(
+                    f"Failed to register receive URL with encoder: {failed[0]!r}",
+                    int(HTTPStatus.BAD_GATEWAY),
+                )
 
         asyncio.run(
             send_embedding_port(

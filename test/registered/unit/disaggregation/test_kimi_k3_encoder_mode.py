@@ -6,7 +6,7 @@ import time
 from array import array
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import torch
@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.encoder.receiver import (
     EmbeddingData,
     MMReceiverHTTP,
     MultiModalEmbeddingData,
+    WaitingZmqRequestGrpc,
     _encoder_media_item,
     _select_mm_processor_prompt,
 )
@@ -770,6 +771,27 @@ def test_epd_scheduler_routes_many_requests_over_one_receive_socket():
         sender.close(linger=0)
         receiver.scheduler_recv_socket.close(linger=0)
         context.term()
+
+
+def test_epd_grpc_registration_failure_aborts_without_waiting_for_timeout():
+    waiting_req = WaitingZmqRequestGrpc.__new__(WaitingZmqRequestGrpc)
+    waiting_req.num_items_assigned = {Modality.IMAGE: [1]}
+    waiting_req.encoder_urls = ["grpc://127.0.0.1:1234"]
+    waiting_req.recv_req = SimpleNamespace(rid="request-id")
+    waiting_req.receive_count = 1
+    waiting_req.host_name = "127.0.0.1"
+    waiting_req.embedding_port = 4321
+    waiting_req._fail_and_release = MagicMock()
+
+    with patch(
+        "sglang.srt.disaggregation.encoder.receiver._grpc_scheduler_receive_url",
+        side_effect=RuntimeError("registration failed"),
+    ):
+        waiting_req.send_encode_request()
+
+    error_msg, error_code = waiting_req._fail_and_release.call_args.args
+    assert "registration failed" in error_msg
+    assert error_code == 502
 
 
 def test_epd_encoder_reuses_scheduler_zmq_peer():
