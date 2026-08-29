@@ -146,22 +146,20 @@ class MooncakeTransferEngine:
         try:
             ret_value = self.engine.register_memory(ptr, length)
         except Exception as exc:
-            raise RuntimeError(f"Mooncake memory registration failed: {ptr}") from exc
+            raise RuntimeError("Mooncake memory registration failed") from exc
 
         if ret_value != 0:
-            raise RuntimeError(
-                f"Mooncake memory registration failed: {ptr} (ret={ret_value})"
-            )
+            raise RuntimeError(f"Mooncake memory registration failed (ret={ret_value})")
 
     def deregister(self, ptr) -> None:
         try:
             ret_value = self.engine.unregister_memory(ptr)
         except Exception as exc:
-            raise RuntimeError(f"Mooncake memory deregistration failed: {ptr}") from exc
+            raise RuntimeError("Mooncake memory deregistration failed") from exc
 
         if ret_value != 0:
             raise RuntimeError(
-                f"Mooncake memory deregistration failed: {ptr} (ret={ret_value})"
+                f"Mooncake memory deregistration failed (ret={ret_value})"
             )
 
     def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
