@@ -376,9 +376,8 @@ class DSparkVerifyPlanner:
         if not get_schedule().disable_overlap_schedule:
             return draft_input.verify_token_budget
 
-        # No collective here: the budget is a pure function of the draft tokens
-        # (via confidence), req_generation, and the static sps table, all of
-        # which already agree across ranks.
+        # No collective: the budget derives only from the broadcast draft tokens
+        # (via confidence), replicated req_generation, and the static sps table.
         draft_input.verify_token_budget = self.compute_budget_sync(
             confidence=confidence,
             prefix_lens=prefix_lens,

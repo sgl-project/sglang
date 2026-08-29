@@ -189,8 +189,8 @@ def _resolve_folded_sampling(
     *, model, gamma, max_bs, device, tp_rank, available_memory_gb: float
 ) -> bool:
     """The sampling buffers are baked into the captured draft graph, so AUTO
-    must decide before capture from a free-memory probe. With TP > 1, pass
-    the group-min ``available_memory_gb`` so ranks fold identically."""
+    must decide before capture from a free-memory probe. ``available_memory_gb``
+    is the group minimum, so every rank folds identically."""
     mode = envs.SGLANG_DSPARK_FOLDED_SAMPLING.get()
     if mode == DsparkFoldedSampling.OFF:
         return False
