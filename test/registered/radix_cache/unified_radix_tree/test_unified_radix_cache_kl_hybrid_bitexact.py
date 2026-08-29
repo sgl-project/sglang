@@ -44,6 +44,7 @@ import re
 import unittest
 
 import requests
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_multiturn_utils import (
     make_mamba_decode_assert,
