@@ -165,6 +165,18 @@ class SWAKVPool(BaseSWAKVPool):
         k_size_swa, v_size_swa = split_size(self.swa_kv_pool)
         return k_size + k_size_swa, v_size + v_size_swa
 
+    def get_v_head_dim(self):
+        # TritonAttnBackend keeps ONE v_head_dim for the whole backend, so a pool
+        # whose sub-pools disagree cannot be served by it. Say so, rather than
+        # silently answering with the full sub-pool's dim.
+        full = self.full_kv_pool.get_v_head_dim()
+        swa = self.swa_kv_pool.get_v_head_dim()
+        assert full == swa, (
+            f"SWAKVPool sub-pools disagree on the value head dim (full={full}, "
+            f"swa={swa}); a single-v_head_dim attention backend cannot serve it."
+        )
+        return full
+
     def is_mla(self) -> bool:
         return isinstance(self.full_kv_pool, MLATokenToKVPool) and isinstance(
             self.swa_kv_pool, MLATokenToKVPool
