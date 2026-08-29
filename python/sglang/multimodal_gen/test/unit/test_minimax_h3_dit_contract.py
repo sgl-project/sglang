@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Mixed-precision weight and TP/Ulysses numerical contracts for H3 DiT."""
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -14,7 +15,13 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionRequirements,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    component_attn_backend_context_manager,
+)
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
@@ -32,6 +39,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     _modulate_gate,
     _reorder_grouped_qkv_to_qkv,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
@@ -42,6 +50,24 @@ def _ensure_single_process_parallel_runtime() -> None:
         return
     ensure_distributed_env_defaults()
     maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+
+
+def test_pruned_adaln_lora_projection_preserves_affine_term():
+    model = SimpleNamespace(
+        arch=SimpleNamespace(adaln_affine_input_dim=3, time_embed_dim=2),
+        adaln_basis=torch.tensor([[1.0, 0.0, 2.0], [0.0, 1.0, -1.0]]),
+        adaln_mean=torch.tensor([1.0, 2.0, 3.0]),
+    )
+    prefix = "blocks.0.adaln_proj.linear."
+    a = torch.tensor([[2.0, 3.0, 4.0]])
+    b = torch.tensor([[5.0], [6.0]])
+    actual = MiniMaxH3DiTModel.prepare_lora_adapter(
+        model, {prefix + "lora_A": a, prefix + "lora_B": b}
+    )
+    torch.testing.assert_close(actual[prefix + "lora_A"], a @ model.adaln_basis.T)
+    torch.testing.assert_close(
+        actual[prefix + "lora_output_offset"], b @ (a @ model.adaln_mean)
+    )
 
 
 def test_native_weight_names_and_grouped_qkv_reorder():
@@ -90,6 +116,12 @@ def test_native_weight_names_and_grouped_qkv_reorder():
         1,
         3,
     )
+    assert mapping("time_embedder.table") == ("adaln_t_table", None, None)
+    assert mapping("transformer_blocks.7.adaln_proj.folded_bias") == (
+        "blocks.7.adaln_proj.linear.bias",
+        None,
+        None,
+    )
 
     diffusers_weights = [
         ("transformer_blocks.0.attn.to_q.qweight", torch.full((2, 3), 1)),
@@ -109,6 +141,19 @@ def test_native_weight_names_and_grouped_qkv_reorder():
         converted["blocks.0.mlp.fc1.weight"],
         torch.tensor([[4, 5], [6, 7], [0, 1], [2, 3]]),
     )
+
+    pruned_config = MiniMaxH3DiTConfig()
+    pruned_config.update_model_arch(
+        {
+            "_class_name": "MiniMaxH3PrunedTransformer3DModel",
+            "adaln_rank": 8,
+            "time_embed_dim": 2688,
+            "time_table_size": 1025,
+        }
+    )
+    assert pruned_config.arch_config.time_embed_dim == 8
+    assert pruned_config.arch_config.adaln_curve_grid == 1025
+    assert pruned_config.arch_config.adaln_affine_input_dim == 2688
 
     weight = torch.arange(12, dtype=torch.float32).reshape(12, 1)
     actual = _reorder_grouped_qkv_to_qkv(
@@ -234,6 +279,48 @@ def test_cache_dit_input_preservation_toggles_every_block():
     assert not any(block.preserve_input_for_cache_dit for block in model.blocks)
 
 
+@pytest.mark.parametrize(
+    ("global_backend", "expected_backend"),
+    [
+        (None, AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN),
+        (AttentionBackendEnum.FA, AttentionBackendEnum.FA),
+    ],
+)
+def test_lazy_attention_resolution_preserves_backend_precedence(
+    global_backend, expected_backend
+):
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model.arch = SimpleNamespace(attention_head_dim=128)
+    model._component_attention_backend_override = (
+        AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+    )
+    model._resolved_attention_backend = None
+    backend = Mock()
+    backend.get_enum.return_value = expected_backend
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
+            "get_global_forced_attn_backend",
+            return_value=global_backend,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend",
+            return_value=backend,
+        ) as get_attn_backend,
+    ):
+        model._resolve_attention_backend_once()
+
+    get_attn_backend.assert_called_once_with(
+        128,
+        torch.bfloat16,
+        selected_attention_backend=expected_backend,
+        attention_requirements=AttentionRequirements(packed_varlen=True),
+    )
+    assert model._resolved_attention_backend is expected_backend
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cache_dit_out_of_place_gate_preserves_cuda_input():
     x = torch.randn(4, 16, device="cuda", dtype=torch.bfloat16)
@@ -316,6 +403,27 @@ def test_tp_and_ulysses_admission_uses_tp_local_shapes():
             ulysses_size=1,
             ring_size=0,
         )
+
+
+def test_meta_model_captures_component_attention_override():
+    _ensure_single_process_parallel_runtime()
+    with (
+        component_attn_backend_context_manager(
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+            component_name="transformer",
+        ),
+        torch.device("meta"),
+    ):
+        model = MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(),
+            hf_config={},
+            quant_config=None,
+        )
+
+    assert (
+        model._component_attention_backend_override
+        is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+    )
 
 
 def test_meta_model_enforces_mixed_precision_weight_contract():

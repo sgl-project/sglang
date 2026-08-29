@@ -178,6 +178,17 @@ def _commit_accept(candidates, accept_len, bonus_tokens):
     return out_tokens, accept_len.to(torch.int32) + 1
 
 
+def _resolve_dflash_embedding_module(draft_model, target_model):
+    if getattr(draft_model, "is_nemotron_35_draft", False):
+        embed_module = draft_model.get_input_embeddings()
+        if embed_module is None:
+            raise RuntimeError(
+                "Nemotron 3.5 DFLASH draft requires its checkpoint embedding."
+            )
+        return embed_module
+    return target_model.get_input_embeddings()
+
+
 def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
@@ -295,7 +306,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         bundle = build_draft_tp_worker(
             server_args=server_args,
             gpu_id=gpu_id,
-            ps=replace(ps, pp_rank=0),
+            ps=replace(ps, pp_rank=0, pp_size=1),
             nccl_port=nccl_port,
             target_model_config=target_worker.model_runner.model_config,
             algo_label="DFLASH",
@@ -1651,13 +1662,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
             )
 
             logits_output, next_token_ids = (
@@ -1753,7 +1767,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
-        embed_module = unwrap_lora_layer(target_model.get_input_embeddings())
+        embed_module = unwrap_lora_layer(
+            _resolve_dflash_embedding_module(self.draft_model, target_model)
+        )
         lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
         if lm_head is None or not (
             hasattr(lm_head, "weight")
