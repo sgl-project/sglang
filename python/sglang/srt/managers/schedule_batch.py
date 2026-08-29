@@ -1916,7 +1916,9 @@ class Req(ReqDllmMixin):
     ):
         if get_parallel().tp_rank == 0:
             logger.error(f"{error_msg}, {self.rid=}")
-        if self.multimodal_inputs is not None:
+        # Session requests share historical multimodal inputs with their prior
+        # request. The session owns and releases those features when it closes.
+        if self.multimodal_inputs is not None and self.session is None:
             self.multimodal_inputs.release_features()
         self.multimodal_inputs = None
         self.grammar = None

@@ -49,6 +49,7 @@ def test_request_abort_releases_multimodal_features():
     mm_inputs = MagicMock()
     req = object.__new__(Req)
     req.rid = "rejected-vlm-request"
+    req.session = None
     req.multimodal_inputs = mm_inputs
     req.grammar = object()
     req.return_logprob = True
@@ -61,6 +62,26 @@ def test_request_abort_releases_multimodal_features():
         req.set_finish_with_abort("invalid multimodal request")
 
     mm_inputs.release_features.assert_called_once_with()
+    assert req.multimodal_inputs is None
+
+
+def test_session_abort_preserves_shared_multimodal_features():
+    mm_inputs = MagicMock()
+    req = object.__new__(Req)
+    req.rid = "rejected-session-turn"
+    req.session = object()
+    req.multimodal_inputs = mm_inputs
+    req.grammar = object()
+    req.return_logprob = True
+    req.logprob_start_len = 0
+
+    with patch(
+        "sglang.srt.managers.schedule_batch.get_parallel",
+        return_value=SimpleNamespace(tp_rank=1),
+    ):
+        req.set_finish_with_abort("invalid session turn")
+
+    mm_inputs.release_features.assert_not_called()
     assert req.multimodal_inputs is None
 
 
