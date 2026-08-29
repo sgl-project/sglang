@@ -171,10 +171,7 @@ class ComponentLoader(ABC):
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
-        native_only_components = getattr(
-            server_args.pipeline_config, "native_only_components", ()
-        )
-        return component_name in native_only_components
+        return component_name in server_args.pipeline_config.native_only_components
 
     def _load_customized_with_context(
         self,
