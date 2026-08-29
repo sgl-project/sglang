@@ -92,6 +92,8 @@ export const benchmarks = [
     accuracy: { gsm8k_pct: 96.74 },
     notes: "8x MI350X, TP8+EP8, AITER attention/MoE, radix cache disabled, full target/draft graphs, EAGLE MTP 3/1/4. The digest-pinned public image scored 1,276/1,319 (96.7400%) on full 5-shot GSM8K with zero request errors, invalid answers, or length truncations, graph replay in 367/367 decode summaries, and mean MTP acceptance 0.838338. Across two controlled speed repeats, median aggregate output throughput was 107.96 tok/s (range 83.80–132.11), 41.59% above the non-MTP median; mean TPOT fell 26.15% while mean TTFT rose 15.02%. Per-run accepted length was 3.07 and 1.94; every speed request returned exactly 1,024 input and 1,024 output tokens with no errors, with EOS ignored by default.",
   },
+  { match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "mi325x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" } },
   { match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" } },
   { match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" } },
   { match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" } },

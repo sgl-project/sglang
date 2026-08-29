@@ -52,7 +52,17 @@ the pinned Docker path used for validation.
 docker pull lmsysorg/sglang:qwen38flashnext
 ```
 
-**AMD GPUs** (MI350X / MI355X) — pull the public CDNA4 image that contains the exact validated #36601 source revision:
+**AMD MI300X / MI325X (gfx942)** — pull the FP8 image containing the exact
+[#36601](https://github.com/sgl-project/sglang/pull/36601) source revision. The
+`gfx942-260828` tag was published in the existing image repository, and the
+command pins its immutable digest:
+
+```bash Command
+docker pull aigmkt/qwen3.8-flash-next-gfx950-260827@sha256:89f79a33f48cc0f99c95902507643a86a181a5fffdcd9d8c61b66d9aacc44673
+```
+
+**AMD MI350X / MI355X (gfx950)** — pull the FP8 and Quark MXFP4 image used for
+the MI350X validation:
 
 ```bash Command
 docker pull aigmkt/qwen3.8-flash-next-gfx950-260827@sha256:51e4be1fde02780a5c39b37c464ebbceeffed5f6d307586f871611209a905828
@@ -80,12 +90,14 @@ For general container setup, see [Install → Method 3: Using Docker](/docs/get-
 
 Pick your hardware + quantization to generate the launch command.
 
-On AMD, the verified FP8 **Low Latency** cell enables the checkpoint's
-EAGLE/MTP head with the 3/1/4 configuration. MXFP4 **High Throughput** is the
+On AMD, FP8 **Low Latency** is available on MI300X, MI325X, MI350X, and MI355X
+and enables the checkpoint's EAGLE/MTP head with the 3/1/4 configuration.
+MXFP4 is limited to MI350X and MI355X: **High Throughput** is the
 non-speculative control, while **Low Latency** enables the same MTP settings.
-All three use TP8+EP8, explicit AITER attention and MoE, disabled radix cache,
-and full decode graphs. The Verified badge covers the digest-pinned MI350X
-command; the equivalent MI355X cells remain Not Verified until they are rerun.
+All AMD cells use TP8+EP8, explicit AITER attention and MoE, disabled radix
+cache, and full decode graphs. The Verified badge covers the digest-pinned
+MI350X command; MI300X, MI325X, and MI355X remain Not Verified until the exact
+command is rerun on those products.
 
 <Note>
 The checkpoint layout constrains plain tensor parallelism. FP8 passes at TP1,
@@ -153,7 +165,7 @@ Each precision is its own repository:
     <tr>
       <td style={{padding: "9px 12px"}}><strong>FP8</strong></td>
       <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8">Qwen/Qwen3.8-Flash-Next-FP8</a></td>
-      <td style={{padding: "9px 12px"}}>H200, B200, B300, GB300; MI350X TP8+EP8 with MTP (validated), MI355X (same gfx950 recipe; not rerun)</td>
+      <td style={{padding: "9px 12px"}}>H200, B200, B300, GB300; MI300X / MI325X (gfx942 recipe; not rerun), MI350X TP8+EP8 with MTP (validated), MI355X (same gfx950 recipe; not rerun)</td>
     </tr>
     <tr style={{background: "rgba(255,255,255,0.02)"}}>
       <td style={{padding: "9px 12px"}}><strong>NVFP4</strong></td>

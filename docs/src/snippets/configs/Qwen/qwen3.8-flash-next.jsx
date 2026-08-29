@@ -8,9 +8,9 @@
 // multi-step-trained MTP head. Multimodal (text + image in, text out).
 //
 // Every recipe on this page is single-node: BF16 and FP8 run TP4 on NVIDIA,
-// NVFP4 runs on one Blackwell GPU, and the validated AMD FP8 / Quark MXFP4
-// paths use TP8+EP8. Plain TP8 is not a valid substitute for that
-// expert-parallel topology on either AMD checkpoint.
+// NVFP4 runs on one Blackwell GPU, AMD FP8 runs on CDNA3 and CDNA4, and Quark
+// MXFP4 is limited to CDNA4. The AMD paths use TP8+EP8. Plain TP8 is not a
+// valid substitute for that expert-parallel topology on either checkpoint.
 //
 // A hardware x quantization x strategy combination with no launch recipe has no
 // cell, and the engine greys it out.
@@ -18,7 +18,10 @@
 export const config = {
   modelName: "Qwen3.8-Flash-Next",
 
-  supportedHardware: ["h200", "b200", "b300", "gb300", "mi350x", "mi355x"],
+  supportedHardware: [
+    "h200", "b200", "b300", "gb300",
+    "mi300x", "mi325x", "mi350x", "mi355x",
+  ],
 
   variants: [
     { id: "default", label: "Default" },
@@ -52,7 +55,7 @@ export const config = {
       // path is CUDA-only, so the row is hidden on the AMD cells. The server
       // already auto-enables it for BF16 on CUDA, hence the default chip is
       // Auto and adds no flag.
-      showWhen: (sel) => !["mi350x", "mi355x"].includes(sel.hw),
+      showWhen: (sel) => !["mi300x", "mi325x", "mi350x", "mi355x"].includes(sel.hw),
       default: "auto",
       options: [
         { id: "auto", label: "Auto",
@@ -111,23 +114,26 @@ export const config = {
     ["mmmu_pro_pct", "MMMU-Pro", "%"],
   ],
 
-  // Launch images. AMD uses the public image built from and validated at the
-  // exact #36601 source revision used by the recipes below.
+  // Launch images. AMD uses architecture-specific public images built from the
+  // exact #36601 source revision used by the recipes below. The gfx942 image is
+  // FP8-only in this cookbook; Quark MXFP4 remains a gfx950 recipe.
   dockerImages: {
     h200:   "lmsysorg/sglang:qwen38flashnext",
     b200:   "lmsysorg/sglang:qwen38flashnext",
     b300:   "lmsysorg/sglang:qwen38flashnext",
     gb300:  "lmsysorg/sglang:qwen38flashnext",
+    mi300x: "aigmkt/qwen3.8-flash-next-gfx950-260827@sha256:89f79a33f48cc0f99c95902507643a86a181a5fffdcd9d8c61b66d9aacc44673",
+    mi325x: "aigmkt/qwen3.8-flash-next-gfx950-260827@sha256:89f79a33f48cc0f99c95902507643a86a181a5fffdcd9d8c61b66d9aacc44673",
     mi350x: "aigmkt/qwen3.8-flash-next-gfx950-260827@sha256:51e4be1fde02780a5c39b37c464ebbceeffed5f6d307586f871611209a905828",
     mi355x: "aigmkt/qwen3.8-flash-next-gfx950-260827@sha256:51e4be1fde02780a5c39b37c464ebbceeffed5f6d307586f871611209a905828",
   },
 
-  dockerGpuVendor: (sel) => ["mi350x", "mi355x"].includes(sel.hw)
+  dockerGpuVendor: (sel) => ["mi300x", "mi325x", "mi350x", "mi355x"].includes(sel.hw)
     ? "amd" : "nvidia",
-  dockerRunCommand: (sel) => ["mi350x", "mi355x"].includes(sel.hw)
+  dockerRunCommand: (sel) => ["mi300x", "mi325x", "mi350x", "mi355x"].includes(sel.hw)
     ? "python3 -m sglang.launch_server"
     : "sglang serve",
-  runModes: (sel) => ["mi350x", "mi355x"].includes(sel.hw)
+  runModes: (sel) => ["mi300x", "mi325x", "mi350x", "mi355x"].includes(sel.hw)
     ? ["docker"] : ["python", "docker"],
 
   github: {
@@ -182,7 +188,7 @@ export const config = {
         { id: "off",     label: "Off (greedy)" },
         { id: "mtp",     label: "MTP 3/1/4",
           flags: (sel) => [
-            `--speculative-algorithm ${["mi350x", "mi355x"].includes(sel.hw) ? "EAGLE" : "NEXTN"}`,
+            `--speculative-algorithm ${["mi300x", "mi325x", "mi350x", "mi355x"].includes(sel.hw) ? "EAGLE" : "NEXTN"}`,
             "--speculative-num-steps 3",
             "--speculative-eagle-topk 1",
             "--speculative-num-draft-tokens 4",
@@ -647,6 +653,70 @@ export const config = {
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
         "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ==== AMD CDNA3 (MI300X / MI325X) ====
+    // FP8 uses the same TP8+EP8 topology and exact #36601 source as CDNA4, in a
+    // separate digest-pinned gfx942 image. These commands remain unverified
+    // until the exact image/checkpoint pair is rerun on gfx942. MXFP4 is not
+    // exposed on CDNA3.
+    {
+      match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      warn: "This gfx942 FP8 command uses the exact #36601 image but has not been rerun end to end on MI300X.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--revision bcd9f01ddc9cff2316eb84281bebcd5b058bddce",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend aiter",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
+        "--chunked-prefill-size 16384",
+        "--watchdog-timeout 1200",
+        "--mem-fraction-static 0.9",
+        "--disable-radix-cache",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--trust-remote-code",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi325x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      warn: "This command shares the MI300X gfx942 path but has not been independently rerun on MI325X.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--revision bcd9f01ddc9cff2316eb84281bebcd5b058bddce",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend aiter",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
+        "--chunked-prefill-size 16384",
+        "--watchdog-timeout 1200",
+        "--mem-fraction-static 0.9",
+        "--disable-radix-cache",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--trust-remote-code",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

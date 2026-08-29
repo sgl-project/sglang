@@ -31,7 +31,8 @@ const COOKBOOK_MODEL_TEMPLATE = join(
   SNIPPETS, "..", "..", "..", ".claude", "skills", "cookbook-add-model",
   "templates", "config.jsx.tmpl");
 const LEGACY_DIMS = ["variants", "quantizations", "strategies", "nodesOptions"];
-const QWEN38_AMD_IMAGE = "aigmkt/qwen3.8-flash-next-gfx950-260827@sha256:51e4be1fde02780a5c39b37c464ebbceeffed5f6d307586f871611209a905828";
+const QWEN38_GFX942_IMAGE = "aigmkt/qwen3.8-flash-next-gfx950-260827@sha256:89f79a33f48cc0f99c95902507643a86a181a5fffdcd9d8c61b66d9aacc44673";
+const QWEN38_GFX950_IMAGE = "aigmkt/qwen3.8-flash-next-gfx950-260827@sha256:51e4be1fde02780a5c39b37c464ebbceeffed5f6d307586f871611209a905828";
 
 const failures = [];
 const fail = (where, msg) => failures.push(`${where}: ${msg}`);
@@ -195,13 +196,19 @@ for (const path of walk(CONFIGS)) {
     }
   }
 
-  // Qwen3.8-Flash-Next's AMD recipes are tied to a public, immutable image and
+  // Qwen3.8-Flash-Next's AMD recipes are tied to public, immutable images and
   // a topology matrix validated on MI350X. Keep the generated cells from
   // drifting back to the broken mutable tag, a source bind mount, or plain TP8.
   if (config.modelName === "Qwen3.8-Flash-Next") {
-    for (const hw of ["mi350x", "mi355x"]) {
-      if (config.dockerImages?.[hw] !== QWEN38_AMD_IMAGE) {
-        fail(where, `${hw} must use the validated digest-pinned ROCm image`);
+    const amdImages = {
+      mi300x: QWEN38_GFX942_IMAGE,
+      mi325x: QWEN38_GFX942_IMAGE,
+      mi350x: QWEN38_GFX950_IMAGE,
+      mi355x: QWEN38_GFX950_IMAGE,
+    };
+    for (const [hw, image] of Object.entries(amdImages)) {
+      if (config.dockerImages?.[hw] !== image) {
+        fail(where, `${hw} must use its architecture-specific digest-pinned ROCm image`);
       }
       const selection = { hw, variant: "default", quant: "fp8",
         strategy: "low-latency", nodes: "single" };
@@ -220,6 +227,8 @@ for (const path of walk(CONFIGS)) {
     }
 
     const expected = [
+      ["mi300x", "fp8", "low-latency", false],
+      ["mi325x", "fp8", "low-latency", false],
       ["mi350x", "fp8", "low-latency", true],
       ["mi350x", "mxfp4", "high-throughput", true],
       ["mi350x", "mxfp4", "low-latency", true],
@@ -228,7 +237,7 @@ for (const path of walk(CONFIGS)) {
       ["mi355x", "mxfp4", "low-latency", false],
     ];
     const amdCells = (config.cells || []).filter((cell) =>
-      ["mi350x", "mi355x"].includes(cell.match?.hw));
+      Object.hasOwn(amdImages, cell.match?.hw));
     if (amdCells.length !== expected.length) {
       fail(where, `expected ${expected.length} AMD cells, found ${amdCells.length}`);
     }
@@ -279,6 +288,11 @@ for (const path of walk(CONFIGS)) {
     for (const cell of amdCells) {
       if (cell.flags.includes("--tp-size 8") && !cell.flags.includes("--ep-size 8")) {
         fail(where, `${cell.match.hw}/${cell.match.quant}/${cell.match.strategy} exposes invalid plain TP8`);
+      }
+    }
+    for (const hw of ["mi300x", "mi325x"]) {
+      if (amdCells.some((cell) => cell.match.hw === hw && cell.match.quant === "mxfp4")) {
+        fail(where, `${hw} must not expose the MI35X-only MXFP4 checkpoint`);
       }
     }
 
