@@ -2155,6 +2155,7 @@ class MMReceiverBase(ABC):
 
     def _process_waiting_requests(self, recv_reqs, waiting_cls, **extra_kwargs):
         new_recv_reqs = []
+        abort_reqs = []
         for recv_req in recv_reqs:
             if (
                 isinstance(recv_req, TokenizedGenerateReqInput)
@@ -2167,31 +2168,82 @@ class MMReceiverBase(ABC):
                 # tokenizer never set encoder_urls (legacy / static path).
                 encode_urls = recv_req.encoder_urls or list(self.encode_urls)
 
-                waiting_req = waiting_cls(
-                    rid=recv_req.rid,
-                    recv_req=recv_req,
-                    mm_processor=self.mm_processor,
-                    encoder_urls=encode_urls,
-                    model_type=self.model_type,
-                    host_name=self.hostname,
-                    receive_count=self.tp_size,
-                    zmq_context=(
-                        None
-                        if self.scheduler_recv_socket is not None
-                        else self.scheduler_context
-                    ),
-                    embedding_port=self.scheduler_embedding_port,
-                    **extra_kwargs,
+                waiting_req = None
+                local_error = None
+                try:
+                    waiting_req = waiting_cls(
+                        rid=recv_req.rid,
+                        recv_req=recv_req,
+                        mm_processor=self.mm_processor,
+                        encoder_urls=encode_urls,
+                        model_type=self.model_type,
+                        host_name=self.hostname,
+                        receive_count=self.tp_size,
+                        zmq_context=(
+                            None
+                            if self.scheduler_recv_socket is not None
+                            else self.scheduler_context
+                        ),
+                        embedding_port=self.scheduler_embedding_port,
+                        **extra_kwargs,
+                    )
+                    if self.scheduler_recv_socket is not None:
+                        self.waiting_by_rid[waiting_req.rid] = waiting_req
+                    waiting_req.send_encode_request()
+                except Exception as error:
+                    local_error = f"{type(error).__name__}: {error}"
+                    logger.exception(
+                        "Failed to start multimodal receive for rid=%s", recv_req.rid
+                    )
+
+                # The status all-reduce below requires every TP rank to append
+                # exactly the same requests. Agree on startup before appending.
+                rank_errors = (
+                    [local_error]
+                    if self.tp_size <= 1
+                    else self.tp_group.all_gather_object(local_error)
                 )
-                if self.scheduler_recv_socket is not None:
-                    self.waiting_by_rid[waiting_req.rid] = waiting_req
-                waiting_req.send_encode_request()
+                failed_ranks = [
+                    rank for rank, error in enumerate(rank_errors) if error is not None
+                ]
+                if failed_ranks:
+                    details = "; ".join(
+                        f"rank {rank}: {rank_errors[rank]}" for rank in failed_ranks
+                    )
+                    error_msg = f"Failed to start multimodal receive ({details})"
+                    logger.error(error_msg)
+                    if waiting_req is not None:
+                        try:
+                            waiting_req.release_resources()
+                        except Exception:
+                            logger.exception(
+                                "Failed to release multimodal receive resources "
+                                "for rid=%s",
+                                waiting_req.rid,
+                            )
+                        try:
+                            waiting_req.close_recv_socket()
+                        except Exception:
+                            logger.exception(
+                                "Failed to close multimodal receive socket for rid=%s",
+                                waiting_req.rid,
+                            )
+                        self.waiting_by_rid.pop(waiting_req.rid, None)
+                    abort_reqs.append(
+                        (
+                            self.create_req(recv_req),
+                            error_msg,
+                            HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                    )
+                    continue
+
                 self.waiting_list.append(waiting_req)
             else:
                 new_recv_reqs.append(recv_req)
 
         if len(self.waiting_list) == 0:
-            return new_recv_reqs, []
+            return new_recv_reqs, abort_reqs
 
         self._drain_scheduler_embeddings()
         current_time = time.time()
@@ -2215,7 +2267,6 @@ class MMReceiverBase(ABC):
         )
 
         new_waiting = []
-        abort_reqs = []
         for i, waiting_req in enumerate(self.waiting_list):
             status_value = local_status[i].item()
             if status_value == WaitingMMRequestStatus.SUCCESS:

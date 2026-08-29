@@ -7,7 +7,7 @@ import time
 from array import array
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -955,6 +955,84 @@ def test_epd_scheduler_routes_many_requests_over_one_receive_socket():
         sender.close(linger=0)
         receiver.scheduler_recv_socket.close(linger=0)
         context.term()
+
+
+def _receiver_for_startup_failure(rank_errors):
+    receiver = MMReceiverHTTP.__new__(MMReceiverHTTP)
+    receiver.mm_processor = object()
+    receiver.model_type = "kimi_k3"
+    receiver.hostname = "127.0.0.1"
+    receiver.tp_size = 2
+    receiver.tp_group = MagicMock()
+    receiver.tp_group.all_gather_object.side_effect = rank_errors
+    receiver.scheduler_recv_socket = object()
+    receiver.scheduler_context = object()
+    receiver.scheduler_embedding_port = 1234
+    receiver.encode_urls = ["http://encoder"]
+    receiver.waiting_by_rid = {}
+    receiver.waiting_list = []
+    receiver.create_req = MagicMock(return_value=object())
+    return receiver
+
+
+def test_epd_receiver_startup_rejects_remote_rank_failure():
+    receiver = _receiver_for_startup_failure(
+        lambda local_error: [local_error, "RuntimeError: bind failed"]
+    )
+    waiting_req = MagicMock()
+    waiting_req.rid = "request-id"
+    waiting_cls = MagicMock(return_value=waiting_req)
+
+    class TokenizedRequest:
+        rid = "request-id"
+        need_wait_for_mm_inputs = True
+        encoder_urls = ["http://encoder"]
+
+    with patch(
+        "sglang.srt.disaggregation.encoder.receiver.TokenizedGenerateReqInput",
+        TokenizedRequest,
+    ):
+        ready, aborts = receiver._process_waiting_requests(
+            [TokenizedRequest()], waiting_cls
+        )
+
+    assert ready == []
+    assert len(aborts) == 1
+    assert "rank 1: RuntimeError: bind failed" in aborts[0][1]
+    assert aborts[0][2] == 500
+    waiting_req.send_encode_request.assert_called_once_with()
+    waiting_req.release_resources.assert_called_once_with()
+    waiting_req.close_recv_socket.assert_called_once_with()
+    assert receiver.waiting_list == []
+    assert receiver.waiting_by_rid == {}
+
+
+def test_epd_receiver_startup_shares_local_constructor_failure():
+    def gather_local_error(local_error):
+        assert "RuntimeError: socket failed" in local_error
+        return [local_error, None]
+
+    receiver = _receiver_for_startup_failure(gather_local_error)
+    waiting_cls = MagicMock(side_effect=RuntimeError("socket failed"))
+
+    class TokenizedRequest:
+        rid = "request-id"
+        need_wait_for_mm_inputs = True
+        encoder_urls = ["http://encoder"]
+
+    with patch(
+        "sglang.srt.disaggregation.encoder.receiver.TokenizedGenerateReqInput",
+        TokenizedRequest,
+    ):
+        ready, aborts = receiver._process_waiting_requests(
+            [TokenizedRequest()], waiting_cls
+        )
+
+    assert ready == []
+    assert len(aborts) == 1
+    assert "rank 0: RuntimeError: socket failed" in aborts[0][1]
+    assert aborts[0][2] == 500
+    assert receiver.waiting_list == []
 
 
 def test_epd_encoder_reuses_scheduler_zmq_peer():
