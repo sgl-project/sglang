@@ -331,9 +331,7 @@ def run_eval(args):
         # simple_eval implementation to fall back to.
         return _run_sgl_eval("mmmu_pro_vision", args)
     elif args.eval_name == "aime25":
-        from sglang.test.simple_eval_aime25 import AIME25Eval
-
-        eval_obj = AIME25Eval(args.num_examples, args.num_threads)
+        return _run_sgl_eval("aime25", args)
     elif args.eval_name == "gsm8k":
         if getattr(args, "api", None) == "sgl_eval":
             # Only the nightly correctness eval opts into sgl-eval (zero-shot
