@@ -195,7 +195,8 @@ def _qsa_split_kernel(
         tl.atomic_xchg(counter_ptr + slot, 0, sem="release", scope="gpu")
 
 
-_MAX_BATCH = 16
+# The worst-case TP1 scratch allocation at the qualified limit is 32.3 MiB.
+_MAX_BATCH = 128
 _MAX_KV_HEADS = 2
 _BLOCK_M = 16
 _MAX_SPLITS = 8

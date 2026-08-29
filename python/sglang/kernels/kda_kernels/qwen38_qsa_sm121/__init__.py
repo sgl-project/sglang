@@ -14,7 +14,8 @@ import torch
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_HEAD_TOPOLOGIES = frozenset({(12, 1), (24, 2)})
-_MAX_BATCH = 16
+# Largest batch qualified by the extended GB10 baseline sweep.
+_MAX_BATCH = 128
 _MAX_SELECTED_KV = 2055
 _logged_fast_path = False
 

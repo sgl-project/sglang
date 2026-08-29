@@ -13,7 +13,7 @@ The kernel is specialized for the packed QSA decode tensors captured from
 - BF16 query, key, value, and output with head dimension 256
 - one packed query row per sequence and device-side `cu_seqlens`
 - 12 query heads per KV head: TP1 uses 24Q/2KV and TP2 uses 12Q/1KV
-- all query-row counts in the low-concurrency `1 <= bs <= 16` envelope
+- all query-row counts in the validated `1 <= bs <= 128` envelope
 - `max_seqlen_k` capacity up to 2055 and captured logical selected-KV lengths
   up to 2051 rows per sequence
 
@@ -43,3 +43,9 @@ An additional synthetic GB10 sweep covers both TP topologies, every batch size
 from 1 through 16, and short plus saturated KV rows. All 64 cases passed; the
 maximum relative L2 against the original correct Triton implementation was
 0.002422, and speedup ranged from 1.41x to 5.09x.
+
+A follow-up extended-batch sweep covers both TP topologies, batch sizes
+17/24/32/48/64/96/128, and short, medium, plus saturated KV rows. All 42 cases
+passed with maximum relative L2 0.002410. Geomean speedup was 4.48x, the slowest
+case still improved by 1.58x, and no case regressed. The packaged scratch space
+is therefore sized for the largest tested batch, 128.

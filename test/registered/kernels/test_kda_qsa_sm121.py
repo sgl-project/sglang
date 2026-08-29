@@ -91,7 +91,7 @@ class TestKdaQwen38QsaSm121(CustomTestCase):
             )
             self.assert_matches_reference(actual, expected)
 
-    def test_all_low_concurrency_batches_and_contract_guard(self):
+    def test_all_low_concurrency_batches(self):
         scale = 256**-0.5
         for num_q_heads, num_kv_heads in ((12, 1), (24, 2)):
             for batch in range(1, 17):
@@ -108,7 +108,24 @@ class TestKdaQwen38QsaSm121(CustomTestCase):
                 )
                 self.assert_matches_reference(actual, _reference(args, scale))
 
-        unsupported = _make_inputs(12, 1, tuple(17 for _ in range(17)))
+    def test_extended_batches_and_contract_guard(self):
+        scale = 256**-0.5
+        for num_q_heads, num_kv_heads in ((12, 1), (24, 2)):
+            for batch in (17, 32, 64, 128):
+                lengths = tuple(17 + (row * 37) % 211 for row in range(batch))
+                args = _make_inputs(num_q_heads, num_kv_heads, lengths)
+                max_seqlen_k = max(lengths)
+                self.assertTrue(
+                    can_use_kda_qwen38_qsa_sm121(*args, max_seqlen_k=max_seqlen_k)
+                )
+                actual = qwen38_qsa_sm121_varlen(
+                    *args,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=scale,
+                )
+                self.assert_matches_reference(actual, _reference(args, scale))
+
+        unsupported = _make_inputs(12, 1, tuple(17 for _ in range(129)))
         self.assertFalse(can_use_kda_qwen38_qsa_sm121(*unsupported, max_seqlen_k=17))
         with self.assertRaisesRegex(ValueError, "unsupported SM121 QSA call"):
             qwen38_qsa_sm121_varlen(*unsupported, max_seqlen_k=17, softmax_scale=scale)
@@ -147,7 +164,9 @@ class TestKdaQwen38QsaSm121(CustomTestCase):
         from sglang.kernels.kda_kernels.qwen38_qsa_sm121.kernel import _get_scratch
 
         scale = 256**-0.5
-        args = _make_inputs(12, 1, (2051, 2051, 2051, 2051))
+        # bs=17 and TP1's two KV heads exercise 34 counter slots, crossing the
+        # old bs<=16 scratch boundary while long rows require two active splits.
+        args = _make_inputs(24, 2, tuple(1537 for _ in range(17)))
         expected = _reference(args, scale)
         for _ in range(100):
             actual = qwen38_qsa_sm121_varlen(

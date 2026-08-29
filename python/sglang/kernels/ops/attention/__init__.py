@@ -67,7 +67,7 @@ register_kernel(
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
             description=(
-                "Qwen3.8 packed QSA decode: D=256, 12:1 GQA, " "1 <= q_rows <= 16"
+                "Qwen3.8 packed QSA decode: D=256, 12:1 GQA, " "1 <= q_rows <= 128"
             ),
         ),
         description=(
@@ -105,7 +105,7 @@ def qwen38_qsa_sm121_varlen(
     causal: bool = True,
     **_: object,
 ) -> torch.Tensor:
-    """Run the only SM121 packed-QSA kernel for the low-concurrency contract."""
+    """Run the only SM121 packed-QSA kernel for its qualified contract."""
     del causal
     if max_seqlen_q != 1:
         raise ValueError(f"QSA requires max_seqlen_q=1, got {max_seqlen_q}")
@@ -114,7 +114,7 @@ def qwen38_qsa_sm121_varlen(
     ):
         raise ValueError(
             "unsupported SM121 QSA call: expected BF16 D=256, 12:1 GQA, "
-            "TP1 24Q/2KV or TP2 12Q/1KV, bs<=16, and selected KV<=2055"
+            "TP1 24Q/2KV or TP2 12Q/1KV, bs<=128, and selected KV<=2055"
         )
     return get_kernel("attention.kda_qwen38_qsa_sm121", KernelBackend.TRITON)(
         q,
