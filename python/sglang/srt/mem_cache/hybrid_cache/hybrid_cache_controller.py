@@ -577,7 +577,9 @@ class HybridCacheController(BaseHiCacheController):
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         hash_value = self.get_hash_str(
-            operation.token_ids, operation.last_hash, page_size=self.page_size
+            operation.token_ids,
+            self.chain_prior_hash(operation.token_ids, operation.last_hash),
+            page_size=self.page_size,
         )
         operation.all_hash_values = hash_value
 
