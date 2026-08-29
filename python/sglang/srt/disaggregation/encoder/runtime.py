@@ -222,6 +222,16 @@ class EncoderScheduler:
             return f"hashes must be list/scalar, got {type(h).__name__}"
         return None
 
+    @staticmethod
+    def _batch_failed_with_client_error(results: List[Tuple]) -> bool:
+        return bool(results) and all(
+            result[4] is not None
+            and HTTPStatus.BAD_REQUEST
+            <= int(result[4])
+            < HTTPStatus.INTERNAL_SERVER_ERROR
+            for result in results
+        )
+
     async def _dispatch_group(
         self, group: List[PendingRequest], modality: Modality
     ) -> None:
@@ -307,6 +317,18 @@ class EncoderScheduler:
             for p in group:
                 if not p.future.done():
                     p.future.set_exception(err)
+            return
+
+        if len(group) > 1 and self._batch_failed_with_client_error(results):
+            # The fused processor reports one error for the entire batch, so
+            # retry separately to keep one invalid media input from failing
+            # otherwise valid requests that happened to be coalesced with it.
+            logger.warning(
+                "Encoder batch hit a client error; retrying %d requests "
+                "individually",
+                len(group),
+            )
+            await self._dispatch_per_request(group, modality)
             return
 
         for p, result in zip(group, results):
