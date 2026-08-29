@@ -678,18 +678,12 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
 
-        _, flashinfer_backend = _get_fp4_gemm_op()
-        uses_flux1_scale_layout = not getattr(
-            self.quant_config, "checkpoint_uses_packed_qkv", False
-        ) and getattr(layer, "prefix", "").startswith(
-            ("transformer_blocks.", "single_transformer_blocks.")
+        # Every FP4 GEMM reachable here reads block scales in the 128x4 TMA layout;
+        # trtllm, the one backend wanting its own shuffled layout, returned above.
+        padded_scales = padded_scales.reshape(
+            B, M_padded // 128, 4, 32, K_padded // 4, 4
         )
-        if flashinfer_backend is None or uses_flux1_scale_layout:
-            # CUTLASS and FLUX.1 CUDNN paths need the TMA scale layout.
-            padded_scales = padded_scales.reshape(
-                B, M_padded // 128, 4, 32, K_padded // 4, 4
-            )
-            padded_scales = padded_scales.permute(0, 1, 4, 3, 2, 5)
+        padded_scales = padded_scales.permute(0, 1, 4, 3, 2, 5)
 
         padded_scales = padded_scales.contiguous().cuda()
         padded_scales = (
