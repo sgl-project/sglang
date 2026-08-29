@@ -236,7 +236,7 @@ class PipelineConfig:
     # Bounds the attention grid the diffusion decoder's stages see, which is
     # what makes a full-length decode tractable.
     diffusion_decoder_tiling: bool = True
-    # Splits those tiles across the sequence-parallel ranks.
+    # Splits those tiles across the decode-parallel ranks.
     diffusion_decoder_parallel_tiling: bool = True
 
     # Image encoder configuration
@@ -868,10 +868,11 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}diffusion_decoder_parallel_tiling",
             default=PipelineConfig.diffusion_decoder_parallel_tiling,
             help=(
-                "Split the LTX-2.5 diffusion decoder's tiles across "
-                "sequence-parallel ranks. Requires --diffusion-decoder-tiling, "
-                "since the tiles it splits only exist on that path; inert "
-                "otherwise, and at a single rank"
+                "Split the LTX-2.5 diffusion decoder's tiles across the "
+                "decode-parallel ranks (TP/SP/PP/CFG within a replica). "
+                "Requires --diffusion-decoder-tiling, since the tiles it "
+                "splits only exist on that path; inert otherwise, and at a "
+                "single rank"
             ),
         )
         parser.add_argument(

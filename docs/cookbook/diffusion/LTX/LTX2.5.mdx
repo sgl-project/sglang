@@ -327,9 +327,11 @@ overlapping tiles instead of the whole volume. It is a **memory** control, not a
 speed one: it costs wall clock and buys headroom.
 
 `--diffusion-decoder-parallel-tiling` splits those tiles across the
-sequence-parallel ranks. Without it every rank decodes every tile and keeps its
-own identical copy. It only applies on the tiled path, so it does nothing when
-tiling is off, and nothing at a single rank.
+decode-parallel ranks -- the TP, SP, PP and CFG ranks of one replica, since the
+decoder is replicated over all of them. Without it every one of those ranks
+decodes every tile and keeps its own identical copy. It only applies on the
+tiled path, so it does nothing when tiling is off, and nothing at a single
+rank.
 
 Decoding stage on 2xH200 at 960×544, Ulysses degree 2. "Peak" is the whole
 process, not the decode alone:
@@ -354,9 +356,10 @@ Reading that:
 - The gain grows with tile count, so it is larger at higher resolution: at
   1920×1088 / 49 frames the decode goes from 12.32s to 7.86s, **1.57x**.
 
-Output is bitwise identical with parallel tiling on or off. Turning *tiling*
-on or off does change the result slightly near tile borders, so pick one and
-stay with it if you need reproducible frames:
+Output is bitwise identical however many ranks the tiles are split over: every
+rank draws the whole grid's noise in the same order, and only the decode is
+shared out. Turning *tiling* on or off does change the result slightly near
+tile borders, so pick one and stay with it if you need reproducible frames:
 
 ```bash
 # Fastest, if the untiled decode fits in VRAM
