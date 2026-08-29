@@ -2754,7 +2754,12 @@ class TestShortConvNoBufferUnchanged(CustomTestCase):
             hf = SimpleNamespace(architectures=["ZayaForCausalLM"])
             return ResolvedView(
                 SimpleNamespace(
-                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf),
+                    # model_config_of hands a fixture-supplied config back
+                    # as-is (no _model_config_built_from key), so resolution
+                    # never builds a real ModelConfig off this fake record.
+                    _model_config=SimpleNamespace(hf_config=hf, is_hybrid_swa=False),
+                    **defaults,
                 )
             )
 
@@ -2939,7 +2944,7 @@ class TestShortConvCacheChunkSize(CustomTestCase):
         # conv[1] -- a pure function of the conv time constants, with no TP term
         # (only the channel axis shards). That is what lets the memoized
         # property read it from either side of distributed init.
-        from sglang.srt.server_args import _max_conv_state_window
+        from sglang.srt.arg_groups.overrides import _max_conv_state_window
 
         config = _make_tiny_config()
         expected = (config.cca_time0 - 1) + (config.cca_time1 - 1)
@@ -2969,7 +2974,7 @@ class TestShortConvCacheChunkSize(CustomTestCase):
         self.assertEqual(len(channels), 3)
 
     def test_zaya_gets_the_generic_chunk_not_its_scan_length(self):
-        from sglang.srt.server_args import (
+        from sglang.srt.arg_groups.overrides import (
             FLA_CHUNK_SIZE,
             _short_conv_cache_chunk_size,
         )
@@ -2983,7 +2988,7 @@ class TestShortConvCacheChunkSize(CustomTestCase):
         # reports mamba_chunk_size == 1 with a conv window of conv_L_cache - 1,
         # exactly ZAYA1's shape, so promoting it would have hit the identical
         # assertion. The derivation cures both.
-        from sglang.srt.server_args import (
+        from sglang.srt.arg_groups.overrides import (
             FLA_CHUNK_SIZE,
             _max_conv_state_window,
             _short_conv_cache_chunk_size,
@@ -2999,7 +3004,7 @@ class TestShortConvCacheChunkSize(CustomTestCase):
         # a whole number of FLA_CHUNK_SIZE so the caller's
         # max(chunk, page) % min(chunk, page) assert still holds for every page
         # size in use.
-        from sglang.srt.server_args import (
+        from sglang.srt.arg_groups.overrides import (
             FLA_CHUNK_SIZE,
             _short_conv_cache_chunk_size,
         )
@@ -3019,7 +3024,7 @@ class TestShortConvCacheChunkSize(CustomTestCase):
     def test_unknown_conv_shape_falls_back_up_never_down(self):
         # An unreadable shape must not silently produce a granularity below the
         # generic chunk; the backend guard is then the thing that fails loudly.
-        from sglang.srt.server_args import (
+        from sglang.srt.arg_groups.overrides import (
             FLA_CHUNK_SIZE,
             _max_conv_state_window,
             _short_conv_cache_chunk_size,
@@ -3040,7 +3045,7 @@ class TestShortConvCacheChunkSize(CustomTestCase):
         self.assertEqual(_short_conv_cache_chunk_size(_Exploding()), FLA_CHUNK_SIZE)
 
     def test_multimodal_wrapper_window_is_found_via_text_config(self):
-        from sglang.srt.server_args import _max_conv_state_window
+        from sglang.srt.arg_groups.overrides import _max_conv_state_window
 
         inner = self._lfm2_config()
         wrapper = SimpleNamespace(mamba_chunk_size=1, text_config=inner)
@@ -3051,7 +3056,7 @@ class TestShortConvCacheChunkSize(CustomTestCase):
         # the FLA_CHUNK_SIZE default for a config that declares none, must both
         # go through max(scan_chunk, page_size) untouched -- so the short-conv
         # helper is never consulted for them.
-        from sglang.srt.server_args import FLA_CHUNK_SIZE
+        from sglang.srt.arg_groups.overrides import FLA_CHUNK_SIZE
 
         def resolve(hf_config, page_size):
             scan = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
@@ -3070,7 +3075,7 @@ class TestShortConvCacheChunkSize(CustomTestCase):
         # The regression this fixes end to end: with the old chunk of 1 the
         # short-conv backend refused to build its track state; with the derived
         # chunk it builds.
-        from sglang.srt.server_args import _short_conv_cache_chunk_size
+        from sglang.srt.arg_groups.overrides import _short_conv_cache_chunk_size
 
         config = _make_tiny_config()
         derived = _short_conv_cache_chunk_size(config)
