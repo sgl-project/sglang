@@ -26,7 +26,7 @@ from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     DSAMetadata,
 )
-from sglang.srt.layers.attention.dsv4.indexer import topk_transform_512_flashinfer
+from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -486,13 +486,7 @@ class TestDSAIndexer(CustomTestCase):
                     torch.sort(expected_page_indices).values,
                 )
             )
-
-            # FlashMLA consumes only the selected prefix, except that it clamps a
-            # zero C4 length to one. In that case slot zero must remain an invalid
-            # index. The rest of the unused suffix is not model-visible and may be
-            # left unspecified by the top-k implementation.
-            if expected_count == 0:
-                self.assertLess(int(actual_page_indices[0].item()), 0)
+            self.assertTrue(torch.all(actual_page_indices[expected_count:] == -1))
 
             if out_raw_indices is not None:
                 actual_raw = out_raw_indices[row]
@@ -503,6 +497,7 @@ class TestDSAIndexer(CustomTestCase):
                         torch.sort(expected_raw).values,
                     )
                 )
+                self.assertTrue(torch.all(actual_raw[expected_count:] == -1))
                 translated_raw = (
                     page_table[row, actual_raw_prefix.long() // page_size] * page_size
                     + actual_raw_prefix % page_size
@@ -553,7 +548,8 @@ class TestDSAIndexer(CustomTestCase):
                     envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.override(True),
                     envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("small"),
                 ):
-                    topk_transform_512_flashinfer(
+                    backend = C4IndexerBackendMixin()
+                    backend.flashinfer_topk_transform(
                         scores,
                         seq_lens,
                         page_table,
@@ -565,7 +561,7 @@ class TestDSAIndexer(CustomTestCase):
 
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
-                        topk_transform_512_flashinfer(
+                        backend.flashinfer_topk_transform(
                             scores,
                             seq_lens,
                             page_table,

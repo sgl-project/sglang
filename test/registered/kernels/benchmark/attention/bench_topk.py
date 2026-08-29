@@ -19,9 +19,7 @@ PAGE_SIZE = 64
 DISABLE_TORCH = True
 
 
-def _make_inputs(
-    batch_size: int, seq_len: int, k: int, page_size: int = PAGE_SIZE
-):
+def _make_inputs(batch_size: int, seq_len: int, k: int, page_size: int = PAGE_SIZE):
     torch.random.manual_seed(42)
     scores = torch.randn(batch_size, seq_len, dtype=torch.float32, device="cuda")
     seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
@@ -39,9 +37,7 @@ def _make_inputs(
 def _build_paged_fn(
     provider: str, batch_size: int, seq_len: int, k: int, page_size: int
 ):
-    scores, seq_lens, page_table, out = _make_inputs(
-        batch_size, seq_len, k, page_size
-    )
+    scores, seq_lens, page_table, out = _make_inputs(batch_size, seq_len, k, page_size)
     N = page_size
 
     def fn(scores, seq_lens, page_table):

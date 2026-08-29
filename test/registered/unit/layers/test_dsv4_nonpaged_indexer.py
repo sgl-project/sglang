@@ -10,7 +10,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.indexer import (
     FP8_DTYPE,
     C4IndexerBackendMixin,
-    topk_transform_512_flashinfer,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
@@ -48,6 +47,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
                 page_size=256,
                 page_table=torch.zeros((1, 1), dtype=torch.int32),
                 c4_seq_lens=torch.tensor([65], dtype=torch.int32),
+                use_topk_v2=False,
                 force_deep_gemm_metadata=True,
             )
 
@@ -69,6 +69,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
                 page_size=256,
                 page_table=torch.zeros((1, 1), dtype=torch.int32),
                 c4_seq_lens=torch.tensor([65], dtype=torch.int32),
+                use_topk_v2=False,
             )
 
         self.assertIsNone(metadata.deep_gemm_metadata)
@@ -84,7 +85,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
                 page_size=256,
                 page_table=torch.zeros((1, 1), dtype=torch.int32),
                 c4_seq_lens=torch.tensor([65], dtype=torch.int32),
-                topk_v2_backend_eligible=False,
+                use_topk_v2=False,
             )
 
         plan_topk_v2.assert_not_called()
@@ -98,7 +99,10 @@ class TestDSV4FlashInferTopK(CustomTestCase):
         self.assertFalse(scores.is_contiguous())
 
         seq_lens = torch.tensor([63, 64], dtype=torch.int32)
-        page_tables = torch.tensor([[7], [11]], dtype=torch.int32)
+        page_tables = torch.tensor(
+            [[7, 17, 8, 18], [11, 21, 12, 22]], dtype=torch.int32
+        )[:, ::2]
+        self.assertFalse(page_tables.is_contiguous())
         out_page_indices = torch.empty((2, 8), dtype=torch.int32)
 
         for fuse_topk, with_raw_output in product((False, True), repeat=2):
@@ -129,7 +133,8 @@ class TestDSV4FlashInferTopK(CustomTestCase):
                     envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.override(True),
                     envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("small"),
                 ):
-                    topk_transform_512_flashinfer(
+                    backend = C4IndexerBackendMixin()
+                    backend.flashinfer_topk_transform(
                         scores,
                         seq_lens,
                         page_tables,
@@ -160,7 +165,9 @@ class TestDSV4FlashInferTopK(CustomTestCase):
                 top_k_page_table_transform.assert_called_once()
                 call = top_k_page_table_transform.call_args
                 self.assertIs(call.args[0], scores)
-                self.assertIs(call.args[1], page_tables)
+                self.assertIsNot(call.args[1], page_tables)
+                self.assertTrue(call.args[1].is_contiguous())
+                self.assertTrue(torch.equal(call.args[1], page_tables))
                 self.assertIs(call.args[2], seq_lens)
                 self.assertEqual(call.args[3], out_page_indices.shape[1])
                 self.assertEqual(

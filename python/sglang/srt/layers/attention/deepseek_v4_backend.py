@@ -705,13 +705,13 @@ class DeepseekV4AttnBackend(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
+            use_topk_v2=self.dsa_topk_backend.should_use_topk_v2(),
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
             force_deep_gemm_metadata=(
                 self.enable_deepseek_v4_fp4_indexer and _is_sm120
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
-            topk_v2_backend_eligible=self.dsa_topk_backend.is_sgl_kernel(),
         )
 
     def init_forward_metadata_decode(

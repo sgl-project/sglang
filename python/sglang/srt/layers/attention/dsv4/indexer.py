@@ -429,34 +429,16 @@ def topk_transform_512_flashinfer_fused(
     )
 
 
-def topk_transform_512_flashinfer(
-    scores: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_tables: torch.Tensor,
-    out_page_indices: torch.Tensor,
-    page_size: int,
-    out_raw_indices: Optional[torch.Tensor] = None,
-) -> None:
-    topk_transform = (
-        topk_transform_512_flashinfer_fused
-        if envs.SGLANG_DSA_FUSE_TOPK.get()
-        else topk_transform_512_flashinfer_unfused
-    )
-    topk_transform(
-        scores,
-        seq_lens,
-        page_tables,
-        out_page_indices,
-        page_size,
-        out_raw_indices,
-    )
-
-
 class C4IndexerBackendMixin:
     def __init__(self):
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
+        self.flashinfer_topk_transform: Callable[..., None] = (
+            topk_transform_512_flashinfer_fused
+            if envs.SGLANG_DSA_FUSE_TOPK.get()
+            else topk_transform_512_flashinfer_unfused
+        )
 
     def _forward_prepare_multi_stream(
         self,
@@ -869,7 +851,7 @@ class C4IndexerBackendMixin:
                 raw_indices,
             )
         elif self.dsa_topk_backend.is_flashinfer():
-            topk_transform_512_flashinfer(
+            self.flashinfer_topk_transform(
                 logits,
                 c4_seq_lens,
                 page_table,
