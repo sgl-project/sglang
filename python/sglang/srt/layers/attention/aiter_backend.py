@@ -149,6 +149,62 @@ class ForwardMetadata:
 _AITER_PARTITION_SIZE_ROCM = 256
 
 
+def _asm_context_prefill_gather_indices(
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_kv_slots: int,
+    forward_mode=None,
+):
+    """KV-pool slots to gather for the ASM context-chunk prefill.
+
+    kv_indptr/kv_indices are token-level for every page_size:
+    AiterIndicesUpdaterPrefill sets kv_indptr = cumsum(seq_lens) and writes one
+    kv_indices entry per token, so token t of sequence i lives in pool slot
+    kv_indices[kv_indptr[i] + t]. There is no page arithmetic to apply here.
+
+    Returns (tok_idx, cu_seqlens_k), or None if the metadata disagrees with
+    seq_lens (mixed/spec batches) and the caller must use the paged kernel.
+    """
+    bs = kv_indptr.numel() - 1
+    device = kv_indices.device
+    kv_indptr = kv_indptr.to(torch.long)
+    seq_lens = seq_lens.to(device=device, dtype=torch.long)
+    # kvlen must not exceed the tokens this batch actually has in kv_indices,
+    # otherwise the gather runs off the end of the table.
+    seq_lens = torch.minimum(seq_lens, kv_indptr[1:] - kv_indptr[:bs])
+    total_k = int(seq_lens.sum().item())
+    cu_k = torch.zeros(bs + 1, dtype=torch.long, device=device)
+    torch.cumsum(seq_lens, 0, out=cu_k[1:])
+    seq_ids = torch.repeat_interleave(torch.arange(bs, device=device), seq_lens)
+    pos_in_seq = torch.arange(total_k, device=device) - cu_k[seq_ids]
+    kv_slot = kv_indptr[seq_ids] + pos_in_seq
+    if total_k and int(kv_slot.max().item()) >= kv_indices.numel():
+        logger.warning(
+            "[asm-context-prefill] metadata mismatch, falling back:"
+            " mode=%s bs=%s kv_slot_max=%s kv_indices=%s seq_lens=%s kv_indptr=%s",
+            forward_mode,
+            bs,
+            int(kv_slot.max().item()),
+            kv_indices.numel(),
+            seq_lens.tolist(),
+            kv_indptr.tolist(),
+        )
+        return None
+    tok_idx = kv_indices[kv_slot].to(torch.long)
+    if total_k and int(tok_idx.max().item()) >= num_kv_slots:
+        logger.warning(
+            "[asm-context-prefill] gather index out of pool, falling back:"
+            " mode=%s bs=%s tok_idx_max=%s num_kv_slots=%s",
+            forward_mode,
+            bs,
+            int(tok_idx.max().item()),
+            num_kv_slots,
+        )
+        return None
+    return tok_idx, cu_k
+
+
 class AiterAttnBackend(AttentionBackend):
 
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
@@ -2581,47 +2637,15 @@ class AiterAttnBackend(AttentionBackend):
             ):
                 bs = forward_batch.batch_size
                 k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-                page = self.page_size
-                kv_indptr = self.forward_metadata.kv_indptr[: bs + 1]
-                kv_pages = self.forward_metadata.kv_indices
-                seq_lens = forward_batch.seq_lens[:bs].to(torch.long)
-                # kvlen must not exceed the pages this batch actually has in
-                # kv_indices (metadata is page-granular for plain extend, but
-                # can disagree with seq_lens in mixed/spec batches -> OOB
-                # gather). Clamp per-seq kvlen to pages*page and fall back to
-                # the paged kernel on any inconsistency.
-                pages_per_seq = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.long)
-                kvlen_cap = pages_per_seq * page
-                seq_lens = torch.minimum(seq_lens, kvlen_cap)
-                total_k = int(seq_lens.sum().item())
-                cu_k = torch.zeros(bs + 1, dtype=torch.long, device=q.device)
-                torch.cumsum(seq_lens, 0, out=cu_k[1:])
-                seq_ids = torch.repeat_interleave(
-                    torch.arange(bs, device=q.device), seq_lens
+                gathered = _asm_context_prefill_gather_indices(
+                    self.forward_metadata.kv_indptr[: bs + 1],
+                    self.forward_metadata.kv_indices,
+                    forward_batch.seq_lens[:bs],
+                    self.token_to_kv_pool.get_key_buffer(layer.layer_id).shape[0],
+                    forward_batch.forward_mode,
                 )
-                pos_in_seq = torch.arange(total_k, device=q.device) - cu_k[seq_ids]
-                page_slot = kv_indptr[seq_ids].to(torch.long) + pos_in_seq // page
-                asm_cp_ok = bool(int(page_slot.max().item()) < kv_pages.numel())
-                if not asm_cp_ok:
-                    logger.warning(
-                        "[asm-context-prefill] metadata mismatch, falling back:"
-                        " mode=%s bs=%s page_slot_max=%s kv_pages=%s seq_lens=%s"
-                        " kv_indptr=%s",
-                        forward_batch.forward_mode,
-                        bs,
-                        int(page_slot.max().item()),
-                        kv_pages.numel(),
-                        seq_lens.tolist(),
-                        kv_indptr.tolist(),
-                    )
-                if asm_cp_ok:
-                    tok_idx = (
-                        kv_pages[page_slot].to(torch.long) * page + pos_in_seq % page
-                    )
-                    asm_cp_ok = int(tok_idx.max().item()) < (
-                        self.token_to_kv_pool.get_key_buffer(layer.layer_id).shape[0]
-                    )
-                if asm_cp_ok:
+                if gathered is not None:
+                    tok_idx, cu_k = gathered
                     hk = layer.tp_k_head_num * layer.qk_head_dim
                     hv = layer.tp_v_head_num * layer.v_head_dim
                     # uint8 view: index_select is not implemented for fp8.
