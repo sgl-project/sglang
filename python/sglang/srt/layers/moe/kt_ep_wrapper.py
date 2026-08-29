@@ -12,8 +12,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_schedule,
 )
@@ -73,22 +75,22 @@ def create_kt_config_from_server_args(
     Returns:
         KTConfig if KT is configured, None otherwise
     """
-    if server_args.kt_weight_path is None:
+    if get_exec().moe.kt_weight_path is None:
         return None
 
     num_layers = getattr(
-        server_args.get_model_config().hf_config, "num_hidden_layers", None
+        model_config_of(server_args).hf_config, "num_hidden_layers", None
     )
 
     return KTConfig(
         layer_idx=layer_idx,
-        num_gpu_experts=server_args.kt_num_gpu_experts,
-        cpuinfer_threads=server_args.kt_cpuinfer,
-        threadpool_count=server_args.kt_threadpool_count,
-        weight_path=server_args.kt_weight_path,
+        num_gpu_experts=get_exec().moe.kt_num_gpu_experts,
+        cpuinfer_threads=get_exec().moe.kt_cpuinfer,
+        threadpool_count=get_exec().moe.kt_threadpool_count,
+        weight_path=get_exec().moe.kt_weight_path,
         chunked_prefill_size=get_schedule().chunked_prefill_size,
-        method=server_args.kt_method,
-        max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
+        method=get_exec().moe.kt_method,
+        max_deferred_experts_per_token=get_exec().moe.kt_max_deferred_experts_per_token,
         num_layers=num_layers,
     )
 

@@ -12,6 +12,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
     resolved_view,
     resolving_view,
 )
@@ -79,6 +80,11 @@ def handle_ssl_validation(server_args: Any):
         if not 0 < cfg.http2_max_concurrent_streams < 2**32:
             raise ValueError(
                 "--http2-max-concurrent-streams must be between 1 and " "4294967295."
+            )
+        if not 1024 <= cfg.http2_initial_connection_window_size < 2**31:
+            raise ValueError(
+                "--http2-initial-connection-window-size must be between "
+                "1024 and 2147483647."
             )
 
         try:
@@ -746,6 +752,7 @@ def handle_multimodal_feature_transport(server_args: Any):
     may still auto-select CUDA VMM. The legacy CUDA IPC flag and environment
     variable remain supported so existing deployments map to this policy.
     """
+
     cfg = resolving_view(server_args)
     requested_transport = cfg.mm_feature_transport
     legacy_ipc_is_set = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.is_set()
@@ -780,7 +787,7 @@ def handle_multimodal_feature_transport(server_args: Any):
                 "--encoder-transfer-backend instead."
             )
         elif (
-            server_args.get_model_config().is_multimodal
+            model_config_of(server_args).is_multimodal
             and is_cuda()
             and cfg.disaggregation_mode == "null"
         ):
@@ -798,7 +805,7 @@ def handle_multimodal_feature_transport(server_args: Any):
                     supports_cuda_vmm_feature_transport,
                 )
 
-                if supports_cuda_vmm_feature_transport(server_args.get_model_config()):
+                if supports_cuda_vmm_feature_transport(model_config_of(server_args)):
                     requested_transport = "cuda_vmm"
                     logger.info(
                         "Multimodal feature transport auto-resolved to "
