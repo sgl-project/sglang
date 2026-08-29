@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+
 from sglang.srt.utils import nvtx_pytorch_hooks
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.test.ci.ci_register import register_cpu_ci
