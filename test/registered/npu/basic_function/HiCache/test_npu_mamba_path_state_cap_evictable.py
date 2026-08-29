@@ -47,8 +47,6 @@ import time
 import unittest
 
 import requests
-
-from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -57,7 +55,6 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_npu_ci(est_time=3600, suite="full-1-npu-a3", nightly=True)
 
 # 模型路径可用环境变量覆盖，默认对齐本地手动脚本；CI 上按需注入。
 MODEL = os.environ.get("MAMBA_MODEL_PATH", "Qwen/Qwen3.5-35B-A3B")
