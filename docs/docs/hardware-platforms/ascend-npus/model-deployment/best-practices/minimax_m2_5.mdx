@@ -85,6 +85,7 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=640
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
 export SGLANG_SET_CPU_AFFINITY=1
@@ -118,7 +119,8 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --tokenizer-worker-num 4 \
     --reasoning-parser minimax-append-think \
-    --tool-call-parser minimax-m2
+    --tool-call-parser minimax-m2 \
+    --device npu
 ```
 
 #### Benchmark
@@ -132,10 +134,11 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 18 \
+    --num-prompts 72 \
     --random-input-len 32768 \
     --random-output-len 1024 \
-    --num-prompts 72 \
-    --random-range-ratio 1
+    --random-range-ratio 1 \
+    --seed 1
 ```
 
 ### MiniMax-M2.5 W8A8 4P IN64K OUT1K PREFIX90 50ms
@@ -184,14 +187,15 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
+export DEEPEP_HCCL_BUFFSIZE=1024
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_BUFFSIZE=1024
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=140000
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
+export SGLANG_NPU_FUSED_MOE_MODE=2
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 export TASK_QUEUE_ENABLE=1
@@ -210,7 +214,8 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 67000 \
     --cuda-graph-bs 2 4 8 12 16 18 20 22 24 26 \
     --moe-a2a-backend ascend_fuseep \
-    --fuseep-mode 2 \
+    --deepep-mode auto \
+    --quantization modelslim \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 3 \
@@ -218,14 +223,15 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 4 \
     --speculative-draft-model-quantization unquant \
     --dtype bfloat16 \
-    --trust-remote-code
+    --trust-remote-code \
+    --device npu
 ```
 
 #### Benchmark
 
 We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
-`--gsp-system-prompt-len 58982` = `int(65536 * 0.9)` is the shared prefix portion.
-`--gsp-question-len 6553` = `int(65536 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-system-prompt-len 58982` = `round(65536 * 0.9)` is the shared prefix portion.
+`--gsp-question-len 6554` = `round(65536 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```bash Command
@@ -237,7 +243,7 @@ python -m sglang.bench_serving \
     --gsp-num-groups 1 \
     --gsp-prompts-per-group 104 \
     --gsp-system-prompt-len 58982 \
-    --gsp-question-len 6553 \
+    --gsp-question-len 6554 \
     --gsp-output-len 1024 \
     --max-concurrency 26 \
     --num-prompts 104 \
@@ -290,14 +296,16 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
+export DEEPEP_HCCL_BUFFSIZE=1024
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_BUFFSIZE=1024
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=160000
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
+export SGLANG_NPU_FUSED_MOE_MODE=2
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 export TASK_QUEUE_ENABLE=1
@@ -318,7 +326,8 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 80000 \
     --cuda-graph-bs 2 4 6 8 \
     --moe-a2a-backend ascend_fuseep \
-    --fuseep-mode 2 \
+    --deepep-mode auto \
+    --quantization modelslim \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 3 \
@@ -326,14 +335,15 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 4 \
     --speculative-draft-model-quantization unquant \
     --tokenizer-worker-num 4 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --device npu
 ```
 
 #### Benchmark
 
 We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
-`--gsp-system-prompt-len 117964` = `int(131072 * 0.9)` is the shared prefix portion.
-`--gsp-question-len 13107` = `int(131072 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-system-prompt-len 117965` = `round(131072 * 0.9)` is the shared prefix portion.
+`--gsp-question-len 13107` = `round(131072 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```bash Command
@@ -344,7 +354,7 @@ python -m sglang.bench_serving \
     --port 6688 \
     --gsp-num-groups 1 \
     --gsp-prompts-per-group 16 \
-    --gsp-system-prompt-len 117964 \
+    --gsp-system-prompt-len 117965 \
     --gsp-question-len 13107 \
     --gsp-output-len 1024 \
     --max-concurrency 4 \
@@ -398,13 +408,15 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
+export DEEPEP_HCCL_BUFFSIZE=2048
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_BUFFSIZE=2048
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=204800
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
+export SGLANG_NPU_FUSED_MOE_MODE=2
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 export TASK_QUEUE_ENABLE=1
@@ -427,7 +439,6 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 8192 \
     --cuda-graph-bs 1 2 3 4 5 6 \
     --moe-a2a-backend ascend_fuseep \
-    --fuseep-mode 2 \
     --deepep-mode auto \
     --quantization modelslim \
     --speculative-algorithm EAGLE3 \
@@ -436,7 +447,8 @@ python3 -m sglang.launch_server \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --speculative-draft-model-quantization unquant \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --device npu
 ```
 
 #### Benchmark
@@ -450,10 +462,11 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 112 \
+    --num-prompts 448 \
     --random-input-len 3500 \
     --random-output-len 1500 \
-    --num-prompts 448 \
-    --random-range-ratio 1
+    --random-range-ratio 1 \
+    --seed 1
 ```
 
 ### MiniMax-M2.5 W8A8 8P IN3K5 OUT1K5 50ms
@@ -502,8 +515,8 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
+export DEEPEP_HCCL_BUFFSIZE=1024
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_BUFFSIZE=1024
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=204800
@@ -526,12 +539,11 @@ python3 -m sglang.launch_server \
     --tool-call-parser minimax-m2 \
     --prefill-delayer-max-delay-passes 500 \
     --enable-prefill-delayer \
-    --chunked-prefill-size -1 \
+    --chunked-prefill-size 196608 \
     --max-prefill-tokens 8192 \
     --cuda-graph-bs 1 2 4 8 12 16 20 \
     --moe-a2a-backend ascend_fuseep \
     --fuseep-mode 2 \
-    --deepep-mode auto \
     --quantization modelslim \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
@@ -539,7 +551,8 @@ python3 -m sglang.launch_server \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --speculative-draft-model-quantization unquant \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --device npu
 ```
 
 #### Benchmark
@@ -553,8 +566,9 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 320 \
+    --num-prompts 1280 \
     --random-input-len 3500 \
     --random-output-len 1500 \
-    --num-prompts 1280 \
-    --random-range-ratio 1
+    --random-range-ratio 1 \
+    --seed 1
 ```
