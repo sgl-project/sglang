@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import os
 import threading
 from concurrent.futures.process import BrokenProcessPool
 from unittest.mock import Mock
@@ -15,6 +16,10 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 class _BrokenExecutor(concurrent.futures.Executor):
     def submit(self, _fn, /, *_args, **_kwargs):
         raise BrokenProcessPool("worker exited")
+
+
+def _exit_worker_process():
+    os._exit(1)
 
 
 def test_llava_replaces_broken_pool_without_replaying_request():
@@ -45,6 +50,23 @@ def test_broken_pool_is_replaced_once_for_concurrent_failures():
     assert processor.cpu_executor is replacement_executor
     processor._create_cpu_executor.assert_called_once_with()
     failed_executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+
+
+def test_replacement_pool_runs_after_real_worker_exit(monkeypatch):
+    monkeypatch.setenv("SGLANG_CPU_WORKERS", "1")
+    processor = object.__new__(LlavaImageProcessor)
+    processor.mm_feature_transport = "cpu"
+    processor._cpu_executor_lock = threading.Lock()
+    failed_executor = processor._create_cpu_executor()
+    processor.cpu_executor = failed_executor
+
+    try:
+        with pytest.raises(BrokenProcessPool):
+            failed_executor.submit(_exit_worker_process).result(timeout=5)
+        processor._replace_broken_cpu_executor(failed_executor)
+        assert processor.cpu_executor.submit(abs, -1).result(timeout=5) == 1
+    finally:
+        processor.cpu_executor.shutdown(wait=True, cancel_futures=True)
 
 
 if __name__ == "__main__":
