@@ -1005,6 +1005,29 @@ TWO_GPU_CASES = [
         DiffusionSamplingParams(prompt=T2V_PROMPT, extras={"seed": 42}),
         run_component_accuracy_check=False,
     ),
+    # LTX-2.5's diffusion decoder, tiled and with the tiles split across both
+    # ranks (`--diffusion-decoder-parallel-tiling`, on by default). 49 frames
+    # is past the decoder's 32-frame tile, so the temporal axis really tiles
+    # and the split is uneven -- 3 tiles over 2 ranks, with a shorter last one.
+    DiffusionTestCase(
+        "ltx_2_5_diffusion_decoder_2gpus",
+        DiffusionServerArgs(
+            model_path="Lightricks/LTX-2.5-Diffusers",
+            modality="video",
+            ulysses_degree=2,
+            extras=["--load-diffusion-decoder"],
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            output_size="768x448",
+            num_frames=49,
+            extras={"seed": 42, "use_diffusion_decoder": True},
+        ),
+        # This case guards the decode path, not its speed; there is no h100
+        # entry for it in perf_baselines/.
+        run_perf_check=False,
+        run_component_accuracy_check=False,
+    ),
     # I2V LoRA test case
     DiffusionTestCase(
         "wan2_1_i2v_14b_lora_2gpu",
