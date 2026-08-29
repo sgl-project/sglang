@@ -391,50 +391,6 @@ class TestEncoderDelivery(CustomTestCase):
 
         asyncio.run(run())
 
-    def test_global_cache_lookup_failure_falls_back_to_all_misses(self):
-        async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
-            encoder.rank = 0
-            encoder.mm_global_cache = SimpleNamespace(
-                batch_is_exist=AsyncMock(side_effect=RuntimeError("store down"))
-            )
-            broadcast = unittest.mock.Mock()
-            encoder._broadcast_global_cache_mask = broadcast
-            ctx = SimpleNamespace(
-                req_id="req",
-                num_items=2,
-                str_mm_hashes=["hash-0", "hash-1"],
-            )
-
-            missing_indices, hit_indices = await encoder._lookup_global_cache(ctx)
-
-            self.assertEqual(missing_indices, [0, 1])
-            self.assertEqual(hit_indices, [])
-            torch.testing.assert_close(
-                broadcast.call_args.args[0], torch.zeros(2, dtype=torch.int32)
-            )
-
-        asyncio.run(run())
-
-    def test_global_cache_insert_failure_is_contained(self):
-        async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
-            encoder.background_tasks = set()
-            encoder.mm_global_cache = SimpleNamespace(
-                wait_store_to_pool=unittest.mock.Mock(
-                    side_effect=RuntimeError("store down")
-                ),
-                insert_batch=unittest.mock.Mock(),
-            )
-            ctx = SimpleNamespace(req_id="req", modality=Modality.IMAGE)
-
-            encoder._launch_global_cache_insert(ctx, ["hash"], [object()])
-            await asyncio.gather(*encoder.background_tasks)
-
-            encoder.mm_global_cache.insert_batch.assert_not_called()
-
-        asyncio.run(run())
-
     def test_grpc_rejects_invalid_request_before_tp_dispatch(self):
         async def run():
             grpc, sglang_encoder_pb2, SGLangEncoderServer = self._load_grpc_server()

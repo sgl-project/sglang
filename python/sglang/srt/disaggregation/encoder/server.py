@@ -1208,19 +1208,7 @@ class MMEncoder:
         ctx: EncodeContext,
     ) -> Tuple[List[int], List[int]]:
         if self.rank == 0:
-            try:
-                exist_mask = await self.mm_global_cache.batch_is_exist(
-                    ctx.str_mm_hashes
-                )
-            except Exception:
-                # global cache is optional; all ranks must take the same miss
-                # path when its control plane is unavailable
-                logger.exception(
-                    "Global multimodal cache lookup failed for req %s; "
-                    "falling back to ViT",
-                    ctx.req_id,
-                )
-                exist_mask = [False] * ctx.num_items
+            exist_mask = await self.mm_global_cache.batch_is_exist(ctx.str_mm_hashes)
             mask_tensor = torch.tensor(
                 [1 if e else 0 for e in exist_mask], dtype=torch.int32
             )
@@ -1296,20 +1284,15 @@ class MMEncoder:
             return
 
         async def _background_insert():
-            try:
-                await asyncio.to_thread(
-                    self.mm_global_cache.wait_store_to_pool,
-                    d2h_handles,
-                )
-                await asyncio.to_thread(
-                    self.mm_global_cache.insert_batch,
-                    hashes,
-                    ctx.modality,
-                )
-            except Exception:
-                logger.exception(
-                    "Global multimodal cache insert failed for req %s", ctx.req_id
-                )
+            await asyncio.to_thread(
+                self.mm_global_cache.wait_store_to_pool,
+                d2h_handles,
+            )
+            await asyncio.to_thread(
+                self.mm_global_cache.insert_batch,
+                hashes,
+                ctx.modality,
+            )
 
         task = asyncio.create_task(_background_insert())
         self.background_tasks.add(task)
