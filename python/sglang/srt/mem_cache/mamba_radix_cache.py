@@ -671,7 +671,9 @@ class MambaRadixCache(BasePrefixCache):
 
         self.dec_lock_ref(req.last_node)
 
-    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
+    def cache_unfinished_req(
+        self, req: Req, chunked: bool = False, is_insert: bool = True
+    ) -> None:
         """Cache request when it is unfinished."""
 
         def _skip_cache_unfinished_req(req: Req) -> None:
@@ -689,7 +691,7 @@ class MambaRadixCache(BasePrefixCache):
             if self.enable_mamba_extra_buffer
             else len(token_ids)
         )
-        if self.disable or cache_len is None:
+        if not is_insert or self.disable or cache_len is None:
             return _skip_cache_unfinished_req(req)
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[

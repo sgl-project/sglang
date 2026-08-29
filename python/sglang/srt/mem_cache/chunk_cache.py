@@ -83,7 +83,9 @@ class ChunkCache(BasePrefixCache):
         # The protected prefix is not this req's to free.
         self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
 
-    def cache_unfinished_req(self, req: Req, chunked=False):
+    def cache_unfinished_req(
+        self, req: Req, chunked: bool = False, is_insert: bool = True
+    ):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : req.extend_range.end
         ]

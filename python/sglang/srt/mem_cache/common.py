@@ -159,10 +159,11 @@ def free_kv_row_segments(
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
-    if getattr(req, "skip_radix_cache_insert", False):
-        return
-
-    tree_cache.cache_unfinished_req(req, **kwargs)
+    tree_cache.cache_unfinished_req(
+        req,
+        is_insert=not getattr(req, "skip_radix_cache_insert", False),
+        **kwargs,
+    )
 
 
 def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
