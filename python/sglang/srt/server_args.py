@@ -2641,6 +2641,19 @@ class ServerArgs:
     mamba_track_interval: A[
         int, "The interval to track the mamba state during decode.", NS("exec.mamba")
     ] = 256
+    gdn_mtp_cache_mode: A[
+        str,
+        Arg(
+            help="Intermediate h-state cache mode for GDN MTP verify. "
+            "'full' (default) caches h at every draft-token position. "
+            "'none' skips intermediate caching and reconstructs h_K after verify by "
+            "re-running the GDN recurrence from the committed h_0 over the accepted "
+            "draft prefix. 'none' trades extra post-verify recovery compute for "
+            "freeing the intermediate_ssm buffer.",
+            choices=["full", "none"],
+        ),
+        NS("exec.mamba"),
+    ] = "full"
     enable_int8_mamba_checkpoint: A[
         bool,
         "Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",
@@ -3996,6 +4009,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.mamba_hook import (
             handle_int8_mamba_checkpoint,
             handle_mamba_backend,
+            validate_gdn_mtp_cache_mode,
         )
 
         handle_mamba_backend(self)
@@ -4059,6 +4073,11 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+
+        # Needs the draft-token count derived just above.
+        # GDN MTP none-mode cache: linear-chain only and mutually exclusive
+        # with ReplaySSM. Mamba radix tracking remains supported.
+        validate_gdn_mtp_cache_mode(self)
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         validate_cutedsl_a2a_token_budget(self)

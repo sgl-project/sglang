@@ -102,6 +102,48 @@ def handle_int8_mamba_checkpoint(server_args: Any):
         )
 
 
+def validate_gdn_mtp_cache_mode(server_args: Any):
+    """Reject configs that GDN MTP --gdn-mtp-cache-mode=none cannot serve.
+
+    none-mode target-verify (FlashInfer WY output-only kernel) and the
+    accepted-state recovery both replay a CONTIGUOUS accepted prefix keyed by
+    one scalar accept-length per request, so topk>1 (EAGLE tree) drafts would
+    verify correctly but recover h_K from the wrong linear-prefix tokens -- a
+    silent mis-decode. That is fail-fast here.
+
+    Mamba radix tracking (extra_buffer) IS supported: none-mode caches no
+    intermediate SSM states, so it recomputes the interval-crossing snapshot
+    via a second boundary recovery pass, on both the FlashInfer and Triton
+    recover paths (each writes the folded boundary state to the ping-pong
+    track slot via a separate output-state index).
+
+    none-mode is also rejected alongside either ReplaySSM flag: this is the
+    single point that keeps RecoverSSM and ReplaySSM apart, so the runtime
+    gate (GDNAttnBackend._recover_ssm) can read the mode alone and never has
+    to reason about which ReplaySSM buffers happen to be allocated.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.gdn_mtp_cache_mode != "none":
+        return
+    if cfg.enable_linear_replayssm_spec or cfg.enable_linear_replayssm:
+        raise ValueError(
+            "--gdn-mtp-cache-mode=none is mutually exclusive with ReplaySSM "
+            "(--enable-linear-replayssm-spec / --enable-linear-replayssm). "
+            "RecoverSSM rebuilds the accepted state after verify and commits "
+            "it straight to the SSM pool, which neither ReplaySSM ring's "
+            "cursor protocol accounts for -- enable only one."
+        )
+    if cfg.speculative_eagle_topk not in (None, 1):
+        raise ValueError(
+            "--gdn-mtp-cache-mode=none requires a linear draft chain "
+            "(--speculative-eagle-topk in {None, 1}); none-mode WY verify and "
+            "accepted-state recovery reconstruct h_K over a contiguous accepted "
+            "prefix and cannot follow an EAGLE tree, so topk>1 would silently "
+            "commit the wrong SSM state. Got "
+            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+        )
+
+
 def validate_mamba_extra_buffer(view, model_arch: str, *, mamba_cache_chunk_size_of):
     from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
 

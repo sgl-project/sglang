@@ -101,9 +101,14 @@ def _build_hybrid_backend(testcase, case: MLAAttentionCase):
         testcase.skipTest("chunk-KV path not enabled on this build")
 
     # full_attn_layers=[0] routes layer 0 through the MLA backend, as a hybrid
-    # model's full-attention layers do. The linear backend is unused here.
+    # model's full-attention layers do. The linear backend is unused here, but
+    # the constructor still reads these two attributes off it: needs_cpu_seq_lens
+    # (only when the full backend's is falsy, so today it short-circuits) and
+    # _recover_ssm (read unconditionally). Both carry the non-GDN defaults.
     hybrid = HybridLinearAttnBackend(
-        full_backend, SimpleNamespace(), full_attn_layers=[0]
+        full_backend,
+        SimpleNamespace(needs_cpu_seq_lens=False, _recover_ssm=False),
+        full_attn_layers=[0],
     )
     return runner, full_backend, hybrid
 
