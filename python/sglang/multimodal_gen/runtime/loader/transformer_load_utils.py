@@ -45,11 +45,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-    hf_hub_download,
-    maybe_download_model,
-    snapshot_download,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
@@ -57,6 +52,11 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_metadata_from_safetensors_file,
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
+)
+from sglang.multimodal_gen.runtime.weights.source import (
+    materialize_weight_set,
+    materialize_weight_set_config,
+    resolve_safetensors_weight_set,
 )
 from sglang.srt.utils.hf_transformers import (
     check_gguf_file,
@@ -71,11 +71,6 @@ _PRECISION_VARIANT_SUFFIX_RE = re.compile(
     r"^(?P<stem>.+?)(?P<precision>\.(?:fp16|bf16|fp32))(?P<shard>-\d+-of-\d+)?(?P<ext>\.safetensors)$"
 )
 _MIXED_SAFETENSORS_RE = re.compile(r".*-mixed(?:-\d+-of-\d+)?\.safetensors$")
-_HF_SAFETENSORS_URL_RE = re.compile(
-    r"https?://huggingface\.co/(?P<repo>[^/]+/[^/]+)/"
-    r"(?:blob|resolve)/(?P<revision>[^/]+)/(?P<filename>.+\.safetensors)$",
-    re.IGNORECASE,
-)
 
 
 def _get_quant_config_name(config: Optional[QuantizationConfig]) -> Optional[str]:
@@ -211,6 +206,14 @@ class TransformerQuantLoadSpec:
                 and self.quant_config.layer_markers is not None
             )
         )
+
+
+@dataclass(frozen=True)
+class TransformerCheckpointFiles:
+    """Files from one checkpoint revision needed during transformer loading."""
+
+    safetensors: tuple[str, ...]
+    config_path: str | None
 
 
 class _TransformerQuantAdapter:
@@ -612,86 +615,55 @@ def resolve_transformer_gguf_to_load(
     return resolved
 
 
-def resolve_transformer_safetensors_to_load(
+def resolve_transformer_checkpoint_files(
     server_args: ServerArgs, component_model_path: str
-) -> list[str]:
+) -> TransformerCheckpointFiles:
     """Resolve transformer weights from the base component path or an override."""
     quantized_path = server_args.transformer_weights_path
 
     if quantized_path:
-        original_quantized_path = quantized_path
-        direct_url = _HF_SAFETENSORS_URL_RE.fullmatch(original_quantized_path)
-        if direct_url is not None:
-            quantized_path = hf_hub_download(
-                repo_id=direct_url.group("repo"),
-                filename=direct_url.group("filename"),
-                revision=direct_url.group("revision"),
-            )
-        else:
-            parts = original_quantized_path.strip("/").split("/")
-            is_hub_file = (
-                not os.path.exists(original_quantized_path)
-                and not os.path.isabs(original_quantized_path)
-                and not original_quantized_path.startswith((".", "~"))
-                and len(parts) > 2
-                and original_quantized_path.endswith(".safetensors")
-            )
-            quantized_path = (
-                hf_hub_download(
-                    repo_id="/".join(parts[:2]),
-                    filename="/".join(parts[2:]),
-                    revision=server_args.revision,
-                )
-                if is_hub_file
-                else maybe_download_model(original_quantized_path)
-            )
-        logger.info("using quantized transformer weights from: %s", quantized_path)
-        if os.path.isfile(quantized_path) and quantized_path.endswith(".safetensors"):
-            safetensors_list = [quantized_path]
-        else:
-            safetensors_list = _list_safetensors_files(quantized_path)
-            if not safetensors_list and not os.path.exists(original_quantized_path):
-                logger.warning(
-                    "No safetensors files found in cached transformer weights path "
-                    "%s; refreshing snapshot for %s",
-                    quantized_path,
-                    original_quantized_path,
-                )
-                quantized_path = snapshot_download(
-                    repo_id=original_quantized_path,
-                    ignore_patterns=["*.onnx", "*.msgpack"],
-                    allow_patterns=[
-                        "*.json",
-                        "*.safetensors",
-                        "*.safetensors.index.json",
-                    ],
-                    max_workers=8,
-                )
-                safetensors_list = _list_safetensors_files(quantized_path)
-    else:
-        safetensors_list = _list_safetensors_files(component_model_path)
+        resolved_set = resolve_safetensors_weight_set(
+            quantized_path,
+            revision=server_args.revision,
+            select_unindexed_weight=_select_single_mixed_safetensors_file,
+        )
+        safetensors_list = materialize_weight_set(resolved_set)
+        logger.info(
+            "using transformer weight set from %s: %s",
+            quantized_path,
+            safetensors_list,
+        )
+        return TransformerCheckpointFiles(
+            safetensors=safetensors_list,
+            config_path=materialize_weight_set_config(resolved_set),
+        )
 
+    safetensors_list = _list_safetensors_files(component_model_path)
     if safetensors_list:
-        # Diffusers repos occasionally ship more than one shard split for the
-        # same checkpoint (e.g. a 4-way and an 8-way split side by side). The
-        # index file is the authoritative source for which files belong to
-        # the checkpoint that was actually exported; anything else is a
-        # leftover sibling variant.
+        # Preserve legacy cleanup for the base component. Explicit overrides
+        # are resolved above, where an index is already the final authority.
         safetensors_list = filter_duplicate_safetensors_files(
             safetensors_list,
             os.path.dirname(safetensors_list[0]),
             SAFE_WEIGHTS_INDEX_NAME,
         )
-
-    safetensors_list = _prefer_mixed_safetensors_files(safetensors_list)
-    safetensors_list = _filter_duplicate_precision_variant_safetensors(safetensors_list)
-
-    if not safetensors_list:
-        raise ValueError(
-            f"no safetensors files found in {quantized_path or component_model_path}"
+        safetensors_list = _prefer_mixed_safetensors_files(safetensors_list)
+        safetensors_list = _filter_duplicate_precision_variant_safetensors(
+            safetensors_list
         )
 
-    return safetensors_list
+    if not safetensors_list:
+        raise ValueError(f"no safetensors files found in {component_model_path}")
+
+    return TransformerCheckpointFiles(tuple(safetensors_list), None)
+
+
+def _select_single_mixed_safetensors_file(
+    candidates: tuple[str, ...],
+) -> str | None:
+    """Preserve the transformer's established mixed-export preference."""
+    mixed = tuple(path for path in candidates if _MIXED_SAFETENSORS_RE.fullmatch(path))
+    return mixed[0] if len(mixed) == 1 else None
 
 
 def _prefer_mixed_safetensors_files(safetensors_list: list[str]) -> list[str]:
@@ -772,6 +744,7 @@ def resolve_transformer_quant_load_spec(
     component_name: str | None = None,
     gguf_file: str | None = None,
     checkpoint_quant_config: QuantizationConfig | None = None,
+    transformer_override_config_path: str | None = None,
 ) -> TransformerQuantLoadSpec:
     if gguf_file is not None:
         if checkpoint_quant_config is not None:
@@ -803,6 +776,7 @@ def resolve_transformer_quant_load_spec(
             server_args=server_args,
             safetensors_list=safetensors_list,
             component_model_path=component_model_path,
+            transformer_override_config_path=transformer_override_config_path,
         )
 
     if quant_config is not None:
@@ -945,37 +919,15 @@ def _build_transformer_quant_adapters(
 
 
 def _resolve_quant_config_from_transformer_override(
-    transformer_weights_path: str,
+    override_config_path: str,
 ) -> Optional[QuantizationConfig]:
     """Resolve quant config from an override transformer repo or directory."""
-    expanded_path = os.path.expanduser(transformer_weights_path)
-    if os.path.isfile(expanded_path):
-        return None
-
-    # A single local safetensors file does not carry a directory-level config.json.
-    # Let downstream metadata probing handle it instead of misrouting it through HF.
-    if expanded_path.endswith(".safetensors") and (
-        os.path.isabs(expanded_path)
-        or expanded_path.startswith(".")
-        or os.sep in expanded_path
-        or (os.path.altsep and os.path.altsep in expanded_path)
-    ):
-        return None
-
-    override_quantized_path = maybe_download_model(transformer_weights_path)
-    if not os.path.isdir(override_quantized_path):
-        return None
-
-    override_config_path = os.path.join(override_quantized_path, "config.json")
-    if not os.path.isfile(override_config_path):
-        return None
-
     with open(override_config_path, encoding="utf-8") as f:
         override_hf_config = json.load(f)
 
     return get_quant_config(
         override_hf_config,
-        override_quantized_path,
+        os.path.dirname(override_config_path),
     )
 
 
@@ -985,6 +937,7 @@ def _resolve_quant_config(
     server_args: ServerArgs,
     safetensors_list: list[str],
     component_model_path: str,
+    transformer_override_config_path: str | None = None,
 ) -> Optional[QuantizationConfig]:
     """
     resolve quant config from checkpoints' metadata
@@ -1055,11 +1008,11 @@ def _resolve_quant_config(
             fallback_group_size,
         )
     quant_config = _merge_modelopt_fp4_configs(quant_config, inferred_nvfp4_config)
-    if quant_config is not None or not server_args.transformer_weights_path:
+    if quant_config is not None or transformer_override_config_path is None:
         return quant_config
 
     quant_config = _resolve_quant_config_from_transformer_override(
-        server_args.transformer_weights_path
+        transformer_override_config_path,
     )
     quant_config = _merge_modelopt_fp4_configs(quant_config, inferred_nvfp4_config)
     if quant_config is not None:

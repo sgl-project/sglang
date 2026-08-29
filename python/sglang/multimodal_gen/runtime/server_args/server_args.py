@@ -1540,11 +1540,11 @@ class ServerArgs(DisaggServerArgsMixin):
     def require_component_resident(
         self, component_name: str, *, feature_name: str
     ) -> None:
-        configured_mode = self.canonical_residency_mode(component_name)
+        configured_mode = self.explicit_residency_mode(component_name)
         if configured_mode is not None and configured_mode != RESIDENT:
             raise ValueError(
                 f"{feature_name} requires {component_name!r} to be resident; "
-                f"got {configured_mode!r} from --component-residency"
+                f"got {configured_mode!r} from an explicit residency option"
             )
         self._required_resident_components.add(component_name)
 
