@@ -56,6 +56,7 @@ from sglang.srt.arg_groups.overrides import (
     mamba_extra_buffer_lazy_of,
     mamba_extra_buffer_of,
     remote_instance_transfer_engine_of,
+    resolution_projection,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -3697,7 +3698,6 @@ class ServerArgs:
         the way `asdict` expands them; the private resolution bookkeeping and the
         `model_config` memo are not fields and do not appear.
         """
-        from sglang.srt.arg_groups.overrides import resolution_projection
 
         return resolution_projection(self)
 

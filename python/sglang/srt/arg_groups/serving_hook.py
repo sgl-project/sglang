@@ -12,6 +12,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
     resolved_view,
     resolving_view,
 )
@@ -751,7 +752,6 @@ def handle_multimodal_feature_transport(server_args: Any):
     may still auto-select CUDA VMM. The legacy CUDA IPC flag and environment
     variable remain supported so existing deployments map to this policy.
     """
-    from sglang.srt.arg_groups.overrides import model_config_of
 
     cfg = resolving_view(server_args)
     requested_transport = cfg.mm_feature_transport

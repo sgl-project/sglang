@@ -934,47 +934,42 @@ class TestDeclaredValuesAreNotEditedLater(CustomTestCase):
         self.addCleanup(restore)
 
     def _resolve_recording_each_entry(self, **supplied):
-        """Resolve, deep-copying every stash entry the moment it is appended."""
-        from sglang.srt.arg_groups import overrides
+        """Resolve, deep-copying every stash entry the moment it is appended.
 
+        The property is about the stash, so the seam is the stash: a list that
+        snapshots on append. Every declaration path -- `declare_resolution`,
+        `declare_late_resolution`, `declare_direct_writes` and the passes --
+        reaches it through `.append`, whatever it was imported as.
+        """
         recorded = []
 
-        def watch(name):
-            original = getattr(overrides, name)
+        class _SnapshotOnAppend(list):
+            def append(self, entry):
+                super().append(entry)
+                recorded.append((len(self) - 1, copy.deepcopy(entry)))
 
-            def wrapper(server_args, *args, **kwargs):
-                result = original(server_args, *args, **kwargs)
-                stash = getattr(server_args, "_resolved_overrides", None) or []
-                while len(recorded) < len(stash):
-                    index = len(recorded)
-                    recorded.append((index, copy.deepcopy(stash[index])))
-                return result
+        class _WatchedArgs(ServerArgs):
+            """Whatever list the pipeline installs, snapshot what lands in it.
 
-            return original, wrapper
+            The pipeline resets the stash at the start of a resolution, so the
+            seam has to survive that assignment rather than precede it.
+            """
 
-        # Every path that appends to the stash.
-        patched = {}
-        for name in (
-            "declare_resolution",
-            "declare_late_resolution",
-            "declare_direct_writes",
-            "run_post_process_pass",
-        ):
-            original, wrapper = watch(name)
-            patched[name] = original
-            setattr(overrides, name, wrapper)
-        try:
-            path = tempfile.mkdtemp(prefix="declared_values_")
-            self.addCleanup(shutil.rmtree, path, ignore_errors=True)
-            with open(os.path.join(path, "config.json"), "w") as handle:
-                json.dump(_MINI_CONFIG, handle)
-            server_args = ServerArgs(
-                model_path=path, device="cuda", random_seed=42, **supplied
-            )
-            server_args.resolve_once()
-        finally:
-            for name, original in patched.items():
-                setattr(overrides, name, original)
+            def __setattr__(self, name, value):
+                if name == "_resolved_overrides" and not isinstance(
+                    value, _SnapshotOnAppend
+                ):
+                    value = _SnapshotOnAppend(value)
+                super().__setattr__(name, value)
+
+        path = tempfile.mkdtemp(prefix="declared_values_")
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        with open(os.path.join(path, "config.json"), "w") as handle:
+            json.dump(_MINI_CONFIG, handle)
+        server_args = _WatchedArgs(
+            model_path=path, device="cuda", random_seed=42, **supplied
+        )
+        server_args.resolve_once()
         return server_args, recorded
 
     def test_no_entry_changes_after_it_is_recorded(self):
