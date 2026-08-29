@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-from sglang.kernels.jit.minicpm_sala import get_block_table
+from sglang.kernels.ops.minicpm_sala import get_block_table
 from sglang.srt.layers.attention.minicpm.sparse_utils import (
     CompressionLevelMetadata,
     MiniCPMSparseMetadata,

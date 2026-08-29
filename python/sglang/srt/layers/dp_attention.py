@@ -28,6 +28,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     derive_attention_widths,
     get_device,
@@ -103,7 +104,11 @@ class DpPaddingMode(IntEnum):
         # Force MAX_LEN so all ranks are padded to equal token counts.
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-        if get_moe_a2a_backend().is_pplx():
+        moe_a2a_backend = get_moe_a2a_backend()
+        if moe_a2a_backend.is_pplx():
+            return DpPaddingMode.MAX_LEN
+
+        if moe_a2a_backend.is_deepep_v2() and envs.SGLANG_DEEPEP_V2_FORCE_MAX_LEN.get():
             return DpPaddingMode.MAX_LEN
 
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
@@ -588,8 +593,6 @@ _dp_gather_fp8_bufs: dict = {}
 
 @functools.lru_cache(maxsize=1)
 def _use_dp_gather_fp8() -> bool:
-    from sglang.srt.environ import envs
-
     return envs.SGLANG_ENABLE_DP_GATHER_FP8.get()
 
 
