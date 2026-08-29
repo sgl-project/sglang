@@ -7,7 +7,9 @@ from sglang.srt.disaggregation.encoder.runtime import (
     EncoderScheduler,
     PendingRequest,
     _resolve_encoder_batch_policy,
+    execute_encode_pipeline,
 )
+from sglang.srt.disaggregation.encoder.server import BadRequestError
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -106,6 +108,31 @@ def test_scheduler_coalesces_concurrent_submissions():
         assert results == [(1, 2, 3, None, None)] * 2
 
     asyncio.run(run_test())
+
+
+def test_invalid_video_request_is_rejected_before_tp_broadcast(monkeypatch):
+    sent_requests = []
+    monkeypatch.setattr(
+        "sglang.srt.disaggregation.encoder.runtime.sock_send",
+        lambda _socket, request: sent_requests.append(request),
+    )
+
+    async def run_test():
+        with pytest.raises(BadRequestError, match="missing or empty mm_items"):
+            await execute_encode_pipeline(
+                enc=object(),
+                sched=None,
+                request={
+                    "req_id": "invalid-video",
+                    "modality": "video",
+                    "num_parts": 1,
+                    "part_idx": 0,
+                },
+                send_sockets=[object()],
+            )
+
+    asyncio.run(run_test())
+    assert sent_requests == []
 
 
 @pytest.mark.parametrize(
