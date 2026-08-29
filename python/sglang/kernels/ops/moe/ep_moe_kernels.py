@@ -176,38 +176,41 @@ if _has_gluon:
     ):
         """Gluon variant of deepep_post_reorder_triton_kernel.
 
+        Launch on a 2-D grid (num_tokens, cdiv(hidden_size, BLOCK_SIZE)):
+        splitting hidden across programs keeps the GPU occupied at small
+        token counts, where the 1-D per-token grid starves it.
         Zero-filled predicated loads make d_k == 0 when dst_k < 0, so the
-        dst_k >= 0 branch disappears and mul+add fuses into fma.rn.bf16x2;
-        see the PR benchmark for the measured win over the Triton kernel.
+        dst_k >= 0 branch disappears and mul+add fuses into fma.rn.bf16x2.
         """
         InDtype = down_output_ptr.dtype.element_ty
 
         src_idx = gl.program_id(0)
+        chunk = gl.program_id(1)
         s2d = src2dst_ptr + src_idx * topk
         tw = topk_weights_ptr + src_idx * topk
         store_ptr = output_ptr + src_idx * hidden_size
 
-        idx = gl.arange(0, BLOCK_SIZE, layout=layout)
-        for start_offset in range(0, hidden_size, BLOCK_SIZE):
-            offset = start_offset + idx
-            mask = offset < hidden_size
+        offset = chunk * BLOCK_SIZE + gl.arange(0, BLOCK_SIZE, layout=layout)
+        mask = offset < hidden_size
 
-            acc = gl.zeros([BLOCK_SIZE], dtype=InDtype, layout=layout)
-            for k in range(TOPK):
-                dst_k = gl.load(s2d + k).to(gl.int64)
-                w_k = gl.load(tw + k).to(InDtype)
-                if routed_scaling_factor != 1.0:
-                    w_k = w_k * routed_scaling_factor
-                # other=0.0 is required, not decorative: a masked-off load
-                # without it is undefined, and dst_k < 0 rows must add 0.
-                d_k = gl.load(
-                    down_output_ptr + dst_k * hidden_size + offset,
-                    mask=mask & (dst_k >= 0),
-                    other=0.0,
-                )
-                acc += d_k * w_k
+        acc = gl.zeros([BLOCK_SIZE], dtype=InDtype, layout=layout)
+        for k in range(TOPK):
+            # int64 is load-bearing: dst_k * hidden_size overflows int32 past
+            # 2**31 elements and corrupts silently (no fault).
+            dst_k = gl.load(s2d + k).to(gl.int64)
+            w_k = gl.load(tw + k).to(InDtype)
+            if routed_scaling_factor != 1.0:
+                w_k = w_k * routed_scaling_factor
+            # other=0.0 pins masked lanes to 0 by contract (dst_k < 0 rows
+            # must add 0); without it the language leaves them undefined.
+            d_k = gl.load(
+                down_output_ptr + dst_k * hidden_size + offset,
+                mask=mask & (dst_k >= 0),
+                other=0.0,
+            )
+            acc += d_k * w_k
 
-            gl.store(store_ptr + offset, acc, mask=mask)
+        gl.store(store_ptr + offset, acc, mask=mask)
 
 else:
     gluon_post_reorder_layout = None
