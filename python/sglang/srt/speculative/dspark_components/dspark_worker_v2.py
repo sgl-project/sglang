@@ -219,7 +219,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             model_runner=self.model_runner,
             device=self.device,
             tp_rank=self.ps.tp_rank,
-            server_args=self.server_args,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
         )
         if (
