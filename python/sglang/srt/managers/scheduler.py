@@ -149,6 +149,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    MMInputsProcessError,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
@@ -2494,6 +2495,8 @@ class Scheduler(
         return result.inputs
 
     def _get_multimodal_inputs(self, mm_inputs):
+        if isinstance(mm_inputs, MMInputsProcessError):
+            raise _MultimodalInputProcessingError(mm_inputs.message)
         if isinstance(mm_inputs, MultimodalInputs):
             return mm_inputs
 
