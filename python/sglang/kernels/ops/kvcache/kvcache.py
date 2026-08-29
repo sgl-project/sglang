@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Mirrors device::kWarpThreads in include/sgl_kernel/utils.cuh (32 on CUDA and HIP).
+_WARP_THREADS = 32
+
 
 @cache_once
 def _jit_kvcache_module(k_row_bytes: int, v_row_bytes: int, num_threads: int) -> Module:
@@ -73,9 +76,9 @@ def store_cache(
     *,
     row_bytes: int = 0,
     v_row_bytes: int = 0,
+    num_split: int = 0,
     size_limit: int = 0,
     reserved_skip_index: int = 0,
-    num_threads: int = 0,
 ) -> None:
     """Store key and value tensors into KV cache at specified indices.
 
@@ -88,6 +91,8 @@ def store_cache(
         row_bytes (int): Key row width in bytes. Inferred from k when 0.
         v_row_bytes (int): Value row width in bytes; differs from row_bytes for
             asymmetric KV (head_dim != v_head_dim). Inferred from v when 0.
+        num_split (int): Warps cooperating on one row. A heuristic picks it
+            when 0; it is the only knob here that exists purely for tuning.
         size_limit (int): Valid slot bound (cache row count = real slots + the
             reserved padding slot); an index outside [0, size_limit) fails fast
             (device assert) instead of an illegal memory access. Defaults to the
@@ -98,7 +103,10 @@ def store_cache(
     """
     row_bytes = row_bytes or k.shape[-1] * k.element_size()
     v_row_bytes = v_row_bytes or v.shape[-1] * v.element_size()
-    module = _jit_kvcache_module(row_bytes, v_row_bytes, num_threads)
+    # One warp per split. The knob stays the split count it has always been:
+    # renaming it changes the registered op schema, and a warm inductor cache
+    # does not notice that -- it replays generated code carrying the old name.
+    module = _jit_kvcache_module(row_bytes, v_row_bytes, num_split * _WARP_THREADS)
     if size_limit <= 0:
         size_limit = k_cache.shape[0]
     module.store_cache(
