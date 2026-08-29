@@ -236,6 +236,27 @@ class TestEncoderDelivery(CustomTestCase):
 
         asyncio.run(run())
 
+    def test_background_task_failure_is_observed(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.background_tasks = set()
+
+            async def fail():
+                raise RuntimeError("background failure")
+
+            with patch(
+                "sglang.srt.disaggregation.encoder.server.logger.exception"
+            ) as log_exception:
+                task = encoder._create_background_task(fail())
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+
+            self.assertTrue(task.done())
+            self.assertNotIn(task, encoder.background_tasks)
+            log_exception.assert_called_once_with("MMEncoder background task failed")
+
+        asyncio.run(run())
+
     def test_contract_has_two_direct_implementations(self):
         self.assertEqual(EncoderDelivery.__abstractmethods__, {"send", "release"})
         self.assertEqual(

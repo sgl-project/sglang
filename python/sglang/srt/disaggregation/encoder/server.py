@@ -607,6 +607,21 @@ class MMEncoder:
 
         logger.info(f"rank {rank} init finish ")
 
+    def _background_task_done(self, task: asyncio.Task) -> None:
+        self.background_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("MMEncoder background task failed")
+
+    def _create_background_task(self, awaitable: Awaitable[Any]) -> asyncio.Task:
+        task = asyncio.create_task(awaitable)
+        self.background_tasks.add(task)
+        task.add_done_callback(self._background_task_done)
+        return task
+
     def supports_modality(self, modality: Modality) -> bool:
         return self.preprocessor.supports_modality(modality)
 
@@ -1185,9 +1200,7 @@ class MMEncoder:
                     "Global multimodal cache insert failed for req %s", ctx.req_id
                 )
 
-        task = asyncio.create_task(_background_insert())
-        self.background_tasks.add(task)
-        task.add_done_callback(self.background_tasks.discard)
+        self._create_background_task(_background_insert())
 
     @staticmethod
     def _as_2d_tensor(tensor: torch.Tensor) -> torch.Tensor:
