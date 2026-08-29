@@ -150,6 +150,11 @@ to override the method inferred by the transformer loader, and
 `--quantization-ignored-layers` to keep matching transformer layers
 unquantized during online quantization.
 
+For a replacement transformer weight set, an adjacent `config.json` and
+safetensors quantization metadata take precedence over the base component.
+Compatible serialized formats are inferred automatically; do not combine them
+with an online `--quantization` override.
+
 For a native text encoder:
 
 - `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias

@@ -148,6 +148,105 @@ def _make_quant_config(name: str, **attrs):
 
 
 class TestTransformerQuantHelpers(unittest.TestCase):
+    def _make_server_args(self, **overrides):
+        defaults = dict(
+            transformer_weights_path=None,
+            pipeline_config=SimpleNamespace(
+                dit_precision="bf16",
+                dit_config=SimpleNamespace(
+                    arch_config=SimpleNamespace(
+                        param_names_mapping={},
+                        reverse_param_names_mapping={},
+                        quant_ignore_remap={},
+                    )
+                ),
+            ),
+            nunchaku_config=None,
+            quantization=None,
+            quantization_ignored_layers=None,
+            revision="test-revision",
+            tp_size=1,
+            dit_cpu_offload=False,
+            direct_gpu_weight_loading=False,
+            text_encoder_cpu_offload=False,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def test_replacement_config_overrides_base_quantization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            weights = f"{directory}/model.safetensors"
+            config = f"{directory}/config.json"
+            save_file({"block.weight": torch.ones((2, 2))}, weights)
+            with open(config, "w", encoding="utf-8") as stream:
+                json.dump(
+                    {
+                        "quantization_config": {
+                            "quant_method": "fp8",
+                            "activation_scheme": "dynamic",
+                        }
+                    },
+                    stream,
+                )
+
+            quant_config = _resolve_quant_config(
+                hf_config={
+                    "quantization_config": {
+                        "quant_method": "fp8",
+                        "activation_scheme": "static",
+                    }
+                },
+                server_args=self._make_server_args(transformer_weights_path=weights),
+                safetensors_list=[weights],
+                component_model_path="/base",
+                transformer_override_config_path=config,
+            )
+
+        self.assertIsInstance(quant_config, Fp8Config)
+        self.assertEqual(quant_config.activation_scheme, "dynamic")
+
+    def test_unquantized_replacement_does_not_inherit_base_quantization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            weights = f"{directory}/model.safetensors"
+            config = f"{directory}/config.json"
+            save_file({"block.weight": torch.ones((2, 2))}, weights)
+            with open(config, "w", encoding="utf-8") as stream:
+                json.dump({}, stream)
+
+            quant_config = _resolve_quant_config(
+                hf_config={"quantization_config": {"quant_method": "fp8"}},
+                server_args=self._make_server_args(transformer_weights_path=weights),
+                safetensors_list=[weights],
+                component_model_path="/base",
+                transformer_override_config_path=config,
+            )
+
+        self.assertIsNone(quant_config)
+
+    def test_replacement_metadata_rejects_online_quantization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            weights = f"{directory}/model.safetensors"
+            save_file(
+                {"block.weight": torch.ones((2, 2))},
+                weights,
+                metadata={
+                    "quantization_config": json.dumps(
+                        {"quant_method": "fp8", "activation_scheme": "dynamic"}
+                    )
+                },
+            )
+
+            with self.assertRaisesRegex(ValueError, "already declares quantization"):
+                _resolve_quant_config(
+                    hf_config={},
+                    server_args=self._make_server_args(
+                        transformer_weights_path=weights,
+                        quantization="fp8",
+                    ),
+                    safetensors_list=[weights],
+                    component_model_path="/base",
+                )
+
     def test_autoround_config_is_inferred_and_remapped_to_native_prefixes(self):
         layer_config = {
             "bits": 4,
@@ -205,27 +304,6 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 ),
                 {},
             )
-
-    def _make_server_args(self, **overrides):
-        defaults = dict(
-            transformer_weights_path=None,
-            pipeline_config=SimpleNamespace(
-                dit_precision="bf16",
-                dit_config=SimpleNamespace(
-                    arch_config=SimpleNamespace(param_names_mapping={})
-                ),
-            ),
-            nunchaku_config=None,
-            quantization=None,
-            quantization_ignored_layers=None,
-            revision="test-revision",
-            tp_size=1,
-            dit_cpu_offload=False,
-            direct_gpu_weight_loading=False,
-            text_encoder_cpu_offload=False,
-        )
-        defaults.update(overrides)
-        return SimpleNamespace(**defaults)
 
     def test_modelopt_fp4_uses_fa_by_default_on_blackwell(self):
         quant_spec = TransformerQuantLoadSpec([], _FakeQuantConfig(), None, None)
