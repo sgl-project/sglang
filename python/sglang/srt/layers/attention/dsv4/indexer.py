@@ -169,9 +169,10 @@ def fp4_paged_mqa_logits_torch(
     max_seq_len: int,
     clean_logits: bool = False,
 ) -> torch.Tensor:
-    """FP4 indexer score for gfx950 (ROCm has no DeepGEMM fp4 kernel).
+    """FP32 reference for the gfx950 fp4 indexer score (``fp4_paged_mqa_logits_triton``).
 
-    Correctness-mirror of fp8_paged_mqa_logits_torch with fp4 q/kv dequant.
+    Dequants the fp4 q/kv and scores in fp32, reproducing the native mxfp4 MFMA
+    (which accumulates in fp32) bit-for-bit; used as the golden in the unit test.
     ``kvcache_raw`` is the raw [pages, page_size*(64+4)] uint8 pool buffer,
     blocked as [page_size*64 fp4 | page_size*4 scale] per _store_fp4_index_k_cache_kernel.
     """
@@ -197,8 +198,9 @@ def fp4_paged_mqa_logits_torch(
     kv_g = kv_values.reshape(pages, block_size * head_dim)[pages_clamped]
     kv_g = kv_g.reshape(batch_size, max_num_pages * block_size, head_dim)
 
-    q_float = q_fp8[:, 0].to(torch.bfloat16)  # [B, H, 128]
-    scores = torch.bmm(kv_g, q_float.transpose(1, 2))
+    # fp32 accumulation to match the MFMA; fp4/fp8 operands are exact in fp32.
+    q_float = q_fp8[:, 0].to(torch.float32)  # [B, H, 128]
+    scores = torch.bmm(kv_g.float(), q_float.transpose(1, 2))
     scores = F.relu(scores)
     scores = scores * weight.unsqueeze(1)
     scores = scores.sum(dim=2)
