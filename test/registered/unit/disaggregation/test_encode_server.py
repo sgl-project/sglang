@@ -1,5 +1,6 @@
 import asyncio
 import pickle
+import threading
 import unittest
 from http import HTTPStatus
 from types import SimpleNamespace
@@ -28,6 +29,7 @@ from sglang.srt.disaggregation.encoder.server import (
     ReqState,
     SendDestination,
     ZmqDelivery,
+    _await_transfer_completion,
     meta_registry,
     rid_to_cond,
     rid_to_receive_count,
@@ -214,6 +216,151 @@ class TestEncoderPreprocessorKimiGrid(CustomTestCase):
 
 
 class TestEncoderDelivery(CustomTestCase):
+    def test_cancelled_zero_copy_transfer_drains_before_return(self):
+        async def run():
+            transfer_started = threading.Event()
+            finish_transfer = threading.Event()
+
+            def transfer():
+                transfer_started.set()
+                finish_transfer.wait()
+
+            task = asyncio.create_task(
+                _await_transfer_completion(asyncio.to_thread(transfer), "test transfer")
+            )
+            while not transfer_started.is_set():
+                await asyncio.sleep(0)
+
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+
+            finish_transfer.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(run())
+
+    def test_cancelled_mooncake_send_keeps_embedding_until_transfer_stops(self):
+        async def run():
+            transfer_started = threading.Event()
+            finish_transfer = threading.Event()
+
+            def transfer_sync(*_args):
+                transfer_started.set()
+                finish_transfer.wait()
+                return 0
+
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.req_states = {}
+            encoder._element_size = 2
+            encoder.transfer_backend = "mooncake"
+            encoder.engine = SimpleNamespace(
+                register=unittest.mock.Mock(),
+                transfer_sync=unittest.mock.Mock(side_effect=transfer_sync),
+                deregister=unittest.mock.Mock(),
+            )
+            encoder.delivery = MooncakeDelivery(encoder)
+
+            embedding = torch.ones((2, 4), dtype=torch.float16)
+            state = ReqState(
+                "cancelled-transfer",
+                EmbeddingData(
+                    "cancelled-transfer",
+                    1,
+                    0,
+                    None,
+                    Modality.IMAGE,
+                    embedding=embedding,
+                ),
+            )
+            state.embedding_ready.set()
+            encoder.req_states[state.req_id] = state
+
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.server.get_disagg",
+                    return_value=SimpleNamespace(encoder_transfer_backend="mooncake"),
+                ),
+                patch.object(meta_registry, "discard", AsyncMock()),
+            ):
+                send_task = asyncio.create_task(
+                    encoder.send_to_destination(
+                        state,
+                        SendDestination(
+                            "127.0.0.1:1", session_id="session", buffer_address=1
+                        ),
+                    )
+                )
+                while not transfer_started.is_set():
+                    await asyncio.sleep(0)
+
+                send_task.cancel()
+                release_task = asyncio.create_task(
+                    encoder.release_request(state.req_id)
+                )
+                await asyncio.sleep(0)
+
+                self.assertFalse(send_task.done())
+                self.assertFalse(release_task.done())
+                self.assertIs(state.embedding_data.embedding, embedding)
+                encoder.engine.deregister.assert_not_called()
+
+                finish_transfer.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await send_task
+                await release_task
+
+            encoder.engine.register.assert_called_once_with(
+                embedding.data_ptr(), embedding.nbytes
+            )
+            encoder.engine.deregister.assert_called_once_with(embedding.data_ptr())
+            self.assertIsNone(state.embedding_data)
+            self.assertNotIn(state.req_id, encoder.req_states)
+
+        asyncio.run(run())
+
+    def test_failed_mooncake_transfer_releases_per_send_registration(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder._element_size = 2
+            encoder.transfer_backend = "mooncake"
+            encoder.engine = SimpleNamespace(
+                register=unittest.mock.Mock(),
+                transfer_sync=unittest.mock.Mock(
+                    side_effect=RuntimeError("transfer failed")
+                ),
+                deregister=unittest.mock.Mock(),
+            )
+            embedding = torch.ones((2, 4), dtype=torch.float16)
+            mm_data = EmbeddingData(
+                "failed-transfer",
+                1,
+                0,
+                None,
+                Modality.IMAGE,
+                embedding=embedding,
+            )
+
+            with patch(
+                "sglang.srt.disaggregation.encoder.server.get_disagg",
+                return_value=SimpleNamespace(encoder_transfer_backend="mooncake"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "transfer failed"):
+                    await encoder._send(
+                        embedding,
+                        mm_data,
+                        session_id="session",
+                        buffer_address=1,
+                    )
+
+            encoder.engine.register.assert_called_once_with(
+                embedding.data_ptr(), embedding.nbytes
+            )
+            encoder.engine.deregister.assert_called_once_with(embedding.data_ptr())
+
+        asyncio.run(run())
+
     def test_contract_has_two_direct_implementations(self):
         self.assertEqual(EncoderDelivery.__abstractmethods__, {"send", "release"})
         self.assertEqual(
