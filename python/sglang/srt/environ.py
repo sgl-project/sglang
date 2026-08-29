@@ -37,6 +37,11 @@ def _default_cache_subdir(name: str) -> str:
     return os.path.join(os.path.expanduser(envs.SGLANG_CACHE_DIR.get()), name)
 
 
+def _default_tree_cache_sanity_check() -> bool:
+    """Enable the expensive tree-cache sanity check by default in CI."""
+    return envs.SGLANG_IS_IN_CI.get()
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -464,6 +469,9 @@ class Envs:
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
+    # The explicit environment variable still takes precedence over this CI
+    # default, so production remains opt-in and CI remains opt-out if needed.
+    SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_tree_cache_sanity_check)
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
@@ -696,6 +704,8 @@ class Envs:
     # ===================================================================
     # HiCache storage backends and mmap allocation
     # ===================================================================
+    # Per-call cudaHostRegister limit in GB.
+    SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
