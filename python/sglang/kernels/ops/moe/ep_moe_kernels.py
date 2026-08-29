@@ -2103,8 +2103,7 @@ def _requant_row(
     g_mask,
     HAS_G_TAIL: tl.constexpr,
 ):
-    """Requantize one row of one expert.  Both phases below place rows; this
-    places the tile, so they cannot disagree about how a row is written."""
+    """Requantize one row; shared by both phases so they write rows identically."""
     row_base = expert.to(tl.int64) * m + row
     x_ptrs = x_ptr + row_base * k + k_offsets
     output_ptrs = output_ptr + row_base * k + k_offsets
@@ -2154,10 +2153,8 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
 
     output_scale_val_inv = 1.0 / tl.load(output_scale_ptr).to(tl.float32)
 
-    # The payload is a whole number of scale groups, so tile it as
-    # [G_BLOCK_SIZE, K_SCALE_BLOCK_SIZE]: one scalar scale load per group rather
-    # than a 128-way gather of m-strided addresses (the dispatcher's scales are
-    # column-major in the last two dims), and a partial k masks whole groups.
+    # Tile whole scale groups: one scalar scale load per group.  DeepEP scales
+    # are column-major in the last two dims, so element-axis loads would gather.
     g_offsets = pid_g * G_BLOCK_SIZE + tl.arange(0, G_BLOCK_SIZE)
     k_offsets = (
         g_offsets[:, None] * K_SCALE_BLOCK_SIZE
@@ -2166,8 +2163,7 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
     g_mask = g_offsets < k // K_SCALE_BLOCK_SIZE
     scale_g_offsets = g_offsets * x_scale_stride2
 
-    # Phase 1 -- this program's own expert, up to the cap the launch was sized
-    # for.  This is the whole job for a batch whose rows are spread evenly.
+    # Phase 1: this expert's rows below row_cap, strided over the m-grid.
     last_effective_id = tl.load(masked_m_ptr + pid_e)
     for row in tl.range(pid_m, min(last_effective_id, row_cap), m_grid):
         _requant_row(
@@ -2187,12 +2183,8 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
             HAS_G_TAIL,
         )
 
-    # Phase 2 -- rows any expert holds beyond the cap, flattened over the whole
-    # launch.  Tying rows to their own expert's slice of the grid is what makes
-    # a lopsided batch serialize: the hot expert's programs work while everyone
-    # else's exit.  Only the rows above the cap can be lopsided, so only those
-    # pay for being looked up, and a batch that has none finds out with one
-    # reduction per program rather than anything per row.
+    # Phase 2: rows above row_cap are shared across the whole launch, so a hot
+    # expert cannot serialize; a batch with no overflow pays one reduction here.
     expert_ids = tl.arange(0, EXPERT_BLOCK)
     counts = tl.load(masked_m_ptr + expert_ids, mask=expert_ids < num_experts, other=0)
     overflow = tl.maximum(counts - row_cap, 0)
@@ -2200,11 +2192,8 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
     if total_overflow == 0:
         return
 
-    # Prefix sum over the overflow turns a flat index into (expert, row): the
-    # owning expert is however many experts finish at or before it, and the row
-    # is the cap plus the distance from where that expert's overflow started.
-    # An expert that does not overflow finishes where it starts, so it drops out
-    # of both without a special case.
+    # The inclusive prefix sum maps flat index i to (expert, row): the owner is
+    # however many experts finish at or before i; zero-overflow experts drop out.
     overflow_before = tl.cumsum(overflow)
     flat_id = pid_e * m_grid + pid_m
     num_programs = m_grid * num_experts
@@ -2229,21 +2218,10 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
         )
 
 
-# Hidden bytes each lane moves per tile.  This, not the element count, is the
-# quantity that was tuned: it decides the access width Triton emits, and the two
-# vendors disagree on lanes per warp, so an element count that is right on one is
-# half the bytes per lane on the other.  Scored against the per-point best over
-# 16 (hidden x expert x row) points per part, at 4 warps:
-#
-#   B/lane |  2      4      8      16     32
-#   H200   |  -      2.44x  1.54x  1.09x  1.21x
-#   MI350X |  1.93x  1.41x  1.17x  1.08x  -
-#
-# 16 B/lane is the optimum on both -- 2048 elements on H200 (4 warps of 32) and
-# 4096 on MI350X (4 of 64).  Below a few dozen experts the grid is too small to
-# fill an NVIDIA part, and halving the tile to buy k-blocks wins there instead
-# (E=8, 1 row: 1.44 vs 1.55 us); that is an NVIDIA-only effect, and it costs
-# MI350X up to 5% at the same points, which is the cheaper side of the trade.
+# Tuned in bytes per lane, not elements: warp width differs by vendor, and
+# 16 B/lane measured best on both H200 (2048 elems) and MI350X (4096).
+# Below _REQUANT_MANY_EXPERTS the grid underfills NVIDIA parts and a half
+# tile buys k-block parallelism; that costs MI350X up to 5% there.
 _REQUANT_BYTES_PER_LANE = 16
 _REQUANT_BYTES_PER_LANE_FEW_EXPERTS = 8
 _REQUANT_MANY_EXPERTS = 32
@@ -2251,18 +2229,13 @@ _REQUANT_NUM_WARPS = 4
 _REQUANT_DEFAULT_WARP_SIZE = 32
 _REQUANT_M_GRID_MAX = 32
 _REQUANT_M_GRID_MIN = 4
-# Target programs on the (m-grid x expert) plane while rows are scarce: 32 per
-# expert oversubscribes at >= 64 experts (measured 15-30%), but past this many
-# rows per expert the extra programs carry real work.  A fixed target, not one
-# scaled by the machine's core count: scaling it to 8 programs per core was
-# neutral on H200 and 1.12x worse on MI350X.
+# Program target on the (m-grid x expert) plane while rows are scarce; measured,
+# and deliberately not scaled to core count (8 per core was worse on MI350X).
 _REQUANT_TARGET_PROGRAMS = 1024
+# Past this many rows per expert the capped-away programs would carry real work.
 _REQUANT_ROWS_SATURATED = 64
-# How far past the dispatcher's average an expert may go before its rows stop
-# being its own programs' problem.  Twice the average leaves ordinary variation
-# in the cheap per-expert phase and sends only real imbalance to the flattened
-# one, which costs 4% at even load and is what keeps a lopsided batch from
-# serializing (measured: an expert at 32x its share went 0.57x -> 3.39x).
+# Rows past slack * expected_rows go to the shared phase.  2x keeps ordinary
+# variation per-expert; measured 4% at even load and removes the skew regression.
 _REQUANT_ROW_CAP_SLACK = 2
 
 
@@ -2286,21 +2259,10 @@ def requant_launch_geometry(
 ) -> Tuple[int, int, int]:
     """Pick (groups per program, m-grid, row cap) for the requant.
 
-    All three are launch hints; any values produce the same bytes.  The m-grid
-    decides how many programs share one expert's rows, and the cap decides how
-    many rows stay that expert's own problem -- past it they are shared with the
-    whole launch instead, so no value of either can make a lopsided batch
-    serialize.  One program per expected row, never above the historical 32 and
-    additionally capped by the expert count while rows are scarce, was the
-    measured optimum across hidden sizes and expert counts.  The row count is
-    rounded down to a power of two because the dispatcher's estimate already
-    rounds up (it adds the expert count before dividing), so an exact average of
-    8 rows arrives as 9 and must not launch 16 programs.
-
-    ``warp_size`` widens the tile on a vendor whose warp is wider, keeping the
-    bytes each lane moves -- the thing that was actually tuned -- constant. It is
-    a launch hint like the rest: any width is correct, so a part that reports an
-    unexpected one only pays for it in bandwidth.
+    All three are launch hints: any values produce the same bytes.  The row
+    estimate rounds down to a power of two because ``dispatch_a`` reports
+    ``(rows + num_experts) // num_experts``, one high at exact averages.
+    ``warp_size`` scales the tile to keep bytes per lane constant.
     """
     # The payload is fp8, so a byte per lane is an element per lane.
     bytes_per_lane = (
@@ -2309,12 +2271,9 @@ def requant_launch_geometry(
         else _REQUANT_BYTES_PER_LANE_FEW_EXPERTS
     )
     tile_elems = bytes_per_lane * _REQUANT_NUM_WARPS * warp_size
-    # Round down, so the tile never covers groups the payload does not have.  A
-    # group count that is not a power of two still pays a partial last tile: 40
-    # and 48 groups fill only 62% and 75% of a 32-group tile, which measured up
-    # to 8% behind the narrower tile on MI350X (never behind the previous
-    # kernel).  Sizing per hidden width needed a third tuned constant that only
-    # moved the loss to another width, so the widths in between are left as-is.
+    # Clamp to the payload.  Non-pow2 group counts (40, 48) leave the last tile
+    # partly masked, up to 8% behind a narrower tile on MI350X; accepted, since
+    # per-width constants only moved the loss.
     g_block = min(_floor_pow2(tile_elems // group_size), _floor_pow2(num_groups))
     if expected_rows is None:
         # Nothing to place a cap against, so leave every row with its own expert.
@@ -2336,22 +2295,19 @@ def fp8_per_token_to_per_tensor_quant_triton(
     output: torch.Tensor,
     expected_rows: Optional[int] = None,
 ):
-    # The [groups, group] tile indexes within a group with tl.arange, so the group
-    # width has to be a power of two; a flat tile would only need it to divide k.
+    # The 2-D tile indexes within a group via tl.arange, so the group width
+    # must be a power of two.
     K_SCALE_BLOCK_SIZE = 128
     assert len(x.shape) == 3 and x.size(2) % K_SCALE_BLOCK_SIZE == 0
     assert x.is_contiguous()
     assert output.shape == x.shape and output.is_contiguous()
-    # Every tensor is addressed by flattening (expert, row) into one index and
-    # scaling it by raw strides, so a shape that disagrees with `x` reads out of
-    # bounds rather than failing.
+    # Addressing flattens (expert, row) by raw strides; a shape mismatch reads
+    # out of bounds rather than failing.
     assert masked_m.shape[0] == x.size(0)
     assert x_scale.size(0) == x.size(0) and x_scale.size(1) == x.size(1)
     assert x_scale.size(2) == x.size(2) // K_SCALE_BLOCK_SIZE
-    # DeepEP hands back int32-packed UE8M0 scales when the dispatcher asks for
-    # them (`use_ue8m0`, FP8-DeepGEMM on Blackwell).  Reinterpreting those as
-    # floats would quantize silently against garbage, so refuse them here -- W4A8
-    # CUTLASS is Hopper-only today, which is the only reason this cannot fire.
+    # Under `use_ue8m0` DeepEP returns int32-packed UE8M0 scales; reinterpreting
+    # those as fp32 would quantize against garbage.
     assert x_scale.dtype == torch.float32
     assert output_scale.numel() == 1
 

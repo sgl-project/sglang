@@ -493,8 +493,8 @@ def cutlass_w4a8_moe_deepep_ll(
         Shape: scalar or [1, N]
     - apply_router_weight_on_input (bool): When true, the topk weights are
         applied directly on the inputs. This is only applicable when topk is 1.
-    - expected_m (Optional[int]): The dispatcher's expected rows per expert, used
-        to size the requantization grid. Only a launch hint; any value is correct.
+    - expected_m (Optional[int]): Dispatcher's expected rows per expert; a
+        requant launch hint only, any value is correct.
 
     Returns:
     - torch.Tensor: The fp8 output tensor after applying the MoE layer.

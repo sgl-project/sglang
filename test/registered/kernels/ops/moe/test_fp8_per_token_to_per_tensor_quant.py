@@ -1,12 +1,8 @@
 """Unit test for ``fp8_per_token_to_per_tensor_quant_triton``.
 
-W4AFP8 DeepEP low-latency requantizes the fp8 dispatch payload with this kernel
-before the first CUTLASS grouped GEMM.  The payload's hidden size is only
-guaranteed to be a multiple of the fp8 scale-group size (128) -- e.g. 3584 for
-Kimi-K3 -- so the kernel must handle a partial tile of scale groups, and must
-still leave the rows past ``masked_m`` untouched.  The launch geometry
-(``expected_rows``, expert count) only decides how the work is split, so every
-combination has to produce the same bytes.
+The hidden size is only guaranteed to be a multiple of the scale group (128),
+rows past ``masked_m`` must stay untouched, and every launch geometry must
+produce the same bytes.
 """
 
 import pytest
@@ -32,15 +28,13 @@ OUTPUT_SCALE = 2.0
 
 def _build(num_experts, m, k, seed, column_major_scales=False):
     g = torch.Generator(device="cpu").manual_seed(seed)
-    # Integers in [-8, 8] with power-of-two per-token-group scales keep every
-    # intermediate exactly representable in e4m3, so the reference below matches
-    # bit-for-bit regardless of the rounding mode of the final cast.
+    # Integers in [-8, 8] with power-of-two group scales keep every intermediate
+    # exactly representable in e4m3, so the reference matches bit-for-bit.
     x = torch.randint(-8, 9, (num_experts, m, k), generator=g).float()
     exps = torch.randint(-1, 2, (num_experts, m, k // K_SCALE_BLOCK_SIZE), generator=g)
     x_scale = torch.pow(2.0, exps.float()).to(dev)
     if column_major_scales:
-        # DeepEP hands back the last two dims column-major (for TMA), so the
-        # per-group scales an expert needs are m elements apart.
+        # DeepEP returns the last two scale dims column-major (for TMA).
         x_scale = x_scale.permute(0, 2, 1).contiguous().permute(0, 2, 1)
     return x.to(dev).to(FP8), x_scale
 
@@ -56,8 +50,7 @@ def _assert_output(output, x, x_scale, masked):
         torch.testing.assert_close(
             output[e, :valid].float(), ref[e, :valid].float(), rtol=0, atol=0
         )
-        # Padding rows are not part of any expert's GEMM problem size and must
-        # stay as the caller left them.
+        # Rows past masked_m must stay as the caller left them.
         padding = output[e, valid:].float()
         torch.testing.assert_close(
             padding, torch.full_like(padding, SENTINEL), rtol=0, atol=0
@@ -87,8 +80,7 @@ def _run_and_check(num_experts, m, k, masked, expected_rows, column_major_scales
 # 7168: fills every tile of scale groups (the DeepSeek-V3 hidden size).
 # 3584 / 1152: only 128-aligned, so the last tile is partially masked.
 @pytest.mark.parametrize("k", [7168, 3584, 1152])
-# None keeps the shape-independent grid; the others exercise the light-decode and
-# saturated ends of the m-grid heuristic.
+# None: shape-independent grid; 4 and 64: both ends of the m-grid heuristic.
 @pytest.mark.parametrize("expected_rows", [None, 4, 64])
 @pytest.mark.parametrize("column_major_scales", [False, True])
 def test_masked_rows_and_group_tail(k, expected_rows, column_major_scales):
@@ -102,9 +94,8 @@ def test_masked_rows_and_group_tail(k, expected_rows, column_major_scales):
     )
 
 
-# Both counts select the 16-group tile (which 3584 also tails).  The row estimates
-# are the ones that make the expert cap bind: 40 experts cap at 16 programs and 128
-# at 8, so without the cap these would be 32 and 16.
+# Row estimates chosen so the expert-count cap binds: 40 experts cap at 16
+# programs, 128 at 8; uncapped these would be 32 and 16.
 @pytest.mark.parametrize("num_experts,expected_rows", [(40, 32), (128, 16)])
 def test_many_experts(num_experts, expected_rows):
     m = 48
@@ -120,13 +111,9 @@ def test_many_experts(num_experts, expected_rows):
     )
 
 
-# The wrapper sizes the tile from the running part's warp width, so a CI machine
-# only ever exercises its own vendor's choice: an NVIDIA runner never launches the
-# 32-group tile a wave64 part picks, and an AMD one never launches the 16-group
-# tile.  Drive the kernel directly instead, across every width either vendor can
-# choose plus the degenerate single-group one, so the docstring's claim -- that
-# the geometry only decides how the work is split -- is checked on whatever GPU
-# CI happens to have.
+# The wrapper only launches the running vendor's tile, so drive the kernel
+# directly across every width either vendor can pick, plus the degenerate
+# single-group tile.
 @pytest.mark.parametrize("g_block", [1, 8, 16, 32])
 @pytest.mark.parametrize("k", [7168, 3584])
 @pytest.mark.parametrize("m_grid", [1, 4, 32])
@@ -164,9 +151,8 @@ def test_every_launch_geometry_agrees(g_block, k, m_grid, row_cap):
     _assert_output(output, x, x_scale, masked)
 
 
-# An expert with no live rows sits in the middle of the flattened row sequence
-# and must be stepped over, not counted -- the case the prefix-sum mapping is
-# most likely to get wrong by one.
+# Experts with no live rows must be stepped over by the prefix-sum mapping,
+# the case most likely to be off by one.
 @pytest.mark.parametrize(
     "masked", [[0, 0, 0, 0], [0, 5, 0, 7], [9, 0, 0, 0], [0, 0, 0, 9]]
 )

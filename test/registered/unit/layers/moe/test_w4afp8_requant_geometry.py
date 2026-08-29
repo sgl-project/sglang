@@ -16,12 +16,8 @@ ROW_CAP_SLACK = 2
 
 class TestRequantLaunchGeometry(CustomTestCase):
     def test_cap_leaves_ordinary_variation_to_the_owning_expert(self):
-        """Rows below the cap stay on their expert's own programs.
-
-        The dispatcher's average is what the launch is sized for, so an expert
-        near it must not be pushed onto the shared path -- that path costs a
-        lookup per row and only pays for itself under real imbalance.
-        """
+        """Rows below the cap stay on their expert; the shared path costs a
+        lookup per row and only pays under real imbalance."""
         for expected_rows in (1, 4, 16, 64, 256):
             _, _, row_cap = requant_launch_geometry(
                 DSV3_GROUPS, 64, expected_rows=expected_rows
@@ -74,11 +70,8 @@ class TestRequantLaunchGeometry(CustomTestCase):
             self.assertEqual(m_grid, PREVIOUS_FIXED_M_GRID)
 
     def test_dispatcher_round_up_does_not_bump_the_grid(self):
-        """`dispatch_a` reports (rows + num_experts) // num_experts, i.e. one high.
-
-        Rounding the grid up as well would launch twice the programs the sweep
-        found optimal at every power of two.
-        """
+        """dispatch_a reports (rows + num_experts) // num_experts, one high;
+        rounding up as well would double the launch at every power of two."""
         for rows in (4, 8, 16, 32):
             exact = requant_launch_geometry(DSV3_GROUPS, 8, expected_rows=rows)[1]
             reported = requant_launch_geometry(DSV3_GROUPS, 8, expected_rows=rows + 1)[
@@ -92,8 +85,8 @@ class TestRequantLaunchGeometry(CustomTestCase):
             _, m_grid, _ = requant_launch_geometry(
                 K3_GROUPS, 8, expected_rows=expected_rows
             )
-            # A floor keeps a one-row batch from serializing a whole expert into
-            # one program, which measured several times slower than the cap does.
+            # The floor keeps a one-row batch from serializing an expert into
+            # one program (measured several times slower).
             self.assertGreaterEqual(m_grid, 4)
             self.assertLessEqual(m_grid, PREVIOUS_FIXED_M_GRID)
             self.assertGreaterEqual(m_grid, previous)
@@ -109,13 +102,8 @@ class TestRequantLaunchGeometry(CustomTestCase):
                 self.assertLessEqual(g_block, num_groups)
 
     def test_tile_holds_bytes_per_lane_across_warp_widths(self):
-        """The tuned quantity is bytes per lane, so a wider warp takes more elements.
-
-        16 B/lane scored 1.09x of the per-point best on H200 and 1.08x on
-        MI350X, and it is the same tile only once the warp width is applied:
-        2048 elements at warp 32, 4096 at warp 64. Sizing in elements alone
-        would hand a wave64 part half the bytes per lane, which measured 1.17x.
-        """
+        """The tuned unit is bytes per lane: 2048 elements at warp 32 must become
+        4096 at warp 64, or a wave64 part gets half the bytes per lane."""
         for warp_size, want_elems in ((32, 2048), (64, 4096)):
             for group_size in (64, 128, 256, 512):
                 g_block, _, _ = requant_launch_geometry(

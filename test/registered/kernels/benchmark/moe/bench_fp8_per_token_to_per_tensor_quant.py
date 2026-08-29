@@ -1,14 +1,9 @@
 """Benchmark the W4AFP8 DeepEP low-latency requant against its previous geometry.
 
-``legacy-geometry`` launches the current kernel with the launch parameters it
-shipped with (a 1024-element tile, 8 warps, 32 programs per expert regardless of
-how many rows are live), so this isolates the launch geometry and not the
-scale-loading rewrite; ``tuned`` goes through the wrapper, which sizes the tile
-from the part's warp width and the m-grid from the dispatcher's expected rows.
-
-``skew`` covers the case the m-grid cannot see: ``expected_m`` is a global
-average, so a hot expert holding ``skew`` times its share serializes its rows
-over an m-grid sized for the average.
+``legacy-geometry`` launches the current kernel with its previous launch
+parameters (1024-element tile, 8 warps, 32 programs per expert); ``tuned`` goes
+through the wrapper.  ``skew`` concentrates rows on one hot expert, which the
+m-grid cannot see because ``expected_m`` is a dispatch-wide average.
 """
 
 import torch
@@ -33,26 +28,14 @@ LEGACY_M_GRID = 32
 
 
 def _expected_m(num_experts, dispatched_rows):
-    """What the dispatcher would report for ``dispatched_rows`` in total.
-
-    `_DeepEPDispatcherImplLowLatency.dispatch_a` computes
-    ``(dispatched_rows + num_experts) // num_experts``, so an exact average
-    arrives one higher; the production launch has to be benchmarked with that.
-    It is an average over the whole dispatch, so it is the same number however
-    those rows are distributed -- which is what makes ``skew`` interesting.
-    """
+    """``dispatch_a`` reports ``(rows + num_experts) // num_experts``, one high
+    at exact averages; benchmark with what production would pass."""
     return (dispatched_rows + num_experts) // num_experts
 
 
 def _row_counts(num_experts, rows, skew):
-    """Live rows per expert: one hot expert at ``skew * rows``, the rest share.
-
-    A batch dispatches a fixed number of rows, so skew redistributes them rather
-    than adding any: the total stays at ``num_experts * rows`` and the average
-    the m-grid is sized from does not move, however lopsided the routing is.
-    That caps the achievable skew at ``num_experts`` -- one expert taking every
-    row.
-    """
+    """One hot expert at ``skew * rows``, the rest share the fixed remainder; a
+    dispatch redistributes rows, so skew cannot exceed ``num_experts``."""
     if skew == 1:
         return [rows] * num_experts
     total = num_experts * rows
@@ -110,8 +93,7 @@ def _legacy_geometry(x, x_scale, masked_m, output_scale, output, expected_m):
         x.size(1),
         x.size(2),
         x.size(0),
-        # A cap at the padded rows leaves every row on its own expert, which is
-        # what the old launch did.
+        # row_cap = m keeps every row on its own expert, as the old launch did.
         x.size(1),
         K_SCALE_BLOCK_SIZE=K_SCALE_BLOCK_SIZE,
         G_BLOCK_SIZE=LEGACY_G_BLOCK,
@@ -144,8 +126,7 @@ def benchmark(hidden: int, num_experts: int, m: int, rows: int, skew: int, impl:
         input_args=args,
         graph_clone_args=(0, 1),
         memory_args=None,
-        # Only `rows` of the padded payload are live, so a tensor-size-derived
-        # bandwidth would be off by the padding factor.
+        # Tensor-size bandwidth would be off by the padding factor.
         disable_log_bandwidth=True,
     )
 
