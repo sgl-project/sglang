@@ -443,6 +443,12 @@ class TestMpsDeviceMixin(CustomTestCase):
             patch.object(common, "is_mps", return_value=True),
             patch.object(common, "is_cuda", return_value=False),
             patch.object(common, "is_hip", return_value=False),
+            patch.object(common, "is_cpu", return_value=False),
+            patch.object(common, "is_npu", return_value=False),
+            patch.object(common, "is_musa", return_value=False),
+            patch.object(common, "is_habana_available", return_value=False),
+            patch.object(torch.cuda, "is_available", return_value=False),
+            patch.object(torch.xpu, "is_available", return_value=False),
             patch.object(common, "empty_device_cache"),
         ):
             common.get_device_count.cache_clear()

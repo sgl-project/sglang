@@ -55,12 +55,19 @@ from sglang.srt.arg_groups.argparse_actions import (
 from sglang.srt.arg_groups.overrides import (
     mamba_extra_buffer_lazy_of,
     mamba_extra_buffer_of,
+    model_config_of,
     remote_instance_transfer_engine_of,
     resolution_projection,
     resolving_view,
 )
+from sglang.srt.arg_groups.validation_hook import validate_standard_mps_server_args
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.hardware_backend.mps.runtime import (
+    validate_mps_model_config,
+    validate_mps_runtime,
+)
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -3681,6 +3688,24 @@ class ServerArgs:
             )
         from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
 
+        # The standard Torch MPS path must reject an unusable runtime before
+        # the pipeline resolves model paths and downloads a checkpoint, so
+        # that nothing is fetched for a runtime that was never going to work.
+        # MLX opts out: it has its own gate inside the pipeline. The raw
+        # device field is what is available this early, and on macOS --device
+        # is usually omitted, so an unset field falls back to the detected
+        # platform or this gate would be dead code on the normal launch path.
+        if not use_mlx():
+            requested_device = getattr(self, "device", None)
+            explicitly_mps = (
+                requested_device is not None
+                and str(requested_device).split(":", 1)[0] == "mps"
+            )
+            if explicitly_mps or (
+                requested_device is None and get_platform().is_mps
+            ):
+                validate_mps_runtime()
+
         try:
             run_resolution_pipeline(self)
         except BaseException:
@@ -3692,6 +3717,24 @@ class ServerArgs:
         # end of the pipeline that normally sets it: the gate is about whether
         # the handlers ran, not how far they got.
         self._resolution_finished = True
+
+        # The standard Torch MPS path supports a narrow slice of the execution
+        # modes, and the checkpoint-derived ones (a quantized or multimodal
+        # config) are only knowable from the model config. Reading that config
+        # has to stay out of the resolution walk, so both checks land here,
+        # once every declaration is visible. Skipped for none/dummy, which
+        # never reach the end of the pipeline and have no checkpoint.
+        cfg = resolving_view(self)
+        if (
+            cfg.device == "mps"
+            and not use_mlx()
+            and str(cfg.model_path).lower() not in ("none", "dummy")
+        ):
+            validate_standard_mps_server_args(self)
+            validate_mps_model_config(
+                model_config_of(self),
+                lora_enabled=bool(getattr(self, "enable_lora", False)),
+            )
 
     def resolved_dict(self) -> Dict[str, Any]:
         """This configuration as a plain dict of resolved field values.
