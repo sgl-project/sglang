@@ -595,6 +595,15 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
     )
 
 
+def is_moe_input_scattered_across_dp_ranks() -> bool:
+    """Whether sparse MoE routing runs on a DP-local token shard."""
+    return (
+        not get_moe_a2a_backend().is_none()
+        or should_use_flashinfer_cutlass_moe_fp4_allgather()
+        or get_parallel().dwdp_size > 1
+    )
+
+
 def should_use_dp_reduce_scatterv():
     """
     Use reduce_scatterv in the standard dispatcher's combine() for DP attention
@@ -695,14 +704,17 @@ def speculative_moe_a2a_backend_context():
     moe = get_flags().moe
     original_backend = moe.a2a_backend
     original_disable_fp4_allgather = moe.disable_fp4_allgather
+    original_speculative_context = moe.speculative_context
     try:
         moe.a2a_backend = get_speculative_moe_a2a_backend()
         # Disable FP4 allgather for spec decode since MTP layers are unquantized
         moe.disable_fp4_allgather = True
+        moe.speculative_context = True
         yield
     finally:
         moe.a2a_backend = original_backend
         moe.disable_fp4_allgather = original_disable_fp4_allgather
+        moe.speculative_context = original_speculative_context
 
 
 # The type of method in top-K routing, for use in torch custom op
