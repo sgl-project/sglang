@@ -111,7 +111,7 @@ def qsa_sm121_varlen_attention(
 ) -> torch.Tensor:
     """Run the one-query packed-varlen attention contract emitted by QSA."""
 
-    del max_seqlen_k, causal
+    del causal
     if not q.is_cuda or not k.is_cuda or not v.is_cuda:
         raise RuntimeError("SM121 QSA varlen attention requires CUDA tensors")
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
@@ -150,6 +150,32 @@ def qsa_sm121_varlen_attention(
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_ENABLE_KDA_QSA_SM121.get():
+        from sglang.kernels.ops.attention import (
+            can_use_kda_qwen38_qsa_sm121,
+            kda_qwen38_qsa_sm121,
+        )
+
+        if can_use_kda_qwen38_qsa_sm121(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_k,
+        ):
+            return kda_qwen38_qsa_sm121(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_k,
+                softmax_scale,
+            )
+
     output = torch.empty_like(q)
     padded_head_dim = triton.next_power_of_2(max(head_dim, 16))
     _qsa_one_query_varlen_kernel[(total_queries, num_q_heads)](

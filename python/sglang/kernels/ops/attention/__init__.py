@@ -6,8 +6,21 @@ The Triton kernels migrated here live in this package
 KV-cache index/write kernels went to the ``kvcache`` group instead.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.selector import get_kernel
+from sglang.kernels.spec import (
+    CapabilityRequirement,
+    FormatSignature,
+    KernelBackend,
+    KernelSpec,
+)
+
+if TYPE_CHECKING:
+    import torch
 
 # (module, public_fn) migrated from layers/attention/triton_ops + model_executor.
 _TRITON_KERNELS = [
@@ -43,7 +56,65 @@ for _mod, _fn in _TRITON_KERNELS:
     )
 del _mod, _fn
 
-__all__ = []
+register_kernel(
+    KernelSpec(
+        op="attention.kda_qwen38_qsa_sm121",
+        backend=KernelBackend.TRITON,
+        target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:" "qwen38_qsa_sm121"),
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(12, 1), max_sm=(12, 1))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description=(
+                "Qwen3.8 packed QSA decode: D=256, 12:1 GQA, " "q_rows in {1,3,4,12}"
+            ),
+        ),
+        description=(
+            "SM121 Qwen3.8 QSA decode optimized by Codex/Kimi K3 through " "KDA-1.5."
+        ),
+    )
+)
+
+
+def can_use_kda_qwen38_qsa_sm121(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_k: int,
+) -> bool:
+    """Check the exact E2E-qualified Qwen3.8/SM121 QSA contract."""
+    from sglang.kernels.kda_kernels.qwen38_qsa_sm121 import (
+        can_use_qwen38_qsa_sm121,
+    )
+
+    return can_use_qwen38_qsa_sm121(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_k)
+
+
+def kda_qwen38_qsa_sm121(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Run the Codex/Kimi K3 KDA Qwen3.8 QSA kernel on SM121."""
+    return get_kernel("attention.kda_qwen38_qsa_sm121", KernelBackend.TRITON)(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_k,
+        softmax_scale,
+    )
+
+
+__all__ = ["can_use_kda_qwen38_qsa_sm121", "kda_qwen38_qsa_sm121"]
 
 
 # Vendored linear-attention (flash-linear-attention port) kernels relocated
