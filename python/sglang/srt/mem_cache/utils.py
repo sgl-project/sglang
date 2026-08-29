@@ -14,7 +14,7 @@
 """Common utilities."""
 
 import hashlib
-from typing import Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 from sglang.kernels.ops.kvcache.mla_buffer import (
     get_mla_kv_buffer_kernel as get_mla_kv_buffer_kernel,
@@ -55,6 +55,9 @@ from sglang.srt.mem_cache.evict_policy import (
     PriorityStrategy,
     SLRUStrategy,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.radix_cache import RadixKey
 
 _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
     "lru": LRUStrategy,
@@ -116,6 +119,40 @@ def get_hash_str(
     return get_native_hash(token_ids, prior_digest, page_size)
 
 
+# Domain separator for the namespace seed; bump it to invalidate salted L3 entries.
+_CACHE_NAMESPACE_DOMAIN = b"sglang-cache-namespace-v1"
+
+
+def namespace_seed(key: "RadixKey") -> Optional[str]:
+    """The digest a page-hash chain starts from, or None for the default namespace.
+
+    Page hashes cover token ids only, so a chain that starts unseeded names the
+    same L3 page for every namespace. Seeding the head with extra_key/cache_salt
+    keeps those namespaces apart. Each part is hashed with a presence byte and
+    its length, so ('a', 'bc') cannot alias ('ab', 'c') and an absent part cannot
+    alias an empty one.
+    """
+    if key.extra_key is None and key.cache_salt is None:
+        return None
+
+    digest = hashlib.sha256(_CACHE_NAMESPACE_DOMAIN)
+    for part in (key.extra_key, key.cache_salt):
+        if part is None:
+            digest.update(b"\x00")
+            continue
+        encoded = part.encode("utf-8")
+        digest.update(b"\x01")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def chain_prior_hash(key: "RadixKey", prior_hash: Optional[str]) -> Optional[str]:
+    """What this page-hash chain links back to: the prior page when the chain
+    continues, else the seed that scopes a fresh chain to its namespace."""
+    return prior_hash if prior_hash else namespace_seed(key)
+
+
 def hash_str_to_int64(hash_str: str) -> int:
     """Convert SHA256 hex string to signed 64-bit integer for events.
 
@@ -133,6 +170,7 @@ def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
     if node.parent is not None and node.parent.hash_value is not None:
         if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
             parent_hash = node.parent.hash_value[-1]
+    parent_hash = chain_prior_hash(node.key, parent_hash)
 
     hash_values = get_hash_str(node.key, parent_hash, page_size=page_size)
     assert isinstance(hash_values, list)

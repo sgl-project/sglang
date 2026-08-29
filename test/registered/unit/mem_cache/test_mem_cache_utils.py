@@ -56,10 +56,11 @@ def _legacy_page_hashes(key, page_size, prior_hash=None):
 
 
 class _HashKey:
-    def __init__(self, token_ids, is_bigram=False, cache_salt=None):
+    def __init__(self, token_ids, is_bigram=False, cache_salt=None, extra_key=None):
         self.token_ids = token_ids
         self.is_bigram = is_bigram
         self.cache_salt = cache_salt
+        self.extra_key = extra_key
 
     def __len__(self):
         if self.is_bigram:
@@ -75,8 +76,13 @@ class _HashKey:
                     self.token_ids[start : stop + 1],
                     is_bigram=True,
                     cache_salt=self.cache_salt,
+                    extra_key=self.extra_key,
                 )
-            return _HashKey(self.token_ids[start:stop], cache_salt=self.cache_salt)
+            return _HashKey(
+                self.token_ids[start:stop],
+                cache_salt=self.cache_salt,
+                extra_key=self.extra_key,
+            )
         if self.is_bigram:
             return (self.token_ids[index], self.token_ids[index + 1])
         return self.token_ids[index]
@@ -333,16 +339,38 @@ class TestComputeNodeHashValues(unittest.TestCase):
             compute_node_event_hash_values(self._make_node(key), page_size=8),
             _legacy_page_hashes(key, page_size=8, prior_hash=seed),
         )
-        self.assertEqual(
-            compute_node_hash_values(self._make_node(key), page_size=8),
-            _legacy_page_hashes(key, page_size=8),
-        )
 
         other = _HashKey(array("q", range(1, 17)), cache_salt="tenant-b")
         self.assertNotEqual(
             compute_node_event_hash_values(self._make_node(key), page_size=8),
             compute_node_event_hash_values(self._make_node(other), page_size=8),
         )
+
+    def test_storage_hash_chain_is_namespaced(self):
+        """Requests whose extra_key or cache_salt differ must not name the same
+        L3 storage page even when their token ids are identical (#26747). The
+        ('a', 'bc') / ('ab', 'c') pair additionally pins that the two parts stay
+        distinguishable once concatenated."""
+        tokens = array("q", range(1, 17))
+        namespaced = [
+            _HashKey(tokens, extra_key="tenant-a"),
+            _HashKey(tokens, extra_key="tenant-b"),
+            _HashKey(tokens, cache_salt="tenant-a"),
+            _HashKey(tokens, extra_key="tenant-a", cache_salt="tenant-a"),
+            _HashKey(tokens, extra_key="a", cache_salt="bc"),
+            _HashKey(tokens, extra_key="ab", cache_salt="c"),
+        ]
+
+        hashes = [
+            tuple(compute_node_hash_values(self._make_node(key), page_size=8))
+            for key in namespaced
+        ]
+        default = tuple(
+            compute_node_hash_values(self._make_node(_HashKey(tokens)), page_size=8)
+        )
+
+        self.assertEqual(len(set(hashes)), len(hashes))
+        self.assertNotIn(default, set(hashes))
 
     def test_cache_salt_event_hashes_are_memoized(self):
         node = self._make_node(
