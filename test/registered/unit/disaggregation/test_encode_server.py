@@ -130,6 +130,16 @@ class TestEncoderPreprocessorKimiGrid(CustomTestCase):
 
 
 class TestEncoderDelivery(CustomTestCase):
+    @staticmethod
+    def _global_cache_context(num_items=2):
+        return SimpleNamespace(
+            req_id="req",
+            num_items=num_items,
+            str_mm_hashes=[f"hash-{i}" for i in range(num_items)],
+            modality=Modality.IMAGE,
+            preprocess_result=SimpleNamespace(token_counts=[2] * num_items),
+        )
+
     def test_contract_has_two_direct_implementations(self):
         self.assertEqual(EncoderDelivery.__abstractmethods__, {"send", "release"})
         self.assertEqual(
@@ -211,6 +221,90 @@ class TestEncoderDelivery(CustomTestCase):
             )
             await encoder._release_encode_ref(first_state)
             await encoder._release_encode_ref(second_state)
+
+        asyncio.run(run())
+
+    def test_global_cache_lookup_failure_falls_back_to_all_misses(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 0
+            encoder.mm_global_cache = SimpleNamespace(
+                batch_is_exist=AsyncMock(side_effect=RuntimeError("store down"))
+            )
+            encoder._broadcast_global_cache_mask = unittest.mock.Mock()
+
+            missing_indices, hit_indices = await encoder._lookup_global_cache(
+                self._global_cache_context()
+            )
+
+            self.assertEqual(missing_indices, [0, 1])
+            self.assertEqual(hit_indices, [])
+            torch.testing.assert_close(
+                encoder._broadcast_global_cache_mask.call_args.args[0],
+                torch.zeros(2, dtype=torch.int32),
+            )
+
+        asyncio.run(run())
+
+    def test_global_cache_prefetch_failure_immediately_falls_back(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 0
+            encoder.mm_global_cache = SimpleNamespace(
+                prefetch=unittest.mock.Mock(side_effect=RuntimeError("store down"))
+            )
+            encoder._broadcast_global_cache_mask = unittest.mock.Mock()
+            ctx = self._global_cache_context()
+
+            hit_hashes, failed = encoder._prefetch_global_cache_hits(ctx, [0, 1])
+            fallback_indices = await encoder._wait_global_cache_prefetch(
+                ctx, [0, 1], hit_hashes, failed
+            )
+
+            self.assertTrue(failed)
+            self.assertEqual(hit_hashes, [])
+            self.assertEqual(fallback_indices, [0, 1])
+            torch.testing.assert_close(
+                encoder._broadcast_global_cache_mask.call_args.args[0],
+                torch.ones(2, dtype=torch.int32),
+            )
+
+        asyncio.run(run())
+
+    def test_global_cache_staging_failure_skips_insert(self):
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder.mm_global_cache = SimpleNamespace(
+            store_to_pool_async=unittest.mock.Mock(
+                side_effect=RuntimeError("pool full")
+            )
+        )
+
+        hashes, handles = encoder._stage_global_cache_slices(
+            self._global_cache_context(num_items=1),
+            [0],
+            [torch.ones((2, 4))],
+        )
+
+        self.assertEqual(hashes, [])
+        self.assertEqual(handles, [])
+
+    def test_global_cache_insert_failure_is_contained(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.background_tasks = set()
+            encoder.mm_global_cache = SimpleNamespace(
+                wait_store_to_pool=unittest.mock.Mock(
+                    side_effect=RuntimeError("store down")
+                ),
+                insert_batch=unittest.mock.Mock(),
+            )
+
+            encoder._launch_global_cache_insert(
+                self._global_cache_context(num_items=1), ["hash-0"], [object()]
+            )
+            await asyncio.gather(*encoder.background_tasks)
+
+            encoder.mm_global_cache.insert_batch.assert_not_called()
 
         asyncio.run(run())
 

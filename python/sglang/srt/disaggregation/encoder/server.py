@@ -1045,7 +1045,17 @@ class MMEncoder:
         ctx: EncodeContext,
     ) -> Tuple[List[int], List[int]]:
         if self.rank == 0:
-            exist_mask = await self.mm_global_cache.batch_is_exist(ctx.str_mm_hashes)
+            try:
+                exist_mask = await self.mm_global_cache.batch_is_exist(
+                    ctx.str_mm_hashes
+                )
+            except Exception:
+                logger.exception(
+                    "Global multimodal cache lookup failed for req %s; "
+                    "falling back to ViT",
+                    ctx.req_id,
+                )
+                exist_mask = [False] * ctx.num_items
             mask_tensor = torch.tensor(
                 [1 if e else 0 for e in exist_mask], dtype=torch.int32
             )
@@ -1063,53 +1073,92 @@ class MMEncoder:
         self,
         ctx: EncodeContext,
         hit_indices: List[int],
-    ) -> List[str]:
+    ) -> Tuple[List[str], bool]:
         if self.rank != 0 or not hit_indices:
-            return []
+            return [], False
 
         hit_hashes = [ctx.str_mm_hashes[i] for i in hit_indices]
         hit_tokens = [ctx.preprocess_result.token_counts[i] for i in hit_indices]
-        self.mm_global_cache.prefetch(ctx.req_id, hit_hashes, hit_tokens, ctx.modality)
-        return hit_hashes
+        try:
+            self.mm_global_cache.prefetch(
+                ctx.req_id, hit_hashes, hit_tokens, ctx.modality
+            )
+        except Exception:
+            logger.exception(
+                "Global multimodal cache prefetch failed for req %s; "
+                "falling back to ViT",
+                ctx.req_id,
+            )
+            return [], True
+        return hit_hashes, False
 
     async def _wait_global_cache_prefetch(
         self,
         ctx: EncodeContext,
         hit_indices: List[int],
         hit_hashes: List[str],
+        prefetch_failed: bool,
     ) -> List[int]:
         fallback_mask = torch.zeros(ctx.num_items, dtype=torch.int32)
         if self.rank == 0 and hit_indices:
-            try:
-
-                async def _wait_prefetch():
-                    while not self.mm_global_cache.check_prefetch_progress(ctx.req_id):
-                        await asyncio.sleep(0.005)
-
-                await asyncio.wait_for(_wait_prefetch(), timeout=60.0)
-
-                for i, idx in enumerate(hit_indices):
-                    if not self.mm_global_cache.has_local_embedding(hit_hashes[i]):
-                        fallback_mask[idx] = 1
-                num_partial_fail = int(fallback_mask.sum().item())
-                if num_partial_fail > 0:
-                    logger.warning(
-                        f"Req {ctx.req_id}: {num_partial_fail}/{len(hit_indices)} "
-                        f"cache-hit items failed to load, falling back to ViT"
-                    )
-            except (asyncio.TimeoutError, Exception) as e:
-                logger.error(
-                    f"Prefetch failed for req {ctx.req_id}: {e}. "
-                    f"Falling back to ViT for {len(hit_indices)} hit items."
-                )
+            if prefetch_failed:
                 for idx in hit_indices:
                     fallback_mask[idx] = 1
+            else:
+                try:
+
+                    async def _wait_prefetch():
+                        while not self.mm_global_cache.check_prefetch_progress(
+                            ctx.req_id
+                        ):
+                            await asyncio.sleep(0.005)
+
+                    await asyncio.wait_for(_wait_prefetch(), timeout=60.0)
+
+                    for i, idx in enumerate(hit_indices):
+                        if not self.mm_global_cache.has_local_embedding(hit_hashes[i]):
+                            fallback_mask[idx] = 1
+                    num_partial_fail = int(fallback_mask.sum().item())
+                    if num_partial_fail > 0:
+                        logger.warning(
+                            f"Req {ctx.req_id}: {num_partial_fail}/{len(hit_indices)} "
+                            f"cache-hit items failed to load, falling back to ViT"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"Prefetch failed for req {ctx.req_id}: {e}. "
+                        f"Falling back to ViT for {len(hit_indices)} hit items."
+                    )
+                    for idx in hit_indices:
+                        fallback_mask[idx] = 1
 
         self._broadcast_global_cache_mask(fallback_mask)
         fallback_indices = [
             i for i in range(ctx.num_items) if fallback_mask[i].item() == 1
         ]
         return fallback_indices
+
+    def _stage_global_cache_slices(
+        self,
+        ctx: EncodeContext,
+        indices: List[int],
+        slices: List[torch.Tensor],
+    ) -> Tuple[List[str], List[Any]]:
+        """Stage cache insert data without making cache failure fatal."""
+        if not slices:
+            return [], []
+        hashes = [ctx.str_mm_hashes[i] for i in indices]
+        try:
+            handles = self.mm_global_cache.store_to_pool_async(
+                hashes, slices, ctx.modality
+            )
+        except Exception:
+            logger.exception(
+                "Global multimodal cache staging failed for req %s; " "skipping insert",
+                ctx.req_id,
+            )
+            return [], []
+        return hashes, handles
 
     def _launch_global_cache_insert(
         self,
@@ -1121,15 +1170,20 @@ class MMEncoder:
             return
 
         async def _background_insert():
-            await asyncio.to_thread(
-                self.mm_global_cache.wait_store_to_pool,
-                d2h_handles,
-            )
-            await asyncio.to_thread(
-                self.mm_global_cache.insert_batch,
-                hashes,
-                ctx.modality,
-            )
+            try:
+                await asyncio.to_thread(
+                    self.mm_global_cache.wait_store_to_pool,
+                    d2h_handles,
+                )
+                await asyncio.to_thread(
+                    self.mm_global_cache.insert_batch,
+                    hashes,
+                    ctx.modality,
+                )
+            except Exception:
+                logger.exception(
+                    "Global multimodal cache insert failed for req %s", ctx.req_id
+                )
 
         task = asyncio.create_task(_background_insert())
         self.background_tasks.add(task)
@@ -1261,7 +1315,7 @@ class MMEncoder:
     ) -> Optional[torch.Tensor]:
         """Resolve cache hits, compute misses, assemble output, and insert misses."""
         missing_indices, hit_indices = await self._lookup_global_cache(ctx)
-        hit_hashes = self._prefetch_global_cache_hits(ctx, hit_indices)
+        hit_hashes, prefetch_failed = self._prefetch_global_cache_hits(ctx, hit_indices)
 
         new_slices = []
         if missing_indices:
@@ -1273,19 +1327,20 @@ class MMEncoder:
                 ctx.get_feature_fn,
             )
 
+        miss_hashes = []
         miss_d2h_handles = []
         # The CPU output path starts D2H staging before waiting for cache-hit loads.
         if self.rank == 0 and new_slices and not keep_on_gpu:
-            miss_hashes = [ctx.str_mm_hashes[i] for i in missing_indices]
-            miss_d2h_handles = self.mm_global_cache.store_to_pool_async(
-                miss_hashes, new_slices, ctx.modality
+            miss_hashes, miss_d2h_handles = self._stage_global_cache_slices(
+                ctx, missing_indices, new_slices
             )
 
         fallback_indices = await self._wait_global_cache_prefetch(
-            ctx, hit_indices, hit_hashes
+            ctx, hit_indices, hit_hashes, prefetch_failed
         )
 
         fallback_slices = []
+        fallback_hashes = []
         fallback_d2h_handles = []
         if fallback_indices:
             logger.info(
@@ -1300,9 +1355,8 @@ class MMEncoder:
                 ctx.get_feature_fn,
             )
             if self.rank == 0 and not keep_on_gpu:
-                fallback_hashes = [ctx.str_mm_hashes[i] for i in fallback_indices]
-                fallback_d2h_handles = self.mm_global_cache.store_to_pool_async(
-                    fallback_hashes, fallback_slices, ctx.modality
+                fallback_hashes, fallback_d2h_handles = self._stage_global_cache_slices(
+                    ctx, fallback_indices, fallback_slices
                 )
 
         if self.rank == 0:
@@ -1310,14 +1364,14 @@ class MMEncoder:
                 # Start staging newly computed GPU slices into the CPU cache
                 # pool asynchronously before assembling the GPU output.
                 if new_slices:
-                    miss_hashes = [ctx.str_mm_hashes[i] for i in missing_indices]
-                    miss_d2h_handles = self.mm_global_cache.store_to_pool_async(
-                        miss_hashes, new_slices, ctx.modality
+                    miss_hashes, miss_d2h_handles = self._stage_global_cache_slices(
+                        ctx, missing_indices, new_slices
                     )
                 if fallback_slices:
-                    fallback_hashes = [ctx.str_mm_hashes[i] for i in fallback_indices]
-                    fallback_d2h_handles = self.mm_global_cache.store_to_pool_async(
-                        fallback_hashes, fallback_slices, ctx.modality
+                    fallback_hashes, fallback_d2h_handles = (
+                        self._stage_global_cache_slices(
+                            ctx, fallback_indices, fallback_slices
+                        )
                     )
                 mm_embedding = self._assemble_global_cache_gpu(
                     ctx,
@@ -1336,11 +1390,9 @@ class MMEncoder:
                     fallback_slices,
                 )
 
-            new_hashes = [ctx.str_mm_hashes[i] for i in missing_indices]
-            new_hashes += [ctx.str_mm_hashes[i] for i in fallback_indices]
             self._launch_global_cache_insert(
                 ctx,
-                new_hashes,
+                miss_hashes + fallback_hashes,
                 miss_d2h_handles + fallback_d2h_handles,
             )
             return mm_embedding
