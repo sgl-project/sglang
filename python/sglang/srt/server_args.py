@@ -2362,6 +2362,11 @@ class ServerArgs:
     speculative_ngram_max_trie_depth: A[
         int, "The max trie depth for ngram speculative decoding.", NS("spec")
     ] = 18
+    speculative_ngram_max_sam_match_depth: A[
+        Optional[int],
+        "The maximum suffix match length for external SAMs in ngram speculative decoding. Defaults to --speculative-ngram-max-trie-depth.",
+        NS("spec"),
+    ] = None
     speculative_ngram_capacity: A[
         int, "The cache capacity for ngram speculative decoding.", NS("spec")
     ] = 10 * 1000 * 1000
