@@ -94,7 +94,8 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
         )
         if "pe" in server_args.component_paths:
             pe_component_path = prepare_diffusers_component_path_for_loading(
-                pe_component_path, revision=server_args.revision
+                pe_component_path,
+                revision=server_args.component_revision("pe"),
             )
         if os.path.exists(os.path.join(pe_component_path, "tokenizer_config.json")):
             return pe_component_path
@@ -215,7 +216,7 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 )
                 pe_tokenizer = AutoTokenizer.from_pretrained(
                     pe_tokenizer_path,
-                    revision=server_args.revision,
+                    revision=server_args.component_revision("pe"),
                     trust_remote_code=server_args.trust_remote_code,
                 )
             self.add_stage(

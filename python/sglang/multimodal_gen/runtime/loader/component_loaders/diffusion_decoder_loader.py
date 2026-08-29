@@ -30,7 +30,9 @@ class DiffusionDecoderLoader(PlainStateDictComponentLoader):
         *args,
     ):
         config = self.load_component_config(
-            component_model_path, component_name, revision=server_args.revision
+            component_model_path,
+            component_name,
+            revision=server_args.component_revision(component_name),
         )
         component_weights_path = self.resolve_component_weights_path(
             component_model_path, server_args, component_name

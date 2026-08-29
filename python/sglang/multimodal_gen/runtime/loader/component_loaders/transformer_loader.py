@@ -112,6 +112,9 @@ def _server_args_for_transformer_component(
         component_server_args = copy.copy(server_args)
         if component_weights_path is not None:
             component_server_args.transformer_weights_path = component_weights_path
+            component_server_args.revision = server_args.component_revision(
+                component_name
+            )
             component_server_args.nunchaku_config = None
             logger.info(
                 "Using transformer_weights_path override for %s: %s",
@@ -206,7 +209,8 @@ class TransformerLoader(ComponentLoader):
 
         # 1. hf config
         config = get_diffusers_component_config(
-            component_path=component_model_path, revision=server_args.revision
+            component_path=component_model_path,
+            revision=server_args.component_revision(component_name),
         )
 
         gguf_file = resolve_transformer_gguf_to_load(

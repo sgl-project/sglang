@@ -22,9 +22,9 @@ class VisionLanguageEncoderLoader(ComponentLoader):
         self,
         component_model_path: str,
         server_args: ServerArgs,
-        transformers_or_diffusers: str = "vision_language_encoder",
+        component_name: str = "vision_language_encoder",
     ) -> Any:
-        if transformers_or_diffusers == "vision_language_encoder":
+        if component_name == "vision_language_encoder":
 
             if server_args.srt_encoder_url is not None:
                 health_url = server_args.srt_encoder_url.rstrip("/") + "/health"
@@ -56,7 +56,7 @@ class VisionLanguageEncoderLoader(ComponentLoader):
             config = get_hf_config(
                 component_model_path,
                 trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
+                revision=server_args.component_revision(component_name),
             )
             target_device = self.target_device(
                 server_args.should_start_component_on_cpu("vision_language_encoder")
@@ -65,10 +65,10 @@ class VisionLanguageEncoderLoader(ComponentLoader):
                 component_model_path,
                 config=config,
                 trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
+                revision=server_args.component_revision(component_name),
             ).to(target_device)
             return model
         else:
             raise ValueError(
-                f"Unsupported library for VisionLanguageEncoder: {transformers_or_diffusers}"
+                f"Unsupported component for VisionLanguageEncoder: {component_name}"
             )

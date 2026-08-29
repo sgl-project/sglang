@@ -33,7 +33,7 @@ def test_component_override_resolves_hub_subfolder_before_loading(tmp_path):
         component_paths={
             "text_encoder_2": "diffusers/FLUX.1-dev-bnb-4bit/text_encoder_2"
         },
-        revision="pinned-revision",
+        component_revision=lambda _component: "component-revision",
     )
 
     with patch(
@@ -51,7 +51,7 @@ def test_component_override_resolves_hub_subfolder_before_loading(tmp_path):
     download.assert_called_once_with(
         "diffusers/FLUX.1-dev-bnb-4bit",
         allow_patterns=["text_encoder_2/**", "text_encoder_2/*"],
-        revision="pinned-revision",
+        revision="component-revision",
     )
 
 
@@ -98,13 +98,13 @@ def test_non_weight_component_loaders_pin_revision(
     ) as native_loader:
         loader.load_customized(
             "owner/component",
-            SimpleNamespace(revision="pinned-revision"),
+            SimpleNamespace(component_revision=lambda _component: "component-revision"),
             component_name,
         )
 
     native_loader.from_pretrained.assert_called_once_with(
         "owner/component",
-        revision="pinned-revision",
+        revision="component-revision",
         **expected_kwargs,
     )
 

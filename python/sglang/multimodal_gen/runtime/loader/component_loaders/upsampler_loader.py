@@ -210,7 +210,8 @@ class UpsamplerLoader(PlainStateDictComponentLoader):
         )
         if component_weights_path == component_model_path:
             safetensors_path = _find_safetensors_file(
-                component_weights_path, revision=server_args.revision
+                component_weights_path,
+                revision=server_args.component_revision(component_name),
             )
         else:
             safetensors_path = _find_safetensors_file(component_weights_path)

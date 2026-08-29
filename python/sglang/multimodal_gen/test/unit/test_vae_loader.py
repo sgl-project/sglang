@@ -41,12 +41,16 @@ class _FakeServerArgs:
         self.num_gpus = num_gpus
         self.model_paths = {}
         self.revision = "test-revision"
+        self.component_revisions = {"vae": "test-revision"}
         self.trust_remote_code = True
         self.layerwise_components = set()
         self.component_quantizations = {}
 
     def resolve_component_attention_backend(self, _component_name):
         return None, None
+
+    def component_revision(self, component_name):
+        return self.component_revisions.get(component_name)
 
     def should_start_component_on_cpu(self, _component_name):
         return False

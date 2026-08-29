@@ -374,7 +374,7 @@ class TestCosmos3SchedulerConfig(unittest.TestCase):
                 scheduler_class_override="FlowUniPCMultistepScheduler",
                 flow_shift=None,
             ),
-            revision=None,
+            component_revision=lambda _component: None,
         )
         with (
             mock.patch.object(

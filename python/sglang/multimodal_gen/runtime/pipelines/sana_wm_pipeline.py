@@ -212,7 +212,8 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
                 server_args, module_name, subpath
             )
             component_path = prepare_diffusers_component_path_for_loading(
-                component_path, revision=server_args.revision
+                component_path,
+                revision=server_args.component_revision(module_name),
             )
             logger.info(
                 "SANA-WM loading refiner component %s from %s",
@@ -249,7 +250,7 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
 
             module = LTX2VideoTransformer3DModel.from_pretrained(
                 component_path,
-                revision=server_args.revision,
+                revision=server_args.component_revision(module_name),
                 torch_dtype=dtype,
             ).eval()
             module = OfficialDiffusersLTX2RefinerModule(module)
@@ -258,7 +259,7 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
 
             module = LTX2TextConnectors.from_pretrained(
                 component_path,
-                revision=server_args.revision,
+                revision=server_args.component_revision(module_name),
                 torch_dtype=dtype,
             ).eval()
         elif module_name == "text_encoder_2":
@@ -268,14 +269,15 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
                 component_path,
                 torch_dtype=dtype,
                 low_cpu_mem_usage=True,
-                revision=server_args.revision,
+                revision=server_args.component_revision(module_name),
             ).eval()
             module = OfficialGemma3TextEncoderModule(module)
         elif module_name == "tokenizer_2":
             from transformers import AutoTokenizer
 
             module = AutoTokenizer.from_pretrained(
-                component_path, revision=server_args.revision
+                component_path,
+                revision=server_args.component_revision(module_name),
             )
         else:
             raise ValueError(f"Unsupported SANA-WM refiner component: {module_name}")

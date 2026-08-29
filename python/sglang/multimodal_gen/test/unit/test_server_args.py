@@ -167,6 +167,23 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             args.component_paths["vae"], os.path.expanduser("~/fake/local/vae")
         )
 
+    def test_component_revision_does_not_leak_base_revision_to_replacements(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "revision": "base-revision",
+                "component_paths": {"text_encoder": "owner/text-encoder"},
+                "component_weights_paths": {"vae": "owner/vae/model.safetensors"},
+                "component_revisions": {"image-encoder": "image-revision"},
+            }
+        )
+
+        self.assertEqual(args.component_revision(None), "base-revision")
+        self.assertEqual(args.component_revision("transformer"), "base-revision")
+        self.assertIsNone(args.component_revision("text_encoder"))
+        self.assertIsNone(args.component_revision("vae"))
+        self.assertEqual(args.component_revision("image_encoder"), "image-revision")
+
     def test_component_weight_file_keeps_base_component_config(self):
         args = self._from_dict_without_model_resolution(
             {
@@ -494,6 +511,9 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 "--component-weights-paths.text_encoder",
                 "owner/repo/text_encoder.safetensors",
                 "--image-encoder-weights-path=/custom/image_encoder.safetensors",
+                "--component-revisions.text_encoder",
+                "qwen3-vl-fp8",
+                "--vae-revision=v1.2.0",
                 "--component-quantizations.text_encoder",
                 "kitchen_int8",
                 "--component-quantization-ignored-layers.text_encoder",
@@ -537,6 +557,10 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 "image_encoder": "/custom/image_encoder.safetensors",
             },
             server_args.component_weights_paths,
+        )
+        self.assertEqual(
+            {"text_encoder": "qwen3-vl-fp8", "vae": "v1.2.0"},
+            server_args.component_revisions,
         )
         self.assertEqual(
             {"transformer": "fa"},

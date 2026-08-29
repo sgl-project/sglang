@@ -19,6 +19,7 @@ Choose the option from the source you have, not from the precision name:
 | --- | --- | --- |
 | Complete component repo/directory | `--component-paths.<component> <source>` | Replaces that component's config and weights. |
 | Weight file/directory for an existing component | `--component-weights-paths.<component> <source>` | Keeps the base component config and replaces only its weights. |
+| Pin a remote replacement component | `--component-revisions.<component> <revision>` | Pins that component independently of `--model-path`. |
 | Online quantization of unquantized weights | `--component-quantizations.<component> <method>` | Constructs a supported quantized implementation during load; use `--component-quantization-ignored-layers.<component>` for exclusions. |
 | Primary DiT convenience spellings | `--transformer-path`, `--transformer-weights-path`, `--quantization` | Aliases for pipelines with one primary DiT; they remain supported but are not generic component names. |
 | Causal KV-cache compression | `--kv-cache-quant` | Quantizes completed runtime cache chunks, not checkpoint weights. |
@@ -27,6 +28,10 @@ Choose the option from the source you have, not from the precision name:
 key from its `model_index.json` or native pipeline registry; examples include
 `transformer`, `transformer_2`, `text_encoder`, `video_vae`, and `audio_vae`,
 but no one name is universal.
+
+`--revision` selects the base-model revision. Use
+`--component-revisions.<component>` when a replacement is hosted in another
+Hub repository, so its config and selected weight files resolve together.
 
 Recommended example for pre-quantized checkpoints:
 

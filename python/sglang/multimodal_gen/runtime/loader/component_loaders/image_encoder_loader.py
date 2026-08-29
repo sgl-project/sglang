@@ -35,7 +35,8 @@ class ImageEncoderLoader(TextEncoderLoader):
         #     model_override_args=None,
         # )
         model_config = get_diffusers_component_config(
-            component_path=component_model_path, revision=server_args.revision
+            component_path=component_model_path,
+            revision=server_args.component_revision(component_name),
         )
 
         encoder_config = server_args.pipeline_config.image_encoder_config

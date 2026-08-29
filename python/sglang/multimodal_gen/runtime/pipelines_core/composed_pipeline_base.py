@@ -358,7 +358,8 @@ class ComposedPipelineBase(ABC):
         override_path = server_args.component_paths.get(module_name)
         if override_path is not None:
             component_model_path = prepare_diffusers_component_path_for_loading(
-                override_path, revision=server_args.revision
+                override_path,
+                revision=server_args.component_revision(module_name),
             )
         else:
             component_model_path = os.path.join(self.model_path, load_module_name)

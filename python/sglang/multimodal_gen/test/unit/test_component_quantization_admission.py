@@ -37,14 +37,15 @@ class _TestLoader(PlainStateDictComponentLoader):
 class TestComponentQuantizationAdmission(unittest.TestCase):
     def test_plain_loader_resolves_weights_separately_from_config(self):
         server_args = SimpleNamespace(
-            component_weights_paths={"vocoder": "owner/repo/vocoder.safetensors"}
+            component_weights_paths={"vocoder": "owner/repo/vocoder.safetensors"},
+            component_revision=lambda _component: "component-revision",
         )
         with (
             patch(
                 "sglang.multimodal_gen.runtime.loader.component_loaders."
                 "component_loader.resolve_weight",
                 return_value="resolved",
-            ),
+            ) as resolve_weight,
             patch(
                 "sglang.multimodal_gen.runtime.loader.component_loaders."
                 "component_loader.materialize_weight",
@@ -56,6 +57,10 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
                     "/base/vocoder", server_args, "vocoder"
                 ),
                 "/cache/vocoder.safetensors",
+            )
+            resolve_weight.assert_called_once_with(
+                "owner/repo/vocoder.safetensors",
+                revision="component-revision",
             )
 
     def test_plain_checkpoint_config_is_accepted(self):
@@ -140,7 +145,9 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
         ):
             AdapterLoader().load_customized(
                 "/model/connectors",
-                SimpleNamespace(revision="pinned-revision"),
+                SimpleNamespace(
+                    component_revision=lambda _component: "pinned-revision"
+                ),
                 "connectors",
             )
 
@@ -152,7 +159,8 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             "quantization_config": {"quant_method": "bitsandbytes"},
         }
         server_args = SimpleNamespace(
-            component_weights_paths={}, revision="pinned-revision"
+            component_weights_paths={},
+            component_revision=lambda _component: "pinned-revision",
         )
 
         with (

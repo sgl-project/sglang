@@ -306,6 +306,9 @@ class ServerArgs(DisaggServerArgsMixin):
     component_paths: dict[str, str] = field(default_factory=dict)
     # Exact weight-file overrides retain the base component configuration.
     component_weights_paths: dict[str, str] = field(default_factory=dict)
+    # Optional Hub revision for one replacement component. `--revision` pins
+    # the base model; a replacement repository can use its own revision.
+    component_revisions: dict[str, str] = field(default_factory=dict)
     # Explicit quantization override for one component. Self-describing
     # checkpoints remain auto-detected and do not need this override.
     component_quantizations: dict[str, str] = field(default_factory=dict)
@@ -1158,6 +1161,21 @@ class ServerArgs(DisaggServerArgsMixin):
                     return AttentionBackendEnum[backend.upper()], backend_key
         return None, None
 
+    def component_revision(self, component_name: str | None) -> str | None:
+        """Resolve a component revision without leaking base revisions across repos."""
+        if component_name is None:
+            return self.revision
+
+        revision = self.component_revisions.get(component_name)
+        if revision is not None:
+            return revision
+        if (
+            component_name in self.component_paths
+            or component_name in self.component_weights_paths
+        ):
+            return None
+        return self.revision
+
     def _adjust_warmup(self):
         if self.warmup_mode is not None and self.warmup_mode not in WARMUP_MODES:
             raise ValueError(
@@ -1752,6 +1770,16 @@ class ServerArgs(DisaggServerArgsMixin):
             component_weights_paths[component] = path
         self.component_paths = component_paths
         self.component_weights_paths = component_weights_paths
+        normalized_revisions: dict[str, str] = {}
+        for component, revision in self.component_revisions.items():
+            component_name = str(component).strip().replace("-", "_")
+            revision_name = str(revision).strip()
+            if not component_name or not revision_name:
+                raise ValueError(
+                    "Component revision entries require a component and revision"
+                )
+            normalized_revisions[component_name] = revision_name
+        self.component_revisions = normalized_revisions
         normalized_quantizations: dict[str, str] = {}
         for component, quantization in self.component_quantizations.items():
             component = str(component).strip().replace("-", "_")
@@ -2847,6 +2875,7 @@ class ServerArgs(DisaggServerArgsMixin):
         *,
         option_prefixes: tuple[str, ...],
         alias_suffix: str,
+        expand_values: bool = True,
     ) -> tuple[dict[str, str], list[str]]:
         component_values: dict[str, str] = {}
         remaining: list[str] = []
@@ -2882,10 +2911,12 @@ class ServerArgs(DisaggServerArgsMixin):
                 remaining.append(arg)
             i += 1
 
-        return {
-            component: os.path.expanduser(value)
-            for component, value in component_values.items()
-        }, remaining
+        if expand_values:
+            component_values = {
+                component: os.path.expanduser(value)
+                for component, value in component_values.items()
+            }
+        return component_values, remaining
 
     @classmethod
     def _extract_component_paths(
@@ -2912,6 +2943,19 @@ class ServerArgs(DisaggServerArgsMixin):
                 "--component_weights_paths.",
             ),
             alias_suffix="-weights-path",
+        )
+
+    @classmethod
+    def _extract_component_revisions(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract optional Hub revisions for exact component replacements."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=("--component-revisions.", "--component_revisions."),
+            alias_suffix="-revision",
+            expand_values=False,
         )
 
     @classmethod
@@ -3027,6 +3071,7 @@ class ServerArgs(DisaggServerArgsMixin):
             remaining
         )
         dynamic_paths, remaining = cls._extract_component_paths(remaining)
+        dynamic_revisions, remaining = cls._extract_component_revisions(remaining)
         dynamic_attention_backends, remaining = (
             cls._extract_component_attention_backends(remaining)
         )
@@ -3057,6 +3102,11 @@ class ServerArgs(DisaggServerArgsMixin):
             existing.update(dynamic_weights_paths)
             provided_args["component_weights_paths"] = existing
             explicit_arg_names.add("component_weights_paths")
+        if dynamic_revisions:
+            existing = dict(provided_args.get("component_revisions") or {})
+            existing.update(dynamic_revisions)
+            provided_args["component_revisions"] = existing
+            explicit_arg_names.add("component_revisions")
         if dynamic_quantizations:
             existing = dict(provided_args.get("component_quantizations") or {})
             existing.update(dynamic_quantizations)

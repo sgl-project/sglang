@@ -287,7 +287,12 @@ class VAELoader(ComponentLoader):
         )
         if weights_override is None:
             return component_model_path
-        model_weights_path = materialize_weight(resolve_weight(weights_override))
+        model_weights_path = materialize_weight(
+            resolve_weight(
+                weights_override,
+                revision=server_args.component_revision(component_name),
+            )
+        )
         logger.info(
             "Using weight-file override for %s: %s",
             component_name,
@@ -324,7 +329,8 @@ class VAELoader(ComponentLoader):
             component_name,
         )
         config = get_diffusers_component_config(
-            component_path=component_model_path, revision=server_args.revision
+            component_path=component_model_path,
+            revision=server_args.component_revision(component_name),
         )
         server_args.model_paths[component_name] = component_model_path
         native_only = component_name in getattr(
@@ -385,7 +391,7 @@ class VAELoader(ComponentLoader):
             with set_default_torch_dtype(vae_dtype):
                 vae = vae_cls.from_pretrained(
                     component_model_path,
-                    revision=server_args.revision,
+                    revision=server_args.component_revision(component_name),
                     trust_remote_code=server_args.trust_remote_code,
                 )
             vae = vae.to(device=target_device, dtype=vae_dtype)

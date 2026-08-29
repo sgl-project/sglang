@@ -369,7 +369,7 @@ class ComponentLoader(ABC):
             config = get_hf_config(
                 component_model_path,
                 trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
+                revision=server_args.component_revision(component_name),
             )
             if uses_native_transformers_quantization(
                 config, component_name or "component"
@@ -402,18 +402,19 @@ class ComponentLoader(ABC):
                 component_model_path,
                 config=config,
                 trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
+                revision=server_args.component_revision(component_name),
                 **load_kwargs,
             )
         elif transformers_or_diffusers == "diffusers":
             from diffusers import AutoModel
 
             component_model_path = prepare_diffusers_component_path_for_loading(
-                component_model_path, revision=server_args.revision
+                component_model_path,
+                revision=server_args.component_revision(component_name),
             )
             return AutoModel.from_pretrained(
                 component_model_path,
-                revision=server_args.revision,
+                revision=server_args.component_revision(component_name),
                 trust_remote_code=server_args.trust_remote_code,
                 **load_kwargs,
             )
@@ -582,7 +583,11 @@ class PlainStateDictComponentLoader(ComponentLoader):
         override = server_args.component_weights_paths.get(component_name)
         if override is None:
             return component_model_path
-        weights_path = materialize_weight(resolve_weight(override))
+        weights_path = materialize_weight(
+            resolve_weight(
+                override, revision=server_args.component_revision(component_name)
+            )
+        )
         logger.info("Using weight override for %s: %s", component_name, weights_path)
         return weights_path
 
@@ -599,7 +604,7 @@ class ImageProcessorLoader(ComponentLoader):
         return AutoImageProcessor.from_pretrained(
             component_model_path,
             backend="torchvision",
-            revision=server_args.revision,
+            revision=server_args.component_revision(component_name),
         )
 
 
@@ -613,7 +618,8 @@ class AutoProcessorLoader(ComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
         return AutoProcessor.from_pretrained(
-            component_model_path, revision=server_args.revision
+            component_model_path,
+            revision=server_args.component_revision(component_name),
         )
 
 
@@ -635,7 +641,8 @@ class TokenizerLoader(ComponentLoader):
             and self.component_architecture.endswith("Processor")
         ):
             return AutoProcessor.from_pretrained(
-                component_model_path, revision=server_args.revision
+                component_model_path,
+                revision=server_args.component_revision(component_name),
             )
 
         # Qwen-Image's model_index declares Qwen2Tokenizer; using the fast class
@@ -645,7 +652,7 @@ class TokenizerLoader(ComponentLoader):
             return AutoTokenizer.from_pretrained(
                 component_model_path,
                 padding_side="right",
-                revision=server_args.revision,
+                revision=server_args.component_revision(component_name),
                 use_fast=use_fast,
             )
         except TypeError as e:
@@ -659,7 +666,7 @@ class TokenizerLoader(ComponentLoader):
                 return _load_auto_tokenizer_with_roberta_processing_compat(
                     component_model_path,
                     padding_side="right",
-                    revision=server_args.revision,
+                    revision=server_args.component_revision(component_name),
                     use_fast=False,
                 )
             raise

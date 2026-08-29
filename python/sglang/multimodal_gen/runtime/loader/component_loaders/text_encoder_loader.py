@@ -528,7 +528,12 @@ class TextEncoderLoader(ComponentLoader):
                     f"GGUF encoder checkpoint {component_name!r} is incompatible "
                     "with FSDP; select resident or layerwise placement"
                 )
-        model_weights_path = materialize_weight(resolve_weight(weights_override))
+        model_weights_path = materialize_weight(
+            resolve_weight(
+                weights_override,
+                revision=server_args.component_revision(component_name),
+            )
+        )
         logger.info(
             "Using weight-file override for %s: %s",
             component_name,
@@ -729,10 +734,11 @@ class TextEncoderLoader(ComponentLoader):
         diffusers_pretrained_config = get_config(
             component_model_path,
             trust_remote_code=True,
-            revision=server_args.revision,
+            revision=server_args.component_revision(component_name),
         )
         model_config = get_diffusers_component_config(
-            component_path=component_model_path, revision=server_args.revision
+            component_path=component_model_path,
+            revision=server_args.component_revision(component_name),
         )
 
         # TODO(mick): had to throw an exception for different text-encoder arch

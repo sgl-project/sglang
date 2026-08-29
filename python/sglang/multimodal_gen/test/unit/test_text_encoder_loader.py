@@ -152,9 +152,9 @@ class TestTextEncoderClassResolution(unittest.TestCase):
         server_args = SimpleNamespace(
             pipeline_config=SimpleNamespace(text_encoder_precisions=["bf16"]),
             explicit_residency_mode=mock.Mock(return_value=None),
-            require_component_resident=mock.Mock(),
             should_use_fsdp_for_component=mock.Mock(return_value=False),
-            revision=None,
+            component_revision=lambda _component: None,
+            require_component_resident=mock.Mock(),
             trust_remote_code=False,
         )
         component_config = {

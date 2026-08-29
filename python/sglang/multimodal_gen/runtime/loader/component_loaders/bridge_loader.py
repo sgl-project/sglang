@@ -32,7 +32,9 @@ class BridgeLoader(PlainStateDictComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         config = self.load_component_config(
-            component_model_path, component_name, revision=server_args.revision
+            component_model_path,
+            component_name,
+            revision=server_args.component_revision(component_name),
         )
         hf_config = deepcopy(config)
         class_name = config.pop("_class_name", None)

@@ -131,6 +131,7 @@ pipeline's registered module name:
 | --- | --- | --- | --- |
 | Replace a component | `--component-paths.<component> {MODEL}` | `--<component>-path {MODEL}` | Load the replacement component's configuration and weights |
 | Replace only its weights | `--component-weights-paths.<component> {WEIGHTS}` | `--<component>-weights-path {WEIGHTS}` | Retain the base component configuration and replace its weights |
+| Pin a replacement Hub source | `--component-revisions.<component> {REVISION}` | `--<component>-revision {REVISION}` | Pin that component's config, processors, and weights independently of the base model |
 | Quantize an unquantized component online | `--component-quantizations.<component> {METHOD}` | `--<component>-quantization {METHOD}` | Apply a method supported by that component's native loader |
 | Keep selected component layers unquantized | `--component-quantization-ignored-layers.<component> {PATTERN...}` | None | Pass component-local ignored-layer patterns to its online quantizer |
 
@@ -141,6 +142,11 @@ single-file checkpoint as follows:
 --component-paths.text_encoder COMPONENT_REPO_OR_DIRECTORY \
 --component-weights-paths.text_encoder WEIGHTS_FILE_OR_REPO_FILE
 ```
+
+`--revision` continues to pin `--model-path`. When a component comes from a
+different Hub repository, pin it explicitly with
+`--component-revisions.<component>` so its configuration, processor/tokenizer,
+and weights resolve to the same commit or tag.
 
 The transformer-specific `--transformer-weights-path` spelling remains
 supported for the primary DiT. Do not mechanically replace it with

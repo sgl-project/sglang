@@ -219,6 +219,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             quantization=None,
             quantization_ignored_layers=None,
             revision="test-revision",
+            component_revision=lambda _component: "test-revision",
             tp_size=1,
             dit_cpu_offload=False,
             direct_gpu_weight_loading=False,
