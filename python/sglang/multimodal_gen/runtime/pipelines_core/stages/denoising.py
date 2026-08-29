@@ -552,6 +552,20 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if self._cache_dit_requested() and not self._cache_dit_enabled:
             logger.debug("Deferring torch.compile until cache-dit is enabled")
             return
+        if (
+            batch is None
+            and getattr(self.server_args, "compile_trajectory_gate_manifest", None)
+        ):
+            # A gate manifest is configured but there's no request yet to build
+            # a workload signature from (e.g. this is the eager, construction-time
+            # compile call). Compiling here unconditionally would mark the module
+            # as compiled and make the per-request gate check below unreachable
+            # for every subsequent request. Defer until the first request.
+            logger.debug(
+                "Deferring torch.compile until first request so the "
+                "compile-trajectory-gate can check the workload signature"
+            )
+            return
         if self._torch_compile_registry.is_compiled(module):
             return
         if batch is not None and not self._is_covered_by_compile_trajectory_gate(

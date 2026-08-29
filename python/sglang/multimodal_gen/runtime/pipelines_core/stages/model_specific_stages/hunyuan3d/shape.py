@@ -314,7 +314,11 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
         freshly_loaded = load_transformer_if_needed(self, server_args)
         if freshly_loaded:
             self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
-            self._maybe_torch_compile(self.transformer)
+            self._maybe_torch_compile(
+                self.transformer,
+                num_inference_steps=cache_dit_num_inference_steps,
+                batch=batch,
+            )
             register_loaded_transformer(self, server_args, pipeline)
         else:
             self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
