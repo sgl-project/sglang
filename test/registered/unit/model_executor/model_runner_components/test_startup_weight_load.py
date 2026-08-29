@@ -392,7 +392,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
             len(registered_architectures), len(set(registered_architectures))
         )
         self.assertEqual(
-            set(registered_architectures), expected_profiles_by_architecture
+            set(registered_architectures), set(expected_profiles_by_architecture)
         )
         for architecture, expected_profile in expected_profiles_by_architecture.items():
             with self.subTest(architecture=architecture):
@@ -1220,15 +1220,17 @@ class TestStartupWeightLoadSelector(CustomTestCase):
             ("auto", False, True),
         ):
             with self.subTest(mode=mode):
-                server_args.startup_weight_load_mode = mode
-                self.assertEqual(
-                    server_args.is_startup_weight_load_overlap,
-                    expected_overlap,
-                )
-                self.assertEqual(
-                    server_args.should_attempt_startup_weight_load_overlap,
-                    expected_attempt,
-                )
+                with get_context().override_server_args(
+                    startup_weight_load_mode=mode
+                ) as mode_args:
+                    self.assertEqual(
+                        mode_args.is_startup_weight_load_overlap,
+                        expected_overlap,
+                    )
+                    self.assertEqual(
+                        mode_args.should_attempt_startup_weight_load_overlap,
+                        expected_attempt,
+                    )
 
     def test_unsupported_overlap_is_rejected_instead_of_falling_back(self):
         cases = (
@@ -1813,6 +1815,11 @@ class TestStartupWeightLoadPolicyRouting(CustomTestCase):
             region=lambda *args, **kwargs: nullcontext()
         )
         with (
+            get_context().override_server_args(
+                enable_weights_cpu_backup=False,
+                enable_draft_weights_cpu_backup=False,
+                weight_cache_mode="off",
+            ),
             patch(f"{_LOAD_MODEL_UTILS_MODULE}.get_model_loader", return_value=loader),
             patch(f"{_LOAD_MODEL_UTILS_MODULE}.monkey_patch_vllm_parallel_state"),
             patch.object(

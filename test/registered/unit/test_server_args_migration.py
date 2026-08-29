@@ -142,8 +142,11 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         self.assertEqual(auto.startup_weight_load_mode, "auto")
         self.assertFalse(auto.is_startup_weight_load_overlap)
         self.assertTrue(auto.should_attempt_startup_weight_load_overlap)
-        serial.startup_weight_load_mode = "future_mode"
-        self.assertFalse(serial.should_attempt_startup_weight_load_overlap)
+
+        args = self.parser.parse_args(["--model", "dummy"])
+        future = ServerArgs.from_cli_args(args)
+        future.startup_weight_load_mode = "future_mode"
+        self.assertFalse(future.should_attempt_startup_weight_load_overlap)
 
         with self.assertRaises(SystemExit):
             self.parser.parse_args(
