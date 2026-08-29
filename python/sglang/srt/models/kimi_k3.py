@@ -302,15 +302,16 @@ class KimiK3MLP(nn.Module):
         # this one dense layer over the full TP group.  Keep the GPU default,
         # but allow the NPU launcher to retain the proven attention-TP layout
         # without a device-type branch in shared model code.
-        self._dense_attn_tp = (
-            get_parallel().enable_dense_mlp_attn_tp
-            and is_dp_attention_enabled()
-            and tp_rank is None
-            and tp_size is None
+        parallel = get_parallel()
+        self._dp_attention = is_dp_attention_enabled()
+        use_default_tp = tp_rank is None and tp_size is None
+        self.use_dp_attention_reduce = (
+            parallel.enable_dense_mlp_attn_tp and self._dp_attention and use_default_tp
         )
-        if self._dense_attn_tp:
-            tp_rank = get_parallel().attn_tp_rank
-            tp_size = get_parallel().attn_tp_size
+        if self.use_dp_attention_reduce:
+            tp_rank, tp_size = parallel.attn_tp_rank, parallel.attn_tp_size
+        elif use_default_tp and parallel.moe_dense_tp_size == 1:
+            tp_rank, tp_size = 0, 1
         _tp_kwargs = (
             dict(tp_rank=tp_rank, tp_size=tp_size) if tp_size is not None else {}
         )
@@ -328,7 +329,7 @@ class KimiK3MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
-            use_dp_attention_reduce=self._dense_attn_tp,
+            use_dp_attention_reduce=self.use_dp_attention_reduce,
             prefix=f"{prefix}.down_proj",
             **_tp_kwargs,
         )
@@ -341,7 +342,6 @@ class KimiK3MLP(nn.Module):
             )
         else:
             raise ValueError(f"Unsupported activation: {hidden_act}")
-        self._dp_attention = is_dp_attention_enabled()
 
     def forward(
         self,
@@ -354,7 +354,9 @@ class KimiK3MLP(nn.Module):
         # given); the shared-experts instance inside KimiK3MoE passes None and
         # runs on the already-gathered buffer.
         use_dp = (
-            self._dp_attention and forward_batch is not None and not self._dense_attn_tp
+            self._dp_attention
+            and forward_batch is not None
+            and not self.use_dp_attention_reduce
         )
         if use_dp:
             local_hidden_states = hidden_states
@@ -565,13 +567,13 @@ class KimiK3MoE(nn.Module):
         self._shared_experts_tp1 = (
             self._ep_a2a and not get_parallel().enable_shared_experts_attn_tp
         )
-        # NPU compatibility mode keeps DeepEP's DP-local token dispatch but
-        # uses the original TP-sharded shared MLP. Gather only that branch's
-        # inputs, then reduce-scatter its output back to the DP-local rows.
+        # NPU compatibility mode keeps DeepEP's token dispatch but uses the
+        # original TP-sharded shared MLP. Gather only that branch's inputs,
+        # then reduce-scatter its output back to the rank-local rows. This
+        # covers both DP-local batches and no-DP SP-MoE token shards.
         self._shared_experts_attn_tp_comm = (
             get_parallel().enable_shared_experts_attn_tp
             and self._ep_a2a
-            and self._dp_attention
             and get_parallel().attn_tp_size > 1
         )
         shared_experts_tp_kwargs = {}

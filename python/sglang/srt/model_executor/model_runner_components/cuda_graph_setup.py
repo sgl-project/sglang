@@ -164,8 +164,10 @@ def capture_cuda_graphs(
 
     """
 
-    model_runner.graph_shared_output = GraphSharedOutput.create_for_model_runner(
-        model_runner
+    model_runner.graph_shared_output = (
+        GraphSharedOutput.create_for_model_runner(model_runner)
+        if capture_decode_cuda_graph
+        else None
     )
 
     # The eager (no-cuda-graph) phase runner, built AFTER the attention
