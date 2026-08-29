@@ -2756,7 +2756,7 @@ def set_gpu_proc_affinity(
 
     # set cpu_affinity to current process
     # p.cpu_affinity(bind_cpu_ids)
-    cpu_ids_group0 = [id for id in range(288, 283)]
+    cpu_ids_group0 = [id for id in range(288, 383)]
     cpu_ids_group1 = [id for id in range(96, 191)]
     if gpu_id in [0, 1, 6, 7]:
         p.cpu_affinity(cpu_ids_group0)

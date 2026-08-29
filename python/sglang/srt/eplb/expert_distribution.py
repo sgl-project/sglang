@@ -28,6 +28,7 @@ import einops
 import torch
 import torch.distributed
 
+from sglang.srt.distributed.parallel_state import get_moe_ep_group
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.observability.metrics_collector import (
@@ -335,6 +336,8 @@ class _SinglePassGatherer(ABC):
                     rank,
                     elastic_ep_enabled=server_args.elastic_ep_backend is not None,
                 )
+            elif server_args.deepep_mode == "auto":
+                return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
@@ -703,7 +706,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         if self._enable:
             self.window_sizes = [10, 100, 1000]
             self._history = _DequeCollection(maxlens=self.window_sizes)
-            self._rank = torch.distributed.get_rank()
+            self._rank = get_moe_ep_group().rank_in_group
             expert_dispatch_cls = resolve_collector_class(
                 self._server_args,
                 STAT_LOGGER_ROLE_EXPERT_DISPATCH,
@@ -743,9 +746,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             num_gpu=self._expert_location_metadata.ep_size,
         )
         gpu_physical_count = gpu_physical_count.to(self._server_args.device)
-        torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
-        )
+        gpu_physical_count = get_moe_ep_group().all_reduce(gpu_physical_count)
 
         if self._rank == 0:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
@@ -916,8 +917,8 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             self._first_dump = False
             torch.get_device_module().empty_cache()
 
-        torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+        logical_count_of_buffered_step = get_moe_ep_group().all_reduce(
+            logical_count_of_buffered_step
         )
 
         output = dict(
@@ -952,11 +953,13 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device="cuda",
+                device=self._server_args.device,
             )
         else:
-            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
-        torch.distributed.broadcast(avg_rate_tensor, src=0)
+            avg_rate_tensor = torch.empty(
+                1, dtype=torch.float32, device=self._server_args.device
+            )
+        avg_rate_tensor = get_moe_ep_group().broadcast(avg_rate_tensor, src=0)
         return avg_rate_tensor.item()
 
 

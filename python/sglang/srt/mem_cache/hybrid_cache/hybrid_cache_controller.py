@@ -431,6 +431,17 @@ class HybridCacheController(BaseHiCacheController):
             host_indices, device_indices, resolved_pool_transfers = (
                 self.move_hybrid_indices(op)
             )
+        # Layer-first: sort indices by host slot so the kernel's peek-ahead
+        # can detect contiguous runs.  GPU sort — no .cpu() sync.
+        if (
+            self.io_backend == "kernel_ascend"
+            and self.mem_pool_host.layout == "page_first_kv_split"
+            and os.environ.get("ENABLE_LAYER_FIRST", "0") == "1"
+            and host_indices.numel() > 0
+        ):
+            sort_idx = torch.argsort(host_indices)
+            host_indices = host_indices[sort_idx]
+            device_indices = device_indices[sort_idx]
         self.write_queue.clear()
         start_event = device_module.Event()
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
@@ -561,6 +572,21 @@ class HybridCacheController(BaseHiCacheController):
         host_indices, device_indices, resolved_pool_transfers = (
             self.move_hybrid_indices(op)
         )
+        # Layer-first: sort indices by host slot so the kernel's peek-ahead
+        # can detect contiguous runs.  GPU sort — no .cpu() sync.
+        sort_event = None
+        if (
+            self.io_backend == "kernel_ascend"
+            and self.mem_pool_host.layout == "page_first_kv_split"
+            and os.environ.get("ENABLE_LAYER_FIRST", "0") == "1"
+            and host_indices.numel() > 0
+        ):
+            sort_idx = torch.argsort(host_indices)
+            host_indices = host_indices[sort_idx]
+            device_indices = device_indices[sort_idx]
+            # Record on the current (default) stream so load_stream can wait.
+            sort_event = device_module.Event()
+            sort_event.record()
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
@@ -577,6 +603,8 @@ class HybridCacheController(BaseHiCacheController):
         self._prefetch_next_layer = 1
 
         with device_module.stream(self.load_stream):
+            if sort_event is not None:
+                sort_event.wait(self.load_stream)
             ack_start_event.record()
             target_device_pool = self.mem_pool_host.anchor_entry.device_pool
             self.mem_pool_host.load_to_device_per_layer(
