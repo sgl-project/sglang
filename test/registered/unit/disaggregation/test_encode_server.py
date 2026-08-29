@@ -2,7 +2,7 @@ import asyncio
 import pickle
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 import torch
@@ -251,6 +251,58 @@ class TestEncoderDelivery(CustomTestCase):
             )
 
         self.assertEqual(events, ["sync", "ready"])
+
+    def test_fused_staging_rolls_back_mrs_before_any_result_is_published(self):
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder.rank = 0
+        encoder.engine = Mock()
+        first_state = ReqState("req-0", active_encodes=1)
+        second_metadata = EmbeddingData(
+            "req-1",
+            1,
+            0,
+            [[1, 1, 1]],
+            Modality.IMAGE,
+            embedding_shape=[2, 4],
+            dtype=torch.float32,
+        )
+        second_state = ReqState(
+            "req-1", embedding_data=second_metadata, active_encodes=1
+        )
+        encoder.req_states = {"req-0": first_state, "req-1": second_state}
+        ctx = SimpleNamespace(
+            req_id="req-0",
+            modality=Modality.IMAGE,
+            items_per_req=[1, 1],
+            preprocess_result=SimpleNamespace(
+                token_counts=[1, 1],
+                grid_thw=[[1, 1, 1], [1, 1, 1]],
+            ),
+            aux_data={},
+            use_global_cache=False,
+        )
+        requests = [
+            {"req_id": "req-0", "num_parts": 1, "part_idx": 0},
+            {"req_id": "req-1", "num_parts": 1, "part_idx": 0},
+        ]
+
+        with self.assertRaisesRegex(InternalError, "Embedding metadata mismatch"):
+            encoder._stage_embeddings(
+                ctx, requests, torch.ones((2, 4)), keep_on_gpu=True
+            )
+
+        registered_ptrs = [
+            call.args[0] for call in encoder.engine.register.call_args_list
+        ]
+        deregistered_ptrs = [
+            call.args[0] for call in encoder.engine.deregister.call_args_list
+        ]
+        self.assertEqual(len(registered_ptrs), 2)
+        self.assertCountEqual(deregistered_ptrs, registered_ptrs)
+        self.assertIsNone(first_state.embedding_data)
+        self.assertIs(second_state.embedding_data, second_metadata)
+        self.assertFalse(first_state.embedding_ready.is_set())
+        self.assertFalse(second_state.embedding_ready.is_set())
 
     def test_stage_embedding_does_not_resurrect_missing_state(self):
         encoder = MMEncoder.__new__(MMEncoder)

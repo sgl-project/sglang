@@ -350,15 +350,8 @@ class MooncakeDelivery(EncoderDelivery):
 
     async def release(self, state: ReqState) -> None:
         mm_data = state.embedding_data
-        if mm_data is not None and mm_data._mr_ptr is not None:
-            try:
-                self.encoder.engine.deregister(mm_data._mr_ptr)
-            except Exception as dereg_err:
-                logger.warning(
-                    f"Shared-MR deregister failed for {state.req_id}: {dereg_err}"
-                )
-            finally:
-                mm_data._mr_ptr = None
+        if mm_data is not None:
+            self.encoder._deregister_shared_mr(mm_data)
 
 
 class ZmqDelivery(EncoderDelivery):
@@ -646,7 +639,7 @@ class MMEncoder:
         if should_release:
             await self.release_request(state.req_id)
 
-    def _stage_embedding(self, mm_data: EmbeddingData) -> None:
+    def _embedding_state_for_stage(self, mm_data: EmbeddingData) -> ReqState:
         state = self._require_active_encode_state(mm_data.req_id)
         metadata = state.embedding_data
         if (
@@ -660,8 +653,20 @@ class MMEncoder:
                 f"expected={metadata.shape}/{metadata.dtype}, "
                 f"actual={mm_data.shape}/{mm_data.dtype}"
             )
+        return state
+
+    def _stage_embedding(self, mm_data: EmbeddingData) -> None:
+        state = self._embedding_state_for_stage(mm_data)
         state.embedding_data = mm_data
         state.embedding_ready.set()
+
+    def _stage_embedding_batch(self, embeddings: List[EmbeddingData]) -> None:
+        """Validate the whole fused batch before publishing any result."""
+        states = [self._embedding_state_for_stage(mm_data) for mm_data in embeddings]
+        for state, mm_data in zip(states, embeddings):
+            state.embedding_data = mm_data
+        for state in states:
+            state.embedding_ready.set()
 
     async def _wait_for_embedding(self, state: ReqState) -> EmbeddingData:
         await state.embedding_ready.wait()
@@ -1694,6 +1699,18 @@ class MMEncoder:
                 f"falling back to per-/send register: {reg_err}"
             )
 
+    def _deregister_shared_mr(self, mm_data: EmbeddingData) -> None:
+        if mm_data._mr_ptr is None:
+            return
+        try:
+            self.engine.deregister(mm_data._mr_ptr)
+        except Exception as dereg_err:
+            logger.warning(
+                f"Shared-MR deregister failed for {mm_data.req_id}: {dereg_err}"
+            )
+        finally:
+            mm_data._mr_ptr = None
+
     def _stage_embeddings(
         self,
         ctx: EncodeContext,
@@ -1714,46 +1731,58 @@ class MMEncoder:
 
         results = []
         staged_embeddings = []
-        item_offset = 0
-        token_offset = 0
-        for req, num_items in zip(requests, ctx.items_per_req):
-            item_end = item_offset + num_items
-            num_tokens = sum(ctx.preprocess_result.token_counts[item_offset:item_end])
-            embedding = mm_embedding[token_offset : token_offset + num_tokens]
-            if keep_on_gpu and len(requests) > 1:
-                # A view would pin the whole batch tensor until the last transfer.
-                embedding = embedding.clone()
-            req_aux_data = dict(ctx.aux_data)
-            if ctx.aux_data.get("original_image_sizes") is not None:
-                req_aux_data["original_image_sizes"] = ctx.aux_data[
-                    "original_image_sizes"
-                ][item_offset:item_end]
-            mm_data = EmbeddingData(
-                req["req_id"],
-                req["num_parts"],
-                req["part_idx"],
-                ctx.preprocess_result.grid_thw[item_offset:item_end],
-                ctx.modality,
-                embedding,
-                **req_aux_data,
-            )
-            # Global-cache embeddings keep registering per /send instead.
-            if keep_on_gpu and not ctx.use_global_cache:
-                self._register_shared_mr(mm_data, embedding)
-            staged_embeddings.append(mm_data)
-            results.append(
-                (embedding.nbytes, embedding.shape[0], embedding.shape[1], None, None)
-            )
-            item_offset = item_end
-            token_offset += num_tokens
+        try:
+            item_offset = 0
+            token_offset = 0
+            for req, num_items in zip(requests, ctx.items_per_req):
+                item_end = item_offset + num_items
+                num_tokens = sum(
+                    ctx.preprocess_result.token_counts[item_offset:item_end]
+                )
+                embedding = mm_embedding[token_offset : token_offset + num_tokens]
+                if keep_on_gpu and len(requests) > 1:
+                    # A view would pin the whole batch tensor until the last transfer.
+                    embedding = embedding.clone()
+                req_aux_data = dict(ctx.aux_data)
+                if ctx.aux_data.get("original_image_sizes") is not None:
+                    req_aux_data["original_image_sizes"] = ctx.aux_data[
+                        "original_image_sizes"
+                    ][item_offset:item_end]
+                mm_data = EmbeddingData(
+                    req["req_id"],
+                    req["num_parts"],
+                    req["part_idx"],
+                    ctx.preprocess_result.grid_thw[item_offset:item_end],
+                    ctx.modality,
+                    embedding,
+                    **req_aux_data,
+                )
+                # Global-cache embeddings keep registering per /send instead.
+                if keep_on_gpu and not ctx.use_global_cache:
+                    self._register_shared_mr(mm_data, embedding)
+                staged_embeddings.append(mm_data)
+                results.append(
+                    (
+                        embedding.nbytes,
+                        embedding.shape[0],
+                        embedding.shape[1],
+                        None,
+                        None,
+                    )
+                )
+                item_offset = item_end
+                token_offset += num_tokens
 
-        # transfer_sync bypasses CUDA streams, so GPU writes (forward and the
-        # per-request clones) must land before /send reads the buffers.
-        if keep_on_gpu and mm_embedding.is_cuda:
-            torch.cuda.current_stream(mm_embedding.device).synchronize()
-        for mm_data in staged_embeddings:
-            self._stage_embedding(mm_data)
-        return results
+            # transfer_sync bypasses CUDA streams, so GPU writes (forward and the
+            # per-request clones) must land before /send reads the buffers.
+            if keep_on_gpu and mm_embedding.is_cuda:
+                torch.cuda.current_stream(mm_embedding.device).synchronize()
+            self._stage_embedding_batch(staged_embeddings)
+            return results
+        except BaseException:
+            for mm_data in staged_embeddings:
+                self._deregister_shared_mr(mm_data)
+            raise
 
     def _stage_errors(
         self, requests: List[dict], modality: Modality, exc: Exception
