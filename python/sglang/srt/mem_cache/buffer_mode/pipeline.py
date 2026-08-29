@@ -99,6 +99,7 @@ class _StagedPrefetch(msgspec.Struct):
     req_id: str
     key_tokens: list[int]
     extra_key: Optional[str]
+    cache_salt: Optional[str]
     matched_len: int
     num_tokens: int
     occupied_tokens: int
@@ -199,6 +200,7 @@ class BufferModePipeline:
         cache: UnifiedRadixCache,
         swa_window_pages: int,
         write_backlog_cap: int,
+        max_context_len: int = 0,
     ):
         self._cache = cache
         # SWA window size in KV pages when the SWA component stages through
@@ -214,8 +216,20 @@ class BufferModePipeline:
 
         kvcache = cache.token_to_kv_pool_allocator.get_kvcache()
         full_pool = kvcache.full_kv_pool if isinstance(kvcache, SWAKVPool) else kvcache
-        self.anchor_lock_cap_tokens = int(
-            envs.SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP.get() * full_pool.size
+        # Clamp by admission headroom: pins must leave room for the largest
+        # allowed request, else a queued hold can wedge admission permanently
+        # (pool full, nothing retractable). No-headroom pools take no pins.
+        self.anchor_lock_cap_tokens = max(
+            0,
+            min(
+                int(envs.SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP.get() * full_pool.size),
+                full_pool.size - max_context_len,
+            ),
+        )
+        logger.info(
+            "BufferModePipeline anchor_lock_enabled=%s cap_tokens=%d",
+            self.anchor_lock_enabled,
+            self.anchor_lock_cap_tokens,
         )
         self.reset()
 
@@ -725,6 +739,7 @@ class BufferModePipeline:
             req_id=req_id,
             key_tokens=prefix_tokens + list(prefetch_key[:num_tokens].token_ids),
             extra_key=prefetch_key.extra_key,
+            cache_salt=prefetch_key.cache_salt,
             matched_len=len(prefix_tokens),
             num_tokens=num_tokens,
             occupied_tokens=occupied_tokens,
@@ -781,6 +796,19 @@ class BufferModePipeline:
             cc.prefetch_tokens_occupied -= f.occupied_tokens
             return unchanged
 
+        # A hold staged under a different namespace than the consuming request
+        # must never splice (wrong-namespace publish = duplicate slot
+        # ownership); unreachable while the prefetch key is request-derived.
+        if f.extra_key != req.extra_key or f.cache_salt != req.cache_salt:
+            logger.error(
+                "HiCache staged prefetch dropped req=%s reason=namespace "
+                "staged=%s req=%s",
+                req.rid,
+                (f.extra_key, f.cache_salt),
+                (req.extra_key, req.cache_salt),
+            )
+            return _drop()
+
         # Splice-validity: the span only fits if the device prefix still
         # ends exactly at the enqueue-time matched_len.
         if len(req.prefix_indices) != f.matched_len:
@@ -800,6 +828,7 @@ class BufferModePipeline:
             array("q", f.key_tokens),
             extra_key=f.extra_key,
             is_bigram=cache.tree_core.is_eagle,
+            cache_salt=f.cache_salt,
         ).page_aligned(cache.page_size)
         span_end = f.matched_len + f.num_tokens
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Validate or build the Kimi K3 Expert Pack derived from GGUF shards."""
+"""Validate or build the Kimi K3 expert pack derived from GGUF shards."""
 
 from __future__ import annotations
 

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
 """Validate or build the DeepSeek expert-pack used by the RTX 5090 benchmark."""
 
 from __future__ import annotations

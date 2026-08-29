@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.serving_hook import handle_multimodal
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
@@ -21,7 +22,7 @@ class TestMmProcessConfigValidation(CustomTestCase):
 
     def _validate_config(self, mm_process_config):
         args = ServerArgs(model_path="dummy", mm_process_config=mm_process_config)
-        args._handle_multimodal()
+        handle_multimodal(args)
         return args
 
     def test_valid_config_accepted(self):
