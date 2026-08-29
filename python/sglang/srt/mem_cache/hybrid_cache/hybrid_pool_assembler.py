@@ -97,7 +97,6 @@ def build_kv_host_pool(
     *,
     kv_pool: Any,
     page_size: int,
-    server_args: ServerArgs,
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
     host_size: Optional[float] = None,
@@ -179,7 +178,6 @@ def build_pool_entry(
 def build_kv_only_group(
     *,
     page_size: int,
-    server_args: ServerArgs,
     kv_pool: Any,
     full_layer_mapping: dict[int, int],
     use_mla: bool,
@@ -192,7 +190,6 @@ def build_kv_only_group(
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=page_size,
-        server_args=server_args,
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
         host_size=host_size,
@@ -223,7 +220,6 @@ def build_kv_only_group(
 def build_hybrid_swa_group(
     *,
     page_size: int,
-    server_args: ServerArgs,
     full_kv_pool: Any,
     swa_kv_pool: Any,
     full_layer_mapping: dict[int, int],
@@ -241,7 +237,6 @@ def build_hybrid_swa_group(
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
         page_size=page_size,
-        server_args=server_args,
         use_mla=use_mla,
         host_size=kv_host_size,
         pool_label="full",
@@ -249,7 +244,6 @@ def build_hybrid_swa_group(
     swa_host_pool = build_kv_host_pool(
         kv_pool=swa_kv_pool,
         page_size=page_size,
-        server_args=server_args,
         use_mla=use_mla,
         host_size=swa_host_size,
         mtp_draft_device_pools=mtp_swa_device_pools,
@@ -295,7 +289,6 @@ def build_hybrid_swa_group(
 def build_kv_only_stack(
     *,
     params: CacheInitParams,
-    server_args: ServerArgs,
     kv_pool: Any,
     full_layer_mapping: dict[int, int],
     load_cache_event,
@@ -310,7 +303,6 @@ def build_kv_only_stack(
     transfer_layer_num = len(full_layer_mapping)
     host_pool_group = build_kv_only_group(
         page_size=params.page_size,
-        server_args=server_args,
         kv_pool=kv_pool,
         full_layer_mapping=full_layer_mapping,
         use_mla=use_mla,
@@ -334,7 +326,7 @@ def build_kv_only_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=server_args.hicache_host_memory_mode,
+        host_memory_mode=get_memory().hicache_host_memory_mode,
     )
     return host_pool_group, cache_controller
 
@@ -342,7 +334,6 @@ def build_kv_only_stack(
 def build_hybrid_swa_stack(
     *,
     params: CacheInitParams,
-    server_args: ServerArgs,
     full_kv_pool: Any,
     swa_kv_pool: Any,
     full_layer_mapping: dict[int, int],
@@ -371,7 +362,6 @@ def build_hybrid_swa_stack(
 
     host_pool_group = build_hybrid_swa_group(
         page_size=params.page_size,
-        server_args=server_args,
         full_kv_pool=full_kv_pool,
         swa_kv_pool=swa_kv_pool,
         full_layer_mapping=full_layer_mapping,
@@ -402,7 +392,7 @@ def build_hybrid_swa_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=server_args.hicache_host_memory_mode,
+        host_memory_mode=get_memory().hicache_host_memory_mode,
     )
     return host_pool_group, cache_controller
 
@@ -445,7 +435,6 @@ def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
-    server_args: ServerArgs,
     kvcache: Any,
     load_cache_event,
     storage_backend: Optional[str],
@@ -687,7 +676,7 @@ def build_deepseek_v4_hicache_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=server_args.hicache_host_memory_mode,
+        host_memory_mode=get_memory().hicache_host_memory_mode,
     )
     return host_pool_group, cache_controller
 
@@ -695,7 +684,6 @@ def build_deepseek_v4_hicache_stack(
 def build_hybrid_mamba_stack(
     *,
     params: CacheInitParams,
-    server_args: ServerArgs,
     kv_pool: Any,
     mamba_pool: Any,
     full_layer_mapping: dict[int, int],
@@ -723,7 +711,6 @@ def build_hybrid_mamba_stack(
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
-        server_args=server_args,
         use_mla=use_mla,
         host_size=kv_host_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
@@ -782,7 +769,7 @@ def build_hybrid_mamba_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=server_args.hicache_host_memory_mode,
+        host_memory_mode=get_memory().hicache_host_memory_mode,
     )
     return host_pool_group, cache_controller
 
@@ -790,7 +777,6 @@ def build_hybrid_mamba_stack(
 def build_hybrid_mamba_swa_stack(
     *,
     params: CacheInitParams,
-    server_args: ServerArgs,
     full_kv_pool: Any,
     swa_kv_pool: Any,
     mamba_pool: Any,
@@ -826,7 +812,6 @@ def build_hybrid_mamba_swa_stack(
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
         page_size=page_size,
-        server_args=server_args,
         use_mla=False,
         host_size=kv_host_size,
         pool_label="full",
@@ -834,7 +819,6 @@ def build_hybrid_mamba_swa_stack(
     swa_host_pool = build_kv_host_pool(
         kv_pool=swa_kv_pool,
         page_size=page_size,
-        server_args=server_args,
         use_mla=False,
         host_size=swa_host_size,
         pool_label="swa",
@@ -896,7 +880,7 @@ def build_hybrid_mamba_swa_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=server_args.hicache_host_memory_mode,
+        host_memory_mode=get_memory().hicache_host_memory_mode,
     )
     return host_pool_group, cache_controller
 
@@ -904,7 +888,6 @@ def build_hybrid_mamba_swa_stack(
 def build_anchor_sidecar_stack(
     *,
     params: CacheInitParams,
-    server_args: ServerArgs,
     kv_pool: Any,
     sidecar_pool_name: PoolName,
     full_layer_mapping: dict[int, int],
@@ -925,7 +908,6 @@ def build_anchor_sidecar_stack(
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
-        server_args=server_args,
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
         mtp_draft_device_pools=mtp_draft_device_pools,
@@ -976,7 +958,7 @@ def build_anchor_sidecar_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=server_args.hicache_host_memory_mode,
+        host_memory_mode=get_memory().hicache_host_memory_mode,
     )
     return host_pool_group, cache_controller
 
@@ -1013,7 +995,6 @@ def build_full_draft_pools(
     *,
     draft_kv_pool: Any,
     tree_cache: Any,
-    server_args: ServerArgs,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build draft KV/DSA sidecars whose indices follow target full KV."""
     from sglang.srt.mem_cache.memory_pool import (
@@ -1089,7 +1070,6 @@ def build_swa_draft_pools(
     *,
     draft_kv_pool: Any,
     tree_cache: Any,
-    server_args: ServerArgs,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build a draft SWA sidecar whose indices follow target SWA."""
     draft_swa_pool = draft_kv_pool.swa_kv_pool
@@ -1143,7 +1123,6 @@ def build_hicache_draft_sidecars(
     *,
     draft_device_pools: tuple[Any, ...],
     tree_cache: Any,
-    server_args: ServerArgs,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Compose the full and SWA draft-sidecar paths."""
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -1158,7 +1137,6 @@ def build_hicache_draft_sidecars(
     return builder(
         draft_kv_pool=draft_kv_pool,
         tree_cache=tree_cache,
-        server_args=server_args,
     )
 
 
@@ -1230,7 +1208,6 @@ class _DeepSeekV4Strategy(StackStrategy):
     ):
         host_pool_group, cache_controller = build_deepseek_v4_hicache_stack(
             params=params,
-            server_args=server_args,
             kvcache=kvcache,
             load_cache_event=load_cache_event,
             storage_backend=storage_backend,
@@ -1306,7 +1283,6 @@ class _MambaStrategy(StackStrategy):
         mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
         host_pool_group, cache_controller = build_hybrid_mamba_stack(
             params=params,
-            server_args=server_args,
             kv_pool=kvcache.full_kv_pool,
             mamba_pool=params.req_to_token_pool.mamba_pool,
             full_layer_mapping=full_layer_mapping,
@@ -1372,7 +1348,6 @@ class _SwaStrategy(StackStrategy):
         full_layer_mapping, swa_layer_mapping = _swa_layer_mappings(kvcache)
         host_pool_group, cache_controller = build_hybrid_swa_stack(
             params=params,
-            server_args=server_args,
             full_kv_pool=kvcache.full_kv_pool,
             swa_kv_pool=kvcache.swa_kv_pool,
             full_layer_mapping=full_layer_mapping,
@@ -1433,7 +1408,6 @@ class _MambaSwaStrategy(StackStrategy):
         mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
         host_pool_group, cache_controller = build_hybrid_mamba_swa_stack(
             params=params,
-            server_args=server_args,
             full_kv_pool=kvcache.full_kv_pool,
             swa_kv_pool=kvcache.swa_kv_pool,
             mamba_pool=params.req_to_token_pool.mamba_pool,
@@ -1501,7 +1475,6 @@ class _DsaStrategy(StackStrategy):
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
-            server_args=server_args,
             kv_pool=full_kv_pool,
             sidecar_pool_name=PoolName.INDEXER,
             full_layer_mapping=full_layer_mapping,
@@ -1561,7 +1534,6 @@ class _MiniMaxSparseStrategy(StackStrategy):
     ):
         host_pool_group, cache_controller = build_minimax_sparse_hicache_stack(
             params=params,
-            server_args=server_args,
             sparse_pool=kvcache,
             load_cache_event=load_cache_event,
             storage_backend=storage_backend,
@@ -1638,7 +1610,6 @@ class _PlainKvStrategy(StackStrategy):
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
         host_pool_group, cache_controller = build_kv_only_stack(
             params=params,
-            server_args=server_args,
             kv_pool=full_kv_pool,
             full_layer_mapping=full_layer_mapping,
             load_cache_event=load_cache_event,
@@ -1754,7 +1725,6 @@ def attach_hybrid_pool_to_unified_cache(
 def build_minimax_sparse_hicache_stack(
     *,
     params: CacheInitParams,
-    server_args: ServerArgs,
     sparse_pool: Any,
     load_cache_event,
     storage_backend: Optional[str],
@@ -1787,7 +1757,6 @@ def build_minimax_sparse_hicache_stack(
     kv_host_pool = build_kv_host_pool(
         kv_pool=main_pool,
         page_size=params.page_size,
-        server_args=server_args,
         use_mla=False,
     )
     entries = [
@@ -1847,7 +1816,6 @@ def build_minimax_sparse_hicache_stack(
 def attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
     radix_cache: HiRadixCache,
     params: CacheInitParams,
-    server_args: ServerArgs,
     *,
     extra_config: dict,
     prefetch_threshold: int,
@@ -1875,7 +1843,6 @@ def attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
         if sparse_pool.index_k_pool is None:
             host_pool_group, cache_controller = build_kv_only_stack(
                 params=params,
-                server_args=server_args,
                 kv_pool=main_pool,
                 full_layer_mapping={
                     layer_id: layer_id for layer_id in range(main_pool.layer_num)
@@ -1892,7 +1859,6 @@ def attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
         else:
             host_pool_group, cache_controller = build_minimax_sparse_hicache_stack(
                 params=params,
-                server_args=server_args,
                 sparse_pool=sparse_pool,
                 load_cache_event=load_cache_event,
                 storage_backend=get_memory().hicache_storage_backend,
@@ -1922,7 +1888,6 @@ def attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
 def attach_hybrid_dsa_pool_to_hiradix_cache(
     radix_cache: HiRadixCache,
     params: CacheInitParams,
-    server_args: ServerArgs,
     *,
     extra_config: dict,
     prefetch_threshold: int,
@@ -1938,7 +1903,6 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
         layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
-            server_args=server_args,
             kv_pool=kv,
             sidecar_pool_name=PoolName.INDEXER,
             full_layer_mapping=layer_mapping,

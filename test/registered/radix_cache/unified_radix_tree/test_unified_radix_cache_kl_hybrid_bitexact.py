@@ -42,7 +42,6 @@ import os
 import random
 import unittest
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_multiturn_utils import (
     make_mamba_decode_assert,
@@ -67,6 +66,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=1150, stage="base-b", runner_config="1-gpu-large")
@@ -158,7 +158,7 @@ class TestUnifiedHybridBitExact(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def _run(self, helper):
         helper(
@@ -270,7 +270,7 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_multiturn_decode_cache_hit_branching(self):
         groups, branches = 3, 3
@@ -350,7 +350,7 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def _run(self, helper):
         helper(

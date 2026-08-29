@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import struct
 import threading
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -536,6 +537,44 @@ class StagingTransferInfo:
         self.ends[idx] = end
 
 
+@dataclasses.dataclass
+class StagingRegisterInfo:
+    """Staging buffer registration info attached to a KVArgsRegisterInfo."""
+
+    base_ptr: int = 0
+    total_size: int = 0
+    # Staging slots stay [all K, all V] after draft buffers alter kv_data_ptrs order;
+    # older peers leave this empty and callers fall back to kv_layer_ids.
+    slot_layer_ids: List[int] = dataclasses.field(default_factory=list)
+
+    @classmethod
+    def from_zmq_fields(
+        cls, msg: list, msg_start_offset: int, slot_ids_index: Optional[int] = None
+    ) -> Optional[StagingRegisterInfo]:
+        i = msg_start_offset
+        base_ptr = (
+            struct.unpack("Q", msg[i])[0] if len(msg) > i and len(msg[i]) == 8 else 0
+        )
+        total_size = (
+            int(msg[i + 1].decode("ascii"))
+            if len(msg) > i + 1 and len(msg[i + 1]) > 0
+            else 0
+        )
+        if base_ptr == 0 and total_size == 0:
+            return None
+        slot_layer_ids: List[int] = []
+        if (
+            slot_ids_index is not None
+            and len(msg) > slot_ids_index
+            and len(msg[slot_ids_index]) > 0
+        ):
+            raw = msg[slot_ids_index]
+            slot_layer_ids = list(struct.unpack(f"{len(raw) // 8}Q", raw))
+        return cls(
+            base_ptr=base_ptr, total_size=total_size, slot_layer_ids=slot_layer_ids
+        )
+
+
 class PrefillStagingStrategy:
     """Prefill-side staging transfer: readiness check + gather-RDMA execution.
 
@@ -627,6 +666,11 @@ class PrefillStagingStrategy:
                 target_info.dst_kv_item_len,
                 target_info.dst_kv_layer_ids,
                 staging_buffer=self.staging_buffer,
+                dst_slot_layer_ids=(
+                    target_info.staging.slot_layer_ids
+                    if target_info.staging is not None
+                    else None
+                ),
             )
         except Exception as e:
             raise RuntimeError(
