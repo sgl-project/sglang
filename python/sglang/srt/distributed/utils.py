@@ -101,6 +101,10 @@ def get_pp_indices(
     """
     # partition_list_str can be set to None in sglang
     partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
+    if pp_size == 1:
+        # A singleton draft PP group owns every layer and must ignore the target's
+        # process-global pipeline partition list.
+        partition_list_str = None
     if partition_list_str is not None:
         try:
             partitions = [int(layer) for layer in partition_list_str.split(",")]

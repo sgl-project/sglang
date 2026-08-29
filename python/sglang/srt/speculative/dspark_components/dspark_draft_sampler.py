@@ -157,7 +157,7 @@ class DsparkDraftSampler:
             draft_tokens, corrected_logits = self.markov_head.sample_block(
                 base_logits,
                 first_prev_tokens=anchor,
-                hidden_states=hidden_states.view(bs, self.gamma, -1),
+                hidden_states=sample_hidden,
                 sampler=sampler,
                 collect_corrected=self.folded_sampling,
             )
@@ -166,15 +166,6 @@ class DsparkDraftSampler:
                     corrected_logits.reshape(bs * self.gamma, -1)
                 )
 
-        else:
-            sampler = greedy_step_sampler
-
-        draft_tokens, corrected_logits = self.markov_head.sample_block(
-            base_logits,
-            first_prev_tokens=anchor,
-            hidden_states=sample_hidden,
-            sampler=sampler,
-        )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:
             confidence = self.confidence_fn(

@@ -7,9 +7,25 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    _deepseek_moe_quant_resolution,
+    _deepseek_spec_moe_resolution,
+    _dsa_kv_cache_dtype_default,
+    _dsa_split_backend_resolution,
+    _enforce_disable_allreduce_fusion,
+    _flashinfer_allreduce_fusion_auto_enable,
+    _hrm_text_attention_force,
+    _mamba_radix_cache_resolution,
+    _sparse_head_overlap_disable,
+    collect_model_override_declarations,
     declare_resolution,
+    mamba_cache_chunk_size,
+    mamba_extra_buffer_of,
+    model_config_of,
     resolved_view,
     resolving_view,
+    run_post_process_pass,
+    use_mla_backend,
+    validate_declarations,
 )
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
@@ -34,6 +50,8 @@ logger = logging.getLogger(__name__)
 
 
 def handle_model_specific_adjustments(server_args: Any):
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
         get_mimo_v2_fused_qkv_expected_tp_size,
@@ -57,7 +75,7 @@ def handle_model_specific_adjustments(server_args: Any):
         # key them on.
         return
 
-    model_config = server_args.get_model_config()
+    model_config = model_config_of(server_args)
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
 
@@ -100,10 +118,6 @@ def handle_model_specific_adjustments(server_args: Any):
     # server_args is never mutated — mid-resolution readers see the
     # declared values through resolved_view, runtime readers through the
     # flags tier.
-    from sglang.srt.arg_groups.overrides import (
-        collect_model_override_declarations,
-        validate_declarations,
-    )
 
     model_overrides = collect_model_override_declarations(
         model_arch, server_args, hf_config
@@ -203,10 +217,9 @@ def handle_model_specific_adjustments(server_args: Any):
                 import torch
 
                 major, _ = torch.cuda.get_device_capability()
-                server_args._set_default_dsa_kv_cache_dtype(
-                    major, resolved_view(server_args).quantization
-                )
-                server_args._set_default_dsa_backends(major)
+
+                run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
+                run_post_process_pass(server_args, _dsa_split_backend_resolution)
 
             if cfg.enable_prefill_cp:
                 assert (
@@ -270,7 +283,7 @@ def handle_model_specific_adjustments(server_args: Any):
             # MLA prefill CP auto-config: the field declarations moved to
             # the override registry (arg_groups/overrides.py:
             # _deepseek_family_overrides).
-            if cfg.enable_prefill_cp and server_args.use_mla_backend():
+            if cfg.enable_prefill_cp and use_mla_backend(server_args):
                 declare_resolution(
                     server_args,
                     "_handle_model_specific_adjustments",
@@ -287,10 +300,6 @@ def handle_model_specific_adjustments(server_args: Any):
         # kv-cache-dtype default above must read the pristine
         # quantization). The HIP arm (fusion log + spec_moe writes, the
         # latter awaiting the speculative-hook migration) stays below.
-        from sglang.srt.arg_groups.overrides import (
-            _deepseek_moe_quant_resolution,
-            run_post_process_pass,
-        )
 
         run_post_process_pass(server_args, _deepseek_moe_quant_resolution)
         if is_hip():
@@ -304,7 +313,7 @@ def handle_model_specific_adjustments(server_args: Any):
                 # here for the rest of the DSA family (DeepSeek-V3.2 /
                 # GLM-5.x) that shares the same decode top-k path.
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-            if not server_args._resolved().enable_dp_attention and cfg.nnodes == 1:
+            if not resolved_view(server_args).enable_dp_attention and cfg.nnodes == 1:
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True
                 logger.info("Enable Aiter AllReduce Fusion for DeepseekV3ForCausalLM")
@@ -313,9 +322,6 @@ def handle_model_specific_adjustments(server_args: Any):
             # resolution pipeline (arg_groups/overrides.py:
             # _deepseek_spec_moe_resolution), invoked here at its legacy
             # slot.
-            from sglang.srt.arg_groups.overrides import (
-                _deepseek_spec_moe_resolution,
-            )
 
             run_post_process_pass(server_args, _deepseek_spec_moe_resolution)
 
@@ -372,8 +378,8 @@ def handle_model_specific_adjustments(server_args: Any):
                 "intel_xpu",
                 "aiter",
             ]
-            prefill_attn_backend, decode_attn_backend = (
-                server_args._resolved_attention_backends()
+            prefill_attn_backend, decode_attn_backend = attention_backends_of(
+                resolved_view(server_args)
             )
             assert (
                 prefill_attn_backend in supported_backends
@@ -387,7 +393,7 @@ def handle_model_specific_adjustments(server_args: Any):
         quant_method = get_quantization_config(hf_config)
         is_mxfp4_quant_format = quant_method == "mxfp4"
         if (
-            not server_args._resolved().enable_dp_attention
+            not resolved_view(server_args).enable_dp_attention
             and cfg.nnodes == 1
             and is_hip()
         ):
@@ -407,13 +413,13 @@ def handle_model_specific_adjustments(server_args: Any):
 
         if resolved_view(server_args).moe_runner_backend == "triton_kernel":
             assert (
-                server_args._resolved().ep_size == 1
+                resolved_view(server_args).ep_size == 1
             ), "Triton kernel MoE is only supported when ep_size == 1"
 
     elif model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
         if model_arch == "MiMoV2ForCausalLM" and not cfg.encoder_only:
             expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(hf_config)
-            view = server_args._resolved()
+            view = resolved_view(server_args)
             attn_dp_size = cfg.dp_size if view.enable_dp_attention else 1
             effective_attn_tp_size = cfg.tp_size // attn_dp_size // view.attn_cp_size
             if (
@@ -476,7 +482,9 @@ def handle_model_specific_adjustments(server_args: Any):
     ):
         # Default attention backend selection moved to the override registry
         # (arg_groups/overrides.py: _gemma4_overrides).
-        prefill_backend, decode_backend = server_args._resolved_attention_backends()
+        prefill_backend, decode_backend = attention_backends_of(
+            resolved_view(server_args)
+        )
         accepted_backends = (
             "trtllm_mha",
             "triton",
@@ -563,11 +571,6 @@ def handle_model_specific_adjustments(server_args: Any):
     # resolved before that tail write of disable_overlap_schedule.
     handle_mamba_radix_cache(server_args, model_arch)
 
-    from sglang.srt.arg_groups.overrides import (
-        _sparse_head_overlap_disable,
-        run_post_process_pass,
-    )
-
     run_post_process_pass(server_args, _sparse_head_overlap_disable)
 
     # The FlashInfer AllReduce Fusion auto-enable and the enforce-disable
@@ -575,16 +578,15 @@ def handle_model_specific_adjustments(server_args: Any):
     # _flashinfer_allreduce_fusion_auto_enable /
     # _enforce_disable_allreduce_fusion), invoked here at their legacy
     # slots.
-    from sglang.srt.arg_groups.overrides import (
-        _enforce_disable_allreduce_fusion,
-        _flashinfer_allreduce_fusion_auto_enable,
-    )
 
     run_post_process_pass(server_args, _flashinfer_allreduce_fusion_auto_enable)
     run_post_process_pass(server_args, _enforce_disable_allreduce_fusion)
 
 
 def handle_model_capability_adjustments(server_args: Any):
+    from sglang.srt.arg_groups.cuda_graph_hook import (
+        generate_prefill_cuda_graph_batch_sizes,
+    )
     from sglang.srt.arg_groups.kv_cache_hook import (
         validate_prefill_only_disable_kv_cache_args,
     )
@@ -592,12 +594,8 @@ def handle_model_capability_adjustments(server_args: Any):
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         return
-    from sglang.srt.arg_groups.overrides import (
-        _hrm_text_attention_force,
-        run_post_process_pass,
-    )
 
-    model_config = server_args.get_model_config()
+    model_config = model_config_of(server_args)
     hf_config = model_config.hf_config
 
     # HRM-Text needs bidirectional prompt attention (prefill), which only
@@ -768,7 +766,7 @@ def handle_model_capability_adjustments(server_args: Any):
                     )
                 }
                 if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
-                    sizing["bs"] = server_args._generate_prefill_cuda_graph_batch_sizes(
+                    sizing["bs"] = generate_prefill_cuda_graph_batch_sizes(
                         sizing["max_bs"]
                     )
                 declare_resolution(
@@ -816,11 +814,6 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
         validate_mamba_extra_buffer,
         validate_mamba_no_buffer,
     )
-    from sglang.srt.arg_groups.overrides import (
-        _mamba_radix_cache_resolution,
-        mamba_extra_buffer_of,
-        run_post_process_pass,
-    )
 
     run_post_process_pass(server_args, _mamba_radix_cache_resolution)
     view = resolved_view(server_args)
@@ -831,13 +824,14 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
         validate_mamba_extra_buffer(
             view,
             model_arch,
-            mamba_cache_chunk_size_of=lambda: server_args.mamba_cache_chunk_size,
+            mamba_cache_chunk_size_of=lambda: mamba_cache_chunk_size(server_args),
         )
     else:
         validate_mamba_no_buffer(view, model_arch)
 
 
 def handle_language_model_only(server_args: Any):
+
     cfg = resolving_view(server_args)
     if not cfg.language_model_only:
         return
@@ -858,7 +852,7 @@ def handle_language_model_only(server_args: Any):
             "--language-model-only is incompatible with --disaggregation-mode "
             "prefill/decode"
         )
-    architectures = server_args.get_model_config().hf_config.architectures
+    architectures = model_config_of(server_args).hf_config.architectures
     if not any(
         a in server_args.LANGUAGE_MODEL_ONLY_ARCHITECTURES for a in architectures
     ):
