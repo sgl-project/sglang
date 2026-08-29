@@ -756,9 +756,10 @@ class ServerArgs(DisaggServerArgsMixin):
         # propose the fold group from the parallelism alone; the loader keeps it
         # only for encoders worth folding at their real post-load size
         # (finalize_encoder_folding)
-        encoder_configs = list(self.pipeline_config.text_encoder_configs) + list(
-            getattr(self.pipeline_config, "image_encoder_configs", ()) or ()
-        )
+        encoder_configs = [
+            *self.pipeline_config.text_encoder_configs,
+            self.pipeline_config.image_encoder_config,
+        ]
         for encoder_config in encoder_configs:
             encoder_config.parallel_folding_mode = mode
 
