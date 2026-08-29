@@ -1100,6 +1100,29 @@ def _record_pipeline_result(modality: Modality, status: str) -> None:
         )
 
 
+async def _publish_pipeline_error(req_id: str, error_msg: str) -> bool:
+    """Report a request error without letting reporting block cleanup."""
+    try:
+        await server_module.meta_registry.publish(req_id, 0, 0, 0, error=error_msg)
+        return True
+    except Exception:
+        logger.exception("Failed to publish encoder error for req_id=%s", req_id)
+        return False
+
+
+async def _release_failed_request(
+    enc: MMEncoder,
+    req_id: str,
+    *,
+    preserve_metadata: bool = False,
+) -> None:
+    """Release request resources without hiding the original request error."""
+    try:
+        await enc.release_request(req_id, preserve_metadata=preserve_metadata)
+    except Exception:
+        logger.exception("Failed to release encoder resources for req_id=%s", req_id)
+
+
 async def execute_encode_pipeline(
     enc: MMEncoder,
     sched: Optional[EncoderScheduler],
@@ -1188,24 +1211,36 @@ async def execute_encode_pipeline(
     except asyncio.TimeoutError:
         error_msg = "encoder batch timed out"
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        await server_module.meta_registry.publish(req_id, 0, 0, 0, error=error_msg)
-        await enc.release_request(req_id, preserve_metadata=backend == "mooncake")
+        error_published = await _publish_pipeline_error(req_id, error_msg)
+        await _release_failed_request(
+            enc,
+            req_id,
+            preserve_metadata=backend == "mooncake" and error_published,
+        )
         _record_pipeline_result(modality, "error")
         raise
     except Exception as e:
         error_msg = str(e)
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        await server_module.meta_registry.publish(req_id, 0, 0, 0, error=error_msg)
-        await enc.release_request(req_id, preserve_metadata=backend == "mooncake")
+        error_published = await _publish_pipeline_error(req_id, error_msg)
+        await _release_failed_request(
+            enc,
+            req_id,
+            preserve_metadata=backend == "mooncake" and error_published,
+        )
         _record_pipeline_result(modality, "error")
         raise
 
     nbytes, embedding_len, embedding_dim, error_msg, error_code = result
     if error_msg:
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        await server_module.meta_registry.publish(req_id, 0, 0, 0, error=error_msg)
+        error_published = await _publish_pipeline_error(req_id, error_msg)
         if backend == "mooncake":
-            await enc.release_request(req_id, preserve_metadata=True)
+            await _release_failed_request(
+                enc,
+                req_id,
+                preserve_metadata=error_published,
+            )
         else:
             try:
                 await _push_embedding_to_prefill(
@@ -1218,6 +1253,7 @@ async def execute_encode_pipeline(
                     f"Error-send failed for req_id={req_id}: {send_err}",
                     exc_info=True,
                 )
+                await _release_failed_request(enc, req_id)
         _record_pipeline_result(modality, "error")
         raise MMError(error_msg, code=error_code or HTTPStatus.INTERNAL_SERVER_ERROR)
 
