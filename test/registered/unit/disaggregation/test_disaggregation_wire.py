@@ -399,20 +399,32 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         override.install()
         self.addCleanup(override.restore)
 
-        with envs.SGLANG_DSA_FUSE_TOPK.override(True), patch(
-            "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=True
+        local_slots = [[309, 101, -1], [801, 990, -1]]
+        unremapped = [[2, 0, -1], [1, 3, -1]]
+        for platform, cuda, hip, fused, expected in (
+            ("cuda", True, False, True, local_slots),
+            ("hip", False, True, True, local_slots),
+            # Everything that is neither CUDA nor ROCm -- NPU in particular --
+            # still declines the seed, so fusion stays off and the wire
+            # positions are passed through unremapped.
+            ("other", False, False, False, unremapped),
         ):
-            self.assertTrue(
-                should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True)
-            )
-            draft_input = build_eagle_disagg_draft_input(
-                batch, torch.tensor([11, 12], dtype=torch.int64), None
-            )
+            with self.subTest(platform=platform), envs.SGLANG_DSA_FUSE_TOPK.override(
+                True
+            ), patch(
+                "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=cuda
+            ), patch(
+                "sglang.srt.layers.attention.dsa.utils.is_hip", return_value=hip
+            ):
+                self.assertEqual(
+                    should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True),
+                    fused,
+                )
+                draft_input = build_eagle_disagg_draft_input(
+                    batch, torch.tensor([11, 12], dtype=torch.int64), None
+                )
 
-        self.assertEqual(
-            draft_input.dsa_topk_indices.tolist(),
-            [[309, 101, -1], [801, 990, -1]],
-        )
+                self.assertEqual(draft_input.dsa_topk_indices.tolist(), expected)
 
     def test_future_map_initializes_seed_buffer_after_seedless_payload(self):
         future_map = object.__new__(FutureMap)
@@ -433,6 +445,41 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         )
         self.assertEqual(future_map.dsa_topk_indices_buf.shape, (4, 3))
         self.assertEqual(future_map.dsa_topk_indices_buf.dtype, torch.int32)
+
+    @patch(
+        "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+        return_value=False,
+    )
+    def test_future_map_initializes_topk_after_prefill_payload(self, _):
+        future_map = object.__new__(FutureMap)
+        future_map.spec_algo = SimpleNamespace(
+            is_some=Mock(return_value=True),
+            need_topk=Mock(return_value=True),
+        )
+        future_map.req_pool_size = 4
+        future_map.device = "cpu"
+        future_map.need_topk = False
+        future_map.need_hidden_states = False
+        future_map.topk_p_buf = None
+        future_map.topk_index_buf = None
+        future_map.hidden_states_buf = None
+        future_map.draft_probs_buf = None
+
+        future_map._maybe_init_forward_bufs(
+            RelayPayload(bonus_tokens=torch.zeros((2,), dtype=torch.int64))
+        )
+        self.assertFalse(future_map.need_topk)
+
+        future_map._maybe_init_forward_bufs(
+            RelayPayload(
+                bonus_tokens=torch.zeros((2,), dtype=torch.int64),
+                topk_p=torch.zeros((2, 3), dtype=torch.float32),
+                topk_index=torch.zeros((2, 3), dtype=torch.int64),
+            )
+        )
+        self.assertTrue(future_map.need_topk)
+        self.assertEqual(future_map.topk_p_buf.shape, (4, 3))
+        self.assertEqual(future_map.topk_index_buf.shape, (4, 3))
 
 
 class TestDSV4C128StateIndices(unittest.TestCase):

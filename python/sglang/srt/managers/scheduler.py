@@ -292,14 +292,16 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import get_context, publish
+from sglang.srt.runtime_context import get_context, get_spec, publish
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
-from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
+from sglang.srt.speculative.eagle_utils import (
+    get_draft_recurrent_hidden_state_spec_from_config,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -577,6 +579,12 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        if self.enable_hierarchical_cache:
+            cache_controller = self.tree_cache.cache_controller
+            if cache_controller is not None:
+                cache_controller.load_fence_stream = (
+                    self.tp_worker.model_runner.forward_stream
+                )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -1374,11 +1382,18 @@ class Scheduler(
         )
 
         if self.spec_algorithm.carries_draft_hidden_states():
-            # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
-            # worker, so a single accessor covers both shapes.
-            draft_runner = self.draft_worker.draft_worker.draft_runner
+            # Derive the rank-uniform PD wire schema from config because only the
+            # last prefill PP stage owns a draft runner.
+            draft_model_config = ModelConfig.from_server_args(
+                self.server_args,
+                model_path=get_spec().speculative_draft_model_path,
+                model_revision=get_spec().speculative_draft_model_revision,
+                is_draft_model=True,
+            )
             disagg_hidden_size, disagg_hidden_states_dtype = (
-                get_draft_recurrent_hidden_state_spec(draft_runner)
+                get_draft_recurrent_hidden_state_spec_from_config(
+                    draft_model_config, self.spec_algorithm
+                )
             )
         else:
             disagg_hidden_size = 16  # minimal padding size for RDMA
@@ -2845,6 +2860,8 @@ class Scheduler(
                     tree_cache.get_last_hash_value(last_host_node),
                     prefix_keys,
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
+                    extra_key=req.extra_key,
+                    cache_salt=req.cache_salt,
                 )
 
     def _retry_missed_storage_prefetches(self):
@@ -3532,16 +3549,18 @@ class Scheduler(
                 # Buffer mode: surface a staged prefetch as the request's host
                 # hit (consumed through init_load_back) plus its SWA window,
                 # which consumption allocates and the request lock pins —
-                # uncharged, the batch alloc can OOM. Set AFTER
+                # uncharged, the batch alloc can OOM. Planned against the same
+                # live prefix admission uses, so only the splice-able span
+                # tail is charged and unusable holds are freed. Set AFTER
                 # init_next_round_input (which recomputes host_hit). Mamba
                 # (fenced in init_hicache) will need the same charge via
                 # mamba_host_hit_length.
-                held_tokens = self.tree_cache.staged_prefetch_tokens(req.rid)
+                held_tokens, held_swa_tokens = self.tree_cache.plan_staged_splice(
+                    req.rid, len(req.prefix_indices)
+                )
                 if held_tokens > 0:
                     req.host_hit_length = held_tokens
-                    req.swa_host_hit_length = (
-                        self.tree_cache.staged_prefetch_swa_tokens(req.rid)
-                    )
+                    req.swa_host_hit_length = held_swa_tokens
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3981,7 +4000,9 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3992,12 +4013,14 @@ class Scheduler(
                         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)
-                # Sync D2H so the result processor can read CPU tensors.
+                # Only the last PP rank owns real results requiring D2H; other ranks
+                # consume device tensors rebuilt from the output ring.
                 batch_result.copy_done = self.device_module.Event()
-                batch_result.copy_to_cpu(
-                    return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
-                )
+                if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
+                    batch_result.copy_to_cpu(
+                        return_logprob=batch.return_logprob,
+                        return_hidden_states=batch.return_hidden_states,
+                    )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
