@@ -3410,6 +3410,8 @@ class FlashAttentionMultiStepBackend:
                     fa_impl_ver=fa_impl_ver,
                 )
             )
+        self.attn_backend_list = self.attn_backends
+        self.forward_metadata = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
