@@ -9,7 +9,10 @@ import os
 from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.overrides import (
+    _hisparse_validation,
+    resolved_view,
     resolving_view,
+    run_post_process_pass,
 )
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
@@ -121,12 +124,8 @@ def check_server_args(server_args: Any):
     assert cfg.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
     assert cfg.mm_processor_worker_num >= 0, "Multimodal processor worker num must >= 0"
     assert cfg.mm_io_worker_num >= 0, "Multimodal I/O worker num must >= 0"
-    validate_buckets_rule(
-        server_args, "--prompt-tokens-buckets", cfg.prompt_tokens_buckets
-    )
-    validate_buckets_rule(
-        server_args, "--generation-tokens-buckets", cfg.generation_tokens_buckets
-    )
+    validate_buckets_rule("--prompt-tokens-buckets", cfg.prompt_tokens_buckets)
+    validate_buckets_rule("--generation-tokens-buckets", cfg.generation_tokens_buckets)
 
     # Check scheduling policy
     if cfg.enable_priority_scheduling:
@@ -157,10 +156,6 @@ def check_server_args(server_args: Any):
     # Check hisparse
     # Moved to the resolution pipeline (arg_groups/overrides.py:
     # _hisparse_validation), invoked here at its legacy slot.
-    from sglang.srt.arg_groups.overrides import (
-        _hisparse_validation,
-        run_post_process_pass,
-    )
 
     run_post_process_pass(server_args, _hisparse_validation)
 
@@ -221,7 +216,7 @@ def check_server_args(server_args: Any):
     check_load_publish_args(server_args)
 
 
-def validate_buckets_rule(server_args: Any, arg_name: str, buckets_rule: List[str]):
+def validate_buckets_rule(arg_name: str, buckets_rule: List[str]):
     if not buckets_rule:
         return
 
@@ -312,7 +307,7 @@ def check_load_publish_args(server_args: Any):
         raise ValueError(reason)
 
 
-def validate_ib_devices(server_args: Any, device_str: Optional[str]) -> Optional[str]:
+def validate_ib_devices(device_str: Optional[str]) -> Optional[str]:
     """
     Validate IB devices before passing to mooncake.
 
@@ -389,7 +384,7 @@ def validate_ib_devices(server_args: Any, device_str: Optional[str]) -> Optional
 
 
 def validate_experimental_sgl_marlin(server_args: Any):
-    view = server_args._resolved()
+    view = resolved_view(server_args)
     if view.moe_runner_backend != "experimental_sgl_marlin":
         return
 

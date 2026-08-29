@@ -32,8 +32,9 @@ from sglang.kernels.ops.quantization.per_token_group_quant import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=65, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-large")
 
 G = 128
 FMAX = float(fp8_max)  # 448 for e4m3
@@ -220,9 +221,20 @@ def test_ue8m0_row_packed_bitexact(hidden):
 # fp32 / int8 scale paths: exact stored scale + dequant round-trip (the codes
 # are not bit-reproducible under fast-math division).
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("hidden", [4096, 768])
-@pytest.mark.parametrize("column_major", [False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+FP32_SCALE_CASES = get_ci_test_range(
+    list(
+        itertools.product([torch.bfloat16, torch.float16], [False, True], [4096, 768])
+    ),
+    [
+        (torch.bfloat16, False, 4096),
+        (torch.bfloat16, True, 768),
+        (torch.float16, False, 768),
+        (torch.float16, True, 4096),
+    ],
+)
+
+
+@pytest.mark.parametrize("dtype,column_major,hidden", FP32_SCALE_CASES)
 def test_fp32_scale(dtype, column_major, hidden):
     """fp32 scale (row-major contiguous / col-major TMA view): the stored scale
     is amax/FMAX (a single multiply, bit-exact) and dequant round-trips within
@@ -342,12 +354,19 @@ MASKED_CASES = get_ci_test_range(
     list(itertools.product([2, 5], [2048, 4096], [128, 384])),
     [(2, 2048, 128), (5, 4096, 384)],
 )
+MASKED_TEST_CASES = get_ci_test_range(
+    list(itertools.product(MASKED_CASES, [None, 4], [torch.int32, torch.int64])),
+    [
+        ((2, 2048, 128), None, torch.int32),
+        ((2, 2048, 128), 4, torch.int64),
+        ((5, 4096, 384), None, torch.int32),
+        ((5, 4096, 384), 4, torch.int64),
+    ],
+)
 
 
-@pytest.mark.parametrize("masked_m_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("expected_m", [None, 4])
-@pytest.mark.parametrize("num_experts,hidden,tokens_pad", MASKED_CASES)
-def test_masked(num_experts, hidden, tokens_pad, expected_m, masked_m_dtype):
+@pytest.mark.parametrize("shape,expected_m,masked_m_dtype", MASKED_TEST_CASES)
+def test_masked(shape, expected_m, masked_m_dtype):
     """Masked EP-MoE schedule (col-packed ue8m0, plain quant -- no silu, so the
     quant is bit-reproducible): rows < masked_m[e] are bit-exact vs the torch
     reference; rows >= masked_m[e] stay zero (untouched). Fusion numerics are
@@ -359,6 +378,7 @@ def test_masked(num_experts, hidden, tokens_pad, expected_m, masked_m_dtype):
     expected_m=4 shrinks the grid's token axis far below masked_m, so the
     grid-stride token loop must still cover every valid token -- guards the
     host-hint-only contract (a wrong hint can never drop tokens)."""
+    num_experts, hidden, tokens_pad = shape
     torch.manual_seed(num_experts * 1000 + hidden + tokens_pad)
     x = torch.randn(
         num_experts, tokens_pad, hidden, device="cuda", dtype=torch.bfloat16
@@ -431,9 +451,26 @@ def test_masked_fused():
         assert torch.all(x_q[e, m:].view(torch.int8) == 0), "padding touched"
 
 
-@pytest.mark.parametrize("poison", [float("nan"), float("inf"), -float("inf")])
-@pytest.mark.parametrize("scale_ue8m0", [False, True])
-@pytest.mark.parametrize("masked", [False, True])
+NON_FINITE_CASES = get_ci_test_range(
+    list(
+        itertools.product(
+            [float("nan"), float("inf"), -float("inf")],
+            [False, True],
+            [False, True],
+        )
+    ),
+    [
+        (float("nan"), False, False),
+        (float("nan"), True, True),
+        (float("inf"), False, True),
+        (float("inf"), True, False),
+        (-float("inf"), False, False),
+        (-float("inf"), True, True),
+    ],
+)
+
+
+@pytest.mark.parametrize("poison,scale_ue8m0,masked", NON_FINITE_CASES)
 def test_non_finite_inputs_are_sanitized(poison, scale_ue8m0, masked):
     """CUDA-graph capture warmup runs the model on reused, uninitialized
     buffers, so quant inputs can contain NaN/Inf bit patterns. The v1/v2/Triton

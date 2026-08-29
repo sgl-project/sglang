@@ -513,7 +513,6 @@ class ModelRunner:
         )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=global_ep_rank,
             )
@@ -718,7 +717,6 @@ class ModelRunner:
             )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=expert_rank,
             )
@@ -759,7 +757,6 @@ class ModelRunner:
     def maybe_init_expert_backup_client(self):
         self.expert_backup_client = (
             ExpertBackupClient(
-                server_args=self.server_args,
                 model_config=self.model_config,
                 moe_ep_size=self.ps.moe_ep_size,
                 moe_ep_rank=self.ps.moe_ep_rank,
@@ -980,7 +977,6 @@ class ModelRunner:
         )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=global_ep_rank,
             )
@@ -1981,7 +1977,6 @@ class ModelRunner:
             return
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=self._elastic_global_rank(),
             )
@@ -2046,7 +2041,6 @@ class ModelRunner:
         ElasticEPStateManager.on_scale(effective_size, target_size)
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=self._elastic_global_rank(),
             )
