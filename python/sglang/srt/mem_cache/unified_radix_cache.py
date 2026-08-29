@@ -82,7 +82,11 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
-from sglang.srt.runtime_context import get_memory, get_observability
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_model,
+    get_observability,
+)
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
 
@@ -432,7 +436,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self.buffer_pipeline = BufferModePipeline(
                 cache=self,
-                max_context_len=server_args.context_length or 0,
+                max_context_len=get_model().context_length or 0,
                 swa_window_pages=(
                     swa.full_window_pages
                     if swa is not None and self.tree_core.has_swa_host_pool

@@ -280,17 +280,6 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
         validate_declarations(server_args, [entry])
 
 
-def _apply_fields(server_args: Any, fields: Dict[str, Any]) -> None:
-    """Write fields on behalf of the pipeline (bypasses the strict bare-
-    assignment guard that protects post-resolution mutation)."""
-    object.__setattr__(server_args, "_internal_write", True)
-    try:
-        for field, value in fields.items():
-            setattr(server_args, field, value)
-    finally:
-        object.__setattr__(server_args, "_internal_write", False)
-
-
 def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
     """Record a resolution write in the declaration stash.
 

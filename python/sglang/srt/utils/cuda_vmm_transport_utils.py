@@ -16,8 +16,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.runtime_context import (
+    get_device,
     get_mm,
     get_parallel,
+    get_serving,
 )
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
@@ -941,14 +943,14 @@ class CudaVmmFeatureTransport:
             )
 
         per_worker_pool_size = get_mm_feature_pool_size_per_worker(
-            MM_FEATURE_CACHE_SIZE, server_args.tokenizer_worker_num
+            MM_FEATURE_CACHE_SIZE, get_serving().tokenizer_worker_num
         )
         self.pool = CudaVmmMemoryPool(
             memory_size=per_worker_pool_size,
             recycle_interval=MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-            base_gpu_id=server_args.base_gpu_id,
+            base_gpu_id=get_device().base_gpu_id,
             consumer_count=get_vmm_feature_consumer_count(),
-            allow_posix_fallback=server_args.nnodes == 1,
+            allow_posix_fallback=get_parallel().nnodes == 1,
         )
 
     def prepare_for_dispatch(

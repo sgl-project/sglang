@@ -4167,10 +4167,8 @@ class ServerArgs:
         # the config bags were projected from. Resolved config changes go to the bags via
         # get_context().override(source, ...); a value one runner or worker
         # owns travels as a constructor argument to it.
-        if (
-            getattr(self, "_resolution_finished", False)
-            and not getattr(self, "_internal_write", False)
-            and (not name.startswith("_") or name in _underscore_field_names())
+        if getattr(self, "_resolution_finished", False) and (
+            not name.startswith("_") or name in _underscore_field_names()
         ):
             raise AttributeError(
                 f"server_args.{name} assigned after resolution; server_args is "

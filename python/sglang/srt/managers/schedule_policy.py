@@ -5,7 +5,10 @@ from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_schedule,
+)
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
@@ -1440,7 +1443,7 @@ class PrefillAdder:
         Returns True if preemption was committed, and the new request can be scheduled.
         """
         # Iterate running requests to find preemptible requests
-        priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
+        priority_sign = 1 if get_schedule().schedule_low_priority_values_first else -1
 
         # NOTE: A request finishes in two phases:
         #   1) update_finish_state + release_kv_cache  (in process_batch_result)

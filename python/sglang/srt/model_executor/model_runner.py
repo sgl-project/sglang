@@ -910,7 +910,7 @@ class ModelRunner:
         )
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-        hisparse_cfg = parse_hisparse_config(self.server_args)
+        hisparse_cfg = parse_hisparse_config()
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
