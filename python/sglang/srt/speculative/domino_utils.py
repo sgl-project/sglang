@@ -21,6 +21,61 @@ def _domino_gru_cell(
 _DOMINO_CANDIDATE_POOL_SIZE = 2048
 
 
+class DominoRolloutWorkspace:
+    """Static candidate-pool buffers reused across Domino rollout cycles."""
+
+    def __init__(
+        self,
+        *,
+        max_batch_size: int,
+        num_feedback_steps: int,
+        candidate_pool_size: int,
+        vocab_size: int,
+        emb_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        self.max_batch_size = int(max_batch_size)
+        self.num_feedback_steps = int(num_feedback_steps)
+        self.candidate_pool_size = int(candidate_pool_size)
+        self.vocab_size = int(vocab_size)
+        self.topk_values = torch.empty(
+            (self.max_batch_size, self.candidate_pool_size),
+            dtype=dtype,
+            device=device,
+        )
+        self.candidate_ids = torch.empty(
+            (self.max_batch_size, self.candidate_pool_size),
+            dtype=torch.long,
+            device=device,
+        )
+        self.pool_scores = torch.empty(
+            (self.max_batch_size, self.vocab_size),
+            dtype=dtype,
+            device=device,
+        )
+        self.candidate_base = torch.empty(
+            (
+                self.max_batch_size,
+                self.num_feedback_steps,
+                self.candidate_pool_size,
+            ),
+            dtype=dtype,
+            device=device,
+        )
+        self.candidate_weight = torch.empty(
+            (self.max_batch_size, self.candidate_pool_size, emb_dim),
+            dtype=dtype,
+            device=device,
+        )
+        self.candidate_weight_flat = self.candidate_weight.view(-1, emb_dim)
+        self.candidate_score = torch.empty(
+            (self.max_batch_size, self.candidate_pool_size),
+            dtype=dtype,
+            device=device,
+        )
+
+
 def validate_domino_runtime(
     *,
     device: torch.device,
@@ -121,6 +176,7 @@ def domino_greedy_rollout(
     vocab_size: int,
     shift_label: bool,
     candidate_pool_size: int = _DOMINO_CANDIDATE_POOL_SIZE,
+    workspace: DominoRolloutWorkspace | None = None,
 ) -> torch.Tensor:
     """Generate a Domino chain using one block-shared base-logit candidate pool."""
     if draft_hidden.ndim != 3:
@@ -143,6 +199,28 @@ def domino_greedy_rollout(
             f"got {candidate_pool_size}."
         )
     candidate_pool_size = min(candidate_pool_size, int(vocab_size))
+    if workspace is not None:
+        if batch_size > workspace.max_batch_size:
+            raise ValueError(
+                f"Domino workspace batch capacity {workspace.max_batch_size} "
+                f"is smaller than batch size {batch_size}."
+            )
+        if candidate_pool_size != workspace.candidate_pool_size:
+            raise ValueError(
+                "Domino workspace candidate-pool size does not match rollout: "
+                f"workspace={workspace.candidate_pool_size}, rollout={candidate_pool_size}."
+            )
+        if workspace.num_feedback_steps != num_proposals - 1:
+            raise ValueError(
+                "Domino workspace feedback-step capacity does not match rollout: "
+                f"workspace={workspace.num_feedback_steps}, "
+                f"rollout={num_proposals - 1}."
+            )
+        if workspace.vocab_size != int(vocab_size):
+            raise ValueError(
+                "Domino workspace vocabulary size does not match rollout: "
+                f"workspace={workspace.vocab_size}, rollout={int(vocab_size)}."
+            )
     start = 0 if shift_label else 1
     z = draft_hidden[:, start : start + num_proposals, :]
     if int(z.shape[1]) != num_proposals:
@@ -169,18 +247,48 @@ def domino_greedy_rollout(
     candidate_weight = None
     if 0 < candidate_pool_size < int(vocab_size):
         feedback_logits = base_logits[1:]
-        candidate_ids = torch.topk(
-            feedback_logits.amax(dim=0),
-            k=candidate_pool_size,
-            dim=-1,
-            sorted=False,
-        ).indices.contiguous()
-        candidate_base = torch.gather(
-            feedback_logits.transpose(0, 1),
-            2,
-            candidate_ids[:, None, :].expand(-1, num_proposals - 1, -1),
-        ).transpose(0, 1)
-        candidate_weight = F.embedding(candidate_ids, embed_proj[2].weight)
+        if workspace is None:
+            candidate_ids = torch.topk(
+                feedback_logits.amax(dim=0),
+                k=candidate_pool_size,
+                dim=-1,
+                sorted=False,
+            ).indices.contiguous()
+            candidate_base = torch.gather(
+                feedback_logits.transpose(0, 1),
+                2,
+                candidate_ids[:, None, :].expand(-1, num_proposals - 1, -1),
+            ).transpose(0, 1)
+            candidate_weight = F.embedding(candidate_ids, embed_proj[2].weight)
+        else:
+            pool_scores = workspace.pool_scores[:batch_size]
+            torch.amax(feedback_logits, dim=0, out=pool_scores)
+            topk_values = workspace.topk_values[:batch_size]
+            candidate_ids = workspace.candidate_ids[:batch_size]
+            torch.topk(
+                pool_scores,
+                k=candidate_pool_size,
+                dim=-1,
+                sorted=False,
+                out=(topk_values, candidate_ids),
+            )
+            candidate_base_bt = workspace.candidate_base[:batch_size]
+            torch.gather(
+                feedback_logits.transpose(0, 1),
+                2,
+                candidate_ids[:, None, :].expand(
+                    -1, num_proposals - 1, -1
+                ),
+                out=candidate_base_bt,
+            )
+            candidate_base = candidate_base_bt.transpose(0, 1)
+            torch.index_select(
+                embed_proj[2].weight,
+                0,
+                candidate_ids.reshape(-1),
+                out=workspace.candidate_weight_flat[: batch_size * candidate_pool_size],
+            )
+            candidate_weight = workspace.candidate_weight[:batch_size]
 
     prefix_ids = torch.stack((verified_ids, first_ids), dim=1)
     _, gru_hidden = prefix_gru(target_embedding(prefix_ids))
@@ -196,9 +304,17 @@ def domino_greedy_rollout(
                 torch.long
             )
         else:
-            correction = torch.bmm(
-                candidate_weight, correction_hidden.unsqueeze(-1)
-            ).squeeze(-1)
+            if workspace is None:
+                correction = torch.bmm(
+                    candidate_weight, correction_hidden.unsqueeze(-1)
+                ).squeeze(-1)
+            else:
+                correction = workspace.candidate_score[:batch_size]
+                torch.bmm(
+                    candidate_weight,
+                    correction_hidden.unsqueeze(-1),
+                    out=correction.unsqueeze(-1),
+                )
             candidate_position = torch.argmax(
                 candidate_base[index - 1] + correction, dim=-1
             )
