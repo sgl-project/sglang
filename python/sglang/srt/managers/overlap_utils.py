@@ -295,8 +295,12 @@ class FutureMap:
         else:
             self.new_seq_lens_cpu_pinned = None
             self.fwd_prepare_d2h_stream = None
-        # Lazy-inited on the first non-empty stash (peeks tensor shapes); non-spec's is a no-op.
-        self._forward_buf_initialized = False
+        self.need_topk = False
+        self.need_hidden_states = False
+        self.topk_p_buf = None
+        self.topk_index_buf = None
+        self.hidden_states_buf = None
+        self.draft_probs_buf = None
         self.dsa_topk_indices_buf = None
 
         # ngram-only relay bufs
@@ -314,22 +318,18 @@ class FutureMap:
             pool=req_to_token_pool,
         )
 
-    def _lazy_init_forward_buf(self, payload: RelayPayload):
+    def _maybe_init_forward_bufs(self, payload: RelayPayload) -> None:
         # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.
         from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 
-        self._forward_buf_initialized = True
-
-        # Spec extras are gated by spec_algo, not by the payload's shape, so a
-        # non-spec stash allocates no extra bufs (only output_tokens_buf).
-        self.need_topk = self.spec_algo.is_some() and self.spec_algo.need_topk()
-        self.need_hidden_states = (
+        # Prefill can omit spec extras; initialize each buffer when decode first
+        # carries it instead of fixing the layout from the first payload.
+        if not self.need_topk and (
             self.spec_algo.is_some()
-            and spec_need_hidden_states()
-            and payload.hidden_states is not None
-        )
-
-        if self.need_topk:
+            and self.spec_algo.need_topk()
+            and payload.topk_p is not None
+        ):
+            self.need_topk = True
             topk_p0 = payload.topk_p[0]
             topk_index0 = payload.topk_index[0]
             self.topk_p_buf = torch.empty(
@@ -342,7 +342,13 @@ class FutureMap:
                 dtype=topk_index0.dtype,
                 device=self.device,
             )
-        if self.need_hidden_states:
+
+        if not self.need_hidden_states and (
+            self.spec_algo.is_some()
+            and spec_need_hidden_states()
+            and payload.hidden_states is not None
+        ):
+            self.need_hidden_states = True
             hidden_states0 = payload.hidden_states[0]
             self.hidden_states_buf = torch.empty(
                 (self.req_pool_size, *hidden_states0.shape),
@@ -350,8 +356,7 @@ class FutureMap:
                 device=self.device,
             )
 
-        self.draft_probs_buf = None
-        if payload.draft_probs is not None:
+        if self.draft_probs_buf is None and payload.draft_probs is not None:
             draft_probs0 = payload.draft_probs[0]
             self.draft_probs_buf = torch.empty(
                 (self.req_pool_size, *draft_probs0.shape),
@@ -545,8 +550,7 @@ class FutureMap:
             self.accept_tokens_buf[indices] = payload.accept_tokens
             self.accept_lens_buf[indices] = payload.accept_lens
             return
-        if not self._forward_buf_initialized:
-            self._lazy_init_forward_buf(payload)
+        self._maybe_init_forward_bufs(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(
             self.output_tokens_buf.dtype
