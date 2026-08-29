@@ -4,6 +4,10 @@ from types import SimpleNamespace
 
 import msgspec
 from sglang.srt.managers.rust_server import RustServer
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _FakeServer:
@@ -20,7 +24,7 @@ class _FakeServer:
         return True
 
 
-class TestEmbeddingBridge(unittest.TestCase):
+class TestEmbeddingBridge(CustomTestCase):
     def _bridge(self):
         bridge = RustServer.__new__(RustServer)
         bridge.server = _FakeServer()
