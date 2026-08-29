@@ -290,8 +290,15 @@ def npu_fused_experts_w4a4_mxfp(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
-    _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    assert swiglu_limit is not None
+    hidden_states = torch.ops.npu.npu_clipped_swiglu(
+        hidden_states,
+        group_index=expert_tokens,
+        alpha=1,
+        limit=swiglu_limit
+    )
+    # _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
+    # hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     hidden_states = w4a8_mxfp_gmm(
         input=hidden_states,
         input_scale=None,
@@ -358,8 +365,15 @@ def npu_fused_experts_w4a4_mxfp_decode(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
-    _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    assert swiglu_limit is not None
+    hidden_states = torch.ops.npu.npu_clipped_swiglu(
+        hidden_states,
+        group_index=expert_tokens,
+        alpha=1,
+        limit=swiglu_limit
+    )
+    # _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
+    # hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     hidden_states = w4a8_mxfp_gmm(
         input=hidden_states,
         input_scale=None,
@@ -467,8 +481,15 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
         group_list=group_list,
         output_dtype=output_dtype,
     )
-    _apply_swiglu_limit_npu(hidden_states, layer.moe_runner_config.swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    assert layer.moe_runner_config.swiglu_limit is not None
+    hidden_states = torch.ops.npu.npu_clipped_swiglu(
+        hidden_states,
+        group_index=group_list,
+        alpha=1,
+        limit=layer.moe_runner_config.swiglu_limit
+    )
+    # _apply_swiglu_limit_npu(hidden_states, layer.moe_runner_config.swiglu_limit)
+    # hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     return w4a8_mxfp_gmm(
         input=hidden_states,
         input_scale=None,
