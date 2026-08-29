@@ -151,7 +151,9 @@ class TestTextEncoderClassResolution(unittest.TestCase):
         )
         server_args = SimpleNamespace(
             pipeline_config=SimpleNamespace(text_encoder_precisions=["bf16"]),
+            explicit_residency_mode=mock.Mock(return_value=None),
             require_component_resident=mock.Mock(),
+            should_use_fsdp_for_component=mock.Mock(return_value=False),
             revision=None,
             trust_remote_code=False,
         )
@@ -162,16 +164,21 @@ class TestTextEncoderClassResolution(unittest.TestCase):
             }
         }
 
+        loader = TextEncoderLoader()
         with mock.patch.object(
             TextEncoderLoader,
             "resolve_native_transformers_model_class",
             return_value=transformers_model_class,
+        ), mock.patch.object(
+            loader,
+            "target_device",
+            return_value=torch.device("cuda:0"),
         ), mock.patch(
             "sglang.multimodal_gen.runtime.loader.component_loaders."
             "component_loader.get_hf_config",
             return_value=component_config,
         ):
-            encoder = TextEncoderLoader().load_native(
+            encoder = loader.load_native(
                 "/model/text_encoder",
                 server_args,
                 "transformers",
@@ -181,7 +188,7 @@ class TestTextEncoderClassResolution(unittest.TestCase):
         self.assertIs(encoder, loaded_encoder)
         server_args.require_component_resident.assert_called_once_with(
             "text_encoder",
-            feature_name="Transformers bitsandbytes component",
+            feature_name="Transformers quantized component",
         )
         transformers_model_class.from_pretrained.assert_called_once_with(
             "/model/text_encoder",
@@ -189,6 +196,7 @@ class TestTextEncoderClassResolution(unittest.TestCase):
             trust_remote_code=False,
             revision=None,
             torch_dtype=torch.bfloat16,
+            device_map={"": torch.device("cuda:0")},
         )
 
 
@@ -712,7 +720,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
         ):
             with self.subTest(architecture=architecture), self.assertRaisesRegex(
                 NativeComponentLoaderRequired,
-                "delegates serialized bitsandbytes checkpoint loading to Transformers",
+                "delegates serialized quant_method='bitsandbytes' checkpoint",
             ):
                 _resolve_and_configure_encoder_quantization(
                     SimpleNamespace(architectures=[architecture], quant_config=None),
@@ -742,10 +750,10 @@ class TestTextEncoderQuantization(unittest.TestCase):
                 "text_encoder",
             )
 
-    def test_rejects_bitsandbytes_8bit(self):
+    def test_bitsandbytes_8bit_delegates_to_transformers(self):
         with self.assertRaisesRegex(
-            ComponentCheckpointUnsupportedError,
-            "supports only serialized BitsAndBytes 4-bit checkpoints",
+            NativeComponentLoaderRequired,
+            "delegates serialized quant_method='bitsandbytes' checkpoint",
         ):
             _resolve_and_configure_encoder_quantization(
                 SimpleNamespace(
@@ -756,6 +764,26 @@ class TestTextEncoderQuantization(unittest.TestCase):
                         "load_in_4bit": False,
                         "load_in_8bit": True,
                         "quant_method": "bitsandbytes",
+                    }
+                },
+                "/model/text_encoder",
+                "/model/text_encoder",
+                "text_encoder",
+            )
+
+    def test_unknown_fp8_architecture_delegates_to_transformers(self):
+        with self.assertRaisesRegex(
+            NativeComponentLoaderRequired,
+            "delegates serialized quant_method='fp8' checkpoint",
+        ):
+            _resolve_and_configure_encoder_quantization(
+                SimpleNamespace(
+                    architectures=["ThirdPartyTextEncoder"], quant_config=None
+                ),
+                {
+                    "quantization_config": {
+                        "quant_method": "fp8",
+                        "activation_scheme": "dynamic",
                     }
                 },
                 "/model/text_encoder",
