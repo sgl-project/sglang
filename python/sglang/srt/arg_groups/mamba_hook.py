@@ -112,13 +112,20 @@ def validate_mamba_extra_buffer(view, model_arch: str, *, mamba_cache_chunk_size
         view, model_arch
     ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
     if requires_short_conv_track_limits(model_arch):
-        # The extend snapshot's row count is mamba_track_mask.sum(), so a
-        # captured prefill graph freezes it at whatever capture saw (zero, since
-        # the capture mask is all-False) and never snapshots again.
+        # The extend snapshot's data-dependent row count is the symptom; the
+        # cause is that no prefill graph backend this model can reach fixes the
+        # request axis. Only Full pads it (PhaseConfig.full_prefill_max_req);
+        # Breakable / TcPiecewise bake the capture batch's request count, and
+        # PrefillCudaGraphRunner.capture_prepare builds ONE synthetic request,
+        # so a bs=3 extend replays a graph shaped for bs=1. Full is out of reach
+        # anyway: ShortConvAttnBackend.init_forward_metadata_out_graph returns
+        # decode-shaped metadata (MambaAttnBackendBase._replay_metadata).
         assert view.cuda_graph_backend_prefill in (None, "disabled"), (
             f"extra_buffer for {model_arch} is not supported together with a "
-            "prefill CUDA graph: the extend track gather has a data-dependent "
-            "shape. Use --mamba-radix-cache-strategy no_buffer, or "
+            "prefill CUDA graph: the captured extend path has no fixed request "
+            "axis, so the track snapshot (and every other per-request tensor) "
+            "freezes at the capture batch's one request. Use "
+            "--mamba-radix-cache-strategy no_buffer, or "
             "--cuda-graph-backend-prefill disabled."
         )
         # The snapshot has to land on the accepted step, and the decode graph

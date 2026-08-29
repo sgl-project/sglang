@@ -1840,9 +1840,11 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 
 
 # Archs whose extra_buffer track is implemented by ShortConvAttnBackend. Its
-# extend-side snapshot is a gather whose row count is data dependent, and it has
-# no per-draft-token verify hook, so it refuses a prefill CUDA graph and
-# speculative decoding -- see requires_short_conv_track_limits.
+# extend-side snapshot rides a captured prefill graph's request axis, which
+# Breakable / TcPiecewise freeze at the capture batch's single request, and it
+# has no per-draft-token verify hook -- so it refuses a prefill CUDA graph and
+# speculative decoding; see requires_short_conv_track_limits and the reasoning
+# in mamba_hook.validate_mamba_extra_buffer.
 _SHORT_CONV_TRACK_ARCHS = frozenset({"ZayaForCausalLM"})
 
 
