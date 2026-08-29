@@ -760,6 +760,120 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
 
         process_and_broadcast.assert_not_called()
 
+    def test_broadcast_mm_inputs_sends_entry_rank_processing_error(self):
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        scheduler = object.__new__(scheduler_module.Scheduler)
+        scheduler.dp_tp_group = SimpleNamespace(rank_in_group=0, first_rank=0)
+        scheduler.dp_tp_cpu_group = object()
+
+        with (
+            patch.object(
+                scheduler_module.MultimodalInputs,
+                "from_processor_output",
+                side_effect=ValueError("bad image"),
+            ),
+            patch.object(
+                scheduler_module.torch.distributed, "is_available", return_value=True
+            ),
+            patch.object(
+                scheduler_module.torch.distributed,
+                "is_initialized",
+                return_value=True,
+            ),
+            patch.object(
+                scheduler_module.torch.distributed, "get_world_size", return_value=2
+            ),
+            patch.object(
+                scheduler_module.torch.distributed, "broadcast_object_list"
+            ) as broadcast,
+            self.assertRaisesRegex(
+                scheduler_module._MultimodalInputProcessingError,
+                "ValueError: bad image",
+            ),
+        ):
+            scheduler._process_and_broadcast_mm_inputs(object())
+
+        payload = broadcast.call_args.args[0][0]
+        self.assertIn("ValueError: bad image", payload.error)
+
+    def test_broadcast_mm_inputs_peer_rank_receives_processing_error(self):
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        scheduler = object.__new__(scheduler_module.Scheduler)
+        scheduler.dp_tp_group = SimpleNamespace(rank_in_group=1, first_rank=0)
+        scheduler.dp_tp_cpu_group = object()
+
+        def receive_error(obj_list, **_kwargs):
+            obj_list[0] = scheduler_module._MultimodalInputBroadcast(error="bad image")
+
+        with (
+            patch.object(
+                scheduler_module.MultimodalInputs, "from_processor_output"
+            ) as materialize,
+            patch.object(
+                scheduler_module.torch.distributed, "is_available", return_value=True
+            ),
+            patch.object(
+                scheduler_module.torch.distributed,
+                "is_initialized",
+                return_value=True,
+            ),
+            patch.object(
+                scheduler_module.torch.distributed, "get_world_size", return_value=2
+            ),
+            patch.object(
+                scheduler_module.torch.distributed,
+                "broadcast_object_list",
+                side_effect=receive_error,
+            ),
+            self.assertRaisesRegex(
+                scheduler_module._MultimodalInputProcessingError, "bad image"
+            ),
+        ):
+            scheduler._process_and_broadcast_mm_inputs(object())
+
+        materialize.assert_not_called()
+
+    def test_embedding_request_aborts_broadcast_processing_error(self):
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        scheduler = object.__new__(scheduler_module.Scheduler)
+        scheduler.tokenizer = object()
+        scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
+        scheduler._add_request_to_queue = MagicMock()
+        scheduler._get_multimodal_inputs = MagicMock(
+            side_effect=scheduler_module._MultimodalInputProcessingError("bad image")
+        )
+        req = MagicMock()
+        recv_req = SimpleNamespace(
+            rid="request-id",
+            input_text="prompt",
+            input_ids=[1],
+            sampling_params=object(),
+            positional_embed_overrides=None,
+            token_type_ids=None,
+            routed_dp_rank=None,
+            priority=None,
+            dimensions=None,
+            lora_id=None,
+            http_worker_ipc=None,
+            time_stats=None,
+            return_pooled_hidden_states=False,
+            multi_item_delimiter_indices=None,
+            mm_inputs=object(),
+        )
+
+        with patch.object(scheduler_module, "Req", return_value=req):
+            scheduler.handle_embedding_request(recv_req)
+
+        req.set_finish_with_abort.assert_called_once_with(
+            "bad image",
+            status_code=500,
+            err_type="InternalServerError",
+        )
+        scheduler._add_request_to_queue.assert_called_once_with(req)
+
     def test_vmm_materialization_consensus_rejects_any_rank_failure(self):
         cases = (
             (None, "RuntimeError: remote failure", "rank 1: RuntimeError"),

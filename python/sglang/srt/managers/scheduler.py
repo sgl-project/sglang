@@ -372,6 +372,16 @@ STEP_MAX_US = 2_000_000
 LOAD_STALL_REFRESH_S = 0.05
 
 
+@dataclasses.dataclass(frozen=True)
+class _MultimodalInputBroadcast:
+    inputs: Optional[MultimodalInputs] = None
+    error: Optional[str] = None
+
+
+class _MultimodalInputProcessingError(RuntimeError):
+    pass
+
+
 def _accumulate_decode_moment(
     totals: list[float],
     batch_size: int,
@@ -2411,6 +2421,11 @@ class Scheduler(
 
         Returns:
             MultimodalInputs | None
+
+        Raises:
+            _MultimodalInputProcessingError: The entry rank could not build the
+                request's multimodal inputs. The same error is broadcast to all
+                ranks before it is raised.
         """
         if raw_mm_inputs is None:
             return None
@@ -2436,18 +2451,29 @@ class Scheduler(
         # Since the Scheduler is single-threaded, any large CPU cost will impact
         # handling of other messages. For example, CPU hits 99.9% can significantly
         # increase the CUDA kernel launch time.
+        result = None
         if self.dp_tp_group.rank_in_group == 0:
-            # Only the entry rank materializes once from dict.
-            image_inputs = MultimodalInputs.from_processor_output(raw_mm_inputs)
-            # Broadcast to other TP ranks (use src=0 within the group).
+            try:
+                result = _MultimodalInputBroadcast(
+                    inputs=MultimodalInputs.from_processor_output(raw_mm_inputs)
+                )
+            except Exception as error:
+                result = _MultimodalInputBroadcast(
+                    error=(
+                        "Multimodal input processing failed on the TP entry rank: "
+                        f"{type(error).__name__}: {error}"
+                    )
+                )
+
+            # Broadcast either the prepared inputs or the request-local error.
             if group_world_size > 1:
-                obj_list = [image_inputs]
+                obj_list = [result]
                 torch.distributed.broadcast_object_list(
                     obj_list,
                     src=self.dp_tp_group.first_rank,
                     group=self.dp_tp_cpu_group,
                 )
-                image_inputs = obj_list[0]
+                result = obj_list[0]
         else:
             # Non-entry ranks: receive if group size > 1; otherwise materialize locally.
             if group_world_size > 1:
@@ -2457,11 +2483,15 @@ class Scheduler(
                     src=self.dp_tp_group.first_rank,
                     group=self.dp_tp_cpu_group,
                 )
-                image_inputs = obj_list[0]
+                result = obj_list[0]
             else:
-                image_inputs = MultimodalInputs.from_processor_output(raw_mm_inputs)
+                result = _MultimodalInputBroadcast(
+                    inputs=MultimodalInputs.from_processor_output(raw_mm_inputs)
+                )
 
-        return image_inputs
+        if result.error is not None:
+            raise _MultimodalInputProcessingError(result.error)
+        return result.inputs
 
     def _get_multimodal_inputs(self, mm_inputs):
         if isinstance(mm_inputs, MultimodalInputs):
@@ -2771,7 +2801,17 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
-            image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+            try:
+                image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+            except _MultimodalInputProcessingError as error:
+                req.set_finish_with_abort(
+                    str(error),
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    err_type="InternalServerError",
+                )
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
 
             SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
 
@@ -3135,7 +3175,16 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
-            image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+            try:
+                image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+            except _MultimodalInputProcessingError as error:
+                req.set_finish_with_abort(
+                    str(error),
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    err_type="InternalServerError",
+                )
+                self._add_request_to_queue(req)
+                return
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             # The `pad_input_ids_func` is model-specific and may be None for
             # embedding models or models not requiring special padding.
