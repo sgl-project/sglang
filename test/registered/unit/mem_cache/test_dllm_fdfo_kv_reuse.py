@@ -65,10 +65,8 @@ def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
         kv_committed_len=len(prefix) if req_pool_idx is not None else 0,
-        kv=(
-            SimpleNamespace(kv_allocated_len=len(prefix) + block_size)
-            if req_pool_idx is not None
-            else None
+        kv=SimpleNamespace(
+            kv_allocated_len=len(prefix) + block_size if req_pool_idx is not None else 0
         ),
     )
 
