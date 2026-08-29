@@ -591,6 +591,11 @@ class BaseMultimodalProcessor(ABC):
             embedding_slice = embeddings[modality][
                 embedding_start : embedding_start + num_tokens
             ]
+            if embedding_slice.shape[0] != num_tokens:
+                raise ValueError(
+                    f"Invalid precomputed {modality.name.lower()} embeddings: "
+                    f"expected {num_tokens} rows, got {embedding_slice.shape[0]}"
+                )
             consumed_per_modality[modality] = embedding_start + num_tokens
             mm_items.append(
                 MultimodalDataItem(
