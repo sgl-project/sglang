@@ -14,7 +14,6 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
 )
 from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
-from sglang.srt.utils import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +186,7 @@ class DsparkDraftSampler:
 
 
 def _resolve_folded_sampling(
-    *, model, gamma, max_bs, device, tp_rank, available_memory_gb: Optional[float]
+    *, model, gamma, max_bs, device, tp_rank, available_memory_gb: float
 ) -> bool:
     """The sampling buffers are baked into the captured draft graph, so AUTO
     must decide before capture from a free-memory probe. With TP > 1, pass
@@ -201,10 +200,6 @@ def _resolve_folded_sampling(
     noise_bytes = max_bs * vocab * 4
     logits_bytes = max_bs * gamma * vocab * _base_logits_dtype(model).itemsize
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
-    if available_memory_gb is None:
-        available_memory_gb = get_available_gpu_memory(
-            device, torch.get_device_module().current_device()
-        )
     if available_memory_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
     if tp_rank == 0:
@@ -228,7 +223,7 @@ def maybe_build_draft_sampler(
     device,
     tp_rank: int,
     tp_sync: DsparkTpSync,
-    available_memory_gb: Optional[float] = None,
+    available_memory_gb: float,
     confidence_fn=None,
     out=None,
 ) -> Optional[DsparkDraftSampler]:

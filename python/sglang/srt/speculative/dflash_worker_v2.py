@@ -466,13 +466,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
         )
         if is_cuda() and capture_decode_cuda_graph:
+            # Group min: every rank must reach the same capture decision.
             available_mem = get_available_gpu_memory(
                 self.device,
                 self.gpu_id,
                 distributed=self._tp_group.world_size > 1,
-                cpu_group=(
-                    self._tp_group.cpu_group if self._tp_group.world_size > 1 else None
-                ),
+                cpu_group=self._tp_group.cpu_group,
             )
             if available_mem < 1.0:
                 capture_decode_cuda_graph = False

@@ -388,17 +388,15 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = self._decode_graph_allowed
-        available_mem = None
+        graph_group = self._draft_graph_group
+        # Group min: every rank must reach the same capture decisions below.
+        available_mem = get_available_gpu_memory(
+            self.device,
+            self.gpu_id,
+            distributed=graph_group.world_size > 1,
+            cpu_group=graph_group.cpu_group,
+        )
         if is_cuda_alike() and capture_decode_cuda_graph:
-            graph_group = self._draft_graph_group
-            available_mem = get_available_gpu_memory(
-                self.device,
-                self.gpu_id,
-                distributed=graph_group.world_size > 1,
-                cpu_group=(
-                    graph_group.cpu_group if graph_group.world_size > 1 else None
-                ),
-            )
             if available_mem < 1.0:
                 capture_decode_cuda_graph = False
                 logger.warning(
@@ -427,7 +425,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
 
-    def _maybe_build_draft_sampler(self, *, available_memory_gb: Optional[float]):
+    def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
