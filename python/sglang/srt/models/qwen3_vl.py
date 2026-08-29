@@ -1307,9 +1307,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 # ModelSlim checkpoints quantize the vision tower as well, so
                 # forward the config for those.
                 quant_config=(
-                    quant_config
-                    if isinstance(quant_config, ModelSlimConfig)
-                    else None
+                    quant_config if isinstance(quant_config, ModelSlimConfig) else None
                 ),
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 prefix=add_prefix("model.visual", prefix),
