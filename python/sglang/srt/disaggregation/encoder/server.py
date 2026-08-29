@@ -96,6 +96,15 @@ async def _get_receive_condition(req_id: str) -> asyncio.Condition:
         return rid_to_cond[req_id]
 
 
+async def _notify_receive_waiters(req_id: str) -> None:
+    """Wake an existing destination waiter without creating new state."""
+    async with cond_dict_lock:
+        cond = rid_to_cond.get(req_id)
+    if cond is not None:
+        async with cond:
+            cond.notify_all()
+
+
 ENCODER_MAX_BATCH_SIZE = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.get()
 ENCODER_MAX_BATCH_SIZE_EXPLICIT = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.is_set()
 # Watchdog: max time to wait for a batched /encode result. Bounds HTTP latency
@@ -589,6 +598,9 @@ class MMEncoder:
                     )
 
             self.req_states: Dict[str, ReqState] = {}
+            # A DP caller can disappear before its encode creates ReqState.
+            # Preserve that release intent until _acquire_encode_ref runs.
+            self.abandoned_req_ids: Set[str] = set()
             # Need to ensure the NCCL launch order on rank0 matches the dispatch order rank>0
             self.encode_dispatch_lock = asyncio.Lock()
 
@@ -633,7 +645,21 @@ class MMEncoder:
             state = ReqState(req_id)
             self.req_states[req_id] = state
         state.active_encodes += 1
+        if req_id in self.abandoned_req_ids:
+            state.release_requested = True
+            self.abandoned_req_ids.discard(req_id)
         return state
+
+    async def abandon_request(self, req_id: str) -> None:
+        """Release now, or remember the release until encode state exists."""
+        self.abandoned_req_ids.add(req_id)
+        if req_id in self.req_states:
+            self.abandoned_req_ids.discard(req_id)
+            await self.release_request(req_id)
+
+    def clear_abandoned_request(self, req_id: str) -> None:
+        """Drop an unused release marker after the worker task exits."""
+        self.abandoned_req_ids.discard(req_id)
 
     async def _release_encode_ref(self, state: Optional[ReqState]) -> None:
         if state is None:
@@ -698,8 +724,16 @@ class MMEncoder:
         async with state.lifecycle_condition:
             state.release_requested = True
             state.preserve_metadata_on_release |= preserve_metadata
-            if state.active_encodes > 0:
-                return
+            encode_is_active = state.active_encodes > 0
+
+        # ``send_with_url`` may be waiting for a destination that will never
+        # arrive after its HTTP caller disappears. Wake it so the worker slot
+        # is retired together with the staged embedding.
+        await _notify_receive_waiters(req_id)
+        if encode_is_active:
+            return
+
+        async with state.lifecycle_condition:
             await state.lifecycle_condition.wait_for(lambda: state.active_sends == 0)
             if self.req_states.get(req_id) is not state:
                 return
@@ -1885,6 +1919,9 @@ class MMEncoder:
 
         try:
             while True:
+                if state.release_requested:
+                    break
+
                 async with rid_lock:
                     current_targets = rid_to_receive_endpoint.get(req_id, set()).copy()
                     expected_count = rid_to_receive_count.get(req_id)
