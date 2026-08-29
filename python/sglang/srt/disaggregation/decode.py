@@ -65,7 +65,6 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
-    ReqKvInfo,
     ScheduleBatch,
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
@@ -1892,10 +1891,7 @@ def alloc_for_decode_prealloc_hisparse(
     uses_swa_tail: bool,
     swa_tail_len: int,
 ) -> torch.Tensor:
-    if req.kv is None:
-        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
-    else:
-        req.kv.kv_allocated_len = fill_len
+    req.kv.kv_allocated_len = fill_len
     device = allocator.device
     prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
     prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
@@ -1940,10 +1936,7 @@ def alloc_for_decode_prealloc(
     swa_tail_len: int,
     req_to_token_pool: Optional[ReqToTokenPool] = None,
 ) -> torch.Tensor:
-    if req.kv is None:
-        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
-    else:
-        req.kv.kv_allocated_len = fill_len
+    req.kv.kv_allocated_len = fill_len
     if allocator.page_size == 1:
         kv_loc = allocator.alloc(delta_len)
     else:
