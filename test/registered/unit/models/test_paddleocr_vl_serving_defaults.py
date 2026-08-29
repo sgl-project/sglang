@@ -28,7 +28,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def test_processor_opts_into_concurrency():
+def test_processor_preprocesses_pages_concurrently():
     assert PaddleOCRVLImageProcessor.supports_mm_processor_concurrency is True
     assert PaddleOCRVLImageProcessor.auto_mm_processor_worker_num > 1
     assert PaddleOCRVLImageProcessor.auto_mm_io_worker_num > 1
@@ -42,13 +42,16 @@ def test_worker_count_stays_at_the_measured_optimum():
     assert PaddleOCRVLImageProcessor.auto_mm_processor_worker_num == 2
 
 
-def test_concurrency_opt_in_is_not_inherited_by_accident():
-    """The base class must stay conservative; this model opts in explicitly."""
-    assert BaseMultimodalProcessor.supports_mm_processor_concurrency is False
-    assert BaseMultimodalProcessor.auto_mm_processor_worker_num == 1
-    assert (
-        PaddleOCRVLImageProcessor.__dict__["supports_mm_processor_concurrency"] is True
-    ), "the opt-in must be declared on PaddleOCRVLImageProcessor itself"
+def test_io_worker_count_is_this_model_own():
+    """Concurrency is the base default now, but the IO fan-out is not.
+
+    Fetching a page is network-bound and cheap to overlap, so this model asks for
+    more IO workers than the conservative base default. That number has to be
+    declared here, not inherited.
+    """
+    assert PaddleOCRVLImageProcessor.__dict__["auto_mm_io_worker_num"] > (
+        BaseMultimodalProcessor.auto_mm_io_worker_num
+    ), "the IO fan-out must be declared on PaddleOCRVLImageProcessor itself"
 
 
 def test_prefill_breakable_cuda_graph_is_allowlisted():
