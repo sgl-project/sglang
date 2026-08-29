@@ -171,10 +171,18 @@ class ComponentLoader(ABC):
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
-        native_only_components = getattr(
-            server_args.pipeline_config, "native_only_components", ()
-        )
-        return component_name in native_only_components
+        return component_name in server_args.pipeline_config.native_only_components
+
+    def validate_native_fallback(
+        self, server_args: ServerArgs, component_name: str
+    ) -> None:
+        """Validate that fallback preserves the exact component's runtime contract."""
+        if server_args.should_use_fsdp_for_component(component_name):
+            raise RuntimeError(
+                f"Native fallback for component {component_name!r} cannot honor "
+                "requested FSDP. Use an SGLang-native implementation or disable "
+                "FSDP for this component."
+            )
 
     def _load_customized_with_context(
         self,
@@ -289,6 +297,7 @@ class ComponentLoader(ABC):
                     f"Failed to load customized {component_name}; native fallback "
                     "is disabled for this component configuration."
                 ) from e
+            self.validate_native_fallback(server_args, component_name)
             if native_loader_required:
                 logger.info("%s", e)
             elif "Unsupported model architecture" in str(e):
