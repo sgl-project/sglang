@@ -64,7 +64,6 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -1437,7 +1436,7 @@ class PrefillAdder:
 
         return self.budget_state()
 
-    def preempt_to_schedule(self, req: Req, server_args: ServerArgs) -> bool:
+    def preempt_to_schedule(self, req: Req) -> bool:
         """
         Preempt running requests to serve the new request if the priority threshold is met and token count sum is verified.
         Returns True if preemption was committed, and the new request can be scheduled.

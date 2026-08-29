@@ -16,7 +16,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.runtime_context import (
-    get_device,
     get_mm,
     get_parallel,
     get_serving,
@@ -948,7 +947,8 @@ class CudaVmmFeatureTransport:
         self.pool = CudaVmmMemoryPool(
             memory_size=per_worker_pool_size,
             recycle_interval=MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-            base_gpu_id=get_device().base_gpu_id,
+            # Per-worker placement; policy above reads the bags.
+            base_gpu_id=server_args.base_gpu_id,
             consumer_count=get_vmm_feature_consumer_count(),
             allow_posix_fallback=get_parallel().nnodes == 1,
         )
