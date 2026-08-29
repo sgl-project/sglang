@@ -555,7 +555,7 @@ class TestEncoderDelivery(CustomTestCase):
 
         asyncio.run(run())
 
-    def test_grpc_encode_cancellation_releases_request(self):
+    def test_grpc_encode_cancellation_drains_tp_collective_before_release(self):
         async def run():
             _, sglang_encoder_pb2, SGLangEncoderServer = self._load_grpc_server()
 
@@ -606,6 +606,65 @@ class TestEncoderDelivery(CustomTestCase):
                     await task
 
             encoder.release_request.assert_awaited_once_with("cancelled-encode")
+
+        asyncio.run(run())
+
+    def test_grpc_encode_cancellation_during_tp_dispatch_completes_encode(self):
+        async def run():
+            _, sglang_encoder_pb2, SGLangEncoderServer = self._load_grpc_server()
+
+            send_started = asyncio.Event()
+            finish_send = asyncio.Event()
+
+            async def send_to_tp(*_args):
+                send_started.set()
+                await finish_send.wait()
+
+            encoder = SimpleNamespace(
+                encode_dispatch_lock=asyncio.Lock(),
+                encode_request=AsyncMock(return_value=(8, 1, 8, None, None)),
+                release_request=AsyncMock(),
+            )
+            server = SGLangEncoderServer(
+                encoder=encoder,
+                send_sockets=[object()],
+                server_args=SimpleNamespace(),
+            )
+            request = sglang_encoder_pb2.EncodeRequest(
+                mm_items=["image"],
+                req_id="cancelled-dispatch",
+                num_parts=1,
+                part_idx=0,
+            )
+            context = SimpleNamespace(
+                set_code=unittest.mock.Mock(),
+                set_details=unittest.mock.Mock(),
+            )
+
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.grpc_server.async_sock_send",
+                    side_effect=send_to_tp,
+                ),
+                patch(
+                    "sglang.srt.disaggregation.encoder.grpc_server.get_disagg",
+                    return_value=SimpleNamespace(encoder_transfer_backend="mooncake"),
+                ),
+            ):
+                task = asyncio.create_task(server.Encode(request, context))
+                await send_started.wait()
+                task.cancel()
+                await asyncio.sleep(0)
+
+                self.assertFalse(task.done())
+                encoder.encode_request.assert_not_awaited()
+
+                finish_send.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            encoder.encode_request.assert_awaited_once()
+            encoder.release_request.assert_awaited_once_with("cancelled-dispatch")
 
         asyncio.run(run())
 
