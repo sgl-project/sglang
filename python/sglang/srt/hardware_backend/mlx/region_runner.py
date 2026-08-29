@@ -10,9 +10,12 @@ Executors are exported per padded shape bucket -- decode batch sizes and
 prefill token counts -- and reused for every later batch the bucket covers,
 the way CUDA-graph replay pads to the nearest captured size (the region reads
 all step-to-step variability -- token ids, positions, cache slots, sequence
-lengths -- from its tensor arguments). Both ladders are operator-configurable
-and exported at startup, so no shape is exported in the request path. A shape
-whose export fails is blacklisted and served by the eager Torch path instead.
+lengths -- from its tensor arguments). Both ladders come from
+``cuda_graph_config`` -- the same --cuda-graph-bs-{decode,prefill} /
+--cuda-graph-max-bs-{decode,prefill} flags the CUDA runners honour, with
+MPS-sized defaults -- and are exported at startup, so no shape is exported in
+the request path. A shape whose export fails is blacklisted and served by the
+eager Torch path instead.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ import dataclasses
 import logging
 import math
 import time
-from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import torch
 
@@ -39,125 +42,52 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Batches are padded up to the smallest exported bucket that covers them, the
-# way CUDA-graph replay pads to the nearest captured batch size, so one
-# executor per bucket serves every size below it. Sizes beyond the largest
-# bucket fall back to the eager Torch path rather than paying an unbounded
-# set of exports.
-_DEFAULT_MAX_DECODE_BATCH_SIZE = 16
 
-# Prefill token counts vary per request, so extend executors are exported per
-# padded bucket instead of per exact length. The x1.3-1.5 ladder bounds pad
-# waste well below the region's kernel win.
-_DEFAULT_MAX_PREFILL_TOKENS = 2048
-_SMALLEST_PREFILL_BUCKET = 128
+def _configured_decode_batch_sizes(model_runner: Any) -> tuple[int, ...]:
+    """Decode buckets from ``cuda_graph_config[decode].bs``.
 
-
-def generate_decode_batch_sizes(max_bs: int) -> tuple[int, ...]:
-    """The default decode bucket ladder up to ``max_bs``.
-
-    Same shape as ``ServerArgs._generate_decode_cuda_graph_batch_sizes`` in
-    the non-speculative case (the region rejects speculative batches): dense
-    at small sizes, coarsening as padding waste shrinks relative to the batch.
+    The same list the CUDA runners capture (--cuda-graph-bs-decode /
+    --cuda-graph-max-bs-decode; MPS-sized defaults from ``region_config``),
+    clamped to the request pool the way ``get_batch_sizes_to_capture`` does.
+    The attention-TP alignment that helper also applies is always 1 on MPS.
     """
-    ladder = (
-        [1, 2, 4, 8, 12]
-        + list(range(16, 257, 8))
-        + list(range(272, 512, 16))
-        + list(range(512, max_bs + 1, 32))
+    buckets = list(
+        _validated_buckets(
+            "cuda_graph_config[decode].bs",
+            get_exec().graph.cuda_graph_config.decode.bs,
+        )
     )
-    return tuple(bs for bs in ladder if bs <= max_bs)
-
-
-def generate_prefill_token_buckets(max_tokens: int) -> tuple[int, ...]:
-    """The default x1.5/x1.33 prefill bucket ladder up to ``max_tokens``."""
-    buckets: list[int] = []
-    size = _SMALLEST_PREFILL_BUCKET
-    while size <= max_tokens:
-        buckets.append(size)
-        if size + size // 2 <= max_tokens:
-            buckets.append(size + size // 2)
-        size *= 2
-    return tuple(buckets)
-
-
-def _resolve_bucket_ladder(
-    explicit: Optional[Sequence[int]],
-    cap: Optional[int],
-    *,
-    default_cap: int,
-    generate: Callable[[int], tuple[int, ...]],
-    list_flag: str,
-    cap_flag: str,
-) -> tuple[int, ...]:
-    """A bucket ladder from its two config leaves, or the generated default.
-
-    Mirrors the --cuda-graph-bs-* / --cuda-graph-max-bs-* pair: an explicit
-    list wins outright, otherwise the ladder is generated up to the cap. The
-    cap itself is always a bucket, so a batch at exactly that size is served
-    by the region rather than falling back to eager.
-    """
-    if explicit:
-        buckets = tuple(sorted({int(bucket) for bucket in explicit}))
-        if buckets[0] <= 0:
-            raise ValueError(f"{list_flag} takes positive sizes, found {buckets[0]}")
-        return buckets
-    cap = int(default_cap if cap is None else cap)
-    if cap <= 0:
-        raise ValueError(f"{cap_flag} must be positive, found {cap}")
-    buckets = generate(cap)
-    if not buckets or buckets[-1] != cap:
-        buckets += (cap,)
-    return buckets
-
-
-def resolve_decode_batch_sizes(
-    explicit: Optional[Sequence[int]], max_bs: Optional[int]
-) -> tuple[int, ...]:
-    """Decode buckets from --mlx-region-decode-bs / --mlx-region-max-decode-bs."""
-    return _resolve_bucket_ladder(
-        explicit,
-        max_bs,
-        default_cap=_DEFAULT_MAX_DECODE_BATCH_SIZE,
-        generate=generate_decode_batch_sizes,
-        list_flag="--mlx-region-decode-bs",
-        cap_flag="--mlx-region-max-decode-bs",
-    )
-
-
-def resolve_prefill_token_buckets(
-    explicit: Optional[Sequence[int]], max_tokens: Optional[int]
-) -> tuple[int, ...]:
-    """Prefill buckets from --mlx-region-prefill-token-buckets / -max-prefill-tokens."""
-    return _resolve_bucket_ladder(
-        explicit,
-        max_tokens,
-        default_cap=_DEFAULT_MAX_PREFILL_TOKENS,
-        generate=generate_prefill_token_buckets,
-        list_flag="--mlx-region-prefill-token-buckets",
-        cap_flag="--mlx-region-max-prefill-tokens",
-    )
-
-
-def _configured_decode_batch_sizes() -> tuple[int, ...]:
-    """This process's decode ladder, read off the published ``exec.graph`` bag.
-
-    Resolved config lives in the namespace bags, not on the ``ServerArgs``
-    instance; this is where the CUDA-graph runners read their capture ladders
-    too (``get_exec().graph.cuda_graph_config``).
-    """
-    graph = get_exec().graph
-    return resolve_decode_batch_sizes(
-        graph.mlx_region_decode_bs, graph.mlx_region_max_decode_bs
-    )
+    pool_size = int(model_runner.req_to_token_pool.size)
+    if buckets[-1] > pool_size:
+        buckets.append(pool_size)
+    return tuple(sorted({size for size in buckets if size <= pool_size}))
 
 
 def _configured_prefill_token_buckets() -> tuple[int, ...]:
-    """This process's prefill ladder, read off the published ``exec.graph`` bag."""
-    graph = get_exec().graph
-    return resolve_prefill_token_buckets(
-        graph.mlx_region_prefill_token_buckets, graph.mlx_region_max_prefill_tokens
+    """Prefill token buckets from ``cuda_graph_config[prefill].bs``.
+
+    --cuda-graph-bs-prefill / --cuda-graph-max-bs-prefill, with MPS-sized
+    defaults from ``region_config``; like CUDA's prefill graphs, ``bs`` carries
+    token counts, not request counts.
+    """
+    return _validated_buckets(
+        "cuda_graph_config[prefill].bs",
+        get_exec().graph.cuda_graph_config.prefill.bs,
     )
+
+
+def _validated_buckets(
+    name: str, configured: Optional[Sequence[int]]
+) -> tuple[int, ...]:
+    if not configured:
+        raise ValueError(
+            f"{name} is not set; ServerArgs resolution fills it on MPS when the "
+            "MLX region is enabled"
+        )
+    buckets = tuple(sorted({int(size) for size in configured}))
+    if buckets[0] <= 0:
+        raise ValueError(f"{name} takes positive sizes, found {buckets[0]}")
+    return buckets
 
 
 # Where a padded prefill token's K/V goes. Slot 0 is the pool's reserved
@@ -284,15 +214,22 @@ class MlxRegionRunner(BaseRunner):
 
         validate_mps_runtime()
         self._lora_enabled = bool(model_runner.server_args.enable_lora)
-        self._decode_batch_sizes = _configured_decode_batch_sizes()
+        self._decode_batch_sizes = _configured_decode_batch_sizes(model_runner)
         self._prefill_token_buckets = _configured_prefill_token_buckets()
         self._executors: dict[int, Any] = {}
         self._failed_batch_sizes: set[int] = set()
         self._state_token: Optional[tuple] = None
         self._constants_checked = False
-        # The wrapper computes hidden @ lm_head.T directly; any model whose
-        # LogitsProcessor does more than that would silently diverge.
-        self._model_reject_reason = _nontrivial_logits_reason(model_runner.model)
+        if model_runner.is_draft_worker:
+            # Registered per device, so draft workers construct one too; the
+            # region serves the target model only.
+            self._model_reject_reason = (
+                "speculative draft workers are not served by the region"
+            )
+        else:
+            # The wrapper computes hidden @ lm_head.T directly; any model whose
+            # LogitsProcessor does more than that would silently diverge.
+            self._model_reject_reason = _nontrivial_logits_reason(model_runner.model)
         if (
             self._model_reject_reason is None
             and (model_runner.sliding_window_size or 0) > 0

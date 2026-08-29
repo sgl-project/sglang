@@ -57,6 +57,10 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.hardware_backend.mlx.region_config import (
+    apply_mps_region_backends,
+    fill_mps_region_ladders,
+)
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -1940,50 +1944,6 @@ class ServerArgs:
     cuda_graph_bs_prefill: A[
         Optional[List[int]],
         "Explicit list of batch sizes to capture for the prefill cuda graph.",
-        NS("exec.graph"),
-    ] = None
-    mlx_region_decode_bs: A[
-        Optional[List[int]],
-        (
-            "MLX whole-region backend only: explicit list of decode batch "
-            "sizes to export. Like CUDA-graph replay, a decode batch is padded "
-            "up to the smallest exported size that covers it and falls back to "
-            "eager Torch above the largest. Wins over --mlx-region-max-decode-bs."
-        ),
-        NS("exec.graph"),
-    ] = None
-    mlx_region_max_decode_bs: A[
-        Optional[int],
-        (
-            "MLX whole-region backend only: largest decode batch size the "
-            "region serves. The default ladder (1, 2, 4, 8, 12, 16, ...; the "
-            "same shape as the CUDA-graph capture ladder) is generated up to "
-            "this cap; larger batches fall back to eager Torch. Ignored when "
-            "--mlx-region-decode-bs is given. Defaults to 16."
-        ),
-        NS("exec.graph"),
-    ] = None
-    mlx_region_prefill_token_buckets: A[
-        Optional[List[int]],
-        (
-            "MLX whole-region backend only: explicit list of prefill token "
-            "buckets to export. The region exports one executor per padded "
-            "bucket; a prefill is served by the smallest bucket that covers "
-            "it and falls back to eager Torch above the largest. Region "
-            "prefill is single-request, so these are token counts. Wins over "
-            "--mlx-region-max-prefill-tokens."
-        ),
-        NS("exec.graph"),
-    ] = None
-    mlx_region_max_prefill_tokens: A[
-        Optional[int],
-        (
-            "MLX whole-region backend only: largest prefill token count the "
-            "region serves. The default x1.5/x1.33 bucket ladder (128, 192, "
-            "256, ...) is generated up to this cap; larger prefills fall back "
-            "to eager Torch. Ignored when --mlx-region-prefill-token-buckets "
-            "is given. Defaults to 2048."
-        ),
         NS("exec.graph"),
     ] = None
     cuda_graph_tc_compiler: A[
@@ -5179,7 +5139,19 @@ class ServerArgs:
         decode_cuda_graph_config = self.cuda_graph_config.decode
         prefill_cuda_graph_config = self.cuda_graph_config.prefill
 
-        if gpu_mem is not None:
+        if self.device == "mps":
+            # The MPS graph runner is the exported MLX region, which pays ~2 s
+            # per shape where a CUDA-graph capture pays milliseconds, so its
+            # default ladders are MPS-sized (hardware_backend/mlx/region_config).
+            if self.chunked_prefill_size is None:
+                self._declare(
+                    "_handle_gpu_memory_settings",
+                    chunked_prefill_size=4096,
+                )
+            fill_mps_region_ladders(
+                self.cuda_graph_config, max_total_tokens=self.max_total_tokens
+            )
+        elif gpu_mem is not None:
             if gpu_mem < 20 * 1024:
                 # T4, 4080
                 # (chunked_prefill_size 2k, max_bs 8)
@@ -6340,11 +6312,22 @@ class ServerArgs:
         # Torch native and flex attention backends
         attention_backend = resolved_view(self).attention_backend
         if attention_backend == "torch_native":
-            logger.warning(
-                "Cuda graph is disabled because of using torch native attention backend"
-            )
-            self.cuda_graph_config.decode.backend = Backend.DISABLED
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            if self.device == "mps" and envs.SGLANG_ENABLE_MLX_WHOLE_REGION.get():
+                # The MPS graph runner is the exported MLX region: one
+                # whole-forward executor per bucket for both phases, which is
+                # exactly Backend.FULL. It is registered in graph_runners like
+                # the CPU/NPU/XPU runners, so cuda_graph_config stays live
+                # here; only full and disabled are meaningful on MPS.
+                apply_mps_region_backends(
+                    self.cuda_graph_config,
+                    getattr(self, "_cuda_graph_config_locked", set()),
+                )
+            else:
+                logger.warning(
+                    "Cuda graph is disabled because of using torch native attention backend"
+                )
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         if attention_backend == "flex_attention":
             logger.warning(

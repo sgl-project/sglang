@@ -2421,30 +2421,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>List[int]</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mlx-region-decode-bs`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MLX whole-region backend only: explicit list of decode batch sizes to export. Like CUDA-graph replay, a decode batch is padded up to the smallest exported size that covers it and falls back to eager Torch above the largest. Wins over <code>--mlx-region-max-decode-bs</code>.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>List[int]</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mlx-region-max-decode-bs`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MLX whole-region backend only: largest decode batch size the region serves. The default ladder (1, 2, 4, 8, 12, 16, ...; the same shape as the CUDA-graph capture ladder) is generated up to this cap; larger batches fall back to eager Torch. Ignored when <code>--mlx-region-decode-bs</code> is given. Defaults to 16.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mlx-region-prefill-token-buckets`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MLX whole-region backend only: explicit list of prefill token buckets to export. The region exports one executor per padded bucket; a prefill is served by the smallest bucket that covers it and falls back to eager Torch above the largest. Region prefill is single-request, so these are token counts. Wins over <code>--mlx-region-max-prefill-tokens</code>.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>List[int]</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mlx-region-max-prefill-tokens`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MLX whole-region backend only: largest prefill token count the region serves. The default x1.5/x1.33 bucket ladder (128, 192, 256, ...) is generated up to this cap; larger prefills fall back to eager Torch. Ignored when <code>--mlx-region-prefill-token-buckets</code> is given. Defaults to 2048.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cuda-graph-tc-compiler`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Compiler used by the <code>tc_piecewise</code> backend (only the prefill phase consumes it today).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>

@@ -20,21 +20,29 @@ from sglang.srt.hardware_backend.mlx.export_validation import (
     resolve_decoder_topology,
     serving_forward_args,
 )
+from sglang.srt.hardware_backend.mlx.region_config import (
+    DEFAULT_MAX_DECODE_BATCH_SIZE,
+    DEFAULT_MAX_PREFILL_TOKENS,
+    apply_mps_region_backends,
+    fill_mps_region_ladders,
+    mlx_region_decode_batch_sizes,
+    mlx_region_prefill_token_buckets,
+)
 from sglang.srt.hardware_backend.mlx.region_runner import (
-    _DEFAULT_MAX_DECODE_BATCH_SIZE,
-    _DEFAULT_MAX_PREFILL_TOKENS,
     _PAD_SINK_SLOT,
     MlxRegionRunner,
     _configured_decode_batch_sizes,
     _configured_prefill_token_buckets,
     _kernel_contract_reject_reason,
     _nontrivial_logits_reason,
-    generate_decode_batch_sizes,
-    generate_prefill_token_buckets,
-    resolve_decode_batch_sizes,
-    resolve_prefill_token_buckets,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    Phase,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -71,11 +79,11 @@ def _make_runner(*, lora_enabled: bool = False) -> MlxRegionRunner:
         attn_backend=None,
     )
     runner._lora_enabled = lora_enabled
-    runner._decode_batch_sizes = generate_decode_batch_sizes(
-        _DEFAULT_MAX_DECODE_BATCH_SIZE
+    runner._decode_batch_sizes = tuple(
+        mlx_region_decode_batch_sizes(DEFAULT_MAX_DECODE_BATCH_SIZE)
     )
-    runner._prefill_token_buckets = generate_prefill_token_buckets(
-        _DEFAULT_MAX_PREFILL_TOKENS
+    runner._prefill_token_buckets = tuple(
+        mlx_region_prefill_token_buckets(DEFAULT_MAX_PREFILL_TOKENS)
     )
     runner._executors = {}
     runner._failed_batch_sizes = set()
@@ -296,11 +304,11 @@ class TestStartupExport(CustomTestCase):
             self._exported_keys(),
             [
                 ("decode", bs)
-                for bs in generate_decode_batch_sizes(_DEFAULT_MAX_DECODE_BATCH_SIZE)
+                for bs in mlx_region_decode_batch_sizes(DEFAULT_MAX_DECODE_BATCH_SIZE)
             ]
             + [
                 ("extend", b)
-                for b in generate_prefill_token_buckets(_DEFAULT_MAX_PREFILL_TOKENS)
+                for b in mlx_region_prefill_token_buckets(DEFAULT_MAX_PREFILL_TOKENS)
             ],
         )
 
@@ -574,95 +582,148 @@ class TestServingForwardArgLayout(CustomTestCase):
             self.assertEqual(args[arg.value], arg.name.lower())
 
 
-class TestPrefillTokenBucketResolution(CustomTestCase):
-    """The prefill bucket ladder is operator-configurable, not hardcoded."""
+class TestRegionLadders(CustomTestCase):
+    """MPS-sized default ladders: the same flags as CUDA, smaller defaults."""
 
-    def test_unset_leaves_reproduce_the_shipped_ladder(self):
+    def test_defaults_reproduce_the_shipped_ladders(self):
         self.assertEqual(
-            resolve_prefill_token_buckets(None, None),
-            (128, 192, 256, 384, 512, 768, 1024, 1536, 2048),
+            mlx_region_decode_batch_sizes(DEFAULT_MAX_DECODE_BATCH_SIZE),
+            [1, 2, 4, 8, 12, 16],
+        )
+        self.assertEqual(
+            mlx_region_prefill_token_buckets(DEFAULT_MAX_PREFILL_TOKENS),
+            [128, 192, 256, 384, 512, 768, 1024, 1536, 2048],
         )
 
-    def test_cap_grows_and_shrinks_the_generated_ladder(self):
+    def test_decode_ladder_matches_the_cuda_shape_and_ends_at_the_cap(self):
         self.assertEqual(
-            resolve_prefill_token_buckets(None, 1024),
-            (128, 192, 256, 384, 512, 768, 1024),
+            mlx_region_decode_batch_sizes(64),
+            [1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64],
         )
-        self.assertEqual(resolve_prefill_token_buckets(None, 4096)[-2:], (3072, 4096))
+        for cap in (10, 3, 1):
+            self.assertEqual(mlx_region_decode_batch_sizes(cap)[-1], cap)
 
-    def test_cap_is_always_its_own_bucket(self):
+    def test_prefill_ladder_grows_shrinks_and_ends_at_the_cap(self):
+        self.assertEqual(
+            mlx_region_prefill_token_buckets(1024),
+            [128, 192, 256, 384, 512, 768, 1024],
+        )
+        self.assertEqual(mlx_region_prefill_token_buckets(4096)[-2:], [3072, 4096])
         # Otherwise a batch at exactly the cap exceeds the largest bucket and
         # silently falls back to eager, which is the opposite of the ask.
         for cap in (3000, 64):
-            self.assertEqual(resolve_prefill_token_buckets(None, cap)[-1], cap)
+            self.assertEqual(mlx_region_prefill_token_buckets(cap)[-1], cap)
 
-    def test_explicit_buckets_win_and_are_sorted_and_deduplicated(self):
-        self.assertEqual(
-            resolve_prefill_token_buckets([512, 128, 512, 256], 4096),
-            (128, 256, 512),
-        )
-
-    def test_rejects_nonpositive_sizes(self):
-        for explicit, cap in (([0, 128], None), ([-5], None), (None, 0), (None, -5)):
+    def test_rejects_nonpositive_caps(self):
+        for cap in (0, -5, None):
             with self.assertRaises(ValueError):
-                resolve_prefill_token_buckets(explicit, cap)
+                mlx_region_decode_batch_sizes(cap)
+            with self.assertRaises(ValueError):
+                mlx_region_prefill_token_buckets(cap)
 
-    def _publish(self, **fields):
-        # The runner reads the published exec.graph leaves, never the
-        # ServerArgs instance; publish for real rather than standing a
-        # SimpleNamespace in for server_args.
-        override = get_context().override_server_args(**fields)
+
+class TestLaddersReadFromCudaGraphConfig(CustomTestCase):
+    """The runner reads cuda_graph_config like the CUDA runners, never the
+    ServerArgs instance; publish for real rather than faking server_args."""
+
+    def _publish(self, decode=None, prefill=None):
+        override = get_context().override_server_args(
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.FULL, **(decode or {})),
+                prefill=PhaseConfig(backend=Backend.FULL, **(prefill or {})),
+            )
+        )
         override.install()
         self.addCleanup(override.restore)
 
-    def test_runner_reads_the_ladder_off_the_exec_graph_bag(self):
-        self._publish()
-        self.assertEqual(
-            _configured_prefill_token_buckets(),
-            (128, 192, 256, 384, 512, 768, 1024, 1536, 2048),
-        )
+    @staticmethod
+    def _model_runner(pool_size):
+        return SimpleNamespace(req_to_token_pool=SimpleNamespace(size=pool_size))
 
-    def test_published_explicit_buckets_reach_the_runner(self):
-        self._publish(mlx_region_prefill_token_buckets=[640, 160, 640])
+    def test_explicit_lists_are_sorted_and_deduplicated(self):
+        self._publish(decode=dict(bs=[6, 2, 6]), prefill=dict(bs=[640, 160, 640]))
+        self.assertEqual(_configured_decode_batch_sizes(self._model_runner(64)), (2, 6))
         self.assertEqual(_configured_prefill_token_buckets(), (160, 640))
 
-    def test_published_cap_reaches_the_runner(self):
-        self._publish(mlx_region_max_prefill_tokens=512)
-        self.assertEqual(_configured_prefill_token_buckets(), (128, 192, 256, 384, 512))
-
-    def test_runner_buckets_drive_executor_selection(self):
-        runner = _make_runner()
-        runner._prefill_token_buckets = (256, 1024)
-        self.assertEqual(runner._executor_key(_extend_batch()), ("extend", 1024))
-        self.assertIsNone(
-            runner._executor_key(
-                _extend_batch(input_ids=torch.zeros(2048, dtype=torch.int64))
-            )
+    def test_decode_ladder_is_clamped_to_the_request_pool(self):
+        # Mirrors get_batch_sizes_to_capture: a pool smaller than the ladder
+        # still gets its full size as a bucket.
+        self._publish(decode=dict(bs=[1, 2, 4, 8, 12, 16]))
+        self.assertEqual(
+            _configured_decode_batch_sizes(self._model_runner(5)), (1, 2, 4, 5)
         )
+        self.assertEqual(
+            _configured_decode_batch_sizes(self._model_runner(8)), (1, 2, 4, 8)
+        )
+
+    def test_unset_or_invalid_lists_fail_loudly(self):
+        self._publish(decode=dict(bs=None), prefill=dict(bs=[0, 128]))
+        with self.assertRaises(ValueError):
+            _configured_decode_batch_sizes(self._model_runner(64))
+        with self.assertRaises(ValueError):
+            _configured_prefill_token_buckets()
+
+
+class TestMpsRegionGraphConfig(CustomTestCase):
+    """On MPS the region is cuda_graph_config's graph runner: resolution keeps
+    Backend.FULL and fills MPS-sized ladders unless the user set them."""
+
+    def test_unset_config_gets_the_mps_defaults(self):
+        config = CudaGraphConfig()
+        fill_mps_region_ladders(config)
+        self.assertEqual(config.decode.max_bs, DEFAULT_MAX_DECODE_BATCH_SIZE)
+        self.assertEqual(config.decode.bs, [1, 2, 4, 8, 12, 16])
+        self.assertEqual(config.prefill.max_bs, DEFAULT_MAX_PREFILL_TOKENS)
+        self.assertEqual(
+            config.prefill.bs, [128, 192, 256, 384, 512, 768, 1024, 1536, 2048]
+        )
+
+    def test_explicit_lists_win_and_pin_the_cap(self):
+        # --cuda-graph-bs-decode 6 2 / --cuda-graph-bs-prefill 640 160
+        config = CudaGraphConfig(
+            decode=PhaseConfig(bs=[6, 2]), prefill=PhaseConfig(bs=[640, 160])
+        )
+        fill_mps_region_ladders(config)
+        self.assertEqual((config.decode.bs, config.decode.max_bs), ([6, 2], 6))
+        self.assertEqual((config.prefill.bs, config.prefill.max_bs), ([640, 160], 640))
+
+    def test_explicit_caps_get_the_mps_ladder_up_to_them(self):
+        # --cuda-graph-max-bs-decode 32 / --cuda-graph-max-bs-prefill 512
+        config = CudaGraphConfig(
+            decode=PhaseConfig(max_bs=32), prefill=PhaseConfig(max_bs=512)
+        )
+        fill_mps_region_ladders(config)
+        self.assertEqual(config.decode.bs, [1, 2, 4, 8, 12, 16, 24, 32])
+        self.assertEqual(config.prefill.bs, [128, 192, 256, 384, 512])
+
+    def test_default_prefill_cap_never_exceeds_max_total_tokens(self):
+        config = CudaGraphConfig()
+        fill_mps_region_ladders(config, max_total_tokens=300)
+        self.assertEqual(config.prefill.max_bs, 300)
+        self.assertEqual(config.prefill.bs, [128, 192, 256, 300])
+
+    def test_unpinned_backends_become_full(self):
+        config = CudaGraphConfig()  # decode defaults to full, prefill to tc_piecewise
+        apply_mps_region_backends(config, locked=set())
+        self.assertEqual(config.decode.backend, Backend.FULL)
+        self.assertEqual(config.prefill.backend, Backend.FULL)
+
+    def test_pinned_disable_is_respected_per_phase(self):
+        # --cuda-graph-backend-decode=disabled
+        config = CudaGraphConfig(decode=PhaseConfig(backend=Backend.DISABLED))
+        apply_mps_region_backends(config, locked={(Phase.DECODE, "backend")})
+        self.assertEqual(config.decode.backend, Backend.DISABLED)
+        self.assertEqual(config.prefill.backend, Backend.FULL)
+
+    def test_pinned_backends_without_an_mps_implementation_are_rejected(self):
+        for backend in (Backend.TC_PIECEWISE, Backend.BREAKABLE):
+            config = CudaGraphConfig(prefill=PhaseConfig(backend=backend))
+            with self.assertRaises(ValueError):
+                apply_mps_region_backends(config, locked={(Phase.PREFILL, "backend")})
 
 
 class TestDecodeBatchBucketing(CustomTestCase):
     """Decode is padded onto an exported bucket ladder, like CUDA-graph replay."""
-
-    def test_default_ladder_matches_the_cuda_graph_shape(self):
-        self.assertEqual(resolve_decode_batch_sizes(None, None), (1, 2, 4, 8, 12, 16))
-        self.assertEqual(
-            resolve_decode_batch_sizes(None, 64),
-            (1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64),
-        )
-
-    def test_cap_is_always_its_own_bucket_and_explicit_wins(self):
-        self.assertEqual(resolve_decode_batch_sizes(None, 10)[-1], 10)
-        self.assertEqual(resolve_decode_batch_sizes([6, 2, 6], 64), (2, 6))
-        for explicit, cap in (([0], None), (None, 0), (None, -1)):
-            with self.assertRaises(ValueError):
-                resolve_decode_batch_sizes(explicit, cap)
-
-    def test_published_leaves_reach_the_runner(self):
-        override = get_context().override_server_args(mlx_region_decode_bs=[6, 2])
-        override.install()
-        self.addCleanup(override.restore)
-        self.assertEqual(_configured_decode_batch_sizes(), (2, 6))
 
     def test_batch_routes_to_the_smallest_covering_bucket(self):
         runner = _make_runner()
