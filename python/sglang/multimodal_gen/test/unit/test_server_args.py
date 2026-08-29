@@ -174,15 +174,25 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 "revision": "base-revision",
                 "component_paths": {"text_encoder": "owner/text-encoder"},
                 "component_weights_paths": {"vae": "owner/vae/model.safetensors"},
-                "component_revisions": {"image-encoder": "image-revision"},
+                "component_revisions": {
+                    "image-encoder": "image-revision",
+                    "vae": "weights-revision",
+                },
             }
         )
 
         self.assertEqual(args.component_revision(None), "base-revision")
         self.assertEqual(args.component_revision("transformer"), "base-revision")
         self.assertIsNone(args.component_revision("text_encoder"))
-        self.assertIsNone(args.component_revision("vae"))
+        self.assertEqual(args.component_revision("vae"), "base-revision")
         self.assertEqual(args.component_revision("image_encoder"), "image-revision")
+        self.assertEqual(
+            args.component_weights_revision("transformer"), "base-revision"
+        )
+        self.assertEqual(args.component_weights_revision("vae"), "weights-revision")
+        self.assertEqual(
+            args.component_weights_revision("image_encoder"), "image-revision"
+        )
 
     def test_component_weight_file_keeps_base_component_config(self):
         args = self._from_dict_without_model_resolution(

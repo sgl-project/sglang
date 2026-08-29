@@ -282,15 +282,13 @@ class VAELoader(ComponentLoader):
         server_args: ServerArgs,
         component_name: str,
     ) -> str:
-        weights_override = getattr(server_args, "component_weights_paths", {}).get(
-            component_name
-        )
+        weights_override = server_args.component_weights_paths.get(component_name)
         if weights_override is None:
             return component_model_path
         model_weights_path = materialize_weight(
             resolve_weight(
                 weights_override,
-                revision=server_args.component_revision(component_name),
+                revision=server_args.component_weights_revision(component_name),
             )
         )
         logger.info(

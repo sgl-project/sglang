@@ -42,6 +42,7 @@ class _FakeServerArgs:
         self.model_paths = {}
         self.revision = "test-revision"
         self.component_revisions = {"vae": "test-revision"}
+        self.component_weights_paths = {}
         self.trust_remote_code = True
         self.layerwise_components = set()
         self.component_quantizations = {}
@@ -50,6 +51,9 @@ class _FakeServerArgs:
         return None, None
 
     def component_revision(self, component_name):
+        return self.component_revisions.get(component_name)
+
+    def component_weights_revision(self, component_name):
         return self.component_revisions.get(component_name)
 
     def should_start_component_on_cpu(self, _component_name):

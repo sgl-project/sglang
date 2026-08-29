@@ -38,7 +38,7 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
     def test_plain_loader_resolves_weights_separately_from_config(self):
         server_args = SimpleNamespace(
             component_weights_paths={"vocoder": "owner/repo/vocoder.safetensors"},
-            component_revision=lambda _component: "component-revision",
+            component_weights_revision=lambda _component: "component-revision",
         )
         with (
             patch(

@@ -531,7 +531,7 @@ class TextEncoderLoader(ComponentLoader):
         model_weights_path = materialize_weight(
             resolve_weight(
                 weights_override,
-                revision=server_args.component_revision(component_name),
+                revision=server_args.component_weights_revision(component_name),
             )
         )
         logger.info(

@@ -585,7 +585,8 @@ class PlainStateDictComponentLoader(ComponentLoader):
             return component_model_path
         weights_path = materialize_weight(
             resolve_weight(
-                override, revision=server_args.component_revision(component_name)
+                override,
+                revision=server_args.component_weights_revision(component_name),
             )
         )
         logger.info("Using weight override for %s: %s", component_name, weights_path)

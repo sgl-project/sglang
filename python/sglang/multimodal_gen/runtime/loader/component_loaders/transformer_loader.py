@@ -112,7 +112,7 @@ def _server_args_for_transformer_component(
         component_server_args = copy.copy(server_args)
         if component_weights_path is not None:
             component_server_args.transformer_weights_path = component_weights_path
-            component_server_args.revision = server_args.component_revision(
+            component_server_args.revision = server_args.component_weights_revision(
                 component_name
             )
             component_server_args.nunchaku_config = None

@@ -1162,19 +1162,33 @@ class ServerArgs(DisaggServerArgsMixin):
         return None, None
 
     def component_revision(self, component_name: str | None) -> str | None:
-        """Resolve a component revision without leaking base revisions across repos."""
+        """Resolve the revision for a component configuration source."""
+        if component_name is None:
+            return self.revision
+
+        if (
+            component_name in self.component_weights_paths
+            and component_name not in self.component_paths
+        ):
+            return self.revision
+        revision = self.component_revisions.get(component_name)
+        if revision is not None:
+            return revision
+        if component_name in self.component_paths:
+            return None
+        return self.revision
+
+    def component_weights_revision(self, component_name: str | None) -> str | None:
+        """Resolve the revision for a component weight override source."""
         if component_name is None:
             return self.revision
 
         revision = self.component_revisions.get(component_name)
         if revision is not None:
             return revision
-        if (
-            component_name in self.component_paths
-            or component_name in self.component_weights_paths
-        ):
+        if component_name in self.component_weights_paths:
             return None
-        return self.revision
+        return self.component_revision(component_name)
 
     def _adjust_warmup(self):
         if self.warmup_mode is not None and self.warmup_mode not in WARMUP_MODES:
