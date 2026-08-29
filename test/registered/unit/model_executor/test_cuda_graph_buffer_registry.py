@@ -1195,6 +1195,76 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         reg.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=3, padded_num_tokens=8)
         self.assertTrue(torch.equal(idx, torch.tensor([3, 4], dtype=torch.int64)))
 
+    def test_pp_proxy_token_slots_copy_head_and_zero_bucket_tail(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+        hidden = torch.full((16, 4), 7.0)
+        residual = torch.full((16, 4), 7.0)
+        src = self._src(
+            pp_proxy_tensors={
+                "hidden_states": hidden,
+                "residual": residual,
+            }
+        )
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=1,
+            max_num_token=16,
+            cache_loc_dtype=torch.int64,
+            source=src,
+        )
+        self.assertTrue(reg.has_slot("pp_proxy_tensors.hidden_states"))
+        fb = _MiniForwardBatch(
+            input_ids=torch.zeros(3, dtype=torch.int64),
+            positions=torch.zeros(3, dtype=torch.int64),
+            out_cache_loc=torch.zeros(3, dtype=torch.int64),
+        )
+        pp_proxy = PPProxyTensors(
+            {
+                "hidden_states": torch.ones((3, 4)),
+                "residual": torch.full((3, 4), 2.0),
+            }
+        )
+        reg.fill_from(
+            fb,
+            raw_bs=1,
+            padded_bs=1,
+            raw_num_tokens=3,
+            padded_num_tokens=8,
+            pp_proxy_tensors=pp_proxy,
+        )
+        self.assertTrue(torch.all(hidden[:3] == 1.0))
+        self.assertTrue(torch.all(residual[:3] == 2.0))
+        self.assertTrue(torch.all(hidden[3:8] == 0.0))
+        self.assertTrue(torch.all(residual[3:8] == 0.0))
+        self.assertTrue(torch.all(hidden[8:] == 7.0))
+
+    def test_prefill_input_buffers_allocate_pp_proxy_by_token(self):
+        from sglang.srt.model_executor.runner_utils.buffers import (
+            PrefillInputBuffers,
+        )
+
+        buffers = PrefillInputBuffers.create(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_tokens=16,
+            cache_loc_dtype=torch.int64,
+            is_multimodal=False,
+            hidden_size=8,
+            dtype=torch.bfloat16,
+            enable_mamba_track=False,
+            pp_size=2,
+            pp_proxy_topk_size=3,
+        )
+        self.assertEqual(
+            tuple(buffers.pp_proxy_tensors["hidden_states"].shape), (16, 8)
+        )
+        self.assertEqual(tuple(buffers.pp_proxy_tensors["residual"].shape), (16, 8))
+        self.assertEqual(tuple(buffers.pp_proxy_tensors["topk_indices"].shape), (16, 3))
+
     def test_source_none_owns_allocated_buffers(self):
         # source=None -> the registry allocates (owns) every slot.
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (

@@ -197,6 +197,7 @@ def _load_explicit_config(
 class UpsamplerLoader(PlainStateDictComponentLoader):
     component_names = ["spatial_upsampler"]
     expected_library = "diffusers"
+    supports_component_weight_override = True
 
     def load_customized(
         self,
@@ -204,9 +205,15 @@ class UpsamplerLoader(PlainStateDictComponentLoader):
         server_args: ServerArgs,
         component_name: str,
     ):
-        safetensors_path = _find_safetensors_file(
-            component_model_path, revision=server_args.revision
+        component_weights_path = self.resolve_component_weights_path(
+            component_model_path, server_args, component_name
         )
+        if component_weights_path == component_model_path:
+            safetensors_path = _find_safetensors_file(
+                component_weights_path, revision=server_args.revision
+            )
+        else:
+            safetensors_path = _find_safetensors_file(component_weights_path)
         raw_config = _load_explicit_config(safetensors_path, component_model_path)
         if raw_config is not None:
             self.ensure_plain_state_dict_checkpoint(raw_config, component_name)

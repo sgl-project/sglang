@@ -151,6 +151,9 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             "_class_name": "LatentUpsampler",
             "quantization_config": {"quant_method": "bitsandbytes"},
         }
+        server_args = SimpleNamespace(
+            component_weights_paths={}, revision="pinned-revision"
+        )
 
         with (
             patch(
@@ -170,9 +173,7 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             self.assertRaises(ComponentCheckpointUnsupportedError),
         ):
             UpsamplerLoader().load_customized(
-                "/model/spatial_upsampler",
-                SimpleNamespace(revision="pinned-revision"),
-                "spatial_upsampler",
+                "/model/spatial_upsampler", server_args, "spatial_upsampler"
             )
 
         load_weights.assert_not_called()
@@ -201,6 +202,33 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
 
         self.assertEqual(resolved, "/cache/component/model.safetensors")
         download.assert_called_once_with("owner/component", revision="pinned-revision")
+
+    def test_upsampler_uses_exact_component_weight_override(self):
+        self.assertTrue(UpsamplerLoader.supports_component_weight_override)
+        server_args = SimpleNamespace(
+            component_weights_paths={"spatial_upsampler": "owner/repo/upsampler"}
+        )
+        with (
+            patch.object(
+                UpsamplerLoader,
+                "resolve_component_weights_path",
+                return_value="/cache/upsampler.safetensors",
+            ) as resolve_weights,
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "upsampler_loader._find_safetensors_file",
+                side_effect=RuntimeError("stop after routing"),
+            ) as find_weights,
+            self.assertRaisesRegex(RuntimeError, "stop after routing"),
+        ):
+            UpsamplerLoader().load_customized(
+                "/base/spatial_upsampler", server_args, "spatial_upsampler"
+            )
+
+        resolve_weights.assert_called_once_with(
+            "/base/spatial_upsampler", server_args, "spatial_upsampler"
+        )
+        find_weights.assert_called_once_with("/cache/upsampler.safetensors")
 
 
 if __name__ == "__main__":
