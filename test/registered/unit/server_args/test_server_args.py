@@ -740,6 +740,74 @@ class TestSkipTokenizerInit(unittest.TestCase):
         self.assertEqual(resolution_result(server_args, "detokenizer_worker_num"), 1)
 
 
+class TestRocmDsaTopKCompatibility(CustomTestCase):
+    def test_gfx942_defaults_to_torch_unfused_topk(self):
+        args = ServerArgs(model_path="dummy")
+
+        with (
+            envs.SGLANG_DSA_FUSE_TOPK.override(True),
+            patch.object(server_args_module, "is_hip", return_value=True),
+            patch.object(server_args_module, "is_gfx95_supported", return_value=False),
+        ):
+            args._handle_rocm_dsa_topk_compatibility()
+
+            self.assertEqual(resolution_result(args, "dsa_topk_backend"), "torch")
+            self.assertEqual(
+                resolution_result(args, "speculative_dsa_topk_backend"),
+                "sgl-kernel",
+            )
+            self.assertFalse(envs.SGLANG_DSA_FUSE_TOPK.get())
+
+    def test_gfx950_keeps_sgl_kernel_fused_topk(self):
+        args = ServerArgs(model_path="dummy")
+
+        with (
+            envs.SGLANG_DSA_FUSE_TOPK.override(True),
+            patch.object(server_args_module, "is_hip", return_value=True),
+            patch.object(server_args_module, "is_gfx95_supported", return_value=True),
+        ):
+            args._handle_rocm_dsa_topk_compatibility()
+
+            self.assertEqual(resolution_result(args, "dsa_topk_backend"), "sgl-kernel")
+            self.assertEqual(
+                resolution_result(args, "speculative_dsa_topk_backend"),
+                "sgl-kernel",
+            )
+            self.assertTrue(envs.SGLANG_DSA_FUSE_TOPK.get())
+
+    def test_cuda_and_explicit_backends_are_unchanged(self):
+        cuda_args = ServerArgs(model_path="dummy")
+        explicit_args = ServerArgs(
+            model_path="dummy",
+            dsa_topk_backend="torch",
+            speculative_dsa_topk_backend="flashinfer",
+        )
+
+        with envs.SGLANG_DSA_FUSE_TOPK.override(True):
+            with patch.object(server_args_module, "is_hip", return_value=False):
+                cuda_args._handle_rocm_dsa_topk_compatibility()
+            self.assertEqual(
+                resolution_result(cuda_args, "dsa_topk_backend"), "sgl-kernel"
+            )
+            self.assertTrue(envs.SGLANG_DSA_FUSE_TOPK.get())
+
+            with (
+                patch.object(server_args_module, "is_hip", return_value=True),
+                patch.object(
+                    server_args_module, "is_gfx95_supported", return_value=False
+                ),
+            ):
+                explicit_args._handle_rocm_dsa_topk_compatibility()
+            self.assertEqual(
+                resolution_result(explicit_args, "dsa_topk_backend"), "torch"
+            )
+            self.assertEqual(
+                resolution_result(explicit_args, "speculative_dsa_topk_backend"),
+                "flashinfer",
+            )
+            self.assertTrue(envs.SGLANG_DSA_FUSE_TOPK.get())
+
+
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
     # The backend selection moved to the resolution pipeline; these policy
     # tests drive the pass through its read-only view.

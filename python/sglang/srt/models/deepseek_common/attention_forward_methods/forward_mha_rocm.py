@@ -269,8 +269,12 @@ class DeepseekMHARocmForwardMixin:
     def _concat_and_cast_mha_k_rocm(
         self: DeepseekV2AttentionMLA,
         k_nope: torch.Tensor,
-        k_pe: torch.Tensor,
+        k_pe: torch.Tensor | None,
     ):
+        if self.qk_rope_head_dim == 0:
+            assert k_pe is None or k_pe.shape[-1] == 0
+            return k_nope.contiguous()
+
         k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
         k = k_nope.new_empty(*k_shape)
         if self.current_attention_backend == "aiter":

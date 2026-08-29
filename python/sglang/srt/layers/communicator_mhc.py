@@ -52,10 +52,12 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
+    get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer_mhc,
     is_allocation_symmetric,
 )
+from sglang.srt.layers.moe import should_use_dp_reduce_scatterv
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -86,6 +88,7 @@ class MHCState:
     hc_attn_pre: Callable
     hc_ffn_pre: Callable
     hc_post: Callable
+    hc_attn_to_mlp: Optional[Callable] = None
     h_res: Optional[torch.Tensor] = None
     h_post: Optional[torch.Tensor] = None
 
@@ -108,9 +111,34 @@ class MHCState:
     def attn_to_mlp(
         self, hidden_states, residual, out_norm: Optional[torch.nn.Module] = None
     ):
+        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
+        if self.hc_attn_to_mlp is not None:
+            fused = self.hc_attn_to_mlp(
+                hidden_states,
+                residual,
+                self.h_res,
+                self.h_post,
+                out_norm_weight,
+                out_norm_eps,
+            )
+            if fused is not None:
+                (
+                    hidden_states,
+                    residual,
+                    self.h_res,
+                    self.h_post,
+                    norm_fused,
+                ) = fused
+                if (
+                    out_norm is not None
+                    and not norm_fused
+                    and hidden_states.shape[0] != 0
+                ):
+                    hidden_states = out_norm(hidden_states)
+                return hidden_states, residual
+
         hidden_states = self.hc_post(hidden_states, residual, self.h_res, self.h_post)
         residual = hidden_states
-        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
         hidden_states, self.h_res, self.h_post, norm_fused = self.hc_ffn_pre(
             hidden_states, out_norm_weight, out_norm_eps
         )
@@ -339,7 +367,19 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             get_local_dp_buffer_mhc(get_tp_group(), 1),
             hidden_states,
         )
-        if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
+        # Mirror CommunicateSummableTensorPairFn._scatter_hidden_states: when
+        # should_use_dp_reduce_scatterv() is true, the MoE skipped its
+        # post-experts all-reduce (should_skip_post_experts_all_reduce) on the
+        # promise that THIS scatter performs the combine. Without this branch,
+        # SUM_LEN rounds take the non-reducing dp_scatter and every DP rank's
+        # tokens keep only that rank's local-expert partial sums.
+        if should_use_dp_reduce_scatterv():
+            get_tp_group().reduce_scatterv(
+                global_hidden_states,
+                output=hidden_states,
+                sizes=get_dp_global_num_tokens(),
+            )
+        elif allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
@@ -412,6 +452,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         hc_attn_pre: Callable,
         hc_ffn_pre: Callable,
         hc_post: Callable,
+        hc_attn_to_mlp: Optional[Callable] = None,
     ):
         self.is_first_layer = is_first_layer
         self.mhc = MHCState(
@@ -419,6 +460,7 @@ class MHCLayerCommunicator(LayerCommunicator):
             hc_attn_pre=hc_attn_pre,
             hc_ffn_pre=hc_ffn_pre,
             hc_post=hc_post,
+            hc_attn_to_mlp=hc_attn_to_mlp,
         )
 
         super().__init__(
@@ -553,9 +595,15 @@ class MHCLayerCommunicator(LayerCommunicator):
         if (
             self._communicate_summable_tensor_pair_fn
             is MHCCommunicateSummableTensorPairFn._scatter_hidden_states
-            and forward_batch.dp_padding_mode.is_max_len()
         ):
-            return True
+            # Mirror LayerCommunicator.should_use_reduce_scatter (PR #24785):
+            # True on should_use_dp_reduce_scatterv() regardless of padding
+            # mode, else RowParallelLinear keeps all-reducing the dense MLP
+            # while the scatter above reduce-scatters on top of it.
+            if should_use_dp_reduce_scatterv():
+                return True
+            if forward_batch.dp_padding_mode.is_max_len():
+                return True
 
         if dsa_use_prefill_cp(forward_batch):
             return True

@@ -8,6 +8,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
 from sglang.srt.batch_overlap.two_batch_overlap import (
@@ -112,6 +113,7 @@ from sglang.srt.models.glm_ocr import (
     GlmOcrVisionPatchEmbed,
     GlmOcrVisionPatchMerger,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
@@ -133,6 +135,7 @@ if _use_aiter_gfx95:
     )
 
 logger = logging.getLogger(__name__)
+_GLM_AITER_FUSED_MHC_LOGGED = False
 
 
 @torch.compile
@@ -757,6 +760,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
+                hc_attn_to_mlp=(self.hc_attn_to_mlp if _use_aiter_gfx95 else None),
             )
             if self.dsa_enable_prefill_cp:
                 self.layer_communicator = MHCHybridDSACPLayerCommunicator(
@@ -821,6 +825,58 @@ class Glm5NextDecoderLayer(nn.Module):
             h_post=h_post,
             h_res=h_res,
             hc_mult=self.config.hc_mult,
+        )
+
+    def hc_attn_to_mlp(
+        self,
+        hidden_states,
+        residual,
+        h_res,
+        h_post,
+        out_norm_weight,
+        out_norm_eps,
+    ):
+        """Fuse attention mHC post with FFN mHC pre on AITER gfx95."""
+        global _GLM_AITER_FUSED_MHC_LOGGED
+
+        from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+            apply_mhc_post_pre_boundary,
+        )
+
+        num_tokens, hidden_size = hidden_states.shape
+        if num_tokens == 0:
+            return None
+        hc_mult = self.config.hc_mult
+        fused = apply_mhc_post_pre_boundary(
+            layer_input=hidden_states,
+            residual=residual.view(num_tokens, hc_mult, hidden_size),
+            post=h_post.view(num_tokens, hc_mult),
+            comb=h_res.view(num_tokens, hc_mult, hc_mult),
+            hc_fn=self.hc_ffn_fn,
+            hc_scale=self.hc_ffn_scale,
+            hc_base=self.hc_ffn_base,
+            hc_mult=hc_mult,
+            rms_eps=self.config.rms_norm_eps,
+            hc_eps=self.config.hc_eps,
+            hc_post_mult=2.0,
+            sinkhorn_iters=self.config.hc_sinkhorn_iters,
+            norm_weight=out_norm_weight,
+            norm_eps=out_norm_eps,
+            fn_transpose=True,
+        )
+        if fused is None:
+            return None
+        if not _GLM_AITER_FUSED_MHC_LOGGED:
+            logger.info("Using fused AITER mHC attention-to-FFN boundary")
+            _GLM_AITER_FUSED_MHC_LOGGED = True
+
+        next_residual, layer_input, next_h_post, next_h_res, norm_fused = fused
+        return (
+            layer_input,
+            next_residual.view(num_tokens, -1),
+            next_h_res.reshape(num_tokens, hc_mult * hc_mult),
+            next_h_post.reshape(num_tokens, hc_mult),
+            norm_fused,
         )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
@@ -959,6 +1015,7 @@ class Glm5NextModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.config = config
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
@@ -1064,6 +1121,7 @@ class Glm5NextModel(nn.Module):
                 )
             )
         self.layers_to_capture = []
+        self.dflash_capture = False
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             self.enable_a2a_moe = True
         else:
@@ -1071,6 +1129,19 @@ class Glm5NextModel(nn.Module):
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
+
+    def _prepare_aux_hidden_state(
+        self, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        # Under mHC the residual is folded into the widened hidden state, so the
+        # layer communicator hands back residual=None and hc_contract below does
+        # the merge. Only the plain residual-stream path has a tensor to add.
+        aux_hidden_state = (
+            hidden_states if residual is None else hidden_states + residual
+        )
+        if self.dflash_capture and self.config.mhc:
+            aux_hidden_state = hc_contract(aux_hidden_state, self.config.hc_mult)
+        return aux_hidden_state
 
     def forward(
         self,
@@ -1122,7 +1193,7 @@ class Glm5NextModel(nn.Module):
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo:
+        if forward_batch.can_run_tbo and not self.dflash_capture:
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer
@@ -1141,13 +1212,14 @@ class Glm5NextModel(nn.Module):
             )
             with ctx:
                 if i in self.layers_to_capture:
+                    aux_hidden_state = self._prepare_aux_hidden_state(
+                        hidden_states, residual
+                    )
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
                         aux_hidden_state = get_parallel().attn_tp_group.all_gather(
-                            hidden_states + residual, dim=0
+                            aux_hidden_state, dim=0
                         )
-                        aux_hidden_states.append(aux_hidden_state)
-                    else:
-                        aux_hidden_states.append(hidden_states + residual)
+                    aux_hidden_states.append(aux_hidden_state)
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
                     positions,
@@ -1201,6 +1273,13 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+            "model.visual.": "visual.",
+        },
+        orig_to_new_suffix={".attn.qkv": ".attn.qkv_proj"},
+    )
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         "fused_qkvbfg_a_proj": [
@@ -1338,9 +1417,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_config = getattr(hf_config, "text_config", hf_config)
         if not getattr(text_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
-        if _device_sm is not None and _device_sm < 80:
+        if not (_is_cuda or _use_aiter_gfx95):
+            return (
+                "Shared experts fusion requires CUDA or the supported "
+                "AITER ROCm path."
+            )
+        if _is_cuda and _device_sm is not None and _device_sm < 80:
             return "Shared experts fusion requires SM80 or newer GPUs."
         if get_parallel().moe_ep_size > 1:
             return (
@@ -1387,6 +1469,20 @@ class Glm5NextForConditionalGeneration(nn.Module):
         else:
             self.capture_aux_hidden_states = True
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.dflash_capture = True
+        # Capturing before layer k + 1 gives the completed output of layer k.
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def prepare_context_parallel_metadata_for_dcp(
         self,
@@ -1607,6 +1703,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
             fused_cat_dim = 0
 
         params_dict = dict(self.named_parameters())
+
+        def maybe_map_fp8_block_scale_name(name: str) -> str:
+            if name.endswith(".weight_scale"):
+                candidate = name.removesuffix(".weight_scale") + ".weight_scale_inv"
+                if candidate in params_dict:
+                    return candidate
+            return name
+
         weight_names = []
         for name, loaded_weight in weights:
             is_visual_weight = "visual" in name
@@ -1670,6 +1774,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 if "mlp.experts" in name:
                     continue
                 candidate = name.replace(weight_name, param_name)
+                candidate = maybe_map_fp8_block_scale_name(candidate)
                 if (
                     param_name
                     in {
@@ -1698,6 +1803,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         continue
                     is_expert_weight = True
                     name = name.replace(weight_name, param_name)
+                    name = maybe_map_fp8_block_scale_name(name)
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
@@ -1749,6 +1855,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                                     "fused_qkv_a_proj_with_mqa",
                                 )
                             )
+                            target = maybe_map_fp8_block_scale_name(target)
                             if target in params_dict:
                                 param = params_dict[target]
                                 weight_loader = getattr(
@@ -1759,6 +1866,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                             cached_a_proj.pop(kv_a_proj_name, None)
                         continue
 
+                    name = maybe_map_fp8_block_scale_name(name)
                     if name not in params_dict:
                         continue
 
