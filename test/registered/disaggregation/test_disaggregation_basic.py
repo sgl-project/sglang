@@ -14,6 +14,7 @@ import openai
 import requests
 from transformers import AutoTokenizer
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv_cache_builder import BACKUP_ONLY_HICACHE_RATIO
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
@@ -188,14 +189,16 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        # set DISAGGREGATION_TEST_FAILURE_PROB to simulate failure
-        os.environ["DISAGGREGATION_TEST_FAILURE_PROB"] = "0.05"
+        # Inject transfer failures so the retry path is actually exercised.
+        # Entered before launch_all() so the server subprocesses inherit it.
+        cls._disagg_failure_ctx = envs.SGLANG_TEST_DISAGG_FAILURE_PROB.override(0.05)
+        cls._disagg_failure_ctx.__enter__()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.launch_all()
 
     @classmethod
     def tearDownClass(cls):
-        os.environ.pop("DISAGGREGATION_TEST_FAILURE_PROB")
+        cls._disagg_failure_ctx.__exit__(None, None, None)
         super().tearDownClass()
 
     def test_gsm8k(self):

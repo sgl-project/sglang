@@ -14,7 +14,7 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
 )
-from sglang.srt.configs.hybrid_arch import mamba2_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
@@ -24,6 +24,9 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
 )
+from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
+    validate_replay_state_indices_cpu,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -31,18 +34,22 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
+    get_spec,
     mamba_cache_chunk_size,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
-from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 if is_npu():
     FLA_CHUNK_SIZE_NPU = 64
+_validate_mamba_replay_state_indices = (
+    envs.SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES.get()
+)
 
 
 class MambaAttnBackendBase(AttentionBackend):
@@ -50,11 +57,16 @@ class MambaAttnBackendBase(AttentionBackend):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = get_spec().speculative_eagle_topk or 0
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_unified_memory = model_runner.server_args.enable_unified_memory
+        # model_config must not be touched here: backend selection reads the
+        # linear_attn_backends stamp first, and that guard test constructs
+        # backends on runners without a real model_config.
+        self._model_runner = model_runner
+        self._mamba_chunk_size: Optional[int] = None
         # Fused replay-prep state-indices fast path (fused_replay_state_indices):
         # requires the static hybrid pool whose v2p translate is the identity —
         # the unified pool overrides translate_mamba_indices with an allocator
@@ -81,6 +93,14 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
+
+    @property
+    def mamba_chunk_size(self) -> int:
+        if self._mamba_chunk_size is None:
+            self._mamba_chunk_size = getattr(
+                self._model_runner.model_config.hf_text_config, "mamba_chunk_size", 64
+            )
+        return self._mamba_chunk_size
 
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba slot-id translate (identity for the non-unified
@@ -326,9 +346,8 @@ class MambaAttnBackendBase(AttentionBackend):
         """src/dst indices to track SSM states for prefix caching: aligned seqs
         cache last_recurrent_state, unaligned cache intermediate `h` at the last
         chunk boundary."""
-        chunk_size = mamba_cache_chunk_size()
-        if is_npu():
-            h_chunk_size = FLA_CHUNK_SIZE_NPU
+        state_chunk_size = self.mamba_chunk_size
+        h_chunk_size = FLA_CHUNK_SIZE_NPU if is_npu() else state_chunk_size
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
@@ -338,11 +357,9 @@ class MambaAttnBackendBase(AttentionBackend):
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
         if isinstance(self, Mamba2AttnBackend):
-            num_h_states = extend_seq_lens // chunk_size
+            num_h_states = extend_seq_lens // state_chunk_size
         else:
-            num_h_states = (extend_seq_lens - 1) // chunk_size + 1
-            if is_npu():
-                num_h_states = (extend_seq_lens - 1) // h_chunk_size + 1
+            num_h_states = (extend_seq_lens - 1) // h_chunk_size + 1
 
         track_ssm_src_offset = torch.zeros_like(num_h_states)
         track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
@@ -352,22 +369,24 @@ class MambaAttnBackendBase(AttentionBackend):
         offset_masked = track_ssm_src_offset[mamba_track_mask]
         dst_masked = mamba_track_indices[mamba_track_mask]
 
-        is_aligned = (lens_masked % chunk_size) == 0
+        is_aligned = (lens_masked % state_chunk_size) == 0
 
         # Aligned: last_recurrent_state from ssm_states.
         track_ssm_final_src = mamba_cache_indices[mamba_track_mask][is_aligned]
         track_ssm_final_dst = dst_masked[is_aligned]
 
         # Unaligned: intermediate state from h.
-        # TODO: handle chunk_size % page size != 0
         not_aligned = ~is_aligned
         track_ssm_h_src = offset_masked[not_aligned] + (
-            lens_masked[not_aligned] // chunk_size
+            lens_masked[not_aligned] // state_chunk_size
         )
         if is_npu():
             track_ssm_h_src = (
                 offset_masked[not_aligned]
-                + ((lens_masked[not_aligned] // chunk_size) * chunk_size)
+                + (
+                    (lens_masked[not_aligned] // state_chunk_size)
+                    * state_chunk_size
+                )
                 // h_chunk_size
             )
         track_ssm_h_dst = dst_masked[not_aligned]
@@ -599,6 +618,17 @@ class MambaAttnBackendBase(AttentionBackend):
             mamba_indices = self._translate_mamba_indices(mamba_indices)
             mamba_indices[bs - num_padding :] = -1
             self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        if _validate_mamba_replay_state_indices and not in_capture:
+            # This pre-replay diagnostic intentionally syncs to reject malformed
+            # live or padded indices before a captured state update uses them.
+            valid_bs = bs - int(num_padding)
+            validate_replay_state_indices_cpu(
+                mamba_indices.detach().cpu(),
+                valid_bs=valid_bs,
+                total_bs=bs,
+                num_state_slots=self.req_to_token_pool.mamba_pool.size + 1,
+                pad_slot_id=self.pad_slot_id,
+            )
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
         # Hand out only the refreshed [:bs] prefix — Mamba2's track-save slices
@@ -849,9 +879,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        config = mamba2_config(model_runner.model_config)
-        assert config is not None
-        self.mamba_chunk_size = config.mamba_chunk_size
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
@@ -999,6 +1026,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.full_attn_backend.supports_ragged_verify_graph
             and self.linear_attn_backend.supports_ragged_verify_graph
         )
+
+    @property
+    def kv_cache_dtype(self):
+        return self.full_attn_backend.kv_cache_dtype
 
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None

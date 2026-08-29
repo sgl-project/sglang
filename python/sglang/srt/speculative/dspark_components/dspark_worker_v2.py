@@ -12,6 +12,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -20,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_position,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
     get_schedule,
@@ -72,7 +74,12 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     prepare_mamba_track_for_verify,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_npu
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_cuda,
+    is_npu,
+    is_pin_memory_available,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,11 +108,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
 
-        self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
+        self._draft_is_moe = draft_is_deepseek_v4()
         self._draft_dp_context_enabled = (
             get_parallel().enable_dp_attention and not self._draft_is_moe
         )
-        self._is_pd_prefill = server_args.disaggregation_mode == "prefill"
+        self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
         self._decode_graph_allowed = (
             not get_exec().graph.disable_cuda_graph and not self._is_pd_prefill
         )
@@ -124,7 +131,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DSPARK",
@@ -155,23 +162,27 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._target_is_mambaish = mambaish_config(target_model_config) is not None
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
-            speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
+            speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
             target_vocab_size=int(target_embed_rows),
         )
         self.gamma = runtime_config.gamma
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
+        self.sample_from_anchor = bool(self.draft_model.sample_from_anchor)
+        self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
 
         if self.ps.tp_rank == 0:
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
-                "gamma=%s, verify_num_draft_tokens=%s, mask_token_id=%s, "
-                "markov_head=%s",
+                "gamma=%s, verify_num_draft_tokens=%s, query_token_num=%s, "
+                "sample_from_anchor=%s, mask_token_id=%s, markov_head=%s",
                 bundle.resolved_attention_backend,
                 self.draft_model.__class__.__name__,
                 self.gamma,
                 self.verify_num_draft_tokens,
+                self.query_token_num,
+                self.sample_from_anchor,
                 self._mask_token_id,
                 type(self.draft_model.markov_head).__name__,
             )
@@ -180,7 +191,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             length=self.verify_num_draft_tokens, device=self.device
         )
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=int(self.gamma), device=self.device
+            draft_token_num=int(self.query_token_num), device=self.device
         )
 
         if getattr(self.draft_model, "uses_own_vocab_modules", False):
@@ -190,13 +201,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         else:
             target_model = self.target_worker.model_runner.model
-            lm_head = getattr(target_model, "lm_head", None)
+            lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
             if lm_head is None or not hasattr(lm_head, "weight"):
                 raise RuntimeError(
                     "DSpark requires the target model to expose `lm_head` with `weight`."
                 )
             self.draft_model.attach_shared_modules(
-                embed_tokens=self._resolve_target_embed_tokens(target_model),
+                embed_tokens=unwrap_lora_layer(
+                    self._resolve_target_embed_tokens(target_model)
+                ),
                 lm_head=lm_head,
             )
 
@@ -345,12 +358,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         with self._draft_context():
-            if _is_npu:
-                from sglang.srt.hardware_backend.npu.extra_ops_loader import (
-                    initialize_dspark_sparse_attn_ops,
-                )
-
-                initialize_dspark_sparse_attn_ops()
             self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
@@ -474,10 +481,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Must inject before prefill returns: the scheduler may update radix
         # afterward, invalidating out_cache_loc.
         device = next_token_ids.device
-        ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
+        pin_memory = is_pin_memory_available(device)
+        ctx_lens = torch.tensor(
+            batch.extend_lens, dtype=torch.int32, pin_memory=pin_memory
+        ).to(device, non_blocking=True)
         draft_seq_lens = torch.tensor(
-            batch.prefix_lens, dtype=torch.int32, device=device
-        )
+            batch.prefix_lens, dtype=torch.int32, pin_memory=pin_memory
+        ).to(device, non_blocking=True)
         positions, _ = compute_position(
             self.model_runner.prefill_attention_backend_str,
             draft_seq_lens,
