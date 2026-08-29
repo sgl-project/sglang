@@ -323,6 +323,7 @@ class Envs:
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
+    SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
 
     # ===================================================================
     # Logging
@@ -441,12 +442,21 @@ class Envs:
     SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD = EnvInt(100)
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
+    SGLANG_TRACE_LOGITS_E2E = EnvBool(False)
+    SGLANG_TRACE_LOGITS_E2E_SYNC = EnvBool(False)
+    SGLANG_TRACE_SAMPLER_E2E = EnvBool(False)
+    SGLANG_TRACE_QWEN_MOE_DEEPEP_E2E = EnvBool(False)
+    SGLANG_DEEPEP_V2_TRACE_CONTIG = EnvBool(False)
+    SGLANG_DEEPEP_V2_TRACE_MASKED = EnvBool(False)
 
     # ===================================================================
     # Debugging and invariant checks
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
+    SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
+    SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
@@ -746,6 +756,7 @@ class Envs:
     # ===================================================================
     # MoRI transport and expert dispatch
     # ===================================================================
+    SGLANG_DEEPEP_V2_FORCE_MAX_LEN = EnvBool(False)
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
     SGLANG_MORI_SEND_AUX_RDMA = EnvBool(False)
     # Number of RDMA Queue Pairs (QPs) used per transfer operation. Higher
@@ -1009,6 +1020,9 @@ class Envs:
     # DeepGEMM
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
+    # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
+    SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
@@ -1017,6 +1031,9 @@ class Envs:
     # load imbalance (they otherwise OOM saturated --moe-runner-backend
     # deep_gemm serving).  Costs one D2H sync per MoE layer.
     SGLANG_OPT_DG_MASKED_M_CAP = EnvBool(False)
+    # Wide-DP eager prefill uses compact routing storage; masked storage scales
+    # with num_local_experts and can OOM on skewed batches.
+    SGLANG_OPT_DG_COMPACT_EAGER = EnvBool(False)
     # Drop dp-attention MAX_LEN pad rows from MoE dispatch (StandardDispatcher
     # post-translation topk_ids -> -1): pad rows otherwise run the router on
     # stale hidden values and burn expert compute whose outputs are discarded;
@@ -1532,6 +1549,16 @@ class Envs:
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
+    # Qwen3.5 and GDN
+    SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    SGLANG_TRACE_QWEN35_FINAL_NORM = EnvBool(False)
+    SGLANG_QWEN35_NATIVE_FINAL_NORM = EnvBool(False)
+    # One switch enables deferred MoE finalize and AR + residual + RMSNorm.
+    SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION = EnvBool(False)
+    # Distinct workspace configurations allowed in one process. Production
+    # uses one model/configuration per rank, so fail closed on accidental reuse.
+    SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES = EnvInt(1)
+
     # ===================================================================
     # Plugin system
     # ===================================================================
@@ -1685,6 +1712,8 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN": _DeprecatedEnv(),
     # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
     "SGLANG_OPT_USE_CUDA_SCONV": _DeprecatedEnv(),
+    # The direct dense BF16 GEMM source is vendored in-tree.
+    "SGLANG_FLASHINFER_PR4266_SOURCE": _DeprecatedEnv(),
     # DSV4 compressor V2 is always used.
     "SGLANG_OPT_USE_COMPRESSOR_V2": _DeprecatedEnv(),
     # Replaced by CLI flags.
