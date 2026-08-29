@@ -32,8 +32,13 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    build_kv_layer_ids,
+    build_transfer_entry_pairs,
     get_dsv4_c128_state_indices,
+    pack_state_types,
+    resolve_state_component_dst_index,
     setup_state_kv_args,
+    unpack_state_types,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
@@ -142,6 +147,46 @@ class TestDisaggregationWire(unittest.TestCase):
     def test_list_of_buffers_roundtrip(self):
         bufs = [b"abc", b"", b"de", b"x" * 17]
         self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
+
+    def test_state_component_matching_uses_type_occurrence(self):
+        src_state_types = [StateType.SWA, StateType.SWA]
+        dst_state_types = [StateType.SWA, StateType.C128_STATE, StateType.SWA]
+
+        self.assertEqual(
+            resolve_state_component_dst_index(src_state_types, dst_state_types, 0),
+            0,
+        )
+        self.assertEqual(
+            resolve_state_component_dst_index(src_state_types, dst_state_types, 1),
+            2,
+        )
+
+    def test_state_types_roundtrip(self):
+        state_types = [StateType.SWA, StateType.C128_STATE, StateType.SWA_RING]
+
+        self.assertEqual(unpack_state_types(pack_state_types(state_types)), state_types)
+
+    def test_layer_shard_kv_layer_ids_use_shard_start(self):
+        kv_pool = SimpleNamespace(
+            layer_shard_enabled=True,
+            layer_shard_start=20,
+            start_layer=0,
+            end_layer=40,
+            get_kv_layer_ids=lambda: [20, 21, 22],
+        )
+
+        kv_pool.get_contiguous_buf_infos = lambda: ([1, 2, 3], [1, 1, 1], [1, 1, 1])
+
+        src_layer_ids = build_kv_layer_ids(
+            token_to_kv_pool=kv_pool,
+            draft_token_to_kv_pool=None,
+            num_draft_entries=0,
+            num_hidden_layers=40,
+        )
+        pairs = build_transfer_entry_pairs(src_layer_ids, list(range(40)), 3, 40)
+
+        self.assertEqual(src_layer_ids, [20, 21, 22])
+        self.assertEqual(pairs, [(0, 20), (1, 21), (2, 22)])
 
 
 class TestCPReplicatedStateTransfer(unittest.TestCase):
