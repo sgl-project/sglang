@@ -200,6 +200,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
     _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
+    # AITER stores the logits with buffer_store, whose 32-bit byte offset caps
+    # one tensor at 2 GiB; past that it takes a gl.store path that fails to
+    # compile, so on ROCm this is a correctness bound and not an OOM guard.
+    _MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
     _mqa_logits_budget_bytes: Dict[int, int] = {}
 
     @staticmethod
@@ -1000,7 +1004,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self, num_q: int, num_k: int, device_index: int
     ) -> Tuple[bool, int]:
         """
-        Detect whether we need to chunk the MQA logits computation to avoid OOM
+        Detect whether we need to chunk the MQA logits computation to avoid OOM,
+        and on ROCm to stay within what AITER can address
         Return: (need_chunk, logits_budget_bytes)
         """
         # Quick static check for normal batches
@@ -1009,6 +1014,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         logits_bytes = num_q * num_k * self._MQA_LOGITS_BYTES_PER_ELEM
         logits_budget_bytes = self._get_mqa_logits_budget_bytes(device_index)
+        if _is_hip:
+            logits_budget_bytes = min(
+                logits_budget_bytes, self._MQA_LOGITS_MAX_BYTES_ROCM
+            )
 
         need_chunk = logits_bytes > logits_budget_bytes
         return need_chunk, logits_budget_bytes
