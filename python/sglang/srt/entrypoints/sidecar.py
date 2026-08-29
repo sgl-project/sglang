@@ -114,7 +114,7 @@ class Sidecar:
             kill_process_tree(self.proc.pid, wait_timeout=self.shutdown_timeout)
 
 
-def start_sidecar(server_args) -> Sidecar:
+def start_sidecar() -> Sidecar:
     module_name = get_serving().sidecar
     assert module_name is not None
     sidecar_args, shutdown_timeout = _parse_sidecar_args(get_serving().sidecar_args)

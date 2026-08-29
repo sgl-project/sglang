@@ -2615,7 +2615,7 @@ class TestGrpcServerArgs(CustomTestCase):
             patch("sglang.srt.entrypoints.sidecar.mp.get_context") as get_context,
             patch("sglang.srt.entrypoints.sidecar.Sidecar") as sidecar_class,
         ):
-            start_sidecar(server_args)
+            start_sidecar()
 
         process_kwargs = get_context.return_value.Process.call_args.kwargs
         self.assertEqual(process_kwargs["name"], "sglang_sidecar_example.sidecar")

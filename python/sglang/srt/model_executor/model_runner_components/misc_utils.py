@@ -18,7 +18,6 @@ from sglang.srt.server_args import CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACK
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +48,7 @@ def maybe_disable_chunked_prefix_cache(
         logger.info("Chunked prefix cache is turned on.")
 
 
-def create_msprobe_debugger(server_args: ServerArgs) -> Optional[Any]:
+def create_msprobe_debugger() -> Optional[Any]:
     if get_observability().msprobe_dump_config is None:
         return None
 

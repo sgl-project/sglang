@@ -409,7 +409,7 @@ async def lifespan(fast_api_app: FastAPI):
             if server_args.sidecar is not None:
                 from sglang.srt.entrypoints.sidecar import start_sidecar
 
-                sidecar = start_sidecar(server_args)
+                sidecar = start_sidecar()
 
         # Execute the general warmup
         warmup_thread = threading.Thread(
