@@ -54,6 +54,11 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
         elif hasattr(layer, "attention"):
             if hasattr(layer.attention, "attn"):
                 attn_layer = layer.attention.attn
+            elif hasattr(layer.attention, "attn_mqa"):
+                # Bailing-MoE linear / v3 hold an MLA module here.
+                attn_layer = layer.attention.attn_mqa
+                if hasattr(layer.attention, "attn_mha"):
+                    mha_companion_layer = layer.attention.attn_mha
         # For NemotronH and similar hybrid models using 'mixer' attribute
         elif hasattr(layer, "mixer"):
             if hasattr(layer.mixer, "attn"):
@@ -62,12 +67,12 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
                 # Mamba layer with split op support - store the layer itself
                 attn_layer = layer
 
-        if attn_layer is not None:
-            attention_layers.append(attn_layer)
-            mha_companion_layers.append(mha_companion_layer)
-        elif hasattr(layer, "mixer"):
-            attention_layers.append(None)
-            mha_companion_layers.append(None)
+        # Always append: consumers index by layer id (``radix_attention`` reads
+        # ``context.attention_layers[layer_id]``), so a layer holding no
+        # attention contributes a None placeholder. Appending only when attention
+        # was found shortens the list and shifts every entry past that layer.
+        attention_layers.append(attn_layer)
+        mha_companion_layers.append(mha_companion_layer)
 
         moe_block = None
         moe_fusion = None
@@ -82,6 +87,10 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
         if hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
             moe_block = layer.moe.experts
             moe_fusion = layer.moe
+        # ZAYA1 names its MoE mixer zaya_block to match the HF checkpoint keys.
+        if hasattr(layer, "zaya_block") and hasattr(layer.zaya_block, "experts"):
+            moe_block = layer.zaya_block.experts
+            moe_fusion = layer.zaya_block
         # For NemotronH MoE layers using 'mixer' attribute
         if hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
             moe_block = layer.mixer.experts

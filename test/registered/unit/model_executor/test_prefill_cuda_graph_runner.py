@@ -88,7 +88,12 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             model_config=SimpleNamespace(context_len=8192, num_hidden_layers=1),
             req_to_token_pool=SimpleNamespace(size=1),
         )
-        language_model = SimpleNamespace(layers=[object()])
+        # ``named_modules`` because capture_prefill_graph checks that every
+        # RadixAttention is reachable as attention_layers[layer_id]; this
+        # stub owns none.
+        language_model = SimpleNamespace(
+            layers=[object()], named_modules=lambda: iter(())
+        )
 
         with (
             patch.object(graph_setup, "check_cuda_graph_backend", return_value=False),

@@ -48,7 +48,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+from sglang.srt.utils import get_available_gpu_memory
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -57,27 +57,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _align_pipeline_layers(layers: list, layer_model) -> list:
-    has_start_layer = hasattr(layer_model, "start_layer")
-    has_end_layer = hasattr(layer_model, "end_layer")
-    assert (
-        has_start_layer == has_end_layer
-    ), "pipeline layer ranges must define start_layer and end_layer together"
-    start_layer = layer_model.start_layer if has_start_layer else 0
-    end_layer = layer_model.end_layer if has_end_layer else len(layer_model.layers)
-    assert isinstance(start_layer, int) and isinstance(
-        end_layer, int
-    ), "pipeline layer ranges must define integer start_layer and end_layer"
-    assert 0 <= start_layer <= end_layer <= len(layer_model.layers), (
-        f"invalid pipeline layer range [{start_layer}, {end_layer}) for "
-        f"{len(layer_model.layers)} layers"
-    )
-    assert (
-        len(layers) <= end_layer - start_layer
-    ), f"found {len(layers)} layers in PP range [{start_layer}, {end_layer})"
-    return (
-        [None] * start_layer + layers + [None] * (len(layer_model.layers) - end_layer)
-    )
+def _unmapped_attention_layers(
+    model, attention_layers: list, mha_companion_layers: list
+) -> list[str]:
+    """Names of the model's RadixAttention modules that the per-layer lists do
+    not address, i.e. ``attention_layers[m.layer_id] is not m`` and the MLA
+    companion list does not hold it either."""
+    from sglang.srt.layers.radix_attention import RadixAttention
+
+    unmapped = []
+    for name, module in model.named_modules():
+        if not isinstance(module, RadixAttention):
+            continue
+        layer_id = module.layer_id
+        if not isinstance(layer_id, int) or not 0 <= layer_id < len(attention_layers):
+            unmapped.append(f"{name} (layer_id={layer_id})")
+            continue
+        if attention_layers[layer_id] is module:
+            continue
+        if mha_companion_layers[layer_id] is module:
+            continue
+        unmapped.append(f"{name} (layer_id={layer_id})")
+    return unmapped
 
 
 class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
@@ -393,20 +394,25 @@ def capture_prefill_graph(
         model_runner.mha_companion_layers,
     ) = compute_attention_and_moe_layers(layer_model)
 
-    model_runner.attention_layers = _align_pipeline_layers(
-        model_runner.attention_layers, layer_model
+    unmapped = _unmapped_attention_layers(
+        language_model,
+        model_runner.attention_layers,
+        model_runner.mha_companion_layers,
     )
-    if len(model_runner.attention_layers) < model_runner.model_config.num_hidden_layers:
-        # TODO(yuwei): support Non-Standard GQA
-        log_info_on_rank0(
-            logger,
-            "Disable prefill CUDA graph because some layers do not apply Standard GQA",
+    if unmapped:
+        # ``radix_attention`` indexes ``attention_layers[layer_id]`` under a
+        # captured prefill graph, so a layer whose module the ladder in
+        # ``compute_attention_and_moe_layers`` could not reach -- or whose
+        # layer_id does not address this list at all, as with a model that
+        # packs several attention modules per decoder layer -- would read None
+        # or run off the end. Those models keep the eager path.
+        logger.warning(
+            "Disable prefill CUDA graph because %d attention module(s) are not "
+            "reachable as attention_layers[layer_id]; first: %s",
+            len(unmapped),
+            unmapped[0],
         )
         return result(None)
-
-    model_runner.mha_companion_layers = _align_pipeline_layers(
-        model_runner.mha_companion_layers, layer_model
-    )
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
