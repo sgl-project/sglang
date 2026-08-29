@@ -267,9 +267,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
         )
 
-        # Router gate: description-driven quant, mirroring vllm-ascend. Only the
-        # offline ModelSlim path (which carries a per-layer quant_model_description)
-        # may quantise the gate — if the checkpoint stored it as MXFP8 it is loaded
+        # Router gate: description-driven quant. Only the offline ModelSlim path
+        # (which carries a per-layer quant_model_description) may quantise the
+        # gate — if the checkpoint stored it as MXFP8 it is loaded
         # and dequantised correctly instead of cast to bf16 without its block scale.
         # The online Fp8/mxfp8 path keeps the gate in bf16 (unchanged, verified).
         gate_quant_config = (
@@ -961,7 +961,7 @@ class Qwen3MoeForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False

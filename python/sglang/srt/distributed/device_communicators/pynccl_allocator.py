@@ -6,12 +6,10 @@ import traceback
 from contextlib import contextmanager, nullcontext
 
 import torch
-from torch.cuda.memory import (
-    CUDAPluggableAllocator,
-    _cuda_beginAllocateCurrentThreadToPool,
-    _cuda_endAllocateToPool,
-    _cuda_releasePool,
-)
+
+# The private _cuda_* pool APIs are absent before torch 2.8; the call sites below
+# reach them via torch._C.<name> so torch 2.7 (Ascend NPU) can still import this.
+from torch.cuda.memory import CUDAPluggableAllocator
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
@@ -200,6 +198,11 @@ def get_nccl_mem_pool(*, graph_capture: bool = False) -> torch.cuda.MemPool:
     from the eager pool and kept alive for the lifetime of the process. Comm
     registration is handled at context exit time for both pools.
     """
+    assert after_2_8_0, (
+        "--enable-symm-mem requires torch>=2.8 "
+        "(torch._C._cuda_beginAllocateCurrentThreadToPool was added there)."
+    )
+
     global _allocator, _mem_pool, _graph_mem_pool, _cur_device, _register_func
     if _allocator is None:
         import torch.utils.cpp_extension
@@ -304,18 +307,18 @@ class SymmetricMemoryContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        _cuda_endAllocateToPool(self._device_index, self._pool_id)
+        torch._C._cuda_endAllocateToPool(self._device_index, self._pool_id)
         try:
             self._register_segments_for_comm()
         finally:
             self._restore_graph_pool()
-            _cuda_releasePool(self._device_index, self._pool_id)
+            torch._C._cuda_releasePool(self._device_index, self._pool_id)
 
             global _active_symmetric_memory_context
             _active_symmetric_memory_context = None
 
     def suspend(self):
-        _cuda_endAllocateToPool(self._device_index, self._pool_id)
+        torch._C._cuda_endAllocateToPool(self._device_index, self._pool_id)
         self._restore_graph_pool()
 
         global _active_symmetric_memory_context
@@ -343,7 +346,9 @@ class SymmetricMemoryContext:
                     _cur_device, _graph_pool_id
                 )
 
-        _cuda_beginAllocateCurrentThreadToPool(self._device_index, self._pool_id)
+        torch._C._cuda_beginAllocateCurrentThreadToPool(
+            self._device_index, self._pool_id
+        )
 
         global _active_symmetric_memory_context
         _active_symmetric_memory_context = self

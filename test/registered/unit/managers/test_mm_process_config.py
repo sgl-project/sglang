@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.serving_hook import handle_multimodal
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
@@ -21,7 +22,7 @@ class TestMmProcessConfigValidation(CustomTestCase):
 
     def _validate_config(self, mm_process_config):
         args = ServerArgs(model_path="dummy", mm_process_config=mm_process_config)
-        args._handle_multimodal()
+        handle_multimodal(args)
         return args
 
     def test_valid_config_accepted(self):
@@ -79,6 +80,7 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         mm_process_config,
         mm_processor_worker_num=0,
         mm_io_worker_num=0,
+        image_processor=None,
     ):
         """Create a BaseMultimodalProcessor via the real __init__ with mocked deps."""
         from sglang.srt.multimodal.processors.base_processor import (
@@ -99,9 +101,21 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         self.addCleanup(override.restore)
 
         server_args = MagicMock()
+        server_args.mm_processor_worker_num = mm_processor_worker_num
+        server_args.mm_io_worker_num = mm_io_worker_num
+        server_args.mm_preprocess_cache_size_mb = None
+        server_args.tokenizer_worker_num = 1
+        server_args.trust_mm_content_hashes = False
+        server_args.media_url_max_file_size_mb = 64
+        # A bare MagicMock makes every attribute truthy, which silently sends
+        # the worker-count decision down the CPU branch. Pin what it reads.
+        server_args.disable_fast_image_processor = False
+        server_args.rl_on_policy_target = None
 
         hf_config = MagicMock()
         mock_hf_processor = MagicMock()
+        if image_processor is not None:
+            mock_hf_processor.image_processor = image_processor
 
         # Call real __init__ so we test actual config extraction
         with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
@@ -111,6 +125,8 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
                 _processor=mock_hf_processor,
                 transport_mode=None,
             )
+        if proc.mm_processor_executor is not None:
+            self.addCleanup(proc.mm_processor_executor.shutdown)
         return proc
 
     def test_configs_extracted(self):
@@ -165,9 +181,85 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         self.assertIsNone(proc.mm_processor_executor)
 
     def test_parallel_workers_require_processor_support(self):
-        proc = self._make_processor({}, mm_processor_worker_num=2)
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(
+            BaseMultimodalProcessor, "supports_mm_processor_concurrency", False
+        ):
+            proc = self._make_processor({}, mm_processor_worker_num=2)
         self.assertEqual(proc.mm_processor_worker_num, 1)
         self.assertIsNone(proc.mm_processor_executor)
+
+    def test_cpu_preprocessing_path_gets_two_workers(self):
+        """A processor whose preprocessing stays on the CPU: the second worker is
+        real parallelism there (H200 4.46 -> 6.08 req/s, GB300 7.07 -> 8.76)."""
+        proc = self._make_processor({})
+        self.assertEqual(proc.mm_processor_worker_num, 2)
+        self.assertIsNotNone(proc.mm_processor_executor)
+
+    def test_gpu_preprocessing_path_stays_at_one_worker(self):
+        """A fast image processor submits to the device the scheduler serves
+        from, so a second worker there only contends for it: flat on H200 and
+        9.30 -> 4.02 req/s on GB300 for full-page images."""
+        from transformers import BaseImageProcessor
+
+        proc = self._make_processor(
+            {}, image_processor=MagicMock(spec=BaseImageProcessor)
+        )
+        self.assertEqual(proc.mm_processor_worker_num, 1)
+        self.assertIsNone(proc.mm_processor_executor)
+
+    def test_explicit_request_overrides_the_path_decision(self):
+        """The server argument wins: an operator who measured their own workload
+        can still ask for concurrency on the GPU path."""
+        from transformers import BaseImageProcessor
+
+        proc = self._make_processor(
+            {},
+            mm_processor_worker_num=2,
+            image_processor=MagicMock(spec=BaseImageProcessor),
+        )
+        self.assertEqual(proc.mm_processor_worker_num, 2)
+        self.assertIsNotNone(proc.mm_processor_executor)
+
+    def test_gpu_path_caps_a_count_the_model_declared(self):
+        """Contending for the scheduler's device is a property of the path, so a
+        subclass asking for concurrency does not exempt it. Qwen-VL declares two
+        and is the model that measures 9.30 -> 4.02 req/s on GB300 full-page
+        images."""
+        from transformers import BaseImageProcessor
+
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 3):
+            proc = self._make_processor(
+                {}, image_processor=MagicMock(spec=BaseImageProcessor)
+            )
+        self.assertEqual(proc.mm_processor_worker_num, 1)
+
+    def test_cpu_path_honours_a_count_the_model_declared(self):
+        """On the CPU path the extra threads are real parallelism, so a model's
+        own measured count stands."""
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 3):
+            proc = self._make_processor({})
+        self.assertEqual(proc.mm_processor_worker_num, 3)
+
+    def test_clone_resolves_tokenizer_like_init(self):
+        proc = self._make_processor({})
+
+        wrapping = MagicMock()
+        self.assertIs(proc._resolve_processor(wrapping)[1], wrapping.tokenizer)
+
+        bare = MagicMock(spec=["encode"])
+        self.assertIs(proc._resolve_processor(bare)[1], bare)
 
     def test_explicit_io_worker_count_overrides_auto(self):
         from sglang.srt.multimodal.processors.base_processor import (
@@ -452,8 +544,9 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
         ):
             processor = BaseMultimodalProcessor()
 
+        hf_processor = SimpleNamespace(tokenizer=object())
         processor.mm_processor_executor = MultimodalProcessorExecutor(
-            SimpleNamespace(tokenizer=object()), max_workers=2
+            lambda: hf_processor, max_workers=2
         )
         processor.process_and_combine_mm_data = MagicMock(
             side_effect=lambda *_args, **_kwargs: threading.current_thread().name
@@ -497,7 +590,8 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
             MultimodalProcessorExecutor,
         )
 
-        executor = MultimodalProcessorExecutor(object(), max_workers=2)
+        hf_processor = SimpleNamespace(tokenizer=object())
+        executor = MultimodalProcessorExecutor(lambda: hf_processor, max_workers=2)
         return_processor = lambda *, processor: processor
         try:
             first = await executor.run(return_processor)
@@ -507,30 +601,37 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(first, second)
 
-    async def test_replacement_worker_lazily_clones_processor(self):
-        from sglang.srt.multimodal.processors import executor as executor_module
+    async def test_clone_carries_customization_applied_after_construction(self):
+        """A subclass keeps customizing `_processor` after `super().__init__()`.
 
-        source_processor = object()
-        replacement_clone = SimpleNamespace(tokenizer=object())
-        with patch.object(
-            executor_module.copy,
-            "deepcopy",
-            return_value=replacement_clone,
-        ) as deepcopy:
-            executor = executor_module.MultimodalProcessorExecutor(
-                source_processor, max_workers=2
-            )
-            executor._processor_clones.clear()
-            return_processor = lambda *, processor: processor
-            try:
-                first = await executor.run(return_processor)
-                second = await executor.run(return_processor)
-            finally:
-                executor.shutdown()
+        Sarashina2Vision patches its image processor there and Pixtral sets
+        `patch_size` / `spatial_merge_size`; a clone snapshotted while the pool
+        was built would serve requests from a half-configured processor.
+        """
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
+        )
 
-        self.assertIs(first, replacement_clone)
-        self.assertIs(first, second)
-        self.assertEqual(deepcopy.call_count, 3)
+        owner = SimpleNamespace(_processor=SimpleNamespace(patch_size=16))
+        executor = MultimodalProcessorExecutor(lambda: owner._processor, max_workers=2)
+        self.addCleanup(executor.shutdown)
+
+        owner._processor.patch_size = 14
+
+        seen = await executor.run(lambda *, processor: processor.patch_size)
+        self.assertEqual(seen, 14)
+
+    async def test_worker_gets_a_clone_not_the_shared_processor(self):
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
+        )
+
+        hf_processor = SimpleNamespace(tokenizer=object())
+        executor = MultimodalProcessorExecutor(lambda: hf_processor, max_workers=2)
+        self.addCleanup(executor.shutdown)
+
+        worker_processor = await executor.run(lambda *, processor: processor)
+        self.assertIsNot(worker_processor, hf_processor)
 
 
 class TestProcessMmDataKwargs(CustomTestCase):
@@ -698,6 +799,7 @@ class TestOverrideProcessorsConfigInjection(CustomTestCase):
         proc.disable_fast_image_processor = server_args.disable_fast_image_processor
         proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_hf_processor
+        proc._tokenizer = mock_hf_processor.tokenizer
         proc.image_config = mm_process_config.get("image", {})
         proc.video_config = mm_process_config.get("video", {})
         proc.audio_config = mm_process_config.get("audio", {})
