@@ -6,6 +6,11 @@ You can install SGLang using any of the methods below. Please go through `System
 
 ## Component Version Mapping For SGLang
 
+Each CANN version requires its own matched set of component versions — do not mix versions across sets.
+
+<Tabs>
+  <Tab title="CANN 9.0.0">
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "34%"}} />
@@ -58,6 +63,71 @@ You can install SGLang using any of the methods below. Please go through `System
   </tbody>
 </table>
 
+  </Tab>
+  <Tab title="CANN 9.1.0">
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Component</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Version</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Obtain Method</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HDK</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>25.5.2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.0.0&driver=Ascend+HDK+25.5.2">link</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CANN</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>9.1.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="#obtain-cann-image">Obtain Images</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TorchNPU</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>26.1.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">link</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.1.4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install memfabric-hybrid==1.1.4`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Triton</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.2.2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install https://github.com/triton-lang/triton-ascend/releases/download/v3.2.2/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl`<br/>`(aarch64 host: replace x86_64 with aarch64)`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>20260821</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/20260821">link</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric-zbal</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.1.3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install memfabric-zbal==1.1.3`</td>
+    </tr>
+  </tbody>
+</table>
+
+<Note>
+SGLang Docker images for the CANN 9.1.0 set have not been published yet. If you deploy with the prebuilt SGLang
+images ([Method 2](#method-2-using-docker-image)), use the CANN 9.0.0 set for now. To use the CANN 9.1.0 set, install
+SGLang from source ([Method 1](#method-1-installing-from-source-with-prerequisites), with the component versions in
+this tab) or start from a CANN 9.1.0 base image (see [Obtain CANN Image](#obtain-cann-image)).
+</Note>
+
+  </Tab>
+</Tabs>
+
 ### Obtain CANN Image
 
 <Warning>
@@ -70,14 +140,22 @@ You can obtain the dependency of a specified version of CANN through an image.
   <Tab title="Atlas 800I A3">
 
 ```bash Command
+# CANN 9.0.0
 docker pull quay.io/ascend/cann:9.0.0-a3-ubuntu22.04-py3.11
+
+# CANN 9.1.0
+docker pull quay.io/ascend/cann:9.1.0-a3-ubuntu22.04-py3.12
 ```
 
   </Tab>
   <Tab title="Atlas 800I A2">
 
 ```bash Command
+# CANN 9.0.0
 docker pull quay.io/ascend/cann:9.0.0-910b-ubuntu22.04-py3.11
+
+# CANN 9.1.0
+docker pull quay.io/ascend/cann:9.1.0-910b-ubuntu22.04-py3.12
 ```
 
   </Tab>
@@ -87,16 +165,22 @@ docker pull quay.io/ascend/cann:9.0.0-910b-ubuntu22.04-py3.11
 
 ### Method 1: Installing from source with prerequisites
 
+The steps in this method install the **CANN 9.0.0** set. To install the CANN 9.1.0 set from source, follow the same steps
+with the component versions from the [version mapping table](#component-version-mapping-for-sglang) (python 3.12 is
+required for the CANN 9.1.0 set).
+
 #### Python Version
 
-**Only `python==3.11` is supported currently**. If you don't want to break system pre-installed python, try installing with [conda](https://github.com/conda/conda).
+**The CANN 9.0.0 set requires `python==3.11`, and the CANN 9.1.0 set uses `python==3.12`.** If you don't want to break
+system pre-installed python, try installing with [conda](https://github.com/conda/conda).
 
 ```bash Command
 conda create --name sglang_npu python=3.11
 conda activate sglang_npu
 ```
 
-Note on Anaconda repository restrictions
+**Note on Anaconda repository restrictions**
+
 If you encounter an error like “Terms of Service have not been accepted” during the conda create step, the default Anaconda repository is blocking package downloads. To resolve this, configure a mirror (e.g., Tsinghua Open Source Mirror):
 
 ```bash Command
@@ -107,7 +191,7 @@ conda config --set show_channel_urls yes
 conda config --remove channels defaults
 ```
 
-Edit the system-level conda config to remove any hardcoded defaults, e.g., vi ~/miniconda3/.condarc
+Edit the system-level conda config to remove any hardcoded defaults, e.g., `vi ~/miniconda3/.condarc`.
 Then remove the failed environment and recreate it:
 
 ```bash Command
@@ -208,6 +292,10 @@ Ensure sufficient disk space before pulling images. Each Docker image requires a
 <Tip>
 We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `cann9.0.0-a3-v0.5.16`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
 </Tip>
+
+<Note>
+SGLang images for the CANN 9.1.0 set have not been published yet. For now, please use the CANN 9.0.0 images below.
+</Note>
 
 <Tabs>
   <Tab title="Atlas 800I A3">

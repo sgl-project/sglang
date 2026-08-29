@@ -14,6 +14,10 @@ from typing import (
 import torch
 import zmq
 
+from sglang.srt.beam_search.output import (
+    beam_completion_tokens,
+    pack_beam_search_output,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -31,6 +35,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
     from sglang.srt.managers.rust_server import RustServer
@@ -168,6 +173,7 @@ class SchedulerOutputStreamer:
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
             rust_server_mode=self.rust_server is not None,
+            current_weight_version=get_serving().weight_version,
         )
         for req in reqs:
             if req is skip_req:
@@ -316,6 +322,7 @@ class _GenerationStreamAccumulator:
     default_stream_interval: int
     default_force_stream_interval: int
     get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
+    current_weight_version: Optional[str]
     rids: list = field(default_factory=list)
     output_reqs: list[Req] = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
@@ -344,10 +351,12 @@ class _GenerationStreamAccumulator:
     spec_correct_drafts_histogram: list = field(default_factory=list)
     spec_cap_lens_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
+    weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
+    beam_search_output: list = field(default_factory=list)
     time_stats: list = field(default_factory=list)
     input_token_logprobs_val: Optional[list] = None
     input_token_logprobs_idx: Optional[list] = None
@@ -402,7 +411,13 @@ class _GenerationStreamAccumulator:
             self.output_token_sampling_mask = []
             self.output_token_sampling_logprobs = []
 
+    def _beam_admits(self, *, req: Req) -> bool:
+        # Only the leader is ever streamed, and only at group finish.
+        return req.is_beam_leader and req.finished()
+
     def accept(self, *, req: Req) -> None:
+        if req.beam_group is not None and not self._beam_admits(req=req):
+            return
         if req.finished():
             assert not req.finished_output
             req.finished_output = True
@@ -445,6 +460,12 @@ class _GenerationStreamAccumulator:
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
         self.prompt_tokens.append(len(req.origin_input_ids))
+        # Index-aligned with the batch items so mixed batches resolve per-item
+        # on the tokenizer side; None for non-beam items and aborted groups.
+        beam_output = (
+            pack_beam_search_output(req) if req.beam_group is not None else None
+        )
+        self.beam_search_output.append(beam_output)
 
         if not self.rust_server_mode:
             # Everything below feeds the Python DetokenizerManager /
@@ -466,7 +487,11 @@ class _GenerationStreamAccumulator:
             )
             self.no_stop_trim.append(req.sampling_params.no_stop_trim)
             self.reasoning_tokens.append(req.reasoning_tokens)
-            self.completion_tokens.append(len(output_ids_))
+            self.completion_tokens.append(
+                beam_completion_tokens(beam_output)
+                if beam_output is not None
+                else len(output_ids_)
+            )
             self.cached_tokens.append(req.cached_tokens)
 
             # Collect detailed cache breakdown if available
@@ -489,6 +514,16 @@ class _GenerationStreamAccumulator:
         self.video_tokens.append(video_t)
 
         self.retraction_counts.append(req.retraction_count)
+        if req.finished():
+            self.weight_versions.append(
+                compute_weight_version_spans(
+                    req.weight_version_events,
+                    current_version=self.current_weight_version,
+                    num_output_tokens=len(output_ids_),
+                )
+            )
+        else:
+            self.weight_versions.append(None)
 
         self.time_stats.append(req.time_stats)
 
@@ -725,5 +760,15 @@ class _GenerationStreamAccumulator:
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,
+            # All-None means no beam item in this batch; drop the list so
+            # non-beam traffic pays no carrier cost.
+            beam_search_output=(
+                self.beam_search_output
+                if any(x is not None for x in self.beam_search_output)
+                else None
+            ),
+            weight_versions=(
+                self.weight_versions if any(self.weight_versions) else None
+            ),
             dp_ranks=dp_ranks,
         )

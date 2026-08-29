@@ -9,7 +9,12 @@ import torch
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_prefill_graph,
 )
@@ -61,6 +66,32 @@ class _FakeKVIndexKernel:
         return run
 
 
+class _FakeGraphSlot:
+    def __init__(self, buffer):
+        self.buffer = buffer
+
+    def slice_for(self, _batch_size, num_tokens):
+        return self.buffer[:num_tokens]
+
+
+class _FakeBatchRegistry:
+    def __init__(self):
+        self.slots = {
+            "input_ids": _FakeGraphSlot(torch.arange(4, dtype=torch.int64)),
+            "positions": _FakeGraphSlot(torch.arange(4, dtype=torch.int64)),
+            "out_cache_loc": _FakeGraphSlot(torch.arange(4, dtype=torch.int64)),
+        }
+
+    def fill_from(self, *_args, **_kwargs):
+        return None
+
+    def has_slot(self, name):
+        return name in self.slots
+
+    def get_slot(self, name):
+        return self.slots[name]
+
+
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
     def test_low_free_memory_still_captures_prefill_graph(self):
         eager_runner = object()
@@ -86,6 +117,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             server_args=SimpleNamespace(),
             model=SimpleNamespace(),
             model_config=SimpleNamespace(context_len=8192, num_hidden_layers=1),
+            layer_info=SimpleNamespace(start_layer=0, end_layer=1),
             req_to_token_pool=SimpleNamespace(size=1),
         )
         language_model = SimpleNamespace(layers=[object()])
@@ -98,7 +130,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             patch.object(
                 graph_setup,
                 "compute_attention_and_moe_layers",
-                return_value=([object()], [], [], [], []),
+                return_value=([object()], [], [], [], [None]),
             ),
             patch.object(
                 graph_setup,
@@ -144,6 +176,63 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             )
 
         self.assertIs(capture.runner, eager_runner)
+
+    def test_pp_proxy_output_is_trimmed_to_raw_prefill_tokens(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.raw_num_tokens = 3
+        output = PPProxyTensors(
+            {
+                "hidden_states": torch.arange(32).view(8, 4),
+                "residual": torch.arange(32, 64).view(8, 4),
+            }
+        )
+
+        trimmed = runner._finalize_execute_output(output)
+
+        self.assertIsInstance(trimmed, PPProxyTensors)
+        self.assertEqual(tuple(trimmed["hidden_states"].shape), (3, 4))
+        self.assertEqual(tuple(trimmed["residual"].shape), (3, 4))
+
+    def test_static_batch_preserves_consumed_multimodal_embeddings(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.capture_num_tokens = [4]
+        runner.buffer_registry = _FakeBatchRegistry()
+        runner.enable_cp_v2_bcg_capture = False
+        runner._is_full_backend = False
+        runner.backend = SimpleNamespace()
+        runner.has_mha_companion_layers = False
+        runner._prefill_static_buffers = None
+        runner.static_draft_hidden_states = None
+        runner.capture_return_pooled_hidden_states = False
+        runner._next_token_logits_buffer = lambda _rows: None
+        runner._prefill_logits_buffer_rows = lambda _batch: 1
+        runner._prepare_forward_metadata_for_replay = lambda *_args: None
+
+        mm_input_embeds = torch.randn(3, 8)
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.arange(3, dtype=torch.int64),
+            req_pool_indices=torch.zeros(1, dtype=torch.int64),
+            seq_lens=torch.tensor([3], dtype=torch.int32),
+            out_cache_loc=torch.arange(3, dtype=torch.int64),
+            seq_lens_sum=3,
+            positions=torch.arange(3, dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
+            extend_seq_lens=torch.tensor([3], dtype=torch.int32),
+            extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
+            extend_start_loc=torch.zeros(1, dtype=torch.int32),
+            extend_seq_lens_cpu=[3],
+            extend_prefix_lens_cpu=[0],
+            mm_inputs=None,
+            mm_input_embeds=mm_input_embeds,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            global_forward_mode=ForwardMode.EXTEND,
+        )
+
+        static_batch = runner.load_batch(forward_batch)
+
+        self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
 
     def test_prefix_chunk_capacity_is_aggregate_and_can_be_overridden(self):
         graph_config = SimpleNamespace(

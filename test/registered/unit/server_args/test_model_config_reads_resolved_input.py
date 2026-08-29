@@ -13,6 +13,7 @@ one field that is deliberately read before resolution touches it.
 """
 
 import ast
+import functools
 import pathlib
 import unittest
 
@@ -25,8 +26,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 _SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
 
 # Read for what the caller asked for: the constructor passes it through and
-# never stores it, while resolution later overwrites the field with the value
-# the architecture implies. Two quantities sharing one name.
+# never stores it, while resolution declares the value the architecture implies.
+# Two quantities sharing one name.
 _READ_BEFORE_RESOLUTION = frozenset({"is_embedding"})
 
 # Declared after the first `get_model_config()`, so the cached configuration
@@ -35,6 +36,20 @@ _READ_BEFORE_RESOLUTION = frozenset({"is_embedding"})
 # means moving the build or the hook. Pinned so a second field in this position
 # has to be looked at.
 _STALE_IN_THE_MODEL_CONFIG = frozenset({"speculative_algorithm"})
+
+# Behind the expert-pack build. `expert_pack_hook.handle_expert_pack` builds a
+# model configuration, and it always did -- the walk stopped at the record's
+# file and never saw it, so these three read as decided before the first build.
+# The call sits behind `load_format != "expert_pack": return`, so it is the
+# first build only on an expert-pack launch. Pre-existing; named rather than
+# fixed, because fixing it means moving the build or the hook.
+_STALE_BEHIND_THE_EXPERT_PACK_BUILD = frozenset(
+    {
+        "_speculative_draft_quantization_explicitly_set",
+        "model_path",
+        "speculative_draft_model_quantization",
+    }
+)
 
 # The same staleness through the registries: `_handle_model_specific_adjustments`
 # builds the model configuration and *then* collects the override declarations,
@@ -49,6 +64,24 @@ _STALE_FROM_THE_REGISTRIES = frozenset(
         "quantization",
     }
 )
+
+
+@functools.lru_cache(maxsize=None)
+def _parsed(path):
+    return ast.parse(path.read_text(encoding="utf-8-sig"))
+
+
+@functools.lru_cache(maxsize=None)
+def _declared_resolution_fields(path):
+    fields = set()
+    for node in ast.walk(_parsed(path)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "declare_resolution"
+        ):
+            fields |= {kw.arg for kw in node.keywords if kw.arg}
+    return frozenset(fields)
 
 
 def _registry_declared_fields():
@@ -79,13 +112,27 @@ def _registry_collection_is_after_the_build():
     collection above this handler's own `get_model_config()` call does not move
     it above the configuration another handler already cached.
     """
-    tree = ast.parse((_SRT / "server_args.py").read_text(encoding="utf-8-sig"))
-    handler = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_handle_model_specific_adjustments"
-    )
+    handler = None
+    for source, wanted in (
+        (_SRT / "server_args.py", "_handle_model_specific_adjustments"),
+        *(
+            (path, "handle_model_specific_adjustments")
+            for path in sorted((_SRT / "arg_groups").glob("*.py"))
+        ),
+    ):
+        for node in ast.walk(_parsed(source)):
+            if isinstance(node, ast.FunctionDef) and node.name == wanted:
+                if any(
+                    isinstance(child, ast.Call)
+                    and getattr(child.func, "attr", getattr(child.func, "id", None))
+                    == "collect_model_override_declarations"
+                    for child in ast.walk(node)
+                ):
+                    handler = node
+                    break
+        if handler is not None:
+            break
+    assert handler is not None, "the model-specific handler was not found"
     build = collect = None
     for node in ast.walk(handler):
         if not isinstance(node, ast.Call):
@@ -106,6 +153,13 @@ def _registry_collection_is_after_the_build():
 
 
 def _server_args_names(tree, path):
+    """Every local that names the record, including the read views over it.
+
+    A resolution-time reader reads through `resolving_view(server_args)` (the
+    declaration stash over the fields): declaration-only resolvers write no
+    field, so a field read there answers with the raw input. `cfg.dtype` after `cfg = resolving_view(sa)` is
+    the same read this scan is looking for, so the local it binds counts.
+    """
     names = {"self"} if path.name == "server_args.py" else {"server_args"}
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -123,13 +177,39 @@ def _server_args_names(tree, path):
                 continue
             if text == "ServerArgs":
                 names.add(arg.arg)
+    # `cfg = resolving_view(server_args)` / `resolved_view(server_args)`
+    for _ in range(2):  # a view over a view-holding local is still one
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            value = node.value
+            bare = (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id in ("resolving_view", "resolved_view")
+                and value.args
+                and isinstance(value.args[0], ast.Name)
+                and value.args[0].id in names
+            )
+            # `resolved = self._resolved()` is the same view, spelled as the
+            # record's own member.
+            member = (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "_resolved"
+                and isinstance(value.func.value, ast.Name)
+                and value.func.value.id in names
+            )
+            if not (bare or member):
+                continue
+            names |= {t.id for t in node.targets if isinstance(t, ast.Name)}
     return names
 
 
 def _constructor_reads():
     """Fields `ModelConfig.from_server_args` takes off the record."""
     path = _SRT / "configs/model_config.py"
-    tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+    tree = _parsed(path)
     constructor = next(
         node
         for node in ast.walk(tree)
@@ -172,12 +252,13 @@ def _late_resolution_fields():
     for name in (
         "server_args.py",
         "arg_groups/overrides.py",
-        "utils/template_detection.py",
+        "parser/template_detection.py",
     ):
         path = _SRT / name
-        if not path.exists():
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+        # A named file that moved away has to be loud; skipping it silently
+        # leaves the scan believing it read a module it never opened.
+        assert path.exists(), f"{name} is not where this scan looks for it"
+        tree = _parsed(path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -205,7 +286,7 @@ def _hook_declarations(dispatch, source_module):
     `test_every_opaque_callback_is_still_late`.
     """
     imported = {}
-    for node in ast.walk(ast.parse(source_module.read_text(encoding="utf-8-sig"))):
+    for node in ast.walk(_parsed(source_module)):
         if isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
                 imported[alias.asname or alias.name] = node.module
@@ -225,22 +306,29 @@ def _hook_declarations(dispatch, source_module):
         path = _SRT / (module[len("sglang.srt.") :].replace(".", "/") + ".py")
         if not path.exists():
             continue
-        for inner in ast.walk(ast.parse(path.read_text(encoding="utf-8-sig"))):
-            if (
-                isinstance(inner, ast.Call)
-                and isinstance(inner.func, ast.Name)
-                and inner.func.id == "declare_resolution"
-            ):
-                for keyword in inner.keywords:
-                    if keyword.arg:
-                        out[keyword.arg] = max(out.get(keyword.arg, 0), node.lineno)
+        for field in _declared_resolution_fields(path):
+            out[field] = max(out.get(field, 0), node.lineno)
     return out
+
+
+def _hook_functions():
+    """Module-level resolution functions under `arg_groups/`.
+
+    A handler that moved out of the record leaves a slot behind that imports
+    one of these and calls it. Without following that hop the scan stops at
+    the slot and silently loses everything the handler does.
+    """
+    functions = {}
+    for path in sorted((_SRT / "arg_groups").glob("*.py")):
+        for node in _parsed(path).body:
+            if isinstance(node, ast.FunctionDef):
+                functions.setdefault(node.name, node)
+    return functions
 
 
 def _pipeline():
     """(ordered steps, {step: methods it reaches}) for the resolution dispatch."""
-    source = (_SRT / "server_args.py").read_text(encoding="utf-8-sig")
-    tree = ast.parse(source)
+    tree = _parsed(_SRT / "server_args.py")
     record = next(
         node
         for node in tree.body
@@ -249,16 +337,33 @@ def _pipeline():
     methods = {
         node.name: node for node in record.body if isinstance(node, ast.FunctionDef)
     }
+    # The dispatcher calls its hooks by bare name, so the walk resolves those
+    # against `arg_groups/` alongside the record's own methods.
+    hooks = _hook_functions()
+    methods.update({name: node for name, node in hooks.items() if name not in methods})
     dispatch = methods["_run_resolution_pipeline"]
+    # A step is either a record method (`self._x()`) or a bare-name hook call.
     steps = [
         name
         for _line, name in sorted(
-            (node.lineno, node.func.attr)
+            (
+                node.lineno,
+                (
+                    node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else node.func.id
+                ),
+            )
             for node in ast.walk(dispatch)
             if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "self"
+            and (
+                (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "self"
+                )
+                or (isinstance(node.func, ast.Name) and node.func.id in hooks)
+            )
         )
     ]
 
@@ -268,25 +373,31 @@ def _pipeline():
             return seen
         seen.add(name)
         for node in ast.walk(methods[name]):
+            if not isinstance(node, ast.Call):
+                continue
             if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "self"
                 and node.func.attr in methods
             ):
                 reaches(node.func.attr, seen)
+            elif isinstance(node.func, ast.Name) and node.func.id in hooks:
+                reaches(node.func.id, seen)
         return seen
 
     step_lines = {}
     for node in ast.walk(dispatch):
+        if not isinstance(node, ast.Call):
+            continue
         if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
+            isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == "self"
         ):
             step_lines.setdefault(node.func.attr, node.lineno)
+        elif isinstance(node.func, ast.Name) and node.func.id in hooks:
+            step_lines.setdefault(node.func.id, node.lineno)
     return steps, methods, {name: reaches(name) for name in steps}, step_lines
 
 
@@ -305,7 +416,7 @@ def _opaque_callback_positions(dispatch, source_module):
     it.
     """
     imported = {}
-    for node in ast.walk(ast.parse(source_module.read_text(encoding="utf-8-sig"))):
+    for node in ast.walk(_parsed(source_module)):
         if isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
                 imported[alias.asname or alias.name] = node.module
@@ -349,7 +460,7 @@ def _opaque_callback_positions(dispatch, source_module):
         path = _SRT / (module[len("sglang.srt.") :].replace(".", "/") + ".py")
         if not path.exists():
             continue
-        for spelling in callbacks_in(ast.parse(path.read_text(encoding="utf-8-sig"))):
+        for spelling in callbacks_in(_parsed(path)):
             positions[spelling] = min(positions.get(spelling, 10**9), node.lineno)
     return positions
 
@@ -392,7 +503,7 @@ def _declaration_positions():
 
     source_module = _SRT / "server_args.py"
     imported = {}
-    for node in ast.walk(ast.parse(source_module.read_text(encoding="utf-8-sig"))):
+    for node in ast.walk(_parsed(source_module)):
         if isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
                 imported[alias.asname or alias.name] = node.module
@@ -405,15 +516,7 @@ def _declaration_positions():
         path = _SRT / (module[len("sglang.srt.") :].replace(".", "/") + ".py")
         if not path.exists():
             return frozenset()
-        fields = set()
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8-sig"))):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "declare_resolution"
-            ):
-                fields |= {kw.arg for kw in node.keywords if kw.arg}
-        return frozenset(fields)
+        return _declared_resolution_fields(path)
 
     declared_at = {}
     for index, step in enumerate(steps):
@@ -475,6 +578,7 @@ class TestModelConfigReadsResolvedInput(CustomTestCase):
             _READ_BEFORE_RESOLUTION
             | _STALE_IN_THE_MODEL_CONFIG
             | _STALE_FROM_THE_REGISTRIES
+            | _STALE_BEHIND_THE_EXPERT_PACK_BUILD
         )
         late = sorted(
             field

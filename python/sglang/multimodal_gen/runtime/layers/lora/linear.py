@@ -44,6 +44,7 @@ LoRAWeightEntry = tuple[
     float,
     int | None,
     int | None,
+    torch.nn.Parameter | None,
 ]
 
 
@@ -104,6 +105,8 @@ class BaseLayerWithLoRA(nn.Module):
 
         self.lora_A = None
         self.lora_B = None
+        self.lora_output_offset = None
+        self.has_lora_output_offset = False
 
     @property
     def weight(self):
@@ -138,16 +141,54 @@ class BaseLayerWithLoRA(nn.Module):
                 )  # type: ignore
             delta = delta * self.strength
             out, output_bias = self.base_layer(x)
-            return out + delta.to(dtype=out.dtype), output_bias
+            out = out + delta.to(dtype=out.dtype)
         else:
             out, output_bias = self.base_layer(x)
-            return out, output_bias
+        return self._add_lora_output_offset(out), output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         return B
+
+    def _scaled_lora_output_offset(
+        self,
+        offset: torch.Tensor | None,
+        strength: float,
+        rank: int | None,
+        alpha: int | None,
+    ) -> torch.Tensor | None:
+        if offset is None:
+            return None
+        offset = self.slice_lora_b_weights(offset.unsqueeze(-1)).squeeze(-1)
+        scale = strength
+        if rank is not None and alpha is not None and rank != alpha:
+            scale *= alpha / rank
+        return offset if scale == 1.0 else offset * scale
+
+    def _active_lora_output_offset(self) -> torch.Tensor | None:
+        if self.disable_lora or not self.has_lora_output_offset:
+            return None
+        if not self.merged:
+            return self._scaled_lora_output_offset(
+                self.lora_output_offset,
+                self.strength,
+                self.lora_rank,
+                self.lora_alpha,
+            )
+        combined = None
+        for _, _, _, strength, rank, alpha, offset in self.lora_weights_list:
+            scaled = self._scaled_lora_output_offset(offset, strength, rank, alpha)
+            if scaled is not None:
+                combined = scaled if combined is None else combined + scaled
+        return combined
+
+    def _add_lora_output_offset(self, output: torch.Tensor) -> torch.Tensor:
+        offset = self._active_lora_output_offset()
+        if offset is None:
+            return output
+        return output + offset.to(device=output.device, dtype=output.dtype)
 
     @staticmethod
     def _as_mutable_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -165,6 +206,7 @@ class BaseLayerWithLoRA(nn.Module):
         strength: float = 1.0,
         clear_existing: bool = False,
         merge_weights: bool = True,
+        output_offset: torch.Tensor | None = None,
     ) -> None:
         """
         Set LoRA weights. Supports multiple LoRA adapters.
@@ -176,17 +218,25 @@ class BaseLayerWithLoRA(nn.Module):
             strength: LoRA strength
             clear_existing: If True, clear existing LoRA weights before adding new one.
                           If False, append to existing list (for multi-LoRA support).
+            output_offset: Optional constant output term paired with this adapter
         """
         lora_A_param = torch.nn.Parameter(
             A
         )  # share storage with weights in the pipeline
         lora_B_param = torch.nn.Parameter(B)
+        output_offset_param = (
+            torch.nn.Parameter(output_offset, requires_grad=False)
+            if output_offset is not None
+            else None
+        )
 
         if clear_existing:
             self.lora_weights_list.clear()
             # Also clear backward compatibility attributes
             self.lora_A = None
             self.lora_B = None
+            self.lora_output_offset = None
+            self.has_lora_output_offset = False
             self.lora_path = None
             self.strength = 1.0
 
@@ -199,6 +249,7 @@ class BaseLayerWithLoRA(nn.Module):
                 strength,
                 self.lora_rank,
                 self.lora_alpha,
+                output_offset_param,
             )
         )
 
@@ -206,6 +257,8 @@ class BaseLayerWithLoRA(nn.Module):
         # This ensures backward compatibility while supporting multiple LoRA
         self.lora_A = lora_A_param
         self.lora_B = lora_B_param
+        self.lora_output_offset = output_offset_param
+        self.has_lora_output_offset |= output_offset_param is not None
         self.lora_path = lora_path
         self.strength = strength
 
@@ -233,10 +286,18 @@ class BaseLayerWithLoRA(nn.Module):
 
         Args:
             data: The base weight tensor to merge LoRA into (modified in-place)
-            lora_list: List of (lora_A, lora_B, lora_path, lora_strength, rank, alpha) tuples
+            lora_list: Adapter factors, path, scale metadata, and output offset
         """
         # Merge all LoRA adapters in order
-        for lora_A, lora_B, _, lora_strength, lora_rank, lora_alpha in lora_list:
+        for (
+            lora_A,
+            lora_B,
+            _,
+            lora_strength,
+            lora_rank,
+            lora_alpha,
+            _,
+        ) in lora_list:
             lora_A_sliced = self.slice_lora_a_weights(lora_A.to(data))
             lora_B_sliced = self.slice_lora_b_weights(lora_B.to(data))
 
@@ -286,7 +347,7 @@ class BaseLayerWithLoRA(nn.Module):
     ) -> bool:
         if os.getenv("SGLANG_DIFFUSION_LORA_MERGE_FP32", "1") != "1":
             return False
-        for _, _, lora_path, _, _, _ in lora_list:
+        for _, _, lora_path, _, _, _, _ in lora_list:
             if lora_path and "distilled-lora" in lora_path.lower():
                 return False
         return True
@@ -332,7 +393,15 @@ class BaseLayerWithLoRA(nn.Module):
             self.strength = strength
             if self.lora_weights_list:
                 self.lora_weights_list = [
-                    (lora_A, lora_B, lora_path, strength, lora_rank, lora_alpha)
+                    (
+                        lora_A,
+                        lora_B,
+                        lora_path,
+                        strength,
+                        lora_rank,
+                        lora_alpha,
+                        output_offset,
+                    )
                     for (
                         lora_A,
                         lora_B,
@@ -340,6 +409,7 @@ class BaseLayerWithLoRA(nn.Module):
                         _,
                         lora_rank,
                         lora_alpha,
+                        output_offset,
                     ) in self.lora_weights_list
                 ]
 
@@ -361,11 +431,18 @@ class BaseLayerWithLoRA(nn.Module):
                     self.strength,
                     self.lora_rank,
                     self.lora_alpha,
+                    self.lora_output_offset,
                 )
             ]
 
         if not lora_list:
             raise ValueError("LoRA weights not set. Please set them first.")
+        if isinstance(self.base_layer.weight, DTensor) and any(
+            output_offset is not None for *_, output_offset in lora_list
+        ):
+            raise ValueError(
+                "LoRA output offsets require dynamic mode with FSDP-sharded weights."
+            )
 
         merge_in_fp32 = self._should_merge_in_fp32(lora_list)
 
@@ -488,6 +565,11 @@ class BaseLayerWithLoRA(nn.Module):
         """
         if not self.merged:
             return
+        if self._active_lora_output_offset() is not None:
+            raise ValueError(
+                "A LoRA with a constant output offset cannot be committed as a "
+                "weight-only base."
+            )
         weight = self.base_layer.weight
         if isinstance(weight, DTensor):
             weight = weight.to_local()
@@ -498,6 +580,8 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_weights_list = []
         self.lora_A = None
         self.lora_B = None
+        self.lora_output_offset = None
+        self.has_lora_output_offset = False
         self.lora_path = None
         self.strength = 1.0
 
@@ -534,7 +618,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        if self.merged or self.disable_lora:
+        if self.disable_lora or (self.merged and not self.has_lora_output_offset):
             return self.base_layer(input_)
 
         lora_A = self.lora_A
@@ -567,6 +651,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             output_parallel = output_parallel + delta_parallel.to(
                 dtype=output_parallel.dtype
             )
+        output_parallel = self._add_lora_output_offset(output_parallel)
         if self.base_layer.gather_output:
             output = tensor_model_parallel_all_gather(output_parallel)
         else:
@@ -667,7 +752,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
 
     def forward(self, input_: torch.Tensor):
-        if self.merged or self.disable_lora:
+        if self.disable_lora or (self.merged and not self.has_lora_output_offset):
             return self.base_layer(input_)
 
         lora_A = self.lora_A
@@ -723,7 +808,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         else:
             output = output_
             output_bias = self.base_layer.bias
-        return output, output_bias
+        return self._add_lora_output_offset(output), output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         tp_rank = get_tp_rank()
@@ -779,11 +864,11 @@ class LinearWithLoRA(BaseLayerWithLoRA):
             delta = delta * self.strength
             # nn.Linear.forward() returns a single tensor, not a tuple
             out = self.base_layer(x)
-            return out + delta.to(dtype=out.dtype)
+            out = out + delta.to(dtype=out.dtype)
         else:
             # nn.Linear.forward() returns a single tensor
             out = self.base_layer(x)
-            return out
+        return self._add_lora_output_offset(out)
 
 
 def _use_owned_base_snapshot(snapshot_base: bool, device_type: str) -> bool:

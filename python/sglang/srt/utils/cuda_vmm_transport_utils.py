@@ -16,7 +16,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.runtime_context import (
-    configured_tp_size,
     get_mm,
     get_parallel,
 )
@@ -162,10 +161,10 @@ def _contains_tensor_container(value) -> bool:
     )
 
 
-def get_vmm_feature_consumer_count(server_args) -> int:
+def get_vmm_feature_consumer_count() -> int:
     if get_parallel().enable_dp_attention:
-        return configured_tp_size() // get_parallel().dp_size
-    return configured_tp_size()
+        return get_parallel().tp_size // get_parallel().dp_size
+    return get_parallel().tp_size
 
 
 class CudaVmmMemoryPool:
@@ -948,7 +947,7 @@ class CudaVmmFeatureTransport:
             memory_size=per_worker_pool_size,
             recycle_interval=MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
             base_gpu_id=server_args.base_gpu_id,
-            consumer_count=get_vmm_feature_consumer_count(server_args),
+            consumer_count=get_vmm_feature_consumer_count(),
             allow_posix_fallback=server_args.nnodes == 1,
         )
 

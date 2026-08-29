@@ -48,6 +48,23 @@ class _CustomEntrypointModel(_UniformDtypeModel):
         pass
 
 
+class _MetaBufferModel(_UniformDtypeModel):
+    """Mirrors cosmos3: a non-checkpoint buffer stays on meta until
+    post_load_weights() rebuilds it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = ReplicatedLinear(4, 4, bias=False)
+        self.register_buffer("inv_freq", torch.empty(2), persistent=False)
+
+    def post_load_weights(self) -> None:
+        if self.inv_freq.is_meta:
+            device = next(self.parameters()).device
+            self.register_buffer(
+                "inv_freq", torch.ones(2, device=device), persistent=False
+            )
+
+
 class TestFSDPMixedPrecisionPolicy(unittest.TestCase):
     def test_quant_config_detection_uses_the_runtime_instance(self):
         self.assertTrue(fsdp_load._is_bitsandbytes_quant_config(BitsAndBytesConfig()))
@@ -215,6 +232,35 @@ class TestOrdinaryWeightLoading(unittest.TestCase):
         )
 
         self.assertEqual(model.proj.weight.data_ptr(), checkpoint_weight.data_ptr())
+        torch.testing.assert_close(model.proj.weight, checkpoint_weight)
+
+
+class TestDevicePostprocessMove(unittest.TestCase):
+    def test_postprocess_move_preserves_meta_buffers_for_post_load_weights(self):
+        # The pre-postprocess device move must not copy buffers that are
+        # still on meta awaiting post_load_weights() (cosmos3's RoPE inv_freq).
+        load_plan = WeightLoadPlan(
+            checkpoint_load_device=torch.device("cpu"),
+            weight_postprocess_device=torch.device("cpu"),
+        )
+        checkpoint_weight = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+
+        with patch.object(fsdp_load.current_platform, "is_mps", return_value=False):
+            model = fsdp_load.maybe_load_fsdp_model(
+                model_cls=_MetaBufferModel,
+                init_params={},
+                weight_dir_list=[],
+                device=torch.device("cpu"),
+                hsdp_replicate_dim=1,
+                hsdp_shard_dim=1,
+                param_dtype=torch.float32,
+                reduce_dtype=torch.float32,
+                weight_load_plan=load_plan,
+                weights_iterator=iter((("proj.weight", checkpoint_weight),)),
+            )
+
+        self.assertFalse(model.inv_freq.is_meta)
+        torch.testing.assert_close(model.inv_freq, torch.ones(2))
         torch.testing.assert_close(model.proj.weight, checkpoint_weight)
 
 
