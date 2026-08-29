@@ -1761,7 +1761,7 @@ class ServerArgs:
                 "flashinfer_sparse_mla",
                 "fa3",
                 "tilelang",
-                "triton",              
+                "triton",         
                 "aiter",
                 "trtllm",
             ],
