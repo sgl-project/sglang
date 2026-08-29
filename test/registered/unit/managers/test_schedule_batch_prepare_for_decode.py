@@ -20,6 +20,7 @@ def _make_req():
         decode_batch_idx=0,
         kv_committed_len=3,
         kv_allocated_len=3,
+        beam_group=None,
     )
 
 

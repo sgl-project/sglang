@@ -701,7 +701,16 @@ def model_parallel_is_initialized() -> bool:
 
 @contextmanager
 def use_tensor_parallel_group(tp_group: GroupCoordinator):
-    """Use one TP group consistently across diffusion and reused SRT modules."""
+    """Use one TP group consistently across diffusion and reused SRT modules.
+
+    The scope replaces the module globals that ``get_tp_group()`` and srt's
+    ``get_tp_group()`` / ``get_attention_tp_group()`` read, and — like srt's
+    ``patch_tensor_parallel_group`` — the three members the runtime context
+    answers with, so that a size read from the published bag cannot disagree
+    with a rank read from the swapped group.
+    """
+    from sglang.srt.runtime_context import get_parallel
+
     old_tp_group = get_tp_group()
     import sglang.srt.distributed.parallel_state as srt_parallel_state
 
@@ -712,7 +721,12 @@ def use_tensor_parallel_group(tp_group: GroupCoordinator):
     srt_parallel_state._TP = tp_group
     srt_parallel_state._ATTN_TP = tp_group
     try:
-        yield
+        with get_parallel().override(
+            tp_size=tp_group.world_size,
+            tp_rank=tp_group.rank_in_group,
+            tp_group=tp_group,
+        ):
+            yield
     finally:
         _TP = old_tp_group
         srt_parallel_state._TP = old_srt_tp_group

@@ -86,7 +86,7 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
-        allocator_type = get_allocator_type(server_args)
+        allocator_type = get_allocator_type()
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
@@ -1733,6 +1733,11 @@ class HiRadixCache(RadixCache):
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    def pop_storage_prefetch_miss(self, req_id: str) -> bool:
+        """Storage prefetch miss markers are not tracked on the dense path;
+        the scheduler's paced availability-check retry is inert here."""
+        return False
+
     def match_prefix(self, params: MatchPrefixParams):
         if self.disable:
             return self._empty_match_result
@@ -1775,6 +1780,10 @@ class HiRadixCache(RadixCache):
         prefix_keys: Optional[List[str]] = None,
         # Scheduler-call parity with UnifiedRadixCache; unused in cache mode.
         matched_prefix_tokens: Optional[List[int]] = None,
+        # Cache mode write-through keeps the anchor on the request's own path,
+        # so the namespace is already carried by ``last_host_node.key``.
+        extra_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ):
         prefetch_key = RadixKey(
             new_input_tokens,

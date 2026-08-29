@@ -13,7 +13,6 @@ from sglang.srt.disaggregation.prefill import (  # noqa: E402
     SchedulerDisaggregationPrefillMixin,
 )
 from sglang.srt.disaggregation.utils import (  # noqa: E402
-    _DRAFT_KV_LAYER_ID_BASE,
     build_transfer_entry_pairs,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
@@ -53,6 +52,7 @@ class TestPPPDConsensus(CustomTestCase):
         class FakeDraftPool:
             start_layer = 0
             end_layer = 1
+            layer_num = 1
 
             @staticmethod
             def get_contiguous_buf_infos():
@@ -262,7 +262,7 @@ class TestPPPDConsensus(CustomTestCase):
         self.assertEqual(layer_ids_by_rank[0], [4, 5])
         self.assertEqual(
             layer_ids_by_rank[1],
-            [4, 5, _DRAFT_KV_LAYER_ID_BASE],
+            [4, 5, 8],
         )
 
     def test_pp_prefill_entries_pair_with_pp1_decode_entries(self):
@@ -273,7 +273,7 @@ class TestPPPDConsensus(CustomTestCase):
             3,
             4,
             5,
-            _DRAFT_KV_LAYER_ID_BASE,
+            8,
         ]
 
         rank_0_pairs = build_transfer_entry_pairs(
@@ -283,7 +283,7 @@ class TestPPPDConsensus(CustomTestCase):
             n_dst=7,
         )
         rank_1_pairs = build_transfer_entry_pairs(
-            src_layer_ids=[4, 5, _DRAFT_KV_LAYER_ID_BASE],
+            src_layer_ids=[4, 5, 8],
             dst_layer_ids=decode_layer_ids,
             n_src=3,
             n_dst=7,

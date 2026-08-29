@@ -1,7 +1,7 @@
 import subprocess
 import sys
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
@@ -279,7 +279,18 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
 
         model_runner.server_args.attention_backend = "minicpm_flashinfer"
         flashinfer_adapter = object()
+        fake_fuse_kernel = ModuleType("sglang.srt.layers.attention.minicpm.fuse_kernel")
+        fake_fuse_kernel.fused_attn_pooling_online_topk_prefill = Mock(
+            return_value="prefill"
+        )
+        fake_fuse_kernel.fused_attn_pooling_online_topk_decode = Mock(
+            return_value="decode"
+        )
         with (
+            patch.dict(
+                sys.modules,
+                {"sglang.srt.layers.attention.minicpm.fuse_kernel": fake_fuse_kernel},
+            ),
             patch.object(backend_module, "MiniCPMHybridConfig", SimpleNamespace),
             patch.object(backend_module, "is_blackwell_supported", return_value=True),
             patch.object(
@@ -296,11 +307,6 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
                 backend_module,
                 "get_parallel",
                 return_value=SimpleNamespace(attn_tp_size=1),
-            ),
-            patch(
-                "sglang.srt.layers.attention.minicpm.fuse_kernel."
-                "fused_attn_pooling_online_topk_prefill",
-                return_value="prefill",
             ),
             patch.object(backend_module, "attach_compressed_cache"),
         ):
@@ -1079,10 +1085,16 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         backend._get_fused_topk_kernel.assert_called_once_with(1, is_prefill=False)
 
     def test_fused_topk_prefill_kernels_compile_for_all_batches_at_startup(self):
-        with patch(
-            "sglang.srt.layers.attention.minicpm.fuse_kernel."
-            "fused_attn_pooling_online_topk_prefill",
-            side_effect=lambda **kwargs: f"prefill-{kwargs['batch_size']}",
+        fake_fuse_kernel = ModuleType("sglang.srt.layers.attention.minicpm.fuse_kernel")
+        fake_fuse_kernel.fused_attn_pooling_online_topk_prefill = Mock(
+            side_effect=lambda **kwargs: f"prefill-{kwargs['batch_size']}"
+        )
+        fake_fuse_kernel.fused_attn_pooling_online_topk_decode = Mock(
+            side_effect=lambda **kwargs: f"decode-{kwargs['batch_size']}"
+        )
+        with patch.dict(
+            sys.modules,
+            {"sglang.srt.layers.attention.minicpm.fuse_kernel": fake_fuse_kernel},
         ):
             backend, *_ = _construct_sparse_backend(
                 max_running_requests=3,
@@ -1104,17 +1116,14 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         backend.fused_kernel_kwargs = {"topk": 8}
         backend.prefill_kernel_max_seqlen_q_grid = 64
 
-        with (
-            patch(
-                "sglang.srt.layers.attention.minicpm.fuse_kernel."
-                "fused_attn_pooling_online_topk_prefill",
-                return_value="prefill",
-            ) as prefill,
-            patch(
-                "sglang.srt.layers.attention.minicpm.fuse_kernel."
-                "fused_attn_pooling_online_topk_decode",
-                return_value="decode",
-            ) as decode,
+        fake_fuse_kernel = ModuleType("sglang.srt.layers.attention.minicpm.fuse_kernel")
+        prefill = Mock(return_value="prefill")
+        decode = Mock(return_value="decode")
+        fake_fuse_kernel.fused_attn_pooling_online_topk_prefill = prefill
+        fake_fuse_kernel.fused_attn_pooling_online_topk_decode = decode
+        with patch.dict(
+            sys.modules,
+            {"sglang.srt.layers.attention.minicpm.fuse_kernel": fake_fuse_kernel},
         ):
             self.assertEqual(
                 backend._get_fused_topk_kernel(3, is_prefill=True), "prefill"

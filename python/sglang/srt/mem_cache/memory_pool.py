@@ -304,30 +304,42 @@ class ReqToTokenPool:
             for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
-        need_size = len(reqs) - len(reusing)
-        if need_size > len(self.free_slots):
+        select_index = self.alloc_rows(len(reqs) - len(reusing))
+        if select_index is None:
             return None
-        if need_size > 0:
-            # Pop from the tail: O(need_size), unlike a prefix pop which is
-            # O(len(free_slots)).
-            select_index = self.free_slots[-need_size:]
-            del self.free_slots[-need_size:]
-        else:
-            # Handled separately: free_slots[-0:] is the entire list, not [].
-            select_index = []
         offset = 0
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
-                self.req_generation[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
+    def alloc_rows(self, need_size: int) -> Optional[List[int]]:
+        """Take need_size rows and bump their generation, with no Req bound to
+        them. alloc() layers Req binding on top; beam member rows have no Req."""
+        if need_size > len(self.free_slots):
+            return None
+        if need_size == 0:
+            # Handled separately: free_slots[-0:] is the entire list, not [].
+            return []
+        # Pop from the tail: O(need_size), unlike a prefix pop which is
+        # O(len(free_slots)).
+        select_index = self.free_slots[-need_size:]
+        del self.free_slots[-need_size:]
+        self.req_generation[select_index] += 1
+        return select_index
+
+    def free_rows(self, indices: List[int]) -> None:
+        # Per-row, so beam member rows release their aux entries too: they reach
+        # alloc_aux_to_lengths via the decode batch's req_pool_indices_cpu.
+        if self._aux_cache is not None:
+            for index in indices:
+                self._aux_cache.free(index)
+        self.free_slots.extend(indices)
+
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
-        if self._aux_cache is not None:
-            self._aux_cache.free(req.req_pool_idx)
-        self.free_slots.append(req.req_pool_idx)
+        self.free_rows([req.req_pool_idx])
         req.req_pool_idx = None
 
     def clear(self):
