@@ -211,6 +211,45 @@ class TestCudaIpcTransport(CustomTestCase):
         stream.synchronize.assert_called_once_with()
         self.assertIsNone(proxy._pool_storage)
 
+    def test_failed_item_batch_releases_undispatched_pool_slice(self):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        pool = MmItemMemoryPool(
+            memory_size=1 << 20,
+            recycle_interval=0.01,
+            base_gpu_id=0,
+            consumer_count=4,
+        )
+        with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
+            processor = BaseMultimodalProcessor.__new__(BaseMultimodalProcessor)
+        processor.use_cuda_ipc = True
+        processor.use_ipc_pool_handle_cache = True
+        processor.cudaipc_mmfeature_pool = pool
+        features = [
+            torch.ones(16, device="cuda"),
+            torch.empty(0, device="cuda"),
+        ]
+        items = [
+            MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
+            for feature in features
+        ]
+
+        try:
+            with self.assertRaisesRegex(ValueError, "empty tensor"):
+                processor._prepare_mm_items_for_transport(items)
+
+            deadline = time.monotonic() + 5
+            while pool.active_lease_count and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(pool.active_lease_count, 0)
+            self.assertIs(items[0].feature, features[0])
+            self.assertIs(items[1].feature, features[1])
+        finally:
+            pool.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
