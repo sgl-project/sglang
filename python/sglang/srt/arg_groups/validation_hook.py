@@ -9,8 +9,10 @@ import os
 from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.overrides import (
+    _hisparse_validation,
     resolved_view,
     resolving_view,
+    run_post_process_pass,
 )
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
@@ -154,10 +156,6 @@ def check_server_args(server_args: Any):
     # Check hisparse
     # Moved to the resolution pipeline (arg_groups/overrides.py:
     # _hisparse_validation), invoked here at its legacy slot.
-    from sglang.srt.arg_groups.overrides import (
-        _hisparse_validation,
-        run_post_process_pass,
-    )
 
     run_post_process_pass(server_args, _hisparse_validation)
 

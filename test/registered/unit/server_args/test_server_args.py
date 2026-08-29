@@ -979,10 +979,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         return args
 
     @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
-    @patch("sglang.srt.arg_groups.overrides.use_mla_backend", return_value=False)
-    def test_combined_attention_backend_fa4_forces_page_size_128(
-        self, _mock_mla, _mock_sm100
-    ):
+    def test_combined_attention_backend_fa4_forces_page_size_128(self, _mock_sm100):
         # `--attention-backend fa4` (combined): prefill/decode fields stay None.
         args = self._make_args(attention_backend="fa4")
 
@@ -994,8 +991,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         self.assertEqual(resolved_view(args).page_size, 128)
 
     @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
-    @patch("sglang.srt.arg_groups.overrides.use_mla_backend", return_value=False)
-    def test_explicit_prefill_fa4_forces_page_size_128(self, _mock_mla, _mock_sm100):
+    def test_explicit_prefill_fa4_forces_page_size_128(self, _mock_sm100):
         # `--prefill-attention-backend fa4`: the previously-covered path.
         args = self._make_args(attention_backend=None, prefill="fa4", page_size=1)
 
@@ -1869,12 +1865,7 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
             is_multimodal=False,
             is_multimodal_piecewise_cuda_graph_supported=False,
         )
-        with (
-            patch("sglang.srt.utils.is_cuda", return_value=True),
-            patch(
-                "sglang.srt.arg_groups.overrides.use_mla_backend", return_value=False
-            ),
-        ):
+        with patch("sglang.srt.utils.is_cuda", return_value=True):
             handle_cuda_graph_config(args)
         return args
 
@@ -1944,12 +1935,7 @@ class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
             is_multimodal=False,
             is_multimodal_piecewise_cuda_graph_supported=False,
         )
-        with (
-            patch("sglang.srt.utils.is_cuda", return_value=True),
-            patch(
-                "sglang.srt.arg_groups.overrides.use_mla_backend", return_value=False
-            ),
-        ):
+        with patch("sglang.srt.utils.is_cuda", return_value=True):
             handle_cuda_graph_config(args)
         return args
 
@@ -2010,12 +1996,7 @@ class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
             is_multimodal_piecewise_cuda_graph_supported=False,
             is_multimodal_breakable_cuda_graph_supported=allowlisted,
         )
-        with (
-            patch("sglang.srt.utils.is_cuda", return_value=True),
-            patch(
-                "sglang.srt.arg_groups.overrides.use_mla_backend", return_value=False
-            ),
-        ):
+        with patch("sglang.srt.utils.is_cuda", return_value=True):
             handle_cuda_graph_config(args)
         return args
 

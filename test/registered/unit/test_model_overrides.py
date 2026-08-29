@@ -2231,6 +2231,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults.update(kw)
             args = SimpleNamespace(**defaults)
             args.default_backend_for_test = default_backend
+            args._model_config = SimpleNamespace(attention_arch=AttentionArch.MHA)
             return args
 
         with patch.object(
@@ -2239,10 +2240,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             overrides_module,
             "get_default_attn_backend",
             lambda server_args, **_: server_args.default_backend_for_test,
-        ), patch.object(
-            overrides_module, "use_mla_backend", return_value=False
-        ), patch.object(
-            overrides_module, "model_config_of", return_value=None
         ):
             # radix on + no extra buffer + no spec -> page_size=1 path
             self.assertEqual(

@@ -8,12 +8,19 @@ import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    _a2a_backend_overrides,
+    _a2a_ep_size,
+    _a2a_fusion_adjustments,
+    _moe_runner_backend_quant_constraints,
+    _moe_runner_fusion_disable,
     cutedsl_moe_max_num_tokens,
     declare_resolution,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
+    model_config_of,
     resolved_view,
     resolving_view,
+    run_post_process_pass,
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -27,14 +34,8 @@ def handle_moe_kernel_config(server_args: Any):
     # The quantization-driven runner resolutions moved to the pipeline
     # (arg_groups/overrides.py: _moe_runner_backend_quant_constraints);
     # the compatibility asserts and fusion writes stay below.
-    from sglang.srt.arg_groups.overrides import model_config_of
 
     cfg = resolving_view(server_args)
-    from sglang.srt.arg_groups.overrides import (
-        _moe_runner_backend_quant_constraints,
-        _moe_runner_fusion_disable,
-        run_post_process_pass,
-    )
 
     run_post_process_pass(server_args, _moe_runner_backend_quant_constraints)
 
@@ -121,15 +122,8 @@ def handle_a2a_moe(server_args: Any):
     # the resolution pipeline (arg_groups/overrides.py:
     # _a2a_backend_overrides / _a2a_ep_size); the per-backend logs,
     # asserts, fusion/deepep_mode/env/cuda-graph writes stay below.
-    from sglang.srt.arg_groups.overrides import model_config_of
 
     cfg = resolving_view(server_args)
-    from sglang.srt.arg_groups.overrides import (
-        _a2a_backend_overrides,
-        _a2a_ep_size,
-        _a2a_fusion_adjustments,
-        run_post_process_pass,
-    )
 
     run_post_process_pass(server_args, _a2a_backend_overrides)
     run_post_process_pass(server_args, _a2a_ep_size)
@@ -420,7 +414,6 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
 
 def validate_deepep_v2_model_architecture(server_args: Any) -> None:
     """Allow DeepEP v2 only where its model workflow is validated."""
-    from sglang.srt.arg_groups.overrides import model_config_of
 
     if (
         parse_connector_type(resolved_view(server_args).model_path)
