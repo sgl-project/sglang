@@ -58,7 +58,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     ComponentCheckpointUnsupportedError,
     ComponentLoader,
     NativeComponentLoaderRequired,
-    uses_native_transformers_bnb4,
+    uses_native_transformers_quantization,
 )
 from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     gguf_weights_iterator,
@@ -135,15 +135,23 @@ _TRANSFORMERS_ENCODER_ONLY_CLASSES = {
 }
 
 
-def _delegate_standard_bnb4_to_transformers(
+def _delegate_quantized_checkpoint_to_transformers(
     component_config: dict,
     component_name: str,
+    *,
+    methods: frozenset[str] | None = None,
 ) -> None:
-    """Use Transformers when it owns a standard serialized BnB4 checkpoint."""
-    if uses_native_transformers_bnb4(component_config, component_name):
+    """Use Transformers when it owns the checkpoint's serialized format."""
+    quant_spec = resolve_checkpoint_quant_spec(component_config)
+    if quant_spec is None or (
+        methods is not None and quant_spec.declared_method not in methods
+    ):
+        return
+    if uses_native_transformers_quantization(component_config, component_name):
+        method = quant_spec.declared_method or "unspecified"
         raise NativeComponentLoaderRequired(
-            f"{component_name!r} delegates serialized bitsandbytes checkpoint "
-            "loading to Transformers"
+            f"{component_name!r} delegates serialized quant_method={method!r} "
+            "checkpoint loading to Transformers"
         )
 
 
@@ -268,9 +276,10 @@ def _configure_encoder_quantization(
         # themselves; running the generic lifecycle as well would process twice.
         return
 
-    _delegate_standard_bnb4_to_transformers(
+    _delegate_quantized_checkpoint_to_transformers(
         component_config,
         component_name,
+        methods=frozenset({"bitsandbytes"}),
     )
     try:
         quant_config = _get_encoder_quant_config(
@@ -280,6 +289,10 @@ def _configure_encoder_quantization(
             model_cls,
         )
     except (KeyError, NotImplementedError, TypeError, ValueError) as error:
+        _delegate_quantized_checkpoint_to_transformers(
+            component_config,
+            component_name,
+        )
         raise ComponentCheckpointUnsupportedError(
             f"Cannot configure checkpoint quantization for {component_name!r}: {error}"
         ) from error
@@ -305,6 +318,10 @@ def _configure_encoder_quantization(
         )
         quant_config = model_config.quant_config
     if quant_config is None:
+        _delegate_quantized_checkpoint_to_transformers(
+            component_config,
+            component_name,
+        )
         return
     if not issubclass(model_cls, EncoderTensorParallelMixin):
         raise ComponentCheckpointUnsupportedError(
@@ -327,7 +344,7 @@ def _resolve_and_configure_encoder_quantization(
     try:
         model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
     except Exception as resolution_error:
-        _delegate_standard_bnb4_to_transformers(
+        _delegate_quantized_checkpoint_to_transformers(
             component_config,
             component_name,
         )
