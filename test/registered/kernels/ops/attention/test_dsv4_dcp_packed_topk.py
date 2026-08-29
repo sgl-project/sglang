@@ -58,6 +58,22 @@ def test_candidate_clamps_metadata_length_to_score_width() -> None:
     )
 
 
+def test_candidate_clamps_negative_metadata_length_to_zero() -> None:
+    candidates = torch.empty((1, 4), dtype=torch.int64, device="cuda")
+    dcp_topk_candidates(
+        torch.tensor([[3.0, 1.0]], device="cuda"),
+        torch.tensor([-1], dtype=torch.int32, device="cuda"),
+        candidates,
+        dcp_size=4,
+        dcp_rank=2,
+    )
+    global_indices = candidates.view(torch.int32).reshape(1, 4, 2)[..., 0]
+    torch.testing.assert_close(
+        global_indices,
+        torch.full((1, 4), -1, dtype=torch.int32, device="cuda"),
+    )
+
+
 @pytest.mark.parametrize("tied", [False, True])
 def test_candidate_large_width_preserves_guard_rows(tied: bool) -> None:
     batch_size, score_width, topk = 64, 32768, 1024
@@ -89,6 +105,16 @@ def test_candidate_large_width_preserves_guard_rows(tied: bool) -> None:
     assert torch.all(global_indices >= 0)
     assert torch.all(global_indices < score_width * 4)
     assert torch.all(torch.remainder(global_indices, 4) == 3)
+    repeated = torch.empty_like(candidates)
+    dcp_topk_candidates(
+        scores,
+        torch.full((batch_size,), score_width, dtype=torch.int32, device="cuda"),
+        repeated,
+        dcp_size=4,
+        dcp_rank=3,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(repeated, candidates, rtol=0, atol=0)
 
 
 def test_candidate_large_concentrated_scores_matches_topk() -> None:
@@ -148,6 +174,44 @@ def test_candidate_long_random_scores_match_exact_topk(score_width: int) -> None
         * dcp_size
         + dcp_rank
     )
+    torch.testing.assert_close(
+        torch.sort(global_indices).values,
+        torch.sort(expected).values,
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_candidate_special_scores_match_canonical_reference() -> None:
+    score_width, topk, dcp_size, dcp_rank = 16384, 1024, 4, 1
+    scores = (
+        1.0
+        + torch.arange(score_width, dtype=torch.float32, device="cuda").unsqueeze(0)
+        * 1.0e-7
+    )
+    scores[0, 0] = float("nan")
+    scores[0, 1] = -0.0
+    scores[0, 2] = 0.0
+    scores[0, 3] = float("inf")
+    scores[0, 4] = -float("inf")
+    candidates = torch.empty((1, topk), dtype=torch.int64, device="cuda")
+    dcp_topk_candidates(
+        scores,
+        torch.tensor([score_width], dtype=torch.int32, device="cuda"),
+        candidates,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+    )
+    torch.cuda.synchronize()
+
+    canonical = torch.nan_to_num(scores[0], nan=-float("inf"))
+    canonical = torch.where(canonical == 0.0, 0.0, canonical)
+    expected = (
+        torch.argsort(canonical, descending=True, stable=True)[:topk].to(torch.int32)
+        * dcp_size
+        + dcp_rank
+    )
+    global_indices = candidates.view(torch.int32).reshape(1, topk, 2)[0, :, 0]
     torch.testing.assert_close(
         torch.sort(global_indices).values,
         torch.sort(expected).values,
@@ -345,6 +409,23 @@ def test_packed_dcp_topk_matches_global_score_set(
             torch.testing.assert_close(page_indices[batch_idx, :count], expected_pages)
             assert torch.all(page_indices[batch_idx, count:] == -1)
             assert torch.all(local_raw[batch_idx, count:] == -1)
+        repeated_page_indices = torch.empty_like(page_indices)
+        repeated_local_raw = torch.empty_like(local_raw)
+        repeated_local_lens = torch.empty_like(local_lens)
+        dcp_topk_merge(
+            gathered,
+            rank_page_tables[rank],
+            repeated_page_indices,
+            repeated_local_lens,
+            C4_PAGE_SIZE,
+            dcp_size,
+            rank,
+            repeated_local_raw,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(repeated_local_lens, local_lens, rtol=0, atol=0)
+        torch.testing.assert_close(repeated_page_indices, page_indices, rtol=0, atol=0)
+        torch.testing.assert_close(repeated_local_raw, local_raw, rtol=0, atol=0)
         per_rank_raw.append(local_raw)
 
     for batch_idx, length_tensor in enumerate(global_lens):

@@ -39,6 +39,8 @@ struct TopKParams {
 };
 
 SGL_DEVICE uint8_t convert_to_uint8(float x) {
+  if (x != x) x = __uint_as_float(0xff800000u);
+  if (x == 0.0f) x = 0.0f;
   __half h = __float2half_rn(x);
   uint16_t bits = __half_as_ushort(h);
   uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
@@ -46,6 +48,8 @@ SGL_DEVICE uint8_t convert_to_uint8(float x) {
 }
 
 SGL_DEVICE uint32_t convert_to_uint32(float x) {
+  if (x != x) x = __uint_as_float(0xff800000u);
+  if (x == 0.0f) x = 0.0f;
   uint32_t bits = __float_as_uint(x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
