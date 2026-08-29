@@ -541,6 +541,30 @@ class TestRealtimeASR(CustomTestCase):
                     bool(_sent_events(connection, ".failed")), not completed
                 )
 
+        for final_text, completed in (("one two three", True), ("", False)):
+            with self.subTest(recovery_after_empty=final_text):
+                manager, connection = _connection(
+                    ["one two", "", final_text],
+                    ["length", "stop", "stop"],
+                    encoder_windows=False,
+                )
+                self.assertTrue(_run(connection._run_inference(is_last=False)))
+                connection.asr_state.audio.append_pcm(b"\x03\x00\x04\x00")
+                self.assertTrue(_run(connection._run_inference(is_last=False)))
+                self.assertEqual(
+                    connection.asr_state.audio.last_processed_offset_bytes, 0
+                )
+
+                _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
+
+                self.assertEqual(len(manager.requests), 3)
+                self.assertEqual(
+                    bool(_sent_events(connection, ".completed")), completed
+                )
+                self.assertEqual(
+                    bool(_sent_events(connection, ".failed")), not completed
+                )
+
     def test_windowed_length_and_abort_fail_without_committing_state(self):
         _, connection = _connection("three four", ["length"])
         with self.assertLogs(level="ERROR"):

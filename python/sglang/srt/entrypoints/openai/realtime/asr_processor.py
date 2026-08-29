@@ -510,6 +510,14 @@ class RealtimeASRProcessor:
             # before this branch and fail the request.
             logger.warning("[realtime] cumulative ASR step returned no response")
             return _TranscriptionOutcome(audio_processed=False)
+        recovering_unprocessed_audio = (
+            state.audio.last_attempted_offset_bytes
+            > state.audio.last_processed_offset_bytes
+        )
+        if recovering_unprocessed_audio and not generation.text:
+            if step.is_last:
+                raise RuntimeError("final realtime ASR recovery returned empty text")
+            return _TranscriptionOutcome(audio_processed=False)
         if step.is_last and generation.finish_reason == "length":
             # Never publish a known-truncated transcript as completed.
             raise RuntimeError("realtime ASR decode reached max_new_tokens")
