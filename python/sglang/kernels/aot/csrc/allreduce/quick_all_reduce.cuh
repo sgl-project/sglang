@@ -57,8 +57,7 @@ template <typename T, int world_size>
 struct CodecQ4 : public CodecBase {
   static constexpr int kWorldSize = world_size;
 
-  // Block-scaled: a large cast scale only pushes blocks past the rcp cliff. See
-  // kQRFp16CastScaleLog2Quant in quick_all_reduce_base.h.
+  // Block-scaled: the cast scale would only cost the low end. See quick_all_reduce_base.h.
   static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Quant;
 
   // Codec tile size process by this workgroup.
@@ -199,8 +198,7 @@ template <typename T, int world_size>
 struct CodecQ6 : public CodecBase {
   static constexpr int kWorldSize = world_size;
 
-  // Block-scaled: a large cast scale only pushes blocks past the rcp cliff. See
-  // kQRFp16CastScaleLog2Quant in quick_all_reduce_base.h.
+  // Block-scaled: the cast scale would only cost the low end. See quick_all_reduce_base.h.
   static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Quant;
 
   // Codec tile size process by this workgroup.
@@ -361,8 +359,7 @@ template <typename T, int world_size>
 struct CodecQ8 : public CodecBase {
   static constexpr int kWorldSize = world_size;
 
-  // Block-scaled: a large cast scale only pushes blocks past the rcp cliff. See
-  // kQRFp16CastScaleLog2Quant in quick_all_reduce_base.h.
+  // Block-scaled: the cast scale would only cost the low end. See quick_all_reduce_base.h.
   static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Quant;
 
   // Codec tile size process by this workgroup.
@@ -508,8 +505,7 @@ struct AllReduceTwoshot {
 
   static constexpr int kWorldSize = Codec::kWorldSize;
 
-  // bf16 -> fp16 cast scale; power of two, so both multiplies are exact. See
-  // kQRFp16CastScaleLog2Fp / kQRFp16CastScaleLog2Quant in quick_all_reduce_base.h.
+  // Power of two, so both multiplies are exact.
   static constexpr float kCastScale = static_cast<float>(1 << Codec::kCastScaleLog2);
   static constexpr float kCastInvScale = 1.0f / kCastScale;
 

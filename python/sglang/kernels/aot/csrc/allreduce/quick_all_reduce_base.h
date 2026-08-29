@@ -34,23 +34,16 @@ static constexpr int kNegOne = 0xBC00BC00;  // {-1, -1}, fp16x2_t
 
 // Range guard for the bf16 -> fp16 fast path (AllReduceTwoshot<..., true>): fp16 saturates at
 // 65504. Divide by a power of two on load and multiply it back on store; the shift is exact, so
-// sum(x_i / S) * S == sum(x_i). S is per codec (Codec::kCastScaleLog2), because the two codec
-// families fail differently.
-//
-// CodecFP carries no block scale, so S is its only range guard and is free there; S = 16 clears
-// the largest reduced magnitude measured on real TP4 traffic, 8.1e4, with margin.
-//
-// The quantized codecs already normalize each 32-element block by its own scale, and MODE.FP16_OVFL
-// (armed in CodecBase) stops an over-ceiling element from becoming an inf that poisons its whole
-// block through the block max. So for them S only costs the low end: encoding_scale =
-// rcp(decoding_scale) itself saturates at 65504, past which encode and decode stop being
-// reciprocals and the block is systematically attenuated. With L = 8 / 32 / 128 for Q4 / Q6 / Q8
-// that rcp cliff sits at blockmax = S * L / 65504, which for Q8 at S = 16 is 0.031 -- measured
-// past by 97.5% of a quiet model's blocks, taking relative L2 from 0.0057 to 0.68. This is a much
-// higher threshold than the decoding scale merely going denormal (blockmax = S * L * 2^-14),
-// which measures harmless. Keep S small here; S = 2 leaves ~2 decades below the observed blocks.
+// sum(x_i / S) * S == sum(x_i). Per codec, because only CodecFP needs it: it carries no block
+// scale, so S is its only range guard, and is free there. The quantized codecs already normalize
+// each 32 values by their own block scale, and MODE.FP16_OVFL (armed in CodecBase) keeps an
+// over-ceiling element from becoming an inf that poisons its block through the block max. S buys
+// them nothing and costs the low end: encoding_scale = rcp(decoding_scale) saturates at 65504,
+// past which encode and decode stop being reciprocals and the block is attenuated wholesale.
+// That cliff sits at blockmax = S * L / 65504 (L = 8 / 32 / 128 for Q4 / Q6 / Q8), so raising S
+// walks it into real data -- 1 -> 2 measures 62% perplexity on GLM-5.2. Leave it at 1.
 static constexpr int kQRFp16CastScaleLog2Fp = 4;     // S = 16, CodecFP
-static constexpr int kQRFp16CastScaleLog2Quant = 1;  // S = 2, CodecQ4 / CodecQ6 / CodecQ8
+static constexpr int kQRFp16CastScaleLog2Quant = 0;  // S = 1, CodecQ4 / CodecQ6 / CodecQ8
 
 // Number of atoms (4xf16x2_t) processed by a single thread
 static constexpr int kAtoms = 8;
