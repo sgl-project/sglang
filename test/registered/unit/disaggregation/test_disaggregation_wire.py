@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import (
     handle_staging_req,
 )
@@ -136,6 +137,48 @@ class TestDisaggregationWire(unittest.TestCase):
     def test_list_of_buffers_roundtrip(self):
         bufs = [b"abc", b"", b"de", b"x" * 17]
         self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
+
+
+class TestCPReplicatedStateTransfer(unittest.TestCase):
+    def test_only_nonzero_cp_ranks_without_layer_split_skip_state(self):
+        cases = [
+            (1, 0, False, False),
+            (8, 0, False, False),
+            (8, 1, False, True),
+            (8, 7, False, True),
+            (8, 1, True, False),
+        ]
+
+        for cp_size, cp_rank, layer_split, expected in cases:
+            with self.subTest(
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                layer_split=layer_split,
+            ):
+                manager = object.__new__(CommonKVManager)
+                manager.attn_cp_size = cp_size
+                manager.attn_cp_rank = cp_rank
+                with get_context().override_server_args(
+                    enable_dsa_cache_layer_split=layer_split,
+                ):
+                    self.assertEqual(
+                        manager._should_skip_cp_replicated_state_transfer(),
+                        expected,
+                    )
+
+    def test_mooncake_uses_common_cp_state_policy(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.attn_cp_size = 8
+        manager.attn_cp_rank = 3
+        manager.is_hybrid_mla_backend = False
+
+        with get_context().override_server_args(
+            enable_dsa_cache_layer_split=False,
+        ):
+            self.assertEqual(
+                manager._get_dsa_cache_transfer_skip_flags(None),
+                (False, True),
+            )
 
 
 class TestGroupConcurrentContiguous(unittest.TestCase):
@@ -390,6 +433,41 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         )
         self.assertEqual(future_map.dsa_topk_indices_buf.shape, (4, 3))
         self.assertEqual(future_map.dsa_topk_indices_buf.dtype, torch.int32)
+
+    @patch(
+        "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+        return_value=False,
+    )
+    def test_future_map_initializes_topk_after_prefill_payload(self, _):
+        future_map = object.__new__(FutureMap)
+        future_map.spec_algo = SimpleNamespace(
+            is_some=Mock(return_value=True),
+            need_topk=Mock(return_value=True),
+        )
+        future_map.req_pool_size = 4
+        future_map.device = "cpu"
+        future_map.need_topk = False
+        future_map.need_hidden_states = False
+        future_map.topk_p_buf = None
+        future_map.topk_index_buf = None
+        future_map.hidden_states_buf = None
+        future_map.draft_probs_buf = None
+
+        future_map._maybe_init_forward_bufs(
+            RelayPayload(bonus_tokens=torch.zeros((2,), dtype=torch.int64))
+        )
+        self.assertFalse(future_map.need_topk)
+
+        future_map._maybe_init_forward_bufs(
+            RelayPayload(
+                bonus_tokens=torch.zeros((2,), dtype=torch.int64),
+                topk_p=torch.zeros((2, 3), dtype=torch.float32),
+                topk_index=torch.zeros((2, 3), dtype=torch.int64),
+            )
+        )
+        self.assertTrue(future_map.need_topk)
+        self.assertEqual(future_map.topk_p_buf.shape, (4, 3))
+        self.assertEqual(future_map.topk_index_buf.shape, (4, 3))
 
 
 class TestDSV4C128StateIndices(unittest.TestCase):

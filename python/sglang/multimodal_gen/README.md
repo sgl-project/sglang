@@ -9,7 +9,7 @@ SGLang diffusion features an end-to-end unified pipeline for accelerating diffus
 ## Key Features
 
 SGLang Diffusion has the following features:
-  - Broad model support: Wan, FastWan, FLUX, Qwen-Image, Z-Image, Ideogram 4, Krea-2, Cosmos3, LTX-2/LTX-2.3, MiniMax-H3, LingBot Video MoE, LingBot World, SANA-Video/SANA-WM, JoyEcho, MOVA, GLM-Image, ERNIE-Image, Hunyuan3D, and more
+  - Broad model support: Wan, FastWan, FLUX, Qwen-Image, LongCat-Image, Z-Image, Ideogram 4, Krea-2, Cosmos3, LTX-2/LTX-2.3/LTX-2.5, MiniMax-H3, LingBot Video MoE, LingBot World, SANA-Video/SANA-WM, JoyEcho, MOVA, GLM-Image, ERNIE-Image, Hunyuan3D, and more
   - Fast inference speed: empowered by optimized `sgl-kernel` kernels, scheduler/runtime improvements, caching acceleration, and native diffusion hot-path optimizations
   - Ease of use: OpenAI-compatible api, CLI, and python sdk support
   - Multi-platform support:
@@ -30,7 +30,7 @@ SGLang Diffusion supports Moore Threads GPUs (MTGPU) through the MUSA software s
 
 ### Apple MPS Support
 
-SGLang Diffusion supports Apple Silicon (M-series) via the MPS backend. Since Triton is Linux-only, all Triton kernels are replaced with PyTorch-native fallbacks on MPS. Norm operations can be optionally accelerated with MLX fused Metal kernels (`SGLANG_USE_MLX=1`). See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
+SGLang Diffusion supports Apple Silicon (M-series) via the MPS backend. Since Triton is Linux-only, Triton kernels are replaced with PyTorch-native fallbacks on MPS. See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
 
 ## Getting Started
 
