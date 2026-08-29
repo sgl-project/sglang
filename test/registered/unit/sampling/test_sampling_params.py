@@ -22,6 +22,16 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class TestSamplingParamsInit(CustomTestCase):
+    def test_original_sampling_values_survive_normalization(self):
+        greedy = SamplingParams(temperature=0.0, top_k=-1)
+        self.assertEqual(greedy.original_temperature, 0.0)
+        self.assertEqual(greedy.original_top_k, -1)
+        self.assertEqual(greedy.temperature, 1.0)
+        self.assertEqual(greedy.top_k, 1)
+
+        sampled = SamplingParams(temperature=0.7, top_k=20)
+        self.assertEqual(sampled.original_temperature, 0.7)
+        self.assertEqual(sampled.original_top_k, 20)
 
     def test_zero_temperature_becomes_greedy(self):
         """Test greedy conversion when temperature is 0."""

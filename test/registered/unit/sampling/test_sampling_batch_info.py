@@ -559,8 +559,10 @@ class TestFromScheduleBatch(CustomTestCase):
     ):
         req = MagicMock()
         req.sampling_params.temperature = temp
+        req.sampling_params.original_temperature = temp
         req.sampling_params.top_p = top_p
         req.sampling_params.top_k = top_k
+        req.sampling_params.original_top_k = top_k
         req.sampling_params.min_p = min_p
         req.sampling_params.frequency_penalty = freq
         req.sampling_params.presence_penalty = presence
@@ -587,6 +589,8 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertAlmostEqual(info.temperatures[0, 0].item(), 0.8, places=5)
         self.assertAlmostEqual(info.top_ps[0].item(), 0.9, places=5)
         self.assertEqual(info.top_ks[0].item(), 50)
+        self.assertAlmostEqual(info.original_temperatures[0].item(), 0.8, places=5)
+        self.assertEqual(info.original_top_ks[0].item(), 50)
 
     def test_greedy_detection(self):
         """Test that top_k=1 sets is_all_greedy=True."""
