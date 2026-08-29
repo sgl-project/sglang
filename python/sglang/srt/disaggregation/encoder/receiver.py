@@ -402,6 +402,24 @@ def _grpc_encode_request(target, encode_request):
         channel.close()
 
 
+async def _gather_blocking_grpc_calls(calls):
+    """Wait for synchronous gRPC threads to stop before propagating cancellation."""
+    future = asyncio.gather(*calls, return_exceptions=True)
+    try:
+        results = await asyncio.shield(future)
+    except asyncio.CancelledError:
+        results = await asyncio.shield(future)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error("gRPC call failed while draining cancellation: %s", result)
+        raise
+
+    for result in results:
+        if isinstance(result, Exception):
+            raise result
+    return results
+
+
 class EmbeddingData:
     def __init__(
         self,
@@ -2634,7 +2652,7 @@ class MMReceiverGrpc(MMReceiverBase):
             )
             for encode_request in encode_requests
         ]
-        await asyncio.gather(*grpc_tasks)
+        await _gather_blocking_grpc_calls(grpc_tasks)
 
 
 def _validate_transport_mode(transport_mode: str, encoder_urls):

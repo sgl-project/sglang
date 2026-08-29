@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.encoder.preprocessor import (
 )
 from sglang.srt.disaggregation.encoder.receiver import (
     EmbeddingData,
+    MMReceiverGrpc,
     MMReceiverHTTP,
     MultiModalEmbeddingData,
     _encoder_media_item,
@@ -616,6 +617,59 @@ def test_epd_tokenizer_receiver_timeout_cancels_tasks_and_closes_socket():
         assert encode_cancelled.is_set()
         assert recv_cancelled.is_set()
         recv_socket.close.assert_called_once_with(linger=0)
+
+    asyncio.run(run())
+
+
+def test_grpc_dispatch_cancellation_waits_for_blocking_calls():
+    async def run():
+        receiver = MMReceiverGrpc.__new__(MMReceiverGrpc)
+        receiver.host = "127.0.0.1"
+        calls_started = 0
+        calls_finished = 0
+        calls_lock = threading.Lock()
+        unblock = threading.Event()
+
+        def blocking_encode(_target, _request):
+            nonlocal calls_started, calls_finished
+            with calls_lock:
+                calls_started += 1
+            unblock.wait(timeout=2)
+            with calls_lock:
+                calls_finished += 1
+
+        with patch(
+            "sglang.srt.disaggregation.encoder.receiver._grpc_encode_request",
+            side_effect=blocking_encode,
+        ):
+            task = asyncio.create_task(
+                receiver.encode(
+                    req_id="req",
+                    mm_data=[
+                        {"modality": Modality.IMAGE, "url": "image-0"},
+                        {"modality": Modality.IMAGE, "url": "image-1"},
+                    ],
+                    embedding_port=1234,
+                    endpoint_encode="encode",
+                    num_items_assigned=[1, 1],
+                    encode_urls=["grpc://encoder-0", "grpc://encoder-1"],
+                )
+            )
+            for _ in range(100):
+                with calls_lock:
+                    if calls_started == 2:
+                        break
+                await asyncio.sleep(0.01)
+            assert calls_started == 2
+
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+
+            unblock.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert calls_finished == 2
 
     asyncio.run(run())
 
