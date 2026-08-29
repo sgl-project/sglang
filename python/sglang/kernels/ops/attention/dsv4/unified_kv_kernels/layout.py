@@ -17,7 +17,9 @@ import torch
 # The fp8 nope row is a fixed 512 B whatever the payload: 448 B latent, then
 # 14 B of E8M0 tile scales (7 tiles, each written twice -- the asm reader reads
 # every tile scale twice), then 50 B nobody touches. Keep in sync with aiter's
-# pack_v4_nope_scale; the 512 B stride is what the reader assumes.
+# pack_v4_nope_scale and with kFp8TwoPoolRowBytes in
+# jit/csrc/deepseek_v4/fused_norm_rope_v2.cuh; the 512 B stride is what the
+# reader assumes and nothing checks it across the language boundary.
 DSV4_FP8_NOPE_ROW_BYTES = 512
 DSV4_FP8_QUANT_TILE = 64
 
