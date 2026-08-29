@@ -139,6 +139,7 @@ class RolloutDenoisingMixin:
         batch._rollout_denoising_env_state = {
             "env": env,
             "step_latents": [],
+            "step_latent_indices": [],
             "step_timesteps": [],
             "pos_cond_kwargs_src": pos_src,
             "neg_cond_kwargs_src": neg_src,
@@ -157,12 +158,13 @@ class RolloutDenoisingMixin:
         if state is None:
             return
 
+        state["step_timesteps"].append(timestep_value.detach().cpu())
         return_step_indices = getattr(batch, "rollout_return_step_indices", None)
         if return_step_indices is not None and step_index not in return_step_indices:
             return
 
         state["step_latents"].append(latents.detach())
-        state["step_timesteps"].append(timestep_value.detach().cpu())
+        state["step_latent_indices"].append(step_index)
 
     def _maybe_finalize_denoising_env_collection(self, batch, pipeline_config) -> None:
         state = getattr(batch, "_rollout_denoising_env_state", None)
@@ -187,6 +189,9 @@ class RolloutDenoisingMixin:
                 latents=step_latents_tensor.cpu(),
                 timesteps=torch.stack(step_timesteps, dim=0).cpu(),
                 sigmas=batch.scheduler.sigmas.detach().cpu().clone(),
+                latent_step_indices=torch.tensor(
+                    state["step_latent_indices"], dtype=torch.long
+                ),
             )
 
         if env is not None and batch.rollout_return_denoising_env:
