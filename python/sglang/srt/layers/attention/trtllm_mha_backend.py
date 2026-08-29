@@ -271,6 +271,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             "trtllm_mha_default_kv_scale",
             lambda: torch.ones(1, dtype=torch.float32, device=self.device),
         )
+        self.decode_seq_len_splits = envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.get()
+        if self.decode_seq_len_splits < 1:
+            raise ValueError(
+                "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
+                f"got {self.decode_seq_len_splits}"
+            )
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
@@ -1084,6 +1090,73 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         assert self.is_nvfp4_kvcache
         return self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
 
+    def _run_fixed_q_len_decode(
+        self,
+        query: torch.Tensor,
+        kv_cache,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        bmm1_scale,
+        bmm2_scale,
+        window_left: int,
+        sinks: Optional[torch.Tensor],
+        q_len_per_req: int = 1,
+        kv_cache_sf=None,
+    ) -> torch.Tensor:
+        """Run decode, optionally sorting and splitting requests by KV length."""
+
+        def run_group(group_query, group_block_tables, group_seq_lens):
+            kwargs = {}
+            if q_len_per_req != 1:
+                kwargs["q_len_per_req"] = q_len_per_req
+            return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=group_query,
+                kv_cache=kv_cache,
+                workspace_buffer=self.workspace_buffer,
+                block_tables=group_block_tables,
+                seq_lens=group_seq_lens,
+                max_seq_len=self.max_context_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                window_left=window_left,
+                sinks=sinks,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                out_dtype=self.q_data_type,
+                kv_cache_sf=kv_cache_sf,
+                multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+                **kwargs,
+            )
+
+        num_requests = seq_lens.shape[0]
+        num_splits = min(self.decode_seq_len_splits, num_requests)
+        if num_splits == 1:
+            return run_group(query, block_tables, seq_lens)
+
+        order = torch.argsort(seq_lens)
+        query_by_request = query.view(
+            num_requests, q_len_per_req, query.shape[-2], query.shape[-1]
+        )
+        output_by_request = torch.empty(
+            query_by_request.shape,
+            dtype=self.q_data_type,
+            device=query.device,
+        )
+        for indices in torch.tensor_split(order, num_splits):
+            group_output = run_group(
+                query_by_request.index_select(0, indices).reshape(
+                    -1, query.shape[-2], query.shape[-1]
+                ),
+                block_tables.index_select(0, indices),
+                seq_lens.index_select(0, indices),
+            )
+            output_by_request.index_copy_(
+                0,
+                indices,
+                group_output.view(-1, q_len_per_req, query.shape[-2], query.shape[-1]),
+            )
+        return output_by_request.view(-1, query.shape[-2], query.shape[-1])
+
     def _get_nvfp4_decode_kv_cache(self, layer: RadixAttention) -> tuple[
         tuple[torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor],
@@ -1170,21 +1243,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
-        o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=q,
-            kv_cache=kv_cache,
-            workspace_buffer=self.workspace_buffer,
-            block_tables=page_table,
-            seq_lens=self.forward_metadata.cache_seqlens_int32,
-            max_seq_len=self.max_context_len,
+        o = self._run_fixed_q_len_decode(
+            q,
+            kv_cache,
+            page_table,
+            self.forward_metadata.cache_seqlens_int32,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
-            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-            out_dtype=self.q_data_type,  # model_runner.dtype
             kv_cache_sf=kv_cache_block_scales,
-            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
         )
         if self.is_nvfp4_kvcache and o.dtype != self.q_data_type:
             o = o.to(self.q_data_type)
@@ -1344,21 +1412,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
             else:
-                o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                    query=q,
-                    kv_cache=kv_cache,
-                    workspace_buffer=self.workspace_buffer,
-                    block_tables=page_table,
-                    seq_lens=self.forward_metadata.cache_seqlens_int32,
-                    max_seq_len=self.max_context_len,
+                o = self._run_fixed_q_len_decode(
+                    q,
+                    kv_cache,
+                    page_table,
+                    self.forward_metadata.cache_seqlens_int32,
                     bmm1_scale=bmm1_scale,
                     bmm2_scale=bmm2_scale,
                     window_left=layer.sliding_window_size,
                     sinks=attention_sink,
-                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-                    out_dtype=self.q_data_type,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
-                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
         elif self.use_fmha_v2 and not cp_v2_active:
             # CP-v2 must go through cp_strategy.run_attention (per-shard

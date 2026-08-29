@@ -15,6 +15,7 @@ Usage:
     python -m pytest test_base_grammar_backend.py -v
 """
 
+import json
 import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
@@ -249,7 +250,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
         backend="none",
         reasoning_parser=None,
         enable_strict_thinking=False,
-        **fields
+        **fields,
     ):
         published = {
             "grammar_backend": backend,
@@ -464,6 +465,63 @@ class TestLlguidanceStructuralTagTriggerPairing(unittest.TestCase):
         )
         result = backend.dispatch_structural_tag(key)
         self.assertNotIsInstance(result, InvalidGrammarObject)
+
+
+class TestNulByteGrammarRejection(unittest.TestCase):
+    def setUp(self):
+        self.backend = BaseGrammarBackend()
+
+    def tearDown(self):
+        self.backend.executor.shutdown(wait=True)
+
+    def test_nul_payload_never_reaches_backend(self):
+        cases = [
+            ("regex", "\x00\x01\x02\x1f"),
+            ("regex", "\x00"),
+            # a non-leading NUL truncates the pattern instead of crashing; pinned
+            # so the guard cannot be narrowed to startswith()
+            ("regex", "a\x00b"),
+            ("ebnf", "root ::= \x00"),
+            ("structural_tag", '{"triggers": ["\x00"]}'),
+            # escaped forms: no raw NUL byte anywhere in the key string
+            ("json", '{"type":"string","pattern":"\\u0000"}'),
+            (
+                "json",
+                '{"type":"object","properties":'
+                '{"f":{"type":"string","pattern":"\\u0000x"}}}',
+            ),
+            ("structural_tag", '{"format":{"pattern":"\\u0000"}}'),
+        ]
+        for key_type, key_string in cases:
+            with self.subTest(key_type=key_type, key_string=repr(key_string)):
+                dispatch = MagicMock()
+                setattr(self.backend, f"dispatch_{key_type}", dispatch)
+
+                result = self.backend._init_value_dispatch(
+                    (key_type, key_string), False
+                )
+
+                self.assertIsInstance(result, InvalidGrammarObject)
+                dispatch.assert_not_called()
+
+    def test_nul_free_payload_still_dispatches(self):
+        cases = [
+            ("regex", "[0-9]+"),
+            ("regex", r"\x00"),  # escaped in the pattern text, not a raw NUL byte
+            ("regex", "\x01\x02\x1f"),  # other control bytes are not the trigger
+            ("json", json.dumps({"type": "string", "pattern": "[0-9]+"})),
+            # malformed json must reach the backend and get its normal error,
+            # not be swallowed by the NUL scan's decode failure
+            ("json", "{not valid json"),
+        ]
+        for key_type, key_string in cases:
+            with self.subTest(key_type=key_type, key_string=repr(key_string)):
+                dispatch = MagicMock(return_value=BaseGrammarObject())
+                setattr(self.backend, f"dispatch_{key_type}", dispatch)
+
+                self.backend._init_value_dispatch((key_type, key_string), False)
+
+                dispatch.assert_called_once_with(key_string)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,10 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
@@ -73,14 +76,9 @@ def create_kt_config_from_server_args(
     if server_args.kt_weight_path is None:
         return None
 
-    # Try to get num_layers from model config
-    num_layers = None
-    try:
-        hf_config = server_args.get_hf_config()
-        num_layers = getattr(hf_config, "num_hidden_layers", None)
-    except Exception:
-        # If we can't get the config, num_layers will be None
-        pass
+    num_layers = getattr(
+        server_args.get_model_config().hf_config, "num_hidden_layers", None
+    )
 
     return KTConfig(
         layer_idx=layer_idx,
@@ -88,7 +86,7 @@ def create_kt_config_from_server_args(
         cpuinfer_threads=server_args.kt_cpuinfer,
         threadpool_count=server_args.kt_threadpool_count,
         weight_path=server_args.kt_weight_path,
-        chunked_prefill_size=server_args.chunked_prefill_size,
+        chunked_prefill_size=get_schedule().chunked_prefill_size,
         method=server_args.kt_method,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
         num_layers=num_layers,

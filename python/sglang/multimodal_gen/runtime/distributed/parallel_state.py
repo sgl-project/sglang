@@ -56,6 +56,7 @@ from .group_coordinator import (
     PipelineGroupCoordinator,
     SequenceParallelGroupCoordinator,
     get_local_torch_device,
+    new_device_group,
 )
 
 logger = init_logger(__name__)
@@ -700,7 +701,16 @@ def model_parallel_is_initialized() -> bool:
 
 @contextmanager
 def use_tensor_parallel_group(tp_group: GroupCoordinator):
-    """Use one TP group consistently across diffusion and reused SRT modules."""
+    """Use one TP group consistently across diffusion and reused SRT modules.
+
+    The scope replaces the module globals that ``get_tp_group()`` and srt's
+    ``get_tp_group()`` / ``get_attention_tp_group()`` read, and — like srt's
+    ``patch_tensor_parallel_group`` — the three members the runtime context
+    answers with, so that a size read from the published bag cannot disagree
+    with a rank read from the swapped group.
+    """
+    from sglang.srt.runtime_context import get_parallel
+
     old_tp_group = get_tp_group()
     import sglang.srt.distributed.parallel_state as srt_parallel_state
 
@@ -711,7 +721,12 @@ def use_tensor_parallel_group(tp_group: GroupCoordinator):
     srt_parallel_state._TP = tp_group
     srt_parallel_state._ATTN_TP = tp_group
     try:
-        yield
+        with get_parallel().override(
+            tp_size=tp_group.world_size,
+            tp_rank=tp_group.rank_in_group,
+            tp_group=tp_group,
+        ):
+            yield
     finally:
         _TP = old_tp_group
         srt_parallel_state._TP = old_srt_tp_group
@@ -999,9 +1014,7 @@ def init_dit_group(
 ) -> None:
     global _DIT
     assert _DIT is None, "DIT group is already initialized"
-    _DIT = torch.distributed.new_group(
-        ranks=list(range(dit_parallel_size)), backend=backend
-    )
+    _DIT = new_device_group(list(range(dit_parallel_size)), backend)
 
 
 def get_dit_group() -> ProcessGroup:
@@ -1018,7 +1031,7 @@ def init_vae_group(
     global _VAE
     assert _VAE is None, "VAE parallel group is already initialized"
     vae_ranks = list(range(dit_parallel_size, dit_parallel_size + vae_parallel_size))
-    _VAE = torch.distributed.new_group(ranks=vae_ranks, backend=backend)
+    _VAE = new_device_group(vae_ranks, backend)
 
 
 def destroy_model_parallel() -> None:

@@ -5,13 +5,12 @@ import threading
 from typing import Optional
 
 import numpy as np
-import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.mem_cache.pool_host.base import (
-    HICACHE_HOST_MEMORY_RESERVE_BYTES,
     HostKVCache,
+    host_memory_budget_bytes,
     sync_fixed_hicache_size,
     synchronized,
 )
@@ -96,9 +95,8 @@ class MambaPoolHost(HostKVCache):
                 device_pool.size,
             )
 
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_memory_budget_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "

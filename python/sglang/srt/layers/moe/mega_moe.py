@@ -15,8 +15,9 @@
 
 from __future__ import annotations
 
+import functools
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -42,26 +43,43 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
-_MEGA_MOE_DG_ENV_APPLIED = False
 
 
-def _apply_mega_moe_dg_env() -> None:
-    """Forward sglang's FP4/MXF4 opt-in flags to DeepGEMM via env vars.
+@functools.lru_cache(maxsize=1)
+def _mega_moe_max_num_sms() -> Optional[int]:
+    if _device_sm < 100:
+        # The SM90 MegaMoE implementation does not use the whole-grid clustered
+        # launch that needs a residency margin.
+        return None
 
-    DeepGEMM reads `DG_USE_FP4_ACTS` (and `DG_USE_MXF4_KIND`) at host-function
-    call time — both `get_symm_buffer_for_mega_moe` and `fp8_fp4_mega_moe`.
-    Forwarding once at first use is sufficient (these are static config
-    flags, not per-request state) and matches the `setdefault` pattern so
-    explicit `DG_USE_*` overrides from outside still win.
-    """
-    global _MEGA_MOE_DG_ENV_APPLIED
-    if _MEGA_MOE_DG_ENV_APPLIED:
+    # Physical count, not deep_gemm.get_num_sms(): two-batch overlap and the DSA
+    # indexer reconfigure that process-wide, so reserving on top would compound.
+    num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
+    reserved_num_sms = max(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(), 0)
+    return max(2, num_sms - reserved_num_sms)
+
+
+@contextmanager
+def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+    max_num_sms = _mega_moe_max_num_sms()
+    if max_num_sms is None:
+        yield
         return
-    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get():
-        os.environ.setdefault("DG_USE_FP4_ACTS", "1")
-    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND.get():
-        os.environ.setdefault("DG_USE_MXF4_KIND", "1")
-    _MEGA_MOE_DG_ENV_APPLIED = True
+
+    current_num_sms = deep_gemm.get_num_sms()
+    # Stay under an outer context's budget instead of claiming SMs back from it.
+    target_num_sms = min(max_num_sms, current_num_sms)
+    # Round down: the clustered launch needs an even CTA count.
+    target_num_sms -= target_num_sms % 2
+    if target_num_sms == current_num_sms:
+        yield
+        return
+
+    deep_gemm.set_num_sms(target_num_sms)
+    try:
+        yield
+    finally:
+        deep_gemm.set_num_sms(current_num_sms)
 
 
 def _get_mega_moe_symm_buffer(
@@ -73,8 +91,6 @@ def _get_mega_moe_symm_buffer(
     intermediate_hidden: int,
 ) -> SymmBuffer:
     import deep_gemm
-
-    _apply_mega_moe_dg_env()
 
     key = (
         id(group),
@@ -232,7 +248,7 @@ def _run_mega_routed(
             num_tokens,
         )
 
-    use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
+    use_fp4_acts = os.getenv("DG_USE_FP4_ACTS") == "1"
     if use_fp4_acts:
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
@@ -269,16 +285,17 @@ def _run_mega_routed(
         device=hidden_states.device,
     )
     swiglu_limit = getattr(moe.config, "swiglu_limit", None)
-    deep_gemm.fp8_fp4_mega_moe(
-        y,
-        moe.experts.mega_l1_weights,
-        moe.experts.mega_l2_weights,
-        buf,
-        recipe=(1, 1, 32),
-        activation="swiglu",
-        activation_clamp=swiglu_limit,
-        fast_math=True,
-    )
+    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+        deep_gemm.fp8_fp4_mega_moe(
+            y,
+            moe.experts.mega_l1_weights,
+            moe.experts.mega_l2_weights,
+            buf,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=swiglu_limit,
+            fast_math=True,
+        )
     y = y[:num_tokens]
 
     if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
