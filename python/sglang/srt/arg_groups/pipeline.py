@@ -94,9 +94,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.validation_hook import (
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
+        validate_prefill_max_requests,
     )
 
     validate_prefill_decode_interval(server_args)
+    validate_prefill_max_requests(server_args)
 
     # Reject an explicitly enabled but incompatible hardware runtime before
     # model path resolution, downloads, or the dummy-model short circuit.
