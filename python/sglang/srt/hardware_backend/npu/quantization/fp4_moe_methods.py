@@ -490,7 +490,7 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
         hidden_states,
         group_index=group_list,
         alpha=1,
-        limit=layer.moe_runner_config.swiglu_limit
+        limit=layer.moe_runner_config.swiglu_limit,
         bias=0,
         interleaved=False,
     )
