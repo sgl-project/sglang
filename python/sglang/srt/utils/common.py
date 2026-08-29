@@ -102,7 +102,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_model,
-    get_observability,
     get_parallel,
     get_spec,
 )
@@ -2340,7 +2339,9 @@ def configure_logger(server_args, prefix: str = ""):
     maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
     format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
     logging.basicConfig(
-        level=getattr(logging, get_observability().log_level.upper()),
+        # Runs before publish, and for multimodal_gen's ServerArgs, which
+        # never publishes these bags -- so the record, not the bag.
+        level=getattr(logging, server_args.log_level.upper()),
         format=format,
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
