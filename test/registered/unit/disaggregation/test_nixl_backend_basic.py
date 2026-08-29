@@ -535,6 +535,92 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertIn(room, mgr.req_to_decode_prefix_len)
         mgr.send_kvcache.assert_called_once()
 
+    def test_dcp_destinations_use_disjoint_pack_regions_before_chunk_barrier(self):
+        room = 23
+        mgr = self._make_manager(room)
+        agents = ("agent0a", "agent0b", "agent1")
+        dcp_ranks = (0, 0, 1)
+        mgr.transfer_infos[room] = {
+            agent: TransferInfo(
+                room=room,
+                endpoint="127.0.0.1",
+                dst_port=5555 + i,
+                agent_name=agent,
+                dst_kv_indices=np.array([2 + i], dtype=np.int32),
+                dst_aux_index=0,
+                required_dst_info_num=len(agents),
+                dst_state_indices=[],
+            )
+            for i, agent in enumerate(agents)
+        }
+        mgr.decode_kv_args_table = {
+            agent: SimpleNamespace(
+                decode_tp_size=len(agents),
+                dst_kv_ptrs=[0x3000 + i * 0x100],
+                dst_aux_ptrs=[0],
+                gpu_id=0,
+                staging_base_ptr=0,
+                staging_total_size=0,
+                kv_xfer_segments=None,
+                dst_homogeneous_mem_kind="VRAM",
+                requires_dcp_relayout=True,
+                dst_dcp_size=2,
+                dst_dcp_rank=dcp_rank,
+                dcp_dst_region_indices=[0],
+                dcp_token_item_lens=[4],
+            )
+            for i, (agent, dcp_rank) in enumerate(zip(agents, dcp_ranks))
+        }
+        mgr.kv_args = SimpleNamespace(
+            engine_rank=0,
+            kv_data_ptrs=[0x1000],
+            page_size=4,
+        )
+        mgr._dcp_pack_buffers = [SimpleNamespace(get_size=lambda: 16)]
+
+        packed_rank0 = ([0x9000], np.arange(2, dtype=np.int64))
+        packed_rank1 = ([0x9008], np.arange(2, dtype=np.int64))
+        try_pack = MagicMock(side_effect=[packed_rank0, packed_rank1])
+        dcp_pack_module = types.ModuleType("sglang.srt.disaggregation.common.dcp_pack")
+        dcp_pack_module.try_pack_dcp_src = try_pack
+        submitted = []
+
+        def send_kvcache_dcp(*args, **kwargs):
+            submitted.append((args[0], args[-1]))
+            return f"handle-{args[0]}"
+
+        mgr.send_kvcache_dcp = MagicMock(side_effect=send_kvcache_dcp)
+        submitted_counts_at_poll = []
+
+        def check_xfer_state(_handle):
+            submitted_counts_at_poll.append(len(submitted))
+            return "DONE"
+
+        mgr.agent = SimpleNamespace(check_xfer_state=check_xfer_state)
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+        chunk.num_kv_tokens = 4
+
+        with patch.dict(
+            sys.modules,
+            {"sglang.srt.disaggregation.common.dcp_pack": dcp_pack_module},
+        ):
+            self._run_worker_once(mgr, chunk)
+
+        self.assertEqual(try_pack.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["pack_offset_bytes"] for call in try_pack.call_args_list],
+            [0, 8],
+        )
+        self.assertEqual(
+            submitted,
+            [
+                ("agent0a", packed_rank0),
+                ("agent0b", packed_rank0),
+                ("agent1", packed_rank1),
+            ],
+        )
+        self.assertEqual(submitted_counts_at_poll, [3, 3, 3])
+
 
 class TestNixlNotifications(CustomTestCase):
     def _make_manager(self, messages, required=None):
@@ -612,6 +698,7 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver.init_time = None
         receiver.conclude_state = None
         receiver.abort_notified = False
+        receiver._connection_pool_entries = {}
         return receiver, mgr
 
     def test_returns_existing_conclude_state_without_polling_manager(self):
@@ -787,16 +874,16 @@ class TestNixlStaging(CustomTestCase):
         agent = StagingFakeAgent(register_result=["staging"])
         mgr = self._make_manager(agent)
 
-        mgr._register_staging_memory(0x1000, 4096, 3)
+        mgr._register_staging_memory(0x1000, 4096)
 
         self.assertEqual(
             agent.register_memory_calls,
-            [([(0x1000, 4096, 3, "")], "VRAM")],
+            [([(0x1000, 4096, 1, "")], "VRAM")],
         )
 
         mgr = self._make_manager(StagingFakeAgent(register_result=[]))
         with self.assertRaisesRegex(RuntimeError, "staging buffer"):
-            mgr._register_staging_memory(0x1000, 4096, 3)
+            mgr._register_staging_memory(0x1000, 4096)
 
     def test_prefetch_staging_reqs_noops_when_disabled_or_missing_kv_buffers(self):
         mgr = self._make_manager()
