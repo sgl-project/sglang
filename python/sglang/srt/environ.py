@@ -960,6 +960,19 @@ class Envs:
     # ===================================================================
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
+    # A-B kill-switch for Work-Centric (Lean) Attention. When True, forces the
+    # standard Triton decode kernel even if --enable-lean-attention or the auto-gate
+    # would select Lean. Used to isolate the Lean kernel in benchmarks.
+    SGLANG_DISABLE_LEAN_ATTENTION = EnvBool(False)
+    # Persistent-grid size multiplier for the Lean decode kernel:
+    # total_programs = round(device_CU_count * this). Default 1.0 (one CTA per CU), which
+    # maximizes KV work-tiles per CTA and minimizes the cross-CTA combine/atomic reduction.
+    # Kernel + E2E A/B sweeps found 1.0 beats 2.0 across uniform and ragged configs on both
+    # MI300X (gfx942) and MI355X (gfx950) — 2.0 oversubscribed the CUs and regressed high-batch
+    # decode. Exposed as a knob (e.g. set 2.0) for grid A/B tuning without a rebuild.
+    SGLANG_FORCE_LEAN_GRID_CU_MULT = EnvFloat(1.0)
+
+    # Torch Compile
     # Compact extend-attention query-tile grid: AMD/HIP-only optimization
     # (parity with flash-attn's ragged-aware launch). The feature checks _is_hip
     # explicitly in code; this env var allows override (0=force off, 1=force on).
