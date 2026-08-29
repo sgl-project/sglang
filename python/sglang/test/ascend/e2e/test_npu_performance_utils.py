@@ -166,6 +166,9 @@ GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH = (
 )
 GLM_5_1_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.1-w4a8"
 GLM_5_2_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w4a8"
+GLM_5_2_0610_PROVIDER_W4A8_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-0610-Provider-w4a8"
+)
 MINIMAX_M2_5_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
 )
@@ -192,12 +195,8 @@ KIMI_K2_6_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/Kimi-K2
 KIMI_K2_6_EAGLE3_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/lightseekorg/kimi-k2.6-eagle3"
 )
-KIMI_K3_W4A8_MODEL_PATH = (
-    "/root/.cache/modelscope/hub/models/sgl-npu/Kimi-K3-W4A8"
-)
-KIMI_K3_DSPARK_MODEL_PATH = (
-    "/root/.cache/modelscope/hub/models/RadixArk/Kimi-K3-DSpark"
-)
+KIMI_K3_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/sgl-npu/Kimi-K3-W4A8"
+KIMI_K3_DSPARK_MODEL_PATH = "/root/.cache/modelscope/hub/models/RadixArk/Kimi-K3-DSpark"
 GLM_4_6V_FLASH_MODEL_PATH = "/root/.cache/modelscope/hub/models/ZhipuAI/GLM-4.6V-Flash"
 QWEN3_VL_8B_THINKING_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Qwen/Qwen3-VL-8B-Thinking"
