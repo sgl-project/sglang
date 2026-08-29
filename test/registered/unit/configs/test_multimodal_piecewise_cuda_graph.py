@@ -9,6 +9,7 @@ from sglang.srt.arg_groups.model_hook import handle_model_capability_adjustments
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.model_config import (
+    AttentionArch,
     is_multimodal_piecewise_cuda_graph_supported,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -109,6 +110,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             is_multimodal_piecewise_cuda_graph_supported=True,
             is_multimodal=False,
             is_multimodal_breakable_cuda_graph_supported=False,
+            attention_arch=AttentionArch.MLA,
             hf_config=SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
         )
         args.cuda_graph_config = CudaGraphConfig(
@@ -116,12 +118,9 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         )
         args._cuda_graph_config_locked = set()
 
-        with (
-            patch(
-                "sglang.srt.arg_groups.overrides.attention_backends_of",
-                return_value=("trtllm_mla", "trtllm_mla"),
-            ),
-            patch("sglang.srt.arg_groups.overrides.use_mla_backend", return_value=True),
+        with patch(
+            "sglang.srt.arg_groups.overrides.attention_backends_of",
+            return_value=("trtllm_mla", "trtllm_mla"),
         ):
             apply_cuda_graph_compatibility(args)
 

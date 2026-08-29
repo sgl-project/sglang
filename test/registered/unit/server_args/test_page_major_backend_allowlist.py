@@ -30,9 +30,10 @@ under its own default configuration.
 """
 
 import unittest
-from unittest import mock
+from types import SimpleNamespace
 
 from sglang.srt.arg_groups.kv_cache_hook import handle_page_major_kv_layout
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -67,18 +68,18 @@ def _accepts(
         "mamba_backend": "triton",
     }.items():
         object.__setattr__(sa, name, value)
-    # `use_mla_backend` asks the model configuration, which this stand-in has
-    # no room for; the case under test is what the handler does with the answer.
-    # The handler imports it inside the function, so the source module is
-    # where the patch has to go.
-    with mock.patch(
-        "sglang.srt.arg_groups.overrides.use_mla_backend", return_value=use_mla
-    ):
-        try:
-            handle_page_major_kv_layout(sa)
-            return True
-        except AssertionError:
-            return False
+    object.__setattr__(
+        sa,
+        "_model_config",
+        SimpleNamespace(
+            attention_arch=AttentionArch.MLA if use_mla else AttentionArch.MHA
+        ),
+    )
+    try:
+        handle_page_major_kv_layout(sa)
+        return True
+    except AssertionError:
+        return False
 
 
 class TestPageMajorBackendAllowlist(unittest.TestCase):

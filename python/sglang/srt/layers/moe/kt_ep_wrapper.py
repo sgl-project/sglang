@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import (
     get_exec,
@@ -76,8 +77,6 @@ def create_kt_config_from_server_args(
     """
     if get_exec().moe.kt_weight_path is None:
         return None
-
-    from sglang.srt.arg_groups.overrides import model_config_of
 
     num_layers = getattr(
         model_config_of(server_args).hf_config, "num_hidden_layers", None

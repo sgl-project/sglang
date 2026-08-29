@@ -9,6 +9,7 @@ from typing import Any
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolving_view,
+    use_mla_backend,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,7 +69,6 @@ def handle_hicache_ratio_default(server_args: Any):
 
 
 def resolve_hicache_dcp_compatibility(server_args: Any):
-    from sglang.srt.arg_groups.overrides import use_mla_backend
 
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
