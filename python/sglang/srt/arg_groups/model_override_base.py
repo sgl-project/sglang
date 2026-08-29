@@ -344,3 +344,33 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
             return "torch_native"
         else:
             return "triton"
+
+
+def _dspark_verify_on_decode_backend(
+    backend: Optional[str], q_len: int, kv_cache_dtype: Optional[str]
+) -> bool:
+    """Whether the MLA decode backend can serve a q_len-wide target verify."""
+    if backend == "trtllm_mla":
+        return True
+    if backend == "tokenspeed_mla":
+        return kv_cache_dtype == "fp8_e4m3" and q_len <= 8
+    if backend == "cutedsl_mla":
+        # cute-dsl monolithic MLA decode folds the verify tokens into the head
+        # dim (fold_sq), so it serves any DSPARK verify width. Needs flashinfer
+        # >= 0.6.15 (older builds reject q_len >= 5).
+        return True
+    return False
+
+
+def _is_mxfp4_pack_quantized(hf_config: Any) -> bool:
+    qc = getattr(
+        getattr(hf_config, "text_config", hf_config), "quantization_config", None
+    )
+    if not isinstance(qc, dict):
+        return False
+    groups = qc.get("config_groups") or {}
+    return any(
+        "mxfp4" in str(g.get("format", ""))
+        for g in groups.values()
+        if isinstance(g, dict)
+    )
