@@ -62,6 +62,22 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
+class _ReceiveRegistrationRunner:
+    """Run encoder receive-URL registration off the scheduler thread."""
+
+    def __init__(self, name: str):
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run, daemon=True, name=name)
+        self.thread.start()
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def submit(self, coroutine):
+        return asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+
+
 def _mark_keep_device_embedding(mm_inputs) -> None:
     """Tell general_mm_embed_routine not to copy embeddings back to CPU."""
     if mm_inputs is None:
@@ -356,15 +372,15 @@ def _normalize_embedding_ports(embedding_port):
     return [embedding_port]
 
 
-def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
+async def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
     import grpc
     from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
-    channel = grpc.insecure_channel(target)
+    channel = grpc.aio.insecure_channel(target)
     stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
     try:
-        stub.SchedulerReceiveUrl(
+        await stub.SchedulerReceiveUrl(
             sglang_encoder_pb2.SchedulerReceiveUrlRequest(
                 req_id=req_id,
                 receive_url=receive_url,
@@ -373,7 +389,7 @@ def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
             timeout=timeout_secs,
         )
     finally:
-        channel.close()
+        await channel.close()
 
 
 def _grpc_encode_request(target, encode_request):
@@ -871,6 +887,7 @@ class WaitingMMRequestBase(ABC):
         embedding_pool: Optional["EmbeddingPool"] = None,
         zmq_context=None,
         embedding_port=None,
+        registration_runner: Optional[_ReceiveRegistrationRunner] = None,
     ):
         self.rid = rid
         self.recv_req = recv_req
@@ -907,6 +924,10 @@ class WaitingMMRequestBase(ABC):
         # Success-path finalizer handle so abort can release the slot early.
         self._mm_finalizer: Optional[weakref.finalize] = None
         self._pool_full_warned = False
+        self.registration_runner = registration_runner
+        self.registration_future = None
+        self.registration_error = None
+        self.registration_lock = threading.Lock()
 
     @abstractmethod
     def send_encode_request(self) -> None:
@@ -914,6 +935,15 @@ class WaitingMMRequestBase(ABC):
 
     def _try_recv_mm_data(self):
         if self.status != WaitingMMRequestStatus.PENDING:
+            return
+
+        with self.registration_lock:
+            registration_error, self.registration_error = (
+                self.registration_error,
+                None,
+            )
+        if registration_error is not None:
+            self._fail_and_release(*registration_error)
             return
 
         # A complete request can remain pending while the GPU pool is full.
@@ -983,7 +1013,7 @@ class WaitingMMRequestBase(ABC):
         self.error_msg = error_msg
         self.error_code = error_code
         self.status = WaitingMMRequestStatus.FAIL
-        self._cleanup_gpu_buffer()
+        self.release_resources()
         self.close_recv_socket()
 
     async def _check_encoder_responses(self, responses, endpoint: str) -> bool:
@@ -1084,6 +1114,12 @@ class WaitingMMRequestBase(ABC):
 
     def release_resources(self):
         """Free pool/GPU resources on abort/fail/timeout. Idempotent."""
+        registration_future, self.registration_future = (
+            self.registration_future,
+            None,
+        )
+        if registration_future is not None and not registration_future.done():
+            registration_future.cancel()
         self._cleanup_gpu_buffer()
         finalizer, self._mm_finalizer = self._mm_finalizer, None
         if finalizer is not None:
@@ -1093,8 +1129,37 @@ class WaitingMMRequestBase(ABC):
 # For zmq_to_scheduler: embedding parts arrive as ZMQ payload frames and
 # are optionally staged into the GPU EmbeddingPool.
 class WaitingZmqRequest(WaitingMMRequestBase):
-    def send_encode_request(self):
+    def _start_registration(self, coroutine) -> None:
+        if self.registration_runner is None:
+            coroutine.close()
+            self._fail_and_release(
+                "Encoder receive registration runner is unavailable",
+                int(HTTPStatus.INTERNAL_SERVER_ERROR),
+            )
+            return
 
+        self.registration_future = self.registration_runner.submit(coroutine)
+        self.registration_future.add_done_callback(self._on_registration_done)
+
+    def _on_registration_done(self, future) -> None:
+        if future.cancelled():
+            return
+        error = future.exception()
+        if error is None:
+            return
+        logger.error(
+            "Failed to register encoder receive URL for rid=%s: %s",
+            self.rid,
+            error,
+            exc_info=error,
+        )
+        with self.registration_lock:
+            self.registration_error = (
+                f"Failed to register receive URL with encoder: {error}",
+                int(HTTPStatus.BAD_GATEWAY),
+            )
+
+    def send_encode_request(self):
         async def _send_single_request(session, url, payload):
             try:
                 async with session.post(url, json=payload) as response:
@@ -1132,7 +1197,7 @@ class WaitingZmqRequest(WaitingMMRequestBase):
                         encoder_url = self.encoder_urls[idx]
                         target_url = f"{encoder_url}/scheduler_receive_url"
                         payload = {
-                            "req_id": part_req_id,  # use part_req_id to match encode request
+                            "req_id": part_req_id,
                             "receive_count": receive_count,
                             "receive_url": NetworkAddress(
                                 host_name, embedding_port
@@ -1170,15 +1235,9 @@ class WaitingZmqRequest(WaitingMMRequestBase):
                         logger.debug(f"Request {i} succeeded.")
                 failed = [r for r in results if isinstance(r, BaseException)]
                 if failed:
-                    # A rank without a registered receive URL can never be
-                    # pushed to; fail via the normal completion path now
-                    # instead of pending until the embedding wait times out.
-                    self._fail_and_release(
-                        f"Failed to register receive URL with encoder: {failed[0]!r}",
-                        int(HTTPStatus.BAD_GATEWAY),
-                    )
+                    raise failed[0]
 
-        asyncio.run(
+        self._start_registration(
             send_embedding_port(
                 self.recv_req.rid,
                 self.receive_count,
@@ -1259,8 +1318,7 @@ class WaitingZmqRequestGrpc(WaitingZmqRequest):
                 target_url = f"{encoder_url}/SchedulerReceiveUrl"
                 logger.info(f"Preparing to send to {target_url}")
                 tasks.append(
-                    asyncio.to_thread(
-                        _grpc_scheduler_receive_url,
+                    _grpc_scheduler_receive_url(
                         _grpc_target(encoder_url),
                         req_id,
                         receive_url,
@@ -1279,8 +1337,11 @@ class WaitingZmqRequestGrpc(WaitingZmqRequest):
                     logger.error(f"Request {i} failed: {result}")
                 else:
                     logger.debug(f"Request {i} succeeded.")
+            failed = [r for r in results if isinstance(r, BaseException)]
+            if failed:
+                raise failed[0]
 
-        asyncio.run(
+        self._start_registration(
             send_embedding_port(
                 self.recv_req.rid,
                 self.receive_count,
@@ -1819,12 +1880,16 @@ class MMReceiverBase(ABC):
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingMMRequestBase] = []
         self.waiting_by_rid: Dict[str, WaitingMMRequestBase] = {}
+        self.registration_runner = None
         self.scheduler_embedding_port = None
         self.scheduler_recv_socket = None
         if (
             self.encoder_transfer_backend == "zmq_to_scheduler"
             and scheduler is not None
         ):
+            self.registration_runner = _ReceiveRegistrationRunner(
+                f"encoder-receive-registration-{tp_rank}"
+            )
             (
                 self.scheduler_embedding_port,
                 self.scheduler_recv_socket,
@@ -2580,7 +2645,10 @@ class MMReceiverHTTP(MMReceiverBase):
                 embedding_pool=self.embedding_pool,
             )
         return self._process_waiting_requests(
-            recv_reqs, WaitingZmqRequest, embedding_pool=self.embedding_pool
+            recv_reqs,
+            WaitingZmqRequest,
+            embedding_pool=self.embedding_pool,
+            registration_runner=self.registration_runner,
         )
 
     async def encode(
@@ -2709,7 +2777,11 @@ class MMReceiverGrpc(MMReceiverBase):
 
     # For zmq_to_scheduler
     def process_waiting_requests(self, recv_reqs):
-        return self._process_waiting_requests(recv_reqs, WaitingZmqRequestGrpc)
+        return self._process_waiting_requests(
+            recv_reqs,
+            WaitingZmqRequestGrpc,
+            registration_runner=self.registration_runner,
+        )
 
     async def encode(
         self,
