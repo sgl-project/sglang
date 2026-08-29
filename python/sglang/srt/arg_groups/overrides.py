@@ -3297,6 +3297,16 @@ def max_prefill_buffer_tokens(server_args: Any) -> int:
     return tokens
 
 
+try:
+    from sglang.kernels.ops.attention.fla.chunk_delta_h import (
+        CHUNK_SIZE as FLA_CHUNK_SIZE,
+    )
+except ImportError:
+    # Kept guarded so this module stays importable without the kernel package.
+    # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE.
+    FLA_CHUNK_SIZE = 64
+
+
 def _max_conv_state_window(hf_config: Any) -> int:
     """Widest conv sliding window over a hybrid model's conv states, or 0.
 
@@ -3322,7 +3332,7 @@ def _max_conv_state_window(hf_config: Any) -> int:
     return 0
 
 
-def _short_conv_cache_chunk_size(hf_config: Any, fla_chunk_size: int) -> int:
+def _short_conv_cache_chunk_size(hf_config: Any) -> int:
     """Radix caching granularity for a model with no chunked recurrence.
 
     A short-conv model reports ``mamba_chunk_size == 1``, honest about the model
@@ -3331,9 +3341,10 @@ def _short_conv_cache_chunk_size(hf_config: Any, fla_chunk_size: int) -> int:
 
     Use the generic FLA chunk instead, raised to clear the widest conv window --
     the extend-side snapshot gathers ``window`` rows ending at the aligned
-    position -- and rounded up to a whole number of ``fla_chunk_size`` so the
+    position -- and rounded up to a whole number of ``FLA_CHUNK_SIZE`` so the
     caller's page-size divisibility assert still holds.
     """
+    fla_chunk_size = FLA_CHUNK_SIZE
     floor = _max_conv_state_window(hf_config) + 1
     num_chunks = max(1, -(-floor // fla_chunk_size))
     return fla_chunk_size * num_chunks
@@ -3351,14 +3362,6 @@ def mamba_cache_chunk_size(server_args: Any) -> int:
 
     if not hasattr(server_args, "_mamba_cache_chunk_size"):
 
-        try:
-            from sglang.kernels.ops.attention.fla.chunk_delta_h import (
-                CHUNK_SIZE as FLA_CHUNK_SIZE,
-            )
-        except ImportError:
-            # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE
-            FLA_CHUNK_SIZE = 64
-
         hf_config = model_config_of(server_args).hf_config
         # The *caching* chunk, not the model's chunk-scan length. For an SSM
         # the two coincide (a scan checkpoints at chunk boundaries anyway).
@@ -3369,7 +3372,7 @@ def mamba_cache_chunk_size(server_args: Any) -> int:
         if scan_chunk_size > 1:
             chunk_size = scan_chunk_size
         else:
-            chunk_size = _short_conv_cache_chunk_size(hf_config, FLA_CHUNK_SIZE)
+            chunk_size = _short_conv_cache_chunk_size(hf_config)
         page_size = resolved_view(server_args).page_size
         assert (
             max(chunk_size, page_size) % min(chunk_size, page_size) == 0
