@@ -154,7 +154,8 @@ class CommonKVManager(BaseKVManager):
         self.kv_args = args
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_item_lens_sum = sum(args.kv_item_lens)
-        self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
+        self.state_item_lens_sums = [sum(comp) for comp in args.state_item_lens]
+        self.state_item_lens_sum = sum(self.state_item_lens_sums)
         self.is_mla_backend = is_mla_backend
         # Per-sender fan-out of a KV copy onto N decode destinations
         # (MLA under Prefill-CP + Decode-TP, or decode_tp > prefill_tp).
@@ -244,6 +245,7 @@ class CommonKVManager(BaseKVManager):
             # Deferred KV release: aborted room -> (decode_ip, decode_port);
             # ack held until the transfer drains.
             self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
+            self._deferred_ack_send_failures: Dict[int, int] = defaultdict(int)
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
@@ -266,6 +268,7 @@ class CommonKVManager(BaseKVManager):
             # drained. Entry exists only while the room is held, so a stale/late
             # ack for a reused bootstrap_room is dropped.
             self._deferred_abort_ack_tracker: Dict[int, Set[int]] = {}
+            self._receiver_armed_abort_rooms: Set[int] = set()
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
@@ -372,6 +375,10 @@ class CommonKVManager(BaseKVManager):
                 return
             self.request_status[bootstrap_room] = status
         else:
+            if self.request_status[bootstrap_room] == KVPoll.Failed:
+                # Failure is terminal. A worker that was already past its abort
+                # check must not resurrect the room with a late Success.
+                return
             if status == KVPoll.Failed:
                 self.request_status[bootstrap_room] = KVPoll.Failed
             else:
@@ -386,7 +393,20 @@ class CommonKVManager(BaseKVManager):
     def register_deferred_abort_room(self, bootstrap_room: int) -> None:
         """Arm drain-ack accounting for a held room; a fresh set wipes stale acks
         from a prior request that reused this bootstrap_room."""
+        # A receiver arms before sending ABORT so a synchronous ack cannot be
+        # lost. The scheduler's historical post-send registration must then be
+        # idempotent instead of wiping that ack.
+        if bootstrap_room in getattr(self, "_receiver_armed_abort_rooms", ()):
+            return
         self._deferred_abort_ack_tracker[bootstrap_room] = set()
+
+    def arm_deferred_abort_room(self, bootstrap_room: int) -> None:
+        """Reset stale state for a new owner and arm before notifying prefill."""
+        armed = getattr(self, "_receiver_armed_abort_rooms", None)
+        if armed is None:
+            armed = self._receiver_armed_abort_rooms = set()
+        self._deferred_abort_ack_tracker[bootstrap_room] = set()
+        armed.add(bootstrap_room)
 
     def note_abort_ack(self, bootstrap_room: int, prefill_rank: int) -> None:
         """Record a prefill rank's drain ack (decode receiver thread). Only counts
@@ -404,6 +424,7 @@ class CommonKVManager(BaseKVManager):
 
     def clear_deferred_abort_state(self, bootstrap_room: int) -> None:
         self._deferred_abort_ack_tracker.pop(bootstrap_room, None)
+        getattr(self, "_receiver_armed_abort_rooms", set()).discard(bootstrap_room)
 
     def _prefill_unique_rank(self) -> int:
         """Stable per-sender id, matching what the transfer worker syncs on Success."""
@@ -413,8 +434,8 @@ class CommonKVManager(BaseKVManager):
             + self.attn_cp_rank
         )
 
-    def _send_abort_ack(self, decode_ip: str, decode_port: int, room: int) -> None:
-        """Best-effort ack that this rank's transfer for an aborted room drained."""
+    def _send_abort_ack(self, decode_ip: str, decode_port: int, room: int) -> bool:
+        """Ack that this rank drained; return success so failures remain retryable."""
         try:
             na = NetworkAddress(decode_ip, decode_port)
             self._send_multipart_locked(
@@ -426,24 +447,62 @@ class CommonKVManager(BaseKVManager):
                 ],
                 is_ipv6=na.is_ipv6,
             )
+            return True
         except Exception as e:
-            logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
+            failures = getattr(self, "_deferred_ack_send_failures", None)
+            if failures is None:
+                failures = self._deferred_ack_send_failures = defaultdict(int)
+            failures[room] = failures.get(room, 0) + 1
+            logger.warning(
+                "Failed to send drained ABORT_ACK for room %s (attempt %s): %s",
+                room,
+                failures[room],
+                e,
+            )
+            return False
 
     def _maybe_ack_drained_abort(self, room: int) -> None:
-        """Send the deferred ack once an aborted room's chunks have drained
-        (outstanding == 0). pop() makes it fire at most once."""
+        """Send a drained ack; retain the target until delivery succeeds."""
         if self._staging_outstanding.get(room, 0) > 0:
             return
-        target = self._deferred_ack_targets.pop(room, None)
+        target = self._deferred_ack_targets.get(room)
         if target is not None:
-            self._send_abort_ack(target[0], target[1], room)
+            # Older/test transports return None after a successful send. Only an
+            # explicit False means delivery failed and should remain retryable.
+            delivered = self._send_abort_ack(target[0], target[1], room)
+            if delivered is False:
+                return
+            if self._deferred_ack_targets.get(room) == target:
+                self._deferred_ack_targets.pop(room, None)
+                getattr(self, "_deferred_ack_send_failures", {}).pop(room, None)
+
+    def retry_deferred_abort_acks(self) -> None:
+        for room in list(self._deferred_ack_targets):
+            self._maybe_ack_drained_abort(room)
+
+    def handle_deferred_abort_notification(
+        self, room: int, decode_ip: str, decode_port: int
+    ) -> bool:
+        """Stop an active room and retain an ack target through source drain."""
+        room_active = (
+            room in self.request_status and self.check_status(room) != KVPoll.Success
+        )
+        if room_active:
+            self.update_status(room, KVPoll.Failed)
+        # A Success room can still have the worker between its last write and
+        # outstanding cleanup. It must also retain the ack target until zero.
+        self.register_deferred_ack_target(room, decode_ip, decode_port)
+        self._maybe_ack_drained_abort(room)
+        return room_active
 
     def register_deferred_ack_target(
         self, room: int, decode_ip: str, decode_port: int
     ) -> None:
-        """Hold this room's ack until its transfer drains. Callers must mark the
-        room Failed FIRST -- registering while it still accepts chunks lets the
-        worker ack, then a new chunk writes pages the decode already released."""
+        """Hold this room's ack until its transfer drains.
+
+        Active rooms must be marked Failed first. Already-Success rooms remain
+        terminal but still need this target while their final worker cleanup runs.
+        """
         self._deferred_ack_targets[room] = (decode_ip, decode_port)
 
     def get_kv_replica_factor(self) -> int:
@@ -1193,7 +1252,7 @@ class CommonKVSender(BaseKVSender):
         self.conclude_state: Optional[KVPoll] = None
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
-        self._transfer_num_state_indices = 0
+        self._transfer_num_state_indices: List[int] = []
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
@@ -1256,8 +1315,21 @@ class CommonKVSender(BaseKVSender):
 
     def get_transfer_metric(self) -> KVTransferMetric:
         total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
-        total_bytes += (
-            self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
+        state_counts = self._transfer_num_state_indices
+        if isinstance(state_counts, int):
+            state_counts = [state_counts] if state_counts else []
+        state_item_lens_sums = getattr(
+            self.kv_mgr,
+            "state_item_lens_sums",
+            [getattr(self.kv_mgr, "state_item_lens_sum", 0)],
+        )
+        if len(state_counts) > len(state_item_lens_sums):
+            raise RuntimeError(
+                "Transfer metric state component count exceeds registered layout: "
+                f"counts={len(state_counts)}, components={len(state_item_lens_sums)}"
+            )
+        total_bytes += sum(
+            count * state_item_lens_sums[i] for i, count in enumerate(state_counts)
         )
         # Pinned to 1 for MHA (disjoint slices); only MLA replication makes it > 1.
         total_bytes *= self.kv_mgr.get_kv_replica_factor()
@@ -1271,9 +1343,16 @@ class CommonKVSender(BaseKVSender):
     ):
         self._transfer_num_kv_indices += len(kv_indices)
         if state_indices:
-            for component_indices in state_indices:
+            if isinstance(self._transfer_num_state_indices, int):
+                old_count = self._transfer_num_state_indices
+                self._transfer_num_state_indices = [old_count] if old_count else []
+            if len(self._transfer_num_state_indices) < len(state_indices):
+                self._transfer_num_state_indices.extend(
+                    [0] * (len(state_indices) - len(self._transfer_num_state_indices))
+                )
+            for i, component_indices in enumerate(state_indices):
                 if component_indices is not None:
-                    self._transfer_num_state_indices += len(component_indices)
+                    self._transfer_num_state_indices[i] += len(component_indices)
 
     def _prepare_send_indices(
         self,
@@ -1377,6 +1456,13 @@ class CommonKVReceiver(BaseKVReceiver):
         self.init_time: Optional[float] = None
         self.abort_notified: bool = False
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
+        if (
+            getattr(self.kv_mgr, "enable_deferred_decode_kv_release", False)
+            and self.bootstrap_room is not None
+        ):
+            # Explicit slot/room reuse boundary. Any prior owner must already
+            # have released before this receiver is constructed.
+            self.kv_mgr.clear_deferred_abort_state(self.bootstrap_room)
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
@@ -1639,6 +1725,10 @@ class CommonKVReceiver(BaseKVReceiver):
             self.abort_notified = True
 
     def _send_abort_notification(self):
+        if getattr(self.kv_mgr, "enable_deferred_decode_kv_release", False):
+            # Arm before the first socket send. A loopback/mock or a quiescent
+            # prefill can acknowledge synchronously.
+            self.kv_mgr.arm_deferred_abort_room(self.bootstrap_room)
         for bootstrap_info in self.bootstrap_infos:
             # Best-effort notification to prefill side that this request was aborted.
             try:

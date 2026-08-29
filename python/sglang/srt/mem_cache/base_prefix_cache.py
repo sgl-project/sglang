@@ -57,6 +57,16 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # Qwen compact DFlash only. Internal cache maintenance rematches must not
+    # retain a restore pin; admission matches keep the default behavior.
+    pin_dflash_restore: bool = True
+
+    # Internal cache maintenance rematches transfer ownership of target FULL
+    # and MAMBA rows back to the request, but never restore draft KV.  They must
+    # therefore ignore DRAFT coverage while normal admission keeps requiring
+    # FULL+MAMBA+DRAFT consensus.
+    require_dflash_draft: bool = True
+
 
 @dataclasses.dataclass
 class InsertParams:
@@ -70,6 +80,12 @@ class InsertParams:
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None
+
+    # Device-only Qwen DFlash radix content rows. The tensor covers the
+    # contiguous token interval beginning at draft_start_seqlen.
+    draft_value: Optional[torch.Tensor] = None
+    draft_start_seqlen: int = 0
+    draft_processed: Optional[torch.Tensor] = None
 
     # SWA specific
     prev_prefix_len: int = 0
@@ -103,6 +119,7 @@ class EvictParams:
     num_tokens: int = 0
     swa_num_tokens: int = 0
     mamba_num: int = 0
+    draft_num_tokens: int = 0
 
 
 @dataclasses.dataclass
@@ -112,6 +129,7 @@ class EvictResult:
     num_tokens_evicted: int = 0
     swa_num_tokens_evicted: int = 0
     mamba_num_evicted: int = 0
+    draft_num_tokens_evicted: int = 0
 
 
 @dataclasses.dataclass
@@ -207,16 +225,26 @@ class MatchResult(NamedTuple):
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
     full_kv_hit_length: int = 0
+    # RID owning a short-lived DFlash content pin, if one was acquired.
+    dflash_match_rid: Optional[str] = None
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
 
 
 def zero_match_result(
-    tree_cache, match_result: MatchResult, extra_key: Optional[str] = None
+    tree_cache,
+    match_result: MatchResult,
+    extra_key: Optional[str] = None,
+    rid: Optional[str] = None,
 ) -> MatchResult:
     if tree_cache.is_chunk_cache():
         # Chunk caches' match_prefix already returns a miss; no root_node to walk back to.
         return match_result
+    rid = rid if rid is not None else match_result.dflash_match_rid
+    if rid is not None:
+        release_pin = getattr(tree_cache, "release_dflash_draft_match_pin", None)
+        if release_pin is not None:
+            release_pin(rid)
     root = tree_cache.root_node_handle(extra_key=extra_key)
     return match_result._replace(
         # [:0] keeps dtype and device of the original tensor (e.g. CUDA int64)
@@ -229,6 +257,7 @@ def zero_match_result(
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
+        dflash_match_rid=None,
     )
 
 

@@ -1609,6 +1609,76 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
+class TestDFlashCompactCacheArgs(CustomTestCase):
+    def test_compact_cache_cli_round_trip(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--speculative-dflash-compact-cache",
+                "--speculative-draft-window-size",
+                "2048",
+                "--speculative-dflash-radix-sidecar-tokens",
+                "4097",
+            ]
+        )
+        self.assertTrue(args.speculative_dflash_compact_cache)
+        self.assertEqual(args.speculative_draft_window_size, 2048)
+        self.assertEqual(args.speculative_dflash_radix_sidecar_tokens, 4097)
+
+    def test_compact_cache_requires_dflash(self):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "EAGLE"
+        args.speculative_dflash_compact_cache = True
+        args.speculative_draft_window_size = 2048
+        with self.assertRaisesRegex(ValueError, "requires.*DFLASH"):
+            handle_speculative_decoding(args)
+
+    def test_compact_cache_requires_window(self):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "DFLASH"
+        args.speculative_dflash_compact_cache = True
+        args.speculative_draft_window_size = None
+        with self.assertRaisesRegex(ValueError, "requires.*draft-window-size"):
+            handle_speculative_decoding(args)
+
+    def test_dflash_radix_sidecar_defaults_off(self):
+        args = ServerArgs(model_path="dummy")
+        self.assertEqual(args.speculative_dflash_radix_sidecar_tokens, 0)
+
+    def test_dflash_radix_sidecar_rejects_negative_cap(self):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_dflash_radix_sidecar_tokens = -1
+        with self.assertRaisesRegex(ValueError, "must be nonnegative"):
+            handle_speculative_decoding(args)
+
+    def test_dflash_radix_sidecar_requires_compact_cache(self):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "DFLASH"
+        args.speculative_draft_window_size = 2048
+        args.speculative_dflash_radix_sidecar_tokens = 4096
+        with self.assertRaisesRegex(ValueError, "requires.*compact-cache"):
+            handle_speculative_decoding(args)
+
+    def test_dflash_radix_sidecar_accepts_confirmed_interface(self):
+        args = ServerArgs(model_path="dummy")
+        args.device = "cuda"
+        args.speculative_algorithm = "DFLASH"
+        args.speculative_draft_model_path = "dummy-draft"
+        args.speculative_num_draft_tokens = 8
+        args.speculative_draft_window_size = 2048
+        args.speculative_dflash_compact_cache = True
+        args.speculative_dflash_radix_sidecar_tokens = 4096
+
+        with patch(
+            "sglang.srt.arg_groups.speculative_hook._resolve_speculative_algorithm_alias",
+            return_value="DFLASH",
+        ):
+            handle_speculative_decoding(args)
+
+        self.assertEqual(args.speculative_dflash_radix_sidecar_tokens, 4096)
+
+
 class TestDecoupledSpecArgs(CustomTestCase):
     """Decoupled speculative-decoding CLI flags.
 

@@ -327,6 +327,85 @@ def rebuild_compact_draft_req_to_token_func(
 
 
 @triton.jit
+def rebuild_compact_physical_draft_req_to_token(
+    draft_req_to_token,
+    req_pool_indices,
+    suffix_start,
+    draft_prefix_lens,
+    physical_out_cache_loc,
+    physical_loc_stride,
+    draft_pool_len: tl.constexpr,
+    owner_span: tl.constexpr,
+    guard_rows: tl.constexpr,
+    window_size: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    """Build the chronological draft view directly from bounded physical IDs.
+
+    Committed prefix positions use the owner's modulo ring. Verify positions
+    use the owner's disjoint stable scratch rows and are also returned to the
+    caller. The fixed grid and device-side lengths avoid a decode-path D2H sync.
+    """
+    BLOCK: tl.constexpr = 256
+    pid = tl.program_id(axis=0)
+    req = tl.load(req_pool_indices + pid).to(tl.int64)
+    start = tl.load(suffix_start + pid).to(tl.int64)
+    prefix_len = tl.load(draft_prefix_lens + pid).to(tl.int64)
+    total = prefix_len + block_size
+
+    owner_base = (req - 1) * owner_span
+    committed_base = owner_base + guard_rows
+    scratch_base = committed_base + window_size
+    dst_row = draft_req_to_token + req * draft_pool_len
+    physical_row = physical_out_cache_loc + pid * physical_loc_stride
+
+    offs = tl.arange(0, BLOCK).to(tl.int64)
+    num_loop = tl.cdiv(total, BLOCK)
+    for i in range(num_loop):
+        col = offs + i * BLOCK
+        in_prefix = col < prefix_len
+        in_block = (col >= prefix_len) & (col < total)
+        committed = committed_base + (start + col) % window_size
+        scratch_offset = col - prefix_len
+        scratch = scratch_base + scratch_offset
+        value = tl.where(in_prefix, committed, scratch)
+        tl.store(dst_row + col, value, mask=in_prefix | in_block)
+        tl.store(
+            physical_row + scratch_offset,
+            scratch,
+            mask=in_block,
+        )
+
+
+def rebuild_compact_physical_draft_req_to_token_func(
+    *,
+    draft_req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    suffix_start: torch.Tensor,
+    draft_prefix_lens: torch.Tensor,
+    physical_out_cache_loc_2d: torch.Tensor,
+    batch_size: int,
+    block_size: int,
+    owner_span: int,
+    guard_rows: int,
+    window_size: int,
+) -> None:
+    rebuild_compact_physical_draft_req_to_token[(batch_size,)](
+        draft_req_to_token,
+        req_pool_indices,
+        suffix_start,
+        draft_prefix_lens,
+        physical_out_cache_loc_2d,
+        physical_out_cache_loc_2d.stride(0),
+        draft_req_to_token.shape[1],
+        owner_span,
+        guard_rows,
+        window_size,
+        block_size,
+    )
+
+
+@triton.jit
 def assign_extend_cache_locs(
     req_pool_indices,
     req_to_token,
