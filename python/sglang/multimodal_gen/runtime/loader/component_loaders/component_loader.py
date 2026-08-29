@@ -198,7 +198,8 @@ class ComponentLoader(ABC):
             component_name=component_attn_name,
             allow_global_backend_fallback=allow_global_backend_fallback,
             require_component_backend_selection=(
-                not server_args.is_component_attention_backend_automatic(
+                attn_backend is None
+                or not server_args.is_component_attention_backend_automatic(
                     component_attn_name
                 )
             ),
@@ -225,7 +226,8 @@ class ComponentLoader(ABC):
             component_name=component_attn_name,
             allow_global_backend_fallback=allow_global_backend_fallback,
             require_component_backend_selection=(
-                not server_args.is_component_attention_backend_automatic(
+                attn_backend is None
+                or not server_args.is_component_attention_backend_automatic(
                     component_attn_name
                 )
             ),
