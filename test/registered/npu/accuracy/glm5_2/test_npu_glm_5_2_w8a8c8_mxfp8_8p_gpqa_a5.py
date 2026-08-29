@@ -5,7 +5,7 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    GLM_5_2_0610_PROVIDER_W4A8_MODEL_PATH,
+    GLM_5_2_W8A8C8_MXFP8_MODEL_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -76,11 +76,11 @@ GLM_5_2_W4A8_8P_A5_OTHER_ARGS = [
 ]
 
 
-class TestNPUGLM_5_2_W4A8_8P_GPQA_A5(TestNpuAccuracyTestCaseBase):
-    """Test NPU accuracy for GLM-5.2-0610-Provider-w4a8 8p A5 GPQA."""
+class TestNPUGLM_5_2_W8A8C8_MXFP8_8P_GPQA_A5(TestNpuAccuracyTestCaseBase):
+    """Test NPU accuracy for GLM-5___2-W8A8C8-mxfp8 8p A5 GPQA."""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    model = GLM_5_2_0610_PROVIDER_W4A8_MODEL_PATH
+    model = GLM_5_2_W8A8C8_MXFP8_MODEL_PATH
     other_args = GLM_5_2_W4A8_8P_A5_OTHER_ARGS
     envs = GLM_5_2_W4A8_8P_A5_ENVS
     accuracy = 0.912
@@ -91,8 +91,8 @@ class TestNPUGLM_5_2_W4A8_8P_GPQA_A5(TestNpuAccuracyTestCaseBase):
     stream = True
     seed = 1
 
-    def test_npu_glm_5_2_w4a8_8p_gpqa_a5(self):
-        """Run NPU accuracy test for GLM-5.2-0610-Provider-w4a8 8p A5 GPQA."""
+    def test_npu_glm_5_2_w8a8c8_mxfp8_8p_gpqa_a5(self):
+        """Run NPU accuracy test for GLM-5___2-W8A8C8-mxfp8 8p A5 GPQA."""
         self.run_accuracy()
 
 
