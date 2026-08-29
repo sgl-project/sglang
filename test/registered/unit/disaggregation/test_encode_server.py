@@ -7,11 +7,15 @@ from unittest.mock import AsyncMock, patch
 import numpy as np
 import torch
 
+import sglang.srt.disaggregation.encoder.server as encoder_server
+from sglang.srt.disaggregation.encoder import http_server
+from sglang.srt.disaggregation.encoder import runtime as encoder_runtime
 from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessor
 from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
 from sglang.srt.disaggregation.encoder.runtime import execute_encode_pipeline
 from sglang.srt.disaggregation.encoder.server import (
     EncoderDelivery,
+    EncoderMetaRegistry,
     InternalError,
     MMEncoder,
     MooncakeDelivery,
@@ -29,6 +33,85 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class TestEncoderMetaRegistry(CustomTestCase):
+    def test_send_retries_do_not_release_before_all_destinations_finish(self):
+        async def run():
+            registry = EncoderMetaRegistry(wait_timeout=1, sweep_timeout=1)
+            released = AsyncMock()
+            registry.on_release = released
+
+            await registry.note_send_done("req", 2, "10.0.0.1:5000")
+            await registry.note_send_done("req", 2, "10.0.0.1:5000")
+            released.assert_not_awaited()
+
+            await registry.note_send_done("req", 2, "10.0.0.2:5000")
+            released.assert_awaited_once_with("req")
+
+        asyncio.run(run())
+
+    def test_http_send_counts_the_normalized_destination(self):
+        async def run():
+            send = AsyncMock(return_value=True)
+            note_send_done = AsyncMock()
+            request = {
+                "req_id": "req",
+                "prefill_host": "127.0.0.1",
+                "embedding_port": 5000,
+                "session_id": "session",
+                "buffer_address": 1234,
+                "receive_count": 2,
+            }
+            with (
+                patch.object(http_server, "dp_dispatcher", None),
+                patch.object(http_server, "encoder", SimpleNamespace(send=send)),
+                patch.object(
+                    encoder_server.meta_registry,
+                    "note_send_done",
+                    note_send_done,
+                ),
+            ):
+                response = await http_server.handle_send_request(request)
+
+            self.assertEqual(response.status_code, 200)
+            note_send_done.assert_awaited_once_with("req", 2, "127.0.0.1:5000")
+
+        asyncio.run(run())
+
+    def test_dp_send_counts_the_normalized_destination(self):
+        async def run():
+            encoder = SimpleNamespace(send=AsyncMock(return_value=True))
+            note_send_done = AsyncMock()
+            request = {
+                "req_id": "req",
+                "prefill_host": "127.0.0.1",
+                "embedding_port": 5000,
+                "session_id": "session",
+                "buffer_address": 1234,
+                "receive_count": 2,
+            }
+            with (
+                patch.object(encoder_runtime, "async_sock_send", AsyncMock()),
+                patch.object(
+                    encoder_server.meta_registry,
+                    "note_send_done",
+                    note_send_done,
+                ),
+            ):
+                await encoder_runtime._dp_worker_handle_request(
+                    encoder,
+                    None,
+                    object(),
+                    asyncio.Lock(),
+                    0,
+                    request,
+                    "send",
+                )
+
+            note_send_done.assert_awaited_once_with("req", 2, "127.0.0.1:5000")
+
+        asyncio.run(run())
 
 
 class TestEncoderPreprocessorKimiGrid(CustomTestCase):

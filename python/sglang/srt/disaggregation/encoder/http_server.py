@@ -394,7 +394,12 @@ async def handle_send_request(request: dict):
     # No count means a pre-refcount decoder: leave it to the sweep, as when
     # some rank never sends at all.
     if receive_count:
-        await server_module.meta_registry.note_send_done(req_id, receive_count)
+        destination_endpoint = NetworkAddress(
+            request["prefill_host"], request["embedding_port"]
+        ).to_host_port_str()
+        await server_module.meta_registry.note_send_done(
+            req_id, receive_count, destination_endpoint
+        )
     return ORJSONResponse(content=None)
 
 

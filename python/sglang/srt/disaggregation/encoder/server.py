@@ -117,7 +117,7 @@ class EncoderMetaRegistry:
         # Backstop for state whose /send calls never all land.
         self.sweep_timeout = sweep_timeout
         self._rid_to_meta: Dict[str, dict] = {}
-        self._rid_to_send_done: Dict[str, int] = {}
+        self._rid_to_send_done: Dict[str, Set[str]] = {}
         self._pending_at: Dict[str, float] = {}
         self._sweeper_task: Optional[asyncio.Task] = None
         # Set only where the embedding also lives; None in the DP main process.
@@ -187,12 +187,15 @@ class EncoderMetaRegistry:
             )
         return self._rid_to_meta.get(req_id)
 
-    async def note_send_done(self, req_id: str, receive_count: int) -> None:
-        """Count one completed ``/send``; release everything at receive_count."""
+    async def note_send_done(
+        self, req_id: str, receive_count: int, destination_endpoint: str
+    ) -> None:
+        """Count one destination once; release after every receiver has sent."""
         async with rid_lock:
-            count = self._rid_to_send_done.get(req_id, 0) + 1
-            self._rid_to_send_done[req_id] = count
-        if count >= receive_count:
+            completed = self._rid_to_send_done.setdefault(req_id, set())
+            completed.add(destination_endpoint)
+            all_done = len(completed) >= receive_count
+        if all_done:
             await self._release(req_id)
 
     async def _release(self, req_id: str) -> None:

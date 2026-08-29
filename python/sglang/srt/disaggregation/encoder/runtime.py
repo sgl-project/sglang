@@ -1300,7 +1300,12 @@ async def _dp_worker_handle_request(
             # a pre-refcount decoder: stay eager rather than pin until the sweep.
             receive_count = request.get("receive_count")
             if receive_count:
-                await server_module.meta_registry.note_send_done(req_id, receive_count)
+                destination_endpoint = NetworkAddress(
+                    request["prefill_host"], request["embedding_port"]
+                ).to_host_port_str()
+                await server_module.meta_registry.note_send_done(
+                    req_id, receive_count, destination_endpoint
+                )
             else:
                 await enc.release_request(req_id)
             content = None
