@@ -33,12 +33,12 @@ def test_reconstruct_indices_from_tree_mask():
             0,
             0,
             1,
-            0,
+            1,
             1,
             0,
             1,
             0,
-            1,
+            0,
             1,
         ],
         device="cuda",
@@ -60,16 +60,16 @@ def test_reconstruct_indices_from_tree_mask():
         [0, 1, 2, 3],
     ], f"{retrive_index=}"
     assert retrive_next_token.tolist() == [
-        [1, -1, 3, -1],
+        [1, 2, -1, -1],
     ], f"{retrive_next_token=}"
     assert retrive_next_sibling.tolist() == [
-        [-1, 2, -1, -1],
+        [-1, 3, -1, -1],
     ], f"{retrive_next_sibling=}"
     assert positions.tolist() == [
         12,
         13,
-        13,
         14,
+        13,
     ], f"{positions=}"
 
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -14,6 +15,24 @@ namespace sglang {
 
 namespace ngram {
 
+enum class GlobalTreeMode : int64_t {
+  DISABLED = 0,
+  PATH_PROBABILITY = 1,
+  SPECIFICITY_PATH_PROBABILITY = 2,
+};
+
+inline const char* globalTreeModeName(GlobalTreeMode mode) {
+  switch (mode) {
+    case GlobalTreeMode::DISABLED:
+      return "disabled";
+    case GlobalTreeMode::PATH_PROBABILITY:
+      return "path_probability";
+    case GlobalTreeMode::SPECIFICITY_PATH_PROBABILITY:
+      return "specificity_path_probability";
+  }
+  return "unknown";
+}
+
 struct Param {
   bool enable;
   bool enable_router_mode;
@@ -24,6 +43,7 @@ struct Param {
   size_t external_sam_budget = 0;
   size_t external_corpus_max_tokens = 10000000;
   std::string match_type;
+  GlobalTreeMode global_tree_mode = GlobalTreeMode::DISABLED;
 
   std::vector<size_t> batch_draft_token_num;
 
@@ -97,7 +117,8 @@ struct Param {
        << ", min_bfs_breadth = " << min_bfs_breadth << ", max_bfs_breadth = " << max_bfs_breadth
        << ", max_trie_depth = " << max_trie_depth << ", draft_token_num = " << draft_token_num
        << ", external_sam_budget = " << external_sam_budget
-       << ", external_corpus_max_tokens = " << external_corpus_max_tokens << ", match_type = " << match_type;
+       << ", external_corpus_max_tokens = " << external_corpus_max_tokens << ", match_type = " << match_type
+       << ", global_tree_mode = " << globalTreeModeName(global_tree_mode);
     ss << ", batch_draft_token_num(" << batch_draft_token_num.size() << ") = ";
     for (int i = 0; i < batch_draft_token_num.size(); ++i) {
       ss << i << "|" << batch_draft_token_num[i] << ",";

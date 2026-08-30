@@ -766,16 +766,13 @@ class TestReconstructIndicesFromTreeMask(CustomTestCase):
 
         bs, draft_token_num = 2, 4
         seq_lens = torch.tensor([12, 5], dtype=torch.int64)
-        # Request 0: root(0) -> {1, 2}, 2 -> 3 (golden case from
-        # python/sglang/kernels/aot/tests/speculative/test_ngram_utils.py).
-        # Request 1: plain chain 0 -> 1 -> 2 -> 3.
         tree_mask = torch.tensor(
             # fmt: off
             [
                 1, 0, 0, 0,
                 1, 1, 0, 0,
-                1, 0, 1, 0,
-                1, 0, 1, 1,
+                1, 1, 1, 0,
+                1, 0, 0, 1,
 
                 1, 0, 0, 0,
                 1, 1, 0, 0,
@@ -802,11 +799,14 @@ class TestReconstructIndicesFromTreeMask(CustomTestCase):
         )
 
         self.assertEqual(retrieve_index.tolist(), [[0, 1, 2, 3], [4, 5, 6, 7]])
-        self.assertEqual(retrieve_next_token.tolist(), [[1, -1, 3, -1], [1, 2, 3, -1]])
         self.assertEqual(
-            retrieve_next_sibling.tolist(), [[-1, 2, -1, -1], [-1, -1, -1, -1]]
+            retrieve_next_token.tolist(), [[1, 2, -1, -1], [1, 2, 3, -1]]
         )
-        self.assertEqual(positions.tolist(), [12, 13, 13, 14, 5, 6, 7, 8])
+        self.assertEqual(
+            retrieve_next_sibling.tolist(),
+            [[-1, 3, -1, -1], [-1, -1, -1, -1]],
+        )
+        self.assertEqual(positions.tolist(), [12, 13, 14, 13, 5, 6, 7, 8])
 
 
 class TestFillKernels(CustomTestCase):

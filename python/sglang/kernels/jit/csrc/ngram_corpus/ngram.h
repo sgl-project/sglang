@@ -86,6 +86,14 @@ class Ngram {
   }
 
  private:
+  Result batchMatchGlobalTree_(
+      const std::vector<int64_t>& state_ids,
+      const std::vector<std::vector<int32_t>>& tokens,
+      const std::vector<size_t>& total_lens);
+  Result batchMatchLegacy_(
+      const std::vector<int64_t>& state_ids,
+      const std::vector<std::vector<int32_t>>& tokens,
+      const std::vector<size_t>& total_lens);
   void insertWorker();
 };
 

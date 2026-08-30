@@ -7,6 +7,7 @@
 #include <functional>
 #include <list>
 #include <new>
+#include <optional>
 #include <set>
 #include <tuple>
 #include <unordered_map>
@@ -24,6 +25,7 @@ struct TrieNode {
   TrieNode* parent;
   std::list<TrieNode*> lru;
   int32_t freq = 0;
+  uint64_t outgoing_freq_sum = 0;
   // Logical generation of this TrieNode. retireNode() bumps it before the node
   // goes back to the pool so stale NodeRefs fail validation after reuse.
   // Starts at 1 so that a default-constructed NodeRef (version=0) never
@@ -55,6 +57,20 @@ struct MatchState {
   std::vector<NodeRef> anchors;
 };
 
+class Trie;
+
+struct TrieAnchor {
+  const Trie* trie = nullptr;
+  const TrieNode* state = nullptr;
+  int32_t matched_length = 0;
+};
+
+struct TrieFrequencyTransition {
+  int32_t token = 0;
+  const TrieNode* state = nullptr;
+  uint64_t mass = 0;
+};
+
 class Trie {
  public:
   Trie(size_t capacity, const Param& param);
@@ -79,6 +95,12 @@ class Trie {
       MatchState& state,
       size_t total_len) const;
 
+  std::optional<TrieAnchor>
+  longestExpandableMatch(const int32_t* context, size_t len, MatchState& state, size_t total_len) const;
+
+  uint64_t
+  frequencyTransitions(const TrieNode* state, size_t max_breadth, std::vector<TrieFrequencyTransition>& ranked) const;
+
   void squeeze(size_t count);
 
   void reset();
@@ -88,8 +110,7 @@ class Trie {
   // this request, infer the newly appended suffix from (`context`, `total_len`)
   // and advance anchors incrementally; otherwise rebuild the cached anchors from
   // `context`. Returns only the suffix matches that are currently expandable.
-  std::vector<std::pair<const TrieNode*, int32_t>>
-  match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const;
+  std::vector<TrieAnchor> match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const;
   // Recompute all cached anchors from the current tail. After this, for every
   // d in [1, min(len, max_trie_depth)], anchors[d - 1] represents the suffix of
   // length d ending at context[len - 1].
@@ -103,7 +124,7 @@ class Trie {
   // MatchState keeps all live suffix matches, including leaves. This helper
   // filters the cached anchors down to the suffixes that currently have children and
   // therefore can seed BFS / PROB draft construction.
-  std::vector<std::pair<const TrieNode*, int32_t>> getExpandableAnchors_(const MatchState& state) const;
+  std::vector<TrieAnchor> getExpandableAnchors_(const MatchState& state) const;
   // Resolve a cached NodeRef back to a live trie node. nullptr means the
   // cached location went stale and the caller should rebuild from context.
   const TrieNode* resolve(const MatchState& state, const NodeRef& ref) const;

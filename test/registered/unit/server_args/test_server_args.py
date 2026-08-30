@@ -1608,6 +1608,31 @@ class TestNgramExternalSamArgs(CustomTestCase):
             handle_speculative_decoding(args)
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
+    def test_global_tree_mode_does_not_require_legacy_sam_budget(self):
+        args = self._make_dummy_ngram_args(
+            speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
+            speculative_ngram_external_sam_budget=0,
+            speculative_ngram_global_tree_mode="path_probability",
+        )
+        handle_speculative_decoding(args)
+        self.assertEqual(
+            args.speculative_ngram_global_tree_mode, "path_probability"
+        )
+
+    def test_global_tree_mode_cli_round_trip(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--speculative-ngram-global-tree-mode",
+                "specificity_path_probability",
+            ]
+        )
+        self.assertEqual(
+            args.speculative_ngram_global_tree_mode,
+            "specificity_path_probability",
+        )
+
 
 class TestDecoupledSpecArgs(CustomTestCase):
     """Decoupled speculative-decoding CLI flags.

@@ -2315,6 +2315,17 @@ class ServerArgs:
     speculative_ngram_match_type: A[
         Literal["BFS", "PROB"], "The match type for cache tree.", NS("spec")
     ] = "BFS"
+    speculative_ngram_global_tree_mode: A[
+        Literal[
+            "disabled",
+            "path_probability",
+            "specificity_path_probability",
+        ],
+        "Experimental global Trie/SAM proposal allocation mode. The disabled "
+        "default preserves fixed source budgets and the configured BFS/PROB path; "
+        "enabled modes use source-local occurrence probabilities.",
+        NS("spec"),
+    ] = "disabled"
     speculative_ngram_max_trie_depth: A[
         int, "The max trie depth for ngram speculative decoding.", NS("spec")
     ] = 18
@@ -2328,7 +2339,8 @@ class ServerArgs:
     ] = None
     speculative_ngram_external_sam_budget: A[
         int,
-        "Number of draft nodes reserved for the external SAM subtree in ngram speculative decoding.",
+        "Number of draft nodes reserved for external SAMs by legacy fixed "
+        "allocation. Experimental global tree modes ignore this value.",
         NS("spec"),
     ] = 0
     speculative_ngram_external_corpus_max_tokens: A[
