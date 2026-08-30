@@ -47,7 +47,10 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4TokenToKVPool,
+    use_dsv4_dspark_draft_swa_sidecar,
+)
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -1128,6 +1131,17 @@ class KVCacheConfigurator:
         else:
             pool_cls = DeepSeekV4TokenToKVPool
 
+        draft_swa_scratch_width = 0
+        if (
+            self.is_draft_worker
+            and use_dsv4_dspark_draft_swa_sidecar(
+                self.server_args, self.spec_algorithm
+            )
+        ):
+            draft_swa_scratch_width = max(
+                (max_speculative_num_draft_tokens() or 0) - 1, 0
+            )
+
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,
             # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
@@ -1155,6 +1169,7 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            draft_swa_scratch_width=draft_swa_scratch_width,
         )
         return token_to_kv_pool
 

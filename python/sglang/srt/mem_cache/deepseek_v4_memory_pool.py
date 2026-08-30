@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
@@ -22,13 +23,121 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_spec
-from sglang.srt.utils import ceil_div, is_hip
+from sglang.srt.utils import ceil_align, ceil_div, is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
+
+def get_dsv4_packed_kv_bytes_per_token(
+    *, qk_nope_head_dim: int, qk_rope_head_dim: int
+) -> int:
+    """Bytes per token in the packed DSV4 SWA/compressed KV layout."""
+    return (
+        int(qk_nope_head_dim)
+        + int(qk_rope_head_dim) * torch.bfloat16.itemsize
+        + int(qk_nope_head_dim) // 64
+        + 1
+    )
+
+
+@dataclass(frozen=True)
+class DraftSWASidecarLayout:
+    """Physical split between cache-owned draft SWA and step-local scratch."""
+
+    committed_size: int
+    scratch_width: int
+    num_req_slots: int
+    page_size: int
+    scratch_base: int
+    physical_size: int
+    committed_pages: int
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        committed_size: int,
+        scratch_width: int,
+        num_req_slots: int,
+        page_size: int,
+    ) -> "DraftSWASidecarLayout":
+        committed_size = int(committed_size)
+        scratch_width = int(scratch_width)
+        num_req_slots = int(num_req_slots)
+        if scratch_width < 0:
+            raise ValueError(f"scratch_width must be non-negative, got {scratch_width}.")
+        committed_pages = (committed_size + page_size + 1) // page_size
+        if scratch_width == 0:
+            return cls(
+                committed_size=committed_size,
+                scratch_width=0,
+                num_req_slots=num_req_slots,
+                page_size=page_size,
+                scratch_base=0,
+                physical_size=committed_size,
+                committed_pages=committed_pages,
+            )
+        # Keep the complete allocator guard page on the committed side. HiCache
+        # exposes exactly committed_pages, so scratch must begin after that view.
+        scratch_base = committed_pages * page_size
+        return cls(
+            committed_size=committed_size,
+            scratch_width=scratch_width,
+            num_req_slots=num_req_slots,
+            page_size=page_size,
+            scratch_base=scratch_base,
+            physical_size=scratch_base + num_req_slots * scratch_width - 1,
+            committed_pages=committed_pages,
+        )
+
+    @property
+    def has_scratch(self) -> bool:
+        return self.scratch_width > 0
+
+    def scratch_locs(
+        self, req_pool_indices: torch.Tensor, block_size: int
+    ) -> torch.Tensor:
+        if not self.has_scratch:
+            raise RuntimeError("DSV4 draft SWA scratch is not enabled.")
+        if block_size > self.scratch_width:
+            raise ValueError(
+                f"Draft block size {block_size} exceeds scratch width "
+                f"{self.scratch_width}."
+            )
+        offsets = torch.arange(
+            block_size, dtype=torch.int64, device=req_pool_indices.device
+        )
+        return (
+            self.scratch_base
+            + req_pool_indices.to(torch.int64).unsqueeze(1) * self.scratch_width
+            + offsets.unsqueeze(0)
+        ).reshape(-1)
+
+
+def use_dsv4_dspark_draft_swa_sidecar(server_args, spec_algorithm) -> bool:
+    """Resolve the rollout flag without silently weakening cache semantics."""
+    if not spec_algorithm.is_dspark():
+        return False
+
+    requested = getattr(
+        server_args, "speculative_dspark_draft_swa_sidecar", None
+    )
+    unsupported_reason = None
+    if is_npu():
+        unsupported_reason = "NPU uses a separate DSV4 cache implementation"
+
+    if unsupported_reason is not None:
+        if requested is True:
+            raise NotImplementedError(
+                "DSV4 DSpark draft SWA sidecar was explicitly enabled, but "
+                f"{unsupported_reason}."
+            )
+        return False
+    return requested is not False
 
 
 def get_compress_state_ring_size(
@@ -104,13 +213,10 @@ class DeepSeekV4SingleKVPool(KVCache):
                 ]
 
     def get_bytes_per_token(self) -> int:
-        dim_per_token = (
-            self.qk_nope_head_dim
-            + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
-            + self.qk_nope_head_dim // self.quantize_block_size
-            + self.scale_pad
+        return get_dsv4_packed_kv_bytes_per_token(
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
         )
-        return dim_per_token
 
     def create_buffer(self, *, num_pages: int):
         bytes_per_token = self.get_bytes_per_token()
@@ -399,7 +505,7 @@ class DeepSeekV4UnifiedKVPool:
     """
     Layout:
     unified_kv[L]: ``[swa_pages + padded_compress_rows, head_dim]`` bf16
-    - rows ``[0, swa_pages)``   = SWA ring (``req_pool_indices * swa_window + pos % swa_window``)
+    - rows ``[0, swa_pages)``   = SWA ring or draft sidecar + scratch
     - rows ``[swa_pages, ...)`` = compressed (``swa_pages + page_index``)
     """
 
@@ -418,11 +524,16 @@ class DeepSeekV4UnifiedKVPool:
         memory_saver_adapter,
         custom_mem_pool,
         swa_ring_size: int,
+        swa_rows: Optional[int] = None,
     ):
         self.swa_ring_size = swa_ring_size
         self.head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.num_slots = num_slots
-        self.swa_pages = num_slots * self.swa_ring_size
+        self.swa_pages = (
+            int(swa_rows)
+            if swa_rows is not None
+            else num_slots * self.swa_ring_size
+        )
         self.num_blocks = num_blocks
         self.page_size = page_size
         self.k_per_block = dict(self.K_PER_BLOCK)
@@ -488,9 +599,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
+        draft_swa_scratch_width: int = 0,
     ):
+        resolved_num_req_slots = (
+            num_req_slots if num_req_slots is not None else max_num_reqs + 1
+        )
+        self.draft_swa_layout = DraftSWASidecarLayout.build(
+            committed_size=swa_size,
+            scratch_width=draft_swa_scratch_width,
+            num_req_slots=resolved_num_req_slots,
+            page_size=swa_page_size,
+        )
+        physical_swa_size = self.draft_swa_layout.physical_size
+
         super().__init__(
-            swa_size,
+            physical_swa_size,
             page_size,
             dtype,
             layer_num,
@@ -512,9 +635,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # SWA ring needs one slot per addressable req_pool_idx. PD decode inflates
         # req_to_token past max_num_reqs (pre-alloc), so the caller passes the real
         # capacity; sizing as max_num_reqs+1 overflows ("length out of range").
-        self.num_req_slots = (
-            num_req_slots if num_req_slots is not None else max_num_reqs + 1
-        )
+        self.num_req_slots = resolved_num_req_slots
         self.c4_size = c4_size
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
@@ -558,7 +679,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert page_size % swa_page_size == 0
         self.sliding_window = sliding_window
 
-        self.swa_size = swa_size
+        # Allocator/radix/HiCache capacity excludes the appended step workspace.
+        self.swa_size = self.draft_swa_layout.committed_size
         self.swa_window_size = swa_page_size
         self.swa_page_size = swa_page_size
         self.scale_pad = 1
@@ -578,6 +700,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self._unified_kv = is_unified_kv_triton()
+        self.unified_swa_is_sidecar = (
+            self._unified_kv and self.draft_swa_layout.has_scratch
+        )
 
         if self._unified_kv:
             self.swa_kv_pool = None
@@ -599,6 +724,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 memory_saver_adapter=self.memory_saver_adapter,
                 custom_mem_pool=self.custom_mem_pool,
                 swa_ring_size=self.sliding_window + spec_extra,
+                swa_rows=(
+                    physical_swa_size + 1 if self.unified_swa_is_sidecar else None
+                ),
             )
 
             self.unified_swa_window = self.sliding_window
@@ -607,7 +735,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         else:
             self.unified_kv_pool = None
             self.swa_kv_pool = self._make_kv_pool(
-                size=swa_size,
+                size=physical_swa_size,
                 page_size=swa_page_size,
                 dtype=dtype,
                 layer_num=stage_layer_num,
@@ -672,6 +800,60 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
 
+    @property
+    def has_draft_swa_scratch(self) -> bool:
+        return self.draft_swa_layout.has_scratch
+
+    def get_draft_swa_scratch_locs(
+        self, req_pool_indices: torch.Tensor, block_size: int
+    ) -> torch.Tensor:
+        return self.draft_swa_layout.scratch_locs(req_pool_indices, block_size)
+
+    def get_draft_swa_scratch_locs_for_tokens(
+        self, req_pool_indices: torch.Tensor, step_offsets: torch.Tensor
+    ) -> torch.Tensor:
+        if not self.has_draft_swa_scratch:
+            raise RuntimeError("DSV4 draft SWA scratch is not enabled.")
+        return (
+            self.draft_swa_layout.scratch_base
+            + req_pool_indices.to(torch.int64) * self.draft_swa_layout.scratch_width
+            + step_offsets.to(torch.int64)
+        )
+
+    def translate_draft_committed_loc(
+        self, full_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Map content-owned full locations into the committed sidecar only."""
+        return self.translate_loc_from_full_to_swa(full_indices)
+
+    def get_draft_swa_committed_buffers(self) -> List[torch.Tensor]:
+        """Views exposed to cache/transfer layers; scratch pages are excluded."""
+        if self._unified_kv:
+            if not self.unified_swa_is_sidecar:
+                raise NotImplementedError(
+                    "Request-scoped unified KV has no draft SWA sidecar."
+                )
+            pages = self.draft_swa_layout.committed_pages
+            page_size = self.draft_swa_layout.page_size
+            head_dim = self.unified_kv_pool.head_dim
+            return [
+                buf.narrow(0, 0, pages * page_size)
+                .reshape(pages, page_size * head_dim)
+                .view(torch.uint8)
+                for buf in self.unified_kv_pool.kv_buffer
+            ]
+        if not self.has_draft_swa_scratch:
+            return list(self.swa_kv_pool.kv_buffer)
+        pages = self.draft_swa_layout.committed_pages
+        return [buf.narrow(0, 0, pages) for buf in self.swa_kv_pool.kv_buffer]
+
+    def get_draft_swa_state_layer_ids(self) -> List[int]:
+        if self._unified_kv:
+            layer_num = len(self.unified_kv_pool.kv_buffer)
+        else:
+            layer_num = len(self.swa_kv_pool.kv_buffer)
+        return list(range(self._stage_start, self._stage_start + layer_num))
+
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
         data_lens: List[int] = []
@@ -734,7 +916,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_ptrs: List[int] = []
         data_lens: List[int] = []
         item_lens: List[int] = []
-        if not self._unified_kv:
+        if not self._unified_kv or self.unified_swa_is_sidecar:
             return data_ptrs, data_lens, item_lens
         swa_pages = self.unified_kv_pool.swa_pages
         for buf in self.unified_kv_pool.kv_buffer:
@@ -787,12 +969,23 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_lens: List[int] = []
         item_lens: List[int] = []
 
-        if not self._unified_kv:
-            for buf in self.swa_kv_pool.kv_buffer:
-                assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+        if self.unified_swa_is_sidecar:
+            for buf in self.get_draft_swa_committed_buffers():
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
                 item_lens.append(buf[0].nbytes)
+        elif not self._unified_kv:
+            for buf in self.swa_kv_pool.kv_buffer:
+                assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+                data_ptrs.append(buf.data_ptr())
+                item_len = buf[0].nbytes
+                item_lens.append(item_len)
+                if self.has_draft_swa_scratch:
+                    data_lens.append(
+                        self.draft_swa_layout.committed_pages * item_len
+                    )
+                else:
+                    data_lens.append(buf.nbytes)
 
         for pools in [
             self.compress_state_pools,

@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
+    DraftSWASidecarComponent,
     FullComponent,
     MambaComponent,
     PrepareLoadBackResult,
@@ -164,6 +165,15 @@ class UnifiedRadixCache(BasePrefixCache):
 
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
+        if params.enable_draft_swa_sidecar:
+            assert ComponentType.SWA in self.tree_components, (
+                "Draft SWA sidecar coverage requires the target SWA component."
+            )
+        self.draft_swa_sidecar = (
+            DraftSWASidecarComponent(self)
+            if params.enable_draft_swa_sidecar
+            else None
+        )
         self.enable_session_radix_cache = params.enable_session_radix_cache
         component_registry = COMPONENT_REGISTRY
         if params.component_registry_override:
@@ -491,6 +501,31 @@ class UnifiedRadixCache(BasePrefixCache):
                 raise RuntimeError("HiCache controller is not attached.")
             self.cache_controller.register_host_pool_entry(entry)
         self.sidecar_pool_specs.append(spec)
+
+    def register_hicache_draft_pools(
+        self, specs: list[SidecarPoolSpec], entries: list[PoolEntry]
+    ) -> None:
+        if self.cache_controller is None:
+            raise RuntimeError("HiCache controller is not attached.")
+        unified_draft_swa = (
+            not specs and len(entries) == 1 and entries[0].name == PoolName.SWA
+        )
+        if not unified_draft_swa and len(specs) != len(entries):
+            raise ValueError(
+                "HiCache draft sidecar specs and entries must be paired, except "
+                "for the unified draft SWA component."
+            )
+        for entry in entries:
+            self.cache_controller.register_host_pool_entry(entry)
+            if (
+                entry.name == PoolName.SWA
+                and self.supports_swa()
+                and self.components[ComponentType.SWA]._swa_kv_pool_host is None
+            ):
+                self.swa_kv_pool_host = entry.host_pool
+                self.components[ComponentType.SWA]._swa_kv_pool_host = entry.host_pool
+                self.tree_core.has_swa_host_pool = True
+        self.sidecar_pool_specs.extend(specs)
 
     def release_host_resources(self) -> None:
         if self.host_pool_group is not None:
@@ -1323,13 +1358,20 @@ class UnifiedRadixCache(BasePrefixCache):
             # backed up. Skip only when no transfer remains.
             if device_value.numel() == 0 and not comp_xfers:
                 continue
-            sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
+            sidecar_xfers = self._build_backup_sidecar(
+                node_id, device_value, comp_xfers
+            )
             host_indices = self._execute_kv_backup(
                 node_id, device_value, comp_xfers, sidecar_xfers
             )
             if host_indices is None:
                 return 0
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
+            if self.draft_swa_sidecar is not None:
+                self.draft_swa_sidecar.mark_host_backup(
+                    self.tree_core.node_by_id(node_id),
+                    any(x.name == PoolName.DRAFT_SWA for x in sidecar_xfers),
+                )
             lock_params = None
             if not write_back:
                 lock_params = self.inc_lock_ref(node_id).to_dec_params()
@@ -1337,11 +1379,14 @@ class UnifiedRadixCache(BasePrefixCache):
             written = len(host_indices)
         return written
 
-    def _build_backup_sidecar(self, device_value, comp_xfers):
+    def _build_backup_sidecar(self, node_id, device_value, comp_xfers):
         """Gather sidecar transfer spec."""
         kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
         return self._build_sidecar_transfers(
-            CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
+            CacheTransferPhase.BACKUP_HOST,
+            kv_xfer,
+            comp_xfers,
+            node=self.tree_core.node_by_id(node_id),
         )
 
     def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
@@ -1462,7 +1507,10 @@ class UnifiedRadixCache(BasePrefixCache):
         kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(node_id, req=req)
         kv_tokens = len(kv_xfer.host_indices)
         sidecar_xfers = self._build_sidecar_transfers(
-            CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
+            CacheTransferPhase.LOAD_BACK,
+            kv_xfer,
+            comp_xfers,
+            node=self.tree_core.node_by_id(node_id),
         )
 
         # Skip if there is nothing to load, or if the Full-KV transfer is too
@@ -1506,6 +1554,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, device_indices, kv_xfer, comp_xfers
             )
         )
+        if self.draft_swa_sidecar is not None:
+            self.draft_swa_sidecar.mark_device_load(
+                self.tree_core.node_by_id(node_id),
+                any(x.name == PoolName.DRAFT_SWA for x in sidecar_xfers),
+            )
 
         self.ongoing_load_back[node_id] = _OngoingLoadBack(
             node_id,
@@ -1520,9 +1573,32 @@ class UnifiedRadixCache(BasePrefixCache):
         phase: CacheTransferPhase,
         kv_xfer: PoolTransfer,
         comp_xfers: dict[ComponentType, list[PoolTransfer]],
+        *,
+        node=None,
     ) -> list[PoolTransfer]:
         transfers: list[PoolTransfer] = []
         for spec in self.sidecar_pool_specs:
+            if (
+                spec.pool_name == PoolName.DRAFT_SWA
+                and self.draft_swa_sidecar is not None
+            ):
+                if node is None and phase != CacheTransferPhase.PREFETCH:
+                    continue
+                if (
+                    phase == CacheTransferPhase.BACKUP_HOST
+                    and not self.draft_swa_sidecar.has_device_window(node)
+                ):
+                    continue
+                if (
+                    phase == CacheTransferPhase.LOAD_BACK
+                    and not self.draft_swa_sidecar.has_loadable_window(node)
+                ):
+                    continue
+                if (
+                    phase == CacheTransferPhase.BACKUP_STORAGE
+                    and not self.draft_swa_sidecar.has_host_window(node)
+                ):
+                    continue
             if spec.indices_from_pool == PoolName.KV:
                 indices_source = kv_xfer
             else:
@@ -1562,6 +1638,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     keys=indices_source.keys,
                     hit_policy=spec.hit_policy,
                     indices_from_pool=spec.indices_from_pool,
+                    nodes_to_load=indices_source.nodes_to_load,
                 )
             )
         return transfers
@@ -1581,7 +1658,10 @@ class UnifiedRadixCache(BasePrefixCache):
             keys=spec.hash_value,
         )
         sidecar_xfers = self._build_sidecar_transfers(
-            CacheTransferPhase.BACKUP_STORAGE, kv_xfer, spec.comp_xfers
+            CacheTransferPhase.BACKUP_STORAGE,
+            kv_xfer,
+            spec.comp_xfers,
+            node=self.tree_core.node_by_id(node_id),
         )
         aux_xfers = [x for xfers in spec.comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
@@ -1880,9 +1960,7 @@ class UnifiedRadixCache(BasePrefixCache):
             comp_xfers,
         ) = self.ongoing_prefetch[req_id]
 
-        # All PP/TP ranks will get the same `min_completed_tokens`, because `completed_tokens`
-        # and `pool_hits` in their operations are same.  No need to sync cross-rank here.
-        if not self._check_hybrid_prefetch_result(
+        usable_tokens = self._check_hybrid_prefetch_result(
             req_id,
             operation,
             completed_tokens,
@@ -1891,25 +1969,26 @@ class UnifiedRadixCache(BasePrefixCache):
             last_host_node_id,
             anchor_lock_params,
             prefetch_key,
-        ):
+        )
+        if usable_tokens is None:
             # Hybrid all-or-nothing check failed; result already discarded.
             return
 
         if self.buffer_pipeline is not None:
-            # No graft: release the rank-local tail beyond the synced usable
-            # length, then park the bounce for admission-time consumption.
+            self.cache_controller.append_host_mem_release(
+                host_indices[usable_tokens:completed_tokens]
+            )
             return self.buffer_pipeline.stage_completed_prefetch(
-                req_id, completed_tokens, hash_value
+                req_id, usable_tokens, hash_value
             )
 
-        fetched_key = prefetch_key[:completed_tokens]
+        fetched_key = prefetch_key[:usable_tokens]
         insert_result = self.tree_core.insert_host(
             last_host_node_id,
             fetched_key,
-            host_indices[:completed_tokens],
-            hash_value[: completed_tokens // self.page_size],
+            host_indices[:usable_tokens],
+            hash_value[: usable_tokens // self.page_size],
         )
-
         # Apply the host-insert walk's actions before the transfer commit.
         self._apply_cache_actions(insert_result.cache_actions)
 
@@ -1930,13 +2009,33 @@ class UnifiedRadixCache(BasePrefixCache):
                 pool_storage_result=operation.pool_storage_result,
             )
             self._apply_cache_actions(commit_actions)
+            if (
+                self.draft_swa_sidecar is not None
+                and insert_result.inserted_host_node is not None
+            ):
+                draft_transfer = next(
+                    (
+                        transfer
+                        for transfer in operation.pool_transfers or ()
+                        if transfer.name == PoolName.DRAFT_SWA
+                    ),
+                    None,
+                )
+                self.draft_swa_sidecar.commit_prefetch(
+                    self.tree_core.node_by_id(insert_result.inserted_host_node),
+                    draft_transfer,
+                    operation.pool_storage_result,
+                )
             # The commit emits via commit_actions only; the walk's were applied above.
             assert not insert_result.cache_actions
 
             self.cache_controller.mem_pool_host.free(
                 host_indices[: insert_result.prefix_len]
             )
-            loaded_from_storage = completed_tokens - insert_result.prefix_len
+            self.cache_controller.append_host_mem_release(
+                host_indices[usable_tokens:completed_tokens]
+            )
+            loaded_from_storage = usable_tokens - insert_result.prefix_len
 
         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[req_id]
@@ -1966,7 +2065,7 @@ class UnifiedRadixCache(BasePrefixCache):
         last_host_node_id: NodeId,
         anchor_lock_params: DecLockRefParams,
         prefetch_key: RadixKey,
-    ) -> bool:
+    ) -> Optional[int]:
         """Decide the length of usable prefix.
 
         Two strategies depending on the hybrid layout:
@@ -1975,12 +2074,14 @@ class UnifiedRadixCache(BasePrefixCache):
           DSA / MiniMax indexer): *clamp* to the minimum fetched prefix shared by
           the Full KV pool and every sidecar. A partial prefix is still usable
           because the sidecar is page-aligned with KV and required for every page.
+        * Draft SWA with RECOMPUTE_TRAILING: reuse the target prefix before the
+          missing tail; normal prefill regenerates that tail and its sidecar.
         * Everything else (SWA / Mamba components, mixed DeepSeekV4 stacks):
           *all-or-nothing*. Their pools only cover a window / tail and cannot be
           truncated page by page, so any shortfall discards the whole prefetch.
 
-        Returns true if prefetch success, or false when an all-or-nothing prefetch
-        was discarded (the caller should then treat the prefetch as finished).
+        Returns the synced usable token count, or ``None`` when an all-or-nothing
+        prefetch was discarded.
         """
         # Sync completed tokens and per-pool hit pages across ATTN groups, taking
         # the minimum so every rank agrees on the same usable prefix length.
@@ -1996,13 +2097,55 @@ class UnifiedRadixCache(BasePrefixCache):
             operation.pool_storage_result.extra_pool_hit_pages if pool_transfers else {}
         )
         pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
-        completed_tokens = operation.completed_tokens
-        # Hybrid cache state is all-or-nothing: every extra pool (SWA / Mamba / ...)
-        # must cover the same fetched prefix. If any pool falls short the whole
-        # prefetch result is unusable, so discard it and release everything.
-        expected_tokens = len(hash_value) * self.page_size
-        all_succeeded = completed_tokens == expected_tokens and all(
-            transfer.keys is not None and count == len(transfer.keys)
+        packed = torch.tensor([completed_tokens, *pool_hit_pages], dtype=torch.int)
+        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+        min_completed_tokens = int(packed[0].item())
+        pool_hit_pages = list(map(int, packed[1:].tolist()))
+        trim_pages = torch.tensor(
+            [operation.pool_storage_result.recompute_tail_pages], dtype=torch.int
+        )
+        self._all_reduce_attn_groups(trim_pages, torch.distributed.ReduceOp.MAX)
+        lookup_trim_pages = int(trim_pages.item())
+        for transfer, count in zip(pool_transfers, pool_hit_pages):
+            hit_pages[transfer.name] = count
+
+        # DSA-style clamp: every sidecar is KV-derived and required for the whole
+        # prefix (ALL_PAGES), so the usable length is simply the shared minimum of
+        # the Full KV completion and each sidecar hit.
+        clampable = bool(pool_transfers) and all(
+            t.hit_policy == PoolHitPolicy.ALL_PAGES
+            and t.indices_from_pool == PoolName.KV
+            for t in pool_transfers
+        )
+        if clampable:
+            usable_pages = min(min_completed_tokens // self.page_size, *pool_hit_pages)
+            return usable_pages * self.page_size
+
+        requested_tokens = len(hash_value) * self.page_size
+        recompute_tail_pages = 0
+        if lookup_trim_pages == 0:
+            # The lookup saw the sidecar, but the subsequent read can still
+            # lose a race with storage eviction. Fall back to tail recompute.
+            recompute_tail_pages = max(
+                (
+                    len(transfer.keys or ())
+                    for transfer, count in zip(pool_transfers, pool_hit_pages)
+                    if transfer.hit_policy == PoolHitPolicy.RECOMPUTE_TRAILING
+                    and count < len(transfer.keys or ())
+                ),
+                default=0,
+            )
+        expected_tokens = max(
+            0, requested_tokens - recompute_tail_pages * self.page_size
+        )
+        min_completed_tokens = min(min_completed_tokens, expected_tokens)
+
+        # Required hybrid state remains all-or-nothing. A recomputable trailing
+        # sidecar may be absent; in that case the returned prefix is shortened
+        # above so normal prefill regenerates it.
+        all_succeeded = min_completed_tokens == expected_tokens and all(
+            transfer.hit_policy == PoolHitPolicy.RECOMPUTE_TRAILING
+            or (transfer.keys is not None and count == len(transfer.keys))
             for transfer, count in zip(pool_transfers, pool_hit_pages)
         )
         if pool_transfers and not all_succeeded:
@@ -2045,8 +2188,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 expected_tokens,
                 keep_pages,
             )
-            return False
-        return True
+            return None
+        return min_completed_tokens
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         # The request is being scheduled; a still-unserved miss marker is moot.
