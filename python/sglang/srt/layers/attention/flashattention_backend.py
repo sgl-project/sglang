@@ -461,6 +461,11 @@ class FlashAttentionBackend(AttentionBackend):
         return self.token_to_kv_pool.full_to_swa_index_mapping
 
     def draft_extend_metadata_captured_in_graph(self) -> bool:
+        # A translating backend rebuilds out of graph: the captured gather
+        # would bake raw req_to_token (virtual) ids into the page table.
+        # Audit surface over replay latency; revisit if evals show cost.
+        if self.kv_index_translator.is_translating:
+            return False
         return (
             not self.use_sliding_window_kv_pool
             or self.token_to_kv_pool.full_to_swa_index_mapping is not None
@@ -3156,18 +3161,49 @@ class FlashAttentionBackend(AttentionBackend):
             max_seq_pages = (
                 metadata.max_seq_len_k + self.page_size - 1
             ) // self.page_size
-            page_indices = self.req_to_token[
-                req_pool_indices[:, None],
-                self.draft_extend_metadata["strided_indices"][:max_seq_pages],
-            ]
-            if self.use_sliding_window_kv_pool and metadata.swa_page_table is not None:
-                swa_page_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    page_indices
+            kv_view = self.kv_index_translator.build_index_table(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                into=self.kv_read_tables,
+                seq_len_delta=self._spec_read_seq_len_delta(forward_mode, spec_info),
+            )
+            if kv_view.is_translated:
+                # Out-of-graph rebuild (draft_extend_metadata_captured_in_graph
+                # is False when translating): the source rows are already
+                # kernel-facing page ids, and the lens include the window, so
+                # the prefix fill covers every read.
+                metadata.page_table[:, :max_seq_pages].copy_(
+                    kv_view.ids[:bs, :max_seq_pages]
                 )
-                metadata.swa_page_table[:, :max_seq_pages].copy_(
-                    swa_page_indices // self.page_size
+                if (
+                    self.use_sliding_window_kv_pool
+                    and metadata.swa_page_table is not None
+                ):
+                    # sliding_window_read_ids: the parallel swa table, or the
+                    # dense table itself under single-space fused semantics.
+                    metadata.swa_page_table[:, :max_seq_pages].copy_(
+                        kv_view.sliding_window_read_ids()[:bs, :max_seq_pages]
+                    )
+            else:
+                page_indices = self.req_to_token[
+                    req_pool_indices[:, None],
+                    self.draft_extend_metadata["strided_indices"][:max_seq_pages],
+                ]
+                if (
+                    self.use_sliding_window_kv_pool
+                    and metadata.swa_page_table is not None
+                ):
+                    swa_page_indices = (
+                        self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                            page_indices
+                        )
+                    )
+                    metadata.swa_page_table[:, :max_seq_pages].copy_(
+                        swa_page_indices // self.page_size
+                    )
+                metadata.page_table[:, :max_seq_pages].copy_(
+                    page_indices // self.page_size
                 )
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
 
         else:
             raise ValueError(
