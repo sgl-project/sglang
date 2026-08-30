@@ -173,15 +173,6 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     run_post_process_pass(server_args, _fa4_page_constraint)
 
-    # AMD platforms backends
-    if resolved_view(server_args).attention_backend == "aiter":
-        if model_config.context_len > 8192:
-            declare_resolution(
-                server_args,
-                "_handle_attention_backend_compatibility",
-                mem_fraction_static=cfg.mem_fraction_static * 0.85,
-            )
-
     # Other platforms backends
     run_post_process_pass(server_args, _attention_backend_platform_fallbacks)
 
