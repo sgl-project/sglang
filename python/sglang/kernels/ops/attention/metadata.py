@@ -263,6 +263,9 @@ def _fused_metadata_kernel_general(
     # still needs in virtual space. Masked so padded lanes never index the table.
     if v2p_ptr is not None:
         page_table_val = tl.load(v2p_ptr + page_table_val, mask=mask, other=0)
+        # A freed page is tombstoned to -1 in v2p; clamp to the slot-0 sink so
+        # replayed metadata never indexes the KV pool at a negative page.
+        page_table_val = tl.maximum(page_table_val, 0)
     page_table_val = page_table_val * PAGE_MULT
 
     # Store to page_table
@@ -283,6 +286,9 @@ def _fused_metadata_kernel_general(
             other=0,
             cache_modifier=".cg",
         )
+        # Same tombstone clamp for the unified SWA v2p; out-of-window pages of
+        # a live request are tombstoned once freed. No-op for the legacy map.
+        swa_slot = tl.maximum(swa_slot, 0)
         if page_size == 1 or SWA_MAPPING_IS_V2P:
             swa_val = swa_slot
         else:
