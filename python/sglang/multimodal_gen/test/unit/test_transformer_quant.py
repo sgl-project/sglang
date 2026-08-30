@@ -267,7 +267,9 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
     def test_qwen_modelopt_fp8_qkv_checkpoint_tensors_are_merged(self):
         mapping = get_param_names_mapping(
-            QwenImageTransformer2DModel.param_names_mapping
+            QwenImageTransformer2DModel.get_param_names_mapping_for_quant_config(
+                ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+            )
         )
         prefix = "transformer_blocks.0.attn"
         source = {}
@@ -301,6 +303,21 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             QwenImageTransformer2DModel.packed_modules_mapping["to_qkv"],
             ["to_q", "to_k", "to_v"],
         )
+
+    def test_qwen_non_fp8_qkv_checkpoint_tensors_are_not_merged(self):
+        prefix = "transformer_blocks.0.attn"
+        source_name = f"{prefix}.to_q.weight"
+        for quant_config in (None, ModelOptFp4Config()):
+            with self.subTest(quant_config=quant_config):
+                mapping = get_param_names_mapping(
+                    QwenImageTransformer2DModel.get_param_names_mapping_for_quant_config(
+                        quant_config
+                    )
+                )
+                target_name, merge_index, total_shards = mapping(source_name)
+                self.assertEqual(target_name, source_name)
+                self.assertIsNone(merge_index)
+                self.assertIsNone(total_shards)
 
     def test_autoround_config_is_inferred_and_remapped_to_native_prefixes(self):
         layer_config = {

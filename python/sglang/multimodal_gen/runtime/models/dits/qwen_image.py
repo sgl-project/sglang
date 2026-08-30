@@ -20,8 +20,6 @@ from sglang.kernels.ops.diffusion import (
     fused_gelu_active,
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
-)
-from sglang.kernels.ops.diffusion.rope.qwen_qkv_epilogue_jit import (
     try_fused_qwen_qkv_epilogue,
 )
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
@@ -171,6 +169,42 @@ def _modelopt_quant_name(
     quant_config: Optional[QuantizationConfig],
 ) -> str | None:
     return None if quant_config is None else quant_config.get_name()
+
+
+_MODEL_OPT_FP8_QKV_PARAM_NAMES_MAPPING = {
+    # ModelOpt FP8 uses one QKV GEMM per stream. Merge the three Diffusers
+    # projections and their static scales into MergedColumnParallelLinear.
+    r"^(transformer_blocks\.\d+\.attn)\.to_q\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_qkv.\2",
+        0,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.to_k\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_qkv.\2",
+        1,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.to_v\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_qkv.\2",
+        2,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.add_q_proj\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_added_qkv.\2",
+        0,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.add_k_proj\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_added_qkv.\2",
+        1,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.add_v_proj\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_added_qkv.\2",
+        2,
+        3,
+    ),
+}
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -1474,6 +1508,15 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_transformer_block]
 
     @classmethod
+    def get_param_names_mapping_for_quant_config(
+        cls, quant_config: Optional[QuantizationConfig]
+    ) -> dict:
+        mapping = dict(cls.param_names_mapping)
+        if _modelopt_quant_name(quant_config) == "modelopt_fp8":
+            mapping.update(_MODEL_OPT_FP8_QKV_PARAM_NAMES_MAPPING)
+        return mapping
+
+    @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
         return {
             "skip": [
@@ -1503,6 +1546,12 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__(config=config, hf_config=hf_config)
+        # Only ModelOpt FP8 constructs packed QKV modules for checkpoints with
+        # Diffusers-style split Q/K/V names. Keep the mapping instance-local so
+        # eager and NVFP4 checkpoints still target their split projections.
+        self.param_names_mapping = self.get_param_names_mapping_for_quant_config(
+            quant_config
+        )
         arch = self.config
         patch_size = arch.patch_size
         in_channels = arch.in_channels
