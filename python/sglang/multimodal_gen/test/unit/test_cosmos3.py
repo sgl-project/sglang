@@ -797,6 +797,11 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
         self.assertEqual(params.candidate_spec.reducer, "mean")
         self.assertTrue(params.candidate_spec.return_candidates)
         self.assertEqual(params.num_outputs_per_prompt, 3)
+        # The single image/prompt must be fanned out to 3 physical copies
+        # (see #35331's "Expand/fan out conditioning" step) or the denoiser
+        # never actually produces 3 candidate trajectories to reduce.
+        self.assertEqual(params.image_path, ["observation.png"] * 3)
+        self.assertEqual(params.prompt, ["pick up the block"] * 3)
 
     def test_candidate_count_rejects_multi_image_batch(self):
         # candidate_spec is one candidate group per logical request (#35331);

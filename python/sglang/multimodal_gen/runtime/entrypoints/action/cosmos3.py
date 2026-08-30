@@ -263,6 +263,18 @@ def build_cosmos3_action_sampling_params(
         raise ValueError("Cosmos3 inverse_dynamics prompt must be a string")
     prompt = _action_prompt(prompt, batch_size)
     candidate_spec = _build_candidate_spec(options, batch_size)
+    if candidate_spec is not None:
+        # Fan out the single image/prompt into candidate_spec.count physical
+        # copies (see #35331's "Expand/fan out conditioning and build
+        # candidate batch" step) by reusing this endpoint's existing
+        # multi-image batch-axis machinery: the pipeline stages downstream
+        # already turn a same-length image/prompt list into a batch of that
+        # size, and derive_candidate_generators (wired into
+        # InputValidationStage._generate_seeds) gives each physical batch
+        # item its own independent, stably-derived RNG stream rather than
+        # sharing one draw across the batch.
+        image_path = [images[0]] * candidate_spec.count
+        prompt = _action_prompt(prompt if isinstance(prompt, str) else prompt[0], candidate_spec.count)
     sampling_kwargs = {
         "request_id": payload.get("request_id") or payload.get("id"),
         "candidate_spec": candidate_spec,
