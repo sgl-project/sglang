@@ -69,6 +69,12 @@ logger = logging.getLogger(__name__)
 GUARD = "NixlMsgGuard".encode("ascii")
 KV_MEM_KINDS = {"VRAM", "DRAM"}
 
+# Once one handle of a batch reports ERR, its siblings settle only when NIXL
+# notices their peer is gone, which for UCX means waiting out peer keepalive.
+# This worker serves other rooms, so bound that wait.
+NIXL_ERR_SETTLE_TIMEOUT_S = 5.0
+NIXL_ERR_SETTLE_POLL_S = 0.001
+
 
 def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> List[str]:
     if kinds is None:
@@ -1104,6 +1110,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             kv_chunk: TransferKVChunk = queue.get()
             room = kv_chunk.room
             handles: List[Any] = []
+            settle_timed_out = False
             try:
                 # Counted at dequeue, before the status check, so
                 # `outstanding == 0` means nothing is dequeued or in flight --
@@ -1325,6 +1332,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # first ERR: a sibling still in PROC keeps writing into the
                 # decode's KV pages, and the failure path below tells the decode
                 # those pages are free.
+                settle_deadline = None
                 while handles:
                     all_settled = True
                     any_failed = False
@@ -1340,7 +1348,21 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 f"NIXL transfer encountered ERR room={room}"
                             )
                         break
-                    time.sleep(0)
+                    if not any_failed:
+                        time.sleep(0)
+                        continue
+                    # This room is already lost, so trade its notification for
+                    # the worker's other rooms: back off, and give up waiting
+                    # for the siblings once the deadline passes.
+                    if settle_deadline is None:
+                        settle_deadline = time.time() + NIXL_ERR_SETTLE_TIMEOUT_S
+                    elif time.time() >= settle_deadline:
+                        settle_timed_out = True
+                        raise RuntimeError(
+                            f"NIXL transfer for room {room} left a handle running "
+                            f"{NIXL_ERR_SETTLE_TIMEOUT_S}s after a peer handle failed"
+                        )
+                    time.sleep(NIXL_ERR_SETTLE_POLL_S)
 
                 self._staging_outstanding[room] -= 1
                 if self.enable_deferred_decode_kv_release:
@@ -1384,7 +1406,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         f"Unexpected transfer worker error for room {room}"
                     )
                 self.exceptions[room] = e
-                self.conclude_failure(bootstrap_room=room, failure_reason=str(e))
+                if settle_timed_out:
+                    # A sibling handle can still write into the decode's KV
+                    # pages, so leave the room to the decode's waiting timeout
+                    # rather than telling it those pages are free.
+                    self.record_failure(room, str(e))
+                    self.update_status(room, KVPoll.Failed)
+                else:
+                    self.conclude_failure(bootstrap_room=room, failure_reason=str(e))
 
     def register_buffer_to_engine(self):
         self.kv_descs = []

@@ -480,9 +480,11 @@ class CommonKVManager(BaseKVManager):
     ) -> Optional[KVPoll]:
         """Returns the status that was emitted, or None for a cleared room.
 
-        A room is sharded onto a single transfer worker, so this runs at most
-        once per room without any at-most-once bookkeeping. ``targets`` defaults
-        to every non-dummy decode endpoint of the room.
+        One transfer worker owns a room, but it can conclude the room more than
+        once: a staging chunk deferred past the last one may fail after the room
+        already concluded Success, and that later failure is reported rather
+        than dropped. ``targets`` defaults to every non-dummy decode endpoint of
+        the room.
         """
         if bootstrap_room not in self.request_status:
             # The sender already cleared this room. Concluding now would
@@ -552,9 +554,15 @@ class CommonKVManager(BaseKVManager):
             expected_response_num = self.required_prefill_response_num_table.get(
                 bootstrap_room
             )
+            if expected_response_num is None:
+                logger.warning(
+                    "No expected prefill response count for room %s",
+                    bootstrap_room,
+                    prefill_rank,
+                )
+                return
             if (
-                expected_response_num is None
-                or len(self.prefill_response_tracker[bootstrap_room])
+                len(self.prefill_response_tracker[bootstrap_room])
                 < expected_response_num
             ):
                 return
