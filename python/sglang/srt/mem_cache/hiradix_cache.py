@@ -1696,26 +1696,30 @@ class HiRadixCache(RadixCache):
         self,
         operation: PrefetchOperation,
     ) -> int:
-        """Determine the minimal number of tokens from full KV hits and sidecar hits.
+        """The usable prefix length: the shared minimum of the Full KV completion
+        and every sidecar that reports its own hit count.
 
-        HiRadixCache only wires DSA-style stacks (Full attention + a KV-derived
-        ALL_PAGES sidecar such as the DSA / MiniMax indexer); For the DSA case we *clamp*
-        to the minimum fetched prefix shared by the Full KV pool and every
-        sidecar rather than discarding everything. With no sidecar (FULL-only)
-        this is just Full KV completion.
+        A KV-derived sidecar (the DSA / MiniMax indexer, ``indices_from_pool=KV``)
+        rides the KV host slots and is read inside
+        ``HiCacheController._page_transfer_kv_batch``, which already clamps
+        ``completed_tokens`` to ``min(kv_hits, sidecar_hits)``. It never reports
+        into ``pool_storage_result``, so counting it here would read as zero hits
+        and discard the whole fetch -- host slots in
+        ``[usable, completed_tokens)`` belong to no one and leak. Only sidecars
+        with independent slots (SWA / Mamba, filled by
+        ``HybridCacheController._page_transfer_sidecar``) are clamped here.
         """
-        # Sync completed tokens and per-pool hit pages across ATTN groups, taking
-        # the minimum so every rank agrees on the same usable prefix length.
-        pool_transfers = getattr(operation, "pool_transfers", None) or []
+        pool_transfers = [
+            transfer
+            for transfer in getattr(operation, "pool_transfers", None) or []
+            if transfer.indices_from_pool != PoolName.KV
+        ]
         hit_pages = (
             operation.pool_storage_result.extra_pool_hit_pages if pool_transfers else {}
         )
         completed_tokens = operation.completed_tokens
         pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
 
-        # Clamp to the shared minimum prefix of the Full KV completion and each
-        # KV-derived ALL_PAGES sidecar (e.g. the DSA indexer). FULL-only has no
-        # sidecar, so the usable prefix is just the Full KV completion.
         usable_pages = completed_tokens // self.page_size
         if pool_transfers:
             usable_pages = min(usable_pages, *pool_hit_pages)
