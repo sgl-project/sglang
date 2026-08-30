@@ -24,6 +24,13 @@ def _blackwell_or_newer(device: torch.device) -> bool:
     )
 
 
+def _sm103(device: torch.device) -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability(device) == (
+        10,
+        3,
+    )
+
+
 def _nss_activation(t, like=None) -> bool:
     return (
         isinstance(t, torch.Tensor)
@@ -145,11 +152,7 @@ def try_fused_bias_scale_residual_norm_scale_shift(
         return None
     if norm_type != "layer" or weight is not None or bias is not None:
         return None
-    if not (
-        _nss_activation(x)
-        and _nss_activation(residual, x)
-        and _blackwell_or_newer(x.device)
-    ):
+    if not (_nss_activation(x) and _nss_activation(residual, x) and _sm103(x.device)):
         return None
 
     input_bias = _row_bf16(input_bias, x.device)
@@ -178,11 +181,7 @@ def try_fused_bias_scale_residual_norm_scale_shift(
 def try_fused_bias_mul_add(x, input_bias, gate, residual):
     if torch.compiler.is_compiling():
         return None
-    if not (
-        _nss_activation(x)
-        and _nss_activation(residual, x)
-        and _blackwell_or_newer(x.device)
-    ):
+    if not (_nss_activation(x) and _nss_activation(residual, x) and _sm103(x.device)):
         return None
 
     input_bias = _row_bf16(input_bias, x.device)

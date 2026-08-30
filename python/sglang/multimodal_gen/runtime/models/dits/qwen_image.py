@@ -77,7 +77,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -111,11 +114,24 @@ def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
 _get_qkv_projections = get_qkv_projections
 
 
-def _defer_modelopt_output_bias(quant_config: Optional[QuantizationConfig]) -> bool:
+def _can_defer_modelopt_output_bias(
+    quant_config: Optional[QuantizationConfig], capability: Any
+) -> bool:
+    # Absorbing the bias moves a BF16 rounding point. The resulting image
+    # quality has only been validated on SM103, so other GPUs keep the GEMM
+    # bias epilogue used before this optimization.
     return (
         quant_config is not None
         and hasattr(quant_config, "get_name")
         and quant_config.get_name() in {"modelopt_fp8", "modelopt_fp4"}
+        and capability is not None
+        and (capability.major, capability.minor) == (10, 3)
+    )
+
+
+def _defer_modelopt_output_bias(quant_config: Optional[QuantizationConfig]) -> bool:
+    return _can_defer_modelopt_output_bias(
+        quant_config, current_platform.get_device_capability()
     )
 
 
