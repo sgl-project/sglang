@@ -57,10 +57,24 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, random_uuid, set_prometheus_multiproc_dir
-from sglang.srt.utils.common import maybe_reindex_device_id
+from sglang.srt.utils.common import kill_process_tree, maybe_reindex_device_id
 from sglang.srt.utils.network import NetworkAddress, get_free_port, get_zmq_socket
 
 logger = logging.getLogger(__name__)
+
+
+def _terminate_worker_processes(processes: List[mp.Process]) -> None:
+    for process in processes:
+        if process.is_alive():
+            kill_process_tree(process.pid, wait_timeout=None)
+
+    alive = []
+    for process in processes:
+        process.join(timeout=5)
+        if process.is_alive():
+            alive.append(process.pid)
+    if alive:
+        raise RuntimeError(f"Encoder workers did not exit after SIGKILL: {alive}")
 
 
 class PendingRequest:
@@ -368,9 +382,10 @@ class EncoderRuntime:
         self.scheduler.start()
 
     async def stop(self) -> None:
-        # Preserve the existing lifecycle: Uvicorn stops the Scheduler, while
-        # daemon TP followers exit with their parent process.
-        await self.scheduler.stop()
+        try:
+            await self.scheduler.stop()
+        finally:
+            _terminate_worker_processes(self.tp_processes)
 
 
 class DPDispatcher:
@@ -454,6 +469,9 @@ class DPDispatcher:
             task = asyncio.create_task(coro)
             self.background_tasks.add(task)
             task.add_done_callback(self.background_tasks.discard)
+
+    async def stop(self) -> None:
+        _terminate_worker_processes(self.worker_processes)
 
     def _drop_pending_and_mapping(self, rank: int, req_id: str) -> None:
         # dispatch / broadcast failure: no follow-up /send expected.
