@@ -99,7 +99,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=1
-ARG FLASHINFER_VERSION=0.6.18rc10
+ARG FLASHINFER_VERSION=0.6.18
 ARG CUTLASS_DSL_VERSION=4.8.0.dev0
 ARG MOONCAKE_VERSION=0.3.12.post1
 ARG MSCCLPP_VERSION=sglang-v0.9.1
@@ -893,6 +893,10 @@ elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nixl nixl-cu13 --no-deps ; \
     python3 -m pip install "cuda-python>=13,<14" ; \
 fi
+
+# Install the latest available AI Dynamo prerelease from NVIDIA's package index.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --pre --extra-index-url https://pypi.nvidia.com/ ai-dynamo
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
