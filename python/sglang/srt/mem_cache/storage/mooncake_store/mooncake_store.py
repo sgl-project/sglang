@@ -899,7 +899,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             key_strs = self._tag_keys(key_strs)
             ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
-            if transfer.name == PoolName.DEEPSEEK_V4_C4:
+            # layer_first pools return one buffer per (page, layer); pack them
+            # into a single multi-buffer object per page key.
+            if transfer.name == PoolName.DEEPSEEK_V4_C4 or (
+                len(ptr_list) > len(key_strs)
+            ):
                 ptr_list, element_size_list = self._pack_multi_buffer_meta(
                     key_strs, ptr_list, element_size_list
                 )
