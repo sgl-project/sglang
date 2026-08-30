@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -68,13 +67,11 @@ class SessionSlot:
             self.last_node = req.last_node
             self.swa_uuid_for_lock = req.swa_uuid_for_lock
             self.skip_lock_node_ids = req.skip_lock_node_ids
+            # The slot takes over the request's KV record.
+            self.kv = req.kv
         else:
-            # The protected prefix is the first request's tree lock; nothing hands
-            # KV to the tree after that, so later turns must not have moved it.
-            assert req.kv.cache_protected_len == self.kv.cache_protected_len
-
-        # Transfer the ownership of this kv row
-        self.kv = copy.copy(req.kv)
+            # Later turns run on the slot's record (see restore_to_req).
+            assert req.kv is self.kv
 
         self.mamba_pool_idx = req.mamba_pool_idx
         self.mamba_ping_pong_track_buffer = req.mamba_ping_pong_track_buffer
@@ -95,7 +92,7 @@ class SessionSlot:
 
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
-        req.kv = copy.copy(self.kv)
+        req.kv = self.kv
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
         req.skip_lock_node_ids = self.skip_lock_node_ids
 
@@ -270,14 +267,13 @@ class StreamingSession(BasePrefixCache):
         if is_npu() and self.page_size > 1:
             prefix_len = (prefix_len // self.page_size) * self.page_size
             req.kv.kv_committed_len = min(req.kv.kv_committed_len, prefix_len)
-            slot.kv.kv_committed_len = min(slot.kv.kv_committed_len, prefix_len)
 
         # Free orphaned tail: alloc_for_extend will overwrite
         # req_to_token[prefix_len:] with new indices. The range
         # [prefix_len, kv_allocated_len) has stale indices from the
         # previous turn's decode (e.g. alloc-commit gap on retract,
         # or speculative draft tokens).
-        self._free_tail(slot, req, prefix_len)
+        self._free_tail(req.kv, prefix_len)
 
         device_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :prefix_len
@@ -320,7 +316,7 @@ class StreamingSession(BasePrefixCache):
                 # return the (possibly extra_buffer ping-pong) slots to
                 # the mamba pool; otherwise the abort orphans them.
                 slot = SessionSlot(
-                    kv=copy.copy(req.kv),
+                    kv=req.kv,
                     last_node=req.last_node,
                     swa_uuid_for_lock=req.swa_uuid_for_lock,
                     skip_lock_node_ids=req.skip_lock_node_ids,
@@ -332,9 +328,8 @@ class StreamingSession(BasePrefixCache):
                 # the abort fall-through doesn't double-free.
                 req.mamba_pool_idx = None
                 req.mamba_ping_pong_track_buffer = None
-            slot.kv.kv_allocated_len = max(
-                slot.kv.kv_allocated_len, req.kv.kv_allocated_len
-            )
+            else:
+                assert req.kv is slot.kv
             self.release_session(session_id)
             req.kv = ReqKvInfo()
             req.session.abort_req()
@@ -542,21 +537,16 @@ class StreamingSession(BasePrefixCache):
 
     # -- Internal helpers (streaming body bits) --
 
-    def _free_tail(self, slot: SessionSlot, req: Req, prefix_len: int) -> None:
+    def _free_tail(self, kv: ReqKvInfo, prefix_len: int) -> None:
         """match_prefix path: free orphaned KV in [prefix_len, kv_allocated_len)
         before alloc_for_extend overwrites it. The gap appears when spec
         decoding pushes allocated above committed, or when retract retry's
         logit-reserve pulls prefix_len below committed.
         """
-        self._free_kv_aligned(
-            slot.kv.req_pool_idx, prefix_len, slot.kv.kv_allocated_len
-        )
-        slot.kv.kv_allocated_len = prefix_len
-        slot.kv.kv_committed_len = min(slot.kv.kv_committed_len, prefix_len)
-        slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, prefix_len)
-        req.kv.kv_allocated_len = prefix_len
-        req.kv.kv_committed_len = min(req.kv.kv_committed_len, prefix_len)
-        req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, prefix_len)
+        self._free_kv_aligned(kv.req_pool_idx, prefix_len, kv.kv_allocated_len)
+        kv.kv_allocated_len = prefix_len
+        kv.kv_committed_len = min(kv.kv_committed_len, prefix_len)
+        kv.swa_evicted_seqlen = min(kv.swa_evicted_seqlen, prefix_len)
 
     def _trim_overshoot(self, req: Req, finished_len: int) -> None:
         """Trim slot KV to finished_len boundary. Spec v2 may overshoot
