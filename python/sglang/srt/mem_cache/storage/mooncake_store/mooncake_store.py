@@ -580,6 +580,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
 
+            # DSA cache layer split: each CP rank only holds a disjoint layer
+            # slice, so L3 objects must be sharded per rank. With a shared key
+            # ranks would overwrite each other (first-writer-wins) and a
+            # self-read would return another rank's slice. The rank suffix
+            # also keeps these objects out of the key space of non-sharded
+            # instances of the same model, whose page objects have a
+            # different intra-page byte layout.
+            if (
+                storage_config is not None
+                and storage_config.is_mla_model
+                and getattr(storage_config, "is_dsa_layer_split", False)
+                and self.attn_cp_size > 1
+            ):
+                self.mla_suffix = f"{self.mla_suffix}_ls{self.attn_cp_rank}"
+
             self.storage_config = storage_config
             self.should_split_heads = storage_config.should_split_heads
             self.split_factor = 0

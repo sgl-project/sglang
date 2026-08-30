@@ -37,6 +37,10 @@ class HiCacheStorageConfig:
     model_name: Optional[str]
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
+    # True when the device pool shards KV/indexer layers across CP ranks
+    # (DSA cache layer split): each rank then owns a disjoint layer slice
+    # and L3 objects must be sharded per rank.
+    is_dsa_layer_split: bool = False
     extra_config: Optional[dict] = None
 
 
