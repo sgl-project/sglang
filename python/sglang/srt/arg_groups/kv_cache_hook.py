@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     declare_resolution,
@@ -46,7 +47,7 @@ def handle_kv4_compatibility(server_args: Any) -> None:
         # slot). Other models must pick one of the generic FP4 recipes —
         # previously they fell through to the KV-cache quant registry,
         # which rejected fp4_e2m1 as "deprecated" deep in pool construction.
-        model_arch = server_args.get_model_config().hf_config.architectures[0]
+        model_arch = model_config_of(server_args).hf_config.architectures[0]
         if model_arch != "DeepseekV4ForCausalLM":
             raise ValueError(
                 "--kv-cache-dtype fp4_e2m1 is only supported for DeepSeek V4 "
