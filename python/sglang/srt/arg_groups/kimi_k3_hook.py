@@ -7,6 +7,7 @@ from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolving_view,
 )
+from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -17,7 +18,6 @@ logger = logging.getLogger(__name__)
 def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
     """Apply speculative backend defaults for Kimi hybrid models."""
     cfg = resolving_view(server_args)
-    from sglang.srt.utils import is_sm100_supported
 
     if cfg.speculative_algorithm is None:
         return
@@ -42,7 +42,7 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
     if (
         cfg.speculative_algorithm == "DSPARK"
         and cfg.speculative_draft_attention_backend is None
-        and is_sm100_supported()
+        and get_platform().is_sm100
     ):
         declare_resolution(
             server_args,
@@ -83,7 +83,6 @@ def apply_kimi_k3_linear_attn_defaults(
 ) -> None:
     """Apply architecture-specific KDA defaults for Kimi hybrid models."""
     cfg = resolving_view(server_args)
-    from sglang.srt.utils import is_sm100_supported
 
     native_kimi_linear = _uses_native_kimi_linear_unbounded_kda(
         server_args, model_arch=model_arch, hf_config=hf_config
@@ -128,7 +127,7 @@ def apply_kimi_k3_linear_attn_defaults(
         cfg.linear_attn_decode_backend is None
         and cfg.linear_attn_backend != "cake"
         and cfg.mamba_ssm_dtype == "bfloat16"
-        and is_sm100_supported()
+        and get_platform().is_sm100
     ):
         declare_resolution(
             server_args,

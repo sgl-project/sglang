@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
     declare_resolution,
     resolved_view,
     resolving_view,
@@ -14,12 +15,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.utils.common import (
-    is_blackwell_supported,
-    is_cuda,
-    is_sm100_supported,
-    is_sm120_supported,
-)
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +25,7 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.kv_cache_dtype != "mxfp8":
         return
-    if not is_blackwell_supported():
+    if not get_platform().is_blackwell:
         raise ValueError(
             "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
             "block-scaled operands used by the FA4 MXFP8 attention path."
@@ -38,7 +34,6 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
 
 def handle_kv4_compatibility(server_args: Any) -> None:
     """Check FP4 KV cache compatibility with the attention backend"""
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
 
@@ -49,9 +44,9 @@ def handle_kv4_compatibility(server_args: Any) -> None:
     prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
     attention_backend = resolved_view(server_args).attention_backend
 
-    if is_cuda():
+    if get_platform().is_cuda:
         if cfg.kv_cache_dtype == "nvfp4" and not (
-            is_sm100_supported() or is_sm120_supported()
+            get_platform().is_sm100 or get_platform().is_sm120
         ):
             raise RuntimeError(
                 "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120. "
@@ -123,7 +118,6 @@ def handle_prefill_only_disable_kv_cache(server_args: Any) -> None:
     still None, backends haven't settled yet and the resolved (prefill,
     decode) pair would be a stale (None, None).
     """
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
 
@@ -199,7 +193,6 @@ def handle_cache_compatibility(server_args: Any) -> None:
 
 
 def handle_unified_memory_pool(server_args: Any) -> None:
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     if not cfg.enable_unified_memory:
@@ -280,7 +273,6 @@ def handle_page_major_kv_layout(server_args: Any):
     # The unified pool stores state in the page-major envelope-strided layout, so
     # enabling it implies --enable-page-major-kv-layout — routing it through the
     # single page-major path + stride-aware Triton asserts (set before the guard).
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     if cfg.enable_unified_memory:

@@ -154,6 +154,7 @@ class TransformerLoader(ComponentLoader):
 
     allow_global_attention_backend_fallback = False
     supports_online_quantization_override = True
+    supports_fsdp_inference = True
 
     component_names = [
         "transformer",
@@ -191,6 +192,33 @@ class TransformerLoader(ComponentLoader):
             or component_server_args.transformer_weights_path is not None
             or component_server_args.quantization is not None
         )
+
+    def validate_native_fallback(
+        self, server_args: ServerArgs, component_name: str
+    ) -> None:
+        requested_distributed_execution = []
+        if server_args.tp_size is not None and server_args.tp_size > 1:
+            requested_distributed_execution.append(f"tp_size={server_args.tp_size}")
+        if server_args.sp_degree is not None and server_args.sp_degree > 1:
+            requested_distributed_execution.append(f"sp_degree={server_args.sp_degree}")
+        if server_args.ulysses_degree is not None and server_args.ulysses_degree > 1:
+            requested_distributed_execution.append(
+                f"ulysses_degree={server_args.ulysses_degree}"
+            )
+        if server_args.ring_degree is not None and server_args.ring_degree > 1:
+            requested_distributed_execution.append(
+                f"ring_degree={server_args.ring_degree}"
+            )
+        if server_args.should_use_fsdp_for_component(component_name):
+            requested_distributed_execution.append("FSDP")
+        if requested_distributed_execution:
+            raise RuntimeError(
+                f"Native Diffusers fallback for transformer component "
+                f"{component_name!r} cannot honor requested distributed execution: "
+                f"{', '.join(requested_distributed_execution)}. Use an SGLang-native "
+                "transformer implementation or set tp_size, sp_degree, "
+                "ulysses_degree, and ring_degree to 1 without FSDP."
+            )
 
     def load_customized(
         self,

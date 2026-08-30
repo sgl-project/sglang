@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 import requests
 import torch
 
+from sglang.srt.arg_groups.serving_hook import ssl_verify_of
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -24,7 +25,7 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     timeout = 300.0  # Increased timeout to 5 minutes for downloading large models
     start_time = time.perf_counter()
 
-    ssl_verify = server_args.ssl_verify()
+    ssl_verify = ssl_verify_of(server_args)
 
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout:
@@ -74,7 +75,7 @@ class HttpServerEngineAdapter(EngineBase):
         """
         url = f"{self.server_args.url()}/{endpoint}"
         response = requests.post(
-            url, json=payload or {}, verify=self.server_args.ssl_verify()
+            url, json=payload or {}, verify=ssl_verify_of(self.server_args)
         )
         response.raise_for_status()
         return response.json()
