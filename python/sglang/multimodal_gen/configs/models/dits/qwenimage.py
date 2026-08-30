@@ -28,6 +28,39 @@ class QwenImageArchConfig(DiTArchConfig):
         default_factory=lambda: {
             # LoRA mappings
             r"^(transformer_blocks\.\d+\.attn\..*\.lora_[AB])\.default$": r"\1",
+            # ModelOpt FP8 uses one QKV GEMM per stream. Merge the three
+            # Diffusers projections and their static scales into the runtime
+            # MergedColumnParallelLinear parameters.
+            r"^(transformer_blocks\.\d+\.attn)\.to_q\.(weight|bias|weight_scale|input_scale)$": (
+                r"\1.to_qkv.\2",
+                0,
+                3,
+            ),
+            r"^(transformer_blocks\.\d+\.attn)\.to_k\.(weight|bias|weight_scale|input_scale)$": (
+                r"\1.to_qkv.\2",
+                1,
+                3,
+            ),
+            r"^(transformer_blocks\.\d+\.attn)\.to_v\.(weight|bias|weight_scale|input_scale)$": (
+                r"\1.to_qkv.\2",
+                2,
+                3,
+            ),
+            r"^(transformer_blocks\.\d+\.attn)\.add_q_proj\.(weight|bias|weight_scale|input_scale)$": (
+                r"\1.to_added_qkv.\2",
+                0,
+                3,
+            ),
+            r"^(transformer_blocks\.\d+\.attn)\.add_k_proj\.(weight|bias|weight_scale|input_scale)$": (
+                r"\1.to_added_qkv.\2",
+                1,
+                3,
+            ),
+            r"^(transformer_blocks\.\d+\.attn)\.add_v_proj\.(weight|bias|weight_scale|input_scale)$": (
+                r"\1.to_added_qkv.\2",
+                2,
+                3,
+            ),
             # SVDquant mappings
             r"(.*)\.add_qkv_proj\.(.+)$": r"\1.to_added_qkv.\2",
             r"(transformer_blocks\.\d+\.(img_mlp|txt_mlp)\..*\.(smooth_factor_orig|wcscales))$": r"\1",

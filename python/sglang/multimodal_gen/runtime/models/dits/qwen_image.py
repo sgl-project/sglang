@@ -21,6 +21,9 @@ from sglang.kernels.ops.diffusion import (
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
 )
+from sglang.kernels.ops.diffusion.rope.qwen_qkv_epilogue_jit import (
+    try_fused_qwen_qkv_epilogue,
+)
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
 from sglang.multimodal_gen.runtime.distributed import (
@@ -162,6 +165,12 @@ def _qwen_modulation_cache_key(
         hidden_dtype=hidden_states.dtype,
         hidden_device=hidden_states.device,
     )
+
+
+def _modelopt_quant_name(
+    quant_config: Optional[QuantizationConfig],
+) -> str | None:
+    return None if quant_config is None else quant_config.get_name()
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -579,8 +588,14 @@ class QwenImageCrossAttention(nn.Module):
         self.parallel_attention = parallel_attention
         self.added_kv_proj_dim = added_kv_proj_dim
         self.prefix = prefix
-
-        self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
+        quant_name = _modelopt_quant_name(quant_config)
+        self.use_fused_qkv_epilogue = quant_name in {
+            "modelopt_fp4",
+            "modelopt_fp8",
+        }
+        self.use_fused_qkv = (
+            isinstance(quant_config, NunchakuConfig) or quant_name == "modelopt_fp8"
+        )
 
         self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
         self.inner_kv_dim = self.inner_dim
@@ -631,7 +646,9 @@ class QwenImageCrossAttention(nn.Module):
             self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
 
         if added_kv_proj_dim is not None:
-            self.use_fused_added_qkv = isinstance(quant_config, NunchakuConfig)
+            self.use_fused_added_qkv = (
+                isinstance(quant_config, NunchakuConfig) or quant_name == "modelopt_fp8"
+            )
             if self.use_fused_added_qkv:
                 self.to_added_qkv = MergedColumnParallelLinear(
                     added_kv_proj_dim,
@@ -750,7 +767,12 @@ class QwenImageCrossAttention(nn.Module):
             txt_query,
             txt_key,
             txt_value,
-        ) = _get_qkv_projections(self, hidden_states, encoder_hidden_states)
+        ) = _get_qkv_projections(
+            self,
+            hidden_states,
+            encoder_hidden_states,
+            make_contiguous=not self.use_fused_qkv_epilogue,
+        )
 
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.local_num_heads, self.head_dim))
@@ -771,34 +793,70 @@ class QwenImageCrossAttention(nn.Module):
 
             img_cache, txt_cache = image_rotary_emb
 
-        if self.qk_norm:
-            img_query, img_key = apply_qk_norm_with_optional_rope(
-                q=img_query,
-                k=img_key,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=self.head_dim,
-                cos_sin_cache=img_cache,
-                is_neox=False,
-                allow_inplace=True,
+        joint_qkv = None
+        if (
+            self.use_fused_qkv_epilogue
+            and self.qk_norm
+            and img_cache is not None
+            and txt_cache is not None
+            and not sp_text_sharded
+            and sp_txt_pad == 0
+        ):
+            joint_qkv = try_fused_qwen_qkv_epilogue(
+                img_query,
+                img_key,
+                img_value,
+                txt_query,
+                txt_key,
+                txt_value,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                self.norm_added_q.weight,
+                self.norm_added_k.weight,
+                img_cache,
+                txt_cache,
+                self.norm_q.variance_epsilon,
+                self.norm_added_q.variance_epsilon,
             )
-            txt_query, txt_key = apply_qk_norm_with_optional_rope(
-                q=txt_query,
-                k=txt_key,
-                q_norm=self.norm_added_q,
-                k_norm=self.norm_added_k,
-                head_dim=self.head_dim,
-                cos_sin_cache=txt_cache,
-                is_neox=False,
-                allow_inplace=True,
-            )
-        elif img_cache is not None and txt_cache is not None:
-            img_query, img_key = apply_flashinfer_rope_qk_inplace(
-                img_query, img_key, img_cache, is_neox=False
-            )
-            txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
-                txt_query, txt_key, txt_cache, is_neox=False
-            )
+
+        if joint_qkv is None:
+            # Fused ModelOpt FP8 projections expose zero-copy Q/K/V views into
+            # one packed GEMM output. Unsupported epilogue cases keep the old
+            # contiguous contract before entering the generic QKNorm/RoPE path.
+            img_query, img_key, img_value = [
+                tensor.contiguous() for tensor in (img_query, img_key, img_value)
+            ]
+            txt_query, txt_key, txt_value = [
+                tensor.contiguous() for tensor in (txt_query, txt_key, txt_value)
+            ]
+            if self.qk_norm:
+                img_query, img_key = apply_qk_norm_with_optional_rope(
+                    q=img_query,
+                    k=img_key,
+                    q_norm=self.norm_q,
+                    k_norm=self.norm_k,
+                    head_dim=self.head_dim,
+                    cos_sin_cache=img_cache,
+                    is_neox=False,
+                    allow_inplace=True,
+                )
+                txt_query, txt_key = apply_qk_norm_with_optional_rope(
+                    q=txt_query,
+                    k=txt_key,
+                    q_norm=self.norm_added_q,
+                    k_norm=self.norm_added_k,
+                    head_dim=self.head_dim,
+                    cos_sin_cache=txt_cache,
+                    is_neox=False,
+                    allow_inplace=True,
+                )
+            elif img_cache is not None and txt_cache is not None:
+                img_query, img_key = apply_flashinfer_rope_qk_inplace(
+                    img_query, img_key, img_cache, is_neox=False
+                )
+                txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
+                    txt_query, txt_key, txt_cache, is_neox=False
+                )
 
         # Joint order [text, image]; join_seqs relocates any SP text tail-pad
         # behind the image (see sp_shard.join_seqs for why).
@@ -819,7 +877,9 @@ class QwenImageCrossAttention(nn.Module):
                 img_value,
                 sp_txt_pad,
             )
-        if seg_qkv is not None:
+        if joint_qkv is not None:
+            joint_query, joint_key, joint_value = joint_qkv
+        elif seg_qkv is not None:
             joint_query, joint_key, joint_value = seg_qkv
         else:
             joint_query = join_seqs(txt_query, img_query, sp_txt_pad)
@@ -1407,6 +1467,10 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
     param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "to_added_qkv": ["add_q_proj", "add_k_proj", "add_v_proj"],
+    }
     _fsdp_shard_conditions = [is_transformer_block]
 
     @classmethod
