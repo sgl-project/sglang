@@ -2598,6 +2598,7 @@ def _attention_backend_fa3_fp8_fallback(view: Any) -> dict:
 
 @register_post_process
 def _fa4_page_constraint(view: Any) -> dict:
+    speculative_algorithm = (getattr(view, "speculative_algorithm", None) or "").upper()
     if (
         (
             view.attention_backend == "fa4"
@@ -2606,9 +2607,11 @@ def _fa4_page_constraint(view: Any) -> dict:
         )
         and not use_mla_backend(view)
         and is_sm100_supported()
-        # EAGLE topk>1 spec runs the two-pass page-tree cascade, which the FA4
-        # CUTLASS kernel aborts on at page_size>1. That path only works at
-        # page_size==1, so skip the 128 auto-force for it and keep the default.
+        # Tree speculative decoding runs the two-pass page-tree cascade, which
+        # the FA4 CUTLASS kernel aborts on at page_size>1. NGRAM resolves its
+        # tree width after attention-backend compatibility, so identify it by
+        # algorithm instead of relying on the EAGLE-specific topk field.
+        and speculative_algorithm != "NGRAM"
         and (view.speculative_eagle_topk or 0) <= 1
     ):
         logger.warning(
