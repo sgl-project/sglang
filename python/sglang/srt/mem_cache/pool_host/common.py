@@ -10,8 +10,11 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.runtime_context import get_memory
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
 
 _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
 
@@ -228,10 +231,28 @@ def alloc_with_host_register(
     """
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
+
+    ROCm gets pin_memory instead wherever the buffer is ours to place: the
+    transfer kernels dereference a table of host pointers on the GPU, and
+    hipHostRegister maps a region at a device address that differs from its host
+    virtual address, while hipHostMalloc (what pin_memory uses) returns one
+    address valid on both sides. A storage backend owns its memory and must
+    still register, ShmHostTensorAllocator included -- hence the exact type test
+    rather than isinstance().
     """
+    if pin_memory and _is_hip and type(allocator) is HostTensorAllocator:
+        return torch.empty(dims, dtype=dtype, device=device, pin_memory=True)
+
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
         _cuda_host_register(buffer, registration_granularity_bytes)
+        if _is_hip:
+            logger.warning(
+                "%s owns its host memory, which ROCm cannot address from the GPU "
+                "at its host virtual address, so the kernel io backend cannot "
+                "read or write these buffers.",
+                type(allocator).__name__,
+            )
     return buffer
 
 
