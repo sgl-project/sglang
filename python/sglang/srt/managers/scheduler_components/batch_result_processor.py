@@ -748,7 +748,7 @@ class SchedulerBatchResultProcessor:
 
                 # Commit the full accepted run (drafts + bonus).
                 num_accept_tokens = len(accept_tokens)
-                req.kv_committed_len += num_accept_tokens
+                req.kv.kv_committed_len += num_accept_tokens
                 req.spec_verify_ct += 1
 
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
@@ -1126,7 +1126,7 @@ class SchedulerBatchResultProcessor:
 
             if completed_mamba_boundary and not lazy:
                 req.mamba_last_track_idx = batch.mamba_track_buffer_indices[i]
-                req.mamba_last_track_seqlen = req.kv_committed_len - lookahead
+                req.mamba_last_track_seqlen = req.kv.kv_committed_len - lookahead
             elif (
                 req.finished()
                 and lazy
@@ -1222,7 +1222,7 @@ class SchedulerBatchResultProcessor:
         lazy = mamba_extra_buffer_lazy_enabled()
         if known_boundary:
             self._mamba_assert_committed_len_lookahead(req)
-            track_seqlen = req.kv_committed_len
+            track_seqlen = req.kv.kv_committed_len
             assert track_seqlen % mamba_track_grid(self.tree_cache.page_size) == 0
             at_boundary = True
         else:
@@ -1317,8 +1317,8 @@ class SchedulerBatchResultProcessor:
             f"(req {req.rid}); output_ids is empty"
         )
         token_seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-        assert (req.kv_committed_len - token_seq_len) in (0, 1), (
-            f"mamba track boundary: kv_committed_len={req.kv_committed_len} "
+        assert (req.kv.kv_committed_len - token_seq_len) in (0, 1), (
+            f"mamba track boundary: kv_committed_len={req.kv.kv_committed_len} "
             f"leads seq_len={token_seq_len} by more than one (req {req.rid}); "
             "overlap lookahead wider than assumed"
         )
@@ -1340,7 +1340,7 @@ class SchedulerBatchResultProcessor:
 
         if batch.spec_algorithm.is_none():
             lookahead = req.decode_batch_idx - batch.mamba_decode_batch_idx_cpu[i]
-            committed_len = req.kv_committed_len - lookahead
+            committed_len = req.kv.kv_committed_len - lookahead
             if committed_len % interval == 0:
                 return True, committed_len
         elif result.num_correct_drafts_per_req_cpu is not None:
