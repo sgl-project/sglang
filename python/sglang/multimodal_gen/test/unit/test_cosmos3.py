@@ -957,6 +957,7 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
             num_inference_steps=30,
             num_frames=5,
             metrics=None,
+            candidate_spec=None,
         )
 
         output = stage.forward(batch, types.SimpleNamespace(vae_cpu_offload=False))
@@ -2203,18 +2204,28 @@ class TestCosmos3CandidateReduction(unittest.TestCase):
         output = stage.forward(batch, server_args)
         return output.output[0]
 
-    def test_no_candidate_spec_keeps_existing_first_candidate_behavior(self):
-        # Byte-identical to the pre-RFC path: candidate_spec is None by
-        # default, so this must still pick action_pred[0].
-        action_latents = torch.stack(
-            [torch.full((2, 3), 1.0), torch.full((2, 3), 5.0)], dim=0
-        )
+    def test_no_candidate_spec_single_output_is_unaffected(self):
+        # Byte-identical to the pre-RFC path: candidate_spec is None and
+        # there is one output, so this must still pick action_pred[0].
+        action_latents = torch.full((1, 2, 3), 1.0)
         payload = self._decode_action(action_latents, candidate_spec=None)
         torch.testing.assert_close(
             torch.as_tensor(payload["actions"]), torch.full((2, 3), 1.0)
         )
         self.assertNotIn("candidates", payload)
         self.assertNotIn("candidate_metrics", payload)
+
+    def test_no_candidate_spec_multi_item_leading_dim_is_multi_image_batch(self):
+        # Without candidate_spec, action_pred's leading dim (when > 1) is the
+        # multi-image batch axis (a different, unrelated Cosmos3 feature --
+        # see test_batched_action_decode_keeps_batch_dimension), not a
+        # candidate axis, so it must be returned in full rather than reduced
+        # to a single output.
+        action_latents = torch.stack(
+            [torch.full((2, 3), 1.0), torch.full((2, 3), 5.0)], dim=0
+        )
+        payload = self._decode_action(action_latents, candidate_spec=None)
+        torch.testing.assert_close(torch.as_tensor(payload["actions"]), action_latents)
 
     def test_candidate_spec_reports_reduction_metrics(self):
         spec = CandidateTrajectorySpec(count=2, reducer="mean")
@@ -2305,11 +2316,14 @@ class TestCosmos3CandidateDistributedGuards(unittest.TestCase):
         return batch, server_args
 
     def test_cfg_parallel_action_guard_fires_with_candidate_spec(self):
+        # forward() is a thin use_declared_component wrapper around
+        # _denoise_once (which the guard lives in); call _denoise_once
+        # directly to avoid needing to stub the component-manager machinery.
         stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
         spec = CandidateTrajectorySpec(count=2, reducer="mean")
         batch, server_args = self._forward_kwargs(candidate_spec=spec)
         with self.assertRaises(NotImplementedError):
-            stage.forward(batch, server_args)
+            stage._denoise_once(batch, server_args)
 
     def test_cfg_parallel_action_guard_fires_without_candidate_spec(self):
         # Same guard must still fire with no candidate_spec at all, so the
@@ -2317,7 +2331,7 @@ class TestCosmos3CandidateDistributedGuards(unittest.TestCase):
         stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
         batch, server_args = self._forward_kwargs(candidate_spec=None)
         with self.assertRaises(NotImplementedError):
-            stage.forward(batch, server_args)
+            stage._denoise_once(batch, server_args)
 
 
 if __name__ == "__main__":
