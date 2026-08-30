@@ -232,6 +232,28 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(backend.name, "TORCH_SDPA")
         self.assertEqual(matched_key, "text_encoder")
 
+    def test_ltx_automatic_text_encoder_backend_is_not_explicit(self):
+        args = _from_dict_without_model_resolution(
+            {"model_path": "Lightricks/LTX-2.3"},
+            pipeline_config=LTX2PipelineConfig(),
+        )
+
+        self.assertEqual(
+            args.component_attention_backends, {"text_encoder": "torch_sdpa"}
+        )
+        self.assertTrue(args.is_component_attention_backend_automatic("text_encoder"))
+
+    def test_ltx_explicit_text_encoder_backend_remains_explicit(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "Lightricks/LTX-2.3",
+                "component_attention_backends": {"text_encoder": "torch_sdpa"},
+            },
+            pipeline_config=LTX2PipelineConfig(),
+        )
+
+        self.assertFalse(args.is_component_attention_backend_automatic("text_encoder"))
+
     def test_invalid_component_attention_backend_raises(self):
         with self.assertRaises(ValueError):
             self._from_dict_without_model_resolution(

@@ -371,6 +371,9 @@ class ServerArgs(DisaggServerArgsMixin):
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
     _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
+    _automatic_component_attention_backend_keys: set[str] = field(
+        default_factory=set, init=False, repr=False
+    )
     _required_resident_components: set[str] = field(
         default_factory=set, init=False, repr=False
     )
@@ -952,6 +955,7 @@ class ServerArgs(DisaggServerArgsMixin):
                     logger.info(
                         "Automatically set torch_sdpa backend for component text_encoder to preserve LTX2 official attention semantics"
                     )
+                    self._automatic_component_attention_backend_keys.add("text_encoder")
                 else:
                     logger.warning(
                         "Overriding %s backend with torch_sdpa for component text_encoder to preserve LTX2 official attention semantics",
@@ -975,6 +979,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "encoder; laser_attn applies to the transformer"
             )
             self.component_attention_backends["text_encoder"] = "torch_sdpa"
+            self._automatic_component_attention_backend_keys.add("text_encoder")
 
         if self.ring_degree > 1:
             if (
@@ -1160,6 +1165,14 @@ class ServerArgs(DisaggServerArgsMixin):
                 if backend is not None:
                     return AttentionBackendEnum[backend.upper()], backend_key
         return None, None
+
+    def is_component_attention_backend_automatic(
+        self, component_name: str | None
+    ) -> bool:
+        return (
+            component_name is not None
+            and component_name in self._automatic_component_attention_backend_keys
+        )
 
     def _adjust_warmup(self):
         if self.warmup_mode is not None and self.warmup_mode not in WARMUP_MODES:
