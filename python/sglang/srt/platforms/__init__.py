@@ -49,7 +49,7 @@ def _is_npu_available() -> bool:
 
 
 def _is_xpu_available() -> bool:
-    return bool(getattr(torch, "xpu", None) is not None and torch.xpu.is_available())
+    return torch.xpu.is_available()
 
 
 def _is_mps_available() -> bool:
