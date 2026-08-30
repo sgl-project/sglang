@@ -2313,6 +2313,18 @@ def select_experts(
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     # remove num_fused_shared_experts from grouped_topk/biased_grouped_topk
     num_routed_topk = top_k - num_fused_shared_experts
+    # On the per-rank shared-slot path the shared expert is appended afterwards by
+    # fused_append_remap_shared_experts_deepep, so the gate must not emit a shared
+    # marker as well. Doing both costs one routed expert (the gate is asked for
+    # K_routed = top_k - num_fused_shared_experts and then spends one of those
+    # slots on the marker) and places that marker at id num_experts, which the
+    # DeepEP remap shifts one past the end of the expert space -- 384 -> 392 for
+    # 384 routed experts on EP8, where the valid ids are 0..391.
+    num_fused_shared_experts_for_gate = (
+        0
+        if has_per_rank_fused_shared_slots(num_fused_shared_experts)
+        else num_fused_shared_experts
+    )
     if use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
@@ -2374,7 +2386,7 @@ def select_experts(
                 topk=num_routed_topk if _use_aiter else top_k,
                 renormalize=renormalize,
                 scoring_func=scoring_func,
-                num_fused_shared_experts=num_fused_shared_experts,
+                num_fused_shared_experts=num_fused_shared_experts_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
@@ -2437,7 +2449,7 @@ def select_experts(
                 renormalize=renormalize,
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
-                num_fused_shared_experts=num_fused_shared_experts,
+                num_fused_shared_experts=num_fused_shared_experts_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 **_fused_topk_kwargs,

@@ -36,7 +36,7 @@ class _DummyReq:
     def __init__(self):
         self._kv_committed_len = 0
         self.swa_prefix_lock_released = False
-        self.kv = SimpleNamespace(swa_evicted_seqlen=0)
+        self.kv = SimpleNamespace(swa_evicted_seqlen=0, cache_protected_len=0)
 
 
 def _build_swa_tree(
@@ -682,7 +682,7 @@ class TestSWA(unittest.TestCase):
         req.last_node = tree.root_node
         req.swa_uuid_for_lock = None
         req.kv.swa_evicted_seqlen = 0
-        req.cache_protected_len = 1
+        req.kv.cache_protected_len = 1
         # Intentionally mismatch to ensure code does not use len(prefix_indices).
         req.prefix_indices = torch.tensor([7, 8, 9, 10, 11], device=tree.device)
 
@@ -700,7 +700,7 @@ class TestSWA(unittest.TestCase):
             req, is_insert=True, kv_len_to_handle=req._kv_committed_len
         )
 
-        self.assertEqual(captured["prev_prefix_len"], req.cache_protected_len)
+        self.assertEqual(captured["prev_prefix_len"], req.kv.cache_protected_len)
         self.assertTrue(captured["is_bigram"])
         self.assertEqual(captured["key_len"], len(req.origin_input_ids) - 1)
 
@@ -720,7 +720,7 @@ class TestSWA(unittest.TestCase):
         req2.last_node = tree.root_node
         req2.swa_uuid_for_lock = None
         req2.kv.swa_evicted_seqlen = 0
-        req2.cache_protected_len = 1
+        req2.kv.cache_protected_len = 1
         req2.prefix_indices = torch.tensor([21, 22, 23, 24, 25], device=tree.device)
 
         freed_lens = []
@@ -917,7 +917,7 @@ class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
         req.get_fill_ids = lambda: token_ids
         req.extra_key = None
         req.cache_salt = None
-        req.cache_protected_len = 0
+        req.kv.cache_protected_len = 0
         req.last_node = tree.root_node
         req.swa_uuid_for_lock = None
         req.prefix_indices = torch.empty(0, dtype=torch.int64, device=tree.device)
@@ -928,7 +928,7 @@ class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
         # The insert itself frees nothing.
         self.assertEqual(allocator.swa_available_size(), swa_before)
         # The live leaf holds a full window, so the whole key stays matchable.
-        self.assertEqual(req.cache_protected_len, num_tokens)
+        self.assertEqual(req.kv.cache_protected_len, num_tokens)
         # [0, evicted) is a tombstone; only [evicted, num_tokens) counts as SWA.
         (first,) = tree.root_node.children.values()
         self.assertTrue(first.swa_tombstone)

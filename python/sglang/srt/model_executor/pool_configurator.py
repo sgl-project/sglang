@@ -44,6 +44,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils.common import (
     ceil_align,
@@ -780,9 +781,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.swa_page_size = cfg.window_size
         self.swa_ratio = get_schedule().swa_full_tokens_ratio
         self.is_speculative = get_spec().speculative_algorithm is not None
-        self.online_c128_mtp_max_draft_tokens = (
-            kvc.server_args.max_speculative_num_draft_tokens or 0
-        )
+        self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
         self.requested_max_running_requests_per_worker = (
             get_schedule().max_running_requests // kvc.ps.attn_dp_size
             if get_schedule().max_running_requests is not None
@@ -814,7 +813,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.
             self._assert_ring_serves_draft_tokens(
-                kvc.server_args.max_speculative_num_draft_tokens or 0
+                max_speculative_num_draft_tokens() or 0
             )
 
         self.bytes_per_full_token = self._get_bytes_per_full_token()

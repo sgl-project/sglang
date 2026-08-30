@@ -36,7 +36,7 @@ import unittest.mock
 import torch
 
 import sglang
-from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.overrides import model_config_of, resolution_result
 from sglang.srt.environ import EnvField, envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda
@@ -445,14 +445,16 @@ class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
         record.resolve_once()
 
         entries = []
-        original = ServerArgs._run_resolution_pipeline
+        from sglang.srt.arg_groups import pipeline as pipeline_module
 
-        def counted(self):
+        original = pipeline_module.run_resolution_pipeline
+
+        def counted(server_args):
             entries.append(1)
-            return original(self)
+            return original(server_args)
 
         with unittest.mock.patch.object(
-            ServerArgs, "_run_resolution_pipeline", counted
+            pipeline_module, "run_resolution_pipeline", counted
         ):
             record.resolve_once()
         self.assertEqual(
@@ -517,7 +519,7 @@ class TestProgramsResolveBeforeReadingResolution(CustomTestCase):
         from sglang.srt.server_args import ServerArgs as _ServerArgs
 
         srt = pathlib.Path(next(iter(sglang.__path__))).resolve() / "srt"
-        declarers = {"_declare", "declare_resolution", "declare_late_resolution"}
+        declarers = {"declare_resolution", "declare_late_resolution"}
         fields = set()
         field_names = {field.name for field in _dataclasses.fields(_ServerArgs)}
         # The record plus every module under `arg_groups/`: a handler declares
@@ -824,10 +826,10 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
     def test_the_copy_carries_what_resolution_left_on_the_record(self):
         """Not just the stash and the flag.
 
-        `get_model_config()` memoizes on the record, and that cache is filled
+        `model_config_of()` memoizes on the record, and that cache is filled
         during resolution. A copy that is marked resolved but arrives without it
         cannot fill it -- the read-only guard refuses the cache write -- so the
-        first `get_model_config()` raises. That is what killed the Ray
+        first `model_config_of()` raises. That is what killed the Ray
         schedulers, and it is why the carry is enumerated from the instance
         rather than from a list of names.
         """
@@ -844,7 +846,7 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
             [],
             f"the copy did not carry what resolution left on the record: {missing}",
         )
-        self.assertIsNotNone(copy_.get_model_config())
+        self.assertIsNotNone(model_config_of(copy_))
         # Containers are copied, so the copy's declaration stays with it.
         self.assertEqual(
             len(parent._resolved_overrides) + 1, len(copy_._resolved_overrides)
@@ -964,7 +966,7 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
         for path in sorted(package_root.rglob("*.py")):
             try:
                 source = path.read_text()
-                if "_run_resolution_pipeline" not in source:
+                if "run_resolution_pipeline" not in source:
                     continue
                 tree = ast.parse(source)
             except SyntaxError:
@@ -984,8 +986,8 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
             for node in ast.walk(tree):
                 if (
                     isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "_run_resolution_pipeline"
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "run_resolution_pipeline"
                 ):
                     rel = path.relative_to(package_root).as_posix()
                     callers.append((rel, ".".join(scopes.get(id(node), ()))))
@@ -1131,12 +1133,14 @@ class TestResolutionStaysLazy(CustomTestCase):
         import sglang
 
         srt = pathlib.Path(next(iter(sglang.__path__))).resolve() / "srt"
-        tree = ast.parse((srt / "server_args.py").read_text(encoding="utf-8-sig"))
+        tree = ast.parse(
+            (srt / "arg_groups" / "pipeline.py").read_text(encoding="utf-8-sig")
+        )
         dispatch = next(
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef)
-            and node.name == "_run_resolution_pipeline"
+            and node.name == "run_resolution_pipeline"
         )
         early_return = min(
             (
