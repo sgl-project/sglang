@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import diffusers
@@ -107,6 +108,60 @@ def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
 
 
 _get_qkv_projections = get_qkv_projections
+
+
+def _safe_tensor_version(tensor: torch.Tensor) -> Optional[int]:
+    """Read a tensor version counter without rejecting inference tensors."""
+    return None if tensor.is_inference() else tensor._version
+
+
+@dataclass(frozen=True, eq=False)
+class _QwenModulationCacheKey:
+    timestep: torch.Tensor
+    timestep_version: Optional[int]
+    additional_t_cond: Optional[torch.Tensor]
+    additional_t_cond_version: Optional[int]
+    hidden_dtype: torch.dtype
+    hidden_device: torch.device
+
+    def matches(self, other: "_QwenModulationCacheKey") -> bool:
+        return (
+            self.timestep is other.timestep
+            and self.timestep_version == other.timestep_version
+            and self.additional_t_cond is other.additional_t_cond
+            and self.additional_t_cond_version == other.additional_t_cond_version
+            and self.hidden_dtype == other.hidden_dtype
+            and self.hidden_device == other.hidden_device
+        )
+
+
+def _qwen_modulation_cache_key(
+    timestep: Optional[torch.Tensor],
+    additional_t_cond: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+) -> Optional[_QwenModulationCacheKey]:
+    """Build the key shared by the two serial CFG forwards at one timestep."""
+    if (
+        not isinstance(timestep, torch.Tensor)
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or is_in_breakable_cuda_graph()
+        or (timestep.device.type == "cuda" and torch.cuda.is_current_stream_capturing())
+    ):
+        return None
+
+    return _QwenModulationCacheKey(
+        timestep=timestep,
+        timestep_version=_safe_tensor_version(timestep),
+        additional_t_cond=additional_t_cond,
+        additional_t_cond_version=(
+            _safe_tensor_version(additional_t_cond)
+            if isinstance(additional_t_cond, torch.Tensor)
+            else None
+        ),
+        hidden_dtype=hidden_states.dtype,
+        hidden_device=hidden_states.device,
+    )
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -977,6 +1032,13 @@ class QwenImageTransformerBlock(nn.Module):
         self.fused_res_ln_ss_gate_select01 = (
             FusedResidualLayerNormScaleShiftGateSelect01()
         )
+        self._modulation_cache: Optional[
+            Tuple[
+                _QwenModulationCacheKey,
+                torch.Tensor,
+                torch.Tensor,
+            ]
+        ] = None
 
         nunchaku_enabled = (
             quant_config is not None
@@ -1057,6 +1119,30 @@ class QwenImageTransformerBlock(nn.Module):
         self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
     ) -> torch.Tensor:
         return self.fuse_mul_add(a, b, c, k)
+
+    def _get_modulation_params(
+        self,
+        temb_img_silu: torch.Tensor,
+        temb_txt_silu: torch.Tensor,
+        cache_key: Optional[_QwenModulationCacheKey],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cached = self._modulation_cache
+        if (
+            cache_key is not None
+            and cached is not None
+            and cached[0].matches(cache_key)
+        ):
+            self._modulation_cache = None
+            return cached[1], cached[2]
+
+        img_mod_params, _ = self.img_mod[1](temb_img_silu)
+        txt_mod_params, _ = self.txt_mod[1](temb_txt_silu)
+        self._modulation_cache = (
+            (cache_key, img_mod_params, txt_mod_params)
+            if cache_key is not None
+            else None
+        )
+        return img_mod_params, txt_mod_params
 
     def _modulate(
         self,
@@ -1165,10 +1251,14 @@ class QwenImageTransformerBlock(nn.Module):
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         modulate_index: Optional[torch.Tensor] = None,
+        modulation_cache_key: Optional[_QwenModulationCacheKey] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
-        img_mod_params, _ = self.img_mod[1](temb_img_silu)  # [B, 6*dim]
-        txt_mod_params, _ = self.txt_mod[1](temb_txt_silu)  # [B, 6*dim]
+        img_mod_params, txt_mod_params = self._get_modulation_params(
+            temb_img_silu,
+            temb_txt_silu,
+            modulation_cache_key,
+        )
 
         if (
             self.quant_config is not None
@@ -1512,6 +1602,12 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         hidden_states, _ = self.img_in(hidden_states)
 
+        modulation_cache_key = _qwen_modulation_cache_key(
+            timestep,
+            additional_t_cond,
+            hidden_states,
+        )
+
         timestep = (timestep / 1000).to(hidden_states.dtype)
 
         if self.zero_cond_t:
@@ -1611,6 +1707,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 image_rotary_emb=image_rotary_emb,
                 joint_attention_kwargs=block_attention_kwargs,
                 modulate_index=modulate_index,
+                modulation_cache_key=modulation_cache_key,
             )
 
             # controlnet residual
