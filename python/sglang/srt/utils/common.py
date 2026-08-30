@@ -133,6 +133,20 @@ def is_hip() -> bool:
     return torch.version.hip is not None
 
 
+@lru_cache(maxsize=1)
+def is_hcu() -> bool:
+    if not is_hip():
+        return False
+    try:
+        props = torch.cuda.get_device_properties(0)
+        gcn_arch = getattr(props, "gcnArchName", "").split(":", 1)[0]
+        supported_archs = {"gfx936", "gfx938", "gfx928"}
+        return gcn_arch in supported_archs
+    except Exception as e:
+        logger.warning("HCU detection failed (not a HCU or HIP misconfigured): %s", e)
+        return False
+
+
 if is_hip():
     HIP_FP8_E4M3_FNUZ_MAX = 224.0
     FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX

@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_hcu,
     is_hip,
     is_musa,
     is_npu,
@@ -48,6 +49,7 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 _is_musa = is_musa()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -123,6 +125,9 @@ elif _is_hip:
     except ImportError:
         # Fallback: vllm not available, will use forward_native
         _has_vllm_rms_norm = False
+
+if _is_hcu:
+    _has_vllm_rms_norm = False
 
 if _is_hip:
     try:

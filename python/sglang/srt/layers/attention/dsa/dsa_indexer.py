@@ -54,6 +54,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_gfx95_supported,
+    is_hcu,
     is_hip,
     is_npu,
     is_xpu,
@@ -184,6 +185,12 @@ def _broadcast_indexer_topk_from_rank0(
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    # HCU does not provide fast_hadamard_transform. This orthogonal transform
+    # only preserves indexer dot products; the CUDA fused path and the GLM-5
+    # Hugging Face reference omit it as well. Keep both HCU query and key in
+    # the same unrotated space without changing CUDA or standard ROCm paths.
+    if is_hcu():
+        return x
     # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform

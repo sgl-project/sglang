@@ -16,6 +16,9 @@ import torch.distributed._symmetric_memory as symm_mem
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
 logger = logging.getLogger(__name__)
 
 # Each thread moves _NUMEL_PER_THREAD bf16 via one 128-bit multimem op; the
@@ -461,6 +464,8 @@ class MultimemAllGatherer:
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
         # None => always NCCL; _UNINIT => build on first eager call.
+        if enabled and _is_hcu:
+            enabled = False
         self._state = self._UNINIT if enabled else None
         if self._state is self._UNINIT:
             # Lazy import avoids a module-load dependency on the distributed facade.
