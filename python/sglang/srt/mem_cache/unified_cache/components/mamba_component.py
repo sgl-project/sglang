@@ -197,7 +197,7 @@ class MambaComponent(TreeComponent):
             return result
         req = params.req
         assert req is not None
-        if req.kv.mamba_pool_idx is None:
+        if not req.kv.holds_mamba:
             dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             if dst_index is None:
                 # Pin the window via inc/dec_lock_ref so evict's SWA release
@@ -669,7 +669,7 @@ class MambaComponent(TreeComponent):
     ) -> PrepareLoadBackResult:
         if (
             req is None
-            or req.kv.mamba_pool_idx is not None
+            or req.kv.holds_mamba
             or not self.tree_core.component_has_host_value_only(
                 node_id, self.component_type
             )

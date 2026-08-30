@@ -3589,9 +3589,7 @@ class Scheduler(
                     # metadata before add_one_req() rejects the request.
                     req.kv.mamba_cow_src_index = None
                     req.kv.mamba_needs_clear = False
-                    if req.kv.mamba_pool_idx is not None and not getattr(
-                        req, "session", None
-                    ):
+                    if req.kv.holds_mamba and not getattr(req, "session", None):
                         self.tree_cache.req_to_token_pool.mamba_allocator.free(
                             req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
@@ -4852,7 +4850,7 @@ class Scheduler(
 
             # For mamba radix cache
             if (
-                req.kv.mamba_pool_idx is not None
+                req.kv.holds_mamba
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
@@ -4867,7 +4865,7 @@ class Scheduler(
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
                 )
-                if req.kv.req_pool_idx is not None or req.kv.mamba_pool_idx is not None:
+                if req.kv.holds_kv or req.kv.holds_mamba:
                     release_kv_cache(req, self.tree_cache, is_insert=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 

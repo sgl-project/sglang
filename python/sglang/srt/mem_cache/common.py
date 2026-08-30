@@ -62,7 +62,7 @@ def free_swa_out_of_window_slots(
     is_chunk_cache: bool = False,
     retain_floor: int | None = None,
 ) -> None:
-    if not req.kv.is_held:
+    if not req.kv.holds_kv:
         return
 
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
@@ -199,14 +199,14 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-    assert (not req.kv.is_held) == req.kv.is_released
+    assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # MambaRadixCache may alloc mamba state before alloc KV cache
-    if not req.kv.is_held:
+    if not req.kv.holds_kv:
         assert (
             tree_cache.supports_mamba()
         ), "Only MambaRadixCache allow freeing before alloc"
         # TODO (csy, hanming): clean up this early allocation logic
-        if req.kv.mamba_pool_idx is not None:
+        if req.kv.holds_mamba:
             tree_cache.req_to_token_pool.mamba_allocator.free(
                 req.kv.mamba_pool_idx.unsqueeze(-1)
             )
@@ -222,8 +222,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     # StreamingSession.cache_finished_req handles speculative tail trim
     # internally, then sets req_pool_idx = None.
-    assert (not req.kv.is_held) == req.kv.is_released
-    if not req.kv.is_held:
+    assert (not req.kv.holds_kv) == req.kv.is_kv_released
+    if not req.kv.holds_kv:
         return
 
     start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
@@ -234,13 +234,13 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         not tree_cache.supports_mamba()
     ):
         assert (
-            req.kv.mamba_pool_idx is not None
+            req.kv.holds_mamba
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     tree_cache.req_to_token_pool.free(req)
-    req.kv.mark_released()
+    req.kv.mark_kv_released()
 
 
 def _release_overallocated_kv_indices(

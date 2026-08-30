@@ -816,7 +816,7 @@ class ReqLogprob:
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqKvInfo:
     # Device KV a request holds outside the prefix cache. Always present on the Req;
-    # whether any KV is held is `is_held` (a row is registered).
+    # whether any KV is held is `holds_kv` (a row is registered).
     req_pool_idx: Optional[int] = None  # req_to_token row, the register for the slots
 
     # The request's own KV is [cache_protected_len, kv_allocated_len).
@@ -855,14 +855,18 @@ class ReqKvInfo:
         return lo
 
     @property
-    def is_held(self) -> bool:
+    def holds_kv(self) -> bool:
         return self.req_pool_idx is not None
 
     @property
-    def is_released(self) -> bool:
+    def holds_mamba(self) -> bool:
+        return self.mamba_pool_idx is not None
+
+    @property
+    def is_kv_released(self) -> bool:
         return self.kv_allocated_len == 0 and self.swa_evicted_seqlen == 0
 
-    def mark_released(self) -> None:
+    def mark_kv_released(self) -> None:
         self.kv_allocated_len = 0
         self.swa_evicted_seqlen = 0
 
@@ -1755,7 +1759,7 @@ class Req(ReqDllmMixin):
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
         self.already_computed = 0
-        assert not self.kv.is_held, "expect it is already released"
+        assert not self.kv.holds_kv, "expect it is already released"
         self.kv.kv_committed_len = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -1792,7 +1796,7 @@ class Req(ReqDllmMixin):
             ),
             mamba_cpu=(
                 mamba_pool.get_cpu_copy(self.kv.mamba_pool_idx.unsqueeze(0))
-                if mamba_pool is not None and self.kv.mamba_pool_idx is not None
+                if mamba_pool is not None and self.kv.holds_mamba
                 else None
             ),
         )
@@ -1804,7 +1808,7 @@ class Req(ReqDllmMixin):
         ]
         # Loads both the kv cache and mamba state if exists
         mamba_cpu = self.kv.retraction_backup.mamba_cpu
-        if mamba_cpu is not None and self.kv.mamba_pool_idx is not None:
+        if mamba_cpu is not None and self.kv.holds_mamba:
             req_to_token_pool.mamba_pool.load_cpu_copy(
                 mamba_cpu, self.kv.mamba_pool_idx.unsqueeze(0)
             )
@@ -2700,7 +2704,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         # Collect mamba init info for deferred ops on forward stream
-        if any(req.kv.mamba_pool_idx is not None for req in reqs):
+        if any(req.kv.holds_mamba for req in reqs):
             self._collect_deferred_mamba_cow_and_clear(reqs)
 
         if self.model_config.is_encoder_decoder:
@@ -3505,7 +3509,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # seqlen progress is monotonic per KV handle.
                     if (
                         req.decode_batch_idx >= 1
-                        and req.kv.is_held
+                        and req.kv.holds_kv
                         and req.seqlen - 1 - sliding_window_size
                         >= req.kv.swa_evicted_seqlen + eviction_interval
                     ):

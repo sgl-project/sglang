@@ -1359,9 +1359,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         for req in reqs:
-            if (
-                req.kv.mamba_pool_idx is not None
-            ):  # for radix cache / continuing chunked
+            if req.kv.holds_mamba:  # for radix cache / continuing chunked
                 pass
             else:
                 mid = self.mamba_allocator.alloc(1)

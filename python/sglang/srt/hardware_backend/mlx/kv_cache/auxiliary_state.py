@@ -270,7 +270,7 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
 
         auxiliary_state_indices = []
         for req in reqs:
-            if req.kv.mamba_pool_idx is not None:
+            if req.kv.holds_mamba:
                 mid = req.kv.mamba_pool_idx
             else:
                 allocated = self.auxiliary_state_pool.alloc(1)
@@ -293,7 +293,7 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         return 0
 
     def free_mamba_cache(self, req, mamba_ping_pong_track_buffer_to_keep=None):
-        if req.kv.mamba_pool_idx is not None:
+        if req.kv.holds_mamba:
             self.auxiliary_state_pool.free(req.kv.mamba_pool_idx.unsqueeze(0))
             req.kv.mamba_pool_idx = None
         track_buffer = req.kv.mamba_ping_pong_track_buffer
@@ -351,7 +351,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
         track_len = req.kv.mamba_last_track_seqlen
         if track_buffer is not None and track_len is not None:
             return track_buffer[0].unsqueeze(-1).clone(), True
-        if req.kv.mamba_pool_idx is None:
+        if not req.kv.holds_mamba:
             return None, False
         return req.kv.mamba_pool_idx.unsqueeze(-1).clone(), False
 
