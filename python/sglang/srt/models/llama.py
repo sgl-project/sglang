@@ -292,11 +292,17 @@ class LlamaAttention(nn.Module):
                 if num_groups > 1:
                     k_b = k_b.repeat_interleave(num_groups, dim=1)
                     v_b = v_b.repeat_interleave(num_groups, dim=1)
-                attn_output = F.scaled_dot_product_attention(
-                    q_b, k_b, v_b, is_causal=False, scale=self.scaling
-                ).transpose(1, 2).reshape(1, -1)
+                attn_output = (
+                    F.scaled_dot_product_attention(
+                        q_b, k_b, v_b, is_causal=False, scale=self.scaling
+                    )
+                    .transpose(1, 2)
+                    .reshape(1, -1)
+                )
             else:
-                last_token_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                last_token_indices = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
                 start_indices = torch.cat(
                     [
                         torch.zeros(1, dtype=torch.long, device=q.device),
@@ -566,7 +572,7 @@ class LlamaModel(nn.Module):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(hidden_states + residual)
             layer = self.layers[i]
-            is_last_layer = (i == num_layers - 1)
+            is_last_layer = i == num_layers - 1
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
@@ -744,7 +750,7 @@ class LlamaForCausalLM(nn.Module):
         num_layers = self.model.config.num_hidden_layers
         for i in range(start, end):
             layer = self.model.layers[i]
-            is_last_layer = (i == num_layers - 1)
+            is_last_layer = i == num_layers - 1
             forward_batch.hidden_states, forward_batch.residual = layer(
                 positions,
                 forward_batch.hidden_states,

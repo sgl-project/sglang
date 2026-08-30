@@ -311,9 +311,16 @@ class RadixAttention(nn.Module):
             else forward_batch.encoder_out_cache_loc
         )
         swa_loc = None
-        if hasattr(backend, "forward_metadata") and backend.forward_metadata is not None:
+        if (
+            hasattr(backend, "forward_metadata")
+            and backend.forward_metadata is not None
+        ):
             swa_loc = getattr(backend.forward_metadata, "swa_out_cache_loc", None)
-        scales = backend._kv_write_scales(self) if hasattr(backend, "_kv_write_scales") else ()
+        scales = (
+            backend._kv_write_scales(self)
+            if hasattr(backend, "_kv_write_scales")
+            else ()
+        )
         backend.token_to_kv_pool.set_kv_buffer(
             self,
             KVWriteLoc(cache_loc, swa_loc),

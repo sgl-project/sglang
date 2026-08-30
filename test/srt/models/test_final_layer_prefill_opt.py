@@ -1,4 +1,5 @@
 import unittest
+
 from sglang.benchmark.one_batch import (
     BenchArgs,
     PortArgs,
