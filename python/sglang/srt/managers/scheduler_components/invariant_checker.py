@@ -329,7 +329,7 @@ class SchedulerInvariantChecker:
                 _add_owner(
                     req,
                     f"req {req.rid}",
-                    req.req_pool_idx,
+                    req.kv.req_pool_idx,
                     req.kv.kv_committed_len,
                     req.kv.kv_allocated_len,
                 )
@@ -340,7 +340,7 @@ class SchedulerInvariantChecker:
                     _add_owner(
                         slot,
                         f"slot {sid[:8]}",
-                        slot.req_pool_idx,
+                        slot.kv.req_pool_idx,
                         slot.kv.kv_committed_len,
                         slot.kv.kv_allocated_len,
                     )

@@ -46,18 +46,22 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
 class _FakeReq:
     def __init__(self, rid, rpi, committed, allocated):
         self.rid = rid
-        self.req_pool_idx = rpi
         self.kv = SimpleNamespace(
-            kv_committed_len=committed, kv_allocated_len=allocated, swa_evicted_seqlen=0
+            req_pool_idx=rpi,
+            kv_committed_len=committed,
+            kv_allocated_len=allocated,
+            swa_evicted_seqlen=0,
         )
         self.is_holding_kv = True
 
 
 class _FakeSlot:
     def __init__(self, rpi, committed, allocated):
-        self.req_pool_idx = rpi
         self.kv = SimpleNamespace(
-            kv_committed_len=committed, kv_allocated_len=allocated, swa_evicted_seqlen=0
+            req_pool_idx=rpi,
+            kv_committed_len=committed,
+            kv_allocated_len=allocated,
+            swa_evicted_seqlen=0,
         )
         self.is_holding_kv = True
 

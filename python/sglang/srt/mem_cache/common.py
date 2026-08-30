@@ -99,7 +99,7 @@ def free_swa_out_of_window_slots(
 
     if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
         free_slots = req_to_token_pool.req_to_token[
-            req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
+            req.kv.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
         token_to_kv_pool_allocator.free_swa(free_slots)
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
@@ -261,9 +261,9 @@ def _release_overallocated_kv_indices(
         start_p = ceil_align(start_p, page_size)
 
     if start_p < end_p:
-        indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
-            start_p:end_p
-        ]
+        indices_to_free = tree_cache.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx
+        ][start_p:end_p]
         # start_p is aligned to the allocator's physical page size above, so it
         # never shares a page with cache_finished_req's tail free in this group.
         allocator.free_segment(indices_to_free, start_pos=start_p)

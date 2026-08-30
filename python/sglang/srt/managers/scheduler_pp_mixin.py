@@ -725,7 +725,7 @@ class SchedulerPPMixin:
                 # Release KV and Mamba cache
                 if req.is_holding_kv:
                     kv_indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, : req.extend_range.end
+                        req.kv.req_pool_idx, : req.extend_range.end
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
                     if req.mamba_pool_idx is not None:
