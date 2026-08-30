@@ -21,6 +21,19 @@ export const config = {
         { id: "high-throughput", label: "High Throughput", subtitle: "Spec decode off" },
       ],
     },
+    {
+      id: "quant",
+      title: "Quantization",
+      options: [
+        { id: "fp8", label: "FP8" },
+        {
+          id: "nvfp4",
+          label: "NVFP4",
+          disabled: (s) => s.hw !== "gb300",
+          disableReason: "The RadixArk NVFP4 checkpoint is validated only on 4x GB300.",
+        },
+      ],
+    },
   ],
 
   isRecommendedSelection(s) {
@@ -44,8 +57,13 @@ export const config = {
         {
           id: "fp8-trtllm",
           label: "FP8 + TRT-LLM",
-          disabled: (s) => ["h100", "h200", "mi300x", "mi325x", "mi355x"].includes(s.hw),
-          disableReason: "This recipe uses BF16 KV cache with TileLang DSA on Hopper and AMD ROCm GPUs.",
+          disabled: (s) =>
+            ["h100", "h200", "mi300x", "mi325x", "mi355x"].includes(s.hw) ||
+            s.quant === "nvfp4",
+          disableReason: (s) =>
+            s.quant === "nvfp4"
+              ? "The NVFP4 checkpoint is validated with BF16 KV cache and TileLang DSA."
+              : "This recipe uses BF16 KV cache with TileLang DSA on Hopper and AMD ROCm GPUs.",
           stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
           flags: [
             "--kv-cache-dtype fp8_e4m3",
@@ -123,6 +141,7 @@ export const config = {
 
   modelNames: {
     default: "zai-org/GLM-5.3-Flash",
+    nvfp4: "RadixArk/GLM-5.3-Flash-NVFP4",
   },
 
   placeholders: {
@@ -169,6 +188,7 @@ sgl-eval run gsm8k \\
 
   accuracyLabels: [
     ["gsm8k_pct", "GSM8K", "%"],
+    ["aime2026_pct", "AIME 2026", "%"],
   ],
 
   // Support is not in a public sglang release yet. NVIDIA uses the
@@ -337,7 +357,7 @@ sgl-eval run gsm8k \\
 
   cells: [
     {
-      match: { hw: "gb300", strategy: "low-latency" },
+      match: { hw: "gb300", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -368,7 +388,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "gb300", strategy: "high-throughput" },
+      match: { hw: "gb300", strategy: "high-throughput", quant: "fp8" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -393,8 +413,74 @@ sgl-eval run gsm8k \\
         "--port {{PORT}}",
       ],
     },
+    // RadixArk NVFP4 W4A4 checkpoint (ModelOpt 0.46.0, abs-max, group size
+    // 16): routed and shared experts plus the dense MLPs are FP4; attention,
+    // router, MTP, embeddings, and the vision tower stay BF16. Validated on
+    // 4x GB300 with BF16 KV + TileLang DSA and the flashinfer_cutlass MoE
+    // runner, so the FP8 + TRT-LLM overlay is disabled for this quant.
     {
-      match: { hw: "h100", strategy: "low-latency" },
+      match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4" },
+      nnodes: 1,
+      verified: true,
+      verificationStatus: (s) =>
+        s.kvDsaPair === "bf16-tilelang" &&
+        s.mmTransport === "auto" &&
+        s.hicache === "off" &&
+        s.dcp === "off"
+          ? "verified"
+          : "unverified",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 4",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-adaptive",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", strategy: "high-throughput", quant: "nvfp4" },
+      nnodes: 1,
+      verified: true,
+      verificationStatus: (s) =>
+        s.kvDsaPair === "bf16-tilelang" &&
+        s.mmTransport === "auto" &&
+        s.hicache === "off" &&
+        s.dcp === "off"
+          ? "verified"
+          : "unverified",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--quantization modelopt_fp4",
+        "--tp-size 4",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h100", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -423,7 +509,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "h100", strategy: "high-throughput" },
+      match: { hw: "h100", strategy: "high-throughput", quant: "fp8" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -445,7 +531,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "h200", strategy: "low-latency" },
+      match: { hw: "h200", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -474,7 +560,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "h200", strategy: "high-throughput" },
+      match: { hw: "h200", strategy: "high-throughput", quant: "fp8" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -495,7 +581,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b200", strategy: "low-latency" },
+      match: { hw: "b200", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) => (s.hicache === "off" ? "verified" : "unverified"),
@@ -520,7 +606,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b200", strategy: "high-throughput" },
+      match: { hw: "b200", strategy: "high-throughput", quant: "fp8" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -541,7 +627,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b300", strategy: "low-latency" },
+      match: { hw: "b300", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) => (s.hicache === "off" ? "verified" : "unverified"),
@@ -566,7 +652,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b300", strategy: "high-throughput" },
+      match: { hw: "b300", strategy: "high-throughput", quant: "fp8" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -587,7 +673,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "gb200", strategy: "low-latency" },
+      match: { hw: "gb200", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,
       verified: false,
       env: [],
@@ -611,7 +697,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "gb200", strategy: "high-throughput" },
+      match: { hw: "gb200", strategy: "high-throughput", quant: "fp8" },
       nnodes: 1,
       verified: false,
       env: [],
@@ -635,7 +721,7 @@ sgl-eval run gsm8k \\
     // while Triton owns the MoE runner. CUDA graphs stay disabled because that
     // is the architecture-gated configuration used for correctness validation.
     {
-      match: { hw: "mi300x", strategy: "high-throughput" },
+      match: { hw: "mi300x", strategy: "high-throughput", quant: "fp8" },
       nnodes: 1,
       verified: true,
       env: ["SGLANG_USE_AITER=1"],
@@ -655,7 +741,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "mi325x", strategy: "high-throughput" },
+      match: { hw: "mi325x", strategy: "high-throughput", quant: "fp8" },
       nnodes: 1,
       verified: false,
       warn: "This MI325X recipe is inferred from the validated MI300X gfx942 path. It has not been measured directly on MI325X.",
@@ -676,7 +762,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "mi355x", strategy: "high-throughput" },
+      match: { hw: "mi355x", strategy: "high-throughput", quant: "fp8" },
       nnodes: 1,
       verified: true,
       env: ["SGLANG_USE_AITER=1"],

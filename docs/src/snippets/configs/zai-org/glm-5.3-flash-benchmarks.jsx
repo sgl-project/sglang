@@ -177,6 +177,20 @@ export const benchmarks = [
       "FP8 KV cache with TRT-LLM DSA on 4x GB300, final weights (c5b82b63e37b) on the current release-image tree (d6ab04bdf1), same protocol as the BF16 rows: 1,227.07 / 2,738.61 / 4,977.02 aggregate output tok/s at concurrency 16 / 64 / 256 — 2.9–5.7% above BF16 + TileLang across the curve, and the FP8 pool holds 12.6M tokens per rank vs 7.0M at BF16 (1.8x capacity at identical pool bytes). Accuracy is the full GSM8K gate on this variant: 97.35% vs 97.50% on BF16 KV, a 0.15-point gap inside sampling noise, with a 100% stop rate over all 1,319 problems. With HiCache L1+L2 (32 GB host tier, 16k prefill chunks) the same protocol measured 1,263.85 / 2,763.31 / 4,773.95 tok/s — within 5% of the non-HiCache rows; the random dataset has no prefix reuse, so L2 benefit was not exercised.",
   },
   {
+    match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4" },
+    sglang_version: "033446bb05",
+    accuracy: { gsm8k_pct: 97.14, aime2026_pct: 92.45 },
+    notes:
+      "RadixArk/GLM-5.3-Flash-NVFP4 — NVFP4 W4A4 post-training quantization of zai-org/GLM-5.3-Flash-BF16 with NVIDIA Model Optimizer 0.46.0 (abs-max scaling, group size 16): routed and shared experts plus the dense MLPs are FP4, while all attention (KDA, DSA indexer, MLA), the router, norms, the vision tower, the MTP layer, embeddings, and the LM head stay BF16. Measured on 4x GB300 with the lmsysorg/sglang:glm-5.3-flash image (PR #36507 head 033446bb05), adaptive MTP 5/1/6, BF16 KV + TileLang DSA, and the flashinfer_cutlass MoE runner. GSM8K 97.14% over the full 1,319-example split x 4 seeds (per-seed range 96.89-97.42%, stop rate 99.85-100%) and AIME 2026 92.45% (30 problems x 16 repeats x 4 seeds = 1,920 generations, per-seed range 91.67-93.54%), both at temperature 1.0 / top_p 0.95. Speed measurement pending.",
+  },
+  {
+    match: { hw: "gb300", strategy: "high-throughput", quant: "nvfp4" },
+    sglang_version: "033446bb05",
+    accuracy: { gsm8k_pct: 97.14, aime2026_pct: 92.45 },
+    notes:
+      "RadixArk/GLM-5.3-Flash-NVFP4 with speculative decoding off — same checkpoint, image, and 4x GB300 measurement stack as the NVFP4 Low Latency row (ModelOpt 0.46.0 NVFP4 W4A4, abs-max, group size 16; MoE and dense MLPs in FP4, attention/router/MTP/embeddings BF16). Accuracy is a checkpoint-level result carried from that arm: GSM8K 97.14% over the full 1,319-example split x 4 seeds (per-seed range 96.89-97.42%, stop rate 99.85-100%) and AIME 2026 92.45% (30 problems x 16 repeats x 4 seeds, per-seed range 91.67-93.54%). Speed measurement pending.",
+  },
+  {
     match: { hw: "h100", strategy: "low-latency" },
     sglang_version: "f040cc72e6",
     accuracy: { gsm8k_pct: 97.27 },
