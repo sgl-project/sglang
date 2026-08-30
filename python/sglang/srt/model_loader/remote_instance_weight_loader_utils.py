@@ -187,24 +187,30 @@ def register_memory_region_v1(model, transfer_engine):
     weight_mr_dict = {}
     registered_blocks = []
     seen_blocks = set()
-    for name, weight in _iter_manifest_parameters(model):
-        size = weight.numel() * weight.element_size()
-        block = (weight.data_ptr(), size)
-        # One registration per byte range; aliases would otherwise register
-        # twice, and the second unregister_memory would fail.
-        if block not in seen_blocks:
-            ret = transfer_engine.register_memory(weight.data_ptr(), size)
-            if ret != 0:
-                raise RuntimeError(
-                    f"register memory failed for weight {name}, error: {ret}"
-                )
-            seen_blocks.add(block)
-            registered_blocks.append(block)
-        weight_mr_dict[name] = (
-            weight.data_ptr(),
-            weight.numel(),
-            weight.element_size(),
-        )
+    try:
+        for name, weight in _iter_manifest_parameters(model):
+            size = weight.numel() * weight.element_size()
+            block = (weight.data_ptr(), size)
+            # One registration per byte range; aliases would otherwise register
+            # twice, and the second unregister_memory would fail.
+            if block not in seen_blocks:
+                ret = transfer_engine.register_memory(weight.data_ptr(), size)
+                if ret != 0:
+                    raise RuntimeError(
+                        f"register memory failed for weight {name}, error: {ret}"
+                    )
+                seen_blocks.add(block)
+                registered_blocks.append(block)
+            weight_mr_dict[name] = (
+                weight.data_ptr(),
+                weight.numel(),
+                weight.element_size(),
+            )
+    except BaseException:
+        # The caller only learns about blocks we return, so a partial
+        # registration would stay pinned with nobody holding a handle.
+        deregister_memory_region(transfer_engine, registered_blocks)
+        raise
 
     end_tic = time.time()
     logger.debug(f"Register memory region time: {(end_tic - start_tic):.4f}s")
@@ -256,14 +262,22 @@ def register_memory_region_v2(model, transfer_engine):
             weight_blocks_for_reg_mr.append(current_weight_block)
 
     # Register merged memory blocks that hold weights.
-    for weight_block in weight_blocks_for_reg_mr:
-        address, size = weight_block
-        ret = transfer_engine.register_memory(address, size)
-        if ret != 0:
-            raise RuntimeError(
-                f"register memory failed for weight block at address {address} with size {size}, error: {ret}"
-            )
+    registered_blocks = []
+    try:
+        for weight_block in weight_blocks_for_reg_mr:
+            address, size = weight_block
+            ret = transfer_engine.register_memory(address, size)
+            if ret != 0:
+                raise RuntimeError(
+                    f"register memory failed for weight block at address {address} with size {size}, error: {ret}"
+                )
+            registered_blocks.append(weight_block)
+    except BaseException:
+        # The caller only learns about blocks we return, so a partial
+        # registration would stay pinned with nobody holding a handle.
+        deregister_memory_region(transfer_engine, registered_blocks)
+        raise
 
     end_tic = time.time()
     logger.debug(f"Register memory region v2 time: {(end_tic - start_tic):.4f}s")
-    return weight_mr_dict, weight_blocks_for_reg_mr
+    return weight_mr_dict, registered_blocks

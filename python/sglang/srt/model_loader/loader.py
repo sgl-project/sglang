@@ -3285,6 +3285,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             == RemoteInstanceWeightLoaderBackend.NCCL
         ):
             model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
+            success = False
             try:
                 with create_remote_connector(
                     model_weights, device_config.device
@@ -3298,12 +3299,15 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     self.load_model_from_remote_instance_by_nccl(
                         model, client, model_config, device_config
                     )
+                success = True
             except ValueError:
                 # A misconfigured connector is not a transient seed failure;
-                # disk would silently paper over the wrong URL.
+                # disk would silently paper over the wrong URL. Safe to raise
+                # past the consensus below: the URL is the same on every rank.
                 raise
             except Exception:
                 logger.exception("Broadcast from the seed instance raised.")
+            if not self._all_ranks_succeeded(success):
                 # The skeleton holds a full copy of the weights, which will
                 # not fit alongside the one the fallback builds.
                 del model
@@ -3349,26 +3353,24 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             except Exception:
                 logger.exception("Transfer from the seed instance raised.")
                 success = False
-            finally:
-                # On by default after a successful load (the registration is
-                # dead weight, but it is charged against the KV pool);
-                # unconditional on failure, so the disk fallback has the memory
-                # to load into.
-                released = True
-                if (
-                    success is not True
-                    or envs.SGLANG_ENABLE_REMOTE_INSTANCE_MR_RELEASE.get()
-                ):
-                    deregister_tic = time.time()
-                    released = deregister_memory_region(
-                        load_config.remote_instance_weight_loader_transfer_engine,
-                        registered_blocks,
-                    )
-                    logger.info(
-                        "TransferEngine memory regions have been deregistered "
-                        "in %.2fs.",
-                        time.time() - deregister_tic,
-                    )
+            # Runs before the release below: a rank that succeeded alone still
+            # needs its registration freed to have room for the checkpoint.
+            success = self._all_ranks_succeeded(success is True)
+            # On by default after a successful load (the registration is
+            # dead weight, but it is charged against the KV pool);
+            # unconditional on failure, so the disk fallback has the memory
+            # to load into.
+            released = True
+            if not success or envs.SGLANG_ENABLE_REMOTE_INSTANCE_MR_RELEASE.get():
+                deregister_tic = time.time()
+                released = deregister_memory_region(
+                    load_config.remote_instance_weight_loader_transfer_engine,
+                    registered_blocks,
+                )
+                logger.info(
+                    "TransferEngine memory regions have been deregistered in %.2fs.",
+                    time.time() - deregister_tic,
+                )
             if not success:
                 if not released:
                     raise RuntimeError(
@@ -3404,6 +3406,36 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             raise ValueError("Invalid remote instance weight loader backend.")
 
         return model.eval()
+
+    @staticmethod
+    def _all_ranks_succeeded(local_success: bool) -> bool:
+        """True only if every rank loaded from the seed.
+
+        SGLang is SPMD, so a rank falling back alone leaves the group serving a
+        mix of seed and checkpoint weights, which the barrier after loading does
+        not catch.
+        """
+        from sglang.srt.distributed import get_world_group
+
+        try:
+            group = get_world_group()
+            if group.world_size <= 1:
+                return local_success
+            all_success = group.all_gather_object(local_success)
+        except (AssertionError, AttributeError, RuntimeError):
+            return local_success
+
+        if not all(all_success):
+            failed = [rank for rank, ok in enumerate(all_success) if not ok]
+            logger.warning(
+                "Falling back to disk on every rank: %d of %d failed to load "
+                "from the seed (ranks %s).",
+                len(failed),
+                len(all_success),
+                failed[:8],
+            )
+            return False
+        return True
 
     def _fallback_to_disk(
         self,
