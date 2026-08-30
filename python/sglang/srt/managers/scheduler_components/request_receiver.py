@@ -78,6 +78,9 @@ class SchedulerRequestReceiver:
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
+    # Emits AbortReqs for SGLANG_REQ_WAITING_TIMEOUT / _RUNNING_TIMEOUT on the
+    # request-pulling rank; they must join the recv stream before the broadcast.
+    poll_timeout_aborts: Optional[Callable[[], List[Any]]] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -98,6 +101,15 @@ class SchedulerRequestReceiver:
                 return []
 
         recv_reqs = self._pull_raw_reqs()
+
+        # Timeout aborts are decided once, on the request-pulling rank, and
+        # ride the same broadcast as tokenizer-initiated aborts.
+        if (
+            recv_reqs is not None
+            and self.ps.pp_rank == 0
+            and self.poll_timeout_aborts is not None
+        ):
+            recv_reqs.extend(self.poll_timeout_aborts())
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
