@@ -68,6 +68,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import (
     get_memory,
     get_observability,
+    get_parallel,
     get_serving,
 )
 
@@ -104,7 +105,6 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_minimax_sparse_pool_to_hiradix_cache.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
-            from sglang.srt.runtime_context import get_parallel
 
             _parallel = get_parallel()
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -148,7 +148,6 @@ class HiRadixCache(RadixCache):
             attach_hybrid_dsa_pool_to_hiradix_cache(
                 self,
                 params,
-                server_args,
                 extra_config=extra_config,
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
@@ -162,7 +161,6 @@ class HiRadixCache(RadixCache):
             attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
                 self,
                 params,
-                server_args,
                 extra_config=extra_config,
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
@@ -344,10 +342,8 @@ class HiRadixCache(RadixCache):
                 labels.update(extra_metric_labels)
             existing_collector = getattr(self, "storage_metrics_collector", None)
             if existing_collector is None:
-                from sglang.srt.runtime_context import get_server_args
 
                 storage_cls = resolve_collector_class(
-                    get_server_args(),
                     STAT_LOGGER_ROLE_STORAGE,
                     StorageMetricsCollector,
                 )
