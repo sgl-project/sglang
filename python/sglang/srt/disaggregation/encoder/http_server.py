@@ -89,7 +89,10 @@ def is_health_check_request(rid: Optional[str]) -> bool:
 async def _lifespan(app: FastAPI):
     if dp_dispatcher is not None:
         dp_dispatcher.start()
-        yield
+        try:
+            yield
+        finally:
+            await dp_dispatcher.stop()
         return
     if local_runtime is not None:
         local_runtime.start()
@@ -232,7 +235,12 @@ def launch_server(server_args: ServerArgs):
         _register_encoder_url_with_bootstrap()
         atexit.register(_unregister_encoder_url_from_bootstrap)
 
-    uvicorn.run(app, host=get_serving().host, port=get_serving().port)
+    uvicorn.run(
+        app,
+        host=get_serving().host,
+        port=get_serving().port,
+        timeout_graceful_shutdown=5,
+    )
 
 
 def _summarise_dp_broadcast(results: List[dict]) -> Response:
