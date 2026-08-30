@@ -102,6 +102,23 @@ logger = logging.getLogger(__name__)
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 
 
+def _meta_info_with_output_token_ids(
+    ret_item: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Expose scheduler-produced token IDs without decoding and retokenizing."""
+
+    meta_info = dict(ret_item["meta_info"])
+    output_token_ids = [int(token_id) for token_id in ret_item["output_ids"]]
+    completion_tokens = int(meta_info["completion_tokens"])
+    if len(output_token_ids) != completion_tokens:
+        raise RuntimeError(
+            "non-streaming output token ID count does not match completion_tokens: "
+            f"{len(output_token_ids)} != {completion_tokens}"
+        )
+    meta_info["output_token_ids"] = output_token_ids
+    return meta_info
+
+
 def normalize_tool_content(role: str, content):
     """Normalize tool message content from OpenAI array format to plain string.
 
@@ -1948,7 +1965,9 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
             choice_meta_info = (
-                ret_item["meta_info"] if request.return_meta_info else None
+                _meta_info_with_output_token_ids(ret_item)
+                if request.return_meta_info
+                else None
             )
             # NOTE: content should not be None but empty string to make sure retokenize consistency.
             reasoning_text, tool_calls = self._get_parsed_response_fields(

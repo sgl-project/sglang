@@ -328,6 +328,13 @@ class SchedulerBatchResultProcessor:
                         self._maybe_update_reasoning_tokens(req, next_token_id)
 
                         req.update_finish_state()
+                    if req.finished() and isinstance(self.draft_worker, BaseSpecWorker):
+                        self.draft_worker.note_request_finished(
+                            rid=req.rid,
+                            natural_stop=isinstance(
+                                req.finished_reason, FINISH_MATCHED_TOKEN
+                            ),
+                        )
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
