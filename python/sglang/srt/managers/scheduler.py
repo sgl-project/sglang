@@ -1300,7 +1300,6 @@ class Scheduler(
                     attn_tp_size=self.ps.attn_tp_size,
                     cpu_group=self.tp_cpu_group,
                     device_group=self.tp_group.device_group,
-                    server_args=self.server_args,
                     metrics_collector=(
                         self.metrics_collector
                         if self.metrics_reporter.enable_metrics
@@ -2820,7 +2819,7 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
-            buffer_mode = self.server_args.hicache_host_memory_mode == "buffer_only"
+            buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
             last_host_node = req.last_host_node
             # Buffer mode host-backups nothing, so match_prefix anchors at
             # root; re-anchor on the deepest device node. The anchor is only
@@ -3544,21 +3543,23 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache)
             if (
                 self.enable_hicache_storage
-                and self.server_args.hicache_host_memory_mode == "buffer_only"
+                and get_memory().hicache_host_memory_mode == "buffer_only"
             ):
                 # Buffer mode: surface a staged prefetch as the request's host
                 # hit (consumed through init_load_back) plus its SWA window,
                 # which consumption allocates and the request lock pins —
-                # uncharged, the batch alloc can OOM. Set AFTER
+                # uncharged, the batch alloc can OOM. Planned against the same
+                # live prefix admission uses, so only the splice-able span
+                # tail is charged and unusable holds are freed. Set AFTER
                 # init_next_round_input (which recomputes host_hit). Mamba
                 # (fenced in init_hicache) will need the same charge via
                 # mamba_host_hit_length.
-                held_tokens = self.tree_cache.staged_prefetch_tokens(req.rid)
+                held_tokens, held_swa_tokens = self.tree_cache.plan_staged_splice(
+                    req.rid, len(req.prefix_indices)
+                )
                 if held_tokens > 0:
                     req.host_hit_length = held_tokens
-                    req.swa_host_hit_length = (
-                        self.tree_cache.staged_prefetch_swa_tokens(req.rid)
-                    )
+                    req.swa_host_hit_length = held_swa_tokens
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3646,7 +3647,7 @@ class Scheduler(
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.swa_evict_floor = req.extend_range.end
+                req.kv.swa_evict_floor = req.extend_range.end
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -4450,7 +4451,7 @@ class Scheduler(
                 if tc.enable_storage:
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
-                    if self.server_args.hicache_host_memory_mode == "buffer_only":
+                    if get_memory().hicache_host_memory_mode == "buffer_only":
                         # Queued writes, staged prefetches, and in-flight
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).

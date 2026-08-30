@@ -72,13 +72,13 @@ class _FakeReq:
         self.kv = SimpleNamespace(
             kv_allocated_len=allocated,
             swa_evicted_seqlen=0,
+            cache_protected_len=0,
         )
         self.origin_input_ids = list(range(committed))
         self.output_ids = []
         self.extra_key = None
         self.cache_salt = None
         self.last_node = None
-        self.cache_protected_len = 0
         self.swa_uuid_for_lock = None
         self.skip_lock_node_ids = {}
         self.mamba_pool_idx = None
@@ -114,8 +114,9 @@ def test_preabort_detaches_session_and_preserves_slot():
     tree_cache.slots["session-a"] = SessionSlot(
         req_pool_idx=0,
         kv_committed_len=48,
-        kv=SimpleNamespace(kv_allocated_len=48, swa_evicted_seqlen=0),
-        cache_protected_len=16,
+        kv=SimpleNamespace(
+            kv_allocated_len=48, swa_evicted_seqlen=0, cache_protected_len=16
+        ),
     )
 
     req = _FakeReq("session-a", req_pool_idx=1, committed=1, allocated=1)
@@ -178,9 +179,10 @@ def test_nth_mid_abort_nukes_session_slot():
     tree_cache.slots["session-a"] = SessionSlot(
         req_pool_idx=0,
         kv_committed_len=50,
-        kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
+        kv=SimpleNamespace(
+            kv_allocated_len=50, swa_evicted_seqlen=0, cache_protected_len=0
+        ),
         last_node=None,
-        cache_protected_len=0,
     )
 
     # Mid-processing abort: req has the SESSION slot's pool_idx (restore_to_req ran).
@@ -216,9 +218,10 @@ def test_release_session_threads_mamba_skip_ids():
     tree_cache.slots["session-a"] = SessionSlot(
         req_pool_idx=0,
         kv_committed_len=50,
-        kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
+        kv=SimpleNamespace(
+            kv_allocated_len=50, swa_evicted_seqlen=0, cache_protected_len=0
+        ),
         last_node=lock_node,
-        cache_protected_len=0,
         skip_lock_node_ids={ComponentType.MAMBA: {42}},
     )
 
