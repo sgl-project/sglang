@@ -12,6 +12,10 @@ from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+    # Resolve here, not in the child: the pipeline probes the device, and a
+    # forked child cannot re-initialize CUDA if this process already has. The
+    # child's gate then finds nothing left to do.
+    server_args.resolve_once()
 
     p = multiprocessing.Process(target=launch_server, args=(server_args,))
     p.start()
@@ -115,6 +119,7 @@ class HttpServerEngineAdapter(EngineBase):
         lora_path=None,
         custom_logit_processor=None,
         priority=None,
+        session_id=None,
     ):
         payload = {
             "text": prompt,
@@ -128,6 +133,7 @@ class HttpServerEngineAdapter(EngineBase):
             "lora_path": lora_path,
             "custom_logit_processor": custom_logit_processor,
             "priority": priority,
+            "session_id": session_id,
         }
         # Filter out None values
         payload = {k: v for k, v in payload.items() if v is not None}

@@ -15,7 +15,7 @@ def jit_hicache_impl(
     item_bytes: int,
     block_quota: int,
 ) -> None:
-    from sglang.jit_kernel.hicache import transfer_hicache_one_layer
+    from sglang.kernels.ops.kvcache.hicache import transfer_hicache_one_layer
 
     _ = item_bytes
 

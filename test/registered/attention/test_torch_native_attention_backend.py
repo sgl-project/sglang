@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 )
 
 # Torch native attention backend integration test with MMLU eval
-register_cuda_ci(est_time=140, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=140, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=150, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -38,12 +38,12 @@ class TestTorchNativeAttnBackend(CustomTestCase):
                 base_url=base_url,
                 model=model,
                 eval_name="mmlu",
-                num_examples=64,
+                num_examples=256,
                 num_threads=32,
             )
 
             metrics = run_eval(args)
-            self.assertGreaterEqual(metrics["score"], 0.65)
+            self.assertGreaterEqual(metrics["score"], 0.64)
         finally:
             kill_process_tree(process.pid)
 

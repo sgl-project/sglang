@@ -13,8 +13,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
 )
@@ -26,6 +29,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -104,8 +108,26 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         self.scheduler = scheduler
 
     @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DENOISER
+
+    @property
     def parallelism_type(self):
         return StageParallelismType.REPLICATED
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        return [
+            ComponentUse(
+                stage_name=stage_name,
+                component_name="transformer",
+                phase="transformer",
+                preferred_ready_after_request=True,
+                memory_intensive=True,
+            )
+        ]
 
     def _denoise_one_chunk(
         self,
@@ -134,6 +156,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         """Denoise a single chunk with full timestep loop."""
         batch_size = latents.shape[0]
         do_cfg = guidance_scale > 1.0
+        profiler = SGLDiffusionProfiler.get_instance()
 
         for i, t in enumerate(timesteps):
             with StageProfiler(
@@ -231,6 +254,8 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                         )
 
                 latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                if profiler:
+                    profiler.step_denoising_step()
 
         return latents
 
@@ -265,6 +290,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         """Denoise a single chunk using pyramid super-resolution (Stage 2)."""
         batch_size, num_channel, num_frames, height, width = latents.shape
         patch_size = self.transformer.patch_size
+        profiler = SGLDiffusionProfiler.get_instance()
 
         # Downsample to lowest pyramid level
         latents = latents.permute(0, 2, 1, 3, 4).reshape(
@@ -446,6 +472,8 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                         dmd_timesteps=scheduler.timesteps,
                         all_timesteps=timesteps,
                     )[0]
+                    if profiler:
+                        profiler.step_denoising_step()
 
                 step_counter += 1
 
@@ -482,11 +510,6 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         is_distilled = pipeline_config.is_distilled
         is_amplify_first_chunk = pipeline_config.is_amplify_first_chunk
         gamma = pipeline_config.gamma
-
-        # Move transformer to GPU if CPU-offloaded
-        if server_args.dit_cpu_offload and not server_args.use_fsdp_inference:
-            if next(self.transformer.parameters()).device.type == "cpu":
-                self.transformer.to(get_local_torch_device())
 
         # Get encoder outputs (prompt_embeds is a list of tensors, one per encoder)
         prompt_embeds = batch.prompt_embeds
@@ -718,10 +741,6 @@ class HeliosChunkedDenoisingStage(PipelineStage):
             history_latents = torch.cat([history_latents, latents], dim=2)
             chunk_latents_list.append(latents)
 
-        # Move transformer back to CPU after denoising
-        if server_args.dit_cpu_offload and not server_args.use_fsdp_inference:
-            if next(self.transformer.parameters()).device.type != "cpu":
-                self.transformer.to("cpu")
         torch.cuda.empty_cache()
 
         # Store per-chunk latents for chunk-by-chunk VAE decode (matches diffusers behavior).

@@ -3,11 +3,9 @@
 import dataclasses
 import multiprocessing as mp
 import os
-import signal
 import sys
-import threading
+import time
 
-import psutil
 import uvicorn
 
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
@@ -15,15 +13,26 @@ from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
+from sglang.multimodal_gen.runtime.entrypoints.utils import ShutdownReq
 from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
+from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     prepare_server_args,
     set_global_server_args,
 )
-from sglang.multimodal_gen.runtime.utils.common import is_port_available
+from sglang.multimodal_gen.runtime.utils.common import (
+    is_port_available,
+    kill_process_tree,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
-from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import init_diffusion_tracing
+from sglang.multimodal_gen.utils import kill_itself_when_parent_died
+
+_SCHEDULER_SHUTDOWN_TIMEOUT_MS = 5000
+_WORKER_JOIN_TIMEOUT_S = 10
+_WORKER_TERMINATE_TIMEOUT_S = 1
+_WORKER_KILL_TIMEOUT_S = 1
 
 
 def _find_available_port(
@@ -44,43 +53,80 @@ def _find_available_port(
     )
 
 
-def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
-    """Kill the process and all its child processes."""
-    # Remove sigchld handler to avoid spammy logs.
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+def _process_names(processes) -> str:
+    return ", ".join(getattr(p, "name", repr(p)) for p in processes)
 
-    if parent_pid is None:
-        parent_pid = os.getpid()
-        include_parent = False
 
-    try:
-        itself = psutil.Process(parent_pid)
-    except psutil.NoSuchProcess:
+def _join_processes_with_deadline(processes, timeout_s: float) -> None:
+    deadline = time.monotonic() + timeout_s
+    for process in processes:
+        remaining_s = max(0.0, deadline - time.monotonic())
+        process.join(timeout=remaining_s)
+
+
+def _terminate_alive_processes(processes, timeout_s: float) -> list:
+    alive = [p for p in processes if p.is_alive()]
+    if not alive:
+        return []
+
+    logger.warning(
+        "Worker process(es) did not exit in time; terminating: %s",
+        _process_names(alive),
+    )
+    for process in alive:
+        process.terminate()
+    _join_processes_with_deadline(alive, timeout_s)
+    return [p for p in alive if p.is_alive()]
+
+
+def _kill_alive_processes(processes, timeout_s: float) -> None:
+    alive = [p for p in processes if p.is_alive()]
+    if not alive:
         return
 
-    children = itself.children(recursive=True)
-    for child in children:
-        if child.pid == skip_pid:
-            continue
-        try:
-            child.kill()
-        except psutil.NoSuchProcess:
-            pass
+    logger.warning(
+        "Worker process(es) did not terminate in time; killing: %s",
+        _process_names(alive),
+    )
+    for process in alive:
+        process.kill()
+    _join_processes_with_deadline(alive, timeout_s)
 
-    if include_parent:
-        try:
-            if parent_pid == os.getpid():
-                itself.kill()
-                sys.exit(0)
 
-            itself.kill()
+def _run_http_server_process(server_args: ServerArgs) -> None:
+    kill_itself_when_parent_died()
+    launch_http_server_only(server_args)
 
-            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
-            # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGQUIT)
-        except psutil.NoSuchProcess:
-            pass
+
+def _request_monolithic_scheduler_shutdown(server_args: ServerArgs) -> None:
+    if server_args.disagg_role != RoleType.MONOLITHIC:
+        return
+
+    client = SchedulerClient()
+    try:
+        client.initialize(server_args)
+        client.forward(ShutdownReq(), timeout_ms=_SCHEDULER_SHUTDOWN_TIMEOUT_MS)
+    except Exception as e:
+        logger.warning("Failed to request graceful scheduler shutdown: %s", e)
+    finally:
+        client.close()
+
+
+def shutdown_scheduler_processes(
+    server_args: ServerArgs | None,
+    processes: list,
+    *,
+    request_shutdown: bool = True,
+) -> None:
+    if not processes:
+        return
+
+    if request_shutdown and server_args is not None:
+        _request_monolithic_scheduler_shutdown(server_args)
+
+    _join_processes_with_deadline(processes, _WORKER_JOIN_TIMEOUT_S)
+    alive = _terminate_alive_processes(processes, _WORKER_TERMINATE_TIMEOUT_S)
+    _kill_alive_processes(alive, _WORKER_KILL_TIMEOUT_S)
 
 
 def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
@@ -93,39 +139,48 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     # Start a new server with multiple worker processes
     logger.info("Starting server...")
 
+    # num_gpus is the total world size across every node; each node runs
+    # its own num_gpus // nnodes local workers, offset by node_rank into the
+    # global rank space (mirrors srt's tp_size_per_node convention). With
+    # nnodes == 1 this is exactly the prior single-node arithmetic.
     num_gpus = server_args.num_gpus
+    nnodes = server_args.nnodes
+    node_rank = server_args.node_rank
+    local_num_gpus = num_gpus // nnodes
+    rank_offset = node_rank * local_num_gpus
     processes = []
 
-    # Pipes for master to talk to slaves
+    # Pipes for master to talk to slaves (local to this node)
     task_pipes_to_slaves_w = []
     task_pipes_to_slaves_r = []
-    for _ in range(num_gpus - 1):
+    for _ in range(local_num_gpus - 1):
         r, w = mp.Pipe(duplex=False)
         task_pipes_to_slaves_r.append(r)
         task_pipes_to_slaves_w.append(w)
 
-    # Pipes for slaves to talk to master
+    # Pipes for slaves to talk to master (local to this node)
     result_pipes_from_slaves_w = []
     result_pipes_from_slaves_r = []
-    for _ in range(num_gpus - 1):
+    for _ in range(local_num_gpus - 1):
         r, w = mp.Pipe(duplex=False)
         result_pipes_from_slaves_r.append(r)
         result_pipes_from_slaves_w.append(w)
 
-    # Launch all worker processes
+    # Launch this node's local worker processes
     master_port = server_args.master_port
     scheduler_pipe_readers = []
     scheduler_pipe_writers = []
 
-    for i in range(num_gpus):
+    for i in range(local_num_gpus):
+        rank = rank_offset + i
         reader, writer = mp.Pipe(duplex=False)
         scheduler_pipe_writers.append(writer)
-        if i == 0:  # Master worker
+        if i == 0:  # This node's local pipe master
             process = mp.Process(
                 target=run_scheduler_process,
                 args=(
                     i,  # local_rank
-                    i,  # rank
+                    rank,
                     master_port,
                     server_args,
                     writer,
@@ -134,7 +189,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                     task_pipes_to_slaves_w,
                     result_pipes_from_slaves_r,
                 ),
-                name=f"sglang-diffusionWorker-{i}",
+                name=f"sglang-diffusionWorker-{rank}",
                 daemon=True,
             )
         else:  # Slave workers
@@ -142,7 +197,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                 target=run_scheduler_process,
                 args=(
                     i,  # local_rank
-                    i,  # rank
+                    rank,
                     master_port,
                     server_args,
                     writer,
@@ -151,7 +206,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                     task_pipes_to_slaves_r[i - 1],
                     result_pipes_from_slaves_w[i - 1],
                 ),
-                name=f"sglang-diffusionWorker-{i}",
+                name=f"sglang-diffusionWorker-{rank}",
                 daemon=True,
             )
         scheduler_pipe_readers.append(reader)
@@ -178,7 +233,8 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             data = reader.recv()
         except EOFError:
             logger.error(
-                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+                f"Rank {rank_offset + i} scheduler is dead. Please check if "
+                "there are relevant logs."
             )
             processes[i].join()
             logger.error(f"Exit code: {processes[i].exitcode}")
@@ -193,19 +249,44 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
 
     logger.debug("All workers are ready")
 
+    if node_rank != 0:
+        # The TokenizerManager / HTTP surface lives on the node that owns
+        # global rank 0; this node only hosts local workers, which tear
+        # down together with the distributed group on shutdown.
+        logger.info(
+            "Node %d ready with %d local worker(s); no local HTTP surface.",
+            node_rank,
+            local_num_gpus,
+        )
+        try:
+            for p in processes:
+                p.join()
+        finally:
+            shutdown_scheduler_processes(None, processes, request_shutdown=False)
+        return processes
+
     if launch_http_server:
+        if server_args.pipeline_config.supports_action_endpoint():
+            logger.info(
+                "Action generation endpoint ready: model=%s; per-request details are "
+                "debug-only (use --log-level debug).",
+                server_args.served_model_name,
+            )
         logger.info("Starting FastAPI server.")
         if server_args.webui:
             logger.info("Launch FastAPI server in another process because of webui.")
             http_server_process = mp.Process(
-                target=launch_http_server_only,
+                target=_run_http_server_process,
                 args=(server_args,),
-                name=f"sglang-diffusion-webui",
+                name="sglang-diffusion-webui",
                 daemon=True,
             )
             http_server_process.start()
         else:
-            launch_http_server_only(server_args)
+            try:
+                launch_http_server_only(server_args)
+            finally:
+                shutdown_scheduler_processes(server_args, processes)
 
     return processes
 
@@ -317,7 +398,7 @@ def launch_pool_disagg_server(
                 "pool_work_endpoint": work_eps[inst_idx],
                 "pool_result_endpoint": result_ep,
                 "num_gpus": num_role_gpus,
-                "warmup": role_type == RoleType.ENCODER,
+                "warmup_mode": "request" if role_type == RoleType.ENCODER else "off",
                 "scheduler_port": find_port(port_cursor),
                 "master_port": find_port(port_cursor + 100),
                 # Per-role parallelism (None = auto-derive from num_gpus)
@@ -331,6 +412,7 @@ def launch_pool_disagg_server(
             base_dict = {
                 f.name: getattr(server_args, f.name)
                 for f in dataclasses.fields(server_args)
+                if f.init
             }
             base_dict.update(role_overrides)
             base_dict.pop("pipeline_config", None)
@@ -407,7 +489,13 @@ def launch_pool_disagg_server(
             "Starting FastAPI server (connected to DiffusionServer at port %d).",
             server_args.scheduler_port,
         )
-        launch_http_server_only(server_args)
+        try:
+            launch_http_server_only(server_args)
+        finally:
+            diffusion_server.stop()
+            shutdown_scheduler_processes(
+                server_args, all_processes, request_shutdown=False
+            )
 
     return all_processes
 
@@ -442,9 +530,7 @@ def _run_disagg_role_process(
 
 
 def launch_http_server_only(server_args):
-    if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
-        trace_set_thread_info("DiffHTTPServer")
+    init_diffusion_tracing(server_args, "DiffHTTPServer")
 
     # set for endpoints to access global_server_args
     set_global_server_args(server_args)
@@ -456,15 +542,16 @@ def launch_http_server_only(server_args):
         host=server_args.host,
         port=server_args.port,
         reload=False,
+        ws_per_message_deflate=False,
     )
 
 
-def parse_url_string(url_str: str) -> list[str]:
+def parse_url_string(url_str: str | None) -> list[str]:
     """Parse a semicolon-separated URL string into a list.
 
     Example: "tcp://10.0.0.1:35000;tcp://10.0.0.2:35000" -> ["tcp://...", "tcp://..."]
     """
-    return [u.strip() for u in url_str.split(";") if u.strip()]
+    return [u.strip() for u in (url_str or "").split(";") if u.strip()]
 
 
 def launch_disagg_server(server_args: ServerArgs):
@@ -479,12 +566,23 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder result: scheduler_port + 3
     """
     configure_logger(server_args)
+    set_global_server_args(server_args)
 
-    for name, val in [
-        ("--encoder-urls", server_args.encoder_urls),
-        ("--denoiser-urls", server_args.denoiser_urls),
-        ("--decoder-urls", server_args.decoder_urls),
-    ]:
+    glm_distributed_mode_enabled = (
+        type(server_args.pipeline_config).__name__ == "GlmImagePipelineConfig"
+        and server_args.srt_encoder_url is not None
+        and server_args.encoder_urls is None
+        and server_args.decoder_urls is None
+    )
+    required_urls = [("--denoiser-urls", server_args.denoiser_urls)]
+    if not glm_distributed_mode_enabled:
+        required_urls.extend(
+            [
+                ("--encoder-urls", server_args.encoder_urls),
+                ("--decoder-urls", server_args.decoder_urls),
+            ]
+        )
+    for name, val in required_urls:
         if val is None:
             raise ValueError(f"{name} is required for --disagg-role server")
 
@@ -518,6 +616,9 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_ep,
     )
 
+    denoiser_options = (
+        {"denoiser_capacity_per_worker": 1} if glm_distributed_mode_enabled else {}
+    )
     diffusion_server = DiffusionServer(
         frontend_endpoint=frontend_endpoint,
         encoder_work_endpoints=encoder_work_endpoints,
@@ -528,6 +629,9 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
+        server_args=server_args,
+        glm_distributed_mode_enabled=glm_distributed_mode_enabled,
+        **denoiser_options,
     )
     diffusion_server.start()
 
@@ -538,7 +642,10 @@ def launch_disagg_server(server_args: ServerArgs):
         "Starting HTTP server (connected to DiffusionServer at port %d).",
         base_port,
     )
-    launch_http_server_only(server_args)
+    try:
+        launch_http_server_only(server_args)
+    finally:
+        diffusion_server.stop()
 
 
 def launch_disagg_role(server_args: ServerArgs):
@@ -589,7 +696,7 @@ def launch_disagg_role(server_args: ServerArgs):
         "disagg_mode": True,
         "pool_work_endpoint": work_endpoint,
         "pool_result_endpoint": result_endpoint,
-        "warmup": role_type == RoleType.ENCODER,
+        "warmup_mode": "request" if role_type == RoleType.ENCODER else "off",
         "scheduler_port": internal_scheduler_port,
         # Per-role parallelism (None = auto-derive from num_gpus)
         "tp_size": role_par["tp_size"],
@@ -597,9 +704,49 @@ def launch_disagg_role(server_args: ServerArgs):
         "ulysses_degree": role_par["ulysses_degree"],
         "ring_degree": role_par["ring_degree"],
     }
+    role_tp = role_par["tp_size"] or 1
+    role_sp = role_par["sp_degree"] or 1
+    cfg_degree = (
+        server_args.cfg_parallel_degree if server_args.enable_cfg_parallel else 1
+    )
+    cfg_parallel_explicit = server_args.is_arg_explicitly_set(
+        "enable_cfg_parallel"
+    ) or server_args.is_arg_explicitly_set("cfg_parallel_degree")
+    required_devices = role_tp * role_sp * cfg_degree * server_args.dp_size
+    if not cfg_parallel_explicit and (
+        required_devices > server_args.num_gpus
+        or server_args.num_gpus % required_devices != 0
+    ):
+        logger.warning(
+            "Disabling auto-enabled CFG parallel for %s role because tp=%d, "
+            "sp=%d, cfg=%d, dp=%d is incompatible with %d devices",
+            role_type.value,
+            role_tp,
+            role_sp,
+            cfg_degree,
+            server_args.dp_size,
+            server_args.num_gpus,
+        )
+        role_overrides["enable_cfg_parallel"] = False
+        role_overrides["cfg_parallel_degree"] = 1
+        cfg_degree = 1
+        required_devices = role_tp * role_sp * server_args.dp_size
+
+    if (
+        required_devices > server_args.num_gpus
+        or server_args.num_gpus % required_devices != 0
+    ):
+        raise ValueError(
+            f"Invalid parallelism for {role_type.value} role: "
+            f"tp={role_tp}, sp={role_sp}, cfg={cfg_degree}, "
+            f"dp={server_args.dp_size} requires groups of {required_devices} "
+            f"devices, but num_gpus={server_args.num_gpus}"
+        )
 
     base_dict = {
-        f.name: getattr(server_args, f.name) for f in dataclasses.fields(server_args)
+        f.name: getattr(server_args, f.name)
+        for f in dataclasses.fields(server_args)
+        if f.init
     }
     base_dict.update(role_overrides)
     base_dict.pop("pipeline_config", None)
@@ -658,10 +805,15 @@ def launch_disagg_role(server_args: ServerArgs):
             p.join()
     except KeyboardInterrupt:
         logger.info("Role %s shutting down.", role_type.value)
+    finally:
+        shutdown_scheduler_processes(role_args, processes, request_shutdown=False)
 
 
 def dispatch_launch(server_args: ServerArgs):
     """Route to the correct launch function based on --disagg-role."""
+    if "NCCL_NVLS_ENABLE" not in os.environ or server_args.enable_nccl_nvls:
+        os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+
     role = server_args.disagg_role
     if role == RoleType.MONOLITHIC:
         launch_server(server_args)

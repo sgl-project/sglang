@@ -6,12 +6,15 @@ from diffusers.image_processor import VaeImageProcessor
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
 from sglang.multimodal_gen.configs.models.encoders.base import EncoderConfig
-from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+from sglang.multimodal_gen.configs.models.encoders.t5 import T5ArchConfig, T5Config
 from sglang.multimodal_gen.configs.models.vaes.glmimage import GlmImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     SpatialImagePipelineConfig,
+    shard_rotary_emb_for_sp,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
 
 @dataclass
@@ -21,7 +24,7 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     vae_precision: str = "bf16"
 
     should_use_guidance: bool = False
-    task_type: ModelTaskType = ModelTaskType.T2I
+    task_type: ModelTaskType = ModelTaskType.TI2I
 
     vae_tiling: bool = False
 
@@ -38,7 +41,7 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     # GLM-Image uses T5 text encoder; base default is EncoderConfig() which lacks
     # parallel_folding and causes AttributeError + fallback to native T5 with missing weights.
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (T5Config(),)
+        default_factory=lambda: (T5Config(T5ArchConfig(num_heads=6)),)
     )
 
     enable_autocast: bool = False
@@ -47,44 +50,63 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
         self.vae_scale_factor = self.vae_config.get_vae_scale_factor()
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
+    def supports_dynamic_batching(self):
+        server_args = get_global_server_args()
+        return server_args.srt_encoder_url is not None
+
+    def supports_native_grouped_requests(self):
+        return True
+
+    def supports_sequential_dit_inference(self):
+        return True
+
+    def supports_sequential_multi_output_inference(self):
+        return current_platform.is_npu()
+
     def get_freqs_cis(self, batch, device, rotary_emb, dtype):
         height = batch.height // self.vae_scale_factor
         width = batch.width // self.vae_scale_factor
         hidden_states = torch.empty(1, 1, height, width, device=device, dtype=dtype)
-        freqs_cis = rotary_emb(hidden_states)
-        return freqs_cis
+        cos, sin = rotary_emb(hidden_states)
+        cos = shard_rotary_emb_for_sp(cos)
+        sin = shard_rotary_emb_for_sp(sin)
+        return cos, sin
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        return {
+        kwargs = {
             "prior_token_id": batch.prior_token_id,
             "prior_token_drop": batch.prior_token_drop_cond,
             "crop_coords": batch.crop_coords,
             "target_size": batch.target_size,
-            "kv_caches": batch.kv_caches,
-            "kv_caches_mode": "read",
             "freqs_cis": self.get_freqs_cis(batch, device, rotary_emb, dtype),
         }
+        if getattr(batch, "prior_token_image_ids", None) is not None:
+            kwargs["kv_caches"] = batch.kv_caches
+            kwargs["kv_caches_mode"] = "read"
+        return kwargs
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        return {
+        kwargs = {
             "prior_token_id": batch.prior_token_id,
             "prior_token_drop": batch.prior_token_drop_uncond,
             "crop_coords": batch.crop_coords,
             "target_size": batch.target_size,
-            "kv_caches": batch.kv_caches,
-            "kv_caches_mode": "skip",
             "freqs_cis": self.get_freqs_cis(batch, device, rotary_emb, dtype),
         }
+        if getattr(batch, "prior_token_image_ids", None) is not None:
+            kwargs["kv_caches"] = batch.kv_caches
+            kwargs["kv_caches_mode"] = "skip"
+        return kwargs
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
         latents_mean = (
             torch.tensor(self.vae_config.latents_mean)
-            .view(1, self.vae_config.latent_channels, 1, 1)
+            .reshape(1, self.vae_config.latent_channels, 1, 1)
             .to(device, dtype)
         )
         latents_std = (
             torch.tensor(self.vae_config.latents_std)
-            .view(1, self.vae_config.latent_channels, 1, 1)
+            .reshape(1, self.vae_config.latent_channels, 1, 1)
             .to(device, dtype)
         )
         return 1.0 / latents_std, latents_mean

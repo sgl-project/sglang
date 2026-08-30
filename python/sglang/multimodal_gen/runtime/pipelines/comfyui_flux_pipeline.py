@@ -23,7 +23,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 logger = init_logger(__name__)
 
@@ -613,7 +613,9 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
 
         safetensors_list = [self.model_path]
         logger.info("Loading weights from: %s", safetensors_list)
-        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        default_dtype = resolve_precision(
+            server_args, "dit", precision_attr="dit_precision"
+        )
         server_args.model_paths["transformer"] = os.path.dirname(self.model_path) or "."
         hf_config = {}
 

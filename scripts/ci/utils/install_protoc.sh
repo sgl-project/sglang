@@ -18,7 +18,7 @@ ARCH=$(uname -m)
 if command -v apt-get &> /dev/null; then
     # Ubuntu/Debian
     apt-get update || true # May fail due to unrelated broken packages
-    PROTOC_APT_PACKAGES=(wget unzip gcc g++ perl make)
+    PROTOC_APT_PACKAGES=(wget unzip)
     apt-get install -y --no-install-recommends "${PROTOC_APT_PACKAGES[@]}" || {
         echo "Warning: apt-get install failed, checking if required packages are available..."
         for pkg in "${PROTOC_APT_PACKAGES[@]}"; do
@@ -32,9 +32,9 @@ if command -v apt-get &> /dev/null; then
 elif command -v yum &> /dev/null; then
     # RHEL/CentOS
     yum update -y
-    yum install -y wget unzip gcc gcc-c++ perl-core make
+    yum install -y wget unzip
 else
-    echo "ERROR: Neither apt-get nor yum found; cannot install protoc build deps"
+    echo "ERROR: Neither apt-get nor yum found; cannot install protoc"
     exit 1
 fi
 

@@ -2,19 +2,10 @@
 
 This test benchmarks the DeepSeek-R1-MXFP4 quantized model on MI35x with 8 GPUs.
 
-The model path can be configured via DEEPSEEK_R1_MXFP4_MODEL_PATH environment variable.
-
 Registry: nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4 suite
-
-Example usage:
-    DEEPSEEK_R1_MXFP4_MODEL_PATH=/data2/models/amd-DeepSeek-R1-MXFP4-Preview python -m pytest test_deepseek_r1_mxfp4_perf_mi35x.py -v
 """
 
 import os
-
-# Set HF cache to /data2/models/ for MI35x so HF models download there
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
 import unittest
 from typing import List
 
@@ -30,7 +21,7 @@ register_amd_ci(
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Generate a simplified markdown report without traces and cost columns.
+    """Generate a simplified markdown report without cost columns.
 
     Skips the first result if it's a warmup run (duplicate batch_size).
     """
@@ -60,24 +51,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
     return summary
 
 
-# Model path configuration for MI35x DeepSeek-R1-MXFP4
-# Priority: 1) env var, 2) local path, 3) HuggingFace model ID
-DEEPSEEK_R1_MXFP4_LOCAL_PATH = "/data2/models/amd-DeepSeek-R1-MXFP4-Preview"
-DEEPSEEK_R1_MXFP4_HF_MODEL_ID = "amd/DeepSeek-R1-MXFP4-Preview"
-PROFILE_DIR = "performance_profiles_deepseek_r1_mxfp4_mi35x"
-
-
-def get_model_path() -> str:
-    """Get effective model path: env var > local path > HF model ID."""
-    # Check env var first
-    env_path = os.environ.get("DEEPSEEK_R1_MXFP4_MODEL_PATH")
-    if env_path:
-        return env_path
-    # Check local path
-    if os.path.exists(DEEPSEEK_R1_MXFP4_LOCAL_PATH):
-        return DEEPSEEK_R1_MXFP4_LOCAL_PATH
-    # Fall back to HF model ID
-    return DEEPSEEK_R1_MXFP4_HF_MODEL_ID
+RESULT_DIR = "performance_results_deepseek_r1_mxfp4_mi35x"
 
 
 class TestDeepseekR1MXFP4PerfMI35x(unittest.TestCase):
@@ -89,7 +63,7 @@ class TestDeepseekR1MXFP4PerfMI35x(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = get_model_path()
+        cls.model = "amd/DeepSeek-R1-MXFP4-Preview"
         print(f"Using model path: {cls.model}")
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 8, 16, 64]
@@ -114,32 +88,14 @@ class TestDeepseekR1MXFP4PerfMI35x(unittest.TestCase):
             },
         ]
 
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
-        # Override full_report to remove traces help text
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
+        # Set the report header for this test
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_one_batch(self):
         """Run benchmark across all configured variants."""
         failed_variants = []
-
-        # For local paths, check if exists. HF model IDs will download automatically.
-        is_local_path = self.model.startswith("/")
-        if is_local_path and not os.path.exists(self.model):
-            print(f"\n⏭️ SKIPPING: Local model not found at {self.model}")
-            self.runner.full_report += (
-                f"\n⏭️ Test skipped: Local model not found at {self.model}\n"
-            )
-            self.runner.write_final_report()
-            return
-
-        # Log model source
-        if is_local_path:
-            print(f"📁 Using local model: {self.model}")
-        else:
-            print(
-                f"📥 Using HuggingFace model: {self.model} (will download if not cached)"
-            )
 
         try:
             for variant_config in self.variants:
@@ -152,7 +108,6 @@ class TestDeepseekR1MXFP4PerfMI35x(unittest.TestCase):
                         other_args=variant_config["other_args"],
                         variant=variant_config["name"],
                         extra_bench_args=["--trust-remote-code"],
-                        enable_profile=False,  # Disable profiling for AMD tests
                     )
                     results = result_tuple[0]
                     success = result_tuple[1]
@@ -160,7 +115,7 @@ class TestDeepseekR1MXFP4PerfMI35x(unittest.TestCase):
                     if not success:
                         failed_variants.append(variant_config["name"])
 
-                    # Use simplified report format without traces
+                    # Use the simplified report format
                     if results:
                         self.runner.full_report += (
                             generate_simple_markdown_report(results) + "\n"

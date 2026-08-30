@@ -21,7 +21,7 @@ from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestWhisperParseFusedOutput(CustomTestCase):
@@ -312,6 +312,75 @@ class TestWhisperBuildFusedAutodetectParams(CustomTestCase):
         params.pop("_detect_language", None)
         params.pop("timestamp_granularities", None)
         SamplingParams(**params)
+
+
+class _FakeTokenizer:
+    """Decodes token ids to a deterministic placeholder string."""
+
+    eos_token_id = 50257
+
+    def decode(self, ids, skip_special_tokens=True):
+        return " " + " ".join(f"tok{i}" for i in ids)
+
+
+class TestWhisperChunkedVerboseResponse(CustomTestCase):
+    """build_verbose_response_chunked for audio split into >30 s chunks.
+
+    Whisper timestamp tokens are relative to each chunk's own 30 s window,
+    so every chunk's segments must be shifted by the chunk's start offset
+    in the original audio and segment ids must keep counting across chunks.
+    """
+
+    TS = WhisperAdapter.TIMESTAMP_BASE_TOKEN_ID  # <|0.00|>
+
+    def test_segments_offset_by_chunk_start(self):
+        request = TranscriptionRequest(
+            model="whisper", language="en", audio_duration_s=57.06
+        )
+        from sglang.srt.entrypoints.openai.protocol import TranscriptionUsage
+
+        usage = TranscriptionUsage(seconds=58)
+        rets = [
+            # chunk 0: one closed segment [0.00 → 5.00]
+            {"output_ids": [100, 101, self.TS + 250]},
+            # chunk 1: closed segment [0.00 → 2.00] + trailing unclosed text
+            {"output_ids": [200, self.TS + 100, 300]},
+        ]
+        resp = WhisperAdapter().build_verbose_response_chunked(
+            request, "你好世界", rets, [0.0, 29.3], _FakeTokenizer(), usage
+        )
+
+        self.assertEqual(resp.language, "en")
+        self.assertEqual(resp.duration, 57.06)
+        self.assertEqual(resp.text, "你好世界")
+        self.assertEqual([s.id for s in resp.segments], [0, 1, 2])
+        self.assertEqual(
+            [(s.start, s.end) for s in resp.segments],
+            [(0.0, 5.0), (29.3, 31.3), (31.3, 31.3)],
+        )
+
+    def test_single_chunk_at_zero_offset_matches_unchunked(self):
+        request = TranscriptionRequest(
+            model="whisper", language="en", audio_duration_s=10.0
+        )
+        from sglang.srt.entrypoints.openai.protocol import TranscriptionUsage
+
+        usage = TranscriptionUsage(seconds=10)
+        output_ids = [100, self.TS + 50]
+        text, segments = WhisperAdapter._parse_segments(output_ids, _FakeTokenizer())
+        chunked = WhisperAdapter().build_verbose_response_chunked(
+            request,
+            text,
+            [{"output_ids": output_ids}],
+            [0.0],
+            _FakeTokenizer(),
+            usage,
+        )
+        self.assertEqual(chunked.text, text)
+        self.assertEqual(
+            [(s.id, s.start, s.end) for s in chunked.segments],
+            [(s.id, s.start, s.end) for s in segments],
+        )
 
 
 if __name__ == "__main__":

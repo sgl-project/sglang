@@ -136,40 +136,17 @@ def _ensure_gguf_version():
 
 
 def _patch_rope_parameters_validation():
-    """Fix rope_parameters validation for unregistered model types.
+    """Guard ``standardize_rope_params()`` against missing
+    ``max_position_embeddings``.
 
-    For unregistered model types (e.g. ``deepseek_v32``), the generic
-    ``PretrainedConfig`` lacks a ``rope_parameters`` field so the conversion
-    that injects ``rope_theta`` from the top-level config is skipped.
-    Additionally, ``standardize_rope_params()`` accesses
+    For ``PretrainedConfig``, ``standardize_rope_params()`` accesses
     ``self.max_position_embeddings`` during ``__post_init__`` before extra
     kwargs are set as attributes, causing ``AttributeError``.
 
-    Fix: (1) patch ``from_dict`` to inject ``rope_theta`` into
-    ``rope_scaling``, (2) guard ``standardize_rope_params`` against missing
+    Fix: guard ``standardize_rope_params`` against missing
     ``max_position_embeddings``.
-
-    TODO(upstream): remove once unregistered model types handle rope
-    standardization correctly in transformers.
     """
     from transformers import PretrainedConfig
-
-    original = PretrainedConfig.from_dict.__func__
-
-    @classmethod  # type: ignore[misc]
-    def patched(cls, config_dict, **kwargs):
-        rope_scaling = config_dict.get("rope_scaling")
-        rope_theta = config_dict.get("rope_theta")
-        if (
-            isinstance(rope_scaling, dict)
-            and rope_theta is not None
-            and "rope_theta" not in rope_scaling
-        ):
-            config_dict = config_dict.copy()
-            config_dict["rope_scaling"] = {**rope_scaling, "rope_theta": rope_theta}
-        return original(cls, config_dict, **kwargs)
-
-    PretrainedConfig.from_dict = patched
 
     # standardize_rope_params accesses self.max_position_embeddings before
     # __post_init__ sets extra kwargs — skip when the attribute is absent.
@@ -271,8 +248,10 @@ def _patch_image_processor_kwargs():
     (e.g. KimiVL) that defines ``preprocess()`` without ``**kwargs`` will
     crash with ``TypeError``.
 
-    Fix: wrap ``__call__`` to catch ``TypeError`` and retry with only the
-    kwargs that ``preprocess()`` actually accepts.
+    Fix: wrap ``__call__`` and filter unsupported kwargs before invoking
+    ``preprocess()``.  The accepted-kwargs set is cached per processor class:
+    apart from avoiding the exception/logging slow path, this matters for VLM
+    requests that preprocess many images on the request critical path.
 
     TODO(upstream): KimiVL image_processing_kimi_vl.py needs ``**kwargs``.
     """
@@ -280,30 +259,40 @@ def _patch_image_processor_kwargs():
         from transformers.image_processing_utils import BaseImageProcessor
 
         original = BaseImageProcessor.__call__
+        accepted_kwargs_cache = {}
+        warned_unsupported_kwargs = set()
 
         def safe_call(self, images, *args, **kwargs):
-            try:
-                return original(self, images, *args, **kwargs)
-            except TypeError as e:
-                if "unexpected keyword argument" not in str(e):
-                    raise
+            processor_type = type(self)
+            accepted_kwargs = accepted_kwargs_cache.get(processor_type)
+            if accepted_kwargs is None and processor_type not in accepted_kwargs_cache:
                 sig = inspect.signature(self.preprocess)
                 params = sig.parameters
                 if any(
                     p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
                 ):
-                    raise
-                dropped = {k for k in kwargs if k not in params}
-                if dropped:
+                    accepted_kwargs = None
+                else:
+                    accepted_kwargs = frozenset(params)
+                accepted_kwargs_cache[processor_type] = accepted_kwargs
+
+            if accepted_kwargs is None:
+                return original(self, images, *args, **kwargs)
+
+            dropped = frozenset(kwargs) - accepted_kwargs
+            if dropped:
+                warning_key = (processor_type, dropped)
+                if warning_key not in warned_unsupported_kwargs:
                     logger.warning(
                         "Image processor %s.preprocess() does not accept %s; "
-                        "retrying without them. Update the model's image processor "
-                        "to accept **kwargs.",
-                        type(self).__name__,
-                        dropped,
+                        "filtering them before preprocessing. Update the model's image "
+                        "processor to accept **kwargs.",
+                        processor_type.__name__,
+                        sorted(dropped),
                     )
-                valid = {k: v for k, v in kwargs.items() if k in params}
-                return original(self, images, *args, **valid)
+                    warned_unsupported_kwargs.add(warning_key)
+                kwargs = {k: v for k, v in kwargs.items() if k in accepted_kwargs}
+            return original(self, images, *args, **kwargs)
 
         BaseImageProcessor.__call__ = safe_call
     except ImportError:

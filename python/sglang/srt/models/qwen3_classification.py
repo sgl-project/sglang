@@ -55,6 +55,9 @@ class Qwen3ForPooledOutput(nn.Module):
         self.eos_token_id = config.eos_token_id
         # Subclasses must set self.score and self.pooler
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.get_input_embeddings()
+
     @torch.no_grad()
     def forward(
         self,

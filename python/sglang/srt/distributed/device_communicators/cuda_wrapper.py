@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/cuda_wrapper.py
 
 """This file is a pure Python wrapper for the cudart library.
@@ -7,6 +9,7 @@ convenient for use when we just need to call a few functions.
 
 import ctypes
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -45,24 +48,30 @@ def find_loaded_library(lib_name) -> Optional[str]:
     shared libraries loaded by the process. We can use this file to find the path of the
     a loaded library.
     """  # noqa
-    found = False
+    candidates = []
     with open("/proc/self/maps") as f:
         for line in f:
-            if lib_name in line:
-                found = True
-                break
-    if not found:
+            if lib_name not in line or "/" not in line:
+                continue
+            path = line[line.index("/") :].strip()
+            if path.endswith(" (deleted)"):
+                path = path[: -len(" (deleted)")]
+            filename = os.path.basename(path)
+            if filename.rpartition(".so")[0].startswith(lib_name):
+                candidates.append(path)
+
+    if not candidates:
         # the library is not loaded in the current process
         return None
-    # if lib_name is libcudart, we need to match a line with:
-    # address /path/to/libcudart-hash.so.11.0
-    start = line.index("/")
-    path = line[start:].strip()
-    filename = path.split("/")[-1]
-    assert filename.rpartition(".so")[0].startswith(
-        lib_name
-    ), f"Unexpected filename: {filename} for library {lib_name}"
-    return path
+
+    # TileLang ships a ``libcudart_stub.so`` that is only sufficient for its
+    # JIT loader.  It can precede the actual CUDA runtime in /proc/self/maps;
+    # choosing it makes CUDA IPC and FlashInfer all-reduce fail when resolving
+    # symbols such as cudaDeviceReset.
+    for path in candidates:
+        if "stub" not in os.path.basename(path):
+            return path
+    return candidates[0]
 
 
 class CudaRTLibrary:

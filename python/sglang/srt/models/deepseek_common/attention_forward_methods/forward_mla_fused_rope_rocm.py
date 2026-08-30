@@ -5,8 +5,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import per_tensor_quant_mla_fp8
+from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
@@ -17,15 +21,15 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 if _is_cuda:
-    from sgl_kernel import bmm_fp8
+    from sglang.kernels.ops.gemm import bmm_fp8
 
 if _is_hip:
-    from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
+    from sglang.kernels.ops.attention.rocm_mla_decode_rope import (
         decode_attention_fwd_grouped_rope,
     )
 
 
-class DeepseekMLARocmForwardMixin:
+class DeepseekMLAFusedRopeRocmForwardMixin:
 
     def init_mla_fused_rope_rocm_forward(self: DeepseekV2AttentionMLA):
         self.rocm_fused_decode_mla = get_bool_env_var(
@@ -108,10 +112,10 @@ class DeepseekMLARocmForwardMixin:
             device=q.device,
         )
         attn_logits, _, kv_indptr, kv_indices, _, _, _ = (
-            forward_batch.attn_backend.forward_metadata
+            get_attn_backend().forward_metadata
         )
         cos_sin_cache = self.rotary_emb.cos_sin_cache
-        num_kv_split = forward_batch.attn_backend.num_kv_splits
+        num_kv_split = get_attn_backend().num_kv_splits
         sm_scale = self.attn_mqa.scaling
         if attn_logits is None:
             attn_logits = torch.empty(
@@ -126,12 +130,10 @@ class DeepseekMLARocmForwardMixin:
             )
 
         # save current latent cache.
-        forward_batch.token_to_kv_pool.set_kv_buffer(
+        get_token_to_kv_pool().set_kv_buffer(
             self.attn_mqa, forward_batch.out_cache_loc, k_input, None
         )
-        key_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
-            self.attn_mqa.layer_id
-        )
+        key_cache_buf = get_token_to_kv_pool().get_key_buffer(self.attn_mqa.layer_id)
         val_cache_buf = key_cache_buf[..., : self.kv_lora_rank]
 
         return (
@@ -171,6 +173,7 @@ class DeepseekMLARocmForwardMixin:
         k_input,
         forward_batch,
         zero_allocator,
+        gate=None,
     ):
         decode_attention_fwd_grouped_rope(
             q_input,
@@ -194,7 +197,7 @@ class DeepseekMLARocmForwardMixin:
 
         if enable_rope_fusion:
             k_input[..., self.kv_lora_rank :] = k_pe_output
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            get_token_to_kv_pool().set_kv_buffer(
                 self.attn_mqa, forward_batch.out_cache_loc, k_input, None
             )
 
@@ -222,6 +225,8 @@ class DeepseekMLARocmForwardMixin:
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        if gate is not None:
+            attn_output = self._apply_gated(attn_output, gate)
         output, _ = self.o_proj(attn_output)
 
         return output

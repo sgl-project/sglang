@@ -83,7 +83,7 @@ fn internal_error(message: impl Into<String>) -> Response {
 }
 
 fn bad_request_structured(error_obj: Value) -> Response {
-    (StatusCode::BAD_REQUEST, Json(json!({"error": error_obj}))).into_response()
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": error_obj }))).into_response()
 }
 
 // ============================================================================

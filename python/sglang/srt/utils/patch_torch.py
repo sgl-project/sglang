@@ -16,9 +16,10 @@ from typing import Callable, Union
 import torch
 from torch.multiprocessing import reductions
 
-from sglang.srt.utils.common import is_npu, torch_release
+from sglang.srt.utils.common import is_musa, is_npu, torch_release
 
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if _is_npu:
     from torch_npu.multiprocessing import reductions as npu_reductions

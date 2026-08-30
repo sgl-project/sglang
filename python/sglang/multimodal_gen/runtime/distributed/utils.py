@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/utils.py
 
 # Copyright 2023 The vLLM team.
@@ -17,7 +18,14 @@ from typing import Any
 import torch
 from torch.distributed import TCPStore
 
+try:
+    from torch.distributed import all_gather_single as _all_gather_single
+except ImportError:
+    from torch.distributed import all_gather_into_tensor as _all_gather_single
+
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+all_gather_single = _all_gather_single
 
 logger = init_logger(__name__)
 

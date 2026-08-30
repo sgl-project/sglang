@@ -51,10 +51,21 @@ class LTXVideoVAEArchConfig(VAEArchConfig):
     decoder_layers_per_block: List[int] = field(default_factory=lambda: [5, 5, 5, 5])
     decoder_causal: bool = False
     decoder_spatial_padding_mode: str = "reflect"
+    decoder_inject_noise: List[bool] = field(
+        default_factory=lambda: [False, False, False, False]
+    )
+    upsample_residual: List[bool] = field(default_factory=lambda: [True, True, True])
+    upsample_factor: List[int] = field(default_factory=lambda: [2, 2, 2])
+    # Per-decoder-stage upsampling axis: "spatial", "temporal" or
+    # "spatiotemporal". `None` keeps every stage spatiotemporal (LTX-2).
+    upsample_type: List[str] | None = None
+    timestep_conditioning: bool = False
 
     # Native LTX variant metadata.
     ltx_variant: str = "ltx_2"
     condition_encoder_subdir: str = ""
+    video_encoder_variant: str = "ltx_2"
+    video_encoder_config: dict[str, Any] = field(default_factory=dict)
     video_decoder_variant: str = "ltx_2"
     video_decoder_config: dict[str, Any] = field(default_factory=dict)
 
@@ -62,3 +73,7 @@ class LTXVideoVAEArchConfig(VAEArchConfig):
 @dataclass
 class LTXVideoVAEConfig(VAEConfig):
     arch_config: LTXVideoVAEArchConfig = field(default_factory=LTXVideoVAEArchConfig)
+    auto_parallel_decode_min_latent_elements_per_rank: int = 1024
+
+    def auto_parallel_decode_prefers_spatial_shard(self) -> bool:
+        return True

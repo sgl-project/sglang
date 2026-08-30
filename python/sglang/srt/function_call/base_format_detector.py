@@ -1,13 +1,19 @@
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import orjson
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+try:
+    from xgrammar import StructuralTag, get_model_structural_tag
+except ImportError:
+    StructuralTag = Any
+    get_model_structural_tag = None
+
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -344,9 +350,22 @@ class BaseFormatDetector(ABC):
         """
         raise NotImplementedError()
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Called once when the stream ends; flush any buffered state.
+
+        Detectors that hold text back while waiting for a marker that can no
+        longer arrive (the stream is over) override this to release it.
+        """
+        return StreamingParseResult()
+
     def supports_structural_tag(self) -> bool:
         """Return True if this detector supports structural tag format."""
         return True
+
+    def parses_required_natively(self) -> bool:
+        """Return True if ``tool_choice="required"`` must skip grammar
+        constraints and parse the model's native output format instead."""
+        return False
 
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
@@ -361,3 +380,66 @@ class BaseFormatDetector(ABC):
             A function that takes a tool name (str) and returns StructureInfo
         """
         raise NotImplementedError()
+
+    def get_structural_tag_name(self) -> Optional[str]:
+        """Return the XGrammar model name for native structural tags, if supported."""
+        return None
+
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+    ) -> Optional[StructuralTag]:
+        """
+        Return a model-native XGrammar structural tag when supported.
+
+        Args:
+            tools: List of available tools
+            tool_choice: The tool choice setting from the request
+            thinking_mode: Whether to include the model's reasoning prefix in
+                the returned structural tag. Pass False when SGLang's
+                ReasonerGrammarBackend will own the <think>...</think> prefix
+                (the typical case when --reasoning-parser is configured) so
+                only one layer constrains the reasoning section.
+            parallel_tool_calls: Whether multiple tool calls may appear in one
+                assistant response. xgrammar's get_model_structural_tag does
+                not expose this knob, so this base implementation ignores it;
+                only detectors that build their own tags (e.g. Kimi K3)
+                honor it.
+
+        Returns:
+            StructuralTag if this detector supports model-native tags, otherwise None
+        """
+        structural_tag_name = self.get_structural_tag_name()
+        if not structural_tag_name or get_model_structural_tag is None:
+            return None
+
+        converted_tools = [tool.model_dump() for tool in tools or []]
+        converted_tool_choice = (
+            tool_choice.model_dump()
+            if isinstance(tool_choice, ToolChoice)
+            else tool_choice
+        )
+        return get_model_structural_tag(
+            model=structural_tag_name,
+            tools=converted_tools,
+            tool_choice=converted_tool_choice,
+            reasoning=thinking_mode,
+        )
+
+    def get_auto_tool_call_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+    ) -> Optional[StructuralTag]:
+        """Return an always-on structural tag for automatic tool choice.
+
+        Most formats leave unconstrained text generation enabled for
+        ``tool_choice="auto"`` unless strict mode is requested. Formats with a
+        token that unambiguously starts a tool payload can override this hook
+        to constrain only the payload after that token.
+        """
+        return None

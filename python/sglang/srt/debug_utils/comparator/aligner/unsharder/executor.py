@@ -13,7 +13,10 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
 )
 from sglang.srt.debug_utils.comparator.dims_spec import (
     ParallelAxis,
+    apply_dim_names,
+    get_dim_names,
     resolve_dim_by_name,
+    without_dim_names,
 )
 from sglang.srt.debug_utils.comparator.output_types import ReplicatedCheckResult
 from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import compute_diff
@@ -65,7 +68,11 @@ def _apply_unshard(
 
     if isinstance(params, ConcatParams):
         dim: int = resolve_dim_by_name(ordered_tensors[0], params.dim_name)
-        return torch.cat(ordered_tensors, dim=dim), []
+        names: tuple[Optional[str], ...] = get_dim_names(ordered_tensors[0])
+        result = torch.cat(ordered_tensors, dim=dim)
+        if names[0] is not None:
+            result = apply_dim_names(result, list(names))
+        return result, []
 
     if isinstance(params, CpThdConcatParams):
         thd_dim: int = resolve_dim_by_name(ordered_tensors[0], params.dim_name)
@@ -79,11 +86,11 @@ def _apply_unshard(
         )
 
     if isinstance(params, ReduceSumParams):
-        stripped: list[torch.Tensor] = [t.rename(None) for t in ordered_tensors]
+        names: tuple[Optional[str], ...] = get_dim_names(ordered_tensors[0])
+        stripped: list[torch.Tensor] = [without_dim_names(t) for t in ordered_tensors]
         result: torch.Tensor = torch.stack(stripped).sum(dim=0)
-        names: tuple[Optional[str], ...] = ordered_tensors[0].names
         if names[0] is not None:
-            result = result.refine_names(*names)
+            result = apply_dim_names(result, list(names))
         return result, []
 
     raise ValueError(f"Unsupported unshard operation: {type(params).__name__}")
@@ -95,7 +102,7 @@ def _verify_replicated_group(
     axis: ParallelAxis,
     group_index: int,
 ) -> list[ReplicatedCheckResult]:
-    baseline: torch.Tensor = ordered_tensors[0].rename(None).float()
+    baseline: torch.Tensor = ordered_tensors[0].float()
 
     return [
         _check_replicated_pair(
@@ -117,7 +124,7 @@ def _check_replicated_pair(
     group_index: int,
     compared_index: int,
 ) -> ReplicatedCheckResult:
-    other_float: torch.Tensor = other.rename(None).float()
+    other_float: torch.Tensor = other.float()
 
     if baseline.shape != other_float.shape:
         passed = False
@@ -126,9 +133,9 @@ def _check_replicated_pair(
         diff_info = compute_diff(
             x_baseline=baseline,
             x_target=other_float,
-            diff_threshold=_REPLICATED_ATOL,
+            predicate=f"max_abs <= {_REPLICATED_ATOL}",
         )
-        passed = diff_info.max_abs_diff <= _REPLICATED_ATOL
+        passed = diff_info.passed
 
     return ReplicatedCheckResult(
         axis=axis.value,
@@ -155,8 +162,8 @@ def _thd_concat(
     This function splits each rank by seq_lens, then interleaves across ranks
     per-seq: [seqA_r0 + seqA_r1 + ... | seqB_r0 + seqB_r1 + ... | tail_pad].
     """
-    names: tuple[Optional[str], ...] = ordered_tensors[0].names
-    stripped: list[torch.Tensor] = [t.rename(None) for t in ordered_tensors]
+    names: tuple[Optional[str], ...] = get_dim_names(ordered_tensors[0])
+    stripped: list[torch.Tensor] = [without_dim_names(t) for t in ordered_tensors]
 
     # Split each rank into [seq0, seq1, ..., tail_remainder]
     split_sizes: list[int] = list(seq_lens_per_rank)
@@ -179,5 +186,5 @@ def _thd_concat(
     )
 
     if names[0] is not None:
-        result = result.refine_names(*names)
+        result = apply_dim_names(result, list(names))
     return result
