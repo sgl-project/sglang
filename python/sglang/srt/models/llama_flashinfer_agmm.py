@@ -13,10 +13,10 @@
 # ==============================================================================
 """Exact FlashInfer AGMM sequence-parallel route for Llama 3.1 70B.
 
-This module intentionally supports only the configuration that has been
-validated end to end: unquantized BF16 Llama 3.1 70B, TP4 on SM103, and an
-extend batch containing exactly 4096 token rows. Decode and other row counts
-continue through the native Llama model path.
+This module intentionally supports only exact unquantized BF16 Llama 3.1 70B
+configurations: TP4 or TP8 on SM103 and an extend batch containing exactly 4096
+token rows. Decode and other row counts continue through the native Llama model
+path.
 """
 
 from __future__ import annotations
@@ -41,17 +41,56 @@ _EXPECTED_MODEL = {
     "num_attention_heads": 64,
     "num_key_value_heads": 8,
 }
-_TP_SIZE = 4
 _FULL_ROWS = 4096
-_LOCAL_ROWS = _FULL_ROWS // _TP_SIZE
-_Q_SIZE = 2048
-_KV_SIZE = 256
-_PACKED_QKV_N = _Q_SIZE + 2 * _KV_SIZE
 _MODEL_TOKEN_ATTRIBUTE = "_flashinfer_agmm_true_sp_model_token"
 
 
-def _row_partition(total_rows: int) -> Optional[int]:
-    return _LOCAL_ROWS if total_rows == _FULL_ROWS else None
+@dataclass(frozen=True)
+class _Topology:
+    tp_size: int
+    local_rows: int
+    q_size: int
+    kv_size: int
+    intermediate_size: int
+
+    @property
+    def packed_qkv_n(self) -> int:
+        return self.q_size + 2 * self.kv_size
+
+    @property
+    def ranks(self) -> tuple[int, ...]:
+        return tuple(range(self.tp_size))
+
+
+_TOPOLOGIES = {
+    4: _Topology(
+        tp_size=4,
+        local_rows=1024,
+        q_size=2048,
+        kv_size=256,
+        intermediate_size=7168,
+    ),
+    8: _Topology(
+        tp_size=8,
+        local_rows=512,
+        q_size=1024,
+        kv_size=128,
+        intermediate_size=3584,
+    ),
+}
+
+
+def _topology_for_tp_size(tp_size: int) -> _Topology:
+    try:
+        return _TOPOLOGIES[tp_size]
+    except KeyError as error:
+        raise RuntimeError(
+            "FlashInfer AGMM true-SP requires tensor parallel size 4 or 8"
+        ) from error
+
+
+def _row_partition(total_rows: int, topology: _Topology) -> Optional[int]:
+    return topology.local_rows if total_rows == _FULL_ROWS else None
 
 
 def _forward_mode_reason(forward_batch: Any) -> Optional[str]:
@@ -71,7 +110,9 @@ def _forward_mode_reason(forward_batch: Any) -> Optional[str]:
     return None
 
 
-def _model_contract_reason(model: Any, torch_module: Any) -> Optional[str]:
+def _model_contract_reason(
+    model: Any, torch_module: Any, topology: _Topology
+) -> Optional[str]:
     pp_group = getattr(model, "pp_group", None)
     if (
         pp_group is None
@@ -117,10 +158,11 @@ def _model_contract_reason(model: Any, torch_module: Any) -> Optional[str]:
         ):
             return f"layer_{layer_index}_linear_types"
         if (
-            tuple(qkv.weight.shape) != (2560, 8192)
-            or tuple(o_proj.weight.shape) != (8192, 2048)
-            or tuple(gate_up.weight.shape) != (14336, 8192)
-            or tuple(down.weight.shape) != (8192, 7168)
+            tuple(qkv.weight.shape) != (topology.packed_qkv_n, 8192)
+            or tuple(o_proj.weight.shape) != (8192, topology.q_size)
+            or tuple(gate_up.weight.shape)
+            != (2 * topology.intermediate_size, 8192)
+            or tuple(down.weight.shape) != (8192, topology.intermediate_size)
         ):
             return f"layer_{layer_index}_weight_shapes"
         if any(module.weight.dtype != torch_module.bfloat16 for module in modules):
@@ -135,20 +177,23 @@ def _model_contract_reason(model: Any, torch_module: Any) -> Optional[str]:
         ):
             return f"layer_{layer_index}_quantization"
         if (
-            int(qkv.tp_size) != 4
-            or int(qkv.q_proj_shard_size) != 2048
-            or int(qkv.kv_proj_shard_size) != 256
-            or int(qkv.v_proj_shard_size) != 256
+            int(qkv.tp_size) != topology.tp_size
+            or int(qkv.q_proj_shard_size) != topology.q_size
+            or int(qkv.kv_proj_shard_size) != topology.kv_size
+            or int(qkv.v_proj_shard_size) != topology.kv_size
             or bool(qkv.gather_output)
         ):
             return f"layer_{layer_index}_qkv_contract"
-        if int(attention.q_size) != _Q_SIZE or int(attention.kv_size) != _KV_SIZE:
+        if (
+            int(attention.q_size) != topology.q_size
+            or int(attention.kv_size) != topology.kv_size
+        ):
             return f"layer_{layer_index}_attention_split"
         if (
-            int(gate_up.tp_size) != 4
+            int(gate_up.tp_size) != topology.tp_size
             or bool(gate_up.gather_output)
-            or int(o_proj.tp_size) != 4
-            or int(down.tp_size) != 4
+            or int(o_proj.tp_size) != topology.tp_size
+            or int(down.tp_size) != topology.tp_size
             or not bool(o_proj.input_is_parallel)
             or not bool(down.input_is_parallel)
             or not bool(o_proj.reduce_results)
@@ -174,8 +219,10 @@ def _validate_prepare_signature(prepare: Callable[..., Any]) -> None:
         raise RuntimeError("FlashInfer prepared AGMM verbose default changed")
 
 
-def _bind_model_contract(model: Any, torch_module: Any) -> tuple[int, object]:
-    reason = _model_contract_reason(model, torch_module)
+def _bind_model_contract(
+    model: Any, torch_module: Any, topology: _Topology
+) -> tuple[int, object]:
+    reason = _model_contract_reason(model, torch_module, topology)
     if reason is not None:
         raise RuntimeError(
             "--enable-flashinfer-agmm-true-sp requires the exact "
@@ -204,11 +251,13 @@ class LlamaFlashInferAgmmTrueSP:
         from flashinfer.comm import prepare_all_gather_matmul
 
         self._torch = torch
-        self._validate_runtime_config()
+        self._topology = self._validate_runtime_config()
         if not callable(prepare_all_gather_matmul):
             raise RuntimeError("FlashInfer prepared AGMM API is unavailable")
         _validate_prepare_signature(prepare_all_gather_matmul)
-        self._model_id, self._model_token = _bind_model_contract(model, torch)
+        self._model_id, self._model_token = _bind_model_contract(
+            model, torch, self._topology
+        )
         self._prepare_all_gather_matmul = prepare_all_gather_matmul
         self._coordinator = None
         self._group = None
@@ -217,7 +266,7 @@ class LlamaFlashInferAgmmTrueSP:
         self._bindings: dict[tuple[int, int], _PreparedBinding] = {}
 
     @staticmethod
-    def _validate_runtime_config() -> None:
+    def _validate_runtime_config() -> _Topology:
         from sglang.srt.runtime_context import (
             get_exec,
             get_memory,
@@ -226,15 +275,17 @@ class LlamaFlashInferAgmmTrueSP:
         )
 
         parallel = get_parallel()
+        tp_size = int(parallel.tp_size)
+        topology = _topology_for_tp_size(tp_size)
         if (
-            int(parallel.tp_size) != 4
-            or int(parallel.attn_tp_size) != 4
+            int(parallel.attn_tp_size) != tp_size
             or int(parallel.attn_dp_size) != 1
             or int(parallel.attn_cp_size) != 1
             or int(parallel.pp_size) != 1
         ):
             raise RuntimeError(
-                "--enable-flashinfer-agmm-true-sp requires TP4, DP1, CP1, PP1"
+                "--enable-flashinfer-agmm-true-sp requires TP4 or TP8, "
+                "DP1, CP1, PP1"
             )
         if not bool(get_exec().graph.disable_cuda_graph):
             raise RuntimeError(
@@ -263,6 +314,7 @@ class LlamaFlashInferAgmmTrueSP:
                 "--enable-flashinfer-agmm-true-sp requires "
                 "--attention-backend flashinfer"
             )
+        return topology
 
     def _input_reason(
         self,
@@ -287,7 +339,7 @@ class LlamaFlashInferAgmmTrueSP:
         total_rows = int(input_ids.shape[0])
         if int(positions.shape[0]) != total_rows:
             return "position_rows"
-        if _row_partition(total_rows) is None:
+        if _row_partition(total_rows, self._topology) is None:
             return "full_rows"
         batch_input_ids = getattr(forward_batch, "input_ids", None)
         if (
@@ -313,10 +365,11 @@ class LlamaFlashInferAgmmTrueSP:
         coordinator = get_tp_group()
         group = coordinator.device_group
         rank = int(coordinator.rank_in_group)
+        topology = self._topology
         if (
-            int(coordinator.world_size) != 4
-            or list(coordinator.ranks) != [0, 1, 2, 3]
-            or int(dist.get_world_size(group)) != 4
+            int(coordinator.world_size) != topology.tp_size
+            or tuple(coordinator.ranks) != topology.ranks
+            or int(dist.get_world_size(group)) != topology.tp_size
             or int(dist.get_rank(group)) != rank
             or str(dist.get_backend(group)).lower() != "nccl"
         ):
@@ -350,7 +403,10 @@ class LlamaFlashInferAgmmTrueSP:
         if packed is None:
             packed = qkv.weight.t().contiguous()
             self._packed_weights[key] = packed
-        if tuple(packed.shape) != (8192, _PACKED_QKV_N) or not packed.is_contiguous():
+        if (
+            tuple(packed.shape) != (8192, self._topology.packed_qkv_n)
+            or not packed.is_contiguous()
+        ):
             raise RuntimeError("FlashInfer AGMM packed-QKV weight changed")
         return packed
 
@@ -375,21 +431,25 @@ class LlamaFlashInferAgmmTrueSP:
             raise RuntimeError("FlashInfer AGMM prepared binding changed")
         return binding.launcher(inp)
 
-    @staticmethod
-    def _all_gather_rows(coordinator: Any, local: Any):
+    def _all_gather_rows(self, coordinator: Any, local: Any):
         if local.ndim != 2 or not local.is_contiguous():
             raise RuntimeError("AGMM all-gather input must be contiguous and 2D")
-        output = local.new_empty(local.shape[0] * _TP_SIZE, local.shape[1])
+        output = local.new_empty(
+            local.shape[0] * self._topology.tp_size, local.shape[1]
+        )
         coordinator.all_gather_into_tensor(output, local)
         return output
 
-    @staticmethod
-    def _reduce_scatter_rows(coordinator: Any, partial: Any):
+    def _reduce_scatter_rows(self, coordinator: Any, partial: Any):
         if partial.ndim != 2 or not partial.is_contiguous():
             raise RuntimeError("AGMM reduce-scatter input must be contiguous and 2D")
-        if partial.shape[0] % _TP_SIZE:
-            raise RuntimeError("AGMM reduce-scatter row count is not divisible by TP4")
-        output = partial.new_empty(partial.shape[0] // _TP_SIZE, partial.shape[1])
+        if partial.shape[0] % self._topology.tp_size:
+            raise RuntimeError(
+                "AGMM reduce-scatter row count is not divisible by the TP size"
+            )
+        output = partial.new_empty(
+            partial.shape[0] // self._topology.tp_size, partial.shape[1]
+        )
         coordinator.reduce_scatter_tensor(output, partial)
         return output
 
@@ -403,7 +463,8 @@ class LlamaFlashInferAgmmTrueSP:
         coordinator: Any,
         group: Any,
     ):
-        if tuple(hidden_states.shape) != (_LOCAL_ROWS, 8192):
+        topology = self._topology
+        if tuple(hidden_states.shape) != (topology.local_rows, 8192):
             raise RuntimeError("AGMM decoder-layer input shape changed")
         if residual is not None and residual.shape != hidden_states.shape:
             raise RuntimeError("AGMM hidden and residual row shards disagree")
@@ -419,7 +480,9 @@ class LlamaFlashInferAgmmTrueSP:
         if not normalized.is_contiguous():
             raise RuntimeError("AGMM input RMSNorm produced noncontiguous rows")
         qkv = self._prepared_qkv(normalized, qkv_proj, group)
-        q, k, v = qkv.split([_Q_SIZE, _KV_SIZE, _KV_SIZE], dim=-1)
+        q, k, v = qkv.split(
+            [topology.q_size, topology.kv_size, topology.kv_size], dim=-1
+        )
         q, k = layer.self_attn.rotary_emb(positions, q, k)
         attention_output = layer.self_attn.attn(q, k, v, forward_batch)
         o_partial, _ = layer.self_attn.o_proj(
@@ -481,7 +544,9 @@ class LlamaFlashInferAgmmTrueSP:
         ):
             raise RuntimeError("FlashInfer AGMM embedding contract changed")
         hidden_states = replicated.narrow(
-            0, rank * _LOCAL_ROWS, _LOCAL_ROWS
+            0,
+            rank * self._topology.local_rows,
+            self._topology.local_rows,
         ).contiguous()
         residual = None
         for layer_index in range(80):
