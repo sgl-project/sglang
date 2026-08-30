@@ -23,7 +23,7 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 
-namespace {
+namespace sglang {
 
 struct UpdateSconvParams {
   const void* __restrict__ x;              // [T, D], channel-contiguous
@@ -135,4 +135,4 @@ struct UpdateSconvCacheKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

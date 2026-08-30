@@ -89,12 +89,15 @@ class PureSWARadixCache(RadixCache):
         ]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids,
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         keys_len = len(radix_key)
 
-        old_prefix_len = req.cache_protected_len
-        swa_evict_floor = req.swa_evict_floor
+        old_prefix_len = req.kv.cache_protected_len
+        swa_evict_floor = req.kv.swa_evict_floor
         swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
         if self.page_size > 1 and swa_evict_floor > 0:

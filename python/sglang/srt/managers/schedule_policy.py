@@ -155,7 +155,12 @@ def match_prefix_for_req(
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
-            key=RadixKey(token_ids=token_ids, extra_key=req.extra_key, limit=key_limit),
+            key=RadixKey(
+                token_ids=token_ids,
+                extra_key=req.extra_key,
+                limit=key_limit,
+                cache_salt=req.cache_salt,
+            ),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
         )
@@ -188,7 +193,7 @@ def match_prefix_for_req(
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
-        req.cache_protected_len = match_result.cache_protected_len
+        req.kv.cache_protected_len = match_result.cache_protected_len
     return match_result
 
 
@@ -288,6 +293,13 @@ class SchedulePolicy:
             return CacheAgnosticPolicy.FCFS
         return self.policy
 
+    def waiting_queue_prefix_matched(self, waiting_queue: List[Req]) -> bool:
+        policy = self._determine_active_policy(waiting_queue)
+        return (
+            isinstance(policy, CacheAwarePolicy)
+            or self.tree_cache.supports_fast_match_prefix()
+        )
+
     def _validate_and_adjust_policy(
         self, policy: str, tree_cache: BasePrefixCache
     ) -> Policy:
@@ -319,6 +331,7 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
+            cache_salt = r.cache_salt
             match_result = match_prefix_for_req(
                 self.tree_cache, r, prefix_ids, include_req=True
             )
@@ -333,7 +346,11 @@ class SchedulePolicy:
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 match_result = self.waiting_queue_radix_tree.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                        key=RadixKey(
+                            token_ids=prefix_ids,
+                            extra_key=extra_key,
+                            cache_salt=cache_salt,
+                        )
                     )
                 )
                 if envs.SGLANG_RADIX_FORCE_MISS.get():
@@ -350,7 +367,11 @@ class SchedulePolicy:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
                         InsertParams(
-                            key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                            key=RadixKey(
+                                token_ids=prefix_ids,
+                                extra_key=extra_key,
+                                cache_salt=cache_salt,
+                            ),
                             value=torch.empty(len(prefix_ids), dtype=torch.bool),
                         )
                     )
@@ -1306,7 +1327,7 @@ class PrefillAdder:
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
-                req.cache_protected_len = prefix_len
+                req.kv.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
@@ -1477,7 +1498,7 @@ class PrefillAdder:
                 )
                 release_counter += 1
                 self.running_batch.release_req(
-                    i, len(self.running_batch.reqs) - release_counter, server_args
+                    i, len(self.running_batch.reqs) - release_counter
                 )
             else:
                 keep_indices.append(i)

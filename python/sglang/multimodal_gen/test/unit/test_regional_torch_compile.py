@@ -4,12 +4,15 @@ from unittest.mock import patch
 import pytest
 import torch.nn as nn
 
-from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2ArchConfig
+from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
+    LTX2VideoTransformer3DModel,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     CompiledModuleRegistry,
+    build_torch_compile_kwargs,
     compile_matching_submodules,
 )
 
@@ -38,8 +41,65 @@ class _RegionalModel(_CompilableModule):
         self.proj_out = _CompilableModule()
 
 
+@pytest.mark.parametrize(
+    ("backend", "options", "expected"),
+    [
+        (
+            "custom_backend",
+            {"pass_manager_config": {"persistent_buffers": ["weight"]}},
+            {
+                "backend": "custom_backend",
+                "options": {"pass_manager_config": {"persistent_buffers": ["weight"]}},
+            },
+        ),
+        (
+            "inductor",
+            {"max_autotune": True},
+            {"backend": "inductor", "options": {"max_autotune": True}},
+        ),
+        (
+            "inductor",
+            None,
+            {"backend": "inductor", "mode": "max-autotune-no-cudagraphs"},
+        ),
+    ],
+)
+def test_out_of_tree_platform_controls_compile_kwargs(backend, options, expected):
+    """Out-of-tree hooks select valid backend, mode, and option combinations."""
+    module = _CompilableModule()
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.utils.torch_compile."
+            "current_platform.is_out_of_tree",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.utils.torch_compile."
+            "current_platform.get_compile_backend",
+            return_value=backend,
+        ) as get_compile_backend,
+        patch(
+            "sglang.multimodal_gen.runtime.utils.torch_compile."
+            "current_platform.get_compile_options",
+            return_value=options,
+        ) as get_compile_options,
+    ):
+        compile_kwargs = build_torch_compile_kwargs(
+            mode="max-autotune-no-cudagraphs",
+            module=module,
+        )
+
+    assert compile_kwargs == {
+        "dynamic": None,
+        "fullgraph": False,
+        **expected,
+    }
+    get_compile_backend.assert_called_once_with("max-autotune-no-cudagraphs")
+    get_compile_options.assert_called_once_with(module)
+
+
 def test_ltx2_compile_conditions_match_only_direct_blocks():
-    conditions = LTX2ArchConfig()._compile_conditions
+    conditions = LTX2VideoTransformer3DModel._compile_conditions
 
     assert conditions
     assert any(condition("transformer_blocks.0", object()) for condition in conditions)
@@ -97,6 +157,7 @@ def test_compiled_module_registry_installs_regions_once():
 
 def test_denoising_stage_selects_regional_compile():
     model = _RegionalModel()
+    compile_kwargs = {"backend": "custom_backend"}
     stage = DenoisingStage.__new__(DenoisingStage)
     stage.server_args = SimpleNamespace(
         enable_breakable_cuda_graph=False,
@@ -119,8 +180,18 @@ def test_denoising_stage_selects_regional_compile():
             "sglang.multimodal_gen.runtime.pipelines_core.stages.denoising."
             "maybe_enable_inductor_compute_comm_overlap"
         ),
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.denoising."
+            "build_torch_compile_kwargs",
+            return_value=compile_kwargs,
+        ) as build_compile_kwargs,
     ):
         stage._maybe_torch_compile(model)
 
+    build_compile_kwargs.assert_called_once_with(mode="default", module=model)
     assert [len(block.compile_calls) for block in model.transformer_blocks] == [1, 1]
+    assert [block.compile_calls for block in model.transformer_blocks] == [
+        [compile_kwargs],
+        [compile_kwargs],
+    ]
     assert not model.compile_calls
