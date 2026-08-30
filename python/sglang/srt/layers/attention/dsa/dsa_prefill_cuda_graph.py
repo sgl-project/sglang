@@ -14,10 +14,11 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 
 GRAPH_WEIGHTS_PROJ_LORA_ERROR = (
     "DSA indexer weights_proj LoRA is incompatible with "
@@ -31,7 +32,7 @@ def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
     return is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph()
 
 
-if _is_cuda:
+if _is_cuda or _is_hip:
 
     def _scale_head_gate_graph_fake_impl(
         weights_raw: torch.Tensor,
@@ -103,7 +104,9 @@ def pcg_dsa_indexer_prefill_split(
     # call site pre-allocates it at a static, padded shape and a downstream
     # captured graph reads it at a fixed address; eager code instead allocates
     # and returns a fresh, naturally-sized tensor each call.
-    assert _is_cuda, "Internal error: DSA graph dispatch is only supported on CUDA"
+    assert (
+        _is_cuda or _is_hip
+    ), "Internal error: DSA graph dispatch is only supported on CUDA/HIP"
     from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 
     forward_context = get_tc_piecewise_forward_context()
