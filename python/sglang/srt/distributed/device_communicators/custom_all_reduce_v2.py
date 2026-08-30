@@ -3,21 +3,23 @@
 The CUDA side is split into independent pieces:
 
 - ``PushPlane``: the zero-filled symmetric push buffers plus a rank-local
-  phase counter. ``1shot_push`` and ``2shot_push`` share this plane: the
+  phase counter. ``1shot_push`` and ``2shot_scatter`` share this plane: the
   former treats it as one full-input slot per source, while the latter lays
-  the reduced shards contiguously across those same slots.
+  the reduced shards contiguously across those same slots in its all-gather
+  half.
 - ``PullPlane``: the symmetric pull buffers plus the per-block semaphores
   guarding them. The buffers exist only because this class hands the
   all-reduce tensors that are not symmetric memory, so it stages them
   through; the K3 fused collectives bring their own symmetric input and
   borrow the semaphores alone.
-- ``Communicator``: the two planes above (either may be absent), the handle
-  every kernel takes, plus the pull launch widths. ``2shot_push`` reaches its
-  all-gather region through the push plane, so it also shares that plane's
-  epoch counter: both push algorithms advance the double buffer together.
+- the scatter plane: ``2shot_scatter``'s per-source shard slots, a third
+  ``PushPlane`` sharing the push plane's epoch counter so every push-family
+  algorithm advances the double buffer together.
+- ``Communicator``: the planes above (any may be absent), the handle every
+  kernel takes, plus the pull launch widths.
 - the all-reduce kernel: a pure function of ``(Communicator, input, algo,
   graph_params, use_multicast)`` with four algorithms (1shot_push /
-  1shot_pull / 2shot_pull / 2shot_push) and three pull data sources (eager
+  1shot_pull / 2shot_pull / 2shot_scatter) and three pull data sources (eager
   pull buffer / CUDA-graph pointer table / multicast address).
 
 All storage is allocated and owned here, in Python.
@@ -131,31 +133,35 @@ class _WorkspaceSizes(NamedTuple):
     """Aligned byte capacities of one instance's symmetric-memory workspace.
 
     ``pull`` and ``push`` are the per-direction message ceilings; either may
-    be ``0``. ``gather_slot`` is the shard slot ``2shot_push`` all-gathers
-    into, and ``two_shot_push`` the message ceiling that slot buys.
+    be ``0``. ``scatter_slot`` sizes ``2shot_scatter``'s per-peer shard slots
+    -- one size serves both its planes, since the scatter inbox holds a
+    contribution shard and the gather half one reduced shard per slot --
+    with ``two_shot_scatter`` the message ceiling that buys.
     """
 
     pull: int
     push: int
-    gather_slot: int
-    two_shot_push: int
+    scatter_slot: int
+    two_shot_scatter: int
 
     @property
     def pull_enabled(self) -> bool:
         return self.pull > 0
 
     @property
-    def two_shot_push_enabled(self) -> bool:
-        return self.gather_slot > 0
+    def two_shot_scatter_enabled(self) -> bool:
+        return self.scatter_slot > 0
 
     @property
     def shared_slot(self) -> int:
         """Size of one of the ``2 * world_size`` shared push slots.
 
-        The two push algos share the plane, so a slot has to hold either
-        occupant: a whole ``1shot_push`` input, or a ``2shot_push`` shard.
+        The push algos share the plane, so a slot has to hold either
+        occupant: a whole ``1shot_push`` input, or a reduced shard from
+        ``2shot_scatter``'s all-gather half (the same shard size that sizes
+        the scatter slots).
         """
-        return max(self.push, self.gather_slot)
+        return max(self.push, self.scatter_slot)
 
     @property
     def max_message(self) -> int:
@@ -171,7 +177,7 @@ class _WorkspaceSizes(NamedTuple):
         max_size: int,
         max_pull_size: Optional[int],
         max_push_size: Optional[int],
-        max_two_shot_push_size: Optional[int],
+        max_two_shot_scatter_size: Optional[int],
         pull_blocks_disabled: bool,
     ) -> "_WorkspaceSizes":
         """Resolve the constructor's optional caps into concrete capacities.
@@ -184,8 +190,8 @@ class _WorkspaceSizes(NamedTuple):
             max_pull_size = min(tuned.max_pull_bytes, max_size)
         if max_push_size is None:
             max_push_size = min(tuned.max_push_bytes, max_size)
-        if max_two_shot_push_size is None:
-            max_two_shot_push_size = min(tuned.max_two_shot_push_bytes, max_size)
+        if max_two_shot_scatter_size is None:
+            max_two_shot_scatter_size = min(tuned.max_two_shot_scatter_bytes, max_size)
         if _FORCE_PULL_SIZE is not None:
             max_pull_size = _FORCE_PULL_SIZE
         if _FORCE_PUSH_SIZE is not None:
@@ -197,21 +203,19 @@ class _WorkspaceSizes(NamedTuple):
         # take this path rather than allocating a placeholder buffer just to
         # satisfy a constructor.
         pull_off = pull_blocks_disabled or max_pull_size <= 0
-        # 2shot_push stages its input through the pull buffer, so it goes
-        # down with the pull half; what it gathers is one reduced shard per
-        # rank, hence a slot of 1/world_size of the message.
-        gather_off = pull_off or max_two_shot_push_size <= 0
-        gather_slot = (
-            0 if gather_off else _align(_div_ceil(max_two_shot_push_size, world_size))
+        # 2shot_scatter workspaces are the scatter slots and the shared push plane's
+        # gather half, and both hold one reduced shard per peer, so one size
+        # serves both.
+        scatter_slot = (
+            0
+            if max_two_shot_scatter_size <= 0
+            else _align(_div_ceil(max_two_shot_scatter_size, world_size))
         )
-        pull = 0 if pull_off else _align(max_pull_size)
         return cls(
-            pull=pull,
+            pull=0 if pull_off else _align(max_pull_size),
             push=_align(max_push_size),
-            gather_slot=gather_slot,
-            # rounding the shard up bought a bit of headroom; the pull
-            # buffer still has to hold the whole message
-            two_shot_push=min(gather_slot * world_size, pull),
+            scatter_slot=scatter_slot,
+            two_shot_scatter=scatter_slot * world_size,
         )
 
 
@@ -256,7 +260,7 @@ def _narrow_config(
         .clip(
             max_push_bytes=sizes.push,
             max_pull_bytes=sizes.pull,
-            max_two_shot_push_bytes=sizes.two_shot_push,
+            max_two_shot_scatter_bytes=sizes.two_shot_scatter,
         )
         ._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
     )
@@ -271,7 +275,7 @@ class CustomAllReduceV2:
         *,
         max_pull_size: Optional[int] = None,
         max_push_size: Optional[int] = None,
-        max_two_shot_push_size: Optional[int] = None,
+        max_two_shot_scatter_size: Optional[int] = None,
         max_pull_blocks: Optional[int] = None,
         max_push_blocks: Optional[int] = None,
     ) -> None:
@@ -285,11 +289,11 @@ class CustomAllReduceV2:
                               push-only instance.
         :param max_push_size: explicit per-slot push workspace size;
                               overrides both the tuned size and ``max_size``.
-        :param max_two_shot_push_size: explicit ``2shot_push`` message ceiling,
-                                 which may enlarge the shared push slots;
-                                 overrides both the tuned size and
-                                 ``max_size``. ``0`` disables the algo and
-                                 leaves the slots at the 1shot_push size.
+        :param max_two_shot_scatter_size: explicit ``2shot_scatter`` message
+                                 ceiling; sizes the scatter slots and may
+                                 enlarge the shared push slots. Overrides both
+                                 the tuned size and ``max_size``; ``0``
+                                 disables the algo and its plane.
         :param max_pull_blocks: cap on the barrier plane's block count; ``0``
                                 builds a push-only instance.
         :param max_push_blocks: exact push grid width, overriding the tuned
@@ -320,15 +324,15 @@ class CustomAllReduceV2:
             max_size=max_size,
             max_pull_size=max_pull_size,
             max_push_size=max_push_size,
-            max_two_shot_push_size=max_two_shot_push_size,
+            max_two_shot_scatter_size=max_two_shot_scatter_size,
             pull_blocks_disabled=max_pull_blocks == 0,
         )
         self.pull_enabled = sizes.pull_enabled
-        self.two_shot_push_enabled = sizes.two_shot_push_enabled
+        self.two_shot_scatter_enabled = sizes.two_shot_scatter_enabled
         self.max_pull_size = sizes.pull
         self.max_push_size = sizes.push
-        self.max_two_shot_push_size = sizes.two_shot_push
-        self.gather_slot_size = sizes.gather_slot
+        self.max_two_shot_scatter_size = sizes.two_shot_scatter
+        self.scatter_slot_size = sizes.scatter_slot
         self.shared_slot_size = sizes.shared_slot
         self.max_size = sizes.max_message
         self.config = _narrow_config(
@@ -363,25 +367,24 @@ class CustomAllReduceV2:
     def _init_workspace(self) -> None:
         """Slice one symmetric-memory allocation into every shared buffer.
 
-        Layout per rank: ``[2 * world_size shared push slots | pull buffer |
-        pull semaphores]``. The shared slots serve both ``1shot_push`` and
-        ``2shot_push``; their common counter is rank-local and therefore
-        lives in a plain CUDA tensor.
+        Layout per rank: ``[2 * world_size shared push slots | 2 * world_size
+        scatter slots | pull buffer | pull semaphores]``. The shared slots
+        serve ``1shot_push`` and both two-shot gather halves; the scatter
+        slots hold ``2shot_scatter``'s per-source shards. One rank-local
+        counter (a plain CUDA tensor) drives both planes' epochs, so every
+        push-family algorithm advances the double buffer together.
         """
         cfg = self.config
         push_num_slots = 2 * self.world_size  # 2 phases x world_size peers
         push_bytes = push_num_slots * self.shared_slot_size
+        scatter_bytes = push_num_slots * self.scatter_slot_size  # 0 if disabled
         pull_bytes = self.max_pull_size  # 0 when the pull half is disabled
-        # 2shot_push now launches with the push grid (`num_sms`) but enters
-        # through the pull barrier. Allocate enough semaphore rows for that
-        # grid while keeping the tuned pull launch width in Communicator.
         num_sem_blocks = cfg.num_pull_blocks if self.pull_enabled else 0
-        if self.two_shot_push_enabled:
-            num_sem_blocks = max(num_sem_blocks, cfg.num_push_blocks)
         sem_bytes = _SEMAPHORE_BYTES * num_sem_blocks
-        total_bytes = push_bytes + pull_bytes + sem_bytes
-        pull_offset = push_bytes
-        sem_offset = push_bytes + pull_bytes
+        total_bytes = push_bytes + scatter_bytes + pull_bytes + sem_bytes
+        scatter_offset = push_bytes
+        pull_offset = push_bytes + scatter_bytes
+        sem_offset = pull_offset + pull_bytes
 
         self._symm_tensor, symm_mem = _allocate_symmetric_memory(
             total_bytes, device=self.device, group=self.group
@@ -414,13 +417,26 @@ class CustomAllReduceV2:
         self._push_counter = torch.zeros(
             (cfg.num_push_blocks,), dtype=torch.uint32, device=self.device
         )
+        counter = self._push_counter.view(-1, 1).view(torch.uint8)
         push_plane = PushPlane(
             self.rank,
             self.world_size,
             workspaces=slice_all([push_num_slots, self.shared_slot_size], 0),
-            counter=self._push_counter.view(-1, 1).view(torch.uint8),
+            counter=counter,
             mc_workspace=mc_at(0),
         )
+        scatter_plane = None
+        if self.two_shot_scatter_enabled:
+            # same counter tensor as the push plane: one epoch for the family
+            scatter_plane = PushPlane(
+                self.rank,
+                self.world_size,
+                workspaces=slice_all(
+                    [push_num_slots, self.scatter_slot_size], scatter_offset
+                ),
+                counter=counter,
+                mc_workspace=mc_at(scatter_offset),
+            )
         pull_plane = None
         if self.pull_enabled:
             pull_plane = PullPlane(
@@ -434,7 +450,7 @@ class CustomAllReduceV2:
         if not self.has_multicast or not self.pull_enabled:
             self.config = self.config._replace(num_mc_blocks=None)
 
-        self.obj = Communicator(push=push_plane, pull=pull_plane)
+        self.obj = Communicator(push=push_plane, pull=pull_plane, scatter=scatter_plane)
         if self.pull_enabled:
             self.obj.set_pull_blocks(self.config.num_pull_blocks)
         if self.config.num_mc_blocks is not None:
@@ -442,12 +458,13 @@ class CustomAllReduceV2:
         if self.rank == 0:
             logger.info(
                 "All Reduce config: symmetric_memory = %.2f MB, "
-                "local_buffer = %.2f MB, multicast = %s, pull = %s, 2shot_push = %s",
+                "local_buffer = %.2f MB, multicast = %s, pull = %s, "
+                "2shot_scatter = %s",
                 total_bytes / MB,
                 (self.graph_params.nbytes + self._push_counter.nbytes) / MB,
                 self.config.num_mc_blocks is not None,
                 self.pull_enabled,
-                self.two_shot_push_enabled,
+                self.two_shot_scatter_enabled,
             )
         dist.barrier(group=self.group)
 
@@ -489,9 +506,13 @@ class CustomAllReduceV2:
         # TODO: refactor this along with the config file
         heuristic = self.config.graph if can_use_graph else self.config.eager
         can_use_multicast = self.config.num_mc_blocks is not None
-        # tried first so its band may start below one_shot_push_threshold
-        if heuristic.two_shot_push.contains(nbytes):
-            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PUSH, use_graph=can_use_graph)
+        # the bands are tried first so they may start below the thresholds
+        if heuristic.two_shot_scatter.contains(nbytes):
+            return AllReduceConfig(
+                AllReduceAlgo.TWO_SHOT_SCATTER,
+                use_multicast=self.has_multicast
+                and heuristic.two_shot_scatter_mc.contains(nbytes),
+            )
         if nbytes <= heuristic.one_shot_push_threshold:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
         if nbytes <= heuristic.one_shot_pull_threshold:

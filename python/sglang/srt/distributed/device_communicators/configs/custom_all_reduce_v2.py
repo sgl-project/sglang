@@ -34,7 +34,7 @@ class Heuristic(NamedTuple):
     """Self-contained algo ranges for one dispatch context (graph or eager).
 
     Five algos are tried in order of preference (fastest first):
-      1. ``2shot_push``: nbytes in ``two_shot_push.min_bytes..two_shot_push.max_bytes``
+      1. ``2shot_scatter``: nbytes in ``two_shot_scatter`` (a barrier-free band)
       2. ``1shot_push``:    nbytes <= ``one_shot_push_threshold``
       3. ``1shot_pull``:    nbytes <= ``one_shot_pull_threshold``
       4. ``2shot_pull`` mc: nbytes in ``mc.min_bytes..mc.max_bytes``
@@ -42,18 +42,19 @@ class Heuristic(NamedTuple):
       5. ``2shot_pull``:    nbytes <= ``two_shot_pull_threshold``
     Above all of these, the caller falls back to NCCL.
 
-    ``two_shot_push`` is tried first so its band may start below
-    ``one_shot_push_threshold``
+    ``two_shot_scatter`` is tried first so its band may start below
+    ``one_shot_push_threshold``.
 
     Setting two adjacent thresholds equal effectively disables the middle
-    algo; leaving ``mc`` / ``two_shot_push`` at the default disables that algo.
+    algo; leaving a ``Range`` at the default disables that algo.
     """
 
     one_shot_push_threshold: int
     one_shot_pull_threshold: int
     two_shot_pull_threshold: int
     mc: Range = Range(0, 0)  # default: multicast disabled in this context
-    two_shot_push: Range = Range(0, 0)  # default: 2shot_push disabled here
+    two_shot_scatter: Range = Range(0, 0)  # default: 2shot_scatter disabled here
+    two_shot_scatter_mc: Range = Range(0, 0)  # multimem fan-out sub-band of 2shot_scatter
 
     @property
     def max_push_bytes(self) -> int:
@@ -62,28 +63,31 @@ class Heuristic(NamedTuple):
     @property
     def max_pull_bytes(self) -> int:
         # The pull workspace hosts every pull-variant kernel, so it has to
-        # fit whichever variant runs at the largest size. 2shot_push
-        # stages its input through it too, and only gathers elsewhere.
+        # fit whichever variant runs at the largest size.
         return max(
             self.one_shot_pull_threshold,
             self.two_shot_pull_threshold,
             self.mc.max_bytes,
-            self.two_shot_push.max_bytes,
         )
 
     @property
-    def max_two_shot_push_bytes(self) -> int:
-        return self.two_shot_push.max_bytes
+    def max_two_shot_scatter_bytes(self) -> int:
+        return self.two_shot_scatter.max_bytes
 
     def clip(
-        self, *, max_push_bytes: int, max_pull_bytes: int, max_two_shot_push_bytes: int
+        self,
+        *,
+        max_push_bytes: int,
+        max_pull_bytes: int,
+        max_two_shot_scatter_bytes: int,
     ) -> "Heuristic":
         return Heuristic(
             min(self.one_shot_push_threshold, max_push_bytes),
             min(self.one_shot_pull_threshold, max_pull_bytes),
             min(self.two_shot_pull_threshold, max_pull_bytes),
             self.mc.clip(max_pull_bytes),
-            self.two_shot_push.clip(max_two_shot_push_bytes),
+            self.two_shot_scatter.clip(max_two_shot_scatter_bytes),
+            self.two_shot_scatter_mc.clip(max_two_shot_scatter_bytes),
         )
 
 
@@ -93,8 +97,8 @@ class AllReduceConfig(NamedTuple):
     The two ``Heuristic`` entries describe the size crossover for each
     dispatch context (CUDA-graph capture vs eager). Block-count knobs apply
     to the kernel grid:
-      - ``num_push_blocks``: shared 1shot_push / 2shot_push grid (bound to
-        the counter array)
+      - ``num_push_blocks``: shared 1shot_push / 2shot_scatter grid (bound
+        to the counter array)
       - ``num_pull_blocks``: 1shot_pull (any mode) and non-mc 2shot_pull
       - ``num_mc_blocks``  : mc 2shot_pull; ``None`` disables multicast
     """
@@ -114,18 +118,23 @@ class AllReduceConfig(NamedTuple):
         return max(self.graph.max_pull_bytes, self.eager.max_pull_bytes)
 
     @property
-    def max_two_shot_push_bytes(self) -> int:
+    def max_two_shot_scatter_bytes(self) -> int:
         return max(
-            self.graph.max_two_shot_push_bytes, self.eager.max_two_shot_push_bytes
+            self.graph.max_two_shot_scatter_bytes,
+            self.eager.max_two_shot_scatter_bytes,
         )
 
     def clip(
-        self, *, max_push_bytes: int, max_pull_bytes: int, max_two_shot_push_bytes: int
+        self,
+        *,
+        max_push_bytes: int,
+        max_pull_bytes: int,
+        max_two_shot_scatter_bytes: int,
     ) -> "AllReduceConfig":
         bounds = dict(
             max_push_bytes=max_push_bytes,
             max_pull_bytes=max_pull_bytes,
-            max_two_shot_push_bytes=max_two_shot_push_bytes,
+            max_two_shot_scatter_bytes=max_two_shot_scatter_bytes,
         )
         return self._replace(
             graph=self.graph.clip(**bounds),
@@ -166,18 +175,18 @@ def _sm100_configs(num_sm: int) -> dict[int, AllReduceConfig]:
         4: config(
             4,
             graph=(
-                2.250 * MB,
-                2.250 * MB,
+                0.625 * MB,
+                0.625 * MB,
                 128.0 * MB,
                 Range(0, 0),
-                Range(int(1.25 * MB), 16 * MB),
+                Range(int(0.625 * MB), 16 * MB),
             ),
             eager=(
-                3.000 * MB,
-                3.000 * MB,
+                0.625 * MB,
+                0.625 * MB,
                 32.00 * MB,
                 Range(0, 0),
-                Range(2 * MB, 16 * MB),
+                Range(int(0.625 * MB), 16 * MB),
             ),
         ),
         5: config(
@@ -343,10 +352,24 @@ def get_supported_world_sizes() -> tuple[int, ...]:
     return tuple(_get_all_reduce_configs())
 
 
-_MULTINODE_TWO_SHOT_PUSH: dict[tuple[int, int], Range] = {
-    # 2 x GB200 (4 GPUs each). 2shot_push beats mc 2shot_pull by 3-30% here
-    # and loses to it from 4 MB up; below 512 KB 1shot_push is still ahead.
-    (10, 8): Range(512 * KB, int(3.5 * MB)),
+# A world size does not pin down the interconnect: 8 ranks on one board and 8
+# ranks spanning two nodes have different crossovers, and the tables above are
+# tuned on the former. Being barrier-free and remote-read-free, 2shot_scatter
+# gains most exactly where fabric round-trips cost most, so its multi-node
+# band runs both lower and wider than the single-node one.
+class _MultinodePushBands(NamedTuple):
+    """The eager 2shot_scatter retune a multi-node group swaps in."""
+
+    two_shot_scatter: Range
+    two_shot_scatter_mc: Range = Range(0, 0)
+
+
+_MULTINODE_PUSH_BANDS: dict[tuple[int, int], _MultinodePushBands] = {
+    # for 2 x GB200 (4 GPUs each).
+    (10, 8): _MultinodePushBands(
+        two_shot_scatter=Range(288 * KB, 16 * MB),
+        two_shot_scatter_mc=Range(int(3.5 * MB), 16 * MB),
+    ),
 }
 
 
@@ -357,15 +380,15 @@ def get_all_reduce_config(world_size: int, multinode: bool = False) -> AllReduce
     Only SM90, SM100 and SM107 are benchmarked so far; other archs get a
     conservative default (1 MB one-shot crossovers, no multicast).
 
-    ``multinode`` swaps in a separately tuned ``2shot_push`` band where one
-    exists. Only the eager row can differ: a multi-node group forces eager
-    anyway, because graph zero-copy input registration is node-local.
+    ``multinode`` swaps in a separately tuned ``2shot_scatter`` band where
+    one exists. Only the eager row can differ: a multi-node group forces eager anyway, because
+    graph zero-copy input registration is node-local.
     """
     config = _get_all_reduce_configs()[world_size]
     if not multinode:
         return config
     cuda_major, _ = torch.cuda.get_device_capability()
-    band = _MULTINODE_TWO_SHOT_PUSH.get((cuda_major, world_size))
-    if band is None:
+    bands = _MULTINODE_PUSH_BANDS.get((cuda_major, world_size))
+    if bands is None:
         return config
-    return config._replace(eager=config.eager._replace(two_shot_push=band))
+    return config._replace(eager=config.eager._replace(**bands._asdict()))

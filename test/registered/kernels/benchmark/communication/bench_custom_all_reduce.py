@@ -45,7 +45,7 @@ FI_SUPPORTED_WORLD_SIZES = (2, 4, 8)
 AOT_SUPPORTED_WORLD_SIZES = (2, 4, 6, 8)
 # jit-eager times the naive-loop dispatch (eager heuristics); jit-graph
 # captures the calls in a CUDA graph (graph heuristics + pointer table).
-PROVIDERS = ["nccl", "aot", "jit-eager", "jit-graph", "fi"]
+PROVIDERS = ["nccl", "aot", "jit-eager", "jit-graph", "fi", "fi-mnnvl"]
 WORLD_SIZES = get_benchmark_range(WORLD_SIZES, [2, 4, 8])
 
 # ---------------------------------------------------------------------------
@@ -146,6 +146,8 @@ class AOTAllReduceBackend:
 
 
 class FlashInferAllReduceBackend:
+    FI_BACKEND = "trtllm"
+
     def __init__(self) -> None:
         import flashinfer.comm as comm
 
@@ -158,14 +160,24 @@ class FlashInferAllReduceBackend:
         num_tokens = MAX_BYTES // (hidden_dim * DTYPE_ITEMSIZE)
         self._comm = comm
         self._hidden_dim = hidden_dim
-        self._workspace = comm.create_allreduce_fusion_workspace(
-            backend="trtllm",
+        create_kw = dict(
+            backend=self.FI_BACKEND,
             world_size=world_size,
             rank=rank,
             max_token_num=num_tokens,
             hidden_dim=hidden_dim,
             dtype=DTYPE,
         )
+        if self.FI_BACKEND == "mnnvl":
+            from sglang.srt.distributed.parallel_state import in_the_same_node_as
+            from sglang.srt.layers.flashinfer_comm_fusion import _TorchDistBackend
+
+            create_kw["comm_backend"] = _TorchDistBackend(
+                device_group=_init_nccl_group(), cpu_group=group
+            )
+            create_kw["group"] = _init_nccl_group()
+            create_kw["gpus_per_node"] = sum(in_the_same_node_as(group, source_rank=0))
+        self._workspace = comm.create_allreduce_fusion_workspace(**create_kw)
 
     def graph_context(self):
         return contextlib.nullcontext()
@@ -178,6 +190,10 @@ class FlashInferAllReduceBackend:
             launch_with_pdl=is_arch_support_pdl(),
             fp32_acc=True,
         )
+
+
+class FlashInferMnnvlBackend(FlashInferAllReduceBackend):
+    FI_BACKEND = "mnnvl"
 
 
 @cache_once
@@ -200,12 +216,18 @@ def _init_fi_backend() -> FlashInferAllReduceBackend:
     return FlashInferAllReduceBackend()
 
 
+@cache_once
+def _init_fi_mnnvl_backend() -> FlashInferMnnvlBackend:
+    return FlashInferMnnvlBackend()
+
+
 BACKEND_FACTORY = {
     "nccl": _init_nccl_backend,
     "jit-eager": _init_jit_backend,
     "jit-graph": _init_jit_backend,
     "aot": _init_aot_backend,
     "fi": _init_fi_backend,
+    "fi-mnnvl": _init_fi_mnnvl_backend,
 }
 
 
@@ -233,6 +255,9 @@ def _init_all_backends() -> None:
         factories.pop("aot", None)  # cudaIpc: cannot leave the node
     if world_size not in FI_SUPPORTED_WORLD_SIZES:
         factories.pop("fi")
+        factories.pop("fi-mnnvl")
+    if _is_multinode():
+        factories.pop("fi", None)  # the trtllm workspace is single-node only
     for fn in factories.values():
         fn()
 
@@ -251,11 +276,13 @@ def benchmark(message_KB: int, provider: str):
     cpu_group = _init_cpu_group()
     gpu_group = _init_nccl_group()
     world_size = dist.get_world_size(cpu_group)
-    if provider == "fi" and world_size not in FI_SUPPORTED_WORLD_SIZES:
+    if provider.startswith("fi") and world_size not in FI_SUPPORTED_WORLD_SIZES:
         marker.skip(
-            f"flashinfer trtllm allreduce_fusion needs world_size in "
+            f"flashinfer allreduce_fusion needs world_size in "
             f"{FI_SUPPORTED_WORLD_SIZES}"
         )
+    if provider == "fi" and _is_multinode():
+        marker.skip("flashinfer trtllm workspace is single-node only")
     if provider == "aot" and world_size not in AOT_SUPPORTED_WORLD_SIZES:
         marker.skip(
             f"AOT custom_all_reduce needs world_size in " f"{AOT_SUPPORTED_WORLD_SIZES}"

@@ -35,7 +35,7 @@ from sglang.kernels.ops.communication.all_reduce import (
 )
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.configs.custom_all_reduce_v2 import (
-    _MULTINODE_TWO_SHOT_PUSH,
+    _MULTINODE_PUSH_BANDS,
     get_all_reduce_config,
     get_supported_world_sizes,
 )
@@ -75,7 +75,7 @@ TEST_ALGOS = [
     AllReduceAlgo.ONE_SHOT_PULL,
     AllReduceAlgo.ONE_SHOT_PUSH,
     AllReduceAlgo.TWO_SHOT_PULL,
-    AllReduceAlgo.TWO_SHOT_PUSH,
+    AllReduceAlgo.TWO_SHOT_SCATTER,
 ]
 USE_GRAPH_OPTIONS = [False, True]
 TEST_LAYERS = 4
@@ -172,7 +172,7 @@ def _init_comm_once() -> CustomAllReduceV2:
         device,
         max_pull_size=max_size,
         max_push_size=max_size,
-        max_two_shot_push_size=max_size,
+        max_two_shot_scatter_size=max_size,
     )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
@@ -254,30 +254,31 @@ def test_empty_input_dispatches_like_the_smallest_one() -> None:
         )
 
 
-def test_multinode_only_retunes_the_eager_2shot_push_band() -> None:
+def test_multinode_only_retunes_the_eager_scatter_band() -> None:
     cuda_major, _ = torch.cuda.get_device_capability()
     tuned = {
-        world_size: band
-        for (major, world_size), band in _MULTINODE_TWO_SHOT_PUSH.items()
+        world_size: bands
+        for (major, world_size), bands in _MULTINODE_PUSH_BANDS.items()
         if major == cuda_major
     }
     for world_size in get_supported_world_sizes():
         single = get_all_reduce_config(world_size)
         multi = get_all_reduce_config(world_size, multinode=True)
-        band = tuned.get(world_size)
-        if band is None:
+        bands = tuned.get(world_size)
+        if bands is None:
             assert multi == single, f"{world_size=} has no multi-node entry"
             continue
-        assert multi.eager.two_shot_push == band
+        assert multi.eager.two_shot_scatter == bands.two_shot_scatter
+        # the mc sub-band must stay inside the band whose fan-out it refines
+        assert bands.two_shot_scatter_mc.min_bytes >= bands.two_shot_scatter.min_bytes
+        assert bands.two_shot_scatter_mc.max_bytes <= bands.two_shot_scatter.max_bytes
         assert multi == single._replace(
-            eager=single.eager._replace(two_shot_push=band)
-        ), f"{world_size=} multi-node override reached past eager.two_shot_push"
-        # the band has to stay inside the pull workspace it stages through
-        assert band.max_bytes <= multi.eager.max_pull_bytes
+            eager=single.eager._replace(**bands._asdict())
+        ), f"{world_size=} multi-node override reached past the eager bands"
 
 
 @torch.inference_mode()
-def test_2shot_push_shares_the_1shot_plane() -> None:
+def test_2shot_scatter_shares_the_1shot_plane() -> None:
     nccl_group = _init_nccl_group_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     dtype = torch.bfloat16
@@ -289,25 +290,25 @@ def test_2shot_push_shares_the_1shot_plane() -> None:
         device,
         max_pull_size=two_shot_bytes,
         max_push_size=_ALIGN_BYTES,
-        max_two_shot_push_size=two_shot_bytes,
+        max_two_shot_scatter_size=two_shot_bytes,
     )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
     register_comm_cleanup(comm)
-    # A whole 2shot_push message spans one enlarged shared slot per peer. Keep
-    # the tuned 1shot limit smaller: physical capacity must not silently widen
-    # its dispatch range.
-    assert comm.gather_slot_size * comm.world_size >= two_shot_bytes
+    # A whole 2shot_scatter message spans one enlarged shared slot per peer.
+    # Keep the tuned 1shot limit smaller: physical capacity must not silently
+    # widen its dispatch range.
+    assert comm.scatter_slot_size * comm.world_size >= two_shot_bytes
     assert comm.max_push_size * comm.world_size < two_shot_bytes
-    assert comm.shared_slot_size == comm.gather_slot_size
+    assert comm.shared_slot_size == comm.scatter_slot_size
     assert comm.shared_slot_size > comm.max_push_size
 
-    plan = [(AllReduceAlgo.TWO_SHOT_PUSH, two_shot_size)] * TEST_LAYERS
+    plan = [(AllReduceAlgo.TWO_SHOT_SCATTER, two_shot_size)] * TEST_LAYERS
     plan += [(AllReduceAlgo.ONE_SHOT_PUSH, push_size)] * TEST_LAYERS
     plan[::2], plan[1::2] = plan[:TEST_LAYERS], plan[TEST_LAYERS:]
 
     # Exercise the shared epoch in eager mode before capturing the same
-    # alternating sequence. Separate push/gather counters would let the two
+    # alternating sequence. Separate push/scatter counters would let the two
     # protocols select the same half of the aliased storage here.
     for _ in range(TEST_LOOP):
         for algo, size in plan:

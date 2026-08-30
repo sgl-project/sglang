@@ -451,7 +451,7 @@ struct CommunicatorObj : public tvm::ffi::Object {
   // Only the constructors live in csrc/distributed/registry.cuh: kernel
   // modules are separate shared objects that see this header but never link
   // that translation unit, so everything they call has to be inline here.
-  CommunicatorObj(Optional<PushPlaneRef> push, Optional<PullPlaneRef> pull);
+  CommunicatorObj(Optional<PushPlaneRef> push, Optional<PullPlaneRef> pull, Optional<PushPlaneRef> scatter);
 
   uint32_t get_rank() const {
     return m_push.has_value() ? m_push.value()->rank : m_pull.value()->rank;
@@ -466,6 +466,9 @@ struct CommunicatorObj : public tvm::ffi::Object {
   bool has_pull() const {
     return m_pull.has_value();
   }
+  bool has_scatter() const {
+    return m_scatter.has_value();
+  }
   /// The planes as handles, for callers that hold on to one (Python). Kernels
   /// want `get_*_obj()` below, which skips the refcount traffic.
   Optional<PushPlaneRef> get_push() const {
@@ -474,6 +477,9 @@ struct CommunicatorObj : public tvm::ffi::Object {
   Optional<PullPlaneRef> get_pull() const {
     return m_pull;
   }
+  Optional<PushPlaneRef> get_scatter() const {
+    return m_scatter;
+  }
   const PushPlaneObj& get_push_obj() const {
     CHECK_HOST(m_push.has_value()) << "This communicator has no push plane";
     return *m_push.value().get();
@@ -481,6 +487,10 @@ struct CommunicatorObj : public tvm::ffi::Object {
   const PullPlaneObj& get_pull_obj() const {
     CHECK_HOST(m_pull.has_value()) << "This communicator has no pull plane";
     return *m_pull.value().get();
+  }
+  const PushPlaneObj& get_scatter_obj() const {
+    CHECK_HOST(m_scatter.has_value()) << "This communicator has no scatter plane";
+    return *m_scatter.value().get();
   }
 
   /// Both knobs only ever narrow the grid: unset means "the plane's capacity",
@@ -507,6 +517,7 @@ struct CommunicatorObj : public tvm::ffi::Object {
   std::optional<uint32_t> m_pull_multicast_blocks;
   Optional<PushPlaneRef> m_push;
   Optional<PullPlaneRef> m_pull;
+  Optional<PushPlaneRef> m_scatter;
 };
 
 SGLANG_REGISTER_FFI_REFERENCE_CLASS(CommunicatorRef, CommunicatorObj);

@@ -22,17 +22,16 @@ class AllReduceAlgo(enum.Enum):
     ONE_SHOT_PUSH = enum.auto()
     ONE_SHOT_PULL = enum.auto()
     TWO_SHOT_PULL = enum.auto()
-    TWO_SHOT_PUSH = enum.auto()
+    TWO_SHOT_SCATTER = enum.auto()
 
     def supports_zero_copy(self) -> bool:
         """Whether peers can reduce straight out of the caller's own buffer.
 
-        Only ``1shot_push`` cannot: it publishes its input to every peer up
-        front, so there is nothing for the graph pointer table to register.
-        The two-shot push does read peers' inputs in place — it pushes only
-        the *reduced shard*, in its all-gather half.
+        The two push algorithms cannot: ``1shot_push`` and ``2shot_scatter``
+        both publish their input to peers up front (whole, or shard-wise), so
+        there is nothing for the graph pointer table to register.
         """
-        return self != AllReduceAlgo.ONE_SHOT_PUSH
+        return self not in (AllReduceAlgo.ONE_SHOT_PUSH, AllReduceAlgo.TWO_SHOT_SCATTER)
 
     @property
     def algo_name(self) -> str:
@@ -43,7 +42,7 @@ _ALGO_NAMES = {
     AllReduceAlgo.ONE_SHOT_PUSH: "1shot_push",
     AllReduceAlgo.ONE_SHOT_PULL: "1shot_pull",
     AllReduceAlgo.TWO_SHOT_PULL: "2shot_pull",
-    AllReduceAlgo.TWO_SHOT_PUSH: "2shot_push",
+    AllReduceAlgo.TWO_SHOT_SCATTER: "2shot_scatter",
 }
 
 if TYPE_CHECKING:
@@ -159,6 +158,7 @@ class Communicator(tvm_ffi.Object):
         def get_world_size(self) -> int: ...
         def get_push(self) -> PushPlane | None: ...
         def get_pull(self) -> PullPlane | None: ...
+        def get_scatter(self) -> PushPlane | None: ...
         def set_pull_blocks(self, num_blocks: int | None) -> None: ...
         def set_pull_multicast_blocks(self, num_blocks: int | None) -> None: ...
 
@@ -166,8 +166,9 @@ class Communicator(tvm_ffi.Object):
         self,
         push: PushPlane | None = None,
         pull: PullPlane | None = None,
+        scatter: PushPlane | None = None,
     ) -> None:
-        self.__ffi_init__(push, pull)
+        self.__ffi_init__(push, pull, scatter)
 
     @property
     def rank(self) -> int:
@@ -186,6 +187,11 @@ class Communicator(tvm_ffi.Object):
     def pull(self) -> PullPlane | None:
         """The pull plane, or None for a push-only communicator."""
         return self.get_pull()
+
+    @property
+    def scatter(self) -> PushPlane | None:
+        """2shot_scatter's shard-slot plane; shares the push plane's epoch."""
+        return self.get_scatter()
 
 
 def _init_ipc_manager() -> None:

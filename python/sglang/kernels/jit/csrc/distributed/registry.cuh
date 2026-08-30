@@ -100,14 +100,25 @@ PullPlaneObj::PullPlaneObj(
   this->mc_workspace = reinterpret_cast<uint8_t*>(mc_workspace_ptr);
 }
 
-CommunicatorObj::CommunicatorObj(Optional<PushPlaneRef> push, Optional<PullPlaneRef> pull)
-    : m_push(std::move(push)), m_pull(std::move(pull)) {
+CommunicatorObj::CommunicatorObj(
+    Optional<PushPlaneRef> push, Optional<PullPlaneRef> pull, Optional<PushPlaneRef> scatter)
+    : m_push(std::move(push)), m_pull(std::move(pull)), m_scatter(std::move(scatter)) {
   CHECK_HOST(m_push.has_value() || m_pull.has_value()) << "A communicator needs at least one plane";
   if (m_push.has_value() && m_pull.has_value()) {
     const auto& push_obj = *m_push.value().get();
     const auto& pull_obj = *m_pull.value().get();
     CHECK_HOST(push_obj.rank == pull_obj.rank && push_obj.world_size == pull_obj.world_size)
         << "Push and pull planes disagree on (rank, world_size)";
+  }
+  if (m_scatter.has_value()) {
+    CHECK_HOST(m_push.has_value()) << "A scatter plane is useless without a push plane to gather through";
+    const auto& scatter_obj = *m_scatter.value().get();
+    const auto& push_obj = *m_push.value().get();
+    CHECK_HOST(scatter_obj.rank == push_obj.rank && scatter_obj.world_size == push_obj.world_size)
+        << "Scatter and push planes disagree on (rank, world_size)";
+    CHECK_HOST(scatter_obj.counter == push_obj.counter)
+        << "The scatter plane must share the push plane's epoch counter";
+    CHECK_HOST(scatter_obj.num_blocks == push_obj.num_blocks) << "Scatter and push planes disagree on num_blocks";
   }
 }
 
@@ -135,12 +146,16 @@ inline void register_communicator() {
 
   refl::ObjectDef<dist::CommunicatorObj>()
       .def(
-          refl::init<dist::Optional<dist::PushPlaneRef>, dist::Optional<dist::PullPlaneRef>>(),
+          refl::init<
+              dist::Optional<dist::PushPlaneRef>,
+              dist::Optional<dist::PullPlaneRef>,
+              dist::Optional<dist::PushPlaneRef>>(),
           "__init__")
       .def("get_rank", &dist::CommunicatorObj::get_rank)
       .def("get_world_size", &dist::CommunicatorObj::get_world_size)
       .def("get_push", &dist::CommunicatorObj::get_push)
       .def("get_pull", &dist::CommunicatorObj::get_pull)
+      .def("get_scatter", &dist::CommunicatorObj::get_scatter)
       .def("set_pull_blocks", &dist::CommunicatorObj::set_pull_blocks)
       .def("set_pull_multicast_blocks", &dist::CommunicatorObj::set_pull_multicast_blocks);
 }

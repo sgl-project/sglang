@@ -1,17 +1,16 @@
 // Custom all-reduce kernels over the decoupled Communicator storage plane.
 //
-// Three algorithms are provided behind one entry point:
+// Four algorithms are provided behind one entry point:
 //   - 1shot_push: lamport-style push of local data to every peer's push
 //     workspace, then a local polling reduce (best at small sizes).
 //   - 1shot_pull: every rank reduces all peers' data (from the symmetric pull
 //     workspaces, a CUDA-graph pointer table, or a multicast address).
 //   - 2shot_pull: reduce-scatter fused with all-gather; each rank reduces its
 //     shard in place so every workspace ends up holding the full result.
-//   - 2shot_push: the same reduce-scatter, but the all-gather pushes each
-//     reduced shard into the shared push plane instead of the peers' pull
-//     workspaces. Readiness then rides in the data — the same pos-zero marker
-//     1shot_push uses, which is what "push" names here — so the exit barrier
-//     goes away: a rank copies each peer's shard out the moment it lands.
+//   - 2shot_scatter: the same reduce-scatter / all-gather split, but both
+//     halves push. Readiness rides in the data — the same pos-zero marker
+//     1shot_push uses, which is what "push" names here — so neither half
+//     needs a barrier and no rank ever reads a peer's input.
 //
 // Unlike the previous implementation, the kernels carry no storage or IPC
 // logic: all pointers arrive via the communication planes (owned by Python)
@@ -67,13 +66,14 @@ struct AllReducePullParams {
 };
 
 template <uint32_t kWorldSize>
-struct AllReduce2ShotPushParams {
+struct AllReduce2ShotScatterParams {
+  const void* __restrict__ input;
   void* __restrict__ output;
   uint32_t num_vecs;
   uint32_t rank;
-  void* const* __restrict__ graph_params;
-  PullWorkSpace<kWorldSize> ws;
-  PushWorkSpace<kWorldSize> gather;
+  uint32_t slot_vecs;  // div_ceil(num_vecs, kWorldSize): shard slot stride
+  PushWorkSpace<kWorldSize> scatter;  // one shard slot per source
+  PushWorkSpace<kWorldSize> gather;   // the shared push plane, flat per half
 };
 
 /// `vec_offset` is a *vector index* and must stay folded into the base pointers
@@ -89,8 +89,8 @@ struct LoadStoreImpl {
   static constexpr uint32_t size() {
     return kWorldSize;
   }
-  /// Templated on the params struct so the 2shot_push kernel, whose params carry
-  /// a gather workspace as well, reuses the same peer table.
+  /// Templated on the params struct so kernels whose params carry extra
+  /// workspaces reuse the same peer table.
   template <typename Params>
   SGL_DEVICE LoadStoreImpl(const Params& params, uint32_t vec_offset = 0) {
     if constexpr (kUseGraph) {
@@ -279,68 +279,102 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
   barrier.arrive_rel_acq(/*n=*/1);
 }
 
-template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
-ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(
-    const __grid_constant__ AllReduce2ShotPushParams<kWorldSize> params) {
+/// Barrier-free two-shot all-reduce with a *pushed* reduce-scatter.
+///
+///   A: push my input, shard-wise, into each owner's scatter slot;
+///   B: poll my own scatter slots, reduce my shard, push it into every peer's
+///      gather half of the shared push plane, restore the scatter markers;
+///   C: drain my gather half into the output, restoring its markers.
+template <typename T, uint32_t kWorldSize, bool kUsePDL, bool kUseMc = false>
+ALL_REDUCE_KERNEL void all_reduce_2shot_scatter_kernel(
+    const __grid_constant__ AllReduce2ShotScatterParams<kWorldSize> params) {
   using namespace device;
   constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
   using vec_t = AlignedVector<packed_t<T>, kVecSize>;
   using Lamport = distributed::LamportTrait<T, kVecSize * 2, /*kAtom=*/4>;
-  const auto num_total_vecs = params.num_vecs;
-  const auto avg_vecs = num_total_vecs / kWorldSize;
-  const auto rem_vecs = num_total_vecs % kWorldSize;
-  const auto num_vecs = avg_vecs + (params.rank < rem_vecs ? 1 : 0);
-  const auto vec_offset = params.rank * avg_vecs + min(params.rank, rem_vecs);
-  const auto impl = Impl{params, vec_offset};
-  PDLWaitPrimary<kUsePDL>();
-  const auto epoch = distributed::PushEpoch<kWorldSize>{params.gather};
-  const auto barrier = distributed::Barrier<kWorldSize>{
-      params.ws.semaphores.data(),
-      params.rank,
-      /*num_arrives=*/1,
-  };
-  barrier.arrive_relaxed(/*n=*/0);
-  __syncthreads();
-
-  // One slot per peer, so the epoch's half of the plane holds a whole message.
-  void* gather_ptrs[kWorldSize];
-#pragma unroll
-  for (uint32_t i = 0; i < kWorldSize; ++i) {
-    gather_ptrs[i] = epoch.slot_ptr(/*dst=*/i);
-  }
-
+  const auto r = params.rank;
+  const auto num_vecs = params.num_vecs;
+  const auto slot_vecs = params.slot_vecs;
   const auto num_threads = blockDim.x * gridDim.x;
-  const auto num_remote_vecs = num_total_vecs - num_vecs;
-  const auto block_major_tid = blockIdx.x * blockDim.x + threadIdx.x;
-  const auto warp_in_block = threadIdx.x / kWarpThreads;
-  const auto lane_id = threadIdx.x % kWarpThreads;
-  const auto global_warp_id = blockIdx.x + gridDim.x * warp_in_block;
-  const auto warp_striped_tid = global_warp_id * kWarpThreads + lane_id;
-  const auto global_tid =
-      num_remote_vecs < num_threads ? warp_striped_tid : block_major_tid;
+  const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  PDLWaitPrimary<kUsePDL>();
+  const auto scatter_epoch = distributed::PushEpoch<kWorldSize>{params.scatter};
+  const auto gather_epoch = distributed::PushEpoch<kWorldSize>{params.gather};
 
-  // shot 1: reduce our own shard from every peer, write it straight to our
-  // output, and push it into every peer's gather plane.
-  for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
-    vec_t vec;
-    impl.load_reduce(vec, vid);
-    Lamport::clear_pos_zero(vec.data());
-    const auto out_vid = vec_offset + vid;
-    vec.store(params.output, out_vid);
-#pragma unroll
-    for (uint32_t i = 0; i < kWorldSize; ++i) {
-      if (i != params.rank) ptx::st_relaxed_16B(vec, gather_ptrs[i], out_vid);
+  const auto my_lo = r * slot_vecs;
+  const auto my_hi = min((r + 1) * slot_vecs, num_vecs);
+  const auto my_len = my_hi > my_lo ? my_hi - my_lo : 0;
+
+  // A: scatter my input to the owners (my own shard is read locally in B).
+  // Each warp takes one destination -- rotated so every peer's ingress port
+  // is busy from the first wave -- instead of a vid loop deriving the
+  // destination by a runtime division per vector. The slot pointer is then
+  // warp-uniform, the lanes write coalesced runs, and every warp has work at
+  // every size.
+  {
+    constexpr uint32_t kFan = kWorldSize - 1;
+    const auto warp = global_tid / 32;
+    const auto lane = global_tid % 32;
+    const auto num_warps = num_threads / 32;
+    auto dst = r + 1 + warp % kFan;
+    if (dst >= kWorldSize) dst -= kWorldSize;
+    const auto group_warps = num_warps / kFan + (warp % kFan < num_warps % kFan ? 1 : 0);
+    const auto lo = min(dst * slot_vecs, num_vecs);
+    const auto len = min(lo + slot_vecs, num_vecs) - lo;
+    const auto slot = scatter_epoch.slot_ptr(dst, r);
+    for (auto lid = (warp / kFan) * 32 + lane; lid < len; lid += group_warps * 32) {
+      vec_t vec;
+      vec.load(params.input, lo + lid);
+      Lamport::clear_pos_zero(vec.data());
+      ptx::st_relaxed_16B(vec, slot, lid);
     }
   }
 
-  // shot 2: poll the peers' shards out of our own gather region, restoring the
-  // marker behind us so this epoch comes back around empty.
   vec_t pos_zero_vec;
   Lamport::fill_pos_zero(pos_zero_vec.data());
-  const auto local_gather = gather_ptrs[params.rank];
+
+  // B: reduce my shard out of my scatter slots, fan the result out
+  for (auto lid = global_tid; lid < my_len; lid += num_threads) {
+    const auto vid = my_lo + lid;
+    vec_t vecs[kWorldSize];
+    vecs[r].load(params.input, vid);
+    do {
+      bool has_zero = false;
+#pragma unroll
+      for (uint32_t src = 0; src < kWorldSize; ++src) {
+        if (src != r) {
+          ptx::ld_relaxed_16B(vecs[src], scatter_epoch.slot_ptr(r, src), lid);
+          has_zero |= Lamport::has_pos_zero(vecs[src].data());
+        }
+      }
+      if (!has_zero) break;
+    } while (true);
+    vec_t out = reduce_vec(vecs);
+    Lamport::clear_pos_zero(out.data());
+    if constexpr (kUseMc) {
+      // one multimem store instead of the unicast fan-out (total egress
+      // 1.5S -> 1.0S). It also lands in our own gather half, which nobody
+      // drains; phase C restores those markers so the shared slots come
+      // back clean for the plane's next user.
+      ptx::st_multimem_16B(out, params.gather.mc_workspace + gather_epoch.slot_offset(), vid);
+    } else {
+#pragma unroll
+      for (uint32_t dst = 0; dst < kWorldSize; ++dst) {
+        if (dst != r) ptx::st_relaxed_16B(out, gather_epoch.slot_ptr(dst), vid);
+      }
+    }
+    out.store(params.output, vid);
+#pragma unroll
+    for (uint32_t src = 0; src < kWorldSize; ++src) {
+      if (src != r) ptx::st_global_16B(pos_zero_vec, scatter_epoch.slot_ptr(r, src), lid);
+    }
+  }
+
+  // C: drain the gather half (everyone else's shards) into the output
+  const auto local_gather = gather_epoch.slot_ptr(r);
+  const auto num_remote_vecs = num_vecs - my_len;
   for (auto rid = global_tid; rid < num_remote_vecs; rid += num_threads) {
-    // compact the two remote ranges around our own, already-written shard
-    const auto vid = rid < vec_offset ? rid : rid + num_vecs;
+    const auto vid = rid < my_lo ? rid : rid + my_len;
     vec_t vec;
     do {
       ptx::ld_relaxed_16B(vec, local_gather, vid);
@@ -350,9 +384,21 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(
     ptx::st_global_16B(pos_zero_vec, local_gather, vid);
   }
 
+  if constexpr (kUseMc) {
+    for (auto lid = global_tid; lid < my_len; lid += num_threads) {
+      const auto vid = my_lo + lid;
+      vec_t vec;
+      do {
+        ptx::ld_relaxed_16B(vec, local_gather, vid);
+        if (!Lamport::has_pos_zero(vec.data())) break;
+      } while (true);
+      ptx::st_global_16B(pos_zero_vec, local_gather, vid);
+    }
+  }
+
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  epoch.flip();
+  gather_epoch.flip();  // one flip: the planes share the counter
 }
 
 template <uint32_t N>
@@ -399,7 +445,8 @@ struct AllReduceKernel {
       const bool use_multicast) {
     using namespace host;
     const auto& comm = *comm_ref.get();
-    CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_push")
+    CHECK_HOST(
+        algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_scatter")
         << algo;
     CHECK_HOST(comm.get_world_size() == kWorldSize) << comm.get_world_size();
     CHECK_HOST(in.IsContiguous() && is_type<T>(in.dtype()) && in.device().device_type == kDLCUDA);
@@ -431,11 +478,34 @@ struct AllReduceKernel {
       return out;
     }
 
+    if (algo == "2shot_scatter") {
+      CHECK_HOST(!use_graph);  // reads only our own input: nothing to register
+      const auto& push = comm.get_push_obj();
+      const auto& scatter = comm.get_scatter_obj();
+      const auto slot_vecs = div_ceil(num_vecs, kWorldSize);
+      Tensor out = ffi::empty_like(in);
+      const auto params = AllReduce2ShotScatterParams<kWorldSize>{
+          .input = in.data_ptr(),
+          .output = out.data_ptr(),
+          .num_vecs = num_vecs,
+          .rank = push.rank,
+          .slot_vecs = slot_vecs,
+          .scatter = scatter.get_workspace<kWorldSize>(int64_t{slot_vecs} * 16),
+          .gather = push.get_workspace<kWorldSize>(div_ceil(nbytes, int64_t{kWorldSize})),
+      };
+      CHECK_HOST(!use_multicast || params.gather.mc_workspace != nullptr)
+          << "multicast needs a push plane with an mc workspace";
+      const auto kernel = use_multicast
+          ? all_reduce_2shot_scatter_kernel<T, kWorldSize, kUsePDL, /*kUseMc=*/true>
+          : all_reduce_2shot_scatter_kernel<T, kWorldSize, kUsePDL>;
+      LaunchKernel(push.num_blocks, choose_block_size(num_vecs), stream)  //
+          .enable_pdl(kUsePDL)(kernel, params);
+      return out;
+    }
+
     const auto& pull = comm.get_pull_obj();
     const auto graph_params = use_graph ? graph_params_opt.value().data_ptr() : nullptr;
     // only 2shot pull + graph mode forces inplace implementation
-    // (2shot_push gathers through the shared push plane, so it never
-    // writes over an input a peer may still be reducing)
     const auto is_inplace = use_graph && algo == "2shot_pull";
     Tensor out = is_inplace ? in : ffi::empty_like(in);
     const auto params = PullParams{
@@ -473,31 +543,6 @@ struct AllReduceKernel {
     using LS = LoadStoreImpl<vec_t, kWorldSize, /*kUseGraph=*/false>;
     using LS_GRAPH = LoadStoreImpl<vec_t, kWorldSize, /*kUseGraph=*/true>;
     using MC = MultiCastImpl<vec_t, kWorldSize, /*kUseGraph=*/false>;
-    if (algo == "2shot_push") {
-      CHECK_HOST(!use_multicast) << "2shot_push gathers through the shared push plane, not multimem";
-      // The all-gather half rides the 1shot_push plane, so it inherits that
-      // grid -- bound to the counter array -- and lands in slots that must
-      // have been sized to hold a shard (`get_workspace` checks that).
-      const auto& push = comm.get_push_obj();
-      const uint32_t gather_blocks = push.num_blocks;
-      CHECK_HOST(gather_blocks <= pull.num_blocks)
-          << "push plane is " << gather_blocks << " blocks wide but only " << pull.num_blocks
-          << " pull semaphores back it";
-      const auto gather_params = AllReduce2ShotPushParams<kWorldSize>{
-          .output = out.data_ptr(),
-          .num_vecs = num_vecs,
-          .rank = pull.rank,
-          .graph_params = static_cast<void* const*>(graph_params),
-          .ws = ws,
-          .gather = push.get_workspace<kWorldSize>(div_ceil(nbytes, int64_t{kWorldSize})),
-      };
-      if (!use_graph) cuda_memcpy(local_workspace, in.data_ptr());
-      const auto kernel = use_graph ? all_reduce_2shot_push_kernel<LS_GRAPH, T, kWorldSize, kUsePDL>
-                                    : all_reduce_2shot_push_kernel<LS, T, kWorldSize, kUsePDL>;
-      LaunchKernel(gather_blocks, choose_block_size(num_vecs), stream)  //
-          .enable_pdl(kUsePDL)(kernel, gather_params);
-      return out;
-    }
     if (algo == "1shot_pull") {
       // first copy to the workspace
       CHECK_HOST(!use_multicast);
