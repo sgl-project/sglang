@@ -10,6 +10,7 @@ This guide outlines the requirements for contributing to the SGLang Diffusion mo
 
 - [Support New Models](./support_new_models): implementation guide for adding new diffusion pipelines
 - [CI Performance](./ci_perf): update and regenerate perf baselines
+- [SGLang Plugin System](/docs/hardware-platforms/plugin): package a hardware platform outside the SGLang repository
 
 
 ## On AI-Assisted ("Vibe Coding") PRs
@@ -75,3 +76,20 @@ Consider adding tests to the `pr-test` or `nightly-test` suites to safeguard you
 Please run the according testcase, then update/add the baseline to `perf_baselines.json` by following the instruction in console if applicable.
 
 See [test](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/test) for examples
+
+## Out-of-tree platform changes
+
+Use the `sglang.multimodal_gen.platforms` entry-point group when a hardware integration can live in a separately installed package. The [plugin guide](/docs/hardware-platforms/plugin#add-diffusion-support) describes the activation callback, diffusion platform contract, and selection behavior.
+
+When you change the platform interface or discovery implementation in SGLang:
+
+- Add focused CPU-only tests with a fake OOT platform.
+- Run SRT tests only when the change touches SRT platform or plugin code.
+- Document workload-specific kernels or optimized paths that still require vendor integration.
+
+Run the diffusion unit suite before submitting:
+
+```bash
+cd python
+python3 sglang/multimodal_gen/test/run_suite.py --suite unit
+```
