@@ -750,7 +750,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+        self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
             element_size=self.token_stride_size
         )
         self.k_device_ptrs = torch.tensor(
