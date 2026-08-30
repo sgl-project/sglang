@@ -106,6 +106,14 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     handle_hardware_runtime_validation()
     if cfg.model_path.lower() in ["none", "dummy"]:
+        # A model that resolves nothing still has to leave every bag holding a
+        # value. The two KV-cache ratios default to None on the record and are
+        # normally filled after the model families run, well past this point.
+        from sglang.srt.arg_groups.kv_cache_hook import (
+            handle_generic_kv_cache_ratios,
+        )
+
+        handle_generic_kv_cache_ratios(server_args)
         return
 
     from sglang.srt.arg_groups.model_path_hook import (
