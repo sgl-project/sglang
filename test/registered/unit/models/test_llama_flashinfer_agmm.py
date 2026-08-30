@@ -375,9 +375,7 @@ class PreparedBindingTests(unittest.TestCase):
             first = types.SimpleNamespace(shape=(route._topology.local_rows, 8192))
             second = types.SimpleNamespace(shape=(route._topology.local_rows, 8192))
 
-            self.assertEqual(
-                route._prepared_qkv(first, qkv, group), ("output", first)
-            )
+            self.assertEqual(route._prepared_qkv(first, qkv, group), ("output", first))
             self.assertEqual(
                 route._prepared_qkv(second, qkv, group), ("output", second)
             )

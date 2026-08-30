@@ -160,8 +160,7 @@ def _model_contract_reason(
         if (
             tuple(qkv.weight.shape) != (topology.packed_qkv_n, 8192)
             or tuple(o_proj.weight.shape) != (8192, topology.q_size)
-            or tuple(gate_up.weight.shape)
-            != (2 * topology.intermediate_size, 8192)
+            or tuple(gate_up.weight.shape) != (2 * topology.intermediate_size, 8192)
             or tuple(down.weight.shape) != (8192, topology.intermediate_size)
         ):
             return f"layer_{layer_index}_weight_shapes"
@@ -284,8 +283,7 @@ class LlamaFlashInferAgmmTrueSP:
             or int(parallel.pp_size) != 1
         ):
             raise RuntimeError(
-                "--enable-flashinfer-agmm-true-sp requires TP4 or TP8, "
-                "DP1, CP1, PP1"
+                "--enable-flashinfer-agmm-true-sp requires TP4 or TP8, " "DP1, CP1, PP1"
             )
         if not bool(get_exec().graph.disable_cuda_graph):
             raise RuntimeError(
