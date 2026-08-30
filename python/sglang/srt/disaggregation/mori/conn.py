@@ -322,8 +322,6 @@ class MoriKVManager(CommonKVManager):
             ]
             self._wait_poll_ms = envs.SGLANG_MORI_WAIT_POLL_MS.get()
             self._transfer_timeout_ms = envs.SGLANG_MORI_TRANSFER_TIMEOUT_MS.get()
-            self._room_status_notified: Dict[int, bool] = {}
-            self._room_notify_lock = threading.Lock()
             for shard, queue in enumerate(self._transfer_queues):
                 threading.Thread(
                     target=self._transfer_worker,
