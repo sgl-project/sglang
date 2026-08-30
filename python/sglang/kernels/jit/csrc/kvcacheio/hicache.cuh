@@ -39,6 +39,25 @@ inline constexpr auto get_mem_package() {
 template <int kUnit>
 using PackageType = decltype(get_mem_package<kUnit>());
 
+// A worker of num_threads lanes copies one element in rounds of `group` bytes,
+// each lane moving group / num_threads of them as one vector package, so that
+// quotient has to be a package size the hardware has.
+inline constexpr bool group_fits(int64_t bytes, uint32_t num_threads, uint32_t group) {
+  if (group % num_threads != 0 || bytes % static_cast<int64_t>(group) != 0) {
+    return false;
+  }
+  const uint32_t package = group / num_threads;
+  return package == 4 || package == 8 || package == 16;
+}
+
+inline constexpr uint32_t pick_group_bytes(int64_t bytes, uint32_t num_threads) {
+  return group_fits(bytes, num_threads, 128)  ? 128u
+         : group_fits(bytes, num_threads, 64) ? 64u
+         : group_fits(bytes, num_threads, 32) ? 32u
+         : group_fits(bytes, num_threads, 16) ? 16u
+                                              : 0u;
+}
+
 // NVIDIA exposes an explicit "do not allocate in L1" cache hint via PTX. ROCm
 // has no equivalent PTX, but non-temporal (streaming) loads/stores express the
 // same intent for one-shot HiCache write-back traffic that should not pollute
@@ -125,10 +144,10 @@ SGL_DEVICE void store_nc(uint4* __restrict__ dst, const uint4& value) {
 
 template <int64_t kBytes, uint32_t kNumThreads>
 SGL_DEVICE auto load_vec(const void* __restrict__ src) {
-  static_assert(kBytes % 128 == 0, "kBytes must be multiple of 128 bytes");
-  static_assert(128 % kNumThreads == 0, "kNumThreads must divide 128 bytes");
-  constexpr uint32_t kLoopCount = kBytes / 128;
-  using Package = details::PackageType<128 / kNumThreads>;
+  constexpr uint32_t kGroupBytes = details::pick_group_bytes(kBytes, kNumThreads);
+  static_assert(kGroupBytes != 0, "no 4/8/16 B package tiles kBytes across kNumThreads lanes");
+  constexpr uint32_t kLoopCount = kBytes / kGroupBytes;
+  using Package = details::PackageType<kGroupBytes / kNumThreads>;
   using Storage = details::LocalStorage<Package, kLoopCount>;
 
   const auto src_packed = static_cast<const Package*>(src);
