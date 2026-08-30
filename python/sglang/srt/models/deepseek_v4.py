@@ -44,7 +44,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
+    Dsv4NpuRoPE,
+    prime_rope_cos_sin,
+    rope_cos_sin,
+)
 from sglang.srt.hardware_backend.npu.utils import (
     is_npu_arch35,
     use_npu_arch35_mxfp8_wo_a,
@@ -843,9 +847,22 @@ class MQALayer(MqaAttentionBase):
         )
 
         if _is_npu:
-            Dsv4NpuRoPE.for_freqs(
+            rope = Dsv4NpuRoPE.for_freqs(
                 self.freqs_cis, getattr(self, "rotary_emb", None)
-            ).ensure_tables(torch.float32)
+            )
+            # fp32 tables feed the compressor gather; bf16 tables make the
+            # activation-dtype gathers cast-free. Bit-identical values:
+            # rounding the table once equals rounding each gathered element.
+            rope.ensure_tables(torch.float32)
+            rope.ensure_tables(torch.bfloat16)
+            # npu_rms_norm has no weight-free overload; the per-head q norm
+            # reads this cached ones vector instead of paying a per-call
+            # alloc + fill.
+            self.register_buffer(
+                "q_rms_norm_ones",
+                torch.ones(self.head_dim, dtype=torch.bfloat16),
+                persistent=False,
+            )
 
         if _is_hip:
             cos_cache = (
@@ -921,22 +938,25 @@ class MQALayer(MqaAttentionBase):
         # has no effect here -- the fused path is on by default.
 
     def _get_npu_rope_position_cache(
-        self, positions: torch.Tensor, dtype: torch.dtype, inverse: bool = False
+        self,
+        forward_batch: ForwardBatch,
+        positions: torch.Tensor,
+        dtype: torch.dtype,
+        inverse: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # ``rotary_emb`` is shared by layers with the same RoPE configuration and
-        # can also be shared by the target and NextN models.  Only cache the
-        # immutable full table on it.  A position-gathered tensor is specific to
-        # this forward and reusing it based on shape alone gives MTP decode the
-        # previous step's RoPE values when positions change but batch size does not.
-        return Dsv4NpuRoPE.for_freqs(
-            self.freqs_cis, getattr(self, "rotary_emb", None)
-        ).get_cos_sin(
+        # can also be shared by the target and NextN models.  Only the immutable
+        # full table is cached on it; position-gathered tensors are memoized per
+        # forward (prime_rope_cos_sin / rope_cos_sin), never across forwards --
+        # reusing them based on shape alone gives MTP decode the previous step's
+        # RoPE values when positions change but batch size does not.
+        return rope_cos_sin(
+            self.freqs_cis,
+            getattr(self, "rotary_emb", None),
+            forward_batch,
             positions,
             dtype,
-            view_4d=True,
             inverse=inverse,
-            allow_build=False,
-            cache_dtype=torch.float32,
         )
 
     def _compute_q_a(
@@ -1132,7 +1152,7 @@ class MQALayer(MqaAttentionBase):
                 kv, _ = self.wkv(x)
             kv = self.kv_norm(kv)
             cos4_k, sin4_k = self._get_npu_rope_position_cache(
-                positions, kv.dtype, inverse=False
+                forward_batch, positions, kv.dtype, inverse=False
             )
             Dsv4NpuRoPE.apply_rotary_mul_inplace(
                 kv.unsqueeze(1),
@@ -1152,10 +1172,9 @@ class MQALayer(MqaAttentionBase):
             stream_q.wait_event(q_lora_ready)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            _dummy = q.new_ones(q.shape[-1])
-            q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
             cos4_q, sin4_q = self._get_npu_rope_position_cache(
-                positions, q.dtype, inverse=False
+                forward_batch, positions, q.dtype, inverse=False
             )
             Dsv4NpuRoPE.apply_rotary_mul_inplace(
                 q,
@@ -1448,8 +1467,7 @@ class MQALayer(MqaAttentionBase):
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            _dummy = q.new_ones(q.shape[-1])
-            q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
 
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
@@ -1458,7 +1476,7 @@ class MQALayer(MqaAttentionBase):
             kv = self.kv_norm(kv)
 
             cos4, sin4 = self._get_npu_rope_position_cache(
-                positions, q.dtype, inverse=False
+                forward_batch, positions, q.dtype, inverse=False
             )
             Dsv4NpuRoPE.apply_rotary_mul_inplace(
                 q,
@@ -1731,7 +1749,7 @@ class MQALayer(MqaAttentionBase):
             o = o[:, tp_slice, :]
         if _is_npu:
             cos4, sin4 = self._get_npu_rope_position_cache(
-                positions, o.dtype, inverse=True
+                forward_batch, positions, o.dtype, inverse=True
             )
             Dsv4NpuRoPE.apply_rotary_mul_inplace(
                 o,
@@ -3207,6 +3225,19 @@ class DeepseekV4Model(nn.Module):
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
+        if _is_npu and not run_tbo:
+            # Rope cos/sin for the whole forward: one bf16 gather per rope
+            # config on the current stream, before the layer loop forks the
+            # KV/Q side streams. TBO children carry their own positions and
+            # recompute per layer.
+            prime_rope_cos_sin(
+                (
+                    self.layers[i].self_attn
+                    for i in range(self.start_layer, self.end_layer)
+                ),
+                forward_batch,
+                positions,
+            )
         if run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
