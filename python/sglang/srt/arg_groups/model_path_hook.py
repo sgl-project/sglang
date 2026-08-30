@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.utils.common import is_remote_url
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+from sglang.srt.utils.oci_utils import is_oci_uri, resolve_oci_model
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 def handle_model_source_paths(server_args: Any):
     """Prepare metadata for model paths backed by remote object stores."""
     cfg = resolving_view(server_args)
+    resolve_oci_model_paths(server_args)
     resolve_hf_gguf_model_path(server_args)
 
     seen_paths = set()
@@ -40,6 +42,30 @@ def handle_model_source_paths(server_args: Any):
         ):
             ObjectStorageModel.download_and_get_path(model_path)
             seen_paths.add(model_path)
+
+
+def resolve_oci_model_paths(server_args: Any):
+    """Turn an `oci://` CNCF ModelPack reference into a local path.
+
+    Runs before every other resolver so the rest of the pipeline, GGUF
+    detection included, only ever sees a local path. One pull per distinct
+    reference: a tokenizer or draft model naming the same image reuses it.
+    """
+    cfg = resolving_view(server_args)
+
+    resolved: dict[str, str] = {}
+    for field in ("model_path", "tokenizer_path", "speculative_draft_model_path"):
+        reference = getattr(cfg, field, None)
+        if not is_oci_uri(reference):
+            continue
+        if reference not in resolved:
+            resolved[reference] = resolve_oci_model(reference)
+        logger.info("Resolved OCI %s %s -> %s", field, reference, resolved[reference])
+        declare_resolution(
+            server_args,
+            "_resolve_oci_model_paths",
+            **{field: resolved[reference]},
+        )
 
 
 def resolve_hf_gguf_model_path(server_args: Any):
