@@ -1118,7 +1118,7 @@ class FlashAttentionBackend(AttentionBackend):
             if self.use_sliding_window_kv_pool:
                 metadata.swa_page_table = kv_view.sliding_window_ids
                 if forward_batch.out_cache_loc is not None:
-                    # The swa write rail was computed from the still-VIRTUAL
+                    # The swa write loc was computed from the still-VIRTUAL
                     # loc at ForwardBatch construction; re-running the
                     # full->swa map on the kernel-facing loc would be garbage.
                     metadata.swa_out_cache_loc = (
@@ -2773,7 +2773,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # refills this buffer with the real rail below.
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
-                # Unified pool: the swa rail the choke point resolved for this
+                # Unified pool: the swa write loc the translator resolved for this
                 # batch's (already kernel-facing) write loc; static SWA pool:
                 # the legacy full->swa translate, via the same resolver.
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(

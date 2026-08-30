@@ -363,7 +363,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         if self.kv_index_translator.is_translating:
-            # Unified pool: the canonical entries ARE the dense block-table
+            # Unified pool: the read-table entries ARE the dense block-table
             # rows; prefix-only build keeps the -1 tail sentinel.
             self.kv_index_translator.fill_read_table(
                 out=block_kv_indices,

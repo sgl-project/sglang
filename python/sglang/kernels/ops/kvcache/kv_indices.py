@@ -131,7 +131,7 @@ def create_flashmla_kv_indices_triton(
     PAGED_SIZE: tl.constexpr = 64,
 ):
     # Static-pool builder only: token ids here are physical, entry = token//ps.
-    # Under the unified pool the block table is filled by the choke point
+    # Under the unified pool the block table is filled by the translator
     # (KVIndexTranslator.build_into) instead — this kernel holds no id-space
     # knowledge.
     NUM_PAGE_PER_BLOCK: tl.constexpr = (

@@ -102,7 +102,7 @@ class TestUnifiedSWARouting(unittest.TestCase):
         """Bug regression: fa3 x unified-SWA crashed at gpt-oss
         cuda-graph capture because every backend except triton bundles the
         2-arg KVWriteLoc(loc, swa) and the full-layer door demanded an explicit
-        full_loc. Once the loc is rebound the generic `loc` IS the full-side kernel-facing rail
+        full_loc. Once the loc is rebound the generic `loc` IS the full-side kernel-facing id
         (rebind_write_loc runs at ForwardBatch construction),
         so the door must fall back to it — the pool still never translates."""
         pool = self._make_bare_pool()

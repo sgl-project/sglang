@@ -1,47 +1,20 @@
-# Copyright 2023-2026 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""The choke-point enforcement scan: unified-pool id-space translation is
-owned by exactly two places, and no attention backend may re-grow its own.
+"""Nothing under layers/attention may translate KV ids for itself.
 
-Ownership after the read-path refactor:
+Ownership is exactly two places: `KVIndexTranslator` for READS (indices are
+born kernel-facing, backends consume its tables) and the ForwardBatch rebind
+(`rebind_write_loc`) for WRITES. Virtual and physical ids share a value range,
+so a backend that forgets a translate -- or does one twice -- reads the wrong
+rows and nothing crashes. This scan makes both unrepresentable.
 
-* READS  — ``KVIndexTranslator`` (canonical tables / batch views): indices are
-  born kernel-facing; backends consume views and never translate.
-* WRITES — the ForwardBatch rebind (``apply_unified_kv_loc_rebind``):
-  ``out_cache_loc`` arrives kernel-facing at every backend.
+Out of scope, deliberately: the allocator-internal implementations
+(`multi_ended_allocator` / `unified_memory_pool`), which ARE the mechanism the
+translator calls; the PD transfer plane's `translate_kv_indices_for_transfer`,
+which stages for RDMA outside the forward path; and the STATIC SWA pool's
+legacy full->swa slot map, a different mapping kind with no virtual/physical
+ambiguity -- its call sites are count-pinned below so new ones are added
+consciously.
 
-Scattered per-backend translation had two demonstrated failure modes, in
-opposite directions, both silent (virtual and physical ids share a value
-range, so nothing crashes — kernels just read wrong rows): the eager
-TARGET_VERIFY branch that FORGOT its translate, and the captured
-verify+SWA path that translated TWICE. This scan makes both classes
-unrepresentable: a backend cannot call the unified translate surfaces at
-all.
-
-Deliberately out of scope, with reasons:
-
-* allocator-internal implementations (``multi_ended_allocator`` /
-  ``unified_memory_pool``) — they ARE the mechanism the choke point calls;
-* the PD transfer-plane ``translate_kv_indices_for_transfer`` — translates
-  for RDMA staging outside the forward path, not for kernels;
-* the STATIC SWA pool's legacy full->swa slot map
-  (``translate_loc_from_full_to_swa`` on non-unified pools) — a different
-  mapping kind with no virtual/physical ambiguity. Its call sites in the
-  choke-point backends are count-pinned below so new ones are added
-  consciously, not accidentally.
-
-    python3 -m pytest test/registered/unit/layers/attention/test_kv_translate_choke_point.py -v
+    python3 -m pytest test/registered/unit/layers/attention/test_kv_translate_ownership.py -v
 """
 
 import os

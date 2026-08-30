@@ -1090,7 +1090,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
-            # Under the unified pool the view is the choke point's canonical,
+            # Under the unified pool the view is the translator's read table,
             # so the emitted ids are already kernel-facing int32 — one pass, no
             # post-hoc translate.
             create_flashinfer_kv_indices_triton[(bs,)](

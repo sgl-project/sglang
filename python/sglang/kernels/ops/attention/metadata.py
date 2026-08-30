@@ -256,7 +256,7 @@ def _fused_metadata_kernel_general(
 
     # Compute page_table
     if SRC_IS_KERNEL_PAGE_TABLE:
-        page_table_val = page_index  # canonical entries are the page ids
+        page_table_val = page_index  # read-table entries are the page ids
     elif page_size == 1:
         page_table_val = page_index
     else:
@@ -599,10 +599,10 @@ def normal_decode_set_metadata(
       5. (optional) swa_page_table for sliding window attention
 
     Unified pool (``src_is_read_table=True``): ``req_to_token`` /
-    ``req_pool_indices`` carry the choke point's canonical PAGE table and its
+    ``req_pool_indices`` carry the translator's PAGE-granular read table and its
     row indices instead (entries already kernel-facing; ``swa_src_table`` is
     the swa canonical, same shape and strides); steps 3-5 become verbatim
-    copies of the canonical rows' live prefixes, folded into the same launch
+    copies of the read table's rows' live prefixes, folded into the same launch
     so the capture-stable page_table is written translated with no separate
     pass a caller could forget.
 

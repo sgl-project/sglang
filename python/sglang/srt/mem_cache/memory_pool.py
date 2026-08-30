@@ -1603,8 +1603,8 @@ class KVWriteLoc:
       pools, rebound at ForwardBatch construction (``rebind_write_loc``) on
       the unified pool.
     - ``swa_loc``: the SWA-sub-pool location for hybrid SWA pools (``None``
-      otherwise); under the unified pool this is the swa rail the choke
-      point resolves for the same rebound loc (``resolve_swa_write_loc``).
+      otherwise); under the unified pool the translator derives it from the
+      same rebound loc (``sliding_window_write_loc_for``).
     - ``full_loc``: OPTIONAL full-attention-sub-pool location. Since the
       construction-time rebind it is the SAME id space as ``loc``, so pools
       fall back to ``loc`` when it is ``None`` — only triton's captured path

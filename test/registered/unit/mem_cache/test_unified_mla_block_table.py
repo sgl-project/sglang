@@ -20,7 +20,7 @@ block table filled with kernel-facing page ids:
 
     dense_page(virtual_page) = v2p[virtual_page] * layer_num
 
-Since the read-path choke point, ONE builder computes that formula for every
+Since the read-path translator, ONE builder computes that formula for every
 family — `build_kv_read_table` (the canonical) — and the backends only
 differ in how they consume it:
   - trtllm_mla / cutedsl_mla / tokenspeed_mla / flashmla: rows filled straight
@@ -236,13 +236,13 @@ class TestDenseBlockTable(unittest.TestCase):
 @unittest.skipUnless(_HAS_CUDA, "requires CUDA")
 class TestFa3MetadataDenseBlockTable(unittest.TestCase):
     """fa3's captured-decode page table is written by `normal_decode_set_metadata`
-    fed with the choke point's canonical kernel page table
+    fed with the translator's read table kernel page table
     (src_is_read_table=True): the fused kernel copies the canonical
     rows' live prefixes into the capture-stable buffer. Pinned END-TO-END:
     build_kv_read_table -> wrapper -> page_table must equal the python
     reference of the kernel-facing formula, on both the page_size == 1 / no-SWA fast
     path (what Kimi-Linear takes) and the general kernel. The static call
-    (no source flag) stays byte-identical to the pre-choke-point kernel.
+    (no source flag) stays byte-identical to the pre-translator kernel.
     """
 
     def _run(self, page_size, *, v2p, mult, bs=5, max_ctx=2048):
@@ -261,7 +261,7 @@ class TestFa3MetadataDenseBlockTable(unittest.TestCase):
         max_seq_pages = (int(sl.max().item()) + page_size - 1) // page_size
 
         if v2p:
-            # The choke point's canonical, then the wrapper copies its rows.
+            # The translator's canonical, then the wrapper copies its rows.
             canonical = torch.zeros((bs, max_pages), dtype=torch.int32, device=_DEV)
             build_kv_read_table(
                 req_to_token=rt,

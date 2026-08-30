@@ -728,7 +728,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # Canonical id source for the index builders below. All flashinfer
         # gathers run OUT-of-graph (plan time), so only buffer reuse — not
-        # pointer stability — motivates the capture-stable canonical here.
+        # pointer stability — motivates the capture-stable read table here.
         kv_view = self.kv_index_translator.build_index_table(
             req_pool_indices=req_pool_indices[:bs],
             seq_lens=seq_lens[:bs],
@@ -863,11 +863,11 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
             if in_capture and self.kv_index_translator.is_translating:
                 # A runner-built capture batch never went through `init_new`,
-                # so there is no prepared rail to resolve — and zeros are the
+                # so there is no prepared write loc to resolve — and zeros are the
                 # page-0 sink in every id space. Replay refills below.
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
-                # Unified: the rail the choke point resolved for this batch's
+                # Unified: the write loc the translator resolved for this batch's
                 # (already kernel-facing) loc; static SWA: the legacy
                 # full->swa translate — one resolver for both.
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
@@ -964,7 +964,7 @@ class FlashInferAttnBackend(AttentionBackend):
         kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            # Unified: the rail the choke point resolved for this batch's
+            # Unified: the write loc the translator resolved for this batch's
             # (already kernel-facing) loc; static SWA: the legacy full->swa
             # translate — one resolver for both.
             swa_out_cache_loc = self.kv_index_translator.sliding_window_write_loc_for(

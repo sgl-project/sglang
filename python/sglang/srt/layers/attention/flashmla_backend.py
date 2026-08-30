@@ -163,7 +163,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             max_seqlen_pad = triton.cdiv(eager_max_k, PAGE_SIZE)
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
             if self.kv_index_translator.is_translating:
-                # Unified pool: the canonical entries ARE the dense block-table
+                # Unified pool: the read-table entries ARE the dense block-table
                 # rows (pool page size is snapped to PAGE_SIZE for flashmla);
                 # prefix-only build, stale tail unread (bounded by seq_lens_k).
                 assert self.page_size == PAGE_SIZE
