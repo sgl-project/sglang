@@ -573,6 +573,11 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         """
         if tgt_loc.numel() == 0:
             return
+        # The envelope view below starts at byte 0, so this sub-pool's region
+        # must too (mirrors UnifiedMLATokenToKVPool.move_kv_cache). A non-zero
+        # anchor would make compaction copy the wrong sub-pool's bytes, and
+        # silently: the ids stay in range and only the KV content is wrong.
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
         ps = self.page_size
         tgt_pages = tgt_loc.view(-1, ps)[:, 0] // ps
         src_pages = src_loc.view(-1, ps)[:, 0] // ps
