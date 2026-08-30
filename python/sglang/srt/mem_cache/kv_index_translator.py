@@ -59,6 +59,17 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
 )
 
 
+class KVReadTables(msgspec.Struct, frozen=True):
+    """One capture-stable destination, however many id spaces the pool has.
+
+    A backend holds this and hands it back to `build_index_table(into=...)`;
+    it never has to know whether there is a sliding-window space behind it.
+    """
+
+    full: torch.Tensor
+    sliding_window: Optional[torch.Tensor]
+
+
 class KVIndexTable(msgspec.Struct, frozen=True):
     """Collection of what one batch gathers from."""
 
@@ -122,26 +133,31 @@ class KVIndexTranslator:
             if self.is_translating
             else None
         )
-        self._capture_full_ids: Optional[torch.Tensor] = None
-        self._capture_swa_ids: Optional[torch.Tensor] = None
         self._index_table_memo: Optional[Tuple[weakref.ref, KVIndexTable]] = None
 
-    # -- capture-stable buffers ------------------------------------------------
+    def make_capture_tables(
+        self, *, max_bs: int, max_context_len: int
+    ) -> Optional[KVReadTables]:
+        """Capture-stable destinations for a backend to own, or None when this
+        pool needs no translation and the backend will never fill any.
 
-    def ensure_capture_buffers(self, *, max_bs: int, max_context_len: int) -> None:
-        """Idempotent. Zero-filled ``(max_bs, ceil(ctx/ps))`` int32 per kind:
-        entry 0 is the reserved padding slot in every id space, so a captured
-        graph replaying before any refresh reads padding, not garbage."""
-        if not self.is_translating or self._capture_full_ids is not None:
-            return
+        Zero-filled: entry 0 is the reserved padding slot in every id space, so
+        a captured graph replaying before its first refresh reads padding, not
+        garbage.
+        """
+        if not self.is_translating:
+            return None
         max_pages = -(-max_context_len // self.page_size)
-        self._capture_full_ids = torch.zeros(
-            (max_bs, max_pages), dtype=torch.int32, device=self.device
-        )
-        if self._swa_v2p_table is not None:
-            self._capture_swa_ids = torch.zeros(
+
+        def _zeros():
+            return torch.zeros(
                 (max_bs, max_pages), dtype=torch.int32, device=self.device
             )
+
+        return KVReadTables(
+            full=_zeros(),
+            sliding_window=_zeros() if self._swa_v2p_table is not None else None,
+        )
 
     # -- per-batch view --------------------------------------------------------
 
@@ -151,14 +167,15 @@ class KVIndexTranslator:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         max_pages: Optional[int] = None,
-        captured: bool = False,
+        into: Optional[KVReadTables] = None,
     ) -> KVIndexTable:
         """The one per-batch entry point.
 
         Non-unified: the raw ``(req_to_token, req_pool_indices)`` passthrough,
-        no tensor ops and no copies. Unified: a fresh table of width
-        ``max_pages`` (eager), or a live-prefix refresh of the capture buffers
-        (``captured=True``), returned WHOLE so its pointer is capture-bakeable.
+        no tensor ops and no copies. Unified: fills each row's live prefix and
+        returns the table WHOLE, so a caller needing a stable pointer (a
+        captured graph bakes it) passes its own tables in ``into``;
+        ``into=None`` allocates of width ``max_pages`` instead.
         """
         if not self.is_translating:
             return KVIndexTable(
@@ -171,17 +188,19 @@ class KVIndexTranslator:
             )
 
         bs = int(req_pool_indices.numel())
-        if captured:
-            assert self._capture_full_ids is not None, (
-                "KVIndexTranslator.build_index_table(captured=True) before "
-                "ensure_capture_buffers()"
+        if into is not None:
+            out_full = into.full
+            out_swa = into.sliding_window
+            # A caller-owned table may be padded wider than req_to_token's span
+            # (trtllm_mla / flashmla pad to a page-count bound); the columns
+            # past it have no source to read, so stop there.
+            width = min(
+                out_full.shape[1] if max_pages is None else max_pages,
+                -(-self.req_to_token.shape[1] // self.page_size),
             )
-            out_full = self._capture_full_ids
-            out_swa = self._capture_swa_ids
-            width = out_full.shape[1] if max_pages is None else max_pages
         else:
             assert max_pages is not None, (
-                "KVIndexTranslator.build_index_table: eager path needs max_pages "
+                "KVIndexTranslator.build_index_table: allocating needs max_pages "
                 "(from the batch's seq_lens_cpu max)"
             )
             width = max_pages
@@ -229,33 +248,18 @@ class KVIndexTranslator:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
     ) -> torch.Tensor:
-        """Fill a backend-owned padded 2-D block table's live prefix with
-        full-attention entries (trtllm_mla / flashmla consume such tables
-        directly — their rows ARE the index table's rows).
-
-        Prefix-only: columns past each row's live pages keep the backend's own
-        fill (-1 sentinel or stale-but-unread values).
-
-        Unified-only: callers dispatch on ``self.is_translating`` and keep
-        their static builder otherwise.
+        """`build_index_table(out=...)` for a caller that wants the tensor back
+        rather than the table: trtllm_mla / flashmla consume a block table
+        directly, its rows already being the index table's rows.
         """
         assert (
             self.is_translating
         ), "KVIndexTranslator.fill_read_table on a pool that needs no translation"
-        max_pages = min(
-            out.shape[1],
-            -(-self.req_to_token.shape[1] // self.page_size),
-        )
-        return build_kv_read_table(
-            req_to_token=self.req_to_token,
+        return self.build_index_table(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            v2p=self._full_v2p_table,
-            multiplier=self._full_page_multiplier,
-            page_size=self.page_size,
-            max_pages=max_pages,
-            out=out,
-        )
+            into=KVReadTables(full=out, sliding_window=None),
+        ).ids
 
     def index_table_for_batch(self, forward_batch) -> KVIndexTable:
         """Eager per-batch view, memoized in one slot keyed by batch identity

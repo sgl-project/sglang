@@ -415,7 +415,7 @@ class TestPoolOwnership(unittest.TestCase):
 
 
 class TestCaptureContract(unittest.TestCase):
-    def test_capture_buffers_zero_filled_idempotent_and_prefix_only(self):
+    def test_caller_owned_table_is_returned_whole_and_filled_prefix_only(self):
         ps = 4
         allocator = _build_composite(ps)
         req_to_token = torch.full((4, 16 * ps), -1, dtype=torch.int64)
@@ -423,24 +423,21 @@ class TestCaptureContract(unittest.TestCase):
         req_to_token[1, : 2 * ps] = v
         src = _make_source(allocator, req_to_token, ps)
 
-        src.ensure_capture_buffers(max_bs=4, max_context_len=8 * ps)
-        cap = src._capture_full_ids
-        self.assertTrue(bool((cap == 0).all()), "capture buffers must start zeroed")
-        src.ensure_capture_buffers(max_bs=4, max_context_len=8 * ps)
-        self.assertIs(
-            src._capture_full_ids, cap, "ensure_capture_buffers must be idempotent"
-        )
+        tables = src.make_capture_tables(max_bs=4, max_context_len=8 * ps)
+        cap, cap_swa = tables.full, tables.sliding_window
+        self.assertTrue(bool((cap == 0).all()), "read tables must start zeroed")
+        self.assertIsNotNone(cap_swa, "the SWA composite has a second id space")
 
         # Poison everything, then refresh a 1-row batch: ONLY its live prefix
         # may change — stale tails and other rows are the fa3 contract.
         cap.fill_(7)
-        src._capture_swa_ids.fill_(7)
+        cap_swa.fill_(7)
         view = src.build_index_table(
             req_pool_indices=torch.tensor([1]),
             seq_lens=torch.tensor([2 * ps]),
-            captured=True,
+            into=tables,
         )
-        self.assertIs(view.ids, cap, "captured view must return the WHOLE buffer")
+        self.assertIs(view.ids, cap, "the caller's table comes back WHOLE")
         want = allocator.full_v2p_page_table[req_to_token[1, ::ps][:2] // ps] * (
             2 * _FULL_L
         )

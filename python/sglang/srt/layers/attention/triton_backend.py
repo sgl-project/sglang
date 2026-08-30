@@ -218,6 +218,9 @@ class TritonAttnBackend(AttentionBackend):
         # The runner's id translator: every read index this backend builds
         # gathers from the table it hands out.
         self.kv_index_translator = model_runner.kv_index_translator
+        # Set unconditionally: the read site evaluates it before the call,
+        # and a non-translating pool never looks at its value.
+        self.kv_read_tables = None
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = get_spec().speculative_eagle_topk or 0
@@ -1149,10 +1152,9 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.int64,
                 device=self.device,
             )
-        if self.kv_index_translator.is_translating:
-            self.kv_index_translator.ensure_capture_buffers(
-                max_bs=max_bs, max_context_len=self.max_context_len
-            )
+        self.kv_read_tables = self.kv_index_translator.make_capture_tables(
+            max_bs=max_bs, max_context_len=self.max_context_len
+        )
 
     def _build_cuda_graph_forward_metadata(
         self,
@@ -1275,7 +1277,7 @@ class TritonAttnBackend(AttentionBackend):
         index_table = self.kv_index_translator.build_index_table(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            captured=True,
+            into=self.kv_read_tables,
         )
         if forward_mode.is_decode_or_idle():
             assert spec_info is None, "Multi-step cuda graph init is not done here."
