@@ -10,7 +10,7 @@ maybe_stub_sgl_kernel()
 from jinja2.ext import loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
-from sglang.srt.entrypoints.openai.chat_encoding import (
+from sglang.srt.entrypoints.openai.encoding_glm import (
     order_glm_tool_results,
     resolve_glm_tool_result_template,
 )

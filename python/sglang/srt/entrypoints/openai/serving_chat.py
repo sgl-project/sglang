@@ -36,7 +36,12 @@ _CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4, encoding_dsv32
+from sglang.srt.entrypoints.openai import (
+    chat_encoding,
+    encoding_dsv4,
+    encoding_dsv32,
+    encoding_glm,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
@@ -304,7 +309,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
-        self._glm_tool_result_template = chat_encoding.resolve_glm_tool_result_template(
+        self._glm_tool_result_template = encoding_glm.resolve_glm_tool_result_template(
             hf_config=self.tokenizer_manager.model_config.hf_config,
             tokenizer=self.tokenizer_manager.tokenizer,
         )
@@ -1364,7 +1369,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if "chat_template" in (request.chat_template_kwargs or {}):
                 glm_tool_result_template = None
             if glm_tool_result_template is not None:
-                openai_compatible_messages = chat_encoding.order_glm_tool_results(
+                openai_compatible_messages = encoding_glm.order_glm_tool_results(
                     openai_compatible_messages
                 )
 
