@@ -344,25 +344,18 @@ class TestSamplingParamsNormalize(CustomTestCase):
         sp.normalize(tokenizer=tokenizer)
         self.assertEqual(sp.stop_strs, ["stop1", "stop2"])
 
-    def test_stop_str_max_len_uses_encoded_length(self):
-        """Test that max_len is based on encoded token count, not character count."""
-        # "ab" encodes to 1 token, "cdef" encodes to 2 tokens
-        tokenizer = self._mock_tokenizer(encode_map={"ab": [1], "cdef": [2, 3]})
-        sp = SamplingParams(stop=["ab", "cdef"])
-        sp.normalize(tokenizer=tokenizer)
-        self.assertEqual(sp.stop_str_max_len, 2)  # max token count
-
-    def test_stop_str_max_len_with_tokenizer(self):
-        """Test that with a tokenizer, max_len counts encoded token IDs."""
-        tokenizer = MagicMock()
-        # "hello" encodes to 2 tokens, "world!!" to 3 tokens
-        tokenizer.encode.side_effect = lambda s, add_special_tokens=False: {
-            "hello": [101, 102],
-            "world!!": [201, 202, 203],
-        }[s]
-        sp = SamplingParams(stop=["hello", "world!!"])
-        sp.normalize(tokenizer=tokenizer)
-        self.assertEqual(sp.stop_str_max_len, 3)
+    def test_stop_str_max_len_is_safe_token_bound(self):
+        """Use the larger of encoded token count and the UTF-8 byte length."""
+        cases = [
+            ("<END>", [1, 2, 3], 5),
+            ("x", [1, 2, 3], 3),
+        ]
+        for stop_str, token_ids, expected in cases:
+            with self.subTest(stop_str=stop_str):
+                tokenizer = self._mock_tokenizer(encode_map={stop_str: token_ids})
+                sp = SamplingParams(stop=stop_str)
+                sp.normalize(tokenizer=tokenizer)
+                self.assertEqual(sp.stop_str_max_len, expected)
 
     def test_none_stop_regex_becomes_empty_list(self):
         """Test that normalize() converts None stop_regex to empty list with max_len=0."""
@@ -452,7 +445,7 @@ class TestSamplingParamsMsgspecStruct(CustomTestCase):
         self.assertIsInstance(rebuilt, SamplingParams)
         self.assertTrue(rebuilt.is_normalized)
         self.assertEqual(rebuilt.stop_strs, ["hello", "world"])
-        self.assertEqual(rebuilt.stop_str_max_len, 2)
+        self.assertEqual(rebuilt.stop_str_max_len, 5)
         self.assertEqual(rebuilt.stop_regex_strs, [r"[a-z]{3}"])
         self.assertEqual(rebuilt.stop_regex_max_len, 3)
         self.assertEqual(rebuilt.stop_token_ids, {1, 2})
