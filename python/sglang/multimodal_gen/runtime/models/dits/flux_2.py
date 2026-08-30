@@ -29,6 +29,8 @@ from sglang.kernels.ops.diffusion import (
     fused_packed_silu_mul_bitexact,
     is_plain_layer_norm,
     residual_gate_add,
+    try_flux2_token_cat_fp8,
+    try_fused_flux2_qkv_epilogue,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
@@ -60,6 +62,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp8Config,
     ModelOptFp8LinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
@@ -366,13 +369,22 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
 
-        # Some FLUX.2 NVFP4 checkpoints store Q/K/V packed as a single tensor, while
-        # ModelOpt's standard diffusers export keeps the original to_q/to_k/to_v layout.
-        # Only enable the fused loader path for the packed checkpoint family.
-        self.use_fused_qkv = isinstance(quant_config, ModelOptFp4Config) and getattr(
+        # Packed NVFP4 checkpoints already serialize QKV together. ModelOpt
+        # FP8 exports separate Diffusers tensors, but the loader can merge
+        # those tensors losslessly and execute one channelwise-CUTLASS GEMM.
+        fp4_packed_qkv = isinstance(quant_config, ModelOptFp4Config) and getattr(
             quant_config, "checkpoint_uses_packed_qkv", False
         )
+        capability = current_platform.get_device_capability()
+        fp8_merged_qkv = (
+            isinstance(quant_config, ModelOptFp8Config)
+            and self.tp_size == 1
+            and capability is not None
+            and capability.major >= 10
+        )
+        self.use_fused_qkv = fp4_packed_qkv or fp8_merged_qkv
         self.use_fused_added_qkv = self.use_fused_qkv
+        self.use_fused_qkv_epilogue = fp8_merged_qkv
 
         if self.use_fused_qkv:
             self.to_qkv = MergedColumnParallelLinear(
@@ -430,13 +442,14 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
             if self.use_fused_added_qkv:
-                # txt_attn.qkv is always BF16 in the NVFP4 checkpoint — no quant needed
+                # txt_attn.qkv is BF16 in the packed NVFP4 checkpoint, while
+                # ModelOpt FP8 keeps it quantized like the image projection.
                 self.to_added_qkv = MergedColumnParallelLinear(
                     added_kv_proj_dim,
                     [self.inner_dim] * 3,
                     bias=added_proj_bias,
                     gather_output=False,
-                    quant_config=None,
+                    quant_config=None if fp4_packed_qkv else quant_config,
                     prefix=f"{prefix}.to_added_qkv" if prefix else "to_added_qkv",
                 )
             else:
@@ -498,7 +511,12 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             encoder_query,
             encoder_key,
             encoder_value,
-        ) = _get_qkv_projections(self, hidden_states, encoder_hidden_states)
+        ) = _get_qkv_projections(
+            self,
+            hidden_states,
+            encoder_hidden_states,
+            make_contiguous=not self.use_fused_qkv_epilogue,
+        )
 
         query = query.unflatten(-1, (self.local_heads, -1))
         key = key.unflatten(-1, (self.local_heads, -1))
@@ -515,41 +533,78 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 dim=-1,
             )
 
+        joint_qkv = None
+        sp_txt_pad = 0
         if self.added_kv_proj_dim is not None:
             encoder_query = encoder_query.unflatten(-1, (self.local_heads, -1))
             encoder_key = encoder_key.unflatten(-1, (self.local_heads, -1))
             encoder_value = encoder_value.unflatten(-1, (self.local_heads, -1))
 
             text_seq_len = encoder_query.shape[1]
-            encoder_query, encoder_key = apply_qk_norm_with_optional_rope(
-                q=encoder_query,
-                k=encoder_key,
-                q_norm=self.norm_added_q,
-                k_norm=self.norm_added_k,
-                head_dim=self.head_dim,
-                cos_sin_cache=cos_sin_cache,
-                is_neox=False,
-                allow_inplace=True,
-            )
-            query, key = apply_qk_norm_with_optional_rope(
-                q=query,
-                k=key,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=self.head_dim,
-                cos_sin_cache=cos_sin_cache,
-                is_neox=False,
-                position_offset=text_seq_len,
-                allow_inplace=True,
-            )
-
             # join_seqs relocates any SP text tail-pad behind the image (see
             # sp_shard.join_seqs for why).
             sp_txt_pad = (attn_mask_meta or {}).get("local_pad", 0)
-            query = join_seqs(encoder_query, query, sp_txt_pad)
-            key = join_seqs(encoder_key, key, sp_txt_pad)
-            value = join_seqs(encoder_value, value, sp_txt_pad)
+            if (
+                self.use_fused_qkv_epilogue
+                and cos_sin_cache is not None
+                and sp_txt_pad == 0
+            ):
+                joint_qkv = try_fused_flux2_qkv_epilogue(
+                    query,
+                    key,
+                    value,
+                    encoder_query,
+                    encoder_key,
+                    encoder_value,
+                    self.norm_q.weight,
+                    self.norm_k.weight,
+                    self.norm_added_q.weight,
+                    self.norm_added_k.weight,
+                    cos_sin_cache,
+                    self.norm_q.variance_epsilon,
+                    self.norm_added_q.variance_epsilon,
+                )
+
+            if joint_qkv is None:
+                if self.use_fused_qkv_epilogue:
+                    query, key, value = [
+                        tensor.contiguous() for tensor in (query, key, value)
+                    ]
+                    encoder_query, encoder_key, encoder_value = [
+                        tensor.contiguous()
+                        for tensor in (encoder_query, encoder_key, encoder_value)
+                    ]
+                encoder_query, encoder_key = apply_qk_norm_with_optional_rope(
+                    q=encoder_query,
+                    k=encoder_key,
+                    q_norm=self.norm_added_q,
+                    k_norm=self.norm_added_k,
+                    head_dim=self.head_dim,
+                    cos_sin_cache=cos_sin_cache,
+                    is_neox=False,
+                    allow_inplace=True,
+                )
+                query, key = apply_qk_norm_with_optional_rope(
+                    q=query,
+                    k=key,
+                    q_norm=self.norm_q,
+                    k_norm=self.norm_k,
+                    head_dim=self.head_dim,
+                    cos_sin_cache=cos_sin_cache,
+                    is_neox=False,
+                    position_offset=text_seq_len,
+                    allow_inplace=True,
+                )
+                query = join_seqs(encoder_query, query, sp_txt_pad)
+                key = join_seqs(encoder_key, key, sp_txt_pad)
+                value = join_seqs(encoder_value, value, sp_txt_pad)
+            else:
+                query, key, value = joint_qkv
         else:
+            if self.use_fused_qkv_epilogue:
+                query, key, value = [
+                    tensor.contiguous() for tensor in (query, key, value)
+                ]
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
                 k=key,
@@ -664,6 +719,9 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             quant_config=quant_config,
             prefix=f"{prefix}.to_out" if prefix else "to_out",
         )
+        self._enable_fp8_token_cat = self.tp_size == 1 and isinstance(
+            self.to_out.quant_method, ModelOptFp8LinearMethod
+        )
         if self.tp_size > 1:
             self._patch_to_out_weight_loader()
 
@@ -765,8 +823,18 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         # Handle the feedforward (FF) logic
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
 
-        # Concatenate and parallel output projection
-        hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+        # Write both branches directly to the static-FP8 GEMM input. This
+        # avoids materializing the full-width BF16 concatenation and launching
+        # a second quantization kernel in every single-stream block.
+        quantized = None
+        if self._enable_fp8_token_cat:
+            quantized = try_flux2_token_cat_fp8(
+                hidden_states, mlp_hidden_states, self.to_out.input_scale
+            )
+        if quantized is None:
+            hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+        else:
+            hidden_states = quantized
         hidden_states, _ = self.to_out(hidden_states)
 
         return hidden_states
@@ -1200,7 +1268,45 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     """
 
-    param_names_mapping = FluxConfig().arch_config.param_names_mapping
+    param_names_mapping = {
+        # ModelOpt FP8 exports separate Diffusers projections. Merge Q/K/V and
+        # their static scales into the runtime MergedColumnParallelLinear.
+        r"^(transformer_blocks\.\d+\.attn)\.to_q\.(weight|bias|weight_scale|input_scale)$": (
+            r"\1.to_qkv.\2",
+            0,
+            3,
+        ),
+        r"^(transformer_blocks\.\d+\.attn)\.to_k\.(weight|bias|weight_scale|input_scale)$": (
+            r"\1.to_qkv.\2",
+            1,
+            3,
+        ),
+        r"^(transformer_blocks\.\d+\.attn)\.to_v\.(weight|bias|weight_scale|input_scale)$": (
+            r"\1.to_qkv.\2",
+            2,
+            3,
+        ),
+        r"^(transformer_blocks\.\d+\.attn)\.add_q_proj\.(weight|bias|weight_scale|input_scale)$": (
+            r"\1.to_added_qkv.\2",
+            0,
+            3,
+        ),
+        r"^(transformer_blocks\.\d+\.attn)\.add_k_proj\.(weight|bias|weight_scale|input_scale)$": (
+            r"\1.to_added_qkv.\2",
+            1,
+            3,
+        ),
+        r"^(transformer_blocks\.\d+\.attn)\.add_v_proj\.(weight|bias|weight_scale|input_scale)$": (
+            r"\1.to_added_qkv.\2",
+            2,
+            3,
+        ),
+        **FluxConfig().arch_config.param_names_mapping,
+    }
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "to_added_qkv": ["add_q_proj", "add_k_proj", "add_v_proj"],
+    }
     scale_shift_swap_params = ("norm_out.linear.weight", "norm_out.linear.bias")
     # FLUX.2 stays closer to the official diffusers output with Torch SDPA.
     # The generic FA path still produces a measurable image-level drift here.

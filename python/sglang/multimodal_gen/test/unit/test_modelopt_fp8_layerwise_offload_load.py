@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Serialized ModelOpt FP8 checkpoints must postprocess on device even under
-layerwise offload: requantize_with_max_scale() runs scaled_fp8_quant(), a
-CUDA-only kernel, so a CPU-resident postprocess must never come back."""
+"""Serialized ModelOpt FP8 checkpoints must postprocess correctly even when
+layerwise offload moves the component back to CPU after loading."""
 
 import unittest
 
@@ -83,7 +82,10 @@ class TestModelOptFp8LayerwiseOffloadLoad(unittest.TestCase):
             maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
         state_dict, weight_ref = _make_serialized_fp8_checkpoint()
-        expected_max_scale = state_dict["qkv.weight_scale"].max()
+        expected_weight = state_dict["qkv.weight"].t().clone()
+        expected_scale = state_dict["qkv.weight_scale"].repeat_interleave(_SHARD_OUT)[
+            :, None
+        ]
 
         # The plan a layerwise-offload component gets when
         # _needs_device_weight_postprocess() returns True: load and postprocess
@@ -111,27 +113,32 @@ class TestModelOptFp8LayerwiseOffloadLoad(unittest.TestCase):
             weights_iterator=iter(state_dict.items()),
         )
 
-        # Postprocess ran: the weight was requantized to the shared max scale
-        # and rebound transposed.
+        # Postprocess ran: CUTLASS keeps the checkpoint's shard-local FP8 bytes
+        # and expands each shard scale channelwise, then rebinds the weight
+        # transposed for GEMM.
         weight = model.qkv.weight
         self.assertEqual(weight.dtype, torch.float8_e4m3fn)
         self.assertEqual(tuple(weight.shape), (_IN_FEATURES, 2 * _SHARD_OUT))
+        torch.testing.assert_close(weight, expected_weight, rtol=0, atol=0)
         weight_scale = model.qkv.weight_scale
         torch.testing.assert_close(
             weight_scale.flatten(),
-            expected_max_scale.expand(weight_scale.numel()),
+            expected_scale.flatten(),
             check_device=False,
         )
         torch.testing.assert_close(
             model.qkv.input_scale.flatten().max(), torch.tensor(0.5), check_device=False
         )
 
-        # The round trip through both quantizations stays close to the source.
-        # Loose on purpose: this guards against garbage (wrong scale, wrong
-        # shard order), not fp8 precision.
-        dequant = weight.t().float().cpu() * expected_max_scale
+        # Dequantizing with the preserved per-shard scales stays close to the
+        # source. Loose on purpose: this guards against a wrong scale or shard
+        # order, not FP8 precision.
+        dequant = weight.t().float().cpu() * expected_scale
         torch.testing.assert_close(
-            dequant, weight_ref, rtol=0.5, atol=float(expected_max_scale) * 8
+            dequant,
+            weight_ref,
+            rtol=0.5,
+            atol=float(expected_scale.max()) * 8,
         )
 
         # Layerwise offload contract: the component lands on CPU afterwards,
