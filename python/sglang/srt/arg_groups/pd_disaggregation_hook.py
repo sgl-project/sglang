@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
+    resolved_view,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -89,7 +91,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "with speculative decoding "
                     f"(--speculative-algorithm {cfg.speculative_algorithm})"
                 )
-            from sglang.srt.arg_groups.overrides import resolved_view
 
             if resolved_view(server_args).enable_dp_attention:
                 logger.warning(
@@ -217,13 +218,11 @@ def handle_encoder_disaggregation(server_args: Any):
         declare_resolution(
             server_args,
             "_handle_encoder_disaggregation",
-            disaggregation_ib_device=validate_ib_devices(
-                server_args, cfg.disaggregation_ib_device
-            ),
+            disaggregation_ib_device=validate_ib_devices(cfg.disaggregation_ib_device),
         )
 
     # Validate model type for encoder disaggregation
-    hf_config = server_args.get_model_config().hf_config
+    hf_config = model_config_of(server_args).hf_config
     model_arch = hf_config.architectures[0]
     if cfg.encoder_transfer_backend == "auto":
         declare_resolution(

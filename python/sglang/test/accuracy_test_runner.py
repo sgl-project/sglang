@@ -34,6 +34,7 @@ class AccuracyTestParams:
     # sgl-eval-backed datasets only: force chat_template_kwargs.thinking instead
     # of letting _run_sgl_eval infer it from the model name.
     sgl_eval_thinking: Optional[bool] = None
+    num_shots: Optional[int] = None  # few-shot count; None = run_eval's default
 
 
 @dataclass
@@ -84,6 +85,7 @@ def _run_simple_eval(
     dataset: str,
     num_examples: Optional[int] = None,
     num_threads: Optional[int] = None,
+    num_shots: Optional[int] = None,
     max_tokens: Optional[int] = None,
     return_latency: bool = False,
     thinking_mode: Optional[str] = None,
@@ -117,6 +119,9 @@ def _run_simple_eval(
             num_examples=num_examples,
             num_threads=num_threads or 1024,
         )
+
+        if num_shots is not None:
+            args.num_shots = num_shots
 
         if api is not None:
             args.api = api
@@ -196,6 +201,7 @@ def run_accuracy_test(
         dataset=params.dataset,
         num_examples=params.num_examples,
         num_threads=params.num_threads,
+        num_shots=params.num_shots,
         max_tokens=params.max_tokens,
         return_latency=params.return_latency,
         thinking_mode=params.thinking_mode,
