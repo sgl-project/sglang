@@ -1191,7 +1191,7 @@ class Scheduler(
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
-            idle_blockers=self.idle_blockers,
+            not_idle_reasons=self.not_idle_reasons,
             ipc_channels=self.ipc_channels,
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
@@ -4397,28 +4397,28 @@ class Scheduler(
         self.maybe_sleep_on_idle()
 
     def is_fully_idle(self, for_health_check=False) -> bool:
-        return not self.idle_blockers(for_health_check)
+        return not self.not_idle_reasons(for_health_check)
 
-    def idle_blockers(self, for_health_check=False) -> List[str]:
+    def not_idle_reasons(self, for_health_check=False) -> List[str]:
         """What is currently keeping the scheduler from being idle.
 
         Single source of truth for `is_fully_idle`, so that the rejection
         messages of destructive ops (flush / attach / detach) can name the
-        actual blocker instead of guessing. Countable blockers carry their
+        actual blocker instead of guessing. Countable reasons carry their
         count (`waiting_queue=16`); the rest are reported by name alone.
         Every predicate is cheap and side-effect free, and this runs on
         control-plane paths only, never in the event loop.
         """
-        blockers: List[str] = []
+        reasons: List[str] = []
 
         def require(name: str, ok: bool) -> None:
             if not ok:
-                blockers.append(name)
+                reasons.append(name)
 
         def require_empty(name: str, sized) -> None:
             count = len(sized)
             if count:
-                blockers.append(f"{name}={count}")
+                reasons.append(f"{name}={count}")
 
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
@@ -4501,7 +4501,7 @@ class Scheduler(
                         # (buffer-mode unified tree only).
                         require("hicache_buffer_pipeline", tc.buffer_pipeline.is_idle())
 
-        return blockers
+        return reasons
 
     def _pp_microbatches_drained(self) -> bool:
         if self.ps.pp_size == 1:
@@ -4523,7 +4523,7 @@ class Scheduler(
                 success=False,
                 message=(
                     "Reject attach: scheduler is not idle. "
-                    f"blocked-by: {', '.join(self.idle_blockers())}"
+                    f"blocked-by: {', '.join(self.not_idle_reasons())}"
                 ),
             )
 
@@ -4578,7 +4578,7 @@ class Scheduler(
                 success=False,
                 message=(
                     "Reject detach: scheduler is not idle. "
-                    f"blocked-by: {', '.join(self.idle_blockers())}"
+                    f"blocked-by: {', '.join(self.not_idle_reasons())}"
                 ),
             )
 
@@ -4636,7 +4636,7 @@ class Scheduler(
         else:
             logging.warning(
                 "Cache not flushed because the scheduler is not idle. "
-                f"blocked-by: {', '.join(self.idle_blockers())}"
+                f"blocked-by: {', '.join(self.not_idle_reasons())}"
             )
             success = False
         return success

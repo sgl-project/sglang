@@ -13,11 +13,11 @@ class SchedulerFlushWrapper:
         self,
         *,
         flush_cache: Callable[[], bool],
-        idle_blockers: Callable[[], List[str]],
+        not_idle_reasons: Callable[[], List[str]],
         ipc_channels: SchedulerIpcChannels,
     ) -> None:
         self._flush_cache = flush_cache
-        self._idle_blockers = idle_blockers
+        self._not_idle_reasons = not_idle_reasons
         self._ipc_channels = ipc_channels
         self._pending: Optional[Tuple[FlushCacheReqInput, float]] = None
 
@@ -32,7 +32,7 @@ class SchedulerFlushWrapper:
         if timeout_s <= 0.0:
             return FlushCacheReqOutput(success=self._flush_cache())
 
-        if not self._idle_blockers():
+        if not self._not_idle_reasons():
             return FlushCacheReqOutput(success=self._flush_cache())
 
         self._pending = (recv_req, time.monotonic() + timeout_s)
@@ -44,7 +44,7 @@ class SchedulerFlushWrapper:
 
         pending_req, deadline = self._pending
 
-        if not self._idle_blockers():
+        if not self._not_idle_reasons():
             success = self._flush_cache()
             self._pending = None
             self._ipc_channels.send_to_tokenizer.send_output(
@@ -53,7 +53,7 @@ class SchedulerFlushWrapper:
             return
 
         if time.monotonic() >= deadline:
-            blocked_by = ", ".join(self._idle_blockers())
+            blocked_by = ", ".join(self._not_idle_reasons())
             logging.warning(
                 "Deferred flush_cache timed out while waiting for idle state. "
                 f"blocked-by: {blocked_by}"
