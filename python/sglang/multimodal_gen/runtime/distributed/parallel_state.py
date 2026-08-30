@@ -284,17 +284,10 @@ def init_distributed_environment(
             "distributed environment"
         )
 
-        # For MPS, MUSA, and XPU, don't pass device_id as it doesn't support device indices
         extra_args = (
-            {}
-            if (
-                current_platform.is_mps()
-                or current_platform.is_musa()
-                or current_platform.is_npu()
-                or current_platform.is_cpu()
-                or current_platform.is_xpu()
-            )
-            else dict(device_id=device_id)
+            dict(device_id=device_id)
+            if current_platform.supports_distributed_device_id()
+            else {}
         )
 
         if timeout is not None:

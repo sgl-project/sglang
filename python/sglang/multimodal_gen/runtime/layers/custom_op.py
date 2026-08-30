@@ -4,16 +4,16 @@
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/custom_op.py
 
 from collections.abc import Callable
-from typing import Any
+from functools import partial
+from typing import Any, ClassVar
 
 import torch.nn as nn
 
+import sglang.multimodal_gen.runtime.platforms as platforms
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-_is_cuda = current_platform.is_cuda()
 
 
 class CustomOp(nn.Module):
@@ -21,6 +21,15 @@ class CustomOp(nn.Module):
     Base class for custom ops.
     Dispatches the forward method to the appropriate backend.
     """
+
+    _oot_forward_registry: ClassVar[dict[str, dict[type["CustomOp"], Callable]]] = {}
+
+    @staticmethod
+    def register_oot_forward(
+        op_cls: type["CustomOp"], *, fn: Callable, platform_key: str
+    ) -> None:
+        """Register ``fn`` for an exact op class and platform device name."""
+        CustomOp._oot_forward_registry.setdefault(platform_key, {})[op_cls] = fn
 
     def __init__(self) -> None:
         super().__init__()
@@ -69,15 +78,21 @@ class CustomOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def dispatch_forward(self) -> Callable:
-        if _is_cuda:
+        platform = platforms.current_platform
+        if platform.is_out_of_tree():
+            forward = self._oot_forward_registry.get(platform.device_name, {}).get(
+                type(self)
+            )
+            return self.forward_oot if forward is None else partial(forward, self)
+        elif platform.is_cuda():
             return self.forward_cuda
-        elif current_platform.is_hip():
+        elif platform.is_hip():
             return self.forward_hip
-        elif current_platform.is_npu():
+        elif platform.is_npu():
             return self.forward_npu
-        elif current_platform.is_xpu():
+        elif platform.is_xpu():
             return self.forward_xpu
-        elif current_platform.is_musa():
+        elif platform.is_musa():
             return self.forward_musa
         else:
             return self.forward_native

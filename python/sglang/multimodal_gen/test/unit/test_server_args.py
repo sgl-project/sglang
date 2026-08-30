@@ -137,6 +137,18 @@ def _from_dict_without_model_resolution(
         return ServerArgs.from_dict(kwargs)
 
 
+class TestPlatformLifecycleHooks(unittest.TestCase):
+    def test_server_args_applies_platform_defaults(self):
+        with patch.object(
+            current_platform, "apply_server_args_defaults"
+        ) as apply_defaults:
+            server_args = _from_dict_without_model_resolution(
+                {"model_path": "test/model"}
+            )
+
+        apply_defaults.assert_called_once_with(server_args)
+
+
 class TestServerArgsPathExpansion(unittest.TestCase):
     def _from_dict_without_model_resolution(self, kwargs):
         return _from_dict_without_model_resolution(kwargs)

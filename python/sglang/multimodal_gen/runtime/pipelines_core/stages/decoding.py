@@ -45,8 +45,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 )
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     ActiveTargetCompiledCallable,
-    build_torch_compile_kwargs,
-    resolve_torch_compile_mode,
+    resolve_torch_compile_kwargs,
 )
 
 logger = init_logger(__name__)
@@ -185,17 +184,15 @@ class DecodingStage(PipelineStage):
             compiled_callable.target_id != id(vae)
             or compiled_callable.compiled_module is None
         )
+        compile_kwargs, mode = resolve_torch_compile_kwargs(
+            "SGLANG_VAE_TORCH_COMPILE_MODE",
+            "SGLANG_TORCH_COMPILE_MODE",
+            default="default",
+        )
         if current_platform.is_npu():
-            compile_kwargs = build_torch_compile_kwargs(mode=None)
             if will_compile:
                 logger.info("Compiling VAE decode with torchair backend on NPU")
         else:
-            mode = resolve_torch_compile_mode(
-                "SGLANG_VAE_TORCH_COMPILE_MODE",
-                "SGLANG_TORCH_COMPILE_MODE",
-                default="default",
-            )
-            compile_kwargs = build_torch_compile_kwargs(mode=mode)
             if will_compile:
                 logger.info("Compiling VAE decode with mode: %s", mode)
 
