@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    LinkerTransferPhase,
     LRURefreshPhase,
     PrepareLoadBackResult,
     PreparePrefetchResult,
@@ -647,6 +648,16 @@ class MambaComponent(TreeComponent):
             ):
                 self._free_mamba_value(insert_params.mamba_value)
             req.mamba_last_track_seqlen = None
+
+    def build_external_linker_transfer(
+        self,
+        phase: LinkerTransferPhase,
+        node: Optional[UnifiedTreeNode],
+        keys: Optional[Sequence[str]],
+    ) -> Optional[PoolTransfer]:
+        raise AssertionError(
+            "MambaComponent does not support external linker mode, will support soon"
+        )
 
     # ---- HiCache Hooks ----
 

@@ -100,7 +100,10 @@ from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
+    get_model,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
@@ -1854,7 +1857,20 @@ def _load_image(
                     "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
                     e,
                 )
-    return Image.open(BytesIO(image_bytes))
+    try:
+        image = Image.open(BytesIO(image_bytes))
+    except OSError as e:
+        raise ValueError(f"Could not decode image: {e}") from e
+    return _fully_load_pil_image(image)
+
+
+def _fully_load_pil_image(image: Image.Image) -> Image.Image:
+    """Force PIL's lazy decode while malformed input is still request-local."""
+    try:
+        image.load()
+    except OSError as e:
+        raise ValueError(f"Could not decode image: {e}") from e
+    return image
 
 
 def load_image(
@@ -1871,7 +1887,7 @@ def load_image(
     image = None
     image_size: Optional[tuple[int, int]] = None
     if isinstance(image_file, Image.Image):
-        image = image_file
+        image = _fully_load_pil_image(image_file)
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
         image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
@@ -2336,6 +2352,8 @@ def configure_logger(server_args, prefix: str = ""):
     maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
     format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
     logging.basicConfig(
+        # Runs before publish, and for multimodal_gen's ServerArgs, which
+        # never publishes these bags -- so the record, not the bag.
         level=getattr(logging, server_args.log_level.upper()),
         format=format,
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -3688,8 +3706,6 @@ def dispose_tensor(x: torch.Tensor):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return
 
-    from sglang.srt.runtime_context import get_flags
-
     if get_flags().capture.disable_dispose_tensor:
         return
 
@@ -3723,7 +3739,6 @@ def require_mlp_tp_gather():
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-    from sglang.srt.runtime_context import get_exec, get_parallel
 
     # elastic-EP scale-up rewrites dp_size on the published config
     if get_parallel().enable_dp_attention:
@@ -3783,7 +3798,6 @@ def require_attn_tp_gather():
     # and do not consume the upstream gathered_buffer. Without this, the
     # cuda graph runner pads num_tokens to attn_tp_size, which can cause
     # autotuners to pick suboptimal kernel variants at small batches.
-    from sglang.srt.runtime_context import get_parallel
 
     if get_parallel().disable_attn_tp_gather:
         return False
@@ -3807,7 +3821,6 @@ def require_gathered_buffer():
 
 
 def require_mlp_sync():
-    from sglang.srt.runtime_context import get_parallel
 
     return get_parallel().enable_dp_attention or require_gathered_buffer()
 
@@ -4643,7 +4656,6 @@ def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
     resolution's answers.
     """
     from sglang.srt.environ import envs
-    from sglang.srt.runtime_context import get_model, get_spec
 
     SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
     MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()

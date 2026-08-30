@@ -45,7 +45,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     # generic TI2V image resize would both duplicate that work and overwrite
     # the already-resolved target canvas.
     skip_input_image_preprocess: bool = True
-    native_only_components = (
+    native_only_components: tuple[str, ...] = (
         "text_encoder",
         "transformer",
         "video_vae",

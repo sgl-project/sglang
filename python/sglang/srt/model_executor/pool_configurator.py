@@ -373,7 +373,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if memory_config.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            indexer_ratio = parse_hisparse_config(kvc.server_args).host_to_device_ratio
+            indexer_ratio = parse_hisparse_config().host_to_device_ratio
 
         from sglang.srt.mem_cache.kv_cache_configurator import (
             _should_elide_dsa_index_k,
@@ -794,9 +794,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if get_memory().enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            self.c4_shrink_factor = parse_hisparse_config(
-                kvc.server_args
-            ).host_to_device_ratio
+            self.c4_shrink_factor = parse_hisparse_config().host_to_device_ratio
         else:
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
