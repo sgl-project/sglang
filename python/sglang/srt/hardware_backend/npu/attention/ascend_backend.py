@@ -717,6 +717,11 @@ class AscendAttnBackend(AttentionBackend):
         max_len = seq_lens_cpu[:bs].max().item()
         if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
             max_len += self.speculative_num_draft_tokens
+            # [FIX] seq_lens must include speculative_num_draft_tokens BEFORE
+            # computing the SWA mask. Otherwise the mask masks out the last
+            # `speculative_num_draft_tokens` KV positions (the draft tokens),
+            # causing the main model to produce wrong attention output.
+            seq_lens = seq_lens + self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             max_len += self.speculative_step_id + 1
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
@@ -754,7 +759,9 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables[bs:, :].fill_(0)
 
         if forward_mode.is_target_verify():
-            seq_lens = seq_lens + self.speculative_num_draft_tokens
+            # [FIX] seq_lens already had speculative_num_draft_tokens added
+            # earlier (before SWA mask computation). Just update cpu_list.
+            metadata.seq_lens_cpu_list = seq_lens[:bs].cpu().int().tolist()
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])

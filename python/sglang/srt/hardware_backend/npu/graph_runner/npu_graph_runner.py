@@ -215,22 +215,24 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             self.load_batch(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
-            if not hasattr(self, "raw_num_token"):
-                # NPU skips the DFLASH verify pre-planning
-                # (DFlashVerifyInput.prepare_for_verify returns early for NPU),
-                # so load_batch may never have recorded the padded batch
-                # shapes. Compute them the same way load_batch does for the
-                # non-ragged path.
-                raw_bs = forward_batch.batch_size
-                if self.require_mlp_tp_gather:
-                    bs = self._pad_to_bucket(
-                        self._max_dp_batch_size(forward_batch), self.capture_bs
-                    )
-                else:
-                    bs = self._pad_to_bucket(raw_bs, self.capture_bs)
-                self.raw_bs = raw_bs
-                self.raw_num_token = raw_bs * self.captured_req_width
-                self.bs = bs
+            # NPU skips the DFLASH verify pre-planning
+            # (DFlashVerifyInput.prepare_for_verify returns early for NPU),
+            # so load_batch may never have recorded the padded batch
+            # shapes. Compute them the same way load_batch does for the
+            # non-ragged path. Recompute on every batch: the verify batch
+            # size varies across requests (e.g. multi-concurrency), so a
+            # cached raw_num_token would slice a stale width and crash the
+            # input copy below.
+            raw_bs = forward_batch.batch_size
+            if self.require_mlp_tp_gather:
+                bs = self._pad_to_bucket(
+                    self._max_dp_batch_size(forward_batch), self.capture_bs
+                )
+            else:
+                bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+            self.raw_bs = raw_bs
+            self.raw_num_token = raw_bs * self.captured_req_width
+            self.bs = bs
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
@@ -249,6 +251,43 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     forward_batch.mrope_positions
                 )
 
+            # [FIX] The pre-planned (else) path skipped
+            # init_forward_metadata_out_graph, so block_tables, seq_lens,
+            # swa_mask etc. stayed at capture-time values during replay.
+            # Refresh them now so the attention op reads correct KV pages.
+            from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+                build_replay_fb_view,
+            )
+
+            self.buffers.seq_lens[: self.raw_bs].copy_(
+                forward_batch.seq_lens_cpu[: self.raw_bs]
+            )
+            self.buffers.seq_lens[self.raw_bs : self.bs].fill_(
+                self.seq_len_fill_value
+            )
+            self.buffers.seq_lens_cpu[: self.raw_bs].copy_(
+                forward_batch.seq_lens_cpu[: self.raw_bs]
+            )
+            self.buffers.seq_lens_cpu[self.raw_bs : self.bs].fill_(
+                self.seq_len_fill_value
+            )
+            self.buffers.req_pool_indices[: self.bs].copy_(
+                forward_batch.req_pool_indices[: self.raw_bs]
+            )
+            fb_view = build_replay_fb_view(
+                forward_batch=forward_batch,
+                buffers=self.buffers,
+                bs=self.bs,
+                raw_bs=self.raw_bs,
+                num_tokens=self.bs * self.captured_req_width,
+                seq_len_fill_value=self.seq_len_fill_value,
+                capture_forward_mode=self.capture_forward_mode,
+                is_encoder_decoder=self.is_encoder_decoder,
+            )
+            self._replay_attn_backend().init_forward_metadata_out_graph(
+                fb_view
+            )
+
         graph_key = self._make_graph_key(self.bs)
 
         if not (
@@ -256,8 +295,21 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
             if forward_batch.forward_mode.is_target_verify():
-                seq_lens_cpu = forward_batch.seq_lens.cpu() + self.captured_req_width
-                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+                # [FIX] graph.update must carry the exact KV length that
+                # _apply_cuda_graph_metadata already computed and stored
+                # in forward_metadata.seq_lens_cpu_list. That value already
+                # includes speculative_num_draft_tokens, so do NOT add it
+                # again here.
+                _attn = self._replay_attn_backend()
+                _meta_list = _attn.forward_metadata.seq_lens_cpu_list
+                if _meta_list is None:
+                    # Fallback: should not happen after init_forward_metadata
+                    _buf_seq = self.buffers.seq_lens[: self.raw_bs].cpu()
+                    _meta_list = _buf_seq.tolist()
+                # meta_list already has self.bs elements (from
+                # _apply_cuda_graph_metadata which slices to [:bs]),
+                # so use it directly — do NOT add more padding.
+                seq_lens = list(_meta_list)
             else:
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
