@@ -161,13 +161,7 @@ class SWAKVPool(BaseSWAKVPool):
             return self.full_kv_pool.get_value_buffer(layer_id_pool)
 
     def get_v_head_dim(self):
-        # Read off the full-attention sub-pool: TritonAttnBackend asks for this on
-        # the mambaish path, where a global layer id is not guaranteed to be a
-        # full-attention layer. Uses start_layer for pipeline parallelism, matching
-        # HybridLinearKVPool.
-        return self.full_kv_pool.get_value_buffer(self.full_kv_pool.start_layer).shape[
-            -1
-        ]
+        return self.full_kv_pool.get_v_head_dim()
 
     def get_kv_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
