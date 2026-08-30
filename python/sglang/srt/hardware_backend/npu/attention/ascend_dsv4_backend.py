@@ -18,10 +18,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
-from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel, get_spec
@@ -1297,6 +1297,11 @@ class DeepseekV4AscendAttnBackend(
             model_runner.spec_algorithm is not None
             and model_runner.spec_algorithm.is_dspark()
         )
+        self._is_eagle_algorithm = bool(
+            model_runner.spec_algorithm is not None
+            and model_runner.spec_algorithm.is_eagle()
+            and not model_runner.spec_algorithm.is_frozen_kv_mtp()
+        )
         self._is_dspark_draft_worker = bool(
             getattr(model_runner, "is_draft_worker", False)
             and self._is_dspark_algorithm
@@ -1755,6 +1760,80 @@ class DeepseekV4AscendAttnBackend(
         if n < dst.shape[0]:
             dst[n:].fill_(0)
 
+    @staticmethod
+    def _stable_compact_1d(
+        dst: torch.Tensor, values: torch.Tensor, keep: torch.Tensor
+    ) -> None:
+        """Compact selected values into a fixed graph buffer without NonZero.
+
+        For every selected element, ``cumsum(keep) - 1`` is exactly its ordinal
+        in ``nonzero(keep)``.  Selected elements therefore have unique scatter
+        destinations, while rejected elements contribute integer zero only.
+        This preserves the stable boolean-index order without a dynamic output
+        shape or a device-to-host size read.
+        """
+        dst.zero_()
+        if dst.numel() == 0 or values.numel() == 0:
+            return
+
+        values = values.reshape(-1)
+        keep = keep.reshape(-1)
+        if values.numel() != keep.numel():
+            raise ValueError(
+                "stable compact requires value/mask size equality, got "
+                f"{values.numel()} and {keep.numel()}"
+            )
+
+        ranks = torch.cumsum(keep.to(torch.int64), dim=0) - 1
+        in_bounds = keep & (ranks < dst.numel())
+        safe_ranks = ranks.clamp(min=0, max=dst.numel() - 1)
+        compact_values = torch.where(
+            in_bounds,
+            values.to(dst.dtype),
+            torch.zeros_like(values, dtype=dst.dtype),
+        )
+        dst.scatter_add_(0, safe_ranks, compact_values)
+
+    def _fill_verify_positions_cmp_padding_one_device(
+        self,
+        positions: torch.Tensor,
+        dst: torch.Tensor,
+        ratio: int,
+        live_seq_lens: torch.Tensor,
+        n_draft: int,
+    ) -> None:
+        """Device-only fixed-shape equivalent of the eager CPU reference path."""
+        if ratio not in self._dsv4_compress_ratios or positions.numel() == 0:
+            dst.zero_()
+            return
+
+        n_draft = int(n_draft)
+        request_num = positions.shape[0] // n_draft
+        if request_num == 0:
+            dst.zero_()
+            return
+        if live_seq_lens.device != positions.device:
+            raise ValueError(
+                "device verify compression metadata requires live_seq_lens and "
+                "positions on the same device"
+            )
+
+        live_seq_lens = live_seq_lens[:request_num]
+        token_offsets = torch.arange(
+            1,
+            n_draft + 1,
+            dtype=live_seq_lens.dtype,
+            device=live_seq_lens.device,
+        )
+        absolute_lengths = live_seq_lens.view(-1, 1) + token_offsets.view(1, -1)
+        boundary_mask = ((absolute_lengths % ratio) == 0) & (
+            live_seq_lens.view(-1, 1) > 0
+        )
+        # Match the CPU reference exactly: select the boundary token from the
+        # request-major positions array, then move RoPE to the group's first token.
+        values = positions[: request_num * n_draft].reshape(-1) + (1 - ratio)
+        self._stable_compact_1d(dst, values, boundary_mask.reshape(-1))
+
     def _build_dsv4_graph_replay_ctx(self, forward_batch: ForwardBatch):
         graph_mode = forward_batch.forward_mode
         runtime_mode = getattr(forward_batch, "actual_forward_mode", None) or graph_mode
@@ -1910,36 +1989,58 @@ class DeepseekV4AscendAttnBackend(
             if ratio not in (4, 128):
                 continue
             should_compress = ((ctx.live_seq_lens % ratio) == 0) & valid
-            pos_cmp = positions_last[should_compress].to(torch.int64) + (1 - ratio)
-            self._copy_1d_with_zero_tail(
-                getattr(fm, f"positions_cmp_padding_c{ratio}"), pos_cmp
-            )
+            dst = getattr(fm, f"positions_cmp_padding_c{ratio}")
+            if self._is_eagle_algorithm:
+                self._stable_compact_1d(
+                    dst,
+                    positions_last.to(torch.int64) + (1 - ratio),
+                    should_compress,
+                )
+            else:
+                pos_cmp = positions_last[should_compress].to(torch.int64) + (1 - ratio)
+                self._copy_1d_with_zero_tail(dst, pos_cmp)
         fm.start_pos.copy_(positions_last.to(torch.int32))
         fm.seqused.copy_(valid.to(torch.int32))
 
     def _refresh_graph_target_verify_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
-        verify_seq_lens_cpu = ctx.final_seq_lens_cpu
-        verify_seq_lens_cpu = torch.where(
-            ctx.live_seq_lens_cpu > 0,
-            verify_seq_lens_cpu,
-            ctx.live_seq_lens_cpu,
-        )
-        self._fill_verify_positions_cmp_padding_one(
-            ctx.forward_batch.positions,
-            fm.positions_cmp_padding_c4,
-            4,
-            verify_seq_lens_cpu,
-            n_draft=ctx.tokens_per_bs,
-        )
-        self._fill_verify_positions_cmp_padding_one(
-            ctx.forward_batch.positions,
-            fm.positions_cmp_padding_c128,
-            128,
-            verify_seq_lens_cpu,
-            n_draft=ctx.tokens_per_bs,
-        )
         fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
+        if self._is_eagle_algorithm:
+            self._fill_verify_positions_cmp_padding_one_device(
+                ctx.forward_batch.positions,
+                fm.positions_cmp_padding_c4,
+                4,
+                ctx.live_seq_lens,
+                n_draft=ctx.tokens_per_bs,
+            )
+            self._fill_verify_positions_cmp_padding_one_device(
+                ctx.forward_batch.positions,
+                fm.positions_cmp_padding_c128,
+                128,
+                ctx.live_seq_lens,
+                n_draft=ctx.tokens_per_bs,
+            )
+        else:
+            verify_seq_lens_cpu = ctx.final_seq_lens_cpu
+            verify_seq_lens_cpu = torch.where(
+                ctx.live_seq_lens_cpu > 0,
+                verify_seq_lens_cpu,
+                ctx.live_seq_lens_cpu,
+            )
+            self._fill_verify_positions_cmp_padding_one(
+                ctx.forward_batch.positions,
+                fm.positions_cmp_padding_c4,
+                4,
+                verify_seq_lens_cpu,
+                n_draft=ctx.tokens_per_bs,
+            )
+            self._fill_verify_positions_cmp_padding_one(
+                ctx.forward_batch.positions,
+                fm.positions_cmp_padding_c128,
+                128,
+                verify_seq_lens_cpu,
+                n_draft=ctx.tokens_per_bs,
+            )
         valid = ctx.live_seq_lens[: ctx.bs] > 0
         fm.seqused.copy_(
             (valid.to(torch.int32) * int(ctx.tokens_per_bs)).to(device=ctx.device)
@@ -2576,6 +2677,19 @@ class DeepseekV4AscendAttnBackend(
             return
 
         n_draft = int(spec_info.draft_token_num)
+        if (
+            cuda_graph_bs is not None
+            and self._is_eagle_algorithm
+            and fm.start_pos.device == positions.device
+        ):
+            self._fill_verify_positions_cmp_padding_one_device(
+                positions, c4_positions, 4, fm.start_pos, n_draft=n_draft
+            )
+            self._fill_verify_positions_cmp_padding_one_device(
+                positions, c128_positions, 128, fm.start_pos, n_draft=n_draft
+            )
+            return
+
         seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
         if seq_lens_cpu is None:
             seq_lens_cpu = getattr(spec_info, "seq_lens_cpu", None)
@@ -2628,6 +2742,13 @@ class DeepseekV4AscendMultiStepDraftBackend:
             DeepseekV4AscendAttnBackend(model_runner, speculative_step_id=step_id)
             for step_id in range(speculative_num_steps)
         ]
+        # DSV4 draft workers currently disable every compressor.  Avoid deriving
+        # per-step compressed-cache locations that no child backend can consume;
+        # the boolean selection otherwise emits four dynamic NonZero calls per
+        # EAGLE cycle (two draft steps x C4/C128 for the common 3-step setup).
+        self._needs_step_compressed_locs = any(
+            bool(backend._dsv4_compress_ratios) for backend in self.attn_backends
+        )
 
     def common_template(self, forward_batch: ForwardBatch, call_fn):
         assert forward_batch.spec_info is not None
@@ -2707,11 +2828,24 @@ class DeepseekV4AscendMultiStepDraftBackend:
             )[:, :, step_id].reshape(-1)
             return loc[step_offsets[step_mask].to(torch.int64)]
 
+        if self._needs_step_compressed_locs:
+            out_c4_loc = step_compress(bundle.out_c4_loc, 4)
+            out_c128_loc = step_compress(bundle.out_c128_loc, 128)
+        else:
+            out_c4_loc = (
+                None if bundle.out_c4_loc is None else bundle.out_c4_loc.new_empty((0,))
+            )
+            out_c128_loc = (
+                None
+                if bundle.out_c128_loc is None
+                else bundle.out_c128_loc.new_empty((0,))
+            )
+
         return DSV4OutCacheLoc(
             out_full_loc=full_steps[step_id],
             out_swa_loc=swa_steps[step_id],
-            out_c4_loc=step_compress(bundle.out_c4_loc, 4),
-            out_c128_loc=step_compress(bundle.out_c128_loc, 128),
+            out_c4_loc=out_c4_loc,
+            out_c128_loc=out_c128_loc,
         )
 
     def _with_step_cache_locs(self, forward_batch: ForwardBatch, step_id: int, call_fn):
