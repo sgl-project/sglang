@@ -1950,7 +1950,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         self.assertTrue(
             bool((composite_out.long() == expected_dense.long()).all().item()),
             "REGRESSION: translate_loc_from_full_to_swa must emit the swa "
-            "sub-pool's dense ids (phys_page * ps * blocks_per_page + offset).",
+            "sub-pool's kernel-facing ids (phys_page * ps * blocks_per_page + offset).",
         )
 
 
@@ -2600,12 +2600,12 @@ class TestO3FusedAllocBind(unittest.TestCase):
 class TestSWACompositeDenseSurface(unittest.TestCase):
     """The SWA composite's dense (kernel-facing) id surface.
 
-    Presence of `translate_kv_loc_dense` / `full_v2p_page_table` is what flips
-    the attention backends' dense-first probes, and the `page_stride` scale in
-    `translate_loc_from_full_to_swa` is what carries the swa dense space.
+    Presence of `translate_kv_loc_for_kernel` / `full_v2p_page_table` is what flips
+    the attention backends' kernel-facing-first probes, and the `page_stride` scale in
+    `translate_loc_from_full_to_swa` is what carries the swa kernel-facing space.
     Everything must collapse
     byte-identically at multiplier 1 — the strided arm every existing SWA model
-    runs — and follow `dense(t) = v2p[t//ps]*(ps*mult) + t%ps` otherwise.
+    runs — and follow `kernel_id(t) = v2p[t//ps]*(ps*mult) + t%ps` otherwise.
     """
 
     PS = 4
@@ -2655,7 +2655,7 @@ class TestSWACompositeDenseSurface(unittest.TestCase):
         composite exposes the raw v2p tables unwrapped. Nothing injects the
         scale: a spec whose views are dense cannot be paired with a
         physical-id multiplier, which is the state that writes physical ids
-        into dense rows."""
+        into view rows."""
         a = self._build()
         self.assertEqual(a.kernel_page_multiplier, 2 * self.FULL_L)
         self.assertEqual(a.swa_kernel_page_multiplier, 2 * self.SWA_L)
@@ -2669,7 +2669,7 @@ class TestSWACompositeDenseSurface(unittest.TestCase):
         self.assertIsNotNone(v)
         v2p = a.full_attn_allocator.virtual_to_physical
         expected = v2p[v // self.PS] * (self.PS * mult) + v % self.PS
-        self.assertTrue(torch.equal(a.translate_kv_loc_dense(v), expected))
+        self.assertTrue(torch.equal(a.translate_kv_loc_for_kernel(v), expected))
         # The PHYSICAL translate must stay unscaled — compaction and the byte
         # machinery depend on it staying in physical space.
         phys = v2p[v // self.PS] * self.PS + v % self.PS
@@ -2690,12 +2690,12 @@ class TestSWACompositeDenseSurface(unittest.TestCase):
                 v2p = a.full_attn_allocator.virtual_to_physical
                 expected = v2p[v // ps] * (ps * mult) + v % ps
                 page_table = v.to(torch.int32).view(2, -1)
-                got = a.translate_kv_loc_dense(page_table)
+                got = a.translate_kv_loc_for_kernel(page_table)
                 self.assertEqual(got.shape, page_table.shape)
                 self.assertTrue(torch.equal(got.reshape(-1), expected))
                 # `out=` takes the same int32 index; the buffer stays int64.
                 dst = torch.empty(page_table.shape, dtype=torch.int64, device=_DEV)
-                a.translate_kv_loc_dense(page_table, out=dst)
+                a.translate_kv_loc_for_kernel(page_table, out=dst)
                 self.assertTrue(torch.equal(dst.reshape(-1), expected))
 
     def test_swa_translate_scales_page_stride(self):

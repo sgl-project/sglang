@@ -3,7 +3,7 @@ End-to-end accuracy test for the unified memory pool on a hybrid-SWA MoE model.
 
 Launches gpt-oss-20b with ``--enable-unified-memory`` on the Triton attention
 backend and checks that GSM8K accuracy holds. This exercises the SWA +
-full-attention KV sub-pools stored as dense per-layer views in the unified
+full-attention KV sub-pools stored as per-layer views in the unified
 page-major envelope.
 
 Registered to the label-gated ``run-ci-extra`` suite (opt-in, not per-commit).

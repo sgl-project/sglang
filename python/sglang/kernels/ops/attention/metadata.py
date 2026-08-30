@@ -193,7 +193,7 @@ def _fused_metadata_kernel_general(
     use_swa: tl.constexpr,
     SHIFT: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
-    # Unified-memory dense-view path (page-major envelope shared with the mamba
+    # Unified-memory per-layer-view path (page-major envelope shared with the mamba
     # sub-pool). Both default to the identity for the statically-partitioned
     # pool, where req_to_token already holds physical ids.
     v2p_ptr=None,
@@ -316,7 +316,7 @@ def _fused_metadata_kernel_ps1_no_swa(
     max_seq_pages,
     seq_len_delta: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
-    # Unified-memory dense-view path; identity defaults for the static pool.
+    # Unified-memory per-layer-view path; identity defaults for the static pool.
     v2p_ptr=None,
     PAGE_MULT: tl.constexpr = 1,
 ):

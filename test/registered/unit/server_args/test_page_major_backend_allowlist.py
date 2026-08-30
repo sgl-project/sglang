@@ -15,9 +15,9 @@
 
 The page-major envelope K/V views are strided, which only the Triton attention
 kernels read. The one exception is the unified-memory MLA pool: it exposes each
-layer as a DENSE contiguous view (`build_dense_mla_views`), so the paged MLA
+layer as a contiguous view (`build_mla_views`), so the paged MLA
 backends can read it directly once their kv_indices / block tables are remapped
-to dense ids -- `fa3`, `flashinfer`'s MLA backend, and `trtllm_mla` with its
+to kernel-facing ids -- `fa3`, `flashinfer`'s MLA backend, and `trtllm_mla` with its
 `cutedsl_mla` / `tokenspeed_mla` subclasses.
 
 Pinned here so the exception cannot silently widen to a backend that has no
@@ -112,7 +112,7 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
             )
 
     def test_dense_mla_backends_rejected_for_mha(self):
-        """The dense-view exception is MLA-only -- MHA sub-pools stay strided."""
+        """The per-layer-view exception is MLA-only -- MHA sub-pools stay strided."""
         for backend in self.DENSE_MLA_BACKENDS:
             self.assertFalse(
                 _accepts(backend, use_mla=False),
@@ -131,7 +131,7 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
     def test_plain_page_major_arm_is_gated_at_boot(self):
         """The strided views were removed: --enable-page-major-kv-layout
         without --enable-unified-memory must be rejected up front for EVERY
-        backend, Triton included, until the dense-view reimplementation."""
+        backend, Triton included, until the per-layer-view reimplementation."""
         for backend in ("triton",) + self.DENSE_MLA_BACKENDS:
             for use_mla in (True, False):
                 self.assertFalse(
@@ -140,7 +140,7 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 )
 
     def test_asymmetric_kv_mha_model_cannot_use_unified_memory(self):
-        """head_dim != v_head_dim (MiMoV2): no uniform rows, so no dense views
+        """head_dim != v_head_dim (MiMoV2): no uniform rows, so no per-layer views
         and no unified pool. The rejection is the POOL's, not a backend's, so
         it must fire on every backend -- Triton included."""
         for backend in ("triton",) + self.DENSE_MLA_BACKENDS:

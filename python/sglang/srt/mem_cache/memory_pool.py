@@ -3182,7 +3182,7 @@ class PageMajorMHATokenToKVPool(MHATokenToKVPool):
 
     TEMPORARILY NON-CONSTRUCTIBLE: the strided 4-D view builder and its write
     kernel were removed; ServerArgs rejects the static page-major arm at boot
-    until the dense-view reimplementation lands.
+    until the per-layer-view reimplementation lands.
 
     All layers/slots share one contiguous ``uint8`` ``_raw`` buffer; per-layer K/V
     are 4-D strided views ``(num_pages, page_size, head_num, head_dim*)`` built by
@@ -3224,7 +3224,7 @@ class PageMajorMHATokenToKVPool(MHATokenToKVPool):
             "removed; the static-pool page-major layout is temporarily "
             "unsupported (ServerArgs rejects it at startup). "
             "--enable-unified-memory provides the page-major layout with "
-            "dense views."
+            "per-layer views."
         )
 
     # The methods below assume the per-layer contiguous 3-D layout. The 4-D
@@ -3661,9 +3661,9 @@ class HybridLinearKVPool(KVCache):
         # virtual->physical mamba-slot translate for the HiCache offload path;
         # identity for a static pool, the allocator's `translate` for the unified pool.
         self._mamba_translate = lambda ids: ids
-        # virtual->dense full-KV translate for the model-level MLA entry points
+        # virtual->kernel-facing full-KV translate for the model-level MLA entry points
         # (`set_mla_kv_buffer` / `get_mla_kv_buffer` receive VIRTUAL locs);
-        # identity for a static pool, `translate_kv_loc_dense` for the unified pool.
+        # identity for a static pool, `translate_kv_loc_for_kernel` for the unified pool.
         self._full_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
@@ -3906,7 +3906,7 @@ class HybridLinearKVPool(KVCache):
             )
         else:
             # Mirror the MHA branch: `full_loc` is the unified pool's
-            # pre-translated (dense) loc; None for a static pool.
+            # pre-translated (kernel-facing) loc; None for a static pool.
             write_loc = full_loc if full_loc is not None else loc
             with self._transfer_id_context(layer):
                 self.full_kv_pool.set_kv_buffer(
@@ -3950,16 +3950,16 @@ class HybridLinearKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
-        loc_is_dense: bool = False,
+        loc_is_kernel_facing: bool = False,
     ):
         assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
         # Model-level MLA entry point: `loc` is a VIRTUAL loc under the unified
-        # pool, so translate to the dense id space here.
+        # pool, so translate to the kernel-facing id space here.
         #
-        # `loc_is_dense`: the caller already translated `loc` (the unified-pool
+        # `loc_is_kernel_facing`: the caller already translated `loc` (the unified-pool
         # cuda-graph decode precomputes it out-of-graph into a capture-stable
         # buffer, so the in-graph write does not capture a translate allocation).
-        if not loc_is_dense:
+        if not loc_is_kernel_facing:
             loc = self._full_translate(loc)
         with self._transfer_id_context(layer):
             self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)

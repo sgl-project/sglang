@@ -136,11 +136,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.is_id_owner = is_id_owner
         # Dense (kernel-facing) index space scale, derived from the sub-pool
         # spec that owns the layout — the same rule `view_tail_pad_bytes`
-        # follows, so no construction site can pair dense views with a
+        # follows, so no construction site can pair per-layer views with a
         # physical-id multiplier. `kernel_page_multiplier=` overrides it only
         # for tests that pin the multiplier-1 collapse.
         self.kernel_page_multiplier = (
-            spec.dense_blocks_per_page()
+            spec.blocks_per_page()
             if kernel_page_multiplier is None
             else kernel_page_multiplier
         )
@@ -646,7 +646,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return phys_pages
 
     def _maybe_zero_pages(self, phys_pages: torch.Tensor) -> None:
-        """Zero the page ENVELOPES on hand-out (MLA-dense full pool only):
+        """Zero the page ENVELOPES on hand-out (MLA full pool only):
         the MLA kernels arithmetically mask the rows beyond seq_len, so
         never-written page bytes must read as finite values. Runs on the
         schedule stream, ordered before the consuming forward by the
@@ -718,36 +718,36 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         result = phys_pages * self.page_size + offsets
         return torch.clamp_min(result, 0)
 
-    def translate_kv_loc_dense(
+    def translate_kv_loc_for_kernel(
         self,
         virt_tokens: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Virtual token ids -> DENSE (kernel-facing) ids:
+        """Virtual token ids -> kernel-facing ids:
 
-            dense(t) = (t // ps) * (ps * kernel_page_multiplier) + t % ps
+            kernel_id(t) = (t // ps) * (ps * kernel_page_multiplier) + t % ps
 
         Internal machinery (compaction, in-flight write sets) MUST keep using
-        `translate_kv_loc`: dense ids are for kernels only. Tombstones (-1)
-        clamp to dense id 0, the page-0 sink. int64 out; a consumer whose
+        `translate_kv_loc`: kernel-facing ids are for kernels only. Tombstones (-1)
+        clamp to kernel-facing id 0, the page-0 sink. int64 out; a consumer whose
         kernel ABI wants int32 narrows where it fills that buffer.
         """
         ps = self.page_size
         stride = ps * self.kernel_page_multiplier
-        with record_function("MultiEndedAlloc.translate_kv_loc_dense"):
+        with record_function("MultiEndedAlloc.translate_kv_loc_for_kernel"):
             pages = virt_tokens if ps == 1 else virt_tokens // ps
             offsets = None if ps == 1 else virt_tokens % ps
             if out is None:
                 phys = self.virtual_to_physical[pages]
-                dense = phys * stride if offsets is None else phys * stride + offsets
-                return dense.clamp_(min=0)
+                ids = phys * stride if offsets is None else phys * stride + offsets
+                return ids.clamp_(min=0)
             assert out.dtype == torch.int64, (
-                f"translate_kv_loc_dense: out= dtype must be int64 (matches v2p), "
+                f"translate_kv_loc_for_kernel: out= dtype must be int64 (matches v2p), "
                 f"got {out.dtype}"
             )
             assert out.shape == virt_tokens.shape, (
-                f"translate_kv_loc_dense: out= shape {tuple(out.shape)} must "
+                f"translate_kv_loc_for_kernel: out= shape {tuple(out.shape)} must "
                 f"match virt_tokens shape {tuple(virt_tokens.shape)}"
             )
             if pages.dtype != torch.int64:
@@ -1904,25 +1904,25 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Page-level virtual->physical table of the full sub-pool. Kernels that
         build the MLA block table directly from req_to_token (e.g. trtllm_mla,
         flashmla) gather through this to turn a VIRTUAL page into a physical one,
-        then scale by `kernel_page_multiplier` to reach the dense per-page block.
+        then scale by `kernel_page_multiplier` to reach the per-page block.
         """
         return self.full_attn_allocator.virtual_to_physical
 
-    def translate_kv_loc_dense(
+    def translate_kv_loc_for_kernel(
         self,
         loc: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> DENSE (kernel-facing) ids."""
-        return self.full_attn_allocator.translate_kv_loc_dense(loc, out=out)
+        """Full-pool virtual TOKEN ids -> kernel-facing ids."""
+        return self.full_attn_allocator.translate_kv_loc_for_kernel(loc, out=out)
 
     def translate_kv_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
         """Virtual TOKEN ids -> PHYSICAL token ids for the PD transfer engine.
 
-        PHYSICAL, not dense: the transfer registers page ENVELOPES (see
+        PHYSICAL, not kernel-facing: the transfer registers page ENVELOPES (see
         `UnifiedMLATokenToKVPool.get_contiguous_buf_infos`).
         """
         return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
@@ -2248,7 +2248,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """SWA-layer read path: virtual TOKEN ids -> swa kernel-facing ids."""
-        return self.swa_attn_allocator.translate_kv_loc_dense(kv_indices, out=out)
+        return self.swa_attn_allocator.translate_kv_loc_for_kernel(kv_indices, out=out)
 
     @property
     def kernel_page_multiplier(self) -> int:
@@ -2259,14 +2259,14 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         """Page-level virtual->physical table of the full sub-pool."""
         return self.full_attn_allocator.virtual_to_physical
 
-    def translate_kv_loc_dense(
+    def translate_kv_loc_for_kernel(
         self,
         loc: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> DENSE (kernel-facing) ids."""
-        return self.full_attn_allocator.translate_kv_loc_dense(loc, out=out)
+        """Full-pool virtual TOKEN ids -> kernel-facing ids."""
+        return self.full_attn_allocator.translate_kv_loc_for_kernel(loc, out=out)
 
     @property
     def swa_kernel_page_multiplier(self) -> int:

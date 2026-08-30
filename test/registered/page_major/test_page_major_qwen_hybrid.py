@@ -5,7 +5,7 @@ Launches Qwen3.5-4B (a gated-delta-net / linear-attention hybrid) with
 ``--enable-unified-memory`` on the Triton attention + linear-attn + Mamba
 backends and checks that GSM8K accuracy holds. This exercises the unified
 envelope's most bug-prone path: the Mamba conv/SSM state stored as a strided
-envelope view, plus the full-attention KV stored as dense per-layer views,
+envelope view, plus the full-attention KV stored as per-layer views,
 both read/written by the GDN prefill and decode kernels.
 
 Registered to the label-gated ``run-ci-extra`` suite (opt-in, not per-commit).

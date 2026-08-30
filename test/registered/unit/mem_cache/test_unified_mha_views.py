@@ -14,23 +14,23 @@
 """Dense MHA K/V views for the unified memory pool (uniform-row hybrid models).
 
 Covers, CPU-only (pure torch — no GPU / Triton kernels):
-  - `build_dense_mha_views` refuses an asymmetric-KV spec: its addressing
+  - `build_mha_views` refuses an asymmetric-KV spec: its addressing
     assumes one uniform row width, so it is the boundary that checks;
-  - `build_dense_mha_views` addressing: view_l[dense(t)] must land exactly at
+  - `build_mha_views` addressing: view_l[kernel_id(t)] must land exactly at
     the page-major envelope byte offset the STRIDED builder assigns to the same
     (page, slot, layer, K|V) cell — the two builders are views over one truth;
-  - K and V of one token share ONE dense id (per-layer origin shift does the
+  - K and V of one token share ONE kernel-facing id (per-layer origin shift does the
     disambiguation), with no aliasing across the 2*L overlapping views;
   - the missing-tail-pad and asymmetric-dims cases fail loud at construction.
 
 Addressing law under test (the derived property everything else builds on):
 
-    dense(t) = (t // ps) * (ps * 2L) + t % ps
+    kernel_id(t) = (t // ps) * (ps * 2L) + t % ps
     K of layer l at block 2l, V at block 2l+1, blocks are ps rows of
     head_num*head_dim elements — offsets identical to
     MHASubPoolSpec.layer_k/v_offset_in_page when rows are uniform.
 
-    python -m pytest test/registered/unit/mem_cache/test_unified_mha_dense_views.py -v
+    python -m pytest test/registered/unit/mem_cache/test_unified_mha_views.py -v
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -44,7 +44,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.layout.page_major import (
-    build_dense_mha_views,
+    build_mha_views,
     mha_entry_bytes,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
@@ -86,7 +86,7 @@ def _mha_spec(head_dim=_D, v_head_dim=None, layer_num=_L, grow="down"):
     )
 
 
-def _dense(t, ps):
+def _kernel_id(t, ps):
     return (t // ps) * (ps * _BLOCKS) + t % ps
 
 
@@ -98,8 +98,8 @@ def _make_raw(ps, num_pages, pad_pages=1):
     return raw
 
 
-def _build_dense(raw, ps, num_pages, head_dim=_D, v_head_dim=_D, layer_num=_L):
-    return build_dense_mha_views(
+def _build_views(raw, ps, num_pages, head_dim=_D, v_head_dim=_D, layer_num=_L):
+    return build_mha_views(
         raw,
         layer_num=layer_num,
         head_num=_H,
@@ -116,7 +116,7 @@ def _reference_strided_views(raw, *, page_size, num_pages, anchor_bytes=0):
 
     This is the retired production strided builder, kept here as the oracle:
     per-layer ``(num_pages, page_size, head_num, head_dim)`` views addressed by
-    ``(page, slot)``, so the dense builder's addressing can be cross-checked
+    ``(page, slot)``, so the builder's addressing can be cross-checked
     against a second, independently-derived description of the same bytes.
     """
     k_row_bytes = _ROW * _ITEM
@@ -151,7 +151,7 @@ def _reference_strided_views(raw, *, page_size, num_pages, anchor_bytes=0):
 
 class TestMHADenseSpecSurface(unittest.TestCase):
     def test_asymmetric_rows_refused_by_the_view_builder(self):
-        """The dense block array exists only for uniform rows, so the builder
+        """The row-block array exists only for uniform rows, so the builder
         whose addressing depends on it is the one that refuses (the MiMoV2
         shape, scaled down). ServerArgs screens such models out of
         --enable-unified-memory long before we get here; this is the check for
@@ -159,7 +159,7 @@ class TestMHADenseSpecSurface(unittest.TestCase):
         spec = _mha_spec()
         raw = torch.zeros(1 << 16, dtype=torch.uint8)
         with self.assertRaises(AssertionError):
-            build_dense_mha_views(
+            build_mha_views(
                 raw,
                 layer_num=spec.layer_num,
                 head_num=spec.head_num,
@@ -170,7 +170,7 @@ class TestMHADenseSpecSurface(unittest.TestCase):
                 num_pages=4,
             )
 
-    def test_spec_offsets_equal_dense_block_origins(self):
+    def test_spec_offsets_equal_block_origins(self):
         """The spec's byte math and the view builder's origins are two
         independent derivations of the envelope; under uniform rows they must
         agree: layer_k_offset(l) == (2l)*ps*row, layer_v_offset(l) == (2l+1)*ps*row."""
@@ -196,45 +196,45 @@ class TestMHADenseSpecSurface(unittest.TestCase):
 class TestDenseMHAViews(unittest.TestCase):
     def test_view_shapes_are_stock_mha(self):
         ps, num_pages = 4, 6
-        k_views, v_views = _build_dense(_make_raw(ps, num_pages), ps, num_pages)
-        n_dense = num_pages * _BLOCKS * ps
+        k_views, v_views = _build_views(_make_raw(ps, num_pages), ps, num_pages)
+        n_rows = num_pages * _BLOCKS * ps
         self.assertEqual(len(k_views), _L)
         self.assertEqual(len(v_views), _L)
         for v in (*k_views, *v_views):
             # The stock MHATokenToKVPool per-layer signature: 3-D, packed rows.
-            self.assertEqual(tuple(v.shape), (n_dense, _H, _D))
+            self.assertEqual(tuple(v.shape), (n_rows, _H, _D))
             self.assertEqual(v.stride(), (_ROW, _D, 1))
 
-    def test_dense_addressing_matches_strided_reference(self):
+    def test_addressing_matches_strided_reference(self):
         """Cross-readback: bytes written through the reference STRIDED views at
-        (page, slot) must be read back through the DENSE views at dense(t),
+        (page, slot) must be read back through the views at kernel_id(t),
         for both K and V of every layer — and vice versa. This pins that the
-        dense builder and the independent strided description agree on the
+        view builder and the independent strided description agree on the
         same physical envelope."""
         for ps in (1, 4):
             num_pages = 5
             raw = _make_raw(ps, num_pages)
             sk, sv = _reference_strided_views(raw, page_size=ps, num_pages=num_pages)
-            dk, dv = _build_dense(raw, ps, num_pages)
+            dk, dv = _build_views(raw, ps, num_pages)
             probes = [(0, 0, 0), (1, 1, ps - 1), (4, 0, ps // 2), (3, 1, 0)]
-            # strided-write -> dense-read
+            # strided-write -> view-read
             for p, l, s in probes:
                 t = p * ps + s
-                d = _dense(t, ps)
+                d = _kernel_id(t, ps)
                 sk[l][p, s] = float(p * 100 + l * 10 + s + 1)
                 sv[l][p, s] = float(p * 100 + l * 10 + s + 2)
                 self.assertTrue(
                     torch.all(dk[l][d] == float(p * 100 + l * 10 + s + 1)),
-                    f"K (p={p}, l={l}, s={s}, ps={ps}) dense readback off-formula",
+                    f"K (p={p}, l={l}, s={s}, ps={ps}) view readback off-formula",
                 )
                 self.assertTrue(
                     torch.all(dv[l][d] == float(p * 100 + l * 10 + s + 2)),
-                    f"V (p={p}, l={l}, s={s}, ps={ps}) dense readback off-formula",
+                    f"V (p={p}, l={l}, s={s}, ps={ps}) view readback off-formula",
                 )
-            # dense-write -> strided-read
+            # view-write -> strided-read
             for p, l, s in probes:
                 t = p * ps + s
-                d = _dense(t, ps)
+                d = _kernel_id(t, ps)
                 dk[l][d] = float(p * 100 + l * 10 + s + 3)
                 dv[l][d] = float(p * 100 + l * 10 + s + 4)
                 self.assertTrue(
@@ -245,7 +245,7 @@ class TestDenseMHAViews(unittest.TestCase):
                 )
 
     def test_byte_addresses_match_envelope_formula(self):
-        """The dense view's byte address for token ``t``, layer ``L`` must equal
+        """The per-layer view's byte address for token ``t``, layer ``L`` must equal
         the hand-computed envelope formula: page origin + layer-block origin +
         slot offset. Independent of any view builder — this is the raw layout
         contract every envelope consumer (moves, sizing, transfer math) relies
@@ -255,9 +255,9 @@ class TestDenseMHAViews(unittest.TestCase):
         for ps in (1, 4):
             num_pages = 5
             page_bytes = ps * _L * (k_row + v_row)
-            dk, dv = _build_dense(_make_raw(ps, num_pages), ps, num_pages)
+            dk, dv = _build_views(_make_raw(ps, num_pages), ps, num_pages)
             for t in (0, 1, ps, 3 * ps + (ps - 1), 4 * ps):
-                d = _dense(t, ps)
+                d = _kernel_id(t, ps)
                 for L in range(_L):
                     expected_k = (
                         (t // ps) * page_bytes
@@ -275,13 +275,13 @@ class TestDenseMHAViews(unittest.TestCase):
                     self.assertEqual(got_k, expected_k, f"K t={t} L={L} ps={ps}")
                     self.assertEqual(got_v, expected_v, f"V t={t} L={L} ps={ps}")
 
-    def test_k_and_v_share_one_dense_id_without_aliasing(self):
-        """One dense id, 2L distinct cells (K and V of every layer): writes
+    def test_k_and_v_share_one_kernel_id_without_aliasing(self):
+        """One kernel-facing id, 2L distinct cells (K and V of every layer): writes
         through all 2L views at the SAME id must not clobber each other."""
         ps, num_pages = 4, 4
-        dk, dv = _build_dense(_make_raw(ps, num_pages), ps, num_pages)
+        dk, dv = _build_views(_make_raw(ps, num_pages), ps, num_pages)
         t = 2 * ps + 1  # page 2, slot 1
-        d = _dense(t, ps)
+        d = _kernel_id(t, ps)
         for l in range(_L):
             dk[l][d] = float(2 * l + 1)
             dv[l][d] = float(2 * l + 2)
@@ -293,16 +293,16 @@ class TestDenseMHAViews(unittest.TestCase):
         ps, num_pages = 2, 4
         raw = _make_raw(ps, num_pages, pad_pages=0)
         with self.assertRaises(AssertionError):
-            _build_dense(raw, ps, num_pages)
+            _build_views(raw, ps, num_pages)
 
     def test_asymmetric_dims_rejected(self):
         ps, num_pages = 2, 4
         raw = _make_raw(ps, num_pages)
         with self.assertRaises(AssertionError):
-            _build_dense(raw, ps, num_pages, head_dim=6, v_head_dim=4)
+            _build_views(raw, ps, num_pages, head_dim=6, v_head_dim=4)
 
 
-# ---- pool-level dense mode ----
+# ---- pool level ----
 
 _N_FULL = 32  # full-attn token slots per pool in the fixtures below
 _N_SWA = 16
@@ -334,7 +334,7 @@ def _make_pool(ps=1, full_spec=None, device=_DEV):
 
 
 class TestUnifiedKVPoolDenseViews(unittest.TestCase):
-    def test_every_mha_sub_pool_is_dense(self):
+    def test_every_mha_sub_pool_is_per_layer_contiguous(self):
         """The unified pool has ONE MHA layout: both sub-pools come back as
         stock 3-D per-layer views, whatever their page size."""
         for ps in (1, 4):
@@ -346,7 +346,7 @@ class TestUnifiedKVPoolDenseViews(unittest.TestCase):
                 self.assertTrue(k[0].is_contiguous())
 
     def test_tail_pad_is_derived_from_the_specs(self):
-        """The dense views hang past the last page envelope, so the pool
+        """The per-layer views hang past the last page envelope, so the pool
         over-allocates one envelope of the widest sub-pool. Derived here, not
         passed in, so no construction site can under-allocate it."""
         for ps in (1, 4):
@@ -381,16 +381,16 @@ def _make_pool_and_kv(ps, device=_DEV):
 
 
 class TestUnifiedMHATokenToKVPool(unittest.TestCase):
-    def test_size_is_dense_bound(self):
+    def test_size_is_view_row_bound(self):
         """`size` drives BOTH the python OOB check and the store kernel's
-        device-side size_limit; it must be the dense row bound, not slot count."""
+        device-side size_limit; it must be the view row bound, not slot count."""
         for ps in (1, 4):
-            dense_kv, dense_pool = _make_pool_and_kv(ps)
-            n_dense = (dense_kv.max_slots("full") // ps) * _BLOCKS * ps
-            self.assertEqual(dense_pool.size, n_dense - ps)
+            unified_kv, pool_under_test = _make_pool_and_kv(ps)
+            n_rows = (unified_kv.max_slots("full") // ps) * _BLOCKS * ps
+            self.assertEqual(pool_under_test.size, n_rows - ps)
 
     def test_stock_write_lands_on_envelope_truth(self):
-        """Byte-identity: the pool's stock inherited `set_kv_buffer` at dense
+        """Byte-identity: the pool's stock inherited `set_kv_buffer` at kernel-facing
         locs must produce exactly the bytes that direct writes through STRIDED
         views over the same envelope produce at the same (page, slot, layer)
         cells. The strided views are built here purely as the independent
@@ -410,7 +410,7 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
                 toks = torch.tensor(
                     [p * ps + s for (p, s) in probes], device=_STORE_DEV
                 )
-                dense_locs = (toks // ps) * (ps * _BLOCKS) + toks % ps
+                kernel_locs = (toks // ps) * (ps * _BLOCKS) + toks % ps
                 k = torch.full(
                     (len(probes), _H, _D),
                     float(l + 1),
@@ -423,7 +423,7 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
                     dtype=_DTYPE,
                     device=_STORE_DEV,
                 )
-                pool.set_kv_buffer(_layer(l), dense_locs, k, v)
+                pool.set_kv_buffer(_layer(l), kernel_locs, k, v)
                 for p, s in probes:
                     self.assertTrue(
                         torch.all(sk[l][p, s] == float(l + 1)),
@@ -435,10 +435,10 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
                     )
 
     def test_move_kv_cache_relocates_whole_envelopes(self):
-        """Compaction hands PHYSICAL token runs, not dense ids. The override
+        """Compaction hands PHYSICAL token runs, not kernel-facing ids. The override
         must relocate exactly the page envelopes those runs name — red if it is
         lost, since the inherited per-layer move would apply physical ids to
-        the dense row space."""
+        the row space."""
         ps = 4
         kv, pool = _make_pool_and_kv(ps)
         live = kv._raw.numel() - kv.view_tail_pad_bytes
@@ -463,7 +463,7 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
 
     def test_transfer_entry_points_fail_loud(self):
         """PD / CPU-copy entry points assume per-layer buffers indexed by TOKEN
-        id; against the dense row space they would silently mis-index (or hit a
+        id; against the row space they would silently mis-index (or hit a
         missing-attr AttributeError). Every one of them must raise."""
         _, pool = _make_pool_and_kv(1)
         with self.assertRaises(NotImplementedError):
@@ -478,16 +478,16 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
     def test_hnd_env_cannot_hijack_layout(self):
         """SGLANG_USE_HND_KVCACHE=1 used to flip the inherited env-driven
         layout selector, putting the pool in a mode whose code paths do not
-        match its buffers (HND indexes 4-D; the dense views are 3-D). The
+        match its buffers (HND indexes 4-D; the per-layer views are 3-D). The
         pinned label must win."""
         with envs.SGLANG_USE_HND_KVCACHE.override(True):
             _, pool = _make_pool_and_kv(1)
             self.assertFalse(pool.use_hnd)
-            self.assertEqual(pool.kv_cache_layout, "page_major_dense")
+            self.assertEqual(pool.kv_cache_layout, "page_major")
 
 
 class TestFactoryDenseViews(unittest.TestCase):
-    """The real SWA factory builds dense sub-pools and wires the matching
+    """The real SWA factory builds both sub-pools and wires the matching
     kernel-facing multipliers into the composite allocator."""
 
     # _swa_factory geometry: L_full = L_swa = 2, uniform 8/8 dims, ps = 1.
@@ -496,7 +496,7 @@ class TestFactoryDenseViews(unittest.TestCase):
 
     def _bundle(self):
         # Self-contained tiny SWA-factory bundle (L_full = L_swa = 2, uniform
-        # 8/8 dims, ps = 1) — small enough that dense views build on CPU.
+        # 8/8 dims, ps = 1) — small enough that per-layer views build on CPU.
         from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 
         return init_unified_swa_pools(
@@ -519,7 +519,7 @@ class TestFactoryDenseViews(unittest.TestCase):
             need_sort=False,
         )
 
-    def test_factory_builds_dense_with_multipliers(self):
+    def test_factory_wires_matching_multipliers(self):
         b = self._bundle()
         pool = b.unified_memory_pool
         alloc = b.token_to_kv_pool_allocator
