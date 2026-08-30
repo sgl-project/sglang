@@ -60,3 +60,22 @@ quick_fs 0.5 权重 ln(0.3)s / web_search 0.2 ln(2)s / run_tests 0.2 ln(10)s / c
 ## 时间表
 
 - D1-D2: harness → D3: v0 Score + 基线 → D4-D5: 完整 Score + 扫描 + MXFP4 交叉 → D6: 入库
+
+## 相关工作定位(2026-08-30 调研)
+
+**Continuum**(arXiv 2511.02230)是最近邻:tool-aware KV TTL。
+- 机制:per-tool μ/σ 在线估计(更新时机与我们相同:请求返回时)+ empirical
+  Bernstein 上界 B(δ);`TTL = now + B(r,f)·(1+α·AvgTurns)/2`;**pin 保护到 TTL 过期**;
+  program 级 FCFS 调度。评测:job completion time 1.12-3.66×、吞吐 1.10-3.22×,
+  baseline = vLLM / Autellix / InferCept。
+- **我们的差异化**:
+  1. **纯驱逐排序 vs pin+TTL**:无 pin 状态、无 unpin/防死锁簿记(Continuum 论文
+     明确写了 deadlock prevention);任意压力下优雅退化(排序总是良定义);
+     radix 内 ~100 行实现,零调度器改动
+  2. **中位数排序 vs Bernstein 上界**:排序不需要置信界;上界偏保守会多占内存
+  3. **与量化 KV 组合**(创新点1):fp4 池 3× 容量改变压力常数,retention 收益
+     与重算成本/prefill 速度耦合——这是 Continuum(bf16 数据中心)没有的维度
+  4. **端侧消费级平台**(sm86 单卡)vs 数据中心
+- 其他相关:Autellix(end-of-turn 驱逐)、AttentionStore/CachedAttention(分层
+  缓存、scheduler-aware 驱逐,但无工具延迟预测)、AsymCache(重算成本感知驱逐)、
+  Parrot(应用语义暴露)、SGLang RadixAttention(我们的实现基座)

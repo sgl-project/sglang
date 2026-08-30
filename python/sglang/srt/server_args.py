@@ -328,6 +328,8 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
+    enable_tool_retention: bool = False
+    tool_retention_prior: Optional[str] = None
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
@@ -1877,6 +1879,22 @@ class ServerArgs:
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
+        )
+        parser.add_argument(
+            "--enable-tool-retention",
+            action="store_true",
+            help="Retain agent-session KV prefixes during tool-execution windows: "
+            "finished tool-call turns annotate the radix leaf with an expected "
+            "return time and eviction prefers evicting the latest-returning "
+            "leaves first.",
+        )
+        parser.add_argument(
+            "--tool-retention-prior",
+            type=str,
+            default=None,
+            help="JSON file with per-tool mean execution latencies in seconds "
+            '(e.g. {"run_tests": 10.0}) seeding the tool-retention policy; '
+            "estimates are refined online.",
         )
         parser.add_argument(
             "--cuda-graph-max-bs",

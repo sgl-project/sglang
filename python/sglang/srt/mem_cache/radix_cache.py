@@ -20,6 +20,7 @@ The radix tree data structure for managing the KV cache.
 """
 
 import heapq
+import logging
 import time
 from collections import defaultdict
 from functools import partial
@@ -38,6 +39,9 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.tool_retention import ToolRetentionPolicy
+
+logger = logging.getLogger(__name__)
 
 
 class TreeNode:
@@ -51,6 +55,12 @@ class TreeNode:
         self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
+
+        # Tool-retention policy: monotonic timestamp of the session's expected
+        # next access (set when the finished output ended in a tool call), or
+        # 0.0 when unknown. Eviction orders by _evict_key() below.
+        self.predicted_return = 0.0
+        self.retention_tool: Optional[str] = None
 
         self.hit_count = 0
         # indicating the node is locked to protect from eviction
@@ -89,8 +99,20 @@ class TreeNode:
             return None
         return self.hash_value[-1]
 
+    # Nodes with a pending return prediction sort by that prediction (the one
+    # expected to return *latest* is evicted first); nodes without one are
+    # evicted before any predicted node (a session that ended without a tool
+    # call is not coming back). With no predictions in the tree this reduces
+    # to plain LRU (monotonic shift of last_access_time).
+    _NO_PREDICTION_BIAS = 1e18
+
+    def _evict_key(self) -> float:
+        if self.predicted_return > 0.0:
+            return -self.predicted_return
+        return self.last_access_time - TreeNode._NO_PREDICTION_BIAS
+
     def __lt__(self, other: "TreeNode"):
-        return self.last_access_time < other.last_access_time
+        return self._evict_key() < other._evict_key()
 
 
 def _key_match_page_size1(key0: List, key1: List):
@@ -122,6 +144,7 @@ class RadixCache(BasePrefixCache):
         page_size: int,
         disable: bool = False,
         enable_kv_cache_events: bool = False,
+        retention_policy: Optional["ToolRetentionPolicy"] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -129,6 +152,9 @@ class RadixCache(BasePrefixCache):
         self.disable = disable
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
+        # Tool-execution-window retention (agent workloads); None = plain LRU.
+        self.retention_policy = retention_policy
+        self._last_insert_leaf: Optional[TreeNode] = None
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -229,6 +255,24 @@ class RadixCache(BasePrefixCache):
         new_prefix_len = self.insert(
             token_ids[:page_aligned_len], page_aligned_kv_indices
         )
+
+        # Tool-retention: if this output ended in a tool call, the session will
+        # come back after the tool's execution latency — annotate the leaf so
+        # eviction spares it until then (and prefers evicting it last).
+        if self.retention_policy is not None and self._last_insert_leaf is not None:
+            tool = self.retention_policy.detect_tool(req.output_ids)
+            if tool is not None:
+                leaf = self._last_insert_leaf
+                leaf.predicted_return = self.retention_policy.predict_return(tool)
+                leaf.retention_tool = tool
+                self.retention_policy.n_annotated += 1
+                if self.retention_policy.n_annotated == 1:
+                    logger.info(
+                        "tool retention: first annotated leaf (tool=%s, return in %.2fs)",
+                        tool,
+                        leaf.predicted_return - time.monotonic(),
+                    )
+
         self.token_to_kv_pool_allocator.free(
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
@@ -296,6 +340,13 @@ class RadixCache(BasePrefixCache):
             return
 
         leaves = self._collect_leaves()
+        if self.retention_policy is not None:
+            # Expired predictions (session never returned) fall back to LRU.
+            now = time.monotonic()
+            for x in leaves:
+                if 0 < x.predicted_return < now:
+                    x.predicted_return = 0.0
+                    x.retention_tool = None
         heapq.heapify(leaves)
 
         num_evicted = 0
@@ -372,6 +423,17 @@ class RadixCache(BasePrefixCache):
         value = []
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
+            if child.predicted_return > 0.0 and self.retention_policy is not None:
+                # Session returned from its tool call: refine the per-tool gap
+                # estimate with the observed elapsed time. Note: a shared
+                # prefix traversed by an unrelated request also lands here
+                # (mild over-observation, acceptable for an EMA).
+                self.retention_policy.observe(
+                    child.retention_tool,
+                    time.monotonic() - child.last_access_time,
+                )
+                child.predicted_return = 0.0
+                child.retention_tool = None
             child.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
@@ -411,6 +473,7 @@ class RadixCache(BasePrefixCache):
     def _insert_helper(self, node: TreeNode, key: List, value):
         node.last_access_time = time.monotonic()
         if len(key) == 0:
+            self._last_insert_leaf = node
             return 0
 
         child_key = self.get_child_key_fn(key)
@@ -439,6 +502,7 @@ class RadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
             self._record_store_event(new_node)
+        self._last_insert_leaf = node
         return total_prefix_length
 
     def _print_helper(self, node: TreeNode, indent: int):

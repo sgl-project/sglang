@@ -684,12 +684,17 @@ class Scheduler(
                     tp_group=self.tp_group,
                 )
             else:
+                from sglang.srt.mem_cache.tool_retention import (
+                    build_tool_retention_policy,
+                )
+
                 self.tree_cache = RadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
+                    retention_policy=build_tool_retention_policy(server_args),
                 )
 
         self.decode_mem_cache_buf_multiplier = (

@@ -1,26 +1,25 @@
 """Agent KV-cache pressure harness (innovation #2 evaluation).
 
 Drives N concurrent multi-turn agent sessions against an OpenAI-compatible
-SGLang endpoint and measures the cost of the *continuation* request (the turn
-sent after a simulated tool execution), which is exactly the request whose
-prefix either hits the radix cache (cheap incremental prefill) or was evicted
-under pressure (full recompute).
+SGLang endpoint using the standard tool-calling loop, and measures the cost of
+the *continuation* request (the turn sent after a simulated tool execution),
+whose prefix either hits the radix cache (cheap incremental prefill) or was
+evicted under pressure (full recompute).
 
 Session structure per round r:
-  1. action turn    : full conversation -> short assistant reply (cached)
-  2. tool gap       : sleep(latency sampled from the tool's calibrated table)
-  3. continuation   : conversation + tool result -> model continues.
-                      ^ TTFT / prompt_tokens of THIS request is the metric.
-                      hit  -> prompt_tokens ~= incremental (tool result only)
-                      miss -> prompt_tokens ~= full prefix (regret: evicted)
+  1. action turn    : conversation + tools -> model emits <tool_call> (the
+                      finished turn's KV gets inserted into the radix cache)
+  2. tool gap       : sleep(latency sampled from the called tool's table)
+  3. continuation   : tool result appended -> model continues (METRIC TURN:
+                      TTFT + prompt_tokens; hit ~ incremental prefill, miss ~
+                      full recompute)
 
-Assistant turns reuse the model's actual output text, so the rendered token
-prefix is continuous and radix-cache hits are exact. Tools are represented at
-the message level (no API tool binding): the caching behavior only depends on
-the token sequence, and the tool-call parser plays no role in it.
+TTFT is measured on streaming continuation turns. sglang does not expose
+cached_tokens, so hit/miss is classified from TTFT-per-prompt-token (the two
+regimes differ by >20x at long contexts).
 
 Usage (host):
-  python harness.py --concurrency 32 --rounds 6 --out run_lru_n32.jsonl
+  python harness.py --concurrency 32 --rounds 6 --out run.jsonl
 """
 import argparse
 import asyncio
@@ -39,12 +38,21 @@ TOOL_TABLE = {
     "code_edit": (math.log(4.0), 0.6),   # 2-8s
     "run_tests": (math.log(10.0), 0.8),  # 4-30s
 }
-TOOL_MIX = {"quick_fs": 0.5, "web_search": 0.2, "run_tests": 0.2, "code_edit": 0.1}
+
+TOOLS = [
+    {"type": "function", "function": {"name": "quick_fs", "description": "Fast filesystem operation: list, read or search files in the repo.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "pattern": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "web_search", "description": "Search the web for documentation or solutions.",
+     "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "code_edit", "description": "Apply an edit to a source file.",
+     "parameters": {"type": "object", "properties": {"file": {"type": "string"}, "change": {"type": "string"}}, "required": ["file", "change"]}}},
+    {"type": "function", "function": {"name": "run_tests", "description": "Run the project test suite and return results.",
+     "parameters": {"type": "object", "properties": {"scope": {"type": "string"}}, "required": ["scope"]}}},
+]
 
 SYSTEM = (
-    "You are a coding agent working inside a repository. At each step, name the "
-    "single tool you would call next (quick_fs, web_search, code_edit or "
-    "run_tests) with its arguments, then stop. Keep the reply under 30 words."
+    "You are a coding agent working inside a repository. Use the provided tools "
+    "to make progress on the task, one tool call per turn."
 )
 
 TASKS = [
@@ -72,25 +80,15 @@ def build_doc(sess: int, start: int, target_chars: int) -> str:
     mimics repo files the agent keeps in context (what makes prefixes unique)."""
     parts, total, i = [], 0, start
     while total < target_chars:
-        chunk = DOC_TMPL.format(i=i, sess=sess % 89)
-        parts.append(chunk)
-        total += len(chunk)
+        parts.append(DOC_TMPL.format(i=i, sess=sess % 89))
+        total += len(parts[-1])
         i += 1
     return "".join(parts)
 
 
-def sample_tool(rng: random.Random) -> str:
-    x, acc = rng.random(), 0.0
-    for name, w in TOOL_MIX.items():
-        acc += w
-        if x < acc:
-            return name
-    return "quick_fs"
-
-
-def sample_latency(tool: str, rng: random.Random) -> float:
+def sample_latency(tool: str, rng: random.Random, scale: float = 1.0) -> float:
     mu, sigma = TOOL_TABLE[tool]
-    return rng.lognormvariate(mu, sigma)
+    return rng.lognormvariate(mu, sigma) * scale
 
 
 def tool_result_text(tool: str, rng: random.Random) -> str:
@@ -110,11 +108,8 @@ def tool_result_text(tool: str, rng: random.Random) -> str:
 
 
 class Session:
-    def __init__(self, sid: int, rounds: int, base_chars: int, growth_chars: int,
-                 rng: random.Random):
+    def __init__(self, sid: int, base_chars: int, growth_chars: int):
         self.sid = sid
-        self.rounds = rounds
-        self.rng = rng
         self.growth_chars = growth_chars
         self.doc_i = 0
         self.messages = [
@@ -122,68 +117,92 @@ class Session:
             {"role": "user", "content": (
                 f"Repository snapshot (files in context):\n\n```python\n"
                 f"{self.next_doc(base_chars)}\n```\n\n"
-                f"Task: {TASKS[sid % len(TASKS)]}. Which tool do you call first?")},
+                f"Task: {TASKS[sid % len(TASKS)]}. Use a tool to start.")},
         ]
-        self.tools_planned = [sample_tool(rng) for _ in range(rounds)]
-        self.gaps = [sample_latency(t, rng) for t in self.tools_planned]
 
     def next_doc(self, target_chars: int) -> str:
         doc = build_doc(self.sid, self.doc_i, target_chars)
         self.doc_i += max(1, target_chars // 300)
         return doc
 
-    def grow(self, tool: str):
+    def grow(self):
         """Unique context growth per round (retrieved document chunk)."""
         self.messages.append({"role": "user", "content": (
-            f"Additional context retrieved via {tool}:\n\n```python\n"
+            f"Additional retrieved context:\n\n```python\n"
             f"{self.next_doc(self.growth_chars)}\n```")})
 
 
-async def run_turn(client, model, messages, max_tokens):
-    """Returns (text, ttft_ms, prompt_tokens). TTFT from first streamed content."""
+async def run_action_turn(client, model, messages, max_tokens):
+    """Non-streaming tool-calling turn. Returns (assistant_msg, prompt_tokens)."""
+    resp = await client.chat.completions.create(
+        model=model, messages=messages, tools=TOOLS, tool_choice="auto",
+        temperature=0.001, max_tokens=max_tokens,
+    )
+    msg = resp.choices[0].message
+    prompt_tokens = resp.usage.prompt_tokens if resp.usage else None
+    # normalize to an OpenAI history message
+    hist = {"role": "assistant", "content": msg.content or ""}
+    if msg.tool_calls:
+        hist["tool_calls"] = [
+            {"id": tc.id, "type": "function",
+             "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+            for tc in msg.tool_calls
+        ]
+    return hist, prompt_tokens
+
+
+async def run_continuation_turn(client, model, messages, max_tokens):
+    """Streaming turn; TTFT = first streamed delta (content or tool call)."""
     t0 = time.perf_counter()
     ttft = None
-    parts = []
     usage = None
     stream = await client.chat.completions.create(
-        model=model, messages=messages, temperature=0.001, max_tokens=max_tokens,
-        stream=True, stream_options={"include_usage": True},
+        model=model, messages=messages, tools=TOOLS, tool_choice="auto",
+        temperature=0.001, max_tokens=max_tokens, stream=True,
+        stream_options={"include_usage": True},
     )
     async for chunk in stream:
         if getattr(chunk, "usage", None) is not None:
             usage = chunk.usage
-        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-            if ttft is None:
-                ttft = (time.perf_counter() - t0) * 1000
-            parts.append(chunk.choices[0].delta.content)
+        if chunk.choices:
+            d = chunk.choices[0].delta
+            if (d and d.content) or (d and d.tool_calls):
+                if ttft is None:
+                    ttft = (time.perf_counter() - t0) * 1000
     if ttft is None:
         ttft = (time.perf_counter() - t0) * 1000
-    return "".join(parts).strip() or "(no text)", ttft, usage
+    return ttft, usage.prompt_tokens if usage else None
 
 
 async def run_session(sid, args, client, model, out_f, lock):
     rng = random.Random(args.seed * 100003 + sid)
-    s = Session(sid, args.rounds, args.base_chars, args.growth_chars, rng)
-    for r in range(s.rounds):
-        tool, gap = s.tools_planned[r], s.gaps[r]
-        # --- action turn (prefix gets cached server-side here) ---
-        text1, ttft1, usage1 = await run_turn(client, model, s.messages, args.action_tokens)
-        s.messages.append({"role": "assistant", "content": text1})
-        # --- tool gap ---
+    s = Session(sid, args.base_chars, args.growth_chars)
+    for r in range(args.rounds):
+        # --- action turn: model emits a tool call; prefix cached server-side ---
+        hist, prompt_a = await run_action_turn(client, model, s.messages, args.action_tokens)
+        s.messages.append(hist)
+        calls = hist.get("tool_calls") or []
+        if not calls:  # model replied in prose; treat as a quick_fs tick
+            calls = [{"id": f"fallback_{sid}_{r}", "type": "function",
+                      "function": {"name": "quick_fs", "arguments": "{}"}}]
+            s.messages.append({"role": "user", "content": "Please use one of the tools."})
+        # --- tool gap: parallel calls overlap; wait for the slowest ---
+        tools_called = [tc["function"]["name"] for tc in calls]
+        gaps = [sample_latency(t, rng, args.latency_scale) for t in tools_called]
+        gap = max(gaps)
         await asyncio.sleep(gap)
         # --- continuation turn (METRIC) ---
-        result = tool_result_text(tool, rng)
-        s.messages.append({"role": "user", "content": (
-            f"Tool `{tool}` finished in {gap:.2f}s:\n{result}\n\n"
-            f"Given this, which tool do you call next?")})
-        text2, ttft2, usage2 = await run_turn(client, model, s.messages, args.action_tokens)
-        s.messages.append({"role": "assistant", "content": text2})
-        s.grow(tool)
+        for tc in calls:
+            s.messages.append({"role": "tool", "tool_call_id": tc["id"], "content":
+                               tool_result_text(tc["function"]["name"], rng)})
+        ttft_c, prompt_c = await run_continuation_turn(client, model, s.messages, args.action_tokens)
+        # close the assistant turn for history continuity
+        s.messages.append({"role": "assistant", "content": "Continuing."})
+        s.grow()
         rec = {
-            "sid": sid, "round": r, "tool": tool, "gap_s": round(gap, 3),
-            "ttft_action_ms": round(ttft1, 1), "ttft_cont_ms": round(ttft2, 1),
-            "prompt_action": usage1.prompt_tokens if usage1 else None,
-            "prompt_cont": usage2.prompt_tokens if usage2 else None,
+            "sid": sid, "round": r, "tools": tools_called, "gap_s": round(gap, 3),
+            "ttft_action_ms": None, "ttft_cont_ms": round(ttft_c, 1),
+            "prompt_action": prompt_a, "prompt_cont": prompt_c,
             "ts": time.time(),
         }
         async with lock:
@@ -193,20 +212,18 @@ async def run_session(sid, args, client, model, out_f, lock):
 
 def summarize(recs, dur, args):
     cont_t = [r["ttft_cont_ms"] for r in recs]
-    act_t = [r["ttft_action_ms"] for r in recs]
     pc = [r["prompt_cont"] for r in recs if r["prompt_cont"]]
-    # Hit/miss classifier: sglang does not expose cached_tokens, but the TTFT
-    # cost per prompt token separates cleanly (cache hit: prefill is only the
-    # ~100-token increment -> ~0.01 ms/tok; miss: full recompute ~0.2-0.5 ms/tok).
-    # miss  <=>  ttft_ms > 0.1 * prompt_tokens + 200
+    # miss <=> ttft_ms > 0.1 * prompt_tokens + 200 (hit ~0.01 ms/tok, miss ~0.2-1)
     def is_miss(r):
         return r["prompt_cont"] and r["ttft_cont_ms"] > 0.1 * r["prompt_cont"] + 200
     miss = [r for r in recs if is_miss(r)]
     hit = [r for r in recs if not is_miss(r)]
+    gapw = [(r["gap_s"], r["ttft_cont_ms"]) for r in recs]
+    # recompute-token cost actually paid: prompt_tokens of missed turns
+    wasted = sum(r["prompt_cont"] for r in miss if r["prompt_cont"])
     lines = [
-        f"===== KV-bench summary =====",
+        "===== KV-bench summary =====",
         f"config: N={args.concurrency} rounds={args.rounds} seed={args.seed} wall={dur:.0f}s requests={len(recs)}",
-        f"action TTFT  ms: p50={statistics.median(act_t):.0f} mean={statistics.mean(act_t):.0f}",
         f"cont TTFT    ms: p50={statistics.median(cont_t):.0f} "
         f"p90={sorted(cont_t)[int(len(cont_t) * 0.9)]:.0f} mean={statistics.mean(cont_t):.0f}",
         f"evicted(miss): {len(miss)}/{len(recs)} = {len(miss) / len(recs) * 100:.1f}%",
@@ -217,6 +234,14 @@ def summarize(recs, dur, args):
     if miss:
         lines.append(f"  miss TTFT p50={statistics.median([r['ttft_cont_ms'] for r in miss]):.0f}ms "
                      f"prompt p50={statistics.median([r['prompt_cont'] for r in miss]):.0f}")
+    # gap-conditional miss rate: fast tools (<=1s) vs slow (>1s)
+    fast = [r for r in recs if r["gap_s"] <= 1.0]
+    slow = [r for r in recs if r["gap_s"] > 1.0]
+    if fast:
+        lines.append(f"  fast-tool(<=1s) n={len(fast)} miss={sum(map(is_miss, fast)) / len(fast) * 100:.0f}%")
+    if slow:
+        lines.append(f"  slow-tool(>1s)  n={len(slow)} miss={sum(map(is_miss, slow)) / len(slow) * 100:.0f}%")
+    lines.append(f"wasted recompute tokens (miss turns): {wasted}")
     lines.append(f"total continuation prompt tokens: {sum(pc)}")
     return "\n".join(lines)
 
@@ -229,8 +254,10 @@ async def main():
     ap.add_argument("--rounds", type=int, default=6)
     ap.add_argument("--base-chars", type=int, default=9000, help="~2.2k tok initial doc")
     ap.add_argument("--growth-chars", type=int, default=5000, help="~1.2k tok growth/round")
-    ap.add_argument("--action-tokens", type=int, default=64)
+    ap.add_argument("--action-tokens", type=int, default=96)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--latency-scale", type=float, default=1.0,
+                    help="multiply all sampled tool latencies (sensitivity analysis)")
     ap.add_argument("--out", default="kvbench_run.jsonl")
     args = ap.parse_args()
 
