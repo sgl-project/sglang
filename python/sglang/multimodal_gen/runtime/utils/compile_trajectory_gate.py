@@ -36,7 +36,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
-from typing import Callable, Dict, Mapping, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, Sequence, Tuple
 
 import torch
 
@@ -132,12 +132,19 @@ class CompiledPlanManifest:
     status: str  # "validated" or "rejected"
     checkpoint_metrics: Mapping[str, Mapping[str, float]]
     decision_trace_matched: bool | None = None
+    # Cold compile/warmup wall time, warm steady-state latency, graph count,
+    # graph breaks, recompiles, and peak memory, keyed by metric name -- the
+    # RFC's benchmark report. Optional and caller-defined: this module does
+    # not measure anything itself.
+    benchmark: Mapping[str, float] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.status not in ("validated", "rejected"):
             raise ValueError(
                 f"status must be 'validated' or 'rejected', got {self.status!r}"
             )
+        if self.benchmark is None:
+            object.__setattr__(self, "benchmark", {})
 
     @property
     def is_validated(self) -> bool:
@@ -166,6 +173,7 @@ class CompiledPlanManifest:
                 name: dict(metrics) for name, metrics in self.checkpoint_metrics.items()
             },
             "decision_trace_matched": self.decision_trace_matched,
+            "benchmark": dict(self.benchmark),
         }
 
     @classmethod
@@ -193,6 +201,7 @@ class CompiledPlanManifest:
                 for name, metrics in data["checkpoint_metrics"].items()
             },
             decision_trace_matched=data.get("decision_trace_matched"),
+            benchmark=dict(data.get("benchmark") or {}),
         )
 
 
@@ -266,7 +275,7 @@ def compute_tensor_metrics(
     }
 
 
-def _passes_thresholds(
+def passes_thresholds(
     metrics: Mapping[str, float], thresholds: Mapping[str, float]
 ) -> bool:
     for metric_name, bound in thresholds.items():
@@ -285,6 +294,80 @@ def _passes_thresholds(
 StepFn = Callable[[int, str], "torch.Tensor | None"]
 
 
+def audit_custom_op_mutation_declaration(
+    op_func: Callable[..., Any],
+    kwargs: Mapping[str, torch.Tensor],
+    declared_mutates_args: Sequence[str],
+) -> None:
+    """Verify a custom op's actual in-place mutations match its declared
+    ``mutates_args`` (see :func:`runtime.layers.utils.direct_register_custom_op`).
+
+    Per the RFC: "If a compiled region mutates cache buffers, the custom-op
+    metadata and fake implementation must declare those mutations
+    accurately. Otherwise the plan is rejected even if one sample appears
+    numerically close." ``torch.compile`` is free to reorder or eliminate a
+    call whose mutation isn't declared, since nothing tells it the call has
+    a side effect -- a failure mode no tensor-parity check on the op's
+    *return value* would ever catch, because the op's inputs (not its
+    return value) are what silently goes stale.
+
+    Runs ``op_func(**kwargs)`` once and compares each tensor argument
+    before/after. Raises on either direction of mismatch: an undeclared
+    mutation (unsafe under compilation) or a declared one that didn't
+    happen (an over-broad ``mutates_args`` that blocks optimizations the op
+    doesn't actually need blocked).
+    """
+    before = {
+        name: tensor.detach().clone()
+        for name, tensor in kwargs.items()
+        if isinstance(tensor, torch.Tensor)
+    }
+    op_func(**kwargs)
+    declared = set(declared_mutates_args)
+    for name, tensor in kwargs.items():
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        mutated = not torch.equal(before[name], tensor)
+        if mutated and name not in declared:
+            raise CompileGateError(
+                f"custom op mutated argument {name!r} in place but it is not "
+                f"declared in mutates_args={sorted(declared)}; torch.compile "
+                "may reorder or eliminate this call, producing silently wrong "
+                "results only under compilation"
+            )
+        if not mutated and name in declared:
+            raise CompileGateError(
+                f"custom op declares argument {name!r} in mutates_args but did "
+                "not mutate it during this audit call"
+            )
+
+
+def assert_no_cross_request_buffer_reuse(
+    first_request_tensors: Sequence[torch.Tensor],
+    second_request_tensors: Sequence[torch.Tensor],
+) -> None:
+    """Raise if a second request's captured tensor shares storage with a
+    tensor captured for an earlier request.
+
+    Per the RFC: "Compiled state must remain request-owned; graphs may not
+    capture a mutable tensor belonging to a prior request." A compiled
+    region that returns a view onto (or the same storage as) a buffer from
+    an earlier request is unsafe even when its values happen to match, so
+    this check is independent of --  and runs alongside -- the tensor
+    metric thresholds.
+    """
+    first_ptrs = {
+        tensor.untyped_storage().data_ptr() for tensor in first_request_tensors
+    }
+    for tensor in second_request_tensors:
+        if tensor.untyped_storage().data_ptr() in first_ptrs:
+            raise CompileGateError(
+                "candidate compiled region returned a tensor sharing storage "
+                "with a tensor captured for a prior request; compiled state "
+                "must be request-owned, not reused across requests"
+            )
+
+
 def run_trajectory_gate(
     *,
     signature: CompileWorkloadSignature,
@@ -296,6 +379,8 @@ def run_trajectory_gate(
     compile_options: Mapping[str, object] = None,  # type: ignore[assignment]
     reference_decision_trace: Sequence[object] = None,  # type: ignore[assignment]
     candidate_decision_trace: Sequence[object] = None,  # type: ignore[assignment]
+    second_request_candidate_step_fn: StepFn = None,  # type: ignore[assignment]
+    second_request_checkpoint_schedule: Sequence[Tuple[int, str]] = None,  # type: ignore[assignment]
 ) -> CompiledPlanManifest:
     """Warm and validate a compiled candidate against an eager reference.
 
@@ -310,6 +395,14 @@ def run_trajectory_gate(
     and ``candidate_decision_trace`` (e.g. per-step cache/skip decisions) must
     both be supplied and must compare equal, in addition to the tensor
     thresholds, for the plan to be promoted.
+
+    When ``second_request_candidate_step_fn`` is supplied (with its own
+    ``second_request_checkpoint_schedule``), it is run as an independent
+    second request through the same compiled candidate and checked via
+    :func:`assert_no_cross_request_buffer_reuse` against the first request's
+    captured tensors -- catching a compiled region that mutates or aliases
+    request-owned state across requests, which no tensor-metric comparison
+    on its own would notice.
     """
     if compile_options is None:
         compile_options = {}
@@ -326,6 +419,7 @@ def run_trajectory_gate(
         )
 
     checkpoint_metrics: Dict[str, Dict[str, float]] = {}
+    candidate_tensors: list[torch.Tensor] = []
     for step_index, checkpoint_name in checkpoint_schedule:
         ref_tensor = reference_step_fn(step_index, checkpoint_name)
         cand_tensor = candidate_step_fn(step_index, checkpoint_name)
@@ -336,6 +430,7 @@ def run_trajectory_gate(
                 f"checkpoint {checkpoint_name!r} is declared in the gate but the "
                 "step function returned no tensor for it"
             )
+        candidate_tensors.append(cand_tensor)
         checkpoint_metrics[checkpoint_name] = compute_tensor_metrics(
             ref_tensor, cand_tensor
         )
@@ -349,7 +444,7 @@ def run_trajectory_gate(
     status = "validated"
     for checkpoint_name, metrics in checkpoint_metrics.items():
         thresholds = gate.tensor_thresholds[checkpoint_name]
-        if not _passes_thresholds(metrics, thresholds):
+        if not passes_thresholds(metrics, thresholds):
             status = "rejected"
             logger.info(
                 "compile trajectory gate rejected at checkpoint %r: metrics=%s thresholds=%s",
@@ -362,6 +457,26 @@ def run_trajectory_gate(
     if decision_trace_matched is False:
         status = "rejected"
         logger.info("compile trajectory gate rejected: decision trace mismatch")
+
+    if status == "validated" and second_request_candidate_step_fn is not None:
+        if second_request_checkpoint_schedule is None:
+            raise CompileGateError(
+                "second_request_candidate_step_fn was supplied but "
+                "second_request_checkpoint_schedule was not"
+            )
+        second_request_tensors = [
+            tensor
+            for step_index, checkpoint_name in second_request_checkpoint_schedule
+            if (tensor := second_request_candidate_step_fn(step_index, checkpoint_name))
+            is not None
+        ]
+        try:
+            assert_no_cross_request_buffer_reuse(
+                candidate_tensors, second_request_tensors
+            )
+        except CompileGateError as exc:
+            status = "rejected"
+            logger.info("compile trajectory gate rejected: %s", exc)
 
     return CompiledPlanManifest(
         signature=signature,

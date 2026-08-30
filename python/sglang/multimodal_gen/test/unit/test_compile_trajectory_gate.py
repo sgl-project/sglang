@@ -21,6 +21,8 @@ from sglang.multimodal_gen.runtime.utils.compile_trajectory_gate import (
     CompileGateError,
     CompileWorkloadSignature,
     TrajectoryGate,
+    assert_no_cross_request_buffer_reuse,
+    audit_custom_op_mutation_declaration,
     compute_tensor_metrics,
     load_manifests,
     run_trajectory_gate,
@@ -29,6 +31,8 @@ from sglang.multimodal_gen.runtime.utils.compile_trajectory_gate import (
 
 
 def _device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
@@ -410,6 +414,109 @@ class TestSelectValidatedPlan:
         assert select_validated_plan([rejected], sig) is None
 
 
+class TestCustomOpMutationAudit:
+    """RFC: "the custom-op metadata and fake implementation must declare
+    [cache-buffer] mutations accurately. Otherwise the plan is rejected
+    even if one sample appears numerically close." -- these tests exercise
+    real in-place tensor mutation, not mocks."""
+
+    def test_correctly_declared_mutation_passes(self):
+        def op(cache: torch.Tensor, value: torch.Tensor) -> None:
+            cache.add_(value)
+
+        cache = torch.zeros(4, device=DEVICE)
+        value = torch.ones(4, device=DEVICE)
+        audit_custom_op_mutation_declaration(
+            op, {"cache": cache, "value": value}, declared_mutates_args=["cache"]
+        )
+
+    def test_undeclared_mutation_raises(self):
+        def op(cache: torch.Tensor, value: torch.Tensor) -> None:
+            cache.add_(value)
+
+        cache = torch.zeros(4, device=DEVICE)
+        value = torch.ones(4, device=DEVICE)
+        with pytest.raises(CompileGateError):
+            audit_custom_op_mutation_declaration(
+                op, {"cache": cache, "value": value}, declared_mutates_args=[]
+            )
+
+    def test_over_declared_mutation_raises(self):
+        def op(cache: torch.Tensor, value: torch.Tensor) -> None:
+            cache.add_(value)
+
+        cache = torch.zeros(4, device=DEVICE)
+        value = torch.ones(4, device=DEVICE)
+        with pytest.raises(CompileGateError):
+            audit_custom_op_mutation_declaration(
+                op,
+                {"cache": cache, "value": value},
+                declared_mutates_args=["cache", "value"],
+            )
+
+    def test_no_mutation_no_declaration_passes(self):
+        def op(x: torch.Tensor) -> torch.Tensor:
+            return x + 1
+
+        x = torch.zeros(4, device=DEVICE)
+        audit_custom_op_mutation_declaration(op, {"x": x}, declared_mutates_args=[])
+
+
+class TestCrossRequestBufferReuse:
+    """Compiled state must stay request-owned -- a compiled region that
+    returns a tensor aliasing a buffer captured for an earlier request must
+    be rejected even when the numbers happen to match (RFC "Stateful and
+    cache-aware behavior")."""
+
+    def test_disjoint_storage_passes(self):
+        first = [torch.randn(4, device=DEVICE) for _ in range(2)]
+        second = [torch.randn(4, device=DEVICE) for _ in range(2)]
+        assert_no_cross_request_buffer_reuse(first, second)
+
+    def test_shared_storage_raises(self):
+        shared = torch.randn(4, device=DEVICE)
+        first = [shared]
+        second = [shared.view(4)]
+        with pytest.raises(CompileGateError):
+            assert_no_cross_request_buffer_reuse(first, second)
+
+    def test_run_trajectory_gate_rejects_leaked_buffer_across_requests(self):
+        gate = _make_gate(checkpoints=("step_0",))
+        signature = _make_signature()
+        leaked = torch.randn(8, device=DEVICE)
+
+        manifest = run_trajectory_gate(
+            signature=signature,
+            gate=gate,
+            reference_step_fn=lambda i, name: leaked,
+            candidate_step_fn=lambda i, name: leaked,
+            checkpoint_schedule=[(0, "step_0")],
+            second_request_candidate_step_fn=lambda i, name: leaked,
+            second_request_checkpoint_schedule=[(0, "step_0")],
+        )
+
+        assert manifest.status == "rejected"
+
+    def test_run_trajectory_gate_validates_independent_second_request(self):
+        gate = _make_gate(checkpoints=("step_0",))
+        signature = _make_signature()
+        t = torch.randn(8, device=DEVICE)
+
+        manifest = run_trajectory_gate(
+            signature=signature,
+            gate=gate,
+            reference_step_fn=lambda i, name: t,
+            candidate_step_fn=lambda i, name: t,
+            checkpoint_schedule=[(0, "step_0")],
+            second_request_candidate_step_fn=lambda i, name: torch.randn(
+                8, device=DEVICE
+            ),
+            second_request_checkpoint_schedule=[(0, "step_0")],
+        )
+
+        assert manifest.status == "validated"
+
+
 class TestManifestSerialization:
     """Covers CompiledPlanManifest.to_dict/from_dict and load_manifests --
     the "machine-readable promotion manifest" artifact the RFC requires,
@@ -428,12 +535,25 @@ class TestManifestSerialization:
                 "step_0": {"cosine_similarity": 0.9995, "max_abs": 1e-4}
             },
             decision_trace_matched=True,
+            benchmark={"cold_compile_time_s": 12.5, "peak_memory_mb": 4096.0},
         )
 
     def test_to_dict_round_trips_through_from_dict(self):
         manifest = self._make_manifest()
         restored = CompiledPlanManifest.from_dict(manifest.to_dict())
         assert restored == manifest
+
+    def test_benchmark_defaults_to_empty_mapping(self):
+        sig = _make_signature()
+        manifest = CompiledPlanManifest(
+            signature=sig,
+            regions=(),
+            compile_options={},
+            gate_digest=sig.digest(),
+            status="validated",
+            checkpoint_metrics={},
+        )
+        assert manifest.benchmark == {}
 
     def test_to_dict_is_json_serializable(self):
         manifest = self._make_manifest()

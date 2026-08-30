@@ -529,7 +529,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             num_inference_steps=(
                 steps if isinstance(steps, int) else steps[0] if steps else 0
             ),
-            cfg_mode="cfg" if batch.do_classifier_free_guidance else "no_cfg",
+            cfg_mode=(
+                "no_cfg"
+                if not batch.do_classifier_free_guidance
+                else (
+                    "cfg_parallel"
+                    if getattr(self.server_args, "enable_cfg_parallel", False)
+                    else "cfg"
+                )
+            ),
             cache_mode=cache_mode,
             state_schema_version="v1",
         )
@@ -573,6 +581,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 signature,
             )
             return False
+        logger.info(
+            "compile-trajectory-gate: signature %s covered by validated plan "
+            "(gate_digest=%s); compiling",
+            signature,
+            plan.gate_digest,
+        )
         return True
 
     def _maybe_torch_compile(
@@ -637,9 +651,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 compile_kwargs=compile_kwargs,
             )
             logger.info(
-                "Enabled regional torch.compile for %d submodules in %s",
+                "Enabled regional torch.compile for %d submodules in %s "
+                "(region_digest=%s)",
                 compiled_count,
                 type(module).__name__,
+                self._torch_compile_registry.region_digest(module),
             )
         else:
             # TODO(triple-mu): support customized fullgraph and dynamic in the future
