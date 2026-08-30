@@ -90,6 +90,35 @@ from sglang.srt.utils import (
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
 
+
+def apply_aiter_attention_sink(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    attn_sink: torch.Tensor,
+) -> torch.Tensor:
+    """Apply HYV4's zero-valued attention sink to AITER MLA output.
+
+    AITER returns the sink-free normalized output and natural-log softmax
+    denominator. Appending a virtual key with score ``attn_sink`` and value
+    zero therefore only rescales the output by
+    ``exp(lse) / (exp(lse) + exp(attn_sink))``.
+    """
+    if output.ndim != 3:
+        raise ValueError(f"AITER MLA output must be 3D, got {output.shape}.")
+    if lse.shape != output.shape[:2]:
+        raise ValueError(
+            "AITER MLA LSE must match the output token/head dimensions, "
+            f"got lse={lse.shape}, output={output.shape}."
+        )
+    if attn_sink.ndim != 1 or attn_sink.shape[0] != output.shape[1]:
+        raise ValueError(
+            "Attention sink must contain one value per local attention head, "
+            f"got sink={attn_sink.shape}, output={output.shape}."
+        )
+    factor = torch.sigmoid(lse.float() - attn_sink.float().unsqueeze(0))
+    return (output.float() * factor.unsqueeze(-1)).to(output.dtype)
+
+
 if is_cuda():
     import deep_gemm
 
@@ -1901,9 +1930,10 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
-        if attn_sink is not None and dsa_impl != "flashmla_sparse":
+        if attn_sink is not None and dsa_impl not in ("flashmla_sparse", "aiter"):
             raise RuntimeError(
-                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
+                "Learnable attention sinks require flashmla_sparse or aiter, "
+                f"got {dsa_impl}"
             )
 
         if dsa_impl == "trtllm" and not self.use_mha:
@@ -2185,6 +2215,7 @@ class DeepseekSparseAttnBackend(
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 layer=layer,
+                attn_sink=attn_sink,
             )
         else:
             raise ValueError(
@@ -2213,9 +2244,12 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
-        if attn_sink is not None and self.dsa_decode_impl != "flashmla_sparse":
+        if attn_sink is not None and self.dsa_decode_impl not in (
+            "flashmla_sparse",
+            "aiter",
+        ):
             raise RuntimeError(
-                "Learnable attention sinks require flashmla_sparse, got "
+                "Learnable attention sinks require flashmla_sparse or aiter, got "
                 f"{self.dsa_decode_impl}"
             )
 
@@ -2364,6 +2398,7 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 bs=forward_batch.batch_size,
+                attn_sink=attn_sink,
             )
 
         else:
@@ -2978,6 +3013,7 @@ class DeepseekSparseAttnBackend(
         layer: RadixAttention,
         metadata: DSAMetadata,
         bs: int,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -3028,7 +3064,7 @@ class DeepseekSparseAttnBackend(
             )
             kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
 
-        mla_decode_fwd(
+        aiter_args = (
             q_kernel,
             kv_cache.view(-1, 1, 1, layer.head_dim),
             o_kernel,
@@ -3037,15 +3073,32 @@ class DeepseekSparseAttnBackend(
             kv_indices,
             kv_last_page_lens,
             metadata.max_seq_len_q,
+        )
+        aiter_kwargs = dict(
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
             q_scale=q_scale,
             kv_scale=kv_scale,
             **aiter_persistent_kwargs,
         )
+        lse = None
+        if attn_sink is None:
+            mla_decode_fwd(*aiter_args, **aiter_kwargs)
+        else:
+            _, lse = mla_decode_fwd(*aiter_args, return_lse=True, **aiter_kwargs)
+            if lse is None:
+                raise RuntimeError("AITER MLA did not return LSE for attention sinks.")
 
         if self.need_pad_heads:
             o = o_kernel[:, :: self.head_repeat_factor, :]
+            if lse is not None:
+                lse = lse[:, :: self.head_repeat_factor]
+
+        if attn_sink is not None:
+            assert lse is not None
+            output = o if self.need_pad_heads else o_kernel
+            output = apply_aiter_attention_sink(output, lse, attn_sink)
+            o = output if self.need_pad_heads else output.reshape_as(o)
 
         return o
 
@@ -3055,6 +3108,7 @@ class DeepseekSparseAttnBackend(
         kv_cache: torch.Tensor,
         page_table_1: torch.Tensor,
         layer: RadixAttention,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         num_tokens = q_all.shape[0]
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
@@ -3117,7 +3171,7 @@ class DeepseekSparseAttnBackend(
             kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
 
         # TODO support more forward_mode
-        mla_decode_fwd(
+        aiter_args = (
             q_kernel,
             kv_cache.view(-1, 1, 1, layer.head_dim),
             o_kernel,
@@ -3126,15 +3180,32 @@ class DeepseekSparseAttnBackend(
             kv_indices,
             kv_last_page_lens,
             1,  # max_seq_len_q = 1 for per-token attention
+        )
+        aiter_kwargs = dict(
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
             q_scale=q_scale,
             kv_scale=kv_scale,
             **aiter_persistent_kwargs,
         )
+        lse = None
+        if attn_sink is None:
+            mla_decode_fwd(*aiter_args, **aiter_kwargs)
+        else:
+            _, lse = mla_decode_fwd(*aiter_args, return_lse=True, **aiter_kwargs)
+            if lse is None:
+                raise RuntimeError("AITER MLA did not return LSE for attention sinks.")
 
         if self.need_pad_heads:
             o = o_kernel[:, :: self.head_repeat_factor, :]
+            if lse is not None:
+                lse = lse[:, :: self.head_repeat_factor]
+
+        if attn_sink is not None:
+            assert lse is not None
+            output = o if self.need_pad_heads else o_kernel
+            output = apply_aiter_attention_sink(output, lse, attn_sink)
+            o = output if self.need_pad_heads else output.reshape_as(o)
 
         return o
 

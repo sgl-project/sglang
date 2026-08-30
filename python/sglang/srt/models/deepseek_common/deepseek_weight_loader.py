@@ -78,6 +78,22 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _is_ue8m0_scale(tensor: torch.Tensor) -> bool:
+    """Return whether a scale tensor carries the optional UE8M0 marker."""
+    return bool(getattr(tensor, "format_ue8m0", False))
+
+
+def _get_effective_weight_block_size(
+    layer: nn.Module, quant_config: Optional[QuantizationConfig]
+) -> Optional[List[int]]:
+    """Prefer a layer-local block size after load-time format conversion."""
+    quant_method = getattr(layer, "quant_method", None)
+    layer_block_size = getattr(quant_method, "weight_block_size", None)
+    if layer_block_size is not None:
+        return layer_block_size
+    return quant_config.weight_block_size if quant_config is not None else None
+
+
 def _get_indexer_weight_block_size(
     quant_config: Optional[QuantizationConfig],
 ) -> List[int]:
@@ -605,95 +621,117 @@ class DeepseekV2WeightLoaderMixin:
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
+                kv_b_quant_method = getattr(self_attn.kv_b_proj, "quant_method", None)
+                exact_mxfp8_fallback = bool(
+                    getattr(kv_b_quant_method, "use_mxfp8", False)
+                    and (
+                        getattr(kv_b_quant_method, "emulate_mxfp8", False)
+                        or getattr(kv_b_quant_method, "convert_mxfp8_to_block", False)
+                    )
+                )
+
+                if exact_mxfp8_fallback:
+                    if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
+                        raise ValueError(
+                            "MXFP8 kv_b_proj fallback requires weight_scale_inv."
+                        )
+
+                    from sglang.srt.layers.quantization.mxfp8_block_convert import (
+                        dequant_mxfp8_to_bf16,
+                    )
+
+                    # kv_b_proj is absorbed into w_kc/w_vc below and therefore
+                    # never reaches Fp8LinearMethod.apply.  Dequantize its native
+                    # group-32 MXFP8 representation exactly before the split,
+                    # instead of normalizing to fnuz and requantizing it to a
+                    # lossy per-tensor FP8 representation.
+                    w = dequant_mxfp8_to_bf16(w, self_attn.kv_b_proj.weight_scale_inv)
+                    self_attn.w_scale = 1.0
+
                 # For mixed quantization (experts int4, linear fp8), use linear_fp8_config
-                selected_quant_config = getattr(
-                    self.quant_config, "linear_fp8_config", None
-                )
-                if selected_quant_config is None:
-                    selected_quant_config = self.quant_config
-                weight_block_size = (
-                    selected_quant_config.weight_block_size
-                    if selected_quant_config is not None
-                    else None
-                )
-                if weight_block_size is not None:
-                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv") or hasattr(
-                        self_attn.kv_b_proj, "weight_scale"
-                    )
-                    weight_scale = (
-                        self_attn.kv_b_proj.weight_scale
-                        if hasattr(self_attn.kv_b_proj, "weight_scale")
-                        else self_attn.kv_b_proj.weight_scale_inv
-                    )
-                    if _is_fp8_fnuz:
-                        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                            weight=w,
-                            weight_scale=weight_scale,
-                            input_scale=None,
-                        )
-                    else:
-                        weight = w
-
-                    # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
-                    if weight_scale.format_ue8m0 and weight_scale.dtype == torch.uint8:
-                        weight_scale = (weight_scale.to(torch.int32) << 23).view(
-                            torch.float32
-                        )
-                    elif (
-                        should_deepgemm_weight_requant_ue8m0(
-                            weight_block_size=(
-                                self.quant_config.weight_block_size
-                                if self.quant_config is not None
-                                else None
-                            )
-                        )
-                        and weight_scale.format_ue8m0
-                    ):
-                        weight_scale = inverse_transform_scale_ue8m0(
-                            weight_scale, mn=weight.shape[-2]
-                        )
-
-                    if (
-                        (_is_cuda or _is_musa or _is_xpu)
-                        and weight_block_size[0] == 128
-                        and weight_block_size[1] == 128
-                    ):
-                        if (
-                            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                            and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
-                            and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
-                        ):
-                            block_scale = weight_scale
-                            use_deep_gemm_bmm = True
-                        else:
-                            w = block_quant_dequant(
-                                weight,
-                                weight_scale,
-                                weight_block_size,
-                                torch.bfloat16,
-                            )
-                    else:
-                        w, scale = block_quant_to_tensor_quant(
-                            weight, weight_scale, weight_block_size
-                        )
-                        self_attn.w_scale = scale
                 else:
-                    if _is_fp8_fnuz:
-                        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                            weight=w,
-                            weight_scale=self_attn.kv_b_proj.weight_scale,
-                            input_scale=None,
+                    selected_quant_config = getattr(
+                        self.quant_config, "linear_fp8_config", None
+                    )
+                    if selected_quant_config is None:
+                        selected_quant_config = self.quant_config
+                    weight_block_size = _get_effective_weight_block_size(
+                        self_attn.kv_b_proj, selected_quant_config
+                    )
+                    if weight_block_size is not None:
+                        assert hasattr(
+                            self_attn.kv_b_proj, "weight_scale_inv"
+                        ) or hasattr(self_attn.kv_b_proj, "weight_scale")
+                        weight_scale = (
+                            self_attn.kv_b_proj.weight_scale
+                            if hasattr(self_attn.kv_b_proj, "weight_scale")
+                            else self_attn.kv_b_proj.weight_scale_inv
                         )
-                    else:
-                        weight = w
-                        weight_scale = self_attn.kv_b_proj.weight_scale
-                        # Per-channel scale is 1D [out]; reshape to [out, 1] so it
-                        # broadcasts correctly against weight [out, in].
-                        if weight_scale.dim() == 1:
-                            weight_scale = weight_scale.view(-1, 1)
+                        if _is_fp8_fnuz:
+                            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                                weight=w,
+                                weight_scale=weight_scale,
+                                input_scale=None,
+                            )
+                        else:
+                            weight = w
 
-                    w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
-                    self_attn.w_scale = scale
+                        # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
+                        if (
+                            _is_ue8m0_scale(weight_scale)
+                            and weight_scale.dtype == torch.uint8
+                        ):
+                            weight_scale = (weight_scale.to(torch.int32) << 23).view(
+                                torch.float32
+                            )
+                        elif should_deepgemm_weight_requant_ue8m0(
+                            weight_block_size=weight_block_size
+                        ) and _is_ue8m0_scale(weight_scale):
+                            weight_scale = inverse_transform_scale_ue8m0(
+                                weight_scale, mn=weight.shape[-2]
+                            )
+
+                        if (
+                            (_is_cuda or _is_musa or _is_xpu)
+                            and weight_block_size[0] == 128
+                            and weight_block_size[1] == 128
+                        ):
+                            if (
+                                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                                and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                                and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
+                            ):
+                                block_scale = weight_scale
+                                use_deep_gemm_bmm = True
+                            else:
+                                w = block_quant_dequant(
+                                    weight,
+                                    weight_scale,
+                                    weight_block_size,
+                                    torch.bfloat16,
+                                )
+                        else:
+                            w, scale = block_quant_to_tensor_quant(
+                                weight, weight_scale, weight_block_size
+                            )
+                            self_attn.w_scale = scale
+                    else:
+                        if _is_fp8_fnuz:
+                            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                                weight=w,
+                                weight_scale=self_attn.kv_b_proj.weight_scale,
+                                input_scale=None,
+                            )
+                        else:
+                            weight = w
+                            weight_scale = self_attn.kv_b_proj.weight_scale
+                            # Per-channel scale is 1D [out]; reshape to [out, 1] so it
+                            # broadcasts correctly against weight [out, in].
+                            if weight_scale.dim() == 1:
+                                weight_scale = weight_scale.view(-1, 1)
+
+                        w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
+                        self_attn.w_scale = scale
 
             if w.dtype == torch.int8:
                 weight_block_size = (

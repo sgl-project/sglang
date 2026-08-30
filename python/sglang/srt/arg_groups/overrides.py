@@ -2041,7 +2041,10 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     )
 
     if getattr(hf_config, "learnable_sink", False):
-        backend = "flashmla_sparse"
+        # FlashMLA consumes the sink natively on CUDA. ROCm uses AITER sparse
+        # MLA and reconstructs the virtual zero-value sink from the kernel's
+        # natural-log LSE, preserving the trained attention denominator.
+        backend = "aiter" if is_hip() else "flashmla_sparse"
         for field in ("dsa_prefill_backend", "dsa_decode_backend"):
             value = getattr(view, field)
             if value is not None and value != backend:

@@ -6,10 +6,31 @@ import torch
 from torch import nn
 
 from sglang.srt.models import hunyuan_v4, hunyuan_v4_nextn
+from sglang.srt.models.deepseek_common.attention_forward_methods import (
+    forward_mla_rocm,
+)
+from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
+    AttnForwardMethod,
+)
 from sglang.srt.runtime_context import get_context, get_flags, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+
+
+@pytest.mark.parametrize("method", (AttnForwardMethod.MLA, AttnForwardMethod.MLA_ROCM))
+def test_attention_accepts_sparse_mla_platform_variants(monkeypatch, method):
+    backend = SimpleNamespace(use_mha=True)
+    monkeypatch.setattr(hunyuan_v4, "get_attn_backend", lambda: backend)
+    monkeypatch.setattr(
+        hunyuan_v4.DeepseekV2AttentionMLA,
+        "dispatch_attn_forward_method",
+        lambda self, forward_batch: method,
+    )
+
+    attention = object.__new__(hunyuan_v4.HYV4Attention)
+    assert attention.dispatch_attn_forward_method(SimpleNamespace()) == method
+    assert backend.use_mha is False
 
 
 @pytest.mark.parametrize("attn_tp_size", [1, 2, 4, 8, 16, 32, 64])
@@ -60,6 +81,68 @@ def test_attention_gate_uses_attention_tp(monkeypatch, attn_tp_size):
     assert captured["tp_size"] == parallel.attn_tp_size
     assert attention.local_gate_width == (64 // attn_tp_size) * 256
     assert attention.linear_gate.output_size_per_partition == attention.local_gate_width
+
+
+def test_rocm_mla_applies_attention_output_gate_before_o_proj(monkeypatch):
+    events = []
+    ungated = torch.tensor([[4.0, 8.0]])
+    gate = torch.tensor([[0.25, 0.25]])
+    attention_sink = torch.tensor([0.5])
+
+    def attn_mqa(*args, **kwargs):
+        events.append("attn_mqa")
+        assert kwargs["attn_sink"] is attention_sink
+        return torch.tensor([[[1.0, 2.0]]])
+
+    def apply_attention_output_gate(attn_output, prepared_gate):
+        events.append("gate")
+        assert torch.equal(attn_output, ungated)
+        assert prepared_gate is gate
+        return attn_output * prepared_gate
+
+    def o_proj(attn_output):
+        events.append("o_proj")
+        assert torch.equal(attn_output, torch.tensor([[1.0, 2.0]]))
+        return attn_output, None
+
+    attention = SimpleNamespace(
+        current_attention_backend=next(
+            iter(forward_mla_rocm.FORWARD_ABSORB_CORE_ATTENTION_BACKENDS)
+        ),
+        num_local_heads=1,
+        kv_lora_rank=2,
+        use_deep_gemm_bmm=False,
+        next_skip_topk=None,
+        learnable_sink_param=attention_sink,
+        _skip_rope_for_dsa_tilelang_fused=lambda: False,
+        _fuse_rope_for_trtllm_mla=lambda forward_batch: False,
+        attn_mqa=attn_mqa,
+        apply_attention_output_gate=apply_attention_output_gate,
+        o_proj=o_proj,
+    )
+    forward_batch = SimpleNamespace()
+
+    monkeypatch.setattr(forward_mla_rocm, "is_dcp_mla_decode_phase", lambda _: False)
+    monkeypatch.setattr(forward_mla_rocm, "rocm_absorb_v_bmm", lambda *_: ungated)
+    monkeypatch.setattr(forward_mla_rocm, "is_kv_b_lora_active", lambda _: False)
+    monkeypatch.setattr(forward_mla_rocm, "_SGLANG_EXPERIMENTAL_LORA_OPTI", False)
+
+    output = forward_mla_rocm.DeepseekMLARocmForwardMixin.forward_absorb_rocm_core(
+        attention,
+        q_pe=None,
+        k_pe=None,
+        q_nope_out=None,
+        k_nope=None,
+        forward_batch=forward_batch,
+        zero_allocator=None,
+        positions=None,
+        topk_indices=None,
+        llama_4_scaling=None,
+        attention_output_gate=gate,
+    )
+
+    assert events == ["attn_mqa", "gate", "o_proj"]
+    assert torch.equal(output, torch.tensor([[1.0, 2.0]]))
 
 
 def test_attention_gate_rejects_mismatched_local_width(monkeypatch):

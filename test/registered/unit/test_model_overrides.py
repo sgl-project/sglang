@@ -1721,6 +1721,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             patch.object(overrides_module, "is_npu", return_value=False),
             patch.object(overrides_module, "is_xpu", return_value=False),
             patch.object(overrides_module, "is_hip", return_value=False),
+            patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False),
             patch("torch.cuda.get_device_capability", return_value=(9, 0)),
         ):
             # Hopper FP8 -> flashmla_kv both
@@ -1809,6 +1810,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             patch.object(overrides_module, "is_npu", return_value=False),
             patch.object(overrides_module, "is_xpu", return_value=False),
             patch.object(overrides_module, "is_hip", return_value=True),
+            patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=True),
             patch("torch.cuda.get_device_capability", return_value=(9, 4)),
         ):
             # ROCm with both unset -> tilelang
@@ -1819,6 +1821,34 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "dsa_decode_backend": "tilelang",
                 },
             )
+            for arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+                with self.subTest(arch=arch, backends="rocm-default"):
+                    self.assertEqual(
+                        _dsa_split_backend_resolution(
+                            _view(
+                                arch=arch,
+                                learnable_sink=True,
+                                kv_cache_dtype="bfloat16",
+                            )
+                        ),
+                        {
+                            "dsa_prefill_backend": "aiter",
+                            "dsa_decode_backend": "aiter",
+                        },
+                    )
+                with self.subTest(arch=arch, backends="rocm-explicit"):
+                    self.assertEqual(
+                        _dsa_split_backend_resolution(
+                            _view(
+                                arch=arch,
+                                learnable_sink=True,
+                                kv_cache_dtype="bfloat16",
+                                dsa_prefill_backend="aiter",
+                                dsa_decode_backend="aiter",
+                            )
+                        ),
+                        {},
+                    )
 
     def test_flashinfer_allreduce_fusion_passes(self):
         from sglang.srt.arg_groups.overrides import (

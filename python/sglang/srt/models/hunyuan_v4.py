@@ -505,7 +505,7 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         if hasattr(backend, "use_mha") and backend.use_mha is not False:
             backend.use_mha = False
         method = super().dispatch_attn_forward_method(forward_batch)
-        if method != AttnForwardMethod.MLA:
+        if method not in (AttnForwardMethod.MLA, AttnForwardMethod.MLA_ROCM):
             raise RuntimeError("HYV4 requires the sparse MLA attention path")
         return method
 

@@ -97,7 +97,6 @@ from sglang.srt.utils import (
     is_sm120_supported,
     is_xpu,
     log_info_on_rank0,
-    mxfp8_block_convert_required,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -117,15 +116,11 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
-# gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
-# block-fp8 [128,128] at load and run through the native block-fp8 kernels.
-# SGLANG_FORCE_MXFP8_BLOCK_CONVERT=1 opts into that same block-fp8 path on
-# gfx950 (MI35x): it routes the fp8 GEMMs / fused MoE through the mature aiter
-# block-scale kernels instead of the native MX dot_scaled path (measured +20%
-# throughput at equal accuracy on MiniMax-M3, GSM8K 0.9719 vs 0.9689).
-_mxfp8_to_block_fp8_required = mxfp8_block_convert_required() or get_bool_env_var(
-    "SGLANG_FORCE_MXFP8_BLOCK_CONVERT"
-)
+# Keep the opt-in block-FP8 conversion separate from the correctness fallback.
+# When ROCm has no native MXFP8 dense kernel but AITER is available, convert the
+# checkpoint once and use AITER block-FP8 GEMMs. Otherwise retain the exact BF16
+# emulation fallback. Devices with a native MX kernel retain that path.
+_force_mxfp8_to_block_fp8 = get_bool_env_var("SGLANG_FORCE_MXFP8_BLOCK_CONVERT")
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
@@ -153,6 +148,17 @@ if _use_aiter:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
+
+
+def _mxfp8_bf16_fallback_required() -> bool:
+    """Whether ROCm lacks a native MXFP8 kernel for checkpoint weights."""
+    return _is_hip and resolve_mxfp8_dense_gemm_backend().is_unsupported()
+
+
+def _mxfp8_block_fp8_fallback_available() -> bool:
+    """Whether AITER block-FP8 can replace unsupported native MXFP8 GEMMs."""
+    return _mxfp8_bf16_fallback_required() and _use_aiter
+
 
 DSV4_DEQUANT_FP4_TABLE = torch.tensor(
     [
@@ -293,7 +299,7 @@ class Fp8Config(QuantizationConfig):
             return 31
         if self.use_mxfp8 and _is_hip and _is_gfx95_supported:
             return 95
-        if self.use_mxfp8 and _mxfp8_to_block_fp8_required:
+        if self.use_mxfp8 and _mxfp8_bf16_fallback_required():
             return 94
 
         return 100 if self.use_mxfp8 else 80
@@ -465,15 +471,26 @@ class Fp8LinearMethod(LinearMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
+        self.convert_mxfp8_to_block = self.use_mxfp8 and (
+            _force_mxfp8_to_block_fp8 or _mxfp8_block_fp8_fallback_available()
+        )
+        self.emulate_mxfp8 = (
+            self.use_mxfp8
+            and _mxfp8_bf16_fallback_required()
+            and not self.convert_mxfp8_to_block
+        )
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
         self.mxfp8_dense_backend = None
-        if self.use_mxfp8 and not self.convert_mxfp8_to_block:
+        if (
+            self.use_mxfp8
+            and not self.emulate_mxfp8
+            and not self.convert_mxfp8_to_block
+        ):
             self.mxfp8_dense_backend = resolve_mxfp8_dense_gemm_backend()
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
-        else:
+        elif not self.emulate_mxfp8:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
@@ -653,6 +670,17 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if getattr(self, "emulate_mxfp8", False):
+            layer.weight.requires_grad_(False)
+            layer.weight_scale_inv.requires_grad_(False)
+            layer.weight_scale_inv.format_ue8m0 = True
+            layer.input_scale = None
+            logger.info_once(
+                "Using graph-capturable MXFP8 dense emulation because no native "
+                "ROCm MXFP8 GEMM is available. Weights remain MXFP8-resident and "
+                "are dequantized to BF16 inside each forward."
+            )
+            return
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
@@ -960,6 +988,20 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if getattr(self, "emulate_mxfp8", False):
+            if isinstance(x, tuple):
+                raise RuntimeError(
+                    "MXFP8 emulation requires unquantized linear inputs."
+                )
+            from sglang.srt.layers.quantization.mxfp8_block_convert import (
+                dequant_mxfp8_to_bf16,
+            )
+
+            weight = dequant_mxfp8_to_bf16(layer.weight, layer.weight_scale_inv).to(
+                x.dtype
+            )
+            return F.linear(x, weight, bias).to(x.dtype)
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
@@ -1080,7 +1122,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
+        self.convert_mxfp8_to_block = self.use_mxfp8 and (
+            _force_mxfp8_to_block_fp8 or _mxfp8_bf16_fallback_required()
+        )
         self.weight_block_size = self.quant_config.weight_block_size
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
@@ -2350,6 +2394,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+
+        # AITER consumes block-FP8 weights rather than checkpoint-native MXFP8.
+        # Devices with native MXFP8 use AITER after a one-time conversion.
+        if self.use_mxfp8 and _use_aiter and moe_runner_backend.is_aiter():
+            self.convert_mxfp8_to_block = True
+
+        # AITER's block-FP8 two-stage path applies router weights in stage 2.
+        # Other backends fall back to graph-capturable Triton when native MXFP8
+        # is unavailable.
+        if (
+            self.use_mxfp8
+            and _mxfp8_bf16_fallback_required()
+            and not (_use_aiter and moe_runner_backend.is_aiter())
+        ):
+            if not moe_runner_backend.is_triton():
+                logger.warning_once(
+                    "Selecting the Triton block-FP8 MoE runner because this device "
+                    "does not provide a native MXFP8 MoE path."
+                )
+            moe_runner_backend = MoeRunnerBackend.TRITON
 
         if (
             moe_runner_backend.is_deep_gemm()

@@ -378,6 +378,13 @@ def _swiglu_silu_clamp_mul(x, gemm1_limit):
     return gate * up
 
 
+def _apply_swiglu_limit_inplace(x: torch.Tensor, swiglu_limit: float) -> None:
+    """Apply the DeepSeek-V4/HYV4 SwiGLU clamp before activation."""
+    gate, up = x.chunk(2, dim=-1)
+    gate.clamp_(max=swiglu_limit)
+    up.clamp_(min=-swiglu_limit, max=swiglu_limit)
+
+
 @torch.compile
 def swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
     # NOTE: This variant uses gemm1_alpha, unlike _swiglu_silu_clamp_mul.
@@ -694,9 +701,6 @@ def _fused_moe_kernel_sequence(
             )
         elif swiglu_limit is not None:
             # DeepSeek V4: swiglu clamp before silu_and_mul.
-            # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
-            #   fusion=True: clamp fused into act_and_mul_triton or silu_and_mul_clamp
-            #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
             assert (
@@ -708,10 +712,17 @@ def _fused_moe_kernel_sequence(
 
             if filter_expert:
                 swiglu_limit_for_triton = swiglu_limit
+            elif _is_hip:
+                # The fused DSV4 clamp kernel is CUDA/XPU-only. Keep ROCm on
+                # the same graph-captured Triton MoE path by applying the exact
+                # gate/up clamps in place before the ROCm sgl-kernel SiLU.
+                _apply_swiglu_limit_inplace(
+                    intermediate_cache1.view(-1, N), swiglu_limit
+                )
             else:
                 assert (
                     _is_cuda or _is_xpu
-                ), "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
+                ), "fused silu_and_mul_clamp kernel is CUDA/XPU only"
                 swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
 
             if not filter_expert:

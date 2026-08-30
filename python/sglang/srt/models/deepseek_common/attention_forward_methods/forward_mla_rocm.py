@@ -348,7 +348,6 @@ def _fused_rope_cat_and_cache(
 
 
 class DeepseekMLARocmForwardMixin:
-
     def forward_absorb_rocm_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -359,6 +358,12 @@ class DeepseekMLARocmForwardMixin:
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        attention_output_gate = (
+            self.prepare_attention_output_gate(hidden_states)
+            if hasattr(self, "prepare_attention_output_gate")
+            else None
+        )
 
         q_replicate_active = (
             get_parallel().dcp_replicate_q_proj
@@ -649,6 +654,11 @@ class DeepseekMLARocmForwardMixin:
             positions,
             topk_indices,
             llama_4_scaling,
+            *(
+                (attention_output_gate,)
+                if hasattr(self, "prepare_attention_output_gate")
+                else ()
+            ),
         )
 
     def forward_absorb_rocm_core(
@@ -662,6 +672,7 @@ class DeepseekMLARocmForwardMixin:
         positions,
         topk_indices,
         llama_4_scaling,
+        attention_output_gate: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = True
 
@@ -726,12 +737,14 @@ class DeepseekMLARocmForwardMixin:
                     )
             else:
                 extra_args = {}
+                if getattr(self, "learnable_sink_param", None) is not None:
+                    extra_args["attn_sink"] = self.learnable_sink_param
                 if self._fuse_rope_for_trtllm_mla(forward_batch):
-                    extra_args = {
-                        "cos_sin_cache": self.rotary_emb.cos_sin_cache,
-                        "is_neox": self.rotary_emb.is_neox_style,
-                        "llama_4_scaling": llama_4_scaling,
-                    }
+                    extra_args.update(
+                        cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                        is_neox=self.rotary_emb.is_neox_style,
+                        llama_4_scaling=llama_4_scaling,
+                    )
                 if is_dcp_mla_decode_phase(forward_batch):
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
@@ -877,6 +890,16 @@ class DeepseekMLARocmForwardMixin:
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
             )
+        if attention_output_gate is not None:
+            apply_gate = getattr(self, "apply_attention_output_gate", None)
+            if apply_gate is not None:
+                attn_bmm_output = apply_gate(attn_bmm_output, attention_output_gate)
+            elif hasattr(self, "_apply_gated"):
+                attn_bmm_output = self._apply_gated(
+                    attn_bmm_output, attention_output_gate
+                )
+            else:
+                attn_bmm_output = attn_bmm_output * torch.sigmoid(attention_output_gate)
         output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:

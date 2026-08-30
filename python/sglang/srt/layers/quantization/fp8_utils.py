@@ -1185,7 +1185,10 @@ def aiter_w8a8_block_fp8_linear(
             _ck_safe_m is not None and input_2d.shape[0] > _ck_safe_m
         )
     else:
-        use_triton = True
+        # Let AITER's public block-scale dispatcher choose the native CK path on
+        # supported ROCm devices without native MX instructions. It falls back to its
+        # Triton implementation itself when no matching HIP code object exists.
+        use_triton = False
 
     # if input_scale not None, input is quanted
     if input_scale is not None:

@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import call, patch
 
 import torch
@@ -15,6 +16,10 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization import fp8 as fp8_quant
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
     CompressedTensorsW8A8Fp8,
+)
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+    _get_effective_weight_block_size,
+    _is_ue8m0_scale,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -29,6 +34,23 @@ def _make_params(n: int = 64, k: int = 128):
 
 
 class TestDeepGemmUE8M0Requant(CustomTestCase):
+    def test_optional_ue8m0_marker_defaults_to_false(self):
+        weight_scale = torch.ones((1, 1), dtype=torch.float32)
+
+        self.assertFalse(_is_ue8m0_scale(weight_scale))
+        weight_scale.format_ue8m0 = True
+        self.assertTrue(_is_ue8m0_scale(weight_scale))
+
+    def test_layer_block_size_wins_after_mxfp8_conversion(self):
+        layer = SimpleNamespace(
+            quant_method=SimpleNamespace(weight_block_size=[128, 128])
+        )
+        quant_config = SimpleNamespace(weight_block_size=[1, 32])
+
+        self.assertEqual(
+            _get_effective_weight_block_size(layer, quant_config), [128, 128]
+        )
+
     def _enabled_deepgemm_ue8m0(self):
         return patch.multiple(
             deep_gemm_wrapper,
