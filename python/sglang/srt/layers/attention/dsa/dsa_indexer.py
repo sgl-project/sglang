@@ -40,7 +40,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_device,
     get_exec,
     get_parallel,
@@ -155,11 +154,14 @@ def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
     if group.world_size == 1:
         return
 
-    if topk_indices.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
-        if group.pynccl_comm is None:
-            raise RuntimeError(
-                "SGLANG_DSA_TOPK_BROADCAST requires PyNCCL during CUDA graph capture."
-            )
+    # PyNCCL is the faster path under capture, but it is not a precondition:
+    # a split attn-TP group is built without one (parallel_state.py), and the
+    # process-group broadcast captures and replays correctly.
+    if (
+        topk_indices.device.type == "cuda"
+        and torch.cuda.is_current_stream_capturing()
+        and group.pynccl_comm is not None
+    ):
         with group.pynccl_comm.change_state(enable=True):
             group.pynccl_comm.broadcast(topk_indices, src=0)
     else:
@@ -249,7 +251,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
-            pp_size = configured_pp_size()
+            pp_size = get_parallel().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
         else:
             self.logits_with_pp_recv = False
@@ -575,7 +577,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
 
-        _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
+        # Rotary may update both inputs in place, so the K-only path must not
+        # alias its dummy query with the key.
+        if _is_cuda or _is_hip or _is_xpu:
+            dummy_q_rope = torch.empty_like(k_rope)
+        else:
+            dummy_q_rope = k_rope
+        _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
         key = rotate_activation(key)
 

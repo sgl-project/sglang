@@ -178,6 +178,8 @@ class LTX2DenoisingStage(DenoisingStage):
             transformer=transformer, scheduler=scheduler, vae=vae, **kwargs
         )
         self.sampler_name = sampler_name
+        # set per request by _prepare_denoising_loop before the cache-dit hook
+        self._disable_cache_dit_for_request = False
 
     def _scheduler_step_kwargs(self, batch: Req, scheduler) -> dict:
         return self.prepare_extra_func_kwargs(
@@ -444,14 +446,12 @@ class LTX2DenoisingStage(DenoisingStage):
             )
         return latents[:, :orig_s, :].contiguous()
 
-    def _maybe_enable_cache_dit(self, num_inference_steps: int, batch: Req) -> None:
-        """Disable cache-dit for TI2V-style requests to avoid stale activations.
-
-        NOTE: base denoising stage calls this hook with (num_inference_steps, batch).
-        """
-        if getattr(self, "_disable_cache_dit_for_request", False):
-            return
-        return super()._maybe_enable_cache_dit(num_inference_steps, batch)
+    def _cache_dit_requested_for_batch(self, batch: Req) -> bool:
+        """TI2V requests must not cache stale activations; reporting "not
+        requested" lets the base stage unmount hooks a prior request left."""
+        if self._disable_cache_dit_for_request:
+            return False
+        return super()._cache_dit_requested_for_batch(batch)
 
     def _get_ltx2_stage1_guider_params(
         self, batch: Req, server_args: ServerArgs, stage: str

@@ -31,7 +31,11 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.runtime_context import get_exec, get_lora
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_lora,
+    get_platform,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -39,9 +43,9 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     set_weight_attrs,
     use_intel_amx_backend,
-    use_intel_xpu_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -72,6 +76,8 @@ if _use_aiter:
 class Bf16GemmBackend(Enum):
     AUTO = "auto"
     CUTEDSL = "cutedsl"
+    FLASHINFER_PR4266 = "flashinfer_pr4266"
+    GEMV = "gemv"
     TORCH = "torch"
 
     def is_auto(self) -> bool:
@@ -80,33 +86,114 @@ class Bf16GemmBackend(Enum):
     def is_cutedsl(self) -> bool:
         return self == Bf16GemmBackend.CUTEDSL
 
+    def is_gemv(self) -> bool:
+        return self == Bf16GemmBackend.GEMV
+
+    def is_flashinfer_pr4266(self) -> bool:
+        return self == Bf16GemmBackend.FLASHINFER_PR4266
+
+    def is_optimized(self) -> bool:
+        return self.is_cutedsl() or self.is_flashinfer_pr4266()
+
 
 _BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
 _cutedsl_bf16_gemm = None
 _use_cutedsl_bf16_gemm = None
+_hopper_bf16_gemv = None
+_use_hopper_bf16_gemv = None
+_flashinfer_pr4266_splitk_tactic = None
+_flashinfer_pr4266_run_splitk_dense = None
+_flashinfer_pr4266_direct_default_tactic = None
+_flashinfer_pr4266_prefer_direct = None
+_flashinfer_pr4266_run_direct_dense = None
+_enable_bf16_splitk_gemm = False
+
+# GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
+# Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
+_FLASHINFER_PR4266_TUNED_TACTICS = {
+    (1, 256, 8192): (64, 8, 4, 11),
+    (2, 256, 8192): (64, 8, 4, 11),
+    (4, 256, 8192): (64, 8, 4, 11),
+    (8, 256, 8192): (64, 8, 4, 11),
+    (16, 256, 8192): (64, 8, 4, 10),
+    (24, 256, 8192): (64, 8, 4, 11),
+    (32, 256, 8192): (64, 8, 4, 12),
+    (1, 512, 8192): (64, 8, 4, 11),
+    (2, 512, 8192): (64, 8, 4, 12),
+    (4, 512, 8192): (64, 8, 4, 10),
+    (8, 512, 8192): (64, 8, 4, 12),
+    (16, 512, 8192): (64, 8, 4, 12),
+    (24, 512, 8192): (64, 8, 4, 12),
+    (32, 512, 8192): (64, 16, 4, 9),
+    (1, 2304, 8192): (128, 8, 4, 6),
+    (2, 2304, 8192): (64, 8, 2, 12),
+    (4, 2304, 8192): (128, 8, 4, 6),
+    (8, 2304, 8192): (64, 8, 4, 10),
+    (16, 2304, 8192): (64, 16, 4, 9),
+    (24, 2304, 8192): (64, 32, 2, 9),
+    (32, 2304, 8192): (64, 32, 2, 9),
+    (1, 2560, 8192): (64, 8, 2, 10),
+    (2, 2560, 8192): (64, 8, 2, 10),
+    (4, 2560, 8192): (64, 8, 2, 10),
+    (8, 2560, 8192): (64, 8, 2, 10),
+    (16, 2560, 8192): (64, 16, 2, 11),
+    (24, 2560, 8192): (64, 32, 2, 9),
+    (32, 2560, 8192): (64, 32, 2, 9),
+}
+
+
+def use_flashinfer_pr4266_bf16_gemm(m: int, n: int, k: int) -> bool:
+    return (m, n, k) in _FLASHINFER_PR4266_TUNED_TACTICS
+
+
+def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
+    """Return whether the optional Split-K path should be initialized."""
+    return backend.is_optimized() and envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
 
 
 def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
-    global _BF16_GEMM_BACKEND, _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
-
-    from sglang.srt.utils import is_sm100_supported
+    global _BF16_GEMM_BACKEND
+    global _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
+    global _flashinfer_pr4266_splitk_tactic
+    global _flashinfer_pr4266_run_splitk_dense
+    global _flashinfer_pr4266_direct_default_tactic
+    global _flashinfer_pr4266_prefer_direct
+    global _flashinfer_pr4266_run_direct_dense
+    global _enable_bf16_splitk_gemm
 
     backend_str = server_args.bf16_gemm_backend
-    if backend_str == "auto" and is_sm100_supported():
+    if backend_str == "auto" and get_platform().is_sm100:
         backend_str = (
-            "torch" if server_args.enable_deterministic_inference else "cutedsl"
+            "torch"
+            if get_exec().deterministic.enable_deterministic_inference
+            else "cutedsl"
         )
 
     backend = Bf16GemmBackend(backend_str)
 
-    if backend.is_cutedsl():
-        if server_args.enable_deterministic_inference:
+    if backend.is_gemv():
+        if torch.cuda.get_device_capability()[0] != 9:
+            raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper)")
+
+        global _hopper_bf16_gemv, _use_hopper_bf16_gemv
+        from sglang.kernels.ops.gemm.hopper_bf16_gemv import (
+            hopper_bf16_gemv,
+            use_hopper_bf16_gemv,
+        )
+
+        _hopper_bf16_gemv = hopper_bf16_gemv
+        _use_hopper_bf16_gemv = use_hopper_bf16_gemv
+    elif backend.is_optimized():
+        if get_exec().deterministic.enable_deterministic_inference:
             raise ValueError(
                 "--bf16-gemm-backend cutedsl is batch-size dependent and cannot "
                 "be combined with --enable-deterministic-inference"
             )
-        if not is_sm100_supported():
-            raise ValueError("--bf16-gemm-backend cutedsl requires an SM10x GPU")
+        if not get_platform().is_sm100:
+            raise ValueError(
+                f"--bf16-gemm-backend {backend.value} requires "
+                "SM100/SM103 (Blackwell)"
+            )
 
         from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
             cutedsl_bf16_gemm,
@@ -115,6 +202,25 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
 
         _cutedsl_bf16_gemm = cutedsl_bf16_gemm
         _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
+
+    _enable_bf16_splitk_gemm = False
+    if should_enable_bf16_splitk_gemm(backend):
+        from sglang.kernels.ops.gemm.flashinfer_pr4266_dense_bf16_gemm_sm100_direct import (
+            default_tactic,
+            prefer_direct_bf16_gemm_sm100,
+            run_direct_dense,
+        )
+        from sglang.kernels.ops.gemm.flashinfer_pr4266_dense_bf16_gemm_sm100_splitk import (
+            SplitKTactic,
+            run_splitk_dense,
+        )
+
+        _flashinfer_pr4266_splitk_tactic = SplitKTactic
+        _flashinfer_pr4266_run_splitk_dense = run_splitk_dense
+        _flashinfer_pr4266_direct_default_tactic = default_tactic
+        _flashinfer_pr4266_prefer_direct = prefer_direct_bf16_gemm_sm100
+        _flashinfer_pr4266_run_direct_dense = run_direct_dense
+        _enable_bf16_splitk_gemm = True
 
     _BF16_GEMM_BACKEND = backend
 
@@ -125,17 +231,60 @@ def _bf16_gemm_dispatch_fake(
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
 
-@register_custom_op(fake_impl=_bf16_gemm_dispatch_fake)
-def bf16_gemm_dispatch(
+def _flashinfer_pr4266_bf16_gemm(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
+    x_2d = x.view(-1, x.shape[-1])
+    out = torch.empty((x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+    m, n, k = x_2d.shape[0], weight.shape[0], weight.shape[1]
+    if bias is None and _flashinfer_pr4266_prefer_direct(m, n, k):
+        tactic = _flashinfer_pr4266_direct_default_tactic(m, n, k)
+        _flashinfer_pr4266_run_direct_dense(x_2d, weight.T, out, True, tactic)
+    else:
+        tactic = _flashinfer_pr4266_splitk_tactic(
+            *_FLASHINFER_PR4266_TUNED_TACTICS[(m, n, k)]
+        )
+        _flashinfer_pr4266_run_splitk_dense(
+            x_2d,
+            weight.T,
+            bias,
+            out,
+            True,
+            tactic,
+        )
+    return out.view(*x.shape[:-1], weight.shape[0])
+
+
+def _bf16_gemm_dispatch_impl(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    m = x.numel() // x.shape[-1]
+    if _enable_bf16_splitk_gemm and use_flashinfer_pr4266_bf16_gemm(
+        m, weight.shape[0], weight.shape[1]
+    ):
+        return _flashinfer_pr4266_bf16_gemm(x, weight, bias)
+    if (
+        _use_hopper_bf16_gemv is not None
+        and bias is None
+        and _use_hopper_bf16_gemv(m, weight.shape[0], weight.shape[1])
+    ):
+        return _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
+            *x.shape[:-1], -1
+        )
     if _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
-        x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
+        m, weight.shape[0], weight.shape[1]
     ):
         return _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
             *x.shape[:-1], -1
         )
     return F.linear(x, weight, bias)
+
+
+@register_custom_op(fake_impl=_bf16_gemm_dispatch_fake)
+def bf16_gemm_dispatch(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    return _bf16_gemm_dispatch_impl(x, weight, bias)
 
 
 def get_bf16_gemm_backend() -> Bf16GemmBackend:
@@ -236,7 +385,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
-            get_bf16_gemm_backend().is_cutedsl()
+            get_bf16_gemm_backend().is_optimized()
             and x.is_cuda
             and x.dtype == torch.bfloat16
             and layer.weight.dtype == torch.bfloat16
@@ -250,17 +399,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 # opaque op resolves it at runtime with concrete shapes,
                 # keeping the per-shape kernel choice.
                 return bf16_gemm_dispatch(x, layer.weight, bias)
-            if _use_cutedsl_bf16_gemm(
-                x.numel() // x.shape[-1],
-                layer.weight.shape[0],
-                layer.weight.shape[1],
-            ):
-                x_shapes = x.shape
-                output = _cutedsl_bf16_gemm(
-                    x.view(-1, x_shapes[-1]), layer.weight, bias
-                )
-                return output.view(*x_shapes[:-1], -1)
-            return F.linear(x, layer.weight, bias)
+            return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
 
@@ -310,18 +449,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
 def _use_xpu_moe_ld_padding(use_triton_kernels: bool) -> bool:
     """Whether MoE expert weights should get a padded row stride for XPU.
 
-    use_intel_xpu_backend() only tells us an XPU exists on this machine, not
-    that the weights being created land on it -- the env var can be set while
-    serving on CPU/CUDA. create_weights takes no device argument and allocates
-    under the model loader's ambient device context, so check that context too:
-    padding a non-XPU weight would make it non-contiguous for no benefit, and
-    other backends' MoE kernels expect contiguous expert tensors.
+    is_xpu() only tells us an XPU exists on this machine, not that the weights
+    being created land on it -- this can be true while serving on CPU/CUDA.
+    create_weights takes no device argument and allocates under the model
+    loader's ambient device context, so check that context too: padding a
+    non-XPU weight would make it non-contiguous for no benefit, and other
+    backends' MoE kernels expect contiguous expert tensors.
 
     The Triton path stores B transposed and does not read a row stride, so it
-    is excluded even on XPU.
+    is excluded even on XPU (either via --moe-runner-backend triton or the
+    triton_kernels build).
     """
     return (
-        use_intel_xpu_backend()
+        is_xpu()
+        and not get_moe_runner_backend().is_triton()
         and torch.get_default_device().type == "xpu"
         and not use_triton_kernels
     )
@@ -567,7 +708,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
 
         self._maybe_interleave_w13_for_fused_swiglu(layer)
-
         return
 
     def _maybe_interleave_w13_for_fused_swiglu(self, layer: torch.nn.Module) -> None:
@@ -600,6 +740,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             and moe_runner_config.gemm1_alpha is None
             and moe_runner_config.gemm1_clamp_limit is None
             and moe_runner_config.swiglu_limit is None
+            and not moe_runner_config.apply_router_weight_on_input
             # The LoRA MoE hooks read and write the full-width pre-activation
             # buffer in halves layout; both assumptions break here.
             and not get_lora().enable_lora
@@ -915,7 +1056,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         ], f"activation = {moe_runner_config.activation} is not supported."
 
         backend = self.runner.runner_backend
-        if use_intel_xpu_backend():
+        if not get_moe_runner_backend().is_triton():
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
 
@@ -941,7 +1082,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             assert (
                 moe_runner_config.activation == "silu"
             ), f"activation = {moe_runner_config.activation} is not supported \
-            for Triton PATH, please set ENV SGLANG_USE_SGL_XPU=1."
+            for Triton PATH, please drop --moe-runner-backend triton to use \
+            the sgl-kernel-xpu path, which supports more activations."
 
             quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)

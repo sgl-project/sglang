@@ -101,6 +101,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
 
@@ -508,7 +509,9 @@ class TestIdeogram4(unittest.TestCase):
         server_args = SimpleNamespace(
             transformer_weights_path="/unused/override.safetensors",
             nunchaku_config={"enabled": True},
-            component_transformer_weights_paths={},
+            component_weights_paths={},
+            component_quantizations={},
+            component_quantization_ignored_layers={},
         )
         component_args = _server_args_for_transformer_component(
             server_args, "unconditional_transformer"
@@ -523,11 +526,15 @@ class TestIdeogram4(unittest.TestCase):
                 "/ckpt/diffusion_models/ideogram4_nvfp4_mixed.safetensors"
             ),
             nunchaku_config={"enabled": True},
-            component_transformer_weights_paths={
+            component_weights_paths={
                 "unconditional_transformer": (
                     "/ckpt/diffusion_models/"
                     "ideogram4_unconditional_nvfp4_mixed.safetensors"
                 )
+            },
+            component_quantizations={"unconditional_transformer": "fp8"},
+            component_quantization_ignored_layers={
+                "unconditional_transformer": ["lm_head"]
             },
         )
 
@@ -542,6 +549,8 @@ class TestIdeogram4(unittest.TestCase):
             "/ckpt/diffusion_models/ideogram4_unconditional_nvfp4_mixed.safetensors",
         )
         self.assertIsNone(component_args.nunchaku_config)
+        self.assertEqual(component_args.quantization, "fp8")
+        self.assertEqual(component_args.quantization_ignored_layers, ["lm_head"])
 
     def test_ideogram_nvfp4_unconditional_transformer_path_uses_sibling_file(self):
         self.assertEqual(
@@ -996,9 +1005,15 @@ class TestIdeogram4(unittest.TestCase):
                     sp_split_auto=False,
                 )
             )
-            with patch(
-                "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
-                return_value=1,
+            with (
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant.current_platform.get_device_capability",
+                    return_value=DeviceCapability(10, 0),
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+                    return_value=1,
+                ),
             ):
                 with torch.device("meta"):
                     model = Ideogram4Transformer2DModel(
@@ -1058,6 +1073,10 @@ class TestIdeogram4(unittest.TestCase):
                 )
             )
             with (
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant.current_platform.get_device_capability",
+                    return_value=DeviceCapability(10, 0),
+                ),
                 patch(
                     "sglang.multimodal_gen.runtime.models.dits.ideogram.model_parallel_is_initialized",
                     return_value=True,
