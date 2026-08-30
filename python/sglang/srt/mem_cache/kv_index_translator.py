@@ -13,37 +13,33 @@
 # ==============================================================================
 """Turns the KV ids stored in `req_to_token` into ids attention kernels can use.
 
-WHY THIS EXISTS. A KV slot can be named in more than one **id space**:
+A KV slot can be named in three id spaces:
 
-  * **virtual** - what `req_to_token` stores. Stable: it keeps naming the same
-    logical slot even after the pool moves data around.
+  * **virtual** - what `req_to_token` stores. Keeps naming the same logical
+    slot even after the pool moves data around.
   * **physical** - where that slot sits in the pool right now.
-  * **kernel-facing** - what a kernel can index the per-layer K/V tensors with.
-    Same as physical for a plain pool; under the unified pool's per-layer views it
-    is the physical page scaled by the per-page block count.
+  * **kernel-facing** - what a kernel can index the per-layer K/V tensors
+    with. Same as physical on a plain pool; under the unified pool it is the
+    physical page scaled by the per-page block count.
 
-On a plain pool all three coincide and nothing here does any work. Under the
-unified memory pool they differ, so somebody must convert - and if every
-backend converts for itself, each one has to know the pool's internals and
-each is a place to get it wrong. This module is the one place that converts.
+All three coincide on a plain pool, so nothing here does any work there.
 
-WHAT BACKENDS GET. A `KVIndexTable`, which answers one question: *what do I
-gather from, and which row is mine?*
+Backends get a `KVIndexTable`, which answers "what do I gather from, and
+which row is mine?":
 
-    ids[row_ids[b], pos]        <- the gather every backend already does
+    ids[row_ids[b], pos]
 
-    plain pool : ids = req_to_token, row_ids = req_pool_indices
-                 (literally those objects - no copy, no kernel, no change)
-    unified    : ids = a freshly built array of kernel-facing ids,
+    plain pool : ids = req_to_token, row_ids = req_pool_indices (those very
+                 objects - no copy, no kernel)
+    unified    : ids = a built array of kernel-facing ids,
                  row_ids = arange(batch_size)
 
 Backends call their own copy a *page table* (fa3) or a *block table*
-(trtllm); this module calls what it hands them the **index table**.
+(trtllm); here it is the **index table**.
 
-WHY ONE TABLE IS ENOUGH FOR EVERYONE. Converting only ever rewrites the page
-number and keeps the offset inside the page. So a page-granular table serves
-both kinds of consumer: a block-table backend uses its rows as-is, and a
-backend that wants a flat per-token list rebuilds one with
+Converting only ever rewrites the page number and keeps the in-page offset, so
+one page-granular table serves both kinds of consumer: a block-table backend
+uses its rows as-is, and one that wants flat per-token ids rebuilds them as
 
     token_id = entry * entry_page_size + pos % entry_page_size
 """
@@ -272,11 +268,9 @@ class KVIndexTranslator:
             return memo[1]
         max_pages = None
         if self.is_translating:
-            # `seq_lens_sum` is the reliable "CPU mirror present" signal, not
-            # `seq_lens_cpu`: the latter is a non-None but STALE slice on a
-            # gpu_only batch, and a stale max under-sizes the table, leaving
-            # the columns past it reading as the sink for tokens the kernel
-            # wants. Fall back to the table's own width, which is always safe.
+            # `seq_lens_cpu` is a non-None but STALE slice on a gpu_only
+            # batch; `seq_lens_sum` is the signal that it is live. A stale max
+            # under-sizes the table and the tail then reads as the sink.
             slc = forward_batch.seq_lens_cpu
             if (
                 forward_batch.seq_lens_sum is not None

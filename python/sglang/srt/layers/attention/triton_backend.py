@@ -209,11 +209,9 @@ class TritonAttnBackend(AttentionBackend):
         # Lets the Triton wrappers specialize on PAGE_SIZE; page_size=1 is
         # byte-identical to the slot-based envelope.
         self.page_size = getattr(model_runner, "page_size", 1) or 1
-        # Unified pool v2p WRITE hook (None = no-op): the write loc arrives
-        # VIRTUAL and the store kernels need the kernel-facing id space
-        # (translate_kv_loc_for_kernel falls back to the physical translate when
-        # kernel_page_multiplier == 1, so preferring it is exact for both).
-        # Applied eagerly so the captured graph has no translate.
+        # Unified pool WRITE hook (None = no-op): the write loc arrives VIRTUAL
+        # and the store kernels need the kernel-facing space. Applied eagerly so
+        # the captured graph holds no translate.
         self._translate_kv_loc = getattr(
             self.token_to_kv_pool_allocator, "translate_kv_loc_for_kernel", None
         ) or getattr(self.token_to_kv_pool_allocator, "translate_kv_loc", None)

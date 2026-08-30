@@ -25,14 +25,13 @@ physical page into the id space the per-layer views use (1 when they are not
 dense). Since only the page number is rewritten, a token-level consumer can
 rebuild flat ids as `entry * ps + offset`.
 
-PREFIX-ONLY per row: columns past the live prefix are never written. That
-matters twice over. A caller-owned buffer keeps whatever it had there, which
-is what lets a captured cuda-graph buffer be refreshed in place; and readers
-bound themselves by `cache_seqlens`, so they never look at those columns.
+PREFIX-ONLY per row: columns past the live prefix are never written, so a
+caller-owned buffer keeps what it had there -- which is what lets a captured
+cuda-graph buffer be refreshed in place. Readers bound themselves by
+`cache_seqlens` and never look past the prefix.
 
-Anything unwritten or freed reads as entry 0, the reserved padding slot: a
-`-1` in `req_to_token` and a freed (`-1`) v2p row both clamp there, so a
-kernel dereferences padding rather than a wild address.
+A `-1` in `req_to_token` and a freed (`-1`) v2p row both clamp to entry 0, the
+reserved padding slot, so a kernel dereferences padding, not a wild address.
 """
 
 from __future__ import annotations
@@ -70,11 +69,8 @@ def build_kv_read_table_kernel(
         mask=mask,
         other=0,
     ).to(tl.int64)
-    # A `-1` slot must index page 0 (the sink), not `v2p[-1]`. Triton's `//`
-    # truncates toward zero, so `-1 // ps` is 0 for ps > 1 but -1 at ps == 1,
-    # which reads one element BEFORE the table and feeds the garbage straight
-    # through the clamp below as a live id. Fold the guard in explicitly so
-    # both page sizes -- and this kernel and its CPU reference -- agree.
+    # Triton's `//` truncates toward zero, so `-1 // ps` is 0 for ps > 1 but
+    # -1 at ps == 1, which would read one element BEFORE `v2p`.
     page = tl.where(tok < 0, 0, tok // PAGE_SIZE)
     phys = tl.load(v2p_ptr + page, mask=mask, other=0)
     entry = tl.maximum(phys * mult, 0).to(tl.int32)

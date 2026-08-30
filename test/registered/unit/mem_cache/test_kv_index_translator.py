@@ -94,16 +94,12 @@ def _build_composite(ps, collapse=False, n_full_pages=16, n_swa_pages=8):
         forward_stream=None,
     )
     if collapse:
-        # The multiplier-1 arm: a sub-pool whose views are NOT dense, so its
-        # kernel-facing ids are the physical ones. No unified sub-pool is built
-        # that way today (the specs all report >1), so pin it here rather than
-        # lose the regime -- the table formula has to hold for both.
+        # The multiplier-1 arm, where kernel-facing ids ARE the physical ones.
+        # No unified sub-pool reports 1 today, so pin the regime here.
         allocator.full_attn_allocator.kernel_page_multiplier = 1
         allocator.swa_attn_allocator.kernel_page_multiplier = 1
-    # The real UnifiedSWAKVPool carries the pool-level full->swa translate, so
-    # the fake must too: it IS the runner's token_to_kv_pool (see _make_source),
-    # and a stand-in that lacked the method would force a wrapper object,
-    # modelling a pool/allocator split that never occurs for a target runner.
+    # The fake IS the runner's token_to_kv_pool, and the real UnifiedSWAKVPool
+    # carries the pool-level full->swa translate, so the fake must too.
     kvcache.translate_loc_from_full_to_swa = allocator.translate_loc_from_full_to_swa
     return allocator
 
