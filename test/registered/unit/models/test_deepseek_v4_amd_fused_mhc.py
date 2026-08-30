@@ -3,6 +3,7 @@ from unittest import mock
 
 from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_fused_mhc
+from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
@@ -19,8 +20,8 @@ class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
         ):
             self.assertTrue(deepseek_v4_fused_mhc.is_cross_layer_mhc_fusion_enabled())
 
-    @mock.patch.object(deepseek_v4_fused_mhc, "is_sm120_supported", return_value=True)
-    def test_sm120_enables_fusion_with_tilelang_pre_disabled(self, _mock_sm120):
+    @override_platform(is_sm120=True)
+    def test_sm120_enables_fusion_with_tilelang_pre_disabled(self):
         # Regression (PR review): consolidating _is_fused_mhc_post_pre_enabled into
         # this module must preserve the SM120 special case. SM120 disables the
         # standalone TileLang pre path, but mhc_fused_post_pre dispatches
@@ -35,8 +36,8 @@ class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
         ):
             self.assertTrue(deepseek_v4_fused_mhc._is_fused_mhc_post_pre_enabled())
 
-    @mock.patch.object(deepseek_v4_fused_mhc, "is_sm120_supported", return_value=False)
-    def test_no_sm120_still_requires_tilelang_pre(self, _mock_sm120):
+    @override_platform(is_sm120=False)
+    def test_no_sm120_still_requires_tilelang_pre(self):
         # Negative branch: the (pre OR sm120) clause must not degrade to
         # always-true. With SM120 unsupported and the pre flag off, fuse+post
         # alone must not enable the standalone TileLang fused path.
@@ -68,11 +69,7 @@ class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
                     envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(fuse),
                     envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(pre),
                     envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(post),
-                    mock.patch.object(
-                        deepseek_v4_fused_mhc,
-                        "is_sm120_supported",
-                        return_value=sm120,
-                    ),
+                    override_platform(is_sm120=sm120),
                 ):
                     self.assertEqual(
                         deepseek_v4_fused_mhc._is_fused_mhc_post_pre_enabled(),
@@ -83,7 +80,6 @@ class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
     @mock.patch.object(deepseek_v4_fused_mhc, "get_bool_env_var", return_value=True)
     @mock.patch.object(deepseek_v4_fused_mhc, "_is_hip", True)
     def test_aiter_gfx95_enables_cross_layer_fusion(self, _mock_aiter, _mock_gfx95):
-        # TileLang flags off: fusion must still enable via the aiter gfx95 path.
         with (
             envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(False),
             envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(False),
