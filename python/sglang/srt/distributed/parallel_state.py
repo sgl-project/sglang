@@ -2869,7 +2869,6 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     Args:
         tp_group (GroupCoordinator): the tp group coordinator
     """
-    from sglang.srt.runtime_context import get_parallel
 
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
