@@ -27,6 +27,7 @@ from sglang.kernels.ops.diffusion import (
     mount_hunyuan_qknorm,
     mount_lingbot_video_rmsnorm,
     mount_ltx2_rms_norm_modulate,
+    mount_nvfp4_bias_gelu,
     mount_sana_video_linear_attention,
     unmount_fused_gate_rmsnorm,
     unmount_fused_linear_gelu,
@@ -34,6 +35,7 @@ from sglang.kernels.ops.diffusion import (
     unmount_hunyuan_qknorm,
     unmount_lingbot_video_rmsnorm,
     unmount_ltx2_rms_norm_modulate,
+    unmount_nvfp4_bias_gelu,
     unmount_sana_video_linear_attention,
 )
 from sglang.multimodal_gen import envs
@@ -165,6 +167,11 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "fused linear+GELU (cublasLt epilogue)",
         mount_fused_linear_gelu,
         unmount_fused_linear_gelu,
+    ),
+    (
+        "Wan NVFP4 fused bias+GELU",
+        mount_nvfp4_bias_gelu,
+        unmount_nvfp4_bias_gelu,
     ),
     (
         "fused LN+modulate (affine folding)",
@@ -1223,8 +1230,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         image_kwargs = self.prepare_extra_func_kwargs(
             getattr(self.transformer, "forward", self.transformer),
             {
+                # Pass None (not []) so T2V paths whose transformer has no
+                # image_embedder skip the branch; diffusers guards on
+                # `is not None` only.
                 # TODO: make sure on-device
-                "encoder_hidden_states_image": image_embeds,
+                "encoder_hidden_states_image": image_embeds if image_embeds else None,
             },
         )
 

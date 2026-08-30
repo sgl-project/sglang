@@ -455,7 +455,7 @@ class LMCRadixCache(RadixCache):
         topk = get_spec().speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
-            kv_committed_len = req.kv_committed_len
+            kv_committed_len = req.kv.kv_committed_len
         else:
             kv_committed_len = len(req.origin_input_ids) + max(
                 len(req.output_ids) - 1, 0

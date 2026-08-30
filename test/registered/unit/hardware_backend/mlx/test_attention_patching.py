@@ -1216,6 +1216,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             ),
             logprob_result_processor=None,
             output_streamer=None,
+            beam_coordinator=None,
             abort_request=lambda req: None,
         )
         # Stub out the methods _handle_finish_state_updated_req calls that
@@ -1520,7 +1521,6 @@ if _HAS_MLX:
             self.req_pool_idx = None
             self.mamba_pool_idx = None
             self.inflight_middle_chunks = 0
-            self.kv_committed_len = 0
 
     class FakeTpWorker:
         def __init__(self, next_token_ids):
