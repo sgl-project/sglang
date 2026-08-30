@@ -288,7 +288,6 @@ python3 -m sglang.launch_server \
   --model-path RadixArk/GLM-5.3-Flash-NVFP4 \
   --quantization modelopt_fp4 \
   --tp-size 4 \
-  --disable-shared-experts-fusion \
   --dsa-prefill-backend tilelang --dsa-decode-backend tilelang \
   --kv-cache-dtype bfloat16 \
   --moe-runner-backend flashinfer_cutlass \
@@ -300,7 +299,7 @@ python3 -m sglang.launch_server \
 
 Operational notes:
 
-- TP-only deployments need `--disable-shared-experts-fusion`.
+- Older builds required `--disable-shared-experts-fusion` for TP-only deployments; the image above and current main already include the fix.
 - Use `--moe-runner-backend flashinfer_cutlass` for these NVFP4 checkpoints.
 - Keep the KV cache in bfloat16 with the TileLang DSA backends.
 
