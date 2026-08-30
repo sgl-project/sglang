@@ -5,8 +5,8 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
-from sglang.srt.utils.common import is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
     return (
         envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
         and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
-        and (envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() or is_sm120_supported())
+        and (envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() or get_platform().is_sm120)
     )
 
 

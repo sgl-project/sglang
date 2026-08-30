@@ -40,15 +40,18 @@ _OWNERS = ("server_args.py", "runtime_context.py", "arg_groups/")
 # startup default wherever it is written, and `benchmark/` ships too.
 _READS_SCANNED = _PACKAGE
 
-_DECLARERS = ("_declare", "declare_resolution", "declare_late_resolution")
+_DECLARERS = ("declare_resolution", "declare_late_resolution")
 
 
 def _declared_by_keyword():
     """Fields named as a keyword at a declaration site."""
     written = set()
     for path in sorted(_SRT.rglob("*.py")):
+        source = path.read_text(encoding="utf-8-sig")
+        if not any(declarer in source for declarer in _DECLARERS):
+            continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            tree = ast.parse(source)
         except SyntaxError:
             raise AssertionError(f"unparsable module in the census: {path}")
         for node in ast.walk(tree):
@@ -122,19 +125,17 @@ def _returned_field_names(function):
             and node.func.value.id in returned
         ):
             names |= {kw.arg for kw in node.keywords if kw.arg}
-            receiver = node.func.value
-            if isinstance(receiver, ast.Name) and receiver.id == "overrides":
-                # Positional dict literals are collected by the Dict walk;
-                # anything else is invisible.
-                for arg in node.args:
-                    if not isinstance(arg, ast.Dict):
-                        raise AssertionError(
-                            f"opaque overrides.update() argument in {function.name}"
-                        )
-                if any(kw.arg is None for kw in node.keywords):
-                    raise AssertionError(
-                        f"**kwargs overrides.update() in {function.name}"
-                    )
+            # A positional dict literal has to be read here. The Dict walk above
+            # only reaches literals that are *returned* or assigned to a returned
+            # name, so `d.update({"field": value})` was being type-checked and
+            # then dropped -- silently, under a comment claiming otherwise.
+            for arg in node.args:
+                if isinstance(arg, ast.Dict):
+                    top_level_keys(arg)
+                else:
+                    raise AssertionError(f"opaque update() argument in {function.name}")
+            if any(kw.arg is None for kw in node.keywords):
+                raise AssertionError(f"**kwargs update() in {function.name}")
     return names
 
 
@@ -148,12 +149,28 @@ def _declared_by_registry_and_passes():
     `@register_model_override*` sees exactly one of them and reports a healthy
     census over a channel it cannot see.
     """
+    import sys
+
     from sglang.srt.arg_groups import overrides
 
-    tree = ast.parse((_SRT / "arg_groups/overrides.py").read_text(encoding="utf-8-sig"))
-    bodies = {
-        node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
-    }
+    # Resolve each callable's body in the file it actually lives in. The
+    # declarations are spread over `arg_groups/model_overrides/`, one module per
+    # model family, and a scan hard-coded to `overrides.py` would find none of
+    # them -- and, worse, would keep reporting a healthy census while doing it.
+    bodies_by_module = {}
+
+    def _bodies(module_name):
+        if module_name not in bodies_by_module:
+            path = getattr(sys.modules[module_name], "__file__", None)
+            assert path, f"{module_name} has no source file"
+            module_tree = ast.parse(pathlib.Path(path).read_text(encoding="utf-8-sig"))
+            bodies_by_module[module_name] = {
+                node.name: node
+                for node in ast.walk(module_tree)
+                if isinstance(node, ast.FunctionDef)
+            }
+        return bodies_by_module[module_name]
+
     callables = {fn for fns in overrides._MODEL_OVERRIDE_FNS.values() for fn in fns}
     callables |= {
         fn for _predicate, fn in getattr(overrides, "_PREDICATE_OVERRIDE_FNS", ())
@@ -162,11 +179,23 @@ def _declared_by_registry_and_passes():
 
     fields = set()
     for fn in callables:
-        body = bodies.get(getattr(fn, "__name__", ""))
-        if body is not None:
-            fields |= _returned_field_names(body)
+        name = getattr(fn, "__name__", "")
+        body = _bodies(fn.__module__).get(name)
+        # Loud, not silent: a body this scan cannot find is a field census it
+        # is not taking, and a narrower census makes every check downstream of
+        # it quietly vacuous.
+        assert body is not None, f"{fn.__module__}.{name} has no body to scan"
+        fields |= _returned_field_names(body)
+
     # The literal arch -> {field: value} table, which has no callable at all.
-    for node in tree.body:
+    # It lives with the rest of the registry, in `model_override_base`.
+    from sglang.srt.arg_groups import model_override_base
+
+    table_tree = ast.parse(
+        pathlib.Path(model_override_base.__file__).read_text(encoding="utf-8-sig")
+    )
+    seen_table = False
+    for node in table_tree.body:
         target = None
         if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
             target = node.targets[0].id
@@ -183,24 +212,29 @@ def _declared_by_registry_and_passes():
                 if not isinstance(key, ast.Constant):
                     raise AssertionError("non-literal override key")
                 fields.add(key.value)
+        seen_table = True
+    assert seen_table, "MODEL_OVERRIDES is not where this scan looks for it"
     return fields
 
 
 def _declared_by_late_resolution():
-    """Keywords of `self._late_resolution(...)`, the fourth declarer spelling.
+    """Keywords of `declare_late_resolution(record, ...)`, the late spelling.
 
-    It forwards `**fields` to `declare_late_resolution`, so the keywords sit at
-    its call sites and a scan for the declarer's own name finds none of them.
+    The fields sit at the call sites rather than in the declarer, so a scan
+    that only knew the declarer's own definition would find none of them.
     """
-    tree = ast.parse((_SRT / "server_args.py").read_text(encoding="utf-8-sig"))
+    # The record plus `arg_groups/`: a hook calls it on the record it was
+    # handed, so scanning the record's file alone finds nothing.
+    sources = [_SRT / "server_args.py", *sorted((_SRT / "arg_groups").rglob("*.py"))]
     fields = set()
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_late_resolution"
-        ):
-            fields |= {keyword.arg for keyword in node.keywords if keyword.arg}
+    for source in sources:
+        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8-sig"))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "declare_late_resolution"
+            ):
+                fields |= {keyword.arg for keyword in node.keywords if keyword.arg}
     return fields
 
 
@@ -293,8 +327,11 @@ def _subtrees_with_their_own_record():
         rel = path.relative_to(_PACKAGE).as_posix()
         if rel.startswith("srt/") or "/" not in rel:
             continue
+        source = path.read_text(encoding="utf-8-sig")
+        if "ServerArgs" not in source:
+            continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            tree = ast.parse(source)
         except SyntaxError:
             continue
         if any(
@@ -333,8 +370,11 @@ def _chain_reads(written):
             under_srt = rel[len("srt/") :]
             if path.name in _OWNERS or under_srt.startswith(_OWNERS[-1]):
                 continue
+        source = path.read_text(encoding="utf-8-sig")
+        if "server_args" not in source:
+            continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            tree = ast.parse(source)
         except SyntaxError:
             raise AssertionError(f"unparsable module in the census: {rel}")
         if (
@@ -402,6 +442,87 @@ def _chain_reads(written):
     return sorted(found)
 
 
+def _passes_named_at_call_sites() -> set:
+    """Names passed to ``run_post_process_pass(sa, fn)`` anywhere in the tree.
+
+    A call whose pass is not a bare name is a hard failure, not a skip: this
+    scan is the ground truth every registry-driven check below is derived from,
+    so `run_post_process_pass(self, overrides._new_pass)` (an `ast.Attribute`)
+    or `run_post_process_pass(self, fn=_new_pass)` (a keyword) would otherwise
+    walk past all of them silently. Keeping the call shape uniform is the
+    price of the scan being complete.
+    """
+    names = set()
+    for path in sorted(pathlib.Path(next(iter(sglang.__path__))).rglob("*.py")):
+        source = path.read_text(encoding="utf-8-sig")
+        if "run_post_process_pass" not in source:
+            continue
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                called = func.id
+            elif isinstance(func, ast.Attribute):
+                called = func.attr
+            else:
+                called = None
+            if called != "run_post_process_pass":
+                continue
+            if (
+                len(node.args) != 2
+                or node.keywords
+                or not isinstance(node.args[1], ast.Name)
+            ):
+                raise AssertionError(
+                    f"{path}:{node.lineno}: run_post_process_pass takes the pass "
+                    "as a bare name in its second positional argument; "
+                    f"{ast.unparse(node)!r} is invisible to this scan and to "
+                    "every registry-driven check derived from it"
+                )
+            names.add(node.args[1].id)
+    return names
+
+
+class TestEveryInvokedPassIsRegistered(CustomTestCase):
+    """The registry is what the scans above enumerate, so a pass missing from it
+    is a pass nothing checks.
+
+    Being invoked and being registered are two edits, and `_a2a_fusion_adjustments`
+    shipped with only the first: it ran in production while the registry-driven
+    scans walked past it. The call sites are the ground truth here -- the registry
+    is derived from a decorator someone has to remember.
+    """
+
+    def test_the_registry_covers_every_call_site(self):
+        from sglang.srt.arg_groups import overrides
+
+        invoked = _passes_named_at_call_sites()
+        self.assertGreater(
+            len(invoked),
+            20,
+            f"only {len(invoked)} call sites found; the scan is broken, not the tree",
+        )
+        registered = {fn.__name__ for fn in overrides.POST_PROCESS_PASSES}
+        self.assertEqual(
+            set(),
+            invoked - registered,
+            "these passes are invoked but carry no @register_post_process, so "
+            "every check that walks POST_PROCESS_PASSES skips them",
+        )
+        self.assertEqual(
+            set(),
+            registered - invoked,
+            "these passes carry @register_post_process but no slot invokes "
+            "them; deleting a call site and leaving the decorator behind "
+            "leaves a pass that only the scans can see",
+        )
+
+
 class TestNoChainReadsOfResolvedConfig(CustomTestCase):
     def test_the_census_has_something_to_count(self):
         """A written set that collapsed would make the pin vacuous.
@@ -447,13 +568,20 @@ class TestNoChainReadsOfResolvedConfig(CustomTestCase):
             len(by_late),
             3,
             f"only {len(by_late)} fields are declared late; the "
-            "`_late_resolution` keyword scan broke",
+            "`declare_late_resolution` keyword scan broke",
         )
-        # The three mechanisms are not the same set: if any became a subset of
-        # the keyword scan, that scan would be doing all the work and a
-        # regression in the others would be invisible.
+        # The data channel is not the keyword scan's subset: if it became one,
+        # that scan would be doing all the work and a regression here would be
+        # invisible. The late channel *is* a subset, and deliberately so --
+        # `declare_late_resolution` is a keyword declarer like the others now
+        # that the record hosts no forwarding member, so its own floor above is
+        # what pins it.
         self.assertTrue(by_data - by_keyword, "the data channel adds nothing")
-        self.assertTrue(by_late - by_keyword, "late resolution adds nothing")
+        self.assertTrue(
+            by_late <= by_keyword,
+            "late resolution declares outside the keyword channel; it is the "
+            "same spelling, so the two cannot disagree",
+        )
 
     def test_nothing_reads_a_resolved_field_off_a_borrowed_record(self):
         found = _chain_reads(_resolution_written())

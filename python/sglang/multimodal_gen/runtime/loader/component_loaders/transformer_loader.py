@@ -25,9 +25,9 @@ from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     TransformerQuantLoadSpec,
+    resolve_transformer_checkpoint_files,
     resolve_transformer_gguf_to_load,
     resolve_transformer_quant_load_spec,
-    resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
@@ -101,7 +101,14 @@ def _server_args_for_transformer_component(
     """Mask global quantized override flags for secondary transformer components."""
     component_weights_path = server_args.component_weights_paths.get(component_name)
     component_quantization = server_args.component_quantizations.get(component_name)
-    if component_weights_path is not None or component_quantization is not None:
+    component_ignored_layers = server_args.component_quantization_ignored_layers.get(
+        component_name
+    )
+    if (
+        component_weights_path is not None
+        or component_quantization is not None
+        or component_ignored_layers is not None
+    ):
         component_server_args = copy.copy(server_args)
         if component_weights_path is not None:
             component_server_args.transformer_weights_path = component_weights_path
@@ -118,6 +125,8 @@ def _server_args_for_transformer_component(
                 component_quantization,
                 component_name,
             )
+        if component_ignored_layers is not None:
+            component_server_args.quantization_ignored_layers = component_ignored_layers
         return component_server_args
 
     if component_name not in ("transformer_2", "unconditional_transformer"):
@@ -145,6 +154,7 @@ class TransformerLoader(ComponentLoader):
 
     allow_global_attention_backend_fallback = False
     supports_online_quantization_override = True
+    supports_fsdp_inference = True
 
     component_names = [
         "transformer",
@@ -183,6 +193,33 @@ class TransformerLoader(ComponentLoader):
             or component_server_args.quantization is not None
         )
 
+    def validate_native_fallback(
+        self, server_args: ServerArgs, component_name: str
+    ) -> None:
+        requested_distributed_execution = []
+        if server_args.tp_size is not None and server_args.tp_size > 1:
+            requested_distributed_execution.append(f"tp_size={server_args.tp_size}")
+        if server_args.sp_degree is not None and server_args.sp_degree > 1:
+            requested_distributed_execution.append(f"sp_degree={server_args.sp_degree}")
+        if server_args.ulysses_degree is not None and server_args.ulysses_degree > 1:
+            requested_distributed_execution.append(
+                f"ulysses_degree={server_args.ulysses_degree}"
+            )
+        if server_args.ring_degree is not None and server_args.ring_degree > 1:
+            requested_distributed_execution.append(
+                f"ring_degree={server_args.ring_degree}"
+            )
+        if server_args.should_use_fsdp_for_component(component_name):
+            requested_distributed_execution.append("FSDP")
+        if requested_distributed_execution:
+            raise RuntimeError(
+                f"Native Diffusers fallback for transformer component "
+                f"{component_name!r} cannot honor requested distributed execution: "
+                f"{', '.join(requested_distributed_execution)}. Use an SGLang-native "
+                "transformer implementation or set tp_size, sp_degree, "
+                "ulysses_degree, and ring_degree to 1 without FSDP."
+            )
+
     def load_customized(
         self,
         component_model_path: str,
@@ -205,10 +242,13 @@ class TransformerLoader(ComponentLoader):
             # A GGUF file holds the whole transformer; the remaining components
             # still load from the base model path.
             safetensors_list = []
+            transformer_override_config_path = None
         else:
-            safetensors_list = resolve_transformer_safetensors_to_load(
+            checkpoint_files = resolve_transformer_checkpoint_files(
                 component_server_args, component_model_path
             )
+            safetensors_list = list(checkpoint_files.safetensors)
+            transformer_override_config_path = checkpoint_files.config_path
 
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
@@ -248,7 +288,10 @@ class TransformerLoader(ComponentLoader):
                     safetensors_list
                 )
                 checkpoint_quant_config = resolve_minimax_h3_checkpoint_quantization(
-                    layer_markers
+                    layer_markers,
+                    safetensors_list,
+                    dit_config.arch_config.param_names_mapping,
+                    dit_config.arch_config.reverse_param_names_mapping,
                 )
                 if adaln_curve_shape is not None:
                     (
@@ -274,6 +317,7 @@ class TransformerLoader(ComponentLoader):
             component_name=component_name,
             gguf_file=gguf_file,
             checkpoint_quant_config=checkpoint_quant_config,
+            transformer_override_config_path=transformer_override_config_path,
         )
         if quant_spec.gguf_file is not None and is_minimax_h3:
             assert quant_spec.quant_config is not None
@@ -411,8 +455,9 @@ class TransformerLoader(ComponentLoader):
         )
         if direct_gpu_weight_loading:
             logger.warning(
-                "Direct GPU weight loading is enabled for %s; the complete checkpoint "
-                "state dict and materialized model weights may coexist on GPU during startup",
+                "Direct GPU weight loading is enabled for %s; compatible checkpoint "
+                "tensors become model storage, while transformed tensors may still "
+                "require temporary GPU allocations",
                 component_name,
             )
 

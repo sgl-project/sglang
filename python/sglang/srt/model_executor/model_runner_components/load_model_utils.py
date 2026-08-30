@@ -11,6 +11,10 @@ import msgspec
 import torch
 import torch.distributed as dist
 
+from sglang.srt.arg_groups.overrides import (
+    modelexpress_transport_of,
+    modelexpress_url_of,
+)
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
@@ -26,6 +30,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_context,
     get_exec,
     get_model,
     get_observability,
@@ -67,14 +72,11 @@ class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
     startup_weight_load: Optional[Any] = None
 
 
-def maybe_downgrade_dtype_for_legacy_gpu(
-    *, server_args: ServerArgs, model_config: ModelConfig
-) -> None:
+def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
     if torch.cuda.get_device_capability()[0] < 8:
         logger.info(
             "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
         )
-        from sglang.srt.runtime_context import get_context
 
         # Device-driven, so every runner in the process resolves the same way;
         # the per-runner truth is model_config.dtype, this is the record.
@@ -85,7 +87,7 @@ def maybe_downgrade_dtype_for_legacy_gpu(
 
 
 def maybe_trigger_remote_instance_nccl_send_group(
-    *, server_args: ServerArgs, tp_rank: int, load_format: Optional[str] = None
+    *, tp_rank: int, load_format: Optional[str] = None
 ) -> None:
     """``load_format`` is this runner's effective format: a draft loading under
     ``--speculative-draft-draft-load-format`` needs its own send group, and the
@@ -107,9 +109,7 @@ def maybe_trigger_remote_instance_nccl_send_group(
             t.start()
 
 
-def load_kv_cache_scales(
-    *, model, server_args: ServerArgs, kv_cache_dtype: str
-) -> None:
+def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
     """``kv_cache_dtype`` is the caller's resolved value. Required rather than
     defaulted: a fallback to ``server_args`` would be a hidden global read for
     any future caller that forgets to pass one."""
@@ -151,7 +151,7 @@ def resolve_sliding_window_size(model, model_config: ModelConfig) -> Optional[in
     return sliding_window_size
 
 
-def report_online_quantization(*, model, server_args: ServerArgs) -> None:
+def report_online_quantization(*, model) -> None:
     # TODO: Make sure all models have `quant_config` attribute, and all online quantization methods register which layers they actually quantize.
     quantized_layers = getattr(
         getattr(model, "quant_config", None), "quantized_layers", None
@@ -170,7 +170,6 @@ def report_online_quantization(*, model, server_args: ServerArgs) -> None:
 def maybe_register_debug_tensor_dump_hook(
     *,
     model,
-    server_args: ServerArgs,
     spec_algorithm: SpeculativeAlgorithm,
     is_draft_worker: bool,
     tp_size: int,
@@ -224,8 +223,8 @@ def build_load_config(
         remote_instance_weight_loader_backend=get_model().remote_instance_weight_loader_backend,
         remote_instance_weight_loader_transfer_engine=remote_instance_weight_transporter_engine,
         remote_instance_weight_loader_transfer_engine_session_id=remote_instance_weight_transporter_session_id,
-        modelexpress_url=server_args.modelexpress_url,
-        modelexpress_transport=server_args.modelexpress_transport,
+        modelexpress_url=modelexpress_url_of(server_args),
+        modelexpress_transport=modelexpress_transport_of(server_args),
         modelopt_config=modelopt_config,
         rl_quant_profile=get_model().rl_quant_profile,
         draft_model_idx=draft_model_idx,
@@ -237,7 +236,6 @@ def build_load_config(
 def maybe_enable_ipc_weight_cache(
     *,
     load_config: LoadConfig,
-    server_args: ServerArgs,
     tp_size: int,
     pp_rank: int,
     tp_rank: int,
@@ -311,12 +309,11 @@ def load_model_with_memory_saver(
                 StartupWeightLoadManager,
             )
 
-            startup_weight_load = StartupWeightLoadManager.create_from_server_args(
+            startup_weight_load = StartupWeightLoadManager.create_from_published_config(
                 loader=loader,
                 model_config=model_config,
                 load_config=load_config,
                 device_config=device_config,
-                server_args=server_args,
                 is_draft_worker=is_draft_worker,
             )
             model = startup_weight_load.prepare()

@@ -257,6 +257,7 @@ class ComposedPipelineBase(ABC):
                 "QwenImageEditPipeline": {"vae"},
                 "QwenImageEditPlusPipeline": {"vae"},
                 "QwenImageLayeredPipeline": {"vae", "transformer"},
+                "LongCatImageEditPipeline": {"vae"},
                 "GlmImagePipeline": {"vae", "transformer"},
                 "WanImageToVideoPipeline": {"vae"},
                 "WanImageToVideoDmdPipeline": {"vae"},
@@ -269,6 +270,12 @@ class ComposedPipelineBase(ABC):
         extra_allowed_modules = set(
             role_to_pipeline_modules.get(role, {}).get(self.pipeline_name, set())
         )
+        if (
+            role == RoleType.DENOISER
+            and self.pipeline_name == "GlmImagePipeline"
+            and getattr(self.server_args, "srt_encoder_url", None) is not None
+        ):
+            extra_allowed_modules.update({"text_encoder", "tokenizer", "vae"})
 
         if role == RoleType.DENOISER and task_name == "ti2v":
             if self.pipeline_name in {
@@ -359,6 +366,22 @@ class ComposedPipelineBase(ABC):
         logger.debug("Resolved component path: %s", component_model_path)
         return component_model_path
 
+    @staticmethod
+    def _validate_direct_gpu_component_selection(
+        model_index: dict[str, Any], server_args: ServerArgs
+    ) -> None:
+        unavailable = sorted(
+            component_name
+            for component_name in server_args.component_direct_gpu_weight_loading
+            if component_name not in model_index or model_index[component_name] is None
+        )
+        if unavailable:
+            raise ValueError(
+                "--component-direct-gpu-weight-loading selects component(s) "
+                "that are not available in this pipeline: "
+                f"{', '.join(unavailable)}"
+            )
+
     def load_modules(
         self,
         server_args: ServerArgs,
@@ -425,6 +448,7 @@ class ComposedPipelineBase(ABC):
         model_index.pop("boundary_ratio", None)
         # used by Wan2.2 ti2v
         model_index.pop("expand_timesteps", None)
+        self._validate_direct_gpu_component_selection(model_index, server_args)
 
         # some sanity checks
         assert (
@@ -1063,6 +1087,10 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
         return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
         )

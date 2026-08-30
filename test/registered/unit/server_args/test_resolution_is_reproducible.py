@@ -36,6 +36,7 @@ import unittest.mock
 import torch
 
 import sglang
+from sglang.srt.arg_groups.overrides import model_config_of, resolution_result
 from sglang.srt.environ import EnvField, envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda
@@ -270,7 +271,10 @@ class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
         for field in dataclasses.fields(server_args):
             if field.name in _NOT_COMPARABLE:
                 continue
-            value = getattr(server_args, field.name)
+            # The resolution result, not the field: a declaration-only resolver
+            # never writes the field, so comparing fields would miss exactly
+            # the decisions a leak would shift.
+            value = resolution_result(server_args, field.name)
             # Nested dataclasses (cuda_graph_config) compare structurally, and
             # everything else is deep-copied: a snapshot that stored the live
             # list/dict would follow an in-place mutation, which is exactly the
@@ -382,10 +386,13 @@ class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
                 # differs from the cpu that `default_before` resolved to.
                 expected = (
                     "cuda_ipc"
-                    if intermediate.mm_feature_transport == "cuda_ipc"
+                    if resolution_result(intermediate, "mm_feature_transport")
+                    == "cuda_ipc"
                     else "cpu"
                 )
-                self.assertEqual(after.mm_feature_transport, expected)
+                self.assertEqual(
+                    resolution_result(after, "mm_feature_transport"), expected
+                )
 
     def test_resolving_a_sibling_leaves_the_first_alone(self):
         for label, config, kwargs in _SHAPES:
@@ -438,14 +445,16 @@ class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
         record.resolve_once()
 
         entries = []
-        original = ServerArgs._run_resolution_pipeline
+        from sglang.srt.arg_groups import pipeline as pipeline_module
 
-        def counted(self):
+        original = pipeline_module.run_resolution_pipeline
+
+        def counted(server_args):
             entries.append(1)
-            return original(self)
+            return original(server_args)
 
         with unittest.mock.patch.object(
-            ServerArgs, "_run_resolution_pipeline", counted
+            pipeline_module, "run_resolution_pipeline", counted
         ):
             record.resolve_once()
         self.assertEqual(
@@ -510,11 +519,14 @@ class TestProgramsResolveBeforeReadingResolution(CustomTestCase):
         from sglang.srt.server_args import ServerArgs as _ServerArgs
 
         srt = pathlib.Path(next(iter(sglang.__path__))).resolve() / "srt"
-        declarers = {"_declare", "declare_resolution", "declare_late_resolution"}
+        declarers = {"declare_resolution", "declare_late_resolution"}
         fields = set()
         field_names = {field.name for field in _dataclasses.fields(_ServerArgs)}
-        for name in ("server_args.py", "arg_groups/overrides.py"):
-            tree = ast.parse((srt / name).read_text(encoding="utf-8-sig"))
+        # The record plus every module under `arg_groups/`: a handler declares
+        # from whichever of the two it lives in.
+        sources = [srt / "server_args.py", *sorted((srt / "arg_groups").rglob("*.py"))]
+        for source in sources:
+            tree = ast.parse(source.read_text(encoding="utf-8-sig"))
             for node in ast.walk(tree):
                 # Registry data: provider dict keys are field names as
                 # *data*, invisible to the keyword scan below. Filtered
@@ -689,13 +701,14 @@ class TestForksResolveFirst(CustomTestCase):
                 continue
             try:
                 source = path.read_text(encoding="utf-8-sig")
+                if "Process" not in source:
+                    continue
                 tree = ast.parse(source)
             except (SyntaxError, UnicodeDecodeError):
                 continue
             for node in ast.walk(tree):
                 if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
-                body = ast.get_source_segment(source, node) or ""
                 forks = [
                     call
                     for call in ast.walk(node)
@@ -714,6 +727,7 @@ class TestForksResolveFirst(CustomTestCase):
                 ]
                 if not forks:
                     continue
+                body = ast.get_source_segment(source, node) or ""
                 examined += 1
                 # `spawn` starts a fresh interpreter, so the child may probe.
                 if 'get_context("spawn")' in body or "'spawn'" in body:
@@ -759,31 +773,43 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
         server_args.resolve_once()
         return server_args
 
-    def test_a_bare_replace_would_resolve_a_second_time(self):
-        """Why the helper exists. If this stops drifting, the pipeline became
-        idempotent and the helper's reason is gone -- read it again before
-        deleting either."""
+    def test_a_bare_replace_resolves_again_and_lands_in_the_same_place(self):
+        """A bare copy resolves to the same place: the fields are the raw input.
+
+        `dataclasses.replace` copies the fields, so a bare copy re-runs
+        resolution over the *same input* the parent got -- the DP-attention
+        halving and the conservativeness scaling apply once. `replace_resolved`
+        buys something else: it carries the parent's declarations and its
+        `model_config`, so the copy answers without resolving at all.
+        """
         parent = self._resolved()
         bare = dataclasses.replace(parent, dist_init_addr="1.2.3.4:5000")
         self.assertFalse(
-            getattr(bare, "_declarations_materialized", False),
+            getattr(bare, "_resolution_finished", False),
             "a bare replace carried the flag; then this test proves nothing",
         )
         bare.resolve_once()
+        drifted = {
+            field.name: (
+                resolution_result(parent, field.name),
+                resolution_result(bare, field.name),
+            )
+            for field in dataclasses.fields(parent)
+            if field.name not in ("dist_init_addr", "random_seed")
+            and repr(resolution_result(parent, field.name))
+            != repr(resolution_result(bare, field.name))
+        }
         self.assertEqual(
-            (bare.chunked_prefill_size, round(bare.schedule_conservativeness, 4)),
-            (
-                parent.chunked_prefill_size // 2,
-                round(parent.schedule_conservativeness * 0.3, 4),
-            ),
-            "the second pass no longer drifts; this is the drift the copy "
-            "helper exists to avoid",
+            drifted,
+            {},
+            "resolving a bare copy landed somewhere else, so the pipeline is "
+            "reading its own output again",
         )
 
     def test_replace_resolved_keeps_the_parents_resolution(self):
         parent = self._resolved()
         copy_ = parent.replace_resolved("ray.test", dist_init_addr="1.2.3.4:5000")
-        self.assertTrue(getattr(copy_, "_declarations_materialized", False))
+        self.assertTrue(getattr(copy_, "_resolution_finished", False))
         drifted = {
             field.name: (getattr(parent, field.name), getattr(copy_, field.name))
             for field in dataclasses.fields(parent)
@@ -800,10 +826,10 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
     def test_the_copy_carries_what_resolution_left_on_the_record(self):
         """Not just the stash and the flag.
 
-        `get_model_config()` memoizes on the record, and that cache is filled
+        `model_config_of()` memoizes on the record, and that cache is filled
         during resolution. A copy that is marked resolved but arrives without it
         cannot fill it -- the read-only guard refuses the cache write -- so the
-        first `get_model_config()` raises. That is what killed the Ray
+        first `model_config_of()` raises. That is what killed the Ray
         schedulers, and it is why the carry is enumerated from the instance
         rather than from a list of names.
         """
@@ -820,7 +846,7 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
             [],
             f"the copy did not carry what resolution left on the record: {missing}",
         )
-        self.assertIsNotNone(copy_.get_model_config())
+        self.assertIsNotNone(model_config_of(copy_))
         # Containers are copied, so the copy's declaration stays with it.
         self.assertEqual(
             len(parent._resolved_overrides) + 1, len(copy_._resolved_overrides)
@@ -845,9 +871,9 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
         self.assertEqual(get_parallel().dist_init_addr, "1.2.3.4:5000")
         self.assertEqual(
             get_schedule().chunked_prefill_size,
-            parent.chunked_prefill_size,
-            "publishing the copy re-ran resolution; the bag disagrees with the "
-            "record the parent resolved",
+            resolution_result(parent, "chunked_prefill_size"),
+            "publishing the copy re-ran resolution; the bag disagrees with what "
+            "the parent's resolution decided",
         )
 
     def test_no_bare_replace_of_a_record_outside_the_helper(self):
@@ -939,7 +965,10 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
         callers = []
         for path in sorted(package_root.rglob("*.py")):
             try:
-                tree = ast.parse(path.read_text())
+                source = path.read_text()
+                if "run_resolution_pipeline" not in source:
+                    continue
+                tree = ast.parse(source)
             except SyntaxError:
                 continue
             # The full (class, function, ...) scope chain, so the assertion can
@@ -957,8 +986,8 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
             for node in ast.walk(tree):
                 if (
                     isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "_run_resolution_pipeline"
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "run_resolution_pipeline"
                 ):
                     rel = path.relative_to(package_root).as_posix()
                     callers.append((rel, ".".join(scopes.get(id(node), ()))))
@@ -988,7 +1017,10 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
         callers = []
         for path in sorted(package_root.rglob("*.py")):
             try:
-                tree = ast.parse(path.read_text())
+                source = path.read_text()
+                if "resolve_once" not in source:
+                    continue
+                tree = ast.parse(source)
             except SyntaxError:
                 continue
             for node in ast.walk(tree):
@@ -1052,6 +1084,140 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
                 "resolved by whoever built it, and publish resolves what it "
                 "is handed",
             )
+
+
+class TestResolutionStaysLazy(CustomTestCase):
+    """Resolving a dummy model must not load the families it never reaches.
+
+    The forwarding slots imported their hook only when the step ran, so a
+    `ServerArgs(model_path="dummy")` resolution touched four hook modules. With
+    the slots gone the imports are function-local for the same reason, and a
+    module-level one costs every caller of the dummy boundary -- which is every
+    `override_server_args` in the test suite.
+    """
+
+    def test_no_hook_module_imports_another_at_module_scope(self):
+        import ast
+
+        import sglang
+
+        srt = pathlib.Path(next(iter(sglang.__path__))).resolve() / "srt"
+        offenders = []
+        for path in sorted((srt / "arg_groups").glob("*.py")):
+            for node in ast.parse(path.read_text(encoding="utf-8-sig")).body:
+                if (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module
+                    and node.module.startswith("sglang.srt.arg_groups")
+                    and node.module.endswith("_hook")
+                ):
+                    offenders.append(f"{path.name}:{node.lineno} -> {node.module}")
+        self.assertEqual(
+            offenders,
+            [],
+            "a hook module imports another at module scope, so loading one "
+            "family drags in a family it may never call. Import it inside the "
+            "function that calls it:\n  " + "\n  ".join(offenders),
+        )
+
+    def test_no_family_is_imported_before_the_step_that_calls_it(self):
+        """Source-level, so it holds whatever else the process has imported.
+
+        Every hook import inside the dispatcher must come after the imports of
+        the families reached earlier and before its own first call -- what an
+        eager block at the top of the function breaks, and what a `sys.modules`
+        diff cannot see once another test has loaded those modules.
+        """
+        import ast
+
+        import sglang
+
+        srt = pathlib.Path(next(iter(sglang.__path__))).resolve() / "srt"
+        tree = ast.parse(
+            (srt / "arg_groups" / "pipeline.py").read_text(encoding="utf-8-sig")
+        )
+        dispatch = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "run_resolution_pipeline"
+        )
+        early_return = min(
+            (
+                n.lineno
+                for n in ast.walk(dispatch)
+                if isinstance(n, ast.Return) and n.value is None
+            ),
+            default=None,
+        )
+        self.assertIsNotNone(early_return, "the dummy short circuit is gone")
+
+        imported_early, called_early = set(), set()
+        for node in ast.walk(dispatch):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module
+                and node.module.endswith("_hook")
+                and node.lineno < early_return
+            ):
+                imported_early.add(node.module.rsplit(".", 1)[-1])
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.lineno < early_return
+            ):
+                called_early.add(node.func.id)
+
+        hooks = {}
+        for path in sorted((srt / "arg_groups").glob("*_hook.py")):
+            for node in ast.parse(path.read_text(encoding="utf-8-sig")).body:
+                if isinstance(node, ast.FunctionDef):
+                    hooks[node.name] = path.stem
+        needed_early = {hooks[name] for name in called_early if name in hooks}
+        self.assertEqual(
+            imported_early - needed_early,
+            set(),
+            "the dispatcher imports a hook family before the dummy short "
+            "circuit without calling it there, so every dummy resolution pays "
+            "for a family it never reaches",
+        )
+
+    def test_a_dummy_resolution_loads_only_what_it_reaches(self):
+        """The same claim measured, in an interpreter of its own.
+
+        In-process this would be vacuous: another test that resolved a real
+        model has already imported the late families, and the `sys.modules`
+        diff comes back empty.
+        """
+        import subprocess
+        import sys
+
+        import sglang
+
+        probe = (
+            "import sys\n"
+            "from sglang.srt.server_args import ServerArgs\n"
+            "before = set(sys.modules)\n"
+            "ServerArgs(model_path='dummy').resolve_once()\n"
+            "print(','.join(sorted(m.rsplit('.', 1)[-1] for m in set(sys.modules) - before"
+            " if '.arg_groups.' in m and m.endswith('_hook'))))\n"
+        )
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(
+            pathlib.Path(next(iter(sglang.__path__))).resolve().parent
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+        )
+        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
+        loaded = [name for name in out.stdout.strip().split(",") if name]
+        self.assertTrue(loaded, f"the probe reported nothing:\n{out.stdout}")
+        for late in ("model_hook", "cuda_graph_hook", "attention_hook", "lora_hook"):
+            self.assertNotIn(late, loaded)
 
 
 if __name__ == "__main__":
