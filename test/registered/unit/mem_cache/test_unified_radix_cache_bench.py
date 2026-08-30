@@ -642,7 +642,7 @@ def bench_cache_finished(
             len(req.prefix_indices), len(req.full_untruncated_fill_ids)
         )
         req.last_node = node
-        req.cache_protected_len = matched_len
+        req.kv.cache_protected_len = matched_len
         req.kv_committed_len = len(seq)
         if hasattr(lr, "swa_uuid_for_lock"):
             req.swa_uuid_for_lock = lr.swa_uuid_for_lock
