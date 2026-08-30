@@ -679,6 +679,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
         *,
         warmup_mode=None,
         warmup_resolutions=None,
+        warmup_num_frames=None,
         enable_torch_compile=False,
         enable_breakable_cuda_graph=False,
         disagg_role=None,
@@ -688,6 +689,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa = ServerArgs.__new__(ServerArgs)
         sa.warmup_mode = warmup_mode
         sa.warmup_resolutions = warmup_resolutions
+        sa.warmup_num_frames = warmup_num_frames
         sa.enable_torch_compile = enable_torch_compile
         sa.enable_breakable_cuda_graph = enable_breakable_cuda_graph
         sa.disagg_role = RoleType.MONOLITHIC if disagg_role is None else disagg_role
@@ -717,6 +719,16 @@ class TestWarmupModeNormalization(unittest.TestCase):
             warmup_resolutions=["512x512"],
         )
         self.assertEqual(sa.warmup_mode, "request")
+
+    def test_num_frames_forces_warmup_on(self):
+        sa = self._resolve(warmup_mode="off", warmup_num_frames=17)
+        self.assertEqual(sa.warmup_mode, "request")
+
+    def test_num_frames_must_be_positive(self):
+        for num_frames in (0, -1):
+            with self.subTest(num_frames=num_frames):
+                with self.assertRaisesRegex(ValueError, "positive"):
+                    self._resolve(warmup_num_frames=num_frames)
 
     def test_torch_compile_defaults_to_server_warmup(self):
         sa = self._resolve(enable_torch_compile=True)
@@ -1221,6 +1233,35 @@ class TestOffloadDefaults(unittest.TestCase):
         args.disable_fsdp_for_component("text_encoder")
         self.assertFalse(args.should_use_fsdp_for_component("text_encoder"))
 
+    def test_resident_requirement_rejects_every_explicit_offload_surface(self):
+        cases = (
+            {"component_residency": ["text_encoder=component-offload"]},
+            {"component_residency": ["text_encoder=layerwise-offload"]},
+            {"cpu_offload_components": ["text_encoder"]},
+            {"text_encoder_cpu_offload": True},
+            {"layerwise_offload_components": ["text_encoder"]},
+        )
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                args = self._from_dict_with_task_type(
+                    ModelTaskType.T2V,
+                    kwargs={"performance_mode": "manual", **kwargs},
+                )
+
+                with self.assertRaisesRegex(ValueError, "explicit residency option"):
+                    args.require_component_resident(
+                        "text_encoder", feature_name="test backend"
+                    )
+
+    def test_resident_requirement_can_override_automatic_placement(self):
+        args = self._from_dict_with_task_type(ModelTaskType.T2V, memory_gb=16)
+        self.assertIsNone(args.explicit_residency_mode("text_encoder"))
+        self.assertNotEqual(args.residency_mode("text_encoder"), RESIDENT)
+
+        args.require_component_resident("text_encoder", feature_name="test backend")
+
+        self.assertEqual(args.residency_mode("text_encoder"), RESIDENT)
+
     def test_diffusers_component_residency_is_pipeline_wide(self):
         self.assertFalse(resolve_diffusers_pipeline_offload({"all": RESIDENT}))
         self.assertTrue(resolve_diffusers_pipeline_offload({"all": COMPONENT_OFFLOAD}))
@@ -1428,6 +1469,12 @@ class TestOffloadDefaults(unittest.TestCase):
         cosmos3_deployment = Cosmos3Config(
             model_path="nvidia/Cosmos3-Nano"
         ).get_model_deployment_config()
+        cosmos3_super_deployment = Cosmos3Config(
+            model_path="nvidia/Cosmos3-Super"
+        ).get_model_deployment_config()
+        local_cosmos3_nano_deployment = Cosmos3Config(
+            model_path="/models/custom-checkpoint", is_nano=True
+        ).get_model_deployment_config()
         wan_deployment = WanT2V480PConfig().get_model_deployment_config()
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
@@ -1440,8 +1487,12 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
         self.assertEqual(qwen_deployment.dit_layerwise_offload_modes, ())
 
-        self.assertEqual(cosmos3_deployment.keep_resident_min_available_gb, 120)
+        self.assertEqual(cosmos3_deployment.keep_resident_min_available_gb, 90)
         self.assertEqual(cosmos3_deployment.keep_resident_components, ("dit", "vae"))
+        self.assertEqual(cosmos3_super_deployment.keep_resident_min_available_gb, 120)
+        self.assertEqual(
+            local_cosmos3_nano_deployment.keep_resident_min_available_gb, 90
+        )
 
         self.assertIsNone(wan_deployment.fsdp_auto_min_available_memory_gb)
         self.assertEqual(wan_deployment.dit_layerwise_offload_modes, ("memory",))
@@ -1918,7 +1969,7 @@ class TestOffloadDefaults(unittest.TestCase):
     def test_auto_cosmos3_keeps_dit_resident_on_high_memory_gpu(self):
         args = self._from_dict_with_pipeline_config(
             Cosmos3Config(model_path="nvidia/Cosmos3-Nano"),
-            available_memory_gb=139,
+            available_memory_gb=95,
             kwargs={
                 "model_path": "nvidia/Cosmos3-Nano",
                 "performance_mode": "auto",
@@ -1935,7 +1986,7 @@ class TestOffloadDefaults(unittest.TestCase):
     def test_auto_cosmos3_offloads_dit_below_resident_threshold(self):
         args = self._from_dict_with_pipeline_config(
             Cosmos3Config(model_path="nvidia/Cosmos3-Nano"),
-            available_memory_gb=100,
+            available_memory_gb=85,
             kwargs={
                 "model_path": "nvidia/Cosmos3-Nano",
                 "performance_mode": "auto",

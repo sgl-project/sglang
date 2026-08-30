@@ -252,19 +252,22 @@ class SchedulerInvariantChecker:
         swa_uncached = 0
         for batch in batches:
             for req in batch.reqs:
-                if req.kv is None:
+                if not req.is_holding_kv:
                     continue
 
                 allocated_len = req.kv.kv_allocated_len
                 if self.page_size > 1:
                     allocated_len = ceil_align(allocated_len, self.page_size)
-                    assert req.cache_protected_len % self.page_size == 0
+                    assert req.kv.cache_protected_len % self.page_size == 0
 
-                full_uncached += allocated_len - req.cache_protected_len
+                full_uncached += allocated_len - req.kv.cache_protected_len
                 if self.is_hybrid_swa:
                     swa_uncached += allocated_len - max(
-                        req.cache_protected_len, req.kv.swa_evicted_seqlen
+                        req.kv.cache_protected_len, req.kv.swa_evicted_seqlen
                     )
+
+                if req.beam_group is not None:
+                    full_uncached += req.beam_group.extra_uncached_tokens()
 
         return full_uncached, swa_uncached
 
@@ -321,13 +324,13 @@ class SchedulerInvariantChecker:
         batch = self.get_last_batch()
         if batch is not None:
             for req in batch.reqs:
-                if req.kv is None:
+                if not req.is_holding_kv:
                     continue
                 _add_owner(
                     req,
                     f"req {req.rid}",
                     req.req_pool_idx,
-                    req.kv_committed_len,
+                    req.kv.kv_committed_len,
                     req.kv.kv_allocated_len,
                 )
         sess = getattr(self.tree_cache, "slots", None)
@@ -338,7 +341,7 @@ class SchedulerInvariantChecker:
                         slot,
                         f"slot {sid[:8]}",
                         slot.req_pool_idx,
-                        slot.kv_committed_len,
+                        slot.kv.kv_committed_len,
                         slot.kv.kv_allocated_len,
                     )
 
@@ -459,6 +462,8 @@ class SchedulerInvariantChecker:
         return has_leak, messages
 
     def _check_tree_cache(self):
+        if not envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():
+            return
         if (
             self.tree_cache.is_tree_cache()
             and (self.is_hybrid_swa and self.tree_cache.supports_swa())

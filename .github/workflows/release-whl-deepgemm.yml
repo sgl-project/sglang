@@ -194,9 +194,10 @@ jobs:
           # - arch_label: sm120
           #   runner: 1-gpu-5090
           #   wheel_arch: x86_64
-          - arch_label: sm100-aarch64
-            runner: 4-gpu-gb300
-            wheel_arch: aarch64
+          # Temporarily disabled while the GB300 runner is unavailable.
+          # - arch_label: sm100-aarch64
+          #   runner: 4-gpu-gb300
+          #   wheel_arch: aarch64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
