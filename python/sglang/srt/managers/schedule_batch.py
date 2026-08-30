@@ -817,13 +817,23 @@ class ReqLogprob:
 class ReqKvInfo:
     # Device KV a request holds outside the prefix cache. Always present on the Req;
     # whether any KV is held is `req.req_pool_idx is not None` (Req.is_holding_kv).
+
+    # The request's own KV is [cache_protected_len, kv_allocated_len).
+    cache_protected_len: int = 0  # tree cache owns [0, here) (matched or inserted)
+    kv_committed_len: int = 0  # KV content committed up to here, <= kv_allocated_len
     kv_allocated_len: int = 0
-    # The length of KV that have been removed in swa cache.
-    # SWA KV cache eviction behavior differs by cache type:
-    # - Radix cache: KV in range [cache_protected_len, swa_evicted_seqlen) is freed manually in
-    #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
-    # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
-    swa_evicted_seqlen: int = 0
+
+    # SWA slots in [swa_dead_lo(page_size), swa_evicted_seqlen) are already freed.
+    swa_evict_floor: int = 0  # [0, here) never window-evicted (prefill-aware SWA)
+    swa_evicted_seqlen: int = 0  # SWA eviction cursor
+
+    def swa_dead_lo(self, page_size: int) -> int:
+        # Lowest SWA position this request may free itself: above the tree-owned
+        # prefix and above the eviction shield, page-aligned upward.
+        lo = max(self.cache_protected_len, self.swa_evict_floor)
+        if page_size > 1 and lo > self.cache_protected_len:
+            lo = ceil_align(lo, page_size)
+        return lo
 
     @property
     def is_released(self) -> bool:
@@ -913,16 +923,11 @@ class Req(ReqDllmMixin):
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
 
         # For req-level memory management
-        self.kv_committed_len = 0
         self.kv = ReqKvInfo()
         self.retraction_backup: Optional[RetractionBackup] = None
 
         # for cross-encoder model
         self.token_type_ids = token_type_ids
-
-        # Tokens in [0, swa_evict_floor) are protected from SWA window eviction.
-        # This is used by prefill-aware SWA models such as Unlimited-OCR to keep prompt/image KV visible during decode.
-        self.swa_evict_floor: int = 0
 
         # The index of the extend / decode batch
         self.extend_batch_idx = 0
@@ -1051,8 +1056,6 @@ class Req(ReqDllmMixin):
         # per-component nodes this req skipped locking (e.g. mamba on the decode
         # hold, already COW'd), so their dec releases only what it took.
         self.skip_lock_node_ids: dict = {}
-        # The prefix length that is inserted into the tree cache
-        self.cache_protected_len: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1283,8 +1286,8 @@ class Req(ReqDllmMixin):
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
-            return min(self.kv_committed_len, len(self.origin_input_ids))
-        return self.kv_committed_len
+            return min(self.kv.kv_committed_len, len(self.origin_input_ids))
+        return self.kv.kv_committed_len
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
         """Record one step accepted draft count (excludes bonus token) into the histogram."""
@@ -1436,9 +1439,9 @@ class Req(ReqDllmMixin):
                 match_result.mamba_branching_seqlen,
             )
             if match_result.cache_protected_len is not None:
-                self.cache_protected_len = match_result.cache_protected_len
+                self.kv.cache_protected_len = match_result.cache_protected_len
             else:
-                self.cache_protected_len = len(self.prefix_indices)
+                self.kv.cache_protected_len = len(self.prefix_indices)
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1721,7 +1724,7 @@ class Req(ReqDllmMixin):
         self.routed_experts = None
         self.indexer_topk = None
         self.last_node = None
-        self.cache_protected_len = 0
+        self.kv.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
@@ -1746,7 +1749,7 @@ class Req(ReqDllmMixin):
         self.mamba_needs_clear = False
         self.already_computed = 0
         assert not self.is_holding_kv, "expect it is already released"
-        self.kv_committed_len = 0
+        self.kv.kv_committed_len = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
@@ -1934,7 +1937,7 @@ def mamba_lazy_spec_in_window(
     kv_committed_len lags device seq_lens by up to one verify under overlap;
     the 2x window absorbs it.
     """
-    seq_len = req.kv_committed_len
+    seq_len = req.kv.kv_committed_len
     window = 2 * max_draft_tokens
     return seq_len // mamba_track_interval != (seq_len + window) // mamba_track_interval
 
@@ -2506,12 +2509,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             req.extend_batch_idx += 1
 
-            # update req-level memory management fields
-            # TODO(th4): co-locate this req.kv bookkeeping with the real KV
-            # allocation in alloc_for_extend above; they are currently a few
-            # steps apart and should become one owned-kv allocation step.
-            req.kv_committed_len = seq_len
-
             # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # Slice to match extend_input_len — PrefillAdder truncates
@@ -2899,7 +2896,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         if self.spec_algorithm.is_none():
-            new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
+            new_pages = sum(
+                1 for r in requests if r.kv.kv_committed_len % page_size == 0
+            )
             return new_pages * page_size + num_beam_member_rows(requests)
 
         return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
@@ -2909,7 +2908,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reserve = get_alloc_reserve_per_decode()
         total = 0
         for r in requests:
-            x = max(0, r.kv_committed_len + reserve - r.kv.kv_allocated_len)
+            x = max(0, r.kv.kv_committed_len + reserve - r.kv.kv_allocated_len)
             cur = r.kv.kv_allocated_len
             nxt = cur + x
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
@@ -3216,10 +3215,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # the allocator, triggered from mem_cache/common.py.)
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
-        # Update req-level memory management fields
         for req in self.reqs:
             req.decode_batch_idx += 1
-            req.kv_committed_len += 1
 
         # New-tensor avoids racing model_worker_batch refs queued for
         # overlap forward.

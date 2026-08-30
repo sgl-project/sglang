@@ -17,6 +17,14 @@ from sglang.srt.utils.common import is_cuda, is_hip, is_host_cpu_arm64, is_npu
 logger = logging.getLogger(__name__)
 
 
+def handle_hardware_runtime_validation():
+    # This is intentionally independent of `server_args.device`: setting
+    # SGLANG_USE_MLX opts into the MLX backend and must fail immediately if
+    # the environment cannot honor that request. With the flag unset,
+    # use_mlx() remains lazy and does not import MLX.
+    use_mlx()
+
+
 def handle_npu_backends(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.device == "npu":
@@ -66,6 +74,20 @@ def handle_nccl_pre_warm(server_args: Any):
             "Ignoring pre_warm_nccl setting on current hardware."
         )
         declare_resolution(server_args, "_handle_nccl_pre_warm", pre_warm_nccl=False)
+
+
+def handle_symm_mem_device_support(server_args: Any):
+    cfg = resolving_view(server_args)
+    # The symm-mem allocator compiles a CUDA plugin and links -lnccl, so off
+    # CUDA/HIP (e.g. Ascend NPU) it fails deep in a build step rather than here.
+    if cfg.enable_symm_mem and not (is_cuda() or is_hip()):
+        logger.warning(
+            "--enable-symm-mem is not supported on non CUDA/HIP devices "
+            "(NCCL symmetric memory is unavailable). Disabling symmetric memory."
+        )
+        declare_resolution(
+            server_args, "_handle_symm_mem_device_support", enable_symm_mem=False
+        )
 
 
 def handle_xpu_backends(server_args: Any):

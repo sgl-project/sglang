@@ -427,8 +427,9 @@ class TransformerLoader(ComponentLoader):
         )
         if direct_gpu_weight_loading:
             logger.warning(
-                "Direct GPU weight loading is enabled for %s; the complete checkpoint "
-                "state dict and materialized model weights may coexist on GPU during startup",
+                "Direct GPU weight loading is enabled for %s; compatible checkpoint "
+                "tensors become model storage, while transformed tensors may still "
+                "require temporary GPU allocations",
                 component_name,
             )
 
