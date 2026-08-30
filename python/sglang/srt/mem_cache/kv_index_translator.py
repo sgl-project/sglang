@@ -272,11 +272,19 @@ class KVIndexTranslator:
             return memo[1]
         max_pages = None
         if self.is_translating:
+            # `seq_lens_sum` is the reliable "CPU mirror present" signal, not
+            # `seq_lens_cpu`: the latter is a non-None but STALE slice on a
+            # gpu_only batch, and a stale max under-sizes the table, leaving
+            # the columns past it reading as the sink for tokens the kernel
+            # wants. Fall back to the table's own width, which is always safe.
             slc = forward_batch.seq_lens_cpu
-            if slc is not None and slc.numel() > 0:
+            if (
+                forward_batch.seq_lens_sum is not None
+                and slc is not None
+                and slc.numel() > 0
+            ):
                 max_seq = int(slc.max())
             else:
-                # gpu_only batches carry no CPU mirror; bound by the table.
                 max_seq = self.req_to_token.shape[1]
             max_pages = max(-(-max_seq // self.page_size), 1)
         view = self.build_index_table(

@@ -475,13 +475,16 @@ class TestCaptureContract(unittest.TestCase):
 
 
 class _FakeForwardBatch:
-    """Weakref-able stand-in (SimpleNamespace is not) carrying the three
-    fields `index_table_for_batch` reads."""
+    """Weakref-able stand-in (SimpleNamespace is not) carrying the four
+    fields `index_table_for_batch` reads. `seq_lens_sum` defaults to the real
+    sum: it is the signal that the CPU mirror is live, and a real ForwardBatch
+    always carries it (None only when the batch is gpu_only)."""
 
-    def __init__(self, *, req_pool_indices, seq_lens, seq_lens_cpu):
+    def __init__(self, *, req_pool_indices, seq_lens, seq_lens_cpu, seq_lens_sum=-1):
         self.req_pool_indices = req_pool_indices
         self.seq_lens = seq_lens
         self.seq_lens_cpu = seq_lens_cpu
+        self.seq_lens_sum = int(seq_lens.sum()) if seq_lens_sum == -1 else seq_lens_sum
 
 
 class TestViewMemo(unittest.TestCase):
