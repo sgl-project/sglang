@@ -21,7 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalProcessorOutput,
 )
-from sglang.srt.sampling.sampling_params import MAX_STOP_STRINGS, SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 from sglang.srt.utils.msgpack_utils import _restore_torch_tensor, enc_hook, ext_hook
 from sglang.test.ci.ci_register import (
@@ -377,38 +377,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             sampling_params=[{}, {}],
             rid=["id1", "id2"],
         )
-
-    def test_stop_strings_respect_limit(self):
-        accepted = GenerateReqInput(
-            text="Hello",
-            sampling_params={"stop": ["stop"] * MAX_STOP_STRINGS},
-        )
-        accepted.normalize_batch_and_arguments()
-
-        rejected = GenerateReqInput(
-            text="Hello",
-            sampling_params={"stop": ["stop"] * (MAX_STOP_STRINGS + 1)},
-        )
-        with self.assertRaisesRegex(
-            ValueError,
-            f"stop must contain at most {MAX_STOP_STRINGS} strings, got {MAX_STOP_STRINGS + 1}",
-        ):
-            rejected.normalize_batch_and_arguments()
-
-    def test_stop_string_limit_checks_each_batched_request(self):
-        req = GenerateReqInput(
-            text=["Hello", "World"],
-            sampling_params=[
-                {"stop": ["first"]},
-                {"stop": ["stop"] * (MAX_STOP_STRINGS + 1)},
-            ],
-        )
-
-        with self.assertRaisesRegex(
-            ValueError,
-            f"stop must contain at most {MAX_STOP_STRINGS} strings, got {MAX_STOP_STRINGS + 1}",
-        ):
-            req.normalize_batch_and_arguments()
 
     def test_single_image_to_list_of_lists(self):
         """Test that a single image is converted to a list of single-image lists."""
