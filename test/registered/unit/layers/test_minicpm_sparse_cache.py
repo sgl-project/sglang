@@ -226,7 +226,7 @@ def test_streaming_session_release_frees_compressed_slots():
     )
     session.slots["session-a"] = SessionSlot(
         req_pool_idx=req_pool_idx,
-        kv=SimpleNamespace(kv_allocated_len=16),
+        kv=SimpleNamespace(kv_allocated_len=16, cache_protected_len=0),
     )
 
     session.release_session("session-a")
