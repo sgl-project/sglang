@@ -3782,11 +3782,15 @@ class ServerArgs:
 
         # ===== END TO BE REFACTORED ====
 
+<<<<<<< HEAD
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
     )
+=======
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+>>>>>>> origin/main
 
     # The strided-layout Triton requirement is enforced via
     # --enable-page-major-kv-layout (implied by the unified pool in
