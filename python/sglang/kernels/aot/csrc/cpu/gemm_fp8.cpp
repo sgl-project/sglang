@@ -986,7 +986,7 @@ void fp_scaled_mm_kernel_impl(
 }
 
 template <typename scalar_t, typename packed_t>
-void fp_per_tensor_scaled_mm_kernel_impl(
+void fp8_per_tensor_scaled_mm_kernel_impl(
     scalar_t* __restrict__ out,
     const scalar_t* __restrict__ mat1,
     const packed_t* __restrict__ mat2,
@@ -1344,7 +1344,7 @@ at::Tensor fp8_per_tensor_scaled_mm_cpu(
   float scale_val = scales2.data_ptr<float>()[0];
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(out_dtype, "fp8_per_tensor_scaled_mm_kernel_impl", [&] {
-    fp_per_tensor_scaled_mm_kernel_impl<scalar_t, at::Float8_e4m3fn>(
+    fp8_per_tensor_scaled_mm_kernel_impl<scalar_t, at::Float8_e4m3fn>(
         out.data_ptr<scalar_t>(),
         mat1.data_ptr<scalar_t>(),
         packed_w.data_ptr<at::Float8_e4m3fn>(),
