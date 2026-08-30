@@ -71,6 +71,49 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import DSV4NPUTokenTo
 
 
 class TestVerifyCompressPositions(unittest.TestCase):
+    @staticmethod
+    def _backend():
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend._dsv4_compress_ratios = (4, 128)
+        return backend
+
+    def _assert_device_path_matches_cpu_reference(
+        self,
+        *,
+        positions,
+        live_seq_lens,
+        n_draft,
+        ratio,
+        dst_size,
+    ):
+        backend = self._backend()
+        positions = torch.tensor(positions, dtype=torch.int64)
+        live_seq_lens = torch.tensor(live_seq_lens, dtype=torch.int32)
+        final_seq_lens = torch.where(
+            live_seq_lens > 0,
+            live_seq_lens + int(n_draft),
+            live_seq_lens,
+        )
+        expected = torch.full((dst_size,), -1, dtype=torch.int64)
+        actual = torch.full((dst_size,), -2, dtype=torch.int64)
+
+        backend._fill_verify_positions_cmp_padding_one(
+            positions,
+            expected,
+            ratio=ratio,
+            seq_lens_cpu=final_seq_lens,
+            n_draft=n_draft,
+        )
+        backend._fill_verify_positions_cmp_padding_one_device(
+            positions,
+            actual,
+            ratio=ratio,
+            live_seq_lens=live_seq_lens,
+            n_draft=n_draft,
+        )
+
+        self.assertEqual(actual.tolist(), expected.tolist())
+
     def test_uses_group_start_rope_position(self):
         backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
         backend._dsv4_compress_ratios = (4, 128)
@@ -136,6 +179,127 @@ class TestVerifyCompressPositions(unittest.TestCase):
         )
 
         self.assertEqual(dst.tolist(), [8, 0])
+
+    def test_device_path_matches_reference_across_boundaries_and_padding(self):
+        cases = (
+            # Existing C4 and C128 boundary examples.
+            dict(
+                positions=[7, 8, 9, 10, 11, 12],
+                live_seq_lens=[7, 10],
+                n_draft=3,
+                ratio=4,
+                dst_size=4,
+            ),
+            dict(
+                positions=[126, 127, 128],
+                live_seq_lens=[126],
+                n_draft=3,
+                ratio=128,
+                dst_size=2,
+            ),
+            # A zero-length graph-padding row may appear before a live row.
+            dict(
+                positions=[0, 0, 0, 10, 11, 12],
+                live_seq_lens=[0, 10],
+                n_draft=3,
+                ratio=4,
+                dst_size=4,
+            ),
+            # More than one boundary per request and destination truncation.
+            dict(
+                positions=list(range(2, 11)) + list(range(7, 16)),
+                live_seq_lens=[2, 7],
+                n_draft=9,
+                ratio=4,
+                dst_size=3,
+            ),
+            # Preserve values from a non-linear tree position array rather than
+            # reconstructing them arithmetically from sequence lengths.
+            dict(
+                positions=[50, 90, 51, 52, 70, 71, 120, 72],
+                live_seq_lens=[3, 126],
+                n_draft=4,
+                ratio=4,
+                dst_size=4,
+            ),
+            # Long-context C128 boundaries around 128K.
+            dict(
+                positions=[131070, 131071, 131072, 131073],
+                live_seq_lens=[131070],
+                n_draft=4,
+                ratio=128,
+                dst_size=2,
+            ),
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                self._assert_device_path_matches_cpu_reference(**case)
+
+    def test_stable_compact_preserves_boolean_index_order_and_zero_tail(self):
+        dst = torch.full((4,), -1, dtype=torch.int64)
+        values = torch.tensor([11, 22, 33, 44, 55, 66], dtype=torch.int64)
+        keep = torch.tensor([False, True, False, True, True, False])
+
+        DeepseekV4AscendAttnBackend._stable_compact_1d(dst, values, keep)
+
+        self.assertEqual(dst.tolist(), [22, 44, 55, 0])
+
+    def test_stable_compact_matches_boolean_index_truncation(self):
+        dst = torch.full((2,), -1, dtype=torch.int64)
+        values = torch.tensor([5, 6, 7, 8, 9], dtype=torch.int64)
+        keep = torch.tensor([True, False, True, True, True])
+
+        DeepseekV4AscendAttnBackend._stable_compact_1d(dst, values, keep)
+
+        self.assertEqual(dst.tolist(), values[keep][:2].tolist())
+
+    def test_stable_compact_matches_all_small_boolean_masks(self):
+        values = torch.arange(1, 7, dtype=torch.int64)
+        for mask_bits in range(1 << values.numel()):
+            keep = torch.tensor(
+                [(mask_bits >> index) & 1 for index in range(values.numel())],
+                dtype=torch.bool,
+            )
+            for dst_size in range(1, values.numel() + 1):
+                dst = torch.full((dst_size,), -1, dtype=torch.int64)
+                DeepseekV4AscendAttnBackend._stable_compact_1d(dst, values, keep)
+                selected = values[keep][:dst_size]
+                expected = torch.zeros_like(dst)
+                expected[: selected.numel()].copy_(selected)
+                self.assertEqual(dst.tolist(), expected.tolist())
+
+
+class TestMultiStepDraftCompressedLocs(unittest.TestCase):
+    def test_skips_unused_compressed_locs_but_preserves_full_and_swa_steps(self):
+        backend = DeepseekV4AscendMultiStepDraftBackend.__new__(
+            DeepseekV4AscendMultiStepDraftBackend
+        )
+        backend.topk = 1
+        backend.speculative_num_steps = 3
+        backend._needs_step_compressed_locs = False
+
+        bundle = SimpleNamespace(
+            out_full_loc=torch.arange(6, dtype=torch.int64),
+            out_swa_loc=torch.arange(10, 16, dtype=torch.int64),
+            out_c4_loc=torch.tensor([101, 102], dtype=torch.int64),
+            out_c128_loc=torch.tensor([201], dtype=torch.int64),
+        )
+        forward_batch = SimpleNamespace(
+            batch_size=2,
+            out_cache_loc=bundle.out_full_loc,
+            out_cache_loc_dsv4=bundle,
+            seq_lens=torch.tensor([7, 11], dtype=torch.int32),
+        )
+
+        with patch("torch.cumsum", side_effect=AssertionError("unexpected compaction")):
+            step = backend._step_out_cache_loc_dsv4(forward_batch, step_id=1)
+
+        self.assertEqual(step.out_full_loc.tolist(), [1, 4])
+        self.assertEqual(step.out_swa_loc.tolist(), [11, 14])
+        self.assertEqual(step.out_c4_loc.numel(), 0)
+        self.assertEqual(step.out_c128_loc.numel(), 0)
+        self.assertEqual(step.out_c4_loc.dtype, bundle.out_c4_loc.dtype)
+        self.assertEqual(step.out_c128_loc.dtype, bundle.out_c128_loc.dtype)
 
 
 class TestC4StateTransferLayout(unittest.TestCase):
