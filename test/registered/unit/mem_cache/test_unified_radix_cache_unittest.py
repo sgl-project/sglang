@@ -6146,6 +6146,65 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(kv_xfer.nodes_to_load, [b])
         self.assertEqual(comp_xfers[ComponentType.SWA][0].nodes_to_load, [a, b])
 
+    def test_hicache_swa_backup_window_stops_at_pending_ancestor(self):
+        if (
+            not self.cfg.has_swa
+            or self.cfg.has_mamba
+            or self.cfg.page_size != 1
+            or self.cfg.sliding_window_size != 4
+        ):
+            self.skipTest("requires page_size=1 Full+SWA with window_size=4")
+
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain collapsed below the pending ancestor test")
+
+        c = chain[-1]
+        c_swa = _device_value(cache, c, ComponentType.SWA).clone()
+
+        # First transfer: publish Full for C only, leaving SWA dirty while the
+        # write-through ack is still pending.
+        cache.tree_core.set_component_device_value_raw(c, ComponentType.SWA, None)
+        self.assertGreater(
+            cache._execute_and_commit_kv_backup(BackupKV(node_ids=[c])),
+            0,
+        )
+        self.assertEqual(
+            cache.tree_core.node_by_id(c).write_through_pending_id,
+            c,
+        )
+        self.assertIsNotNone(_host_value(cache, c, ComponentType.FULL))
+        self.assertIsNone(_host_value(cache, c, ComponentType.SWA))
+
+        # Simulate SWA being reconstructed on device before the first ack. The
+        # next incremental SWA backup must treat C as the boundary and back up
+        # only the newly inserted descendant.
+        cache.tree_core.set_component_device_value_raw(c, ComponentType.SWA, c_swa)
+        tokens = self._match_tokens_for_chain(cache, chain)
+        next_tokens = tokens + self._make_seq(9000, 1)
+        cache.write_through_threshold = 1
+
+        self._insert(cache, allocator, req_to_token_pool, next_tokens)
+
+        d = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", next_tokens)))
+        ).last_device_node
+        self.assertEqual(
+            cache.tree_core.node_by_id(c).write_through_pending_id,
+            c,
+        )
+        self.assertEqual(
+            cache.tree_core.node_by_id(d).write_through_pending_id,
+            d,
+        )
+        self.assertIsNone(_host_value(cache, c, ComponentType.SWA))
+        self.assertIsNotNone(_host_value(cache, d, ComponentType.SWA))
+
+        cache.writing_check(write_back=True)
+        self.assertIsNone(cache.tree_core.node_by_id(c).write_through_pending_id)
+        self.assertIsNone(cache.tree_core.node_by_id(d).write_through_pending_id)
+
     def _swa_finalize_setup(self):
         """Build a SWA chain long enough to fill at least the window
         plus one extra page, and host-back every node so we can flip

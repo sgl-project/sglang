@@ -91,6 +91,9 @@ class SWAComponent(TreeComponent):
         while (
             cur is not self.tree_core.root_node and covered < self.sliding_window_size
         ):
+            if cur.write_through_pending_id is not None:
+                break
+
             cd = cur.component_data[ct]
             value = cd.value if cd.value is not None else cd.host_value
             if value is None:
@@ -828,6 +831,9 @@ class SWAComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         insert_params: Optional[InsertParams] = None,
     ) -> None:
+        if insert_result is not None and insert_result.swa_branch_inserted:
+            req.swa_branching_seqlen = None
+
         # Free unused SWA slots after inserting the branch.
         if (
             not is_finished
