@@ -11,23 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""ForwardBatch construction wires the unified write-loc rebind (phase 1).
+"""ForwardBatch construction wires the unified write-loc rebind.
 
-The write contract has two phases: `init_new` rebinds the FULL side once
-(phase 1), and the sliding-window side derives at the per-batch build,
-pointwise from the kernel-facing values (phase 2 — semantics pinned in
-test_kv_index_translator.py over the real composite). Phase 2 needs no
-ForwardBatch-side wiring at all: pads, slices, and buffer copies preserve
-the values it derives from. So this file pins the ONE call site the
-contract hangs on:
-
-  `init_new` calls `kv_index_translator.rebind_write_loc` — a construction
-  path that skipped it would ship VIRTUAL write ids to the kernels, a
-  silent wrong-slot store under the unified pool;
-
-plus an end-to-end run of the REAL `_pad_inputs_to_size` against a live
-translator: pad lanes are zeros, and zeros derive to the slot-0 sink —
-the property that lets the pad need no handover.
+`init_new` must call `kv_index_translator.rebind_write_loc`: a construction
+path that skips it ships VIRTUAL write ids to the kernels, a silent
+wrong-slot store. Also runs the REAL `_pad_inputs_to_size` against a live
+translator, since pad lanes are zeros and zeros must derive to the slot-0
+sink. Sliding-window semantics are pinned in test_kv_index_translator.py.
 
     python -m pytest test/registered/unit/model_executor/test_unified_out_cache_loc_rebind.py -v
 """

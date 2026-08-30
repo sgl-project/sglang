@@ -147,11 +147,10 @@ def maybe_detect_kernel_facing_loc(
     """Async check that a write loc is in the pool's KERNEL-FACING id space.
 
     A kernel-facing id is `phys_page * (page_size * blocks_per_page) + offset`
-    with `offset < page_size`, so it leaves a remainder below page_size modulo
-    the page stride. A VIRTUAL id passed here by mistake satisfies that only
-    when it happens to fall in the first block, so a batch of them trips this
-    almost surely -- and nothing else can see it, since virtual ids are in
-    range for the OOB probe. Vacuous at blocks_per_page 1 (no kernel-facing space).
+    with `offset < page_size`, so its remainder modulo the page stride is
+    below page_size; a VIRTUAL id satisfies that only in the first block.
+    Vacuous at blocks_per_page 1. Virtual ids are in range for the OOB probe,
+    so this is the only check that separates them.
     """
     if blocks_per_page <= 1 or not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
         return
