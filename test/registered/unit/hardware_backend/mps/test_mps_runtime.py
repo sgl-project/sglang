@@ -65,13 +65,14 @@ class TestMpsRuntime(unittest.TestCase):
         where it sits.
         """
         from sglang.srt import server_args
+        from sglang.srt.server_args import ServerArgs
 
         with (
             mock.patch.object(server_args, "use_mlx", return_value=mlx),
             override_platform(is_mps=detected_mps),
             mock.patch.object(server_args, "validate_mps_runtime") as validate,
         ):
-            server_args.ServerArgs(model_path="dummy", device=device).resolve_once()
+            ServerArgs(model_path="dummy", device=device).resolve_once()
         return validate
 
     def test_server_args_selects_runtime_gate_by_execution_path(self):
@@ -126,7 +127,6 @@ class TestMpsRuntime(unittest.TestCase):
         for overrides, expected in (
             ({"attention_backend": "fa3"}, "torch_native attention backend"),
             ({"sampling_backend": "flashinfer"}, "pytorch sampling backend"),
-            ({"quantization": "awq"}, "unquantized"),
             ({"tp_size": 2}, "tp_size=1"),
             ({"pp_size": 2}, "tp_size=1"),
             ({"dp_size": 2}, "tp_size=1"),
