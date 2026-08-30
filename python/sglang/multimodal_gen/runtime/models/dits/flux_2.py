@@ -24,8 +24,8 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_defer_flux2_gated_residual,
-    can_use_fused_layernorm_modulate,
     can_use_flux2_gated_resnorm,
+    can_use_fused_layernorm_modulate,
     flux2_gated_resnorm_raw,
     fused_layernorm_modulate_raw,
     fused_packed_silu_mul_bitexact,
