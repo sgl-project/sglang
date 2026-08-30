@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.bridge_loader import
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
+    ComponentLoader,
     PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.diffusion_decoder_loader import (
@@ -24,8 +25,12 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.sound_tokenizer_load
 from sglang.multimodal_gen.runtime.loader.component_loaders.upsampler_loader import (
     UpsamplerLoader,
 )
+from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import VAELoader
 from sglang.multimodal_gen.runtime.loader.component_loaders.vocoder_loader import (
     VocoderLoader,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
+    ComposedPipelineBase,
 )
 
 
@@ -34,6 +39,42 @@ class _TestLoader(PlainStateDictComponentLoader):
 
 
 class TestComponentQuantizationAdmission(unittest.TestCase):
+    def test_direct_gpu_selection_requires_a_declared_component(self):
+        server_args = SimpleNamespace(
+            component_direct_gpu_weight_loading={"missing_vae": True}
+        )
+
+        with self.assertRaisesRegex(ValueError, "missing_vae"):
+            ComposedPipelineBase._validate_direct_gpu_component_selection(
+                {"vae": ["diffusers", "AutoencoderKL"]}, server_args
+            )
+
+    def test_direct_gpu_selector_is_rejected_by_unqualified_loader(self):
+        server_args = SimpleNamespace(
+            component_quantizations={},
+            should_direct_gpu_weight_load_component=lambda component: component
+            == "vocoder",
+        )
+
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError, "does not support direct GPU"
+        ):
+            ComponentLoader().load(
+                "/model/vocoder", server_args, "vocoder", "diffusers"
+            )
+
+    def test_direct_gpu_selector_is_rejected_by_unqualified_component(self):
+        server_args = SimpleNamespace(
+            component_quantizations={},
+            should_direct_gpu_weight_load_component=lambda component: component
+            == "audio_vae",
+        )
+
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError, "does not support direct GPU"
+        ):
+            VAELoader().load("/model/audio_vae", server_args, "audio_vae", "diffusers")
+
     def test_plain_loader_resolves_weights_separately_from_config(self):
         server_args = SimpleNamespace(
             component_weights_paths={"vocoder": "owner/repo/vocoder.safetensors"}
