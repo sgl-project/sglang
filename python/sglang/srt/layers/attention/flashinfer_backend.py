@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from sglang.srt.runtime_context import (
+    get_buffer,
     get_exec,
     get_parallel,
+    get_platform,
 )
 
 """
@@ -44,7 +46,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_buffer
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -55,7 +56,6 @@ from sglang.srt.utils import (
     get_cuda_graph_max_batch_size,
     get_int_env_var,
     is_flashinfer_available,
-    is_sm100_supported,
     next_power_of_2,
 )
 
@@ -471,7 +471,7 @@ class FlashInferAttnBackend(AttentionBackend):
             ]
 
         fmha_backend = "auto"
-        if is_sm100_supported():
+        if get_platform().is_sm100:
             # Disable CUTLASS backend when piecewise cuda graph is enabled
             # due to TMA descriptor initialization issues on SM100 GPUs.
             if not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
