@@ -366,6 +366,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_fused_layernorm_modulate": "norm.layernorm_modulate_triton",
     "can_use_fused_qk_head_layernorm": "norm.layernorm_modulate_triton",
     "fused_layernorm_modulate": "norm.layernorm_modulate_triton",
+    "fused_layernorm_modulate_fp8_quant_raw": "norm.layernorm_modulate_triton",
     "fused_layernorm_modulate_raw": "norm.layernorm_modulate_triton",
     "fused_qk_head_layernorm": "norm.layernorm_modulate_triton",
     "is_plain_layer_norm": "norm.layernorm_modulate_triton",

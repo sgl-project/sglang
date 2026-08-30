@@ -53,6 +53,8 @@ from sglang.kernels.ops.diffusion.common.numerics import (
     round_bf16_to_fp32,
 )
 from sglang.kernels.ops.diffusion.common.platform import is_cuda
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, fp8_max, fp8_min
+from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -171,15 +173,22 @@ def _push_vec4(
 @triton.jit
 def _layernorm_modulate_kernel(
     y_ptr,
+    y_q_ptr,
     x_ptr,
     scale_ptr,
     shift_ptr,
+    input_scale_ptr,
     seq_len,
     n_rows,
     scale_row_stride,
     eps,
     D: tl.constexpr,
     ROWS: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    STORE_BF16: tl.constexpr,
+    QUANTIZE_FP8: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     row_offs = pid * ROWS + tl.arange(0, ROWS)
@@ -258,7 +267,21 @@ def _layernorm_modulate_kernel(
         ).to(tl.float32)
         one_plus = round_bf16_to_fp32(1.0 + sc)
         y = round_bf16_to_fp32(y * one_plus) + sh
-        tl.store(y_ptr + row_base[:, None] + cols[None, :], y, mask=mask)
+        if STORE_BF16:
+            tl.store(y_ptr + row_base[:, None] + cols[None, :], y, mask=mask)
+        if QUANTIZE_FP8:
+            # The standalone static quantizer reads the just-written BF16
+            # modulation output, so reproduce that final store/load rounding
+            # before applying its exact per-tensor scale expression.
+            y = round_bf16_to_fp32(y)
+            input_scale = tl.load(input_scale_ptr).to(tl.float32)
+            input_scale_inv = 1.0 / input_scale
+            y_q = tl.clamp(y * input_scale_inv, FP8_MIN, FP8_MAX).to(FP8_DTYPE)
+            tl.store(
+                y_q_ptr + row_base[:, None] + cols[None, :],
+                y_q.to(tl.uint8, bitcast=True),
+                mask=mask,
+            )
 
 
 @triton.jit
@@ -409,19 +432,69 @@ def fused_layernorm_modulate_raw(
     with torch.cuda.device(x.device):
         _layernorm_modulate_kernel[(triton.cdiv(n_rows, rows),)](
             out,
+            out,
             x,
             scale,
             shift,
+            scale,
             seq_len,
             n_rows,
             stride,
             eps,
             D=hidden,
             ROWS=rows,
+            FP8_DTYPE=fp8_dtype_to_triton(fp8_dtype),
+            FP8_MIN=fp8_min,
+            FP8_MAX=fp8_max,
+            STORE_BF16=True,
+            QUANTIZE_FP8=False,
             # H200-tuned: 38.5us at (1, 4096, 4096) vs the 121.8us eager
             # chain, 14.3us at Sana's (2, 1024, 2240) vs 43.1us.  ROWS=1 +
             # 4 warps triggers pathological Triton layout conversions in
             # the fold stage (47-58us).
+            num_warps=4 if hidden >= 2048 else 2,
+        )
+    return out
+
+
+def fused_layernorm_modulate_fp8_quant_raw(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    input_scale: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Fuse FLUX.2 LayerNorm, adaLN modulation, and static FP8 quantization.
+
+    The returned tensor is byte-identical to running
+    :func:`fused_layernorm_modulate_raw` followed by ``static_quant_fp8``.
+    Unlike that two-op chain, this path does not materialize the intermediate
+    BF16 activation because FLUX.2 feeds it directly into an FP8 projection.
+    """
+    batch, seq_len, hidden = x.shape
+    n_rows = batch * seq_len
+    rows = 2
+    out = torch.empty_like(x, dtype=fp8_dtype)
+    stride = _mod_row_stride(scale, batch, hidden)
+    with torch.cuda.device(x.device):
+        _layernorm_modulate_kernel[(triton.cdiv(n_rows, rows),)](
+            out,
+            out.view(torch.uint8),
+            x,
+            scale,
+            shift,
+            input_scale,
+            seq_len,
+            n_rows,
+            stride,
+            eps,
+            D=hidden,
+            ROWS=rows,
+            FP8_DTYPE=fp8_dtype_to_triton(fp8_dtype),
+            FP8_MIN=fp8_min,
+            FP8_MAX=fp8_max,
+            STORE_BF16=False,
+            QUANTIZE_FP8=True,
             num_warps=4 if hidden >= 2048 else 2,
         )
     return out

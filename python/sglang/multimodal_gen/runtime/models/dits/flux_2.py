@@ -24,11 +24,13 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fused_layernorm_modulate,
+    fused_layernorm_modulate_fp8_quant_raw,
     fused_layernorm_modulate_raw,
     fused_packed_silu_mul_bitexact,
     is_plain_layer_norm,
     residual_gate_add,
 )
+from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -58,6 +60,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp8LinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -83,6 +86,92 @@ assert _FLUX2_LN_MOD_SIGS is not None
 _FLUX2_SWIGLU = BitExactFusionGate("FLUX.2 fused SwiGLU", per_signature=True)
 _FLUX2_SWIGLU_SIGS = _FLUX2_SWIGLU.verified_sigs
 assert _FLUX2_SWIGLU_SIGS is not None
+_FLUX2_LN_FP8 = BitExactFusionGate(
+    "FLUX.2 fused LN+modulate+FP8 quant", per_signature=True
+)
+_FLUX2_LN_FP8_SIGS = _FLUX2_LN_FP8.verified_sigs
+assert _FLUX2_LN_FP8_SIGS is not None
+
+
+def _valid_modelopt_fp8_linear(linear: nn.Module) -> bool:
+    input_scale = getattr(linear, "input_scale", None)
+    return (
+        isinstance(getattr(linear, "quant_method", None), ModelOptFp8LinearMethod)
+        and isinstance(input_scale, torch.Tensor)
+        and input_scale.is_cuda
+        and input_scale.dtype == torch.float32
+        and input_scale.numel() == 1
+        and input_scale.is_contiguous()
+        and bool(torch.isfinite(input_scale).all().item())
+        and bool((input_scale > 0).all().item())
+    )
+
+
+def _shared_modelopt_fp8_scale(linears: list[nn.Module]) -> bool:
+    if not all(_valid_modelopt_fp8_linear(linear) for linear in linears):
+        return False
+    reference = linears[0].input_scale
+    return all(torch.equal(reference, linear.input_scale) for linear in linears[1:])
+
+
+def _try_flux2_norm_modulate_fp8(
+    norm: nn.Module,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    input_scale: Optional[torch.Tensor],
+    *,
+    enabled: bool,
+) -> Optional[torch.Tensor]:
+    """Return the exact prequantized FP8 projection input when eligible."""
+    if not enabled or torch.compiler.is_compiling():
+        return None
+
+    scale_row = scale.squeeze(1) if scale.dim() == 3 and scale.shape[1] == 1 else scale
+    shift_row = shift.squeeze(1) if shift.dim() == 3 and shift.shape[1] == 1 else shift
+    if (
+        _FLUX2_LN_FP8.disabled
+        or x.shape[-1] != 6144
+        or not is_plain_layer_norm(norm, x.shape[-1])
+        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+    ):
+        return None
+
+    sig = (
+        x.dtype,
+        x.device,
+        x.shape[0],
+        x.shape[-1],
+        x.stride(-1),
+        scale_row.stride(0) if scale_row.shape[0] > 1 else x.shape[-1],
+        shift_row.stride(0) if shift_row.shape[0] > 1 else x.shape[-1],
+        norm.eps,
+    )
+    verified = sig in _FLUX2_LN_FP8_SIGS
+    if not verified and torch.cuda.is_current_stream_capturing():
+        return None
+    try:
+        out = fused_layernorm_modulate_fp8_quant_raw(
+            x, scale_row, shift_row, input_scale, norm.eps
+        )
+    except Exception as exc:
+        _FLUX2_LN_FP8.on_exception(exc, logger=logger)
+        return None
+    if verified:
+        return out
+
+    reference_bf16 = _flux2_norm_modulate(norm, x, scale, shift)
+    reference, _ = static_quant_fp8(reference_bf16, input_scale)
+    return _FLUX2_LN_FP8.accept_or_fallback(
+        out,
+        reference,
+        sig=sig,
+        logger=logger,
+        mismatch_msg=(
+            "FLUX.2 fused LN+modulate+FP8 quant fast path is not bit-exact "
+            "on this platform; falling back to the split path"
+        ),
+    )
 
 
 def _flux2_norm_modulate(
@@ -717,6 +806,10 @@ class Flux2SingleTransformerBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn" if prefix else "attn",
         )
+        self._fp8_norm_quant = False
+
+    def configure_fp8_norm_quant(self) -> None:
+        self._fp8_norm_quant = _valid_modelopt_fp8_linear(self.attn.to_qkv_mlp_proj)
 
     def forward(
         self,
@@ -737,9 +830,18 @@ class Flux2SingleTransformerBlock(nn.Module):
 
         mod_shift, mod_scale, mod_gate = temb_mod_params
 
-        norm_hidden_states = _flux2_norm_modulate(
-            self.norm, hidden_states, mod_scale, mod_shift
+        norm_hidden_states = _try_flux2_norm_modulate_fp8(
+            self.norm,
+            hidden_states,
+            mod_scale,
+            mod_shift,
+            (self.attn.to_qkv_mlp_proj.input_scale if self._fp8_norm_quant else None),
+            enabled=self._fp8_norm_quant,
         )
+        if norm_hidden_states is None:
+            norm_hidden_states = _flux2_norm_modulate(
+                self.norm, hidden_states, mod_scale, mod_shift
+            )
 
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
@@ -816,6 +918,36 @@ class Flux2TransformerBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.ff_context" if prefix else "ff_context",
         )
+        self._fp8_img_attn_norm_quant = False
+        self._fp8_txt_attn_norm_quant = False
+        self._fp8_img_ff_norm_quant = False
+        self._fp8_txt_ff_norm_quant = False
+
+    def configure_fp8_norm_quant(self) -> None:
+        if self.attn.use_fused_qkv:
+            self._fp8_img_attn_norm_quant = _valid_modelopt_fp8_linear(self.attn.to_qkv)
+        else:
+            self._fp8_img_attn_norm_quant = _shared_modelopt_fp8_scale(
+                [self.attn.to_q, self.attn.to_k, self.attn.to_v]
+            )
+
+        if self.attn.use_fused_added_qkv:
+            self._fp8_txt_attn_norm_quant = _valid_modelopt_fp8_linear(
+                self.attn.to_added_qkv
+            )
+        else:
+            self._fp8_txt_attn_norm_quant = _shared_modelopt_fp8_scale(
+                [
+                    self.attn.add_q_proj,
+                    self.attn.add_k_proj,
+                    self.attn.add_v_proj,
+                ]
+            )
+
+        self._fp8_img_ff_norm_quant = _valid_modelopt_fp8_linear(self.ff.linear_in)
+        self._fp8_txt_ff_norm_quant = _valid_modelopt_fp8_linear(
+            self.ff_context.linear_in
+        )
 
     def forward(
         self,
@@ -852,17 +984,51 @@ class Flux2TransformerBlock(nn.Module):
         ) = temb_mod_params_txt
 
         # Img stream
-        norm_hidden_states = _flux2_norm_modulate(
-            self.norm1, hidden_states, scale_msa, shift_msa
+        norm_hidden_states = _try_flux2_norm_modulate_fp8(
+            self.norm1,
+            hidden_states,
+            scale_msa,
+            shift_msa,
+            (
+                (
+                    self.attn.to_qkv.input_scale
+                    if self.attn.use_fused_qkv
+                    else self.attn.to_q.input_scale
+                )
+                if self._fp8_img_attn_norm_quant
+                else None
+            ),
+            enabled=self._fp8_img_attn_norm_quant,
         )
+        if norm_hidden_states is None:
+            norm_hidden_states = _flux2_norm_modulate(
+                self.norm1, hidden_states, scale_msa, shift_msa
+            )
 
         # Conditioning txt stream
-        norm_encoder_hidden_states = _flux2_norm_modulate(
+        norm_encoder_hidden_states = _try_flux2_norm_modulate_fp8(
             self.norm1_context,
             encoder_hidden_states,
             c_scale_msa,
             c_shift_msa,
+            (
+                (
+                    self.attn.to_added_qkv.input_scale
+                    if self.attn.use_fused_added_qkv
+                    else self.attn.add_q_proj.input_scale
+                )
+                if self._fp8_txt_attn_norm_quant
+                else None
+            ),
+            enabled=self._fp8_txt_attn_norm_quant,
         )
+        if norm_encoder_hidden_states is None:
+            norm_encoder_hidden_states = _flux2_norm_modulate(
+                self.norm1_context,
+                encoder_hidden_states,
+                c_scale_msa,
+                c_shift_msa,
+            )
 
         # Attention on concatenated img + txt stream
         attention_outputs = self.attn(
@@ -878,9 +1044,18 @@ class Flux2TransformerBlock(nn.Module):
         # Process attention outputs for the image stream (`hidden_states`).
         hidden_states = residual_gate_add(hidden_states, attn_output, gate_msa)
 
-        norm_hidden_states = _flux2_norm_modulate(
-            self.norm2, hidden_states, scale_mlp, shift_mlp
+        norm_hidden_states = _try_flux2_norm_modulate_fp8(
+            self.norm2,
+            hidden_states,
+            scale_mlp,
+            shift_mlp,
+            (self.ff.linear_in.input_scale if self._fp8_img_ff_norm_quant else None),
+            enabled=self._fp8_img_ff_norm_quant,
         )
+        if norm_hidden_states is None:
+            norm_hidden_states = _flux2_norm_modulate(
+                self.norm2, hidden_states, scale_mlp, shift_mlp
+            )
 
         ff_output = self.ff(norm_hidden_states)
         hidden_states = residual_gate_add(hidden_states, ff_output, gate_mlp)
@@ -890,12 +1065,25 @@ class Flux2TransformerBlock(nn.Module):
             encoder_hidden_states, context_attn_output, c_gate_msa
         )
 
-        norm_encoder_hidden_states = _flux2_norm_modulate(
+        norm_encoder_hidden_states = _try_flux2_norm_modulate_fp8(
             self.norm2_context,
             encoder_hidden_states,
             c_scale_mlp,
             c_shift_mlp,
+            (
+                self.ff_context.linear_in.input_scale
+                if self._fp8_txt_ff_norm_quant
+                else None
+            ),
+            enabled=self._fp8_txt_ff_norm_quant,
         )
+        if norm_encoder_hidden_states is None:
+            norm_encoder_hidden_states = _flux2_norm_modulate(
+                self.norm2_context,
+                encoder_hidden_states,
+                c_scale_mlp,
+                c_shift_mlp,
+            )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
         encoder_hidden_states = residual_gate_add(
@@ -1024,26 +1212,45 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     }
 
     def post_load_weights(self) -> None:
-        if not isinstance(getattr(self, "quant_config", None), ModelOptFp4Config):
-            return
+        super().post_load_weights()
+        if isinstance(getattr(self, "quant_config", None), ModelOptFp4Config):
+            # BFL/ComfyUI checkpoints store AdaLN modulation params as
+            # [scale, shift], while diffusers expects [shift, scale].
+            for param_name in self.scale_shift_swap_params:
+                parts = param_name.split(".")
+                module = self
+                for part in parts[:-1]:
+                    module = getattr(module, part)
+                param = getattr(module, parts[-1], None)
+                if param is None:
+                    continue
+                half = param.shape[0] // 2
+                with torch.no_grad():
+                    first_half = param[:half].clone()
+                    param[:half] = param[half:]
+                    param[half:] = first_half
+                logger.info(
+                    "Swapped scale/shift order for %s (BFL → diffusers)",
+                    param_name,
+                )
 
-        # BFL/ComfyUI checkpoints store AdaLN modulation params as [scale, shift],
-        # while diffusers expects [shift, scale].
-        for param_name in self.scale_shift_swap_params:
-            parts = param_name.split(".")
-            module = self
-            for part in parts[:-1]:
-                module = getattr(module, part)
-            param = getattr(module, parts[-1], None)
-            if param is None:
-                continue
-            half = param.shape[0] // 2
-            with torch.no_grad():
-                first_half = param[:half].clone()
-                param[:half] = param[half:]
-                param[half:] = first_half
+        for block in self.transformer_blocks:
+            block.configure_fp8_norm_quant()
+        for block in self.single_transformer_blocks:
+            block.configure_fp8_norm_quant()
+        enabled = sum(
+            block._fp8_img_attn_norm_quant
+            + block._fp8_txt_attn_norm_quant
+            + block._fp8_img_ff_norm_quant
+            + block._fp8_txt_ff_norm_quant
+            for block in self.transformer_blocks
+        ) + sum(block._fp8_norm_quant for block in self.single_transformer_blocks)
+        total = 4 * len(self.transformer_blocks) + len(self.single_transformer_blocks)
+        if enabled:
             logger.info(
-                "Swapped scale/shift order for %s (BFL → diffusers)", param_name
+                "Enabled FLUX.2 FP8 norm+quant fusion for %d/%d block paths",
+                enabled,
+                total,
             )
 
     def __init__(
