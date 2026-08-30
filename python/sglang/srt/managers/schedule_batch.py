@@ -2509,12 +2509,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             req.extend_batch_idx += 1
 
-            # update req-level memory management fields
-            # TODO(th4): co-locate this req.kv bookkeeping with the real KV
-            # allocation in alloc_for_extend above; they are currently a few
-            # steps apart and should become one owned-kv allocation step.
-            req.kv.kv_committed_len = seq_len
-
             # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # Slice to match extend_input_len — PrefillAdder truncates
@@ -3221,10 +3215,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # the allocator, triggered from mem_cache/common.py.)
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
-        # Update req-level memory management fields
         for req in self.reqs:
             req.decode_batch_idx += 1
-            req.kv.kv_committed_len += 1
 
         # New-tensor avoids racing model_worker_batch refs queued for
         # overlap forward.
