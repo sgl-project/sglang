@@ -571,7 +571,7 @@ class CommonKVManager(BaseKVManager):
             )
             if expected_response_num is None:
                 logger.warning(
-                    "No expected prefill response count for room %s",
+                    "No expected prefill response count for room %s, prefill rank %s",
                     bootstrap_room,
                     prefill_rank,
                 )
