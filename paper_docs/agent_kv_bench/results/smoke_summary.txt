@@ -1,0 +1,8 @@
+===== KV-bench summary =====
+config: N=4 rounds=3 seed=7 wall=17s requests=12
+action TTFT  ms: p50=126 mean=360
+cont TTFT    ms: p50=62 p90=70 mean=64
+regret(miss) : 8/12 = 66.7%  (thresh=1570 tok)
+  hit  TTFT p50=56ms prompt p50=1220
+  miss TTFT p50=65ms prompt p50=2240
+total continuation prefill tokens: 22837
