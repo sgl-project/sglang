@@ -70,7 +70,13 @@ def build_kv_read_table_kernel(
         mask=mask,
         other=0,
     ).to(tl.int64)
-    phys = tl.load(v2p_ptr + tok // PAGE_SIZE, mask=mask, other=0)
+    # A `-1` slot must index page 0 (the sink), not `v2p[-1]`. Triton's `//`
+    # truncates toward zero, so `-1 // ps` is 0 for ps > 1 but -1 at ps == 1,
+    # which reads one element BEFORE the table and feeds the garbage straight
+    # through the clamp below as a live id. Fold the guard in explicitly so
+    # both page sizes -- and this kernel and its CPU reference -- agree.
+    page = tl.where(tok < 0, 0, tok // PAGE_SIZE)
+    phys = tl.load(v2p_ptr + page, mask=mask, other=0)
     entry = tl.maximum(phys * mult, 0).to(tl.int32)
     tl.store(out_ptr + bid.to(tl.int64) * out_stride + cols, entry, mask=mask)
 
