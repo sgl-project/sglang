@@ -2309,7 +2309,9 @@ class TestCosmos3CandidateDistributedGuards(unittest.TestCase):
             guidance_scale=4.0,
             generator=None,
             seed=0,
-            scheduler=None,
+            # Non-None so _denoise_once doesn't fall back to self.scheduler,
+            # which __new__ (skipping __init__) never sets.
+            scheduler=types.SimpleNamespace(),
             rollout=False,
         )
         server_args = types.SimpleNamespace(enable_cfg_parallel=True)
