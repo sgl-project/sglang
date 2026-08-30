@@ -1200,10 +1200,6 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             disaggregation_mode=None,
             enable_overlap=False,
             enable_overlap_mlx=False,
-            server_args=SimpleNamespace(
-                disaggregation_decode_enable_offload_kvcache=False,
-                enable_hisparse=False,
-            ),
             model_config=None,
             token_to_kv_pool_allocator=None,
             tree_cache=tree_cache,
@@ -1220,6 +1216,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             ),
             logprob_result_processor=None,
             output_streamer=None,
+            beam_coordinator=None,
             abort_request=lambda req: None,
         )
         # Stub out the methods _handle_finish_state_updated_req calls that
@@ -1524,7 +1521,6 @@ if _HAS_MLX:
             self.req_pool_idx = None
             self.mamba_pool_idx = None
             self.inflight_middle_chunks = 0
-            self.kv_committed_len = 0
 
     class FakeTpWorker:
         def __init__(self, next_token_ids):

@@ -95,12 +95,12 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_xpu,
     log_info_on_rank0,
     mxfp8_block_convert_required,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
-    use_intel_xpu_backend,
 )
 
 if TYPE_CHECKING:
@@ -1085,6 +1085,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
+        # The MxFP4 wrapper methods borrow this instance for weight loading;
+        # they never call create_moe_runner, so moe_runner_config is unset.
+        self._owns_moe_runner = False
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -2144,10 +2147,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
+        # The runner backend is global, so it is also true for a borrowed delegate,
+        # which has no moe_runner_config and whose kernel ignores these params.
         if (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
-        ):
+        ) and self._owns_moe_runner:
             self._prepare_flashinfer_trtllm_activation_params(layer)
 
         if get_moe_runner_backend().is_hpc_ops():
@@ -2325,6 +2330,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        self._owns_moe_runner = False
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
@@ -2349,6 +2355,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_hpc_ops()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            self._owns_moe_runner = True
         else:
             # TODO(cwan): refactor other backends
             pass
@@ -2428,10 +2435,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if quant_info is not None:
                 return self.runner.run(dispatch_output, quant_info)
 
-        if use_intel_xpu_backend() and not (
-            getattr(self, "runner", None) is not None
-            and self.runner.runner_backend.is_triton()
-        ):
+        if is_xpu() and not get_moe_runner_backend().is_triton():
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
 

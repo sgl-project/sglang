@@ -23,7 +23,7 @@ inside the function body to preserve that invariant.
 import argparse
 import dataclasses
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
 
@@ -117,6 +117,25 @@ def default_prefill_backend() -> str:
     from sglang.srt.utils import is_cuda
 
     return Backend.BREAKABLE if is_cuda() else Backend.TC_PIECEWISE
+
+
+def with_phase(config: "CudaGraphConfig", phase: str, **changes) -> "CudaGraphConfig":
+    """A copy of ``config`` with ``changes`` applied to one phase.
+
+    Resolution declares values, so a handler that decides a graph setting hands
+    the stash a new config instead of editing the one an earlier handler
+    declared.
+    """
+    if phase not in Phase.ALL:
+        raise KeyError(phase)
+    # Not a deep copy: `dataclasses.replace` copies field references, so a
+    # list-valued `bs` is shared. Rebind `bs`, never mutate it in place.
+    return CudaGraphConfig(
+        **{
+            name: replace(getattr(config, name), **(changes if name == phase else {}))
+            for name in Phase.ALL
+        }
+    )
 
 
 @dataclass

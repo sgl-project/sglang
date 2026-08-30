@@ -116,8 +116,17 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
 
         inputs = self._build_prompt_inputs(prompt, images)
         inputs = inputs.to(device)
-        outputs = text_encoder(**inputs, output_hidden_states=True)
-        prompt_embeds = outputs.hidden_states[-(self.hidden_state_skip_layer + 1)]
+        outputs = self._forward_text_encoder(
+            text_encoder,
+            {
+                **inputs,
+                "output_hidden_states": self.hidden_state_skip_layer is not None,
+            },
+        )
+        if self.hidden_state_skip_layer is not None:
+            prompt_embeds = outputs.hidden_states[-(self.hidden_state_skip_layer + 1)]
+        else:
+            prompt_embeds = outputs.last_hidden_state
 
         prompt_mask = inputs["attention_mask"]
         crop_start = self._compute_crop_start()
