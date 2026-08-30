@@ -114,6 +114,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=95, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=95, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_amd_ci(est_time=8, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -123,6 +124,12 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 # asserting a fused outcome are CUDA-only.
 requires_inline_ptx = pytest.mark.skipif(
     not is_cuda(), reason="bit-exact norm fusions are NVIDIA PTX"
+)
+requires_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not is_cuda()
+    or torch.cuda.get_device_capability()[0] < 10,
+    reason="FLUX.2 gated residual fusion requires SM100 or newer",
 )
 
 
@@ -241,7 +248,7 @@ class TestFlux2EagerFusions(CustomTestCase):
         self.assertFalse(flux2._FLUX2_LN_MOD.disabled)
         self.assertEqual(len(flux2._FLUX2_LN_MOD_SIGS), 1)
 
-    @requires_inline_ptx
+    @requires_blackwell
     def test_gated_residual_norm_modulate_is_bit_exact(self):
         hidden = 6144
         shape = (1, 64, hidden)
