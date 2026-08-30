@@ -474,7 +474,6 @@ sgl-eval run gsm8k \\
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
