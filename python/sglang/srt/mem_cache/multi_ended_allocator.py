@@ -114,7 +114,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
-        kernel_page_multiplier: int = 1,
+        kernel_page_multiplier: Optional[int] = None,
     ):
         spec = unified_buffer.spec(sub_pool_name)
         max_slots = unified_buffer.max_slots(sub_pool_name)
@@ -134,11 +134,16 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.entry_bytes = spec.entry_bytes()
         self.min_slot_index = unified_buffer.min_slot_index(sub_pool_name)
         self.is_id_owner = is_id_owner
-        # Dense (kernel-facing) index space scale: the page-major envelope of a
-        # multi-layer uniform-entry sub-pool (MLA) is a valid dense paged pool
-        # once page ids are scaled by layer_num — `translate_kv_loc_dense` emits
-        # that space. 1 for sub-pools whose kernels take real physical ids.
-        self.kernel_page_multiplier = kernel_page_multiplier
+        # Dense (kernel-facing) index space scale, derived from the sub-pool
+        # spec that owns the layout — the same rule `view_tail_pad_bytes`
+        # follows, so no construction site can pair dense views with a
+        # physical-id multiplier. `kernel_page_multiplier=` overrides it only
+        # for tests that pin the multiplier-1 collapse.
+        self.kernel_page_multiplier = (
+            spec.dense_blocks_per_page()
+            if kernel_page_multiplier is None
+            else kernel_page_multiplier
+        )
         # Zero page envelopes on hand-out — see _maybe_zero_pages.
         self._zero_pages_on_alloc = isinstance(kvcache, UnifiedMLATokenToKVPool)
         # Overlap mode: `free` drops a wait_stream(forward_stream) barrier so its
@@ -1712,7 +1717,6 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
-        full_kernel_page_multiplier: int = 1,
     ):
         full_max = unified_buffer.max_slots("full")
         super().__init__(
@@ -1740,7 +1744,6 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
-            kernel_page_multiplier=full_kernel_page_multiplier,
         )
         self.mamba_allocator = MultiEndedAllocator(
             kvcache=kvcache.mamba_pool,
@@ -2035,8 +2038,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
-        full_kernel_page_multiplier: int = 1,
-        swa_kernel_page_multiplier: int = 1,
     ):
         # Set _size_full / _size_swa BEFORE base init (read during it). STATIC
         # partition caps — the slot-conservation value the leak invariant expects.
@@ -2071,7 +2072,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
-            kernel_page_multiplier=full_kernel_page_multiplier,
         )
         self.swa_attn_allocator = MultiEndedAllocator(
             kvcache=kvcache.swa_kv_pool,
@@ -2083,7 +2083,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
-            kernel_page_multiplier=swa_kernel_page_multiplier,
         )
         self.full_attn_allocator.bind_peer(self.swa_attn_allocator)
         self.swa_attn_allocator.bind_peer(self.full_attn_allocator)

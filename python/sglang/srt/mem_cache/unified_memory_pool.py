@@ -97,6 +97,16 @@ class SubPoolSpec(ABC):
         """Bytes this sub-pool's views reach PAST its last page envelope."""
         return 0
 
+    def dense_blocks_per_page(self) -> int:
+        """Row-blocks one page holds in this sub-pool's kernel-facing id space.
+
+        The page envelope is a uniform array of equally wide row-blocks, so a
+        kernel-facing id is the physical page scaled by this count (see
+        `MultiEndedAllocator.translate_kv_loc_dense`). 1 means the views are
+        not dense and kernels take real physical ids.
+        """
+        return 1
+
 
 @dataclass(frozen=True, kw_only=True)
 class MHASubPoolSpec(SubPoolSpec):
@@ -193,6 +203,11 @@ class MLASubPoolSpec(SubPoolSpec):
 
     def view_tail_pad_bytes(self, page_size: int) -> int:
         return page_size * self.entry_bytes()
+
+    def dense_blocks_per_page(self) -> int:
+        """One latent row per layer, so L blocks per page (MHA has 2L: a K
+        block and a V block per layer)."""
+        return self.layer_num
 
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
@@ -465,7 +480,7 @@ class UnifiedKVPool:
         num_pages = max_slots // page_size
         _assert_dense_id_bound(
             sub_pool_name=spec.name,
-            n_dense=num_pages * spec.layer_num * page_size,
+            n_dense=num_pages * spec.dense_blocks_per_page() * page_size,
         )
         return build_dense_mla_views(
             self._raw,
@@ -1228,11 +1243,6 @@ def init_unified_mamba_pools(
         need_sort=need_sort,
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
-        full_kernel_page_multiplier=(
-            len(full_attention_layer_ids)
-            if use_mla_backend
-            else full_spec.dense_blocks_per_page()
-        ),
     )
 
     # Wrap the composite's mamba MultiEndedAllocator in a slot allocator (PHYSICAL view).
@@ -1645,8 +1655,6 @@ def init_unified_swa_pools(
         need_sort=need_sort,
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
-        full_kernel_page_multiplier=full_spec.dense_blocks_per_page(),
-        swa_kernel_page_multiplier=swa_spec.dense_blocks_per_page(),
     )
 
     logger.info(

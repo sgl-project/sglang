@@ -1938,13 +1938,19 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             "v2p_page[virt_pages] * page_size + offsets.",
         )
 
-        # And the composite allocator's translate method must produce the
-        # same token-granular result (same page math).
+        # The composite's translate is the KERNEL-FACING id, which is the
+        # physical page scaled by the sub-pool's block count -- it is NOT the
+        # physical token id this helper returns. The two agree only when the
+        # multiplier collapses to 1, which no dense sub-pool does; asserting
+        # equality here would pin the id spaces together again.
+        swa_mult = allocator.swa_kernel_page_multiplier
+        self.assertEqual(swa_mult, 2 * swa_spec.layer_num)
         composite_out = allocator.translate_loc_from_full_to_swa(v_tokens)
+        expected_dense = swa_phys_pages_direct * (PS * swa_mult) + offsets_in
         self.assertTrue(
-            bool((swa_phys.long() == composite_out.long()).all().item()),
-            "REGRESSION: the UnifiedSWAKVPool helper and the composite "
-            "allocator's translate_loc_from_full_to_swa must agree.",
+            bool((composite_out.long() == expected_dense.long()).all().item()),
+            "REGRESSION: translate_loc_from_full_to_swa must emit the swa "
+            "sub-pool's dense ids (phys_page * ps * blocks_per_page + offset).",
         )
 
 
@@ -2606,7 +2612,7 @@ class TestSWACompositeDenseSurface(unittest.TestCase):
     FULL_L = 4
     SWA_L = 2
 
-    def _build(self, full_mult=1, swa_mult=1):
+    def _build(self):
         full_spec = MHASubPoolSpec(
             name="full",
             layer_num=self.FULL_L,
@@ -2642,26 +2648,23 @@ class TestSWACompositeDenseSurface(unittest.TestCase):
             page_size=self.PS,
             need_sort=False,
             forward_stream=None,
-            full_kernel_page_multiplier=full_mult,
-            swa_kernel_page_multiplier=swa_mult,
         )
 
-    def test_surface_collapses_at_multiplier_one(self):
-        """Strided-arm guard: with both multipliers 1, the new surface must be
-        byte-identical to the physical translate and expose the raw v2p
-        tables — a drift here silently changes every existing SWA model."""
+    def test_multipliers_come_from_the_specs(self):
+        """Both sides scale by their OWN sub-pool's block count, and the
+        composite exposes the raw v2p tables unwrapped. Nothing injects the
+        scale: a spec whose views are dense cannot be paired with a
+        physical-id multiplier, which is the state that writes physical ids
+        into dense rows."""
         a = self._build()
-        self.assertEqual(a.kernel_page_multiplier, 1)
-        self.assertEqual(a.swa_kernel_page_multiplier, 1)
+        self.assertEqual(a.kernel_page_multiplier, 2 * self.FULL_L)
+        self.assertEqual(a.swa_kernel_page_multiplier, 2 * self.SWA_L)
         self.assertIs(a.full_v2p_page_table, a.full_attn_allocator.virtual_to_physical)
         self.assertIs(a.swa_v2p_page_table, a.swa_attn_allocator.virtual_to_physical)
-        v = a.alloc(2 * self.PS)
-        self.assertIsNotNone(v)
-        self.assertTrue(torch.equal(a.translate_kv_loc_dense(v), a.translate_kv_loc(v)))
 
     def test_full_dense_translate_matches_formula(self):
         mult = 2 * self.FULL_L
-        a = self._build(full_mult=mult)
+        a = self._build()
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
         v2p = a.full_attn_allocator.virtual_to_physical
@@ -2681,7 +2684,7 @@ class TestSWACompositeDenseSurface(unittest.TestCase):
             with self.subTest(page_size=ps):
                 self.PS = ps
                 mult = 2 * self.FULL_L
-                a = self._build(full_mult=mult)
+                a = self._build()
                 v = a.alloc(4 * ps)
                 self.assertIsNotNone(v)
                 v2p = a.full_attn_allocator.virtual_to_physical
@@ -2697,7 +2700,7 @@ class TestSWACompositeDenseSurface(unittest.TestCase):
 
     def test_swa_translate_scales_page_stride(self):
         mult = 2 * self.SWA_L
-        a = self._build(swa_mult=mult)
+        a = self._build()
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
         v2p_swa = a.swa_attn_allocator.virtual_to_physical
@@ -2709,7 +2712,7 @@ class TestSWACompositeDenseSurface(unittest.TestCase):
         page's ids (v2p == -1 -> -stride + offset, negative for every in-page
         offset) still land on the sink, never negative."""
         mult = 2 * self.SWA_L
-        a = self._build(swa_mult=mult)
+        a = self._build()
         v = a.alloc(2 * self.PS)
         self.assertIsNotNone(v)
         tomb_page = int(v[0].item()) // self.PS
