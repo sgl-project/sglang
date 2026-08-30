@@ -341,6 +341,7 @@ def _fp8_2buff_store(
     swa_loc: Optional[torch.Tensor],
     k_nope_out: Optional[torch.Tensor],
     k_rope_out: Optional[torch.Tensor],
+    q_rope_out: Optional[torch.Tensor],
 ) -> torch.Tensor:
     if not _HAS_GROUP_QUANT:
         # is_unified_kv_fp8() already falls back to bf16 off gfx95, so reaching here
@@ -396,6 +397,17 @@ def _fp8_2buff_store(
         else torch.empty_like(q_out, memory_format=torch.contiguous_format)
     )
 
+    # Q mirrors the K pair when the reader is the v4 nm asm kernel: nope fp8 with
+    # the tile scales inline, rotated PE beside it in bf16. A bf16 q_out instead
+    # keeps the whole rotated Q in one tensor, which is what the Triton
+    # sparse_attn reader takes. aiter picks between the two on the buffer's dtype
+    # alone, so the rope buffer has to be present exactly when q_out is fp8 --
+    # otherwise it silently allocates one and the PE half goes nowhere.
+    assert (q_dst.element_size() == 1) == (q_rope_out is not None), (
+        f"q_out is {q_dst.dtype} but q_rope_out is "
+        f"{None if q_rope_out is None else tuple(q_rope_out.shape)}"
+    )
+
     # The packed K pair lands in the caller's buffers when it passed them (verify
     # and prefill hand those to store_swa_into_unified); decode only wants the
     # fused ring write, so it lets aiter allocate them and drops them.
@@ -409,6 +421,7 @@ def _fp8_2buff_store(
         rms_eps,
         is_neox=False,
         q_nope_scale_buff=q_dst,
+        q_rope_buff=q_rope_out,
         k_nope_scale_buff=k_nope_out,
         k_rope_buff=k_rope_out,
         q_weight=q_norm_weight,
@@ -446,6 +459,7 @@ def fused_qk_norm_rope_swa_store(
     swa_rope_cache: Optional[torch.Tensor] = None,
     k_nope_out: Optional[torch.Tensor] = None,
     k_rope_out: Optional[torch.Tensor] = None,
+    q_rope_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused Q norm + KV norm + RoPE + optional SWA store.
 
@@ -458,9 +472,14 @@ def fused_qk_norm_rope_swa_store(
         bf16_store: write the whole head_dim as plain bf16 at swa_cache[swa_loc]
         fp8_2buff: two-pool fp8 unified_kv. Delegates to aiter; ``swa_cache`` is
             the fp8 nope pool and ``swa_rope_cache`` the bf16 rope pool, both
-            addressed by ``swa_loc``. Q stays bf16. Unlike the Triton path this
-            leaves ``kv`` untouched -- the normed + RoPE'd K comes back packed in
+            addressed by ``swa_loc``. Unlike the Triton path this leaves ``kv``
+            untouched -- the normed + RoPE'd K comes back packed in
             ``k_nope_out`` / ``k_rope_out`` when the caller supplies them.
+        q_rope_out: [M, num_local_heads, rope_head_dim] bf16, fp8_2buff only.
+            Present means Q is packed like K (nope fp8 + inline scales in
+            ``q_out``, rotated PE here) for the v4 nm asm reader; absent means
+            ``q_out`` holds the whole rotated Q in bf16 for the Triton reader.
+            ``q_out``'s dtype has to agree.
     """
     head_dim = kv.shape[1]
 
@@ -504,6 +523,7 @@ def fused_qk_norm_rope_swa_store(
             swa_loc,
             k_nope_out,
             k_rope_out,
+            q_rope_out,
         )
 
     HAS_SWA_STORE = swa_cache is not None and swa_loc is not None
