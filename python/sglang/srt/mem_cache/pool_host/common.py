@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from collections import defaultdict
 
 import torch
@@ -124,6 +125,13 @@ def get_allocator_type() -> str:
     return backend or "default"
 
 
+# Only these may be unregistered. A buffer that came from hipHostMalloc was
+# never registered, and unregistering one reports success while corrupting the
+# runtime's memory-object map.
+_registered_host_ptrs: set[int] = set()
+_registered_host_ptrs_lock = threading.Lock()
+
+
 def _cuda_host_register(
     buffer: torch.Tensor, registration_granularity_bytes: int | None = None
 ) -> None:
@@ -174,12 +182,16 @@ def _cuda_host_register(
         # cudaHostUnregister to receive each base pointer, not just the tensor's
         # original base once after several independent registrations.
         setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, registered_ranges)
+        with _registered_host_ptrs_lock:
+            _registered_host_ptrs.add(base)
     except Exception:
         remaining_ranges = _cuda_host_unregister_ranges(
             cudart, registered_ranges, operation="registration rollback"
         )
         if remaining_ranges:
             setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
+            with _registered_host_ptrs_lock:
+                _registered_host_ptrs.add(base)
         raise
 
 
@@ -191,7 +203,7 @@ def _cuda_host_unregister_ranges(
         rc = int(cudart.cudaHostUnregister(ptr))
         if rc != 0:
             failed_ranges.append((ptr, size))
-            logger.warning(
+            logger.error(
                 "cudaHostUnregister failed during %s (rc=%d, %s) for ptr=%#x size=%d",
                 operation,
                 rc,
@@ -204,6 +216,12 @@ def _cuda_host_unregister_ranges(
 
 
 def _cuda_host_unregister(buffer: torch.Tensor) -> None:
+    with _registered_host_ptrs_lock:
+        was_registered = buffer.data_ptr() in _registered_host_ptrs
+        _registered_host_ptrs.discard(buffer.data_ptr())
+    if not was_registered:
+        return
+
     cudart = torch.cuda.cudart()
     registered_ranges = getattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, None)
     if registered_ranges is None:
