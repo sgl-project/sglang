@@ -164,6 +164,9 @@ class SchedulerInvariantChecker:
             release_pages = self.token_to_kv_pool_allocator.release_pages
             if free_pages is None or release_pages is None:
                 return leak, msg
+            if hasattr(self.token_to_kv_pool_allocator, "get_all_free_pages"):
+                free_pages = self.token_to_kv_pool_allocator.get_all_free_pages()
+                release_pages = release_pages.new_empty((0,))
             free_full_pages = set(free_pages.tolist() + release_pages.tolist())
             cached_full_pages = set(self.tree_cache.all_values_flatten().tolist())
             full_page_msg = ""
@@ -373,6 +376,8 @@ class SchedulerInvariantChecker:
             return
 
         def _free_pages(a):
+            if hasattr(a, "get_all_free_pages"):
+                return a.get_all_free_pages()
             free = a.free_pages
             release = getattr(a, "release_pages", None)
             return (
