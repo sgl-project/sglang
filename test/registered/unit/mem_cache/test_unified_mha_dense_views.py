@@ -14,9 +14,8 @@
 """Dense MHA K/V views for the unified memory pool (uniform-row hybrid models).
 
 Covers, CPU-only (pure torch — no GPU / Triton kernels):
-  - `MHASubPoolSpec` dense surface: `is_uniform_row` is exactly
-    `k_row_bytes == v_row_bytes`, and `dense_blocks_per_page == 2*L` refuses
-    asymmetric specs;
+  - `build_dense_mha_views` refuses an asymmetric-KV spec: its addressing
+    assumes one uniform row width, so it is the boundary that checks;
   - `build_dense_mha_views` addressing: view_l[dense(t)] must land exactly at
     the page-major envelope byte offset the STRIDED builder assigns to the same
     (page, slot, layer, K|V) cell — the two builders are views over one truth;
@@ -151,17 +150,25 @@ def _reference_strided_views(raw, *, page_size, num_pages, anchor_bytes=0):
 
 
 class TestMHADenseSpecSurface(unittest.TestCase):
-    def test_asymmetric_rows_refused_at_construction(self):
-        """The unified pool has ONE layout and the dense block array exists
-        only for uniform rows, so an asymmetric-KV spec (the MiMoV2 shape,
-        scaled down) cannot be built at all. ServerArgs screens such models out
-        of --enable-unified-memory before we ever get here."""
-        self.assertTrue(_mha_spec().is_uniform_row())
+    def test_asymmetric_rows_refused_by_the_view_builder(self):
+        """The dense block array exists only for uniform rows, so the builder
+        whose addressing depends on it is the one that refuses (the MiMoV2
+        shape, scaled down). ServerArgs screens such models out of
+        --enable-unified-memory long before we get here; this is the check for
+        a caller that reaches the builder directly."""
+        spec = _mha_spec()
+        raw = torch.zeros(1 << 16, dtype=torch.uint8)
         with self.assertRaises(AssertionError):
-            _mha_spec(head_dim=6, v_head_dim=4)
-
-    def test_dense_blocks_is_k_and_v_per_layer(self):
-        self.assertEqual(_mha_spec().dense_blocks_per_page(), _BLOCKS)
+            build_dense_mha_views(
+                raw,
+                layer_num=spec.layer_num,
+                head_num=spec.head_num,
+                head_dim=6,
+                v_head_dim=4,
+                store_dtype=spec.store_dtype,
+                page_size=1,
+                num_pages=4,
+            )
 
     def test_spec_offsets_equal_dense_block_origins(self):
         """The spec's byte math and the view builder's origins are two

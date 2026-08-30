@@ -126,11 +126,6 @@ class MHASubPoolSpec(SubPoolSpec):
         assert (
             self.v_head_dim > 0
         ), f"v_head_dim must be positive; got {self.v_head_dim}"
-        assert self.is_uniform_row(), (
-            f"sub-pool {self.name!r}: the unified pool requires uniform K/V "
-            f"rows; got k_row_bytes={self.k_row_bytes()} != "
-            f"v_row_bytes={self.v_row_bytes()}"
-        )
 
     def k_row_bytes(self) -> int:
         return self.head_num * self.head_dim * self.store_dtype.itemsize
@@ -155,10 +150,6 @@ class MHASubPoolSpec(SubPoolSpec):
             self.layer_k_offset_in_page(layer_id, page_size)
             + page_size * self.k_row_bytes()
         )
-
-    def is_uniform_row(self) -> bool:
-        """Equal K/V row width — the precondition for dense per-layer views."""
-        return self.k_row_bytes() == self.v_row_bytes()
 
     def view_tail_pad_bytes(self, page_size: int) -> int:
         return page_size * self.entry_bytes()
