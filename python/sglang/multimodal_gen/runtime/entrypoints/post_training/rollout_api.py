@@ -140,6 +140,7 @@ def _slice_rollout_trajectory_for_sample(
             latents=_extract_single_sample_tensor(dit.latents, sample_idx, batch_size),
             timesteps=dit.timesteps,
             sigmas=dit.sigmas,
+            latent_step_indices=dit.latent_step_indices,
         )
     return RolloutTrajectoryData(
         rollout_log_probs=log_probs,
@@ -194,6 +195,11 @@ def _serialize_rollout_trajectory(
             ),
             "timesteps": serialized_dit_timesteps,
             "sigmas": serialized_dit_sigmas,
+            "latent_step_indices": (
+                _maybe_serialize(dit.latent_step_indices)
+                if dit.latent_step_indices is not None
+                else None
+            ),
         }
     return (
         serialized_log_probs,
@@ -360,6 +366,7 @@ async def rollout_generate(request: RolloutRequest):
         ) from exc
     if output_batch.error:
         raise HTTPException(status_code=500, detail=output_batch.error)
+
     def _serialize_response() -> list[bytes]:
         with stamps.span("build"):
             rollout_responses = _build_response(

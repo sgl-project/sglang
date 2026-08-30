@@ -679,7 +679,17 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 if isinstance(seed, list):
                     seed = seed[0]
                 generator.manual_seed(int(seed))
-                collector = MiniMaxH3RolloutCollector(sigmas_video=sigmas_video)
+                return_step_indices = getattr(
+                    batch, "rollout_return_step_indices", None
+                )
+                collector = MiniMaxH3RolloutCollector(
+                    sigmas_video=sigmas_video,
+                    return_step_indices=(
+                        set(return_step_indices)
+                        if return_step_indices is not None
+                        else None
+                    ),
+                )
                 packed_cpu = {
                     k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
                     for k, v in packed.items()
