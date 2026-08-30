@@ -1,3 +1,8 @@
+from sglang.srt.layers.moe.customized import (
+    CustomizedMoELayer,
+    CustomizedMoEProvider,
+    register_customized_moe_provider,
+)
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
@@ -23,6 +28,9 @@ __all__ = [
     "MoeRunner",
     "MoeRunnerConfig",
     "MoeRunnerBackend",
+    "CustomizedMoELayer",
+    "CustomizedMoEProvider",
+    "register_customized_moe_provider",
     "initialize_moe_config",
     "get_moe_a2a_backend",
     "get_moe_runner_backend",

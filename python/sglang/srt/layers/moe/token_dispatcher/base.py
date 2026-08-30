@@ -182,6 +182,7 @@ class DispatchOutputFormat(Enum):
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
     ASCEND_TP = "ascend_tp"
+    CUSTOMIZED = "customized"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -206,6 +207,9 @@ class DispatchOutputFormat(Enum):
 
     def is_deepep_v2(self) -> bool:
         return self == DispatchOutputFormat.DEEPEP_V2
+
+    def is_customized(self) -> bool:
+        return self == DispatchOutputFormat.CUSTOMIZED
 
 
 @runtime_checkable
@@ -275,6 +279,7 @@ class CombineInputFormat(Enum):
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
     ASCEND_TP = "ascend_tp"
+    CUSTOMIZED = "customized"
 
 
 @runtime_checkable

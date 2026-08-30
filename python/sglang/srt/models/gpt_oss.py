@@ -917,6 +917,20 @@ class GptOssForCausalLM(nn.Module):
         is_nextn: bool = False,
         weight_name_mapping: dict = None,
     ):
+        loads_expert_weights = all(
+            getattr(layer.mlp.experts.quant_method, "loads_expert_weights", True)
+            for layer in self.model.layers[self.start_layer : self.end_layer]
+            if isinstance(layer.mlp, GptOssSparseMoeBlock)
+        )
+        if not loads_expert_weights:
+            self._load_normal_weights(
+                weights,
+                is_nextn=is_nextn,
+                weight_name_mapping=weight_name_mapping,
+                skip_expert_weights=True,
+            )
+            return
+
         quant_config_name = (
             self.quant_config.get_name() if self.quant_config is not None else None
         )
@@ -1142,6 +1156,7 @@ class GptOssForCausalLM(nn.Module):
         is_nextn: bool,
         weight_name_mapping: dict,
         other_loaded_param_names=[],
+        skip_expert_weights: bool = False,
     ):
         if is_nextn:
             logging.warning(
@@ -1218,11 +1233,14 @@ class GptOssForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
-            loaded_weight = _WeightCreator.maybe_materialize(loaded_weight)
-
             # Apply weight name mapping if provided
             if weight_name_mapping and name in weight_name_mapping:
                 name = weight_name_mapping[name]
+
+            if skip_expert_weights and ".mlp.experts." in name:
+                continue
+
+            loaded_weight = _WeightCreator.maybe_materialize(loaded_weight)
 
             layer_id = get_layer_id(name)
             if (

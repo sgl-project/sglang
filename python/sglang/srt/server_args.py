@@ -2362,6 +2362,7 @@ class ServerArgs:
             "deepep_v2",
             "ascend_tp",
             "pplx",
+            "customized",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -2377,6 +2378,7 @@ class ServerArgs:
                 "deepep_v2",
                 "pplx",
                 "ascend_tp",
+                "customized",
             ],
             resolvable=True,
         ),

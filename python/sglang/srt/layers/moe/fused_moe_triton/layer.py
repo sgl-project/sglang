@@ -29,6 +29,10 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
+from sglang.srt.layers.moe.customized import (
+    CustomizedMoELayer,
+    get_customized_moe_provider,
+)
 from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
@@ -207,6 +211,10 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
             moe_runner_config=moe_runner_config,
+        )
+    elif a2a_backend.is_customized():
+        raise RuntimeError(
+            "customized dispatchers are constructed by their layer provider"
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
@@ -452,6 +460,24 @@ class FusedMoE(torch.nn.Module):
                     self.use_flashinfer_trtllm_moe,
                     self.use_deep_gemm,
                 )
+        customized_layer: CustomizedMoELayer | None = None
+        if get_moe_a2a_backend().is_customized():
+            customized_layer = get_customized_moe_provider().prepare_layer(
+                layer=self,
+                prefix=prefix,
+                native_method=self.quant_method,
+                runner_config=self.moe_runner_config,
+            )
+            if not isinstance(customized_layer, CustomizedMoELayer):
+                raise TypeError(
+                    "CustomizedMoEProvider.prepare_layer must return CustomizedMoELayer"
+                )
+            if not isinstance(customized_layer.method, FusedMoEMethodBase):
+                raise TypeError(
+                    "CustomizedMoELayer.method must be a FusedMoEMethodBase"
+                )
+            self.quant_method = customized_layer.method
+
         _validate_hpc_ops_quant_method(self.quant_method)
         _validate_deepep_v2_quant_method(self.quant_method)
         nvfp4_deferred = envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get() and isinstance(
@@ -492,7 +518,16 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
-        self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        if customized_layer is None:
+            self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        else:
+            self.dispatcher = customized_layer.dispatcher_factory(
+                self.moe_runner_config
+            )
+            if not isinstance(self.dispatcher, BaseDispatcher):
+                raise TypeError(
+                    "CustomizedMoELayer.dispatcher_factory must return BaseDispatcher"
+                )
         # Dispatchers are not nn.Modules, so they cannot register their own
         # buffers; the AITER expert mask would not survive a memory-saver resume.
         expert_mask = getattr(self.dispatcher, "expert_mask_gpu", None)
@@ -518,7 +553,8 @@ class FusedMoE(torch.nn.Module):
             self.moe_runner_config.inplace = False
 
         self.should_fuse_routed_scaling_factor_in_topk = (
-            _fuses_routed_scaling_factor_in_topk(self.quant_method)
+            customized_layer is None
+            and _fuses_routed_scaling_factor_in_topk(self.quant_method)
         )
 
         self.routing_method_type = routing_method_type

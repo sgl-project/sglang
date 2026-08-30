@@ -89,6 +89,7 @@ class LinearMethodBase(QuantizeMethodBase):
 
 class FusedMoEMethodBase(QuantizeMethodBase):
     runner: MoeRunner | None = None
+    loads_expert_weights = True
 
     def create_weights(
         self,
