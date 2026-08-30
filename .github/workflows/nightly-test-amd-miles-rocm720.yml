@@ -51,6 +51,7 @@ jobs:
           repo="rocm/sgl-dev"
           base="miles-rocm720-mi35x"
           tag="${{ inputs.image_tag }}"
+          age=""
           if [ -z "${tag}" ]; then
             # Walk back from today; the build job pushes a dated tag at 12:00 UTC.
             # Probe with `manifest inspect` so we don't pull a multi-GB image just
@@ -60,6 +61,7 @@ jobs:
               candidate="${base}-${d}"
               if docker manifest inspect "${repo}:${candidate}" >/dev/null 2>&1; then
                 tag="${candidate}"
+                age="${i}"
                 break
               fi
             done
@@ -70,6 +72,16 @@ jobs:
           fi
           echo "MILES_IMAGE=${repo}:${tag}" >> "$GITHUB_ENV"
           echo "Using miles image: ${repo}:${tag}"
+          echo "Miles image: \`${repo}:${tag}\`" >> "$GITHUB_STEP_SUMMARY"
+          # Falling back to an older tag means the 12:00 UTC build failed, so this run
+          # reports on code that was never built. Without an annotation that reads as a
+          # normal green nightly and the build outage goes unnoticed for days.
+          if [ -n "${age}" ] && [ "${age}" -gt 0 ]; then
+            echo "::warning::Newest ${base} image is ${age} day(s) old (${tag}); the nightly image build has been failing since then, so these results do not cover the last ${age} day(s) of commits"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "> [!WARNING]" >> "$GITHUB_STEP_SUMMARY"
+            echo "> Image is **${age} day(s) old**: the newer \`${base}\` builds failed, so these results do not cover the last ${age} day(s) of commits." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
