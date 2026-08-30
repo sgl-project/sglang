@@ -47,6 +47,9 @@ jobs:
   # Adding a machine is one row here, and adding a test to an existing machine
   # is none -- `stage="weekly"` + `runner_config=` on the test is enough.
   weekly-test:
+    # Without this, the matrix default names the job after every value in the
+    # row -- "weekly-test (1-gpu-large, 120, 180)".
+    name: weekly-test-${{ matrix.runner_config }}
     needs: check-changes
     if: github.repository == 'sgl-project/sglang'
     strategy:
