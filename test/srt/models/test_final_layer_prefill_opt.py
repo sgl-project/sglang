@@ -1,5 +1,4 @@
 import unittest
-import torch
 from sglang.benchmark.one_batch import (
     BenchArgs,
     PortArgs,
