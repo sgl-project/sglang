@@ -433,13 +433,6 @@ def validate_standard_mps_server_args(server_args: Any):
             f"pytorch sampling backend; got sampling_backend={sampling_backend!r}"
         )
 
-    quantization = getattr(cfg, "quantization", None)
-    if quantization not in (None, "unquant"):
-        raise ValueError(
-            "The standard Torch MPS path currently supports only unquantized "
-            f"model weights; got quantization={quantization!r}"
-        )
-
     if (
         getattr(cfg, "tp_size", 1) != 1
         or getattr(cfg, "pp_size", 1) != 1

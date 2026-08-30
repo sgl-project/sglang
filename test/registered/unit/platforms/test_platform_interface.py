@@ -5,7 +5,6 @@ Tests DeviceMixin, SRTPlatform, PlatformEnum, CpuArchEnum, DeviceCapability,
 and the platform discovery / lazy initialization mechanism.
 """
 
-import platform
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -421,11 +420,12 @@ class TestMpsDeviceMixin(CustomTestCase):
         with patch.object(_platform_stubs, "_cached_props", None):
             self.assertEqual(_platform_stubs.get_device_properties().total_memory, 800)
 
-    def test_device_metadata_contract(self):
+    @patch("torch.backends.mps.get_name", return_value="Apple M-series")
+    def test_device_metadata_contract(self, _mock_name):
         base = MpsSRTPlatform()
         # MPS exposes no compute-capability analogue.
         self.assertIsNone(base.get_device_capability())
-        self.assertEqual(base.get_device_name(), f"Apple MPS ({platform.machine()})")
+        self.assertEqual(base.get_device_name(), "Apple M-series")
 
     @patch("torch.mps.driver_allocated_memory")
     @patch("torch.mps.recommended_max_memory")
@@ -450,14 +450,19 @@ class TestMpsDeviceMixin(CustomTestCase):
             patch.object(torch.cuda, "is_available", return_value=False),
             patch.object(torch.xpu, "is_available", return_value=False),
             patch.object(common, "empty_device_cache"),
+            # `_mps_get_name` is unavailable in CPU-only Torch builds, and
+            # this file also runs in the Linux CPU suite.
+            patch("torch.backends.mps.get_name", return_value="Apple M-series"),
+            patch(
+                "sglang.srt.hardware_backend.mlx.runtime.use_mlx",
+                return_value=False,
+            ),
         ):
             common.get_device_count.cache_clear()
             common.get_device.cache_clear()
             try:
                 self.assertEqual(common.get_device_memory_capacity("mps"), 8192)
-                self.assertEqual(
-                    common.get_device_name(), f"Apple MPS ({platform.machine()})"
-                )
+                self.assertEqual(common.get_device_name(), "Apple M-series")
                 self.assertEqual(common.get_device_count(), 1)
                 self.assertEqual(common.get_device(), "mps")
                 self.assertEqual(common.get_device(0), "mps:0")

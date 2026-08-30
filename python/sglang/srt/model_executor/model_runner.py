@@ -243,7 +243,7 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
     init_npu_backend()
-elif current_platform.is_mps() or current_platform.is_out_of_tree():
+elif current_platform.is_out_of_tree():
     current_platform.init_backend()
 
 # Detect stragger ranks in model loading
@@ -407,6 +407,19 @@ class ModelRunner:
         # can access the device context. torch.mps has no set_device: the
         # single Apple GPU is always current, so there is nothing to select.
         is_mps_device = str(self.device).split(":", 1)[0] == "mps"
+        if is_mps_device:
+            from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
+            if not use_mlx():
+                # Keep the platform boundary authoritative for programmatic
+                # ModelRunner construction too, not just the CLI launch path.
+                # MPS availability only means this is a Mac, and MLX also runs
+                # on "mps" without the Torch model path.
+                from sglang.srt.hardware_backend.mps.runtime import (
+                    validate_mps_runtime,
+                )
+
+                validate_mps_runtime()
         try:
             if not is_mps_device:
                 torch.get_device_module(self.device).set_device(ps.gpu_id)
