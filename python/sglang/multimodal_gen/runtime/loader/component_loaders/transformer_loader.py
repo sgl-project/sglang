@@ -5,12 +5,14 @@ from contextlib import nullcontext
 from typing import Any
 
 import torch
-
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+    KitchenInt8Config,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -60,6 +62,16 @@ def _resolve_checkpoint_load_device(
     ):
         return torch.device("cpu")
     return runtime_device
+
+
+def _can_stage_online_kitchen_int8_on_cpu(
+    *, component_starts_on_cpu: bool, runtime_quant_config: object | None
+) -> bool:
+    return bool(
+        component_starts_on_cpu
+        and isinstance(runtime_quant_config, KitchenInt8Config)
+        and not runtime_quant_config.is_checkpoint_int8_serialized
+    )
 
 
 def _minimax_h3_adaln_cache_key_filter(name: str) -> bool:
@@ -395,6 +407,14 @@ class TransformerLoader(ComponentLoader):
             )
 
         local_torch_device = get_local_torch_device()
+        # Online kitchen_int8 already round-trips one layer at a time through CUDA
+        # in process_weights_after_loading(). Keep the BF16 source model on CPU
+        # when layerwise offload starts the component there; moving the complete
+        # model to CUDA first defeats that bounded-memory implementation.
+        online_kitchen_int8_cpu_staging = _can_stage_online_kitchen_int8_on_cpu(
+            component_starts_on_cpu=component_starts_on_cpu,
+            runtime_quant_config=runtime_quant_config,
+        )
         checkpoint_load_device = (
             torch.device("cpu")
             if cpu_offload_flag
@@ -403,7 +423,8 @@ class TransformerLoader(ComponentLoader):
                 component_starts_on_cpu=component_starts_on_cpu,
                 runtime_quant_config=quant_spec.runtime_quant_config,
                 quantized_cpu_load_supported=(
-                    quant_spec.gguf_file is not None
+                    online_kitchen_int8_cpu_staging
+                    or quant_spec.gguf_file is not None
                     or quant_spec.is_serialized_kitchen_int8
                     or quant_spec.is_serialized_kitchen_w4a8
                 ),
@@ -418,7 +439,10 @@ class TransformerLoader(ComponentLoader):
             )
         weight_load_plan = WeightLoadPlan.for_component(
             checkpoint_load_device=checkpoint_load_device,
-            needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
+            needs_device_weight_postprocess=(
+                quant_spec.needs_device_weight_postprocess
+                and not online_kitchen_int8_cpu_staging
+            ),
             component_starts_on_cpu=component_starts_on_cpu,
             load_full_state_dict_on_device=direct_gpu_weight_loading,
             mps_layerwise_cpu_staging=bool(

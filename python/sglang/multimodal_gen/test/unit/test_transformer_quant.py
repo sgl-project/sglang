@@ -85,6 +85,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
 from sglang.multimodal_gen.runtime.loader.component_loaders import transformer_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
+    _can_stage_online_kitchen_int8_on_cpu,
     _default_quantized_attention_backend,
     _resolve_checkpoint_load_device,
     _warn_if_expected_param_dtype_missing,
@@ -831,6 +832,30 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         )
 
         self.assertTrue(plan.load_full_state_dict_on_device)
+
+    def test_online_kitchen_int8_stages_on_cpu_for_offloaded_component(self):
+        self.assertTrue(
+            _can_stage_online_kitchen_int8_on_cpu(
+                component_starts_on_cpu=True,
+                runtime_quant_config=KitchenInt8Config(),
+            )
+        )
+
+    def test_online_kitchen_int8_stays_on_device_for_resident_component(self):
+        self.assertFalse(
+            _can_stage_online_kitchen_int8_on_cpu(
+                component_starts_on_cpu=False,
+                runtime_quant_config=KitchenInt8Config(),
+            )
+        )
+
+    def test_serialized_kitchen_int8_does_not_use_online_cpu_staging(self):
+        self.assertFalse(
+            _can_stage_online_kitchen_int8_on_cpu(
+                component_starts_on_cpu=True,
+                runtime_quant_config=KitchenInt8Config(layer_markers={}),
+            )
+        )
 
     def test_unquantized_cpu_offload_loads_checkpoint_on_cpu(self):
         device = _resolve_checkpoint_load_device(
