@@ -168,6 +168,21 @@ def resolve_attention_backend_strs(
     draft_attn_backend = model_runner.draft_attention_backend
     if is_draft_worker and draft_attn_backend:
         logger.warning(f"Overriding draft attention backend to {draft_attn_backend}.")
+        prefill_backend, _ = attention_backends()
+        # TRTLLM MHA's DCP kernel intentionally covers decode and uniform
+        # speculative rows, not ordinary prompt prefill.  Preserve the
+        # configured prefill backend for that one mode while keeping the
+        # operator-selected backend for draft decode/draft-extend.
+        if (
+            draft_attn_backend == "trtllm_mha"
+            and model_runner.server_args.dcp_size > 1
+            and prefill_backend != draft_attn_backend
+        ):
+            return ResolvedAttentionBackendStr(
+                prefill=prefill_backend,
+                decode=draft_attn_backend,
+                is_draft_override=True,
+            )
         # Single backend for all draft modes (no prefill/decode split).
         return ResolvedAttentionBackendStr(
             prefill=draft_attn_backend,
@@ -184,7 +199,7 @@ def _build_resolved_backend(
     resolved: ResolvedAttentionBackendStr,
     init_new_workspace: bool,
 ) -> AttentionBackend:
-    if resolved.is_draft_override:
+    if resolved.is_draft_override and resolved.decode == resolved.prefill:
         attn_backend = _build_backend_from_str(
             model_runner=model_runner,
             backend_str=resolved.prefill,

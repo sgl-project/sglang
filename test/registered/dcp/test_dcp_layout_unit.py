@@ -22,6 +22,7 @@ import torch
 from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.dcp.comm import cp_lse_ag_out_rs_mha
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
@@ -142,6 +143,44 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
 
 
 class TestGetDcpLens(CustomTestCase):
+    def test_mha_merge_supports_base2_lse(self):
+        rank_lses = [
+            torch.tensor([[1.0, 3.0]], dtype=torch.float32),
+            torch.tensor([[2.0, 1.0]], dtype=torch.float32),
+        ]
+        rank_outs = [
+            torch.tensor([[[2.0], [5.0]]], dtype=torch.float32),
+            torch.tensor([[[8.0], [1.0]]], dtype=torch.float32),
+        ]
+        global_lse = torch.logsumexp(
+            torch.stack(rank_lses) * math.log(2.0), dim=0
+        ) * math.log2(math.e)
+        weights = [torch.exp2(lse - global_lse) for lse in rank_lses]
+
+        class FakeGroup:
+            world_size = 2
+            rank_in_group = 0
+
+            def all_gather(self, tensor, dim):
+                self.assert_tensor = tensor
+                return torch.cat(rank_lses, dim=dim)
+
+            def all_reduce(self, tensor):
+                return tensor + rank_outs[1] * weights[1].unsqueeze(-1)
+
+        merged_out, merged_lse = cp_lse_ag_out_rs_mha(
+            rank_outs[0].clone(),
+            rank_lses[0],
+            FakeGroup(),
+            return_lse=True,
+            is_lse_base_on_e=False,
+        )
+        expected_out = sum(
+            out * weight.unsqueeze(-1) for out, weight in zip(rank_outs, weights)
+        )
+        torch.testing.assert_close(merged_out, expected_out[:, :1])
+        torch.testing.assert_close(merged_lse, global_lse[:, :1])
+
     def test_start_none_matches_owner_count(self):
         for n in DCP_SIZES:
             for rank in range(n):

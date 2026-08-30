@@ -27,6 +27,9 @@ from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
 from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -38,6 +41,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -45,7 +49,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer, get_spec
+from sglang.srt.runtime_context import get_buffer, get_parallel, get_spec
 from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
     resolve_ragged_verify_layout,
@@ -76,6 +80,9 @@ DEFAULT_WORKSPACE_SIZE_MB = 512
 class TRTLLMMHAMetadata:
     # Sequence lengths for the forward batch
     cache_seqlens_int32: torch.Tensor = None
+    # Global KV prefix length before speculative query row 0. Cake DCP uses
+    # this to apply the per-row causal boundary without expanding requests.
+    causal_seqlens_kv_global: torch.Tensor = None
     # Maximum sequence length for query
     max_seq_len_q: int = 1
     # Cumulative sequence lengths for `query
@@ -153,6 +160,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # MHA-specific dimensions
         self.max_context_len = model_runner.model_config.context_len
         self.hidden_size = config.hidden_size
+        self.head_dim = config.head_dim
 
         # Runtime parameters
         self.data_type = model_runner.kv_cache_dtype
@@ -160,6 +168,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.device = model_runner.device
+        parallel = get_parallel()
+        self.dcp_size = parallel.attn_dcp_size
+        self.dcp_rank = parallel.attn_dcp_rank
+        self.dcp_group = parallel.dcp_group if self.dcp_size > 1 else None
+        self.num_q_heads = config.num_attention_heads // parallel.attn_tp_size
+        self.dcp_max_context_len = (
+            self.max_context_len + self.dcp_size - 1
+        ) // self.dcp_size
 
         # Workspace allocation
         self.workspace_size = workspace_size_bytes
@@ -204,12 +220,23 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             self._swa_full_to_swa_mapping = None
 
+        if self.dcp_size > 1 and self._swa_kv_pool is not None:
+            raise NotImplementedError("TRTLLM MHA DCP does not support SWA KV pools")
+        if self.dcp_size > 1 and self.decode_uses_native_fp4:
+            raise NotImplementedError(
+                "TRTLLM MHA DCP does not support native FP4 KV cache"
+            )
+
         # Static page-table width (upper bound). The CUDA-graph path builds the
         # page table on-device sized to this constant, so it never reads a runtime
         # max. See _fill_page_table_device.
         self.max_num_pages = (
-            self.max_context_len + self.page_size - 1
+            self.dcp_max_context_len + self.page_size - 1
         ) // self.page_size
+        self.dcp_cuda_graph_out_buffer: Optional[torch.Tensor] = None
+        self.dcp_cuda_graph_lse_buffer: Optional[torch.Tensor] = None
+        self.dcp_cuda_graph_q_gather_buffer: Optional[torch.Tensor] = None
+        self.dcp_cuda_graph_q_buffer: Optional[torch.Tensor] = None
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
@@ -223,6 +250,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+        if self.dcp_size > 1 and self.is_xqa_impl:
+            raise NotImplementedError(
+                "TRTLLM MHA DCP requires trtllm-gen return_lse support"
+            )
 
         # fmha_v2 prefill kernel supports SM90 and SM120
         self.use_fmha_v2 = is_sm90_supported() or is_sm120_supported()
@@ -234,8 +265,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # "Missing TRTLLM-GEN kernel" error during CUDA-graph capture.
         # XQA (SM90/SM120 decode) has native page-128 kernels; no check needed.
         if self.page_size >= 128 and not self.is_xqa_impl:
-            from sglang.srt.runtime_context import get_parallel
-
             attn_tp_size = get_parallel().attn_tp_size
             num_q_heads = config.num_attention_heads // attn_tp_size
             num_kv_heads = config.get_num_kv_heads(attn_tp_size)
@@ -352,6 +381,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             full_to_swa=(
                 self._swa_kv_pool.full_to_swa_index_mapping if has_swa else None
             ),
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
         )
 
     def _get_layer_cache_loc(
@@ -473,6 +504,31 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ),
             "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
         }
+        if self.dcp_size > 1:
+            with use_symmetric_memory(self.dcp_group):
+                self.dcp_cuda_graph_q_gather_buffer = torch.empty(
+                    max_num_tokens * self.dcp_size,
+                    self.num_q_heads,
+                    self.head_dim,
+                    dtype=self.q_data_type,
+                    device=self.device,
+                )
+                self.dcp_cuda_graph_q_buffer = torch.empty(
+                    max_num_tokens,
+                    self.num_q_heads * self.dcp_size,
+                    self.head_dim,
+                    dtype=self.q_data_type,
+                    device=self.device,
+                )
+                self.dcp_cuda_graph_out_buffer = torch.empty_like(
+                    self.dcp_cuda_graph_q_buffer
+                )
+                self.dcp_cuda_graph_lse_buffer = torch.empty(
+                    max_num_tokens,
+                    self.num_q_heads * self.dcp_size,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
 
         # SWA write-target buffer; bound as a [:num_tokens] view in
         # _build_cuda_graph_metadata and refilled by the fused metadata kernel.
@@ -528,6 +584,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             }
+            if self.dcp_size > 1:
+                self.target_verify_metadata["causal_seqlens_kv_global"] = torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                )
             if self.expand_encoder_only_verify:
                 max_verify_rows = max_bs * self.speculative_num_draft_tokens
                 self.target_verify_metadata["encoder_cache_seqlens"] = torch.zeros(
@@ -560,6 +620,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             }
+            if self.dcp_size > 1:
+                self.draft_extend_metadata["causal_seqlens_kv_global"] = torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                )
 
     def _build_cuda_graph_metadata(
         self,
@@ -635,6 +699,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 else num_tokens // bs
             )
             metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
+            if self.dcp_size > 1:
+                metadata.causal_seqlens_kv_global = self.target_verify_metadata[
+                    "causal_seqlens_kv_global"
+                ][:bs]
             self._bind_swa_page_table(
                 metadata,
                 self.target_verify_metadata,
@@ -665,6 +733,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][: bs + 1]
             metadata.max_seq_len_q = num_tokens_per_req
             metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
+            if self.dcp_size > 1:
+                metadata.causal_seqlens_kv_global = self.draft_extend_metadata[
+                    "causal_seqlens_kv_global"
+                ][:bs]
             self._bind_swa_page_table(
                 metadata,
                 self.draft_extend_metadata,
@@ -723,6 +795,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         qlens = None
         q_stride = 0
         q_mode = Q_MODE_NONE
+        causal_seqlen_offset = 0
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
                 # Draft Decode
@@ -752,6 +825,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             cu_seqlens_q = metadata.cu_seqlens_q
             q_stride = num_tokens_per_req
             q_mode = Q_MODE_STRIDED
+            causal_seqlen_offset = -num_tokens_per_req
         else:
             raise ValueError(
                 "TRTLLM-MHA CUDA graph metadata build got an unsupported forward "
@@ -782,6 +856,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             qlens=qlens,
             q_stride=q_stride,
             q_mode=q_mode,
+            causal_seqlens_kv_global=metadata.causal_seqlens_kv_global,
+            causal_seqlen_offset=causal_seqlen_offset,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
         )
 
         if self._needs_encoder_only_expand(forward_mode, metadata):
@@ -810,7 +888,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ) -> bool:
         """Check if we should use the fused FP8 KV cache write path."""
         return (
-            not is_cp_v2_active(forward_batch)
+            self.dcp_size == 1
+            and not is_cp_v2_active(forward_batch)
             and save_kv_cache
             and k is not None
             and self.data_type == torch.float8_e4m3fn
@@ -886,6 +965,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
     def _assert_ragged_verify_supported(self) -> None:
+        if self.dcp_size > 1:
+            raise NotImplementedError(
+                "TRTLLM MHA DCP speculative decode requires uniform query lengths"
+            )
         if self.is_xqa_impl:
             raise NotImplementedError(
                 "Compact ragged verify (variable-length cum_seq_lens_q) "
@@ -950,7 +1033,50 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
 
-        if forward_batch.forward_mode.is_decode_or_idle():
+        if self.dcp_size > 1:
+            if forward_batch.forward_mode.is_decode_or_idle():
+                global_cache_seqlens = seqlens_in_batch
+                if forward_batch.spec_info is not None:
+                    global_cache_seqlens = global_cache_seqlens + (
+                        self.speculative_step_id + 1
+                    )
+                q_len_per_req = 1
+            elif forward_batch.forward_mode.is_target_verify():
+                if resolve_ragged_verify_layout(forward_batch) is not None:
+                    self._assert_ragged_verify_supported()
+                q_len_per_req = forward_batch.input_ids.shape[0] // batch_size
+                global_cache_seqlens = seqlens_in_batch + q_len_per_req
+                metadata.causal_seqlens_kv_global = seqlens_in_batch.to(
+                    torch.int32
+                ).contiguous()
+            elif forward_batch.forward_mode.is_draft_extend_v2():
+                q_len_per_req = forward_batch.spec_info.num_tokens_per_req
+                global_cache_seqlens = seqlens_in_batch
+                metadata.causal_seqlens_kv_global = torch.clamp(
+                    seqlens_in_batch - q_len_per_req, min=0
+                ).to(torch.int32)
+            else:
+                raise NotImplementedError(
+                    "TRTLLM MHA DCP supports decode and uniform speculative "
+                    "decode only; use a separate prefill backend for prompt extend"
+                )
+            metadata.cache_seqlens_int32 = get_dcp_lens(
+                global_cache_seqlens, self.dcp_size, self.dcp_rank
+            ).to(torch.int32)
+            metadata.max_seq_len_q = q_len_per_req
+            metadata.cu_seqlens_q = torch.arange(
+                0,
+                batch_size * q_len_per_req + 1,
+                q_len_per_req,
+                dtype=torch.int32,
+                device=device,
+            )
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
+                (1, 0),
+            )
+
+        elif forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.spec_info is not None:
                 # Draft Decode
                 # Here we only support topk = 1 for now.
@@ -1090,6 +1216,35 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         assert self.is_nvfp4_kvcache
         return self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
 
+    def _all_gather_dcp_spec_q(self, query: torch.Tensor) -> torch.Tensor:
+        """Gather DCP query heads into a CUDA-Graph-stable Cake input."""
+        query = query.contiguous()
+        if self.dcp_cuda_graph_q_buffer is None:
+            return self.dcp_group.all_gather(query, dim=1).contiguous()
+
+        num_rows, num_local_heads, head_dim = query.shape
+        if (
+            num_rows > self.dcp_cuda_graph_q_buffer.shape[0]
+            or num_local_heads != self.num_q_heads
+            or head_dim != self.head_dim
+        ):
+            raise RuntimeError(
+                "DCP speculative query exceeds the preallocated CUDA Graph buffer: "
+                f"got {tuple(query.shape)}, capacity "
+                f"{tuple(self.dcp_cuda_graph_q_buffer.shape)}"
+            )
+
+        gathered = self.dcp_cuda_graph_q_gather_buffer[: num_rows * self.dcp_size]
+        self.dcp_group.all_gather_into_tensor(gathered, query)
+        gathered = gathered.view(
+            self.dcp_size, num_rows, num_local_heads, head_dim
+        ).transpose(0, 1)
+        stable_query = self.dcp_cuda_graph_q_buffer[:num_rows]
+        stable_query.view(num_rows, self.dcp_size, num_local_heads, head_dim).copy_(
+            gathered
+        )
+        return stable_query
+
     def _run_fixed_q_len_decode(
         self,
         query: torch.Tensor,
@@ -1103,35 +1258,98 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         sinks: Optional[torch.Tensor],
         q_len_per_req: int = 1,
         kv_cache_sf=None,
+        causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
-        def run_group(group_query, group_block_tables, group_seq_lens):
+        def run_group(
+            group_query,
+            group_block_tables,
+            group_seq_lens,
+            group_causal_seqlens_kv_global=None,
+        ):
             kwargs = {}
             if q_len_per_req != 1:
                 kwargs["q_len_per_req"] = q_len_per_req
-            return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            if (
+                self.dcp_size > 1
+                and q_len_per_req > 1
+                and group_causal_seqlens_kv_global is None
+            ):
+                raise RuntimeError(
+                    "DCP speculative decode requires global KV prefix lengths"
+                )
+            dcp_spec_enabled = (
+                self.dcp_size > 1 and group_causal_seqlens_kv_global is not None
+            )
+            if dcp_spec_enabled:
+                if group_query.dtype != torch.bfloat16:
+                    raise NotImplementedError(
+                        "FlashInfer Cake DCP speculative decode requires BF16 query"
+                    )
+                kwargs.update(
+                    cp_world=self.dcp_size,
+                    cp_rank=self.dcp_rank,
+                    q_len_per_req=q_len_per_req,
+                    causal_seqlens_kv_global=group_causal_seqlens_kv_global,
+                )
+
+            if self.dcp_size > 1:
+                kwargs["return_lse"] = True
+                if self.dcp_cuda_graph_out_buffer is not None:
+                    num_rows = group_query.shape[0]
+                    kwargs["out"] = self.dcp_cuda_graph_out_buffer[:num_rows]
+                    kwargs["lse"] = self.dcp_cuda_graph_lse_buffer[:num_rows]
+
+            result = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=group_query,
                 kv_cache=kv_cache,
                 workspace_buffer=self.workspace_buffer,
                 block_tables=group_block_tables,
                 seq_lens=group_seq_lens,
-                max_seq_len=self.max_context_len,
+                max_seq_len=(
+                    self.dcp_max_context_len
+                    if self.dcp_size > 1
+                    else self.max_context_len
+                ),
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
                 window_left=window_left,
                 sinks=sinks,
-                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                skip_softmax_threshold_scale_factor=(
+                    None
+                    if dcp_spec_enabled
+                    else envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get()
+                ),
                 out_dtype=self.q_data_type,
                 kv_cache_sf=kv_cache_sf,
                 multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 **kwargs,
             )
+            if self.dcp_size == 1:
+                return result
+
+            local_out, local_lse = result
+            return cp_lse_ag_out_rs_mha(
+                local_out,
+                local_lse,
+                self.dcp_group,
+                is_lse_base_on_e=False,
+            ).to(self.q_data_type)
 
         num_requests = seq_lens.shape[0]
-        num_splits = min(self.decode_seq_len_splits, num_requests)
+        # Keep DCP rows in their original order: Cake's causal prefix tensor and
+        # the caller-owned CUDA-graph buffers share this exact row layout.
+        num_splits = (
+            1 if self.dcp_size > 1 else min(self.decode_seq_len_splits, num_requests)
+        )
         if num_splits == 1:
-            return run_group(query, block_tables, seq_lens)
+            return run_group(
+                query,
+                block_tables,
+                seq_lens,
+                causal_seqlens_kv_global,
+            )
 
         order = torch.argsort(seq_lens)
         query_by_request = query.view(
@@ -1149,6 +1367,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 block_tables.index_select(0, indices),
                 seq_lens.index_select(0, indices),
+                None,
             )
             output_by_request.index_copy_(
                 0,
@@ -1202,27 +1421,42 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             v = None
         else:
             if save_kv_cache and k is not None:
+                kv_write_kwargs = {}
+                if self.dcp_size > 1:
+                    cache_loc = cache_loc // self.dcp_size
+                    kv_write_kwargs["dcp_kv_mask"] = (
+                        forward_batch.positions % self.dcp_size == self.dcp_rank
+                    )
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                     k,
                     v,
                     *self._kv_write_scales(layer),
+                    **kv_write_kwargs,
                 )
 
         # For XQA, q_dtype should be bf16. For trtllm-gen,
         # q_dtype should be FP8 when KV is in FP8.
         q_scale = 1.0
-        if (
-            self.data_type == torch.float8_e4m3fn
-            and not self.is_xqa_impl
-            and not use_fused_qkv
-        ):
-            q = q.to(torch.float8_e4m3fn)
-        if self.is_xqa_impl:
-            q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-        else:
+        if self.dcp_size > 1:
             q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+            with use_symmetric_memory(self.dcp_group):
+                q = q.contiguous()
+            q = self.dcp_group.all_gather(q, dim=1).contiguous()
+            if self.data_type == torch.float8_e4m3fn and not use_fused_qkv:
+                q = q.to(torch.float8_e4m3fn)
+        else:
+            if (
+                self.data_type == torch.float8_e4m3fn
+                and not self.is_xqa_impl
+                and not use_fused_qkv
+            ):
+                q = q.to(torch.float8_e4m3fn)
+            if self.is_xqa_impl:
+                q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            else:
+                q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
 
         if self.is_nvfp4_kvcache:
             kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
@@ -1295,7 +1529,27 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             v = None
         else:
             if save_kv_cache and k is not None:
-                if cp_v2_active:
+                if self.dcp_size > 1:
+                    cache_loc = cache_loc // self.dcp_size
+                    if (
+                        forward_batch.positions is not None
+                        and forward_batch.positions.numel() == cache_loc.numel()
+                    ):
+                        dcp_kv_mask = (
+                            forward_batch.positions % self.dcp_size == self.dcp_rank
+                        )
+                    else:
+                        dcp_kv_mask = forward_batch.dcp_kv_mask
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        layer.k_scale,
+                        layer.v_scale,
+                        dcp_kv_mask=dcp_kv_mask,
+                    )
+                elif cp_v2_active:
                     cp_strategy = get_cp_strategy()
                     assert cp_strategy is not None
                     cp_strategy.materialize_full_kv(
@@ -1317,7 +1571,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         q_scale = 1.0
         if (
-            self.data_type == torch.float8_e4m3fn
+            self.dcp_size == 1
+            and self.data_type == torch.float8_e4m3fn
             and (
                 not self.is_xqa_impl
                 or not forward_batch.forward_mode.is_target_verify()
@@ -1326,7 +1581,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         ):
             q = q.to(torch.float8_e4m3fn)
 
-        if self.use_fmha_v2:
+        if self.dcp_size > 1:
+            q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+            with use_symmetric_memory(self.dcp_group):
+                q = q.contiguous()
+            q = self._all_gather_dcp_spec_q(q)
+        elif self.use_fmha_v2:
             q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         else:
             q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1364,6 +1624,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.forward_mode.is_target_verify()
                 and layer.attn_type == AttentionType.ENCODER_ONLY
             ):
+                if self.dcp_size > 1:
+                    raise NotImplementedError(
+                        "TRTLLM MHA DCP does not support ENCODER_ONLY target verify"
+                    )
                 # ENCODER_ONLY layers need bidirectional attention over the
                 # verify window; the spec-decode kernel is causal in-window, so
                 # run bs*L single-token rows over the full window instead (the
@@ -1393,6 +1657,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
             elif self.forward_metadata.is_ragged_verify:
+                if self.dcp_size > 1:
+                    self._assert_ragged_verify_supported()
                 o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                     query=q,
                     kv_cache=kv_cache,
@@ -1422,6 +1688,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     window_left=layer.sliding_window_size,
                     sinks=attention_sink,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
+                    causal_seqlens_kv_global=(
+                        self.forward_metadata.causal_seqlens_kv_global
+                        if self.dcp_size > 1
+                        else None
+                    ),
                 )
         elif self.use_fmha_v2 and not cp_v2_active:
             # CP-v2 must go through cp_strategy.run_attention (per-shard

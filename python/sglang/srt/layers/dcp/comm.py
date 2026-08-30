@@ -16,10 +16,11 @@
 
 The two LSE-merge variants kept separate (bodies are backend-forced, see
 PR #25090 vs #14194):
-  - cp_lse_ag_out_rs_mha: torch / natural-log logsumexp / all-reduce + head slice
+  - cp_lse_ag_out_rs_mha: torch / selectable LSE log base / all-reduce + head slice
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
+import math
 import warnings
 from typing import Optional
 
@@ -85,14 +86,19 @@ def cp_lse_ag_out_rs_mha(
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
     return_lse: bool = False,
+    is_lse_base_on_e: bool = True,
 ):
     if cp_group.world_size == 1:
         return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
 
     cp_attn_lse = cp_attn_lse.contiguous()
     lses = _ag_lse(cp_attn_lse, cp_group)
-    global_lse = torch.logsumexp(lses, dim=0)
-    scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
+    if is_lse_base_on_e:
+        global_lse = torch.logsumexp(lses, dim=0)
+        scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
+    else:
+        global_lse = torch.logsumexp(lses * math.log(2.0), dim=0) * math.log2(math.e)
+        scale = torch.exp2(cp_attn_lse - global_lse).unsqueeze(-1)
     scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
 
     out = cp_attn_out.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
