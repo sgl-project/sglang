@@ -90,6 +90,10 @@ class SubPoolSpec(ABC):
     name: str
     layer_num: int
     grow_direction: str  # "up" | "down" | "float"
+    # Fused draft-KV region riding in this sub-pool's pages; None = unfused.
+    # A kind that resolves one also defines the draft page math
+    # (`draft_kernel_page_multiplier` / `draft_region_offset_in_page`).
+    draft_region: Optional[DenseDraftRegion] = None
 
     def __post_init__(self):
         assert self.grow_direction in self._allowed_grow_directions, (
@@ -186,7 +190,6 @@ class MHASubPoolSpec(SubPoolSpec):
     head_dim: int
     store_dtype: torch.dtype
     v_head_dim: Optional[int] = None
-    draft_region: Optional[DenseDraftRegion] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -300,6 +303,9 @@ class MLASubPoolSpec(SubPoolSpec):
         assert (
             self.qk_rope_head_dim > 0
         ), f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
+        assert (
+            self.draft_region is None
+        ), "MLA sub-pools do not carry a fused draft region yet"
 
     @property
     def kv_cache_dim(self) -> int:
@@ -307,6 +313,11 @@ class MLASubPoolSpec(SubPoolSpec):
 
     def entry_bytes(self) -> int:
         return self.layer_num * self.kv_cache_dim * self.store_dtype.itemsize
+
+    def blocks_per_page(self) -> int:
+        """Page stride in latent-row units — this sub-pool's
+        `kernel_page_multiplier`. One latent row per layer per token."""
+        return self.layer_num
 
     def view_tail_pad_bytes(self, page_size: int) -> int:
         return page_size * self.entry_bytes()
@@ -333,6 +344,9 @@ class MambaSubPoolSpec(SubPoolSpec):
     def __post_init__(self):
         super().__post_init__()
         assert len(self.conv_state_shapes) > 0, "conv_state_shapes must be non-empty"
+        assert (
+            self.draft_region is None
+        ), "mamba state pages never carry a fused draft region"
 
     def conv_row_bytes(self, idx: int) -> int:
         return _prod(self.conv_state_shapes[idx]) * self.conv_dtype.itemsize
@@ -563,6 +577,18 @@ class UnifiedKVPool:
         ), f"sub-pool {name!r} is {type(s).__name__}, expected MambaSubPoolSpec"
         return s
 
+    def draft_host_spec(self, name: str) -> SubPoolSpec:
+        """The sub-pool spec whose pages carry the fused draft region.
+
+        Kind-agnostic: any spec that resolves a `draft_region` also defines
+        the draft page math consumers use (`draft_kernel_page_multiplier`,
+        `draft_region_offset_in_page`)."""
+        s = self._specs_by_name[name]
+        assert (
+            s.draft_region is not None
+        ), f"sub-pool {name!r} carries no fused draft region"
+        return s
+
     def max_slots(self, name: str) -> int:
         return self._max_slots[name]
 
@@ -616,10 +642,7 @@ class UnifiedKVPool:
         """Per-layer dense K/V views of the DRAFT region fused into
         ``sub_pool_name``'s pages. Same pages, same v2p table, own dense id
         space (`draft_kernel_page_multiplier`)."""
-        spec = self._specs_by_name[sub_pool_name]
-        assert (
-            isinstance(spec, MHASubPoolSpec) and spec.draft_region is not None
-        ), f"sub-pool {sub_pool_name!r} carries no fused draft region"
+        spec = self.draft_host_spec(sub_pool_name)
         region = spec.draft_region
         page_size = self._page_size
         num_pages = self.max_slots(sub_pool_name) // page_size
@@ -814,11 +837,7 @@ class UnifiedDraftKVPool(MHATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
-        spec = unified_buffer.mha_spec(host_sub_pool_name)
-        assert spec.draft_region is not None, (
-            f"UnifiedDraftKVPool: host sub-pool {host_sub_pool_name!r} carries "
-            "no fused draft region"
-        )
+        spec = unified_buffer.draft_host_spec(host_sub_pool_name)
         region = spec.draft_region
         k_views, v_views = unified_buffer.build_dense_draft_views(host_sub_pool_name)
         max_slots = unified_buffer.max_slots(host_sub_pool_name)

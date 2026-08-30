@@ -631,7 +631,7 @@ class KVCacheConfigurator:
         of its own)."""
         if not self.spec_algorithm.is_eagle():
             return None
-        spec = alloc.unified_buffer.mha_spec("full")
+        spec = alloc.unified_buffer.spec("full")
         if spec.draft_region is None:
             # The gate admitted an EAGLE-family draft, so target boot must
             # have resolved the region; missing means a boot-order bug.

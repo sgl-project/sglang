@@ -37,7 +37,9 @@ import torch
 from sglang.srt.mem_cache.layout.page_major import build_mha_views
 from sglang.srt.mem_cache.unified_memory_pool import (
     DenseDraftRegion,
+    MambaSubPoolSpec,
     MHASubPoolSpec,
+    MLASubPoolSpec,
     UnifiedDraftKVPool,
     UnifiedKVPool,
     UnifiedMHATokenToKVPool,
@@ -89,6 +91,32 @@ class TestFusedSpecMath(unittest.TestCase):
         # The draft region begins exactly where the host blocks end.
         ps = 4
         self.assertEqual(f.draft_region_offset_in_page(ps), ps * f.host_entry_bytes())
+
+    def test_only_page_envelope_kinds_accept_a_draft_region(self):
+        """`draft_region` is a universal spec field (None = unfused), but a
+        kind without the fused page math must refuse one at construction —
+        a silently-carried region would never reach the layout."""
+        with self.assertRaises(AssertionError):
+            MLASubPoolSpec(
+                name="full",
+                layer_num=2,
+                kv_lora_rank=8,
+                qk_rope_head_dim=4,
+                store_dtype=torch.bfloat16,
+                grow_direction="down",
+                draft_region=_draft_region(),
+            )
+        with self.assertRaises(AssertionError):
+            MambaSubPoolSpec(
+                name="mamba",
+                layer_num=1,
+                conv_state_shapes=((2, 2),),
+                conv_dtype=torch.float32,
+                temporal_state_shape=(2,),
+                temporal_dtype=torch.float32,
+                grow_direction="up",
+                draft_region=_draft_region(),
+            )
 
 
 class TestGeneralizedBuilderDefaults(unittest.TestCase):
