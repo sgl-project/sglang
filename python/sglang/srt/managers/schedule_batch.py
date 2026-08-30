@@ -817,18 +817,17 @@ class ReqLogprob:
 class ReqKvInfo:
     # Device KV a request holds outside the prefix cache. Always present on the Req;
     # whether any KV is held is `req.req_pool_idx is not None` (Req.is_holding_kv).
-    # Prefix length owned by the tree cache (matched or inserted); the request's
-    # own KV starts here.
+
+    # [0, cache_protected_len) is owned by the tree cache (matched or inserted);
+    # the request's own KV is [cache_protected_len, kv_allocated_len).
     cache_protected_len: int = 0
     kv_allocated_len: int = 0
-    # Tokens in [0, swa_evict_floor) are protected from SWA window eviction.
-    # This is used by prefill-aware SWA models such as Unlimited-OCR to keep prompt/image KV visible during decode.
+
+    # SWA eviction inside the request's own segment: slots in
+    # [swa_dead_lo(page_size), swa_evicted_seqlen) have already been freed as the
+    # window slid past them; tokens in [0, swa_evict_floor) are never window-evicted
+    # (prefill-aware SWA models keep the prompt/image KV resident during decode).
     swa_evict_floor: int = 0
-    # The length of KV that have been removed in swa cache.
-    # SWA KV cache eviction behavior differs by cache type:
-    # - Radix cache: KV in range [cache_protected_len, swa_evicted_seqlen) is freed manually in
-    #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
-    # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
     swa_evicted_seqlen: int = 0
 
     def swa_dead_lo(self, page_size: int) -> int:
