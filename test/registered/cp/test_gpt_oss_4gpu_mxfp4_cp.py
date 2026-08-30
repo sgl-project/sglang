@@ -11,9 +11,8 @@ class TestGptOss4GpuMxfp4CP(BaseTestGptOss):
         self.run_test(
             model_variant="120b",
             quantization="mxfp4",
-            # BASELINE PENDING: re-measure against sgl-eval's gpqa before merge.
             expected_score_of_reasoning_effort={
-                "low": 0.0,
+                "low": 0.50,
             },
             other_args=[
                 "--tp",
