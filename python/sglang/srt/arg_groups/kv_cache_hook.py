@@ -318,12 +318,8 @@ def handle_page_major_kv_layout(server_args: Any):
         "pool's per-layer views require a uniform row width; run "
         "this model without --enable-unified-memory."
     )
-    # Allow-list. Under the unified pool every backend below reads through
-    # ONE id surface — the read-path choke point
-    # (mem_cache/kv_index_translator.py) hands each batch a canonical
-    # kernel-facing page table and the backends consume it in their own
-    # format — so what gates a backend is only whether its kernels can
-    # address the pool's per-layer views:
+    # Allow-list. Every backend below reads through the translator, so what
+    # gates one is only whether its kernels can address the per-layer views:
     #   * MLA models: the full paged MLA family, incl. flashmla (ps=64
     #     snap). cutlass_mla stays rejected (never exercised).
     #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside

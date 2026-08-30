@@ -346,11 +346,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
-        # Canonical id source for the index builders below (one build serves
-        # both the capture-time plan and _apply_cuda_graph_metadata). All
-        # flashinfer gathers run OUT-of-graph (plan time), so only buffer
-        # reuse — not pointer stability — motivates the capture-stable
-        # canonical here.
+        # One build serves both the capture-time plan and
+        # _apply_cuda_graph_metadata. All flashinfer gathers run OUT-of-graph
+        # (plan time), so the capture-stable table is for buffer reuse here,
+        # not pointer stability.
         kv_view = self.kv_index_translator.build_index_table(
             req_pool_indices=req_pool_indices[:bs],
             seq_lens=seq_lens[:bs],
@@ -922,13 +921,9 @@ class FlashInferMLAIndicesUpdaterDecode:
         if spec_info is None:
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
-            # On the cuda-graph replay path `kv_indices` IS the capture-stable
-            # buffer (fast_decode_kwargs["kv_indices"] == cuda_graph_kv_indices)
-            # that the captured wrapper reads -- never rebind it; the builder
-            # fills only the [:paged_kernel_lens_sum] prefix and leaves the
-            # stale tail alone. Under the unified pool the view is the choke
-            # point's canonical, so the emitted ids are already kernel-facing — one
-            # pass, no in-place retranslate.
+            # On replay `kv_indices` IS the capture-stable buffer the captured
+            # wrapper reads -- never rebind it. The builder fills only the
+            # [:paged_kernel_lens_sum] prefix; the stale tail is unread.
             kv_indices = (
                 torch.empty(paged_kernel_lens_sum, dtype=torch.int32, device="cuda")
                 if not init_metadata_replay

@@ -775,11 +775,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # bounds real KV reads by cache_seqlens, so this is a fixed loop
         # bound only — never a host max / seq_lens_cpu D2H sync.
         max_seq_pages = self.max_num_pages
-        # Unified pool: page tables are capture-stable canonical buffers
-        # refreshed out-of-graph (init_forward_metadata_out_graph), and the
-        # swa write rail is refilled there from the ForwardBatch rail — the recorded
-        # kernel must neither overwrite the canonical with virtual-derived
-        # pages nor run the (nonexistent) token-level swa mapping.
+        # Unified pool: the page tables and the swa write loc are refreshed
+        # out-of-graph, so the recorded kernel must neither rebuild them from
+        # virtual ids nor run the (nonexistent) token-level swa mapping.
         unified = self.kv_index_translator.is_translating
         update_trtllm_mha_graph_metadata(
             req_pool_indices=req_pool_indices,

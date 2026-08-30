@@ -193,11 +193,9 @@ def _fused_metadata_kernel_general(
     use_swa: tl.constexpr,
     SHIFT: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
-    # Unified pool: the source is the choke point's canonical KERNEL PAGE
-    # table pair instead of req_to_token — `req_to_token` carries the full
-    # canonical (PAGE-granular, entries already kernel-facing) and
-    # `full_to_swa_mapping` carries the swa canonical (same shape/strides).
-    # Entries are emitted verbatim: no >>SHIFT, no v2p, no mapping gather.
+    # Unified pool: `req_to_token` and `full_to_swa_mapping` instead carry the
+    # translator's PAGE-granular read tables, entries already kernel-facing.
+    # Emitted verbatim: no >>SHIFT, no v2p, no mapping gather.
     SRC_IS_KERNEL_PAGE_TABLE: tl.constexpr = 0,
 ):
     pid_b = tl.program_id(0)  # batch index
@@ -635,10 +633,9 @@ def normal_decode_set_metadata(
     page_table_stride_1 = page_table.stride(1)
 
     # Check if we should use the specialized fast path for page_size=1, no SWA.
-    # The fast path also serves the unified source unchanged: at ps=1 the
-    # canonical is token-granular and its entries pass through verbatim (no
-    # SHIFT, no gather transform), so src_is_read_table needs no
-    # specialization there — only the general kernel branches on it.
+    # Check if we should use the specialized fast path for page_size=1, no SWA.
+    # At ps=1 the read table is token-granular and passes through verbatim, so
+    # only the general kernel branches on src_is_read_table.
     use_swa = swa_page_table is not None and (
         token_to_kv_pool is not None or swa_src_table is not None
     )

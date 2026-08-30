@@ -284,12 +284,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
-        # Per-forward kernel-facing write loc ([:n] view of a capture-stable buffer),
-        # refilled by the cuda-graph out-graph hook; None on the eager path
-        # (where forward_batch.out_cache_loc — already kernel-facing, rebound at
-        # ForwardBatch construction by rebind_write_loc — is passed
-        # to the pool door directly). The READ-side block tables come from the
-        # choke point (self.kv_index_translator, bound by the FlashInferMLA parent).
+        # Per-forward write loc ([:n] view of a capture-stable buffer), refilled
+        # by the cuda-graph out-graph hook; None on the eager path, which passes
+        # forward_batch.out_cache_loc (already kernel-facing) straight through.
         self._decode_kernel_loc: Optional[torch.Tensor] = None
         self.cuda_graph_out_cache_loc_kernel: Optional[torch.Tensor] = None
         # Fused KV-scatter + q-concat on the decode dense-loc path (one launch

@@ -1244,12 +1244,9 @@ def init_unified_mamba_pools(
     # `_mamba_translate` feeds the HiCache offload path, GATED OFF here — wired but inert.
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
-    # NOTE: no full-KV translate hook is wired. The model-side MLA doors
-    # (`set_mla_kv_buffer`/`get_mla_kv_buffer`) receive KERNEL-FACING ids:
-    # writes carry the ForwardBatch's rebound `out_cache_loc`
-    # (rebind_write_loc), and read indices are translated at their
-    # production sites (fetch_mha_one_shot_kv_indices /
-    # prepare_chunked_kv_indices).
+    # No full-KV translate hook is wired: both MLA doors now receive
+    # KERNEL-FACING ids -- writes from the ForwardBatch rebind, reads
+    # translated at their production sites.
 
     logger.info(
         "[unified-memory-pool] ============================================================"
@@ -1490,12 +1487,9 @@ class UnifiedSWAKVPool(SWAKVPool):
                 layer_id_override=pool_layer_id,
             )
             return
-        # Full layer: the generic `loc` IS the full-side kernel-facing rail —
-        # rebind_write_loc rebinds out_cache_loc at ForwardBatch construction,
-        # before any backend sees it — so an explicit full_loc is an optional
-        # same-space alias. Triton's captured path still passes its
-        # capture-stable buffer; every other backend's 2-arg KVWriteLoc
-        # (loc, swa) falls back to loc here.
+        # Full layer: `loc` is already the full-side kernel-facing id, so an
+        # explicit full_loc is a same-space alias -- only triton's captured path
+        # passes one (its capture-stable buffer).
         if full_loc is None:
             full_loc = loc
         self.full_kv_pool.set_kv_buffer(

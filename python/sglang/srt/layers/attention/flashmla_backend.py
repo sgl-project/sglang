@@ -340,11 +340,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
 
             if self.kv_index_translator.is_translating:
-                # Unified pool: prefix-only refresh of the capture-stable table
-                # (spec is asserted off, so only decode/idle reaches this under
-                # unified; the builder takes seq_lens as a tensor, so the
-                # verify/draft-widened lengths plug in when the spec seam
-                # opens). Stale tail unread — bounded by seq_lens_k.
+                # Prefix-only refresh of the capture-stable table; the stale tail is
+                # unread, bounded by seq_lens_k. Only decode/idle reaches this (spec is
+                # asserted off under the unified pool).
                 assert self.page_size == PAGE_SIZE
                 self.kv_index_translator.fill_read_table(
                     out=self.cuda_graph_kv_indices,

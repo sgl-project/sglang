@@ -191,11 +191,9 @@ class FlashAttentionBackend(AttentionBackend):
         # seq_lens_cpu / seq_lens_sum D2H sync is ever needed.
         self.needs_cpu_seq_lens = False
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        # Read-path id-space choke point (owned by the ModelRunner): page
-        # tables come from its per-batch view — req_to_token verbatim for
-        # static pools, the canonical kernel-facing tables for the unified
-        # pool (MLA per-layer views, and dense MHA/SWA views alike). This backend
-        # holds no translate callables and no v2p tables.
+        # Page tables come from the runner's translator: req_to_token verbatim
+        # for static pools, kernel-facing tables for the unified pool. This
+        # backend holds no translate callables and no v2p tables.
         self.kv_index_translator = model_runner.kv_index_translator
         # Set unconditionally: the read site evaluates it before the call,
         # and a non-translating pool never looks at its value.
@@ -1101,14 +1099,10 @@ class FlashAttentionBackend(AttentionBackend):
                 text_row, text_col
             ]
 
-        # Unified pool: swap in the canonical kernel-facing PAGE tables from
-        # the choke point (built once per batch, already translated and
-        # page-granular), replacing the token-granular slices the eager
-        # branches above produced. Rebinding is safe because those branches
-        # each made a fresh tensor. Neither the static pools' full->swa map
-        # nor the `// page_size` reduction below applies to the canonical.
-        # The captured path instead feeds the canonical straight into
-        # normal_decode_set_metadata, which must write in place.
+        # Unified pool: the translator's tables are PAGE-granular and already
+        # kernel-facing, so neither the static full->swa map nor the
+        # `// page_size` reduction below applies. Safe to rebind: every eager
+        # branch above produced a fresh tensor.
         _unified_read = (
             self.kv_index_translator.is_translating and metadata.page_table is not None
         )
@@ -2766,11 +2760,9 @@ class FlashAttentionBackend(AttentionBackend):
             n = out_cache_loc.shape[0]
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
             if in_capture and self.kv_index_translator.is_translating:
-                # Capture batches are runner-built and never went through
-                # `init_new`, so there is no prepared rail to resolve — and
-                # nothing to translate: capture records kernel ADDRESSES, and
-                # slot 0 is the reserved sink in both id spaces. Replay
-                # refills this buffer with the real rail below.
+                # Capture batches are runner-built, so they never went through
+                # `init_new` and carry no rebound write loc. Nothing to translate:
+                # capture records ADDRESSES, and replay refills this buffer below.
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 # Unified pool: the swa write loc the translator resolved for this
@@ -2913,12 +2905,9 @@ class FlashAttentionBackend(AttentionBackend):
                         if seq_lens_cpu is not None
                         else self.max_context_len
                     )
-                    # Choke-point refresh: under the unified pool this
-                    # rewrites the capture-stable canonical tables' live
-                    # prefixes from the post-compaction v2p, and the fused
-                    # kernel below copies them into the metadata buffers —
-                    # born translated, no separate pass. Static pools get the
-                    # passthrough (req_to_token) and the legacy transform.
+                    # Refresh the capture-stable tables' live prefixes from the
+                    # post-compaction v2p; the fused kernel below copies them into the
+                    # metadata buffers already translated.
                     kv_view = self.kv_index_translator.build_index_table(
                         req_pool_indices=req_pool_indices,
                         seq_lens=seq_lens,
