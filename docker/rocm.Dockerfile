@@ -310,7 +310,10 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 # flavor name, so they apply here unchanged.
 FROM $BASE_IMAGE_1250_ROCM1000 AS gfx1250-rocm1000
 ENV BUILD_VLLM="0"
-ENV BUILD_TRITON="0"
+# Unlike the gfx942/gfx950 images, this one replaces the SDK's Triton: the
+# revision below is what the MI45x bring-up ran on, and it carries a fix the
+# SDK build does not have yet.
+ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
@@ -318,10 +321,8 @@ ENV BUILD_MOONCAKE="1"
 # plus the four reverts applied at clone time are what the gfx1250 kernels were
 # brought up against.
 ENV AITER_COMMIT_DEFAULT="a6d2b564fd671724a3720b8edf70e8d674e4d694"
-# Unused while BUILD_TRITON=0, recorded because gfx1250 is the arch most likely
-# to need it: this is the upstream Triton revision the bring-up was validated
-# against, and the known-good fallback if the SDK's Triton turns out to
-# miscompile a gfx1250 kernel.
+# The upstream Triton the gfx1250 bring-up was validated against, carried over
+# from the ROCm 7.14 flavor this image replaced. Built from source below.
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
@@ -1112,6 +1113,17 @@ RUN python3 -c "from pathlib import Path; import transformers.dynamic_module_uti
 # torch 2.11 names this `triton-rocm`; uninstall it so the pin is the only Triton.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
         case "${GPU_ARCH}" in \
+          gfx1250-rocm1000) \
+            echo "[Triton] gfx1250: building ${TRITON_COMMIT} from source"; \
+            pip uninstall -y triton triton-rocm || true \
+            && apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/* \
+            && git clone ${TRITON_REPO} triton-custom \
+            && cd triton-custom \
+            && git checkout ${TRITON_COMMIT} \
+            && pip install -r python/requirements.txt \
+            && pip install -e . \
+            && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
+            ;; \
           *rocm72*) \
             echo "[Triton] ROCm 7.2: installing pinned wheels from ${TRITON_INDEX_URL}"; \
             pip uninstall -y triton-rocm || true && \
