@@ -2,11 +2,11 @@ import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import prime_rope_cos_sin
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
@@ -41,7 +41,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer, DeepseekV4ForCausalLM
+from sglang.srt.models.deepseek_v4 import (
+    DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
+    _is_npu,
+    hc_head_torch,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -129,13 +134,25 @@ class DeepseekV4ModelNextN(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
-        shape, dtype = x.size(), x.dtype
-        x = x.flatten(1).float()
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.rms_norm_eps)
-        mixes = F.linear(x, hc_fn) * rsqrt
-        pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
-        return y.to(dtype)
+        if x.numel() > 0:
+            from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
+
+            return fused_hc_head(
+                x.contiguous(),
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+            )
+        return hc_head_torch(
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            norm_eps=self.rms_norm_eps,
+            hc_eps=self.hc_eps,
+        )
 
     def forward(
         self,
@@ -189,6 +206,11 @@ class DeepseekV4ModelNextN(nn.Module):
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
                 input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
+
+        if _is_npu:
+            # Same per-forward rope prime as DeepseekV4Model.forward: the
+            # decoder layer reads the memoized gather instead of re-gathering.
+            prime_rope_cos_sin([self.decoder.self_attn], forward_batch, positions)
 
         hidden_states, residual, post, comb = self.decoder(
             positions=positions,
