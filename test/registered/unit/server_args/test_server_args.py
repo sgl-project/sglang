@@ -55,6 +55,7 @@ from sglang.srt.arg_groups.serving_hook import (
     handle_multimodal_feature_transport,
     handle_ssl_validation,
     handle_tokenizer_batching,
+    ssl_verify_of,
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import check_two_batch_overlap
@@ -1367,13 +1368,15 @@ class TestSSLArgs(unittest.TestCase):
         self.assertTrue(server_args.url().startswith("https://"))
 
     def test_ssl_verify_without_ssl(self):
+        # the derived read lives with the rest of the SSL handling now
+
         server_args = ServerArgs(model_path="dummy")
-        self.assertIs(server_args.ssl_verify(), True)
+        self.assertIs(ssl_verify_of(server_args), True)
 
     @patch("os.path.isfile", return_value=True)
     def test_ssl_verify_with_ssl_no_ca(self, _mock_isfile):
         server_args = self._validate_ssl(ssl_keyfile="key.pem", ssl_certfile="cert.pem")
-        self.assertIs(server_args.ssl_verify(), False)
+        self.assertIs(ssl_verify_of(server_args), False)
 
     @patch("os.path.isfile", return_value=True)
     def test_ssl_verify_with_ssl_and_ca(self, _mock_isfile):
@@ -1382,7 +1385,7 @@ class TestSSLArgs(unittest.TestCase):
             ssl_certfile="cert.pem",
             ssl_ca_certs="ca.pem",
         )
-        self.assertEqual(server_args.ssl_verify(), "ca.pem")
+        self.assertEqual(ssl_verify_of(server_args), "ca.pem")
 
     def test_ssl_ca_certs_without_certfile_raises(self):
         with self.assertRaises(ValueError) as context:
@@ -2840,8 +2843,13 @@ class TestDcpKvEventContract(CustomTestCase):
     def test_kv_event_block_size_widens_a_single_token_page(self):
         # page_size=1 + DCP is a real deployment shape: the allocator is still
         # paged, at dcp_size.
+        from sglang.srt.arg_groups.overrides import (
+            kv_event_block_size_of,
+            resolving_view,
+        )
+
         args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
-        self.assertEqual(args.kv_event_block_size, 8)
+        self.assertEqual(kv_event_block_size_of(resolving_view(args)), 8)
 
 
 if __name__ == "__main__":

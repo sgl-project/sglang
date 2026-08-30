@@ -1200,6 +1200,9 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
     def test_activation_reserve_matches_the_member(self):
         from types import SimpleNamespace
 
+        from sglang.srt.arg_groups.overrides import (
+            pre_capture_activation_reserve_mb_of,
+        )
         from sglang.srt.runtime_context import pre_capture_activation_reserve_mb
 
         graph = SimpleNamespace(decode=SimpleNamespace(max_bs=64))
@@ -1231,7 +1234,7 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
                     args = _FakeResolvedArgs(cuda_graph_config=graph, **case)
                     get_context().set_server_args(args)
                     self.assertEqual(
-                        ServerArgs.pre_capture_activation_reserve_mb(args, gpu_mem),
+                        pre_capture_activation_reserve_mb_of(args, gpu_mem),
                         pre_capture_activation_reserve_mb(gpu_mem),
                     )
 

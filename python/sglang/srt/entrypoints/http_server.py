@@ -483,6 +483,7 @@ from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
 
+from sglang.srt.arg_groups.serving_hook import ssl_verify_of
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 from sglang.srt.runtime_context import (
     describe_kv_events_publisher,
@@ -2199,7 +2200,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
-    ssl_verify = server_args.ssl_verify()
+    ssl_verify = ssl_verify_of(server_args)
 
     # Wait until the server is launched
     success = False
@@ -2375,7 +2376,7 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
             server_args.url() + "/freeze_gc",
             headers=freeze_headers,
             timeout=10,
-            verify=server_args.ssl_verify(),
+            verify=ssl_verify_of(server_args),
         )
         res.raise_for_status()
     except requests.exceptions.RequestException:
