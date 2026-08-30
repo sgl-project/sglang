@@ -19,6 +19,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.plugins import load_plugins
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     GenerationResult,
     ListLorasReq,
@@ -134,6 +135,8 @@ class DiffGenerator:
 
         Priority level: Default pipeline config < User's pipeline config < User's kwargs
         """
+        load_plugins()
+
         # If users also provide some kwargs, it will override the ServerArgs and PipelineConfig.
 
         if (server_args := kwargs.get("server_args", None)) is not None:
@@ -159,6 +162,7 @@ class DiffGenerator:
         Returns:
             The created DiffGenerator
         """
+        load_plugins()
         globally_suppress_loggers()
         instance = cls(
             server_args=server_args,
