@@ -56,7 +56,11 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
-from sglang.srt.runtime_context import get_parallel, max_speculative_num_draft_tokens
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_resources,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.utils import is_flashinfer_available, is_tokenspeed_mla_available
 
 if is_flashinfer_available():
@@ -87,7 +91,6 @@ def _get_tokenspeed_workspace(
     kv_lora_rank: int,
     max_q_len: int = _TOKENSPEED_MAX_Q_LEN,
 ) -> torch.Tensor:
-    from sglang.srt.runtime_context import get_resources
 
     # DCP target verification gathers Q to the full head count before launching
     # TokenSpeed; size for that launch shape, not the rank-local head count.

@@ -45,13 +45,17 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer, get_spec
+from sglang.srt.runtime_context import (
+    get_buffer,
+    get_parallel,
+    get_platform,
+    get_spec,
+)
 from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -222,10 +226,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # TRTLLM-GEN:
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
-        self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+        self.is_xqa_impl = get_platform().is_sm90 or get_platform().is_sm120
 
         # fmha_v2 prefill kernel supports SM90 and SM120
-        self.use_fmha_v2 = is_sm90_supported() or is_sm120_supported()
+        self.use_fmha_v2 = get_platform().is_sm90 or get_platform().is_sm120
 
         # trtllm-gen serves page_size >= 128 only through its dynamic
         # tokens-per-page kernels, which exist solely for GQA with equal QK/V
@@ -234,7 +238,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # "Missing TRTLLM-GEN kernel" error during CUDA-graph capture.
         # XQA (SM90/SM120 decode) has native page-128 kernels; no check needed.
         if self.page_size >= 128 and not self.is_xqa_impl:
-            from sglang.srt.runtime_context import get_parallel
 
             attn_tp_size = get_parallel().attn_tp_size
             num_q_heads = config.num_attention_heads // attn_tp_size

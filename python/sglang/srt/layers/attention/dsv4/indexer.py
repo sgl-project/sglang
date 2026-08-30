@@ -40,10 +40,13 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
-from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -714,7 +717,7 @@ class C4IndexerBackendMixin:
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
             fn = _aiter_fp8_paged_mqa_logits
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            if is_sm120_supported():
+            if get_platform().is_sm120:
                 fn = fp8_paged_mqa_logits_torch_sm120
             else:
                 fn = fp8_paged_mqa_logits_torch

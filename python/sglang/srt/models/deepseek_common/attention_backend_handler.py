@@ -11,8 +11,11 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_common.utils import _is_hip
-from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_sm100_or_sm110_supported, use_intel_amx_backend
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_platform,
+)
+from sglang.srt.utils import use_intel_amx_backend
 
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
 
@@ -157,7 +160,7 @@ def handle_attention_fa4(attn, forward_batch):
     # flash_attn.cute only implements on SM100/SM110 (not SM120); keep the
     # pre-existing MHA chunked-KV path elsewhere. Deterministic inference
     # requires MLA and rejects fa4 on other archs at startup (server_args).
-    if not is_sm100_or_sm110_supported():
+    if not get_platform().is_sm100_or_sm110:
         return AttnForwardMethod.MHA_CHUNKED_KV
     if get_exec().deterministic.enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
