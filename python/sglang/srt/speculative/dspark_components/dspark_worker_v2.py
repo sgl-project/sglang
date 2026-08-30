@@ -178,7 +178,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         parallel = get_parallel()
         self._tp_sync = SpecTpSync(
             parallel.attn_tp_group
-            if server_args.enable_dp_attention
+            if parallel.enable_dp_attention
             else parallel.tp_group
         )
         self._draft_graph_group = (
