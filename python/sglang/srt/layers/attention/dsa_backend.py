@@ -16,8 +16,10 @@ import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.runtime_context import (
+    get_buffer,
     get_exec,
     get_parallel,
+    get_platform,
     get_spec,
 )
 
@@ -73,13 +75,11 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_gfx95_supported,
     is_hip,
-    is_sm100_supported,
     print_warning_once,
 )
 
@@ -670,7 +670,7 @@ class DeepseekSparseAttnBackend(
             forward_mode.is_target_verify()
             and next_n
             and next_n >= 2
-            and is_sm100_supported()
+            and get_platform().is_sm100
         ):
             return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
@@ -1497,7 +1497,7 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d = None
                 if (
                     self.speculative_num_draft_tokens >= 2
-                    and is_sm100_supported()
+                    and get_platform().is_sm100
                     and metadata.paged_mqa_ctx_lens_2d is not None
                     and metadata.paged_mqa_ctx_lens_2d.dim() == 2
                     and metadata.paged_mqa_ctx_lens_2d.size(0) == bs

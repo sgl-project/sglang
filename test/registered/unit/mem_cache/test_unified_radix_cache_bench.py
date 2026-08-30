@@ -642,8 +642,8 @@ def bench_cache_finished(
             len(req.prefix_indices), len(req.full_untruncated_fill_ids)
         )
         req.last_node = node
-        req.cache_protected_len = matched_len
-        req.kv_committed_len = len(seq)
+        req.kv.cache_protected_len = matched_len
+        req.kv.kv_committed_len = len(seq)
         if hasattr(lr, "swa_uuid_for_lock"):
             req.swa_uuid_for_lock = lr.swa_uuid_for_lock
         env.rtp.req_to_token[req.req_pool_idx, : len(kv_indices)] = kv_indices
@@ -657,7 +657,7 @@ def bench_cache_finished(
         "cache_finished",
         lambda: req_items,
         lambda req: env.tree.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req.kv_committed_len
+            req, is_insert=True, kv_len_to_handle=req.kv.kv_committed_len
         ),
         len(req_items) - warmup,
         env.avg_tokens,

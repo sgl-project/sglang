@@ -50,8 +50,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         fill_ids=origin_input_ids + output_ids,
         seqlen=len(origin_input_ids) + len(output_ids),
         req_pool_idx=None,
-        kv=SimpleNamespace(kv_allocated_len=0),
-        kv_committed_len=0,
+        kv=SimpleNamespace(kv_allocated_len=0, kv_committed_len=0),
         finished_reason=None,
         hisparse_staging=False,
         staging=False,
@@ -219,7 +218,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.assertIsNotNone(kv_loc, "KV alloc failed")
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
         req.kv.kv_allocated_len = fill_len
-        req.kv_committed_len = fill_len
+        req.kv.kv_committed_len = fill_len
         req.full_untruncated_fill_ids = array("q", range(fill_len))
         req.extend_range = Range(0, fill_len)
         return kv_loc
@@ -579,7 +578,7 @@ class TestHiSparseUnit(unittest.TestCase):
         seq_len = fill_len + 1
         self.req_to_token_pool.write((req.req_pool_idx, fill_len), out_loc)
         req.kv.kv_allocated_len = seq_len
-        req.kv_committed_len = seq_len
+        req.kv.kv_committed_len = seq_len
 
         self.coordinator.map_last_loc_to_buffer(
             seq_lens=torch.tensor([seq_len], dtype=torch.int64, device=device),
@@ -770,7 +769,7 @@ class TestHiSparseUnit(unittest.TestCase):
             )
         )
         self.assertEqual(req.kv.kv_allocated_len, fill_len)
-        self.assertEqual(req.kv_committed_len, fill_len)
+        self.assertEqual(req.kv.kv_committed_len, fill_len)
         self.assertEqual(req.extend_range.length, fill_len)
 
         rounded_len = (fill_len + self.page_size - 1) // self.page_size * self.page_size

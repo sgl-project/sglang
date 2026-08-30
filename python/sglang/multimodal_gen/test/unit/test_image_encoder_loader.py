@@ -43,6 +43,7 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
             component_precisions={},
             encoder_parallel="replicate",
             resolve_component_attention_backend=lambda _name: (None, None),
+            should_use_fsdp_for_component=lambda _name: False,
         )
 
     def _component_config(self, architecture, *, quantized):

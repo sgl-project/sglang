@@ -27,6 +27,7 @@ import random
 import unittest
 import unittest.mock
 from array import array
+from types import SimpleNamespace
 
 import torch
 
@@ -518,7 +519,7 @@ class TestRadixCache(unittest.TestCase):
         cache.req_to_token_pool = ReqToTokenPool(request_indices.clone())
         req = unittest.mock.Mock(
             req_pool_idx=0,
-            cache_protected_len=0,
+            kv=SimpleNamespace(cache_protected_len=0),
             extra_key=None,
             cache_salt=None,
             priority=0,
