@@ -49,7 +49,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance-scale", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-gpus", type=int, default=1)
-    parser.add_argument("--dit-precision", default="unspecified")
+    parser.add_argument(
+        "--dit-precision",
+        default="bf16",
+        help=(
+            "Must match the deployed model's actual PipelineConfig.dit_precision "
+            "(default bf16 for most models) -- this feeds the workload signature "
+            "DenoisingStage._build_compile_workload_signature computes from the "
+            "live pipeline_config, so a mismatch here means the manifest never "
+            "matches at serve time."
+        ),
+    )
     parser.add_argument(
         "--regional-compile",
         action="store_true",
@@ -255,11 +265,11 @@ def build_manifest(args: argparse.Namespace) -> CompiledPlanManifest:
         dtype=args.dit_precision,
         backend="torch.compile",
         parallel_signature=f"sp{args.num_gpus}",
-        latent_shape_regime=tuple(
-            v
-            for v in (args.height, args.width, args.num_frames)
-            if v is not None
-        ),
+        # num_frames defaults to 1 (not None) at the Req/SamplingParams level
+        # even for image models, so it must be included here the same way, or
+        # this will never match DenoisingStage._build_compile_workload_signature's
+        # (height, width, num_frames) tuple at serve time.
+        latent_shape_regime=(args.height, args.width, args.num_frames or 1),
         num_inference_steps=args.num_inference_steps,
         cfg_mode=(
             "no_cfg"

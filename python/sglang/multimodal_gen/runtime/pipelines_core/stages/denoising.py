@@ -519,8 +519,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if v is not None
         )
         return CompileWorkloadSignature(
-            model_revision=self.server_args.model_paths.get(
-                "transformer", self.server_args.model_path
+            # A stable, user-given identifier, not model_paths["transformer"]
+            # (the resolved local HF-cache snapshot path): that path is
+            # machine- and cache-state-specific, so keying the signature to it
+            # would make an offline-built manifest never match at serve time
+            # on a different machine -- defeating the point of an offline/CI
+            # artifact. transformer_weights_path is kept because it is an
+            # explicit, user-controlled override (e.g. A/B testing a
+            # transformer swap), not an incidental resolution detail.
+            model_revision=(
+                self.server_args.transformer_weights_path
+                or self.server_args.model_path
             ),
             dtype=dtype,
             backend="torch.compile",
