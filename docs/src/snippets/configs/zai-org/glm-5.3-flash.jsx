@@ -62,7 +62,7 @@ export const config = {
             s.quant === "nvfp4",
           disableReason: (s) =>
             s.quant === "nvfp4"
-              ? "The NVFP4 checkpoint is validated with BF16 KV cache and TileLang DSA."
+              ? "FP8 KV + TRT-LLM DSA crashes with this NVFP4 checkpoint on the current image; the validated pairing is BF16 KV + TileLang DSA."
               : "This recipe uses BF16 KV cache with TileLang DSA on Hopper and AMD ROCm GPUs.",
           stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
           flags: [
@@ -438,7 +438,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend flashinfer_cutlass",
-        "--speculative-algorithm NEXTN",
+        "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",

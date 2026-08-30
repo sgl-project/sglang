@@ -43,7 +43,7 @@ export const benchmarks = [
       "The Low Latency recipe with FP8 KV + TRT-LLM DSA on 4x GB300, final weights (c5b82b63e37b) on the current release-image tree (d6ab04bdf1), adaptive MTP 5/1/6 with SGLANG_SIMULATE_ACC_LEN=3 (accept 3.00): 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,853.88 aggregate output tok/s — 1.6% above the BF16 + TileLang Low Latency row, with mean TPOT 6.25 ms vs 6.43 ms. Draft and target full-graph capture succeeded for this combination. The speed rows were measured with the NEXTN spelling and --disable-shared-experts-fusion, which resolve to the same runtime path as the published command on this tree.",
   },
   {
-    match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "fp8-trtllm", dcp: "4" },
+    match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "fp8-trtllm", dcp: "4", quant: "fp8" },
     sglang_version: "d6ab04bdf1",
     latencyPercentile: "Mean",
     speed: [
@@ -64,7 +64,7 @@ export const benchmarks = [
       "The Low Latency recipe with FP8 KV + TRT-LLM DSA and DCP4 (--dcp-size 4 --dcp-comm-backend a2a --dcp-replicate-q-proj) on 4x GB300, final weights (c5b82b63e37b) on the d6ab04bdf1 tree, adaptive MTP 5/1/6 with full decode graph: 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,680.61 aggregate output tok/s at a 3.937 accept length — about 10% below the non-DCP FP8 Low Latency row. TRT-LLM DSA DCP decode returns the LSE natively, so this arm needs no patch.",
   },
   {
-    match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "bf16-tilelang", dcp: "4" },
+    match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "bf16-tilelang", dcp: "4", quant: "fp8" },
     sglang_version: "d6ab04bdf1",
     latencyPercentile: "Mean",
     speed: [
@@ -181,14 +181,14 @@ export const benchmarks = [
     sglang_version: "033446bb05",
     accuracy: { gsm8k_pct: 97.14, aime2026_pct: 92.45 },
     notes:
-      "RadixArk/GLM-5.3-Flash-NVFP4 — NVFP4 W4A4 post-training quantization of zai-org/GLM-5.3-Flash-BF16 with NVIDIA Model Optimizer 0.46.0 (abs-max scaling, group size 16): routed and shared experts plus the dense MLPs are FP4, while all attention (KDA, DSA indexer, MLA), the router, norms, the vision tower, the MTP layer, embeddings, and the LM head stay BF16. Measured on 4x GB300 with the lmsysorg/sglang:glm-5.3-flash image (PR #36507 head 033446bb05), adaptive MTP 5/1/6, BF16 KV + TileLang DSA, and the flashinfer_cutlass MoE runner. GSM8K 97.14% over the full 1,319-example split x 4 seeds (per-seed range 96.89-97.42%, stop rate 99.85-100%) and AIME 2026 92.45% (30 problems x 16 repeats x 4 seeds = 1,920 generations, per-seed range 91.67-93.54%), both at temperature 1.0 / top_p 0.95. Speed measurement pending.",
+      "RadixArk/GLM-5.3-Flash-NVFP4 — NVFP4 W4A4 post-training quantization of zai-org/GLM-5.3-Flash-BF16 with NVIDIA Model Optimizer 0.46.0 (abs-max scaling, group size 16): routed and shared experts plus the dense MLPs are FP4, while all attention (KDA, DSA indexer, MLA), the router, norms, the vision tower, the MTP layer, embeddings, and the LM head stay BF16. Measured on 4x GB300 with the lmsysorg/sglang:glm-5.3-flash image (PR #36507 head 033446bb05), adaptive MTP 5/1/6, BF16 KV + TileLang DSA, and the flashinfer_cutlass MoE runner. GSM8K 97.14% over the full 1,319-example split x 4 seeds (per-seed range 96.89-97.42%, stop rate 99.85-100%) and AIME 2026 92.45% (30 problems x 16 repeats x 4 seeds = 1,920 generations, per-seed range 91.67-93.54%), both at temperature 1.0 / top_p 0.95. The accuracy runs used the NEXTN spelling of --speculative-algorithm, which resolves to the same runtime path as the published EAGLE command on this tree. Speed measurement pending.",
   },
   {
     match: { hw: "gb300", strategy: "high-throughput", quant: "nvfp4" },
     sglang_version: "033446bb05",
     accuracy: { gsm8k_pct: 97.14, aime2026_pct: 92.45 },
     notes:
-      "RadixArk/GLM-5.3-Flash-NVFP4 with speculative decoding off — same checkpoint, image, and 4x GB300 measurement stack as the NVFP4 Low Latency row (ModelOpt 0.46.0 NVFP4 W4A4, abs-max, group size 16; MoE and dense MLPs in FP4, attention/router/MTP/embeddings BF16). Accuracy is a checkpoint-level result carried from that arm: GSM8K 97.14% over the full 1,319-example split x 4 seeds (per-seed range 96.89-97.42%, stop rate 99.85-100%) and AIME 2026 92.45% (30 problems x 16 repeats x 4 seeds, per-seed range 91.67-93.54%). Speed measurement pending.",
+      "RadixArk/GLM-5.3-Flash-NVFP4 with speculative decoding off — same checkpoint, image, and 4x GB300 measurement stack as the NVFP4 Low Latency row (ModelOpt 0.46.0 NVFP4 W4A4, abs-max, group size 16; MoE and dense MLPs in FP4, attention/router/MTP/embeddings BF16). Accuracy is a checkpoint-level result carried from that arm: GSM8K 97.14% over the full 1,319-example split x 4 seeds (per-seed range 96.89-97.42%, stop rate 99.85-100%) and AIME 2026 92.45% (30 problems x 16 repeats x 4 seeds, per-seed range 91.67-93.54%). Those runs used the NEXTN spelling of --speculative-algorithm on the adaptive-MTP arm, which resolves to the same runtime path as the published EAGLE command. Speed measurement pending.",
   },
   {
     match: { hw: "h100", strategy: "low-latency" },
