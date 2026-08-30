@@ -33,6 +33,10 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.candidates import (
+    CandidateContractError,
+    reduce_candidates,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -1037,6 +1041,11 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         do_cfg = guidance_scale > 1.0
 
         enable_cfg_parallel = server_args.enable_cfg_parallel and do_cfg
+        # This predates and is independent of candidate_spec (see
+        # runtime.pipelines_core.candidates / #35331): candidates reuse the
+        # existing num_outputs_per_prompt batch axis, so a candidate group
+        # hits this same guard rather than silently producing an
+        # unvalidated CFG-parallel combine.
         if action_latents is not None and enable_cfg_parallel:
             raise NotImplementedError(
                 "Cosmos3 action generation does not support CFG parallel yet"
@@ -1058,6 +1067,10 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             get_classifier_free_guidance_world_size() if enable_cfg_parallel else 1
         )
 
+        # action_latents (unlike video latents) is never chunked across SP
+        # ranks below -- it's small and passed to _run_transformer whole on
+        # every rank, so it needs no SP all-gather/reconstruction before the
+        # candidate-trajectory reducer runs on it in Cosmos3DecodingStage.
         sp_size = get_sp_world_size()
         sp_rank = get_sp_parallel_rank() if sp_size > 1 else 0
         ulysses_enabled = sp_size > 1
@@ -1645,9 +1658,20 @@ class Cosmos3DecodingStage(PipelineStage):
         if batch.data_type == DataType.ACTION:
             if action_pred is None:
                 raise RuntimeError("Cosmos3 action request produced no action tensor")
+            candidate_spec = batch.candidate_spec
+            if candidate_spec is not None:
+                try:
+                    reduced_action = reduce_candidates(action_pred, candidate_spec)
+                except CandidateContractError as exc:
+                    raise RuntimeError(
+                        f"Cosmos3 candidate-trajectory reduction failed: {exc}"
+                    ) from exc
+                actions_out = reduced_action.numpy()
+            else:
+                actions_out = action_pred[0].numpy()
             payload = {
                 "request_id": batch.request_id,
-                "actions": action_pred[0].numpy(),
+                "actions": actions_out,
                 "action_mode": action_metadata["action_mode"],
                 "domain_id": action_metadata["action_domain_id"],
                 "raw_action_dim": action_metadata["action_raw_action_dim"],
@@ -1656,6 +1680,8 @@ class Cosmos3DecodingStage(PipelineStage):
                     "num_frames": batch.num_frames,
                 },
             }
+            if candidate_spec is not None and candidate_spec.return_candidates:
+                payload["candidates"] = action_pred.numpy()
             return OutputBatch(
                 output=[payload],
                 action_pred=action_pred,

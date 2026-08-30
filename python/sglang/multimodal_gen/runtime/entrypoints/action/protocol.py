@@ -18,6 +18,9 @@ from sglang.multimodal_gen.configs.sample.action import ActionSamplingParams
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.pipelines_core.candidates import (
+    CandidateTrajectorySpec,
+)
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -446,6 +449,29 @@ def _cosmos3_image_from_observation(observation: dict[str, Any]) -> Any:
     return image
 
 
+def _build_candidate_spec(options: dict[str, Any]) -> CandidateTrajectorySpec | None:
+    """Build the opt-in candidate-trajectory spec (see #35331 and
+    ``runtime.pipelines_core.candidates``) from request options, or None to
+    keep today's single-output behavior unchanged.
+
+    ``candidate_count`` is the only required knob: a client asking for more
+    than one candidate gets a "mean" reduction by default (Cosmos3's action
+    output is a continuous action-chunk tensor, so a per-channel mean is the
+    framework-registered reducer that applies without a model-specific rule).
+    """
+    candidate_count = options.get("candidate_count")
+    if candidate_count is None:
+        return None
+    candidate_count = int(candidate_count)
+    if candidate_count == 1:
+        return None
+    return CandidateTrajectorySpec(
+        count=candidate_count,
+        reducer=str(options.get("candidate_reducer", "mean")),
+        return_candidates=_runtime_bool(options.get("return_candidates"), False),
+    )
+
+
 def _build_cosmos3_action_sampling_params(
     payload: dict[str, Any],
     server_args: ServerArgs,
@@ -508,8 +534,13 @@ def _build_cosmos3_action_sampling_params(
         raise ValueError("raw_action_dim is required when only domain_id is provided")
 
     prompt = observation.get("prompt") or observation.get("task") or ""
+    candidate_spec = _build_candidate_spec(options)
     sampling_kwargs = {
         "request_id": payload.get("request_id") or payload.get("id"),
+        "candidate_spec": candidate_spec,
+        "num_outputs_per_prompt": (
+            candidate_spec.count if candidate_spec is not None else None
+        ),
         "prompt": prompt,
         "image_path": image_path,
         "video_path": video_path,
@@ -618,19 +649,48 @@ def action_generation_response(
     else:
         default_num_inference_steps = pipeline_config.default_num_inference_steps
 
+    data = [
+        {
+            "index": 0,
+            "input_index": 0,
+            "candidate_index": 0,
+            "action": action,
+        }
+    ]
+    # candidate_spec.return_candidates (see #35331 /
+    # runtime.pipelines_core.candidates) surfaces the raw pre-reduction
+    # trajectories alongside the served (reduced) result above; candidate 0
+    # here is a raw trajectory in its own right, distinct from the reduced
+    # data[0] entry, so numbering starts at 1 to avoid implying it *is* the
+    # served action.
+    raw_candidates = output.get("candidates")
+    if raw_candidates is not None:
+        for i, candidate_actions in enumerate(raw_candidates):
+            candidate_values = (
+                candidate_actions
+                if preserve_numpy
+                else np.asarray(candidate_actions).tolist()
+            )
+            data.append(
+                {
+                    "index": 0,
+                    "input_index": 0,
+                    "candidate_index": i + 1,
+                    "action": {
+                        "type": "continuous",
+                        "dtype": "float32",
+                        "shape": list(np.asarray(candidate_actions).shape),
+                        "values": candidate_values,
+                    },
+                }
+            )
+
     response = {
         "id": output.get("request_id") or f"act_{uuid.uuid4().hex}",
         "object": "action.generation",
         "created": int(time.time()),
         "model": server_args.served_model_name,
-        "data": [
-            {
-                "index": 0,
-                "input_index": 0,
-                "candidate_index": 0,
-                "action": action,
-            }
-        ],
+        "data": data,
         "usage": {
             "action_horizon": action_shape[0] if action_shape else 0,
             "action_dim": action_shape[1] if len(action_shape) > 1 else 0,
