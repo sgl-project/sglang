@@ -82,6 +82,8 @@ class SessionSlot:
             # The protected prefix is the first request's tree lock; nothing hands
             # KV to the tree after that, so later turns must not have moved it.
             assert req.kv.cache_protected_len == self.kv.cache_protected_len
+
+        # Transfer the ownership of this kv row
         self.kv = copy.copy(req.kv)
 
         self.mamba_pool_idx = req.mamba_pool_idx
@@ -91,14 +93,8 @@ class SessionSlot:
         self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
         self.mamba_branching_seqlen = req.mamba_branching_seqlen
 
-        # Ownership has transferred to the slot. Null *all* of the req's
-        # references so any later alloc()/free path that inspects the req
-        # (e.g. the alloc-skip check on `req.mamba_ping_pong_track_buffer
-        # is None`, or the retract cleanup) sees no dangling pointers
-        # into slot-owned tensors. Without this the alloc path can decide
-        # the req still has a ping-pong buffer and skip alloc, causing
-        # the slot's tensor to be reused by a new req and leaked when
-        # the slot is later freed.
+        # Ownership moved to the slot; clear the req's references so a later
+        # alloc/retract path cannot mistake slot-owned mamba state for its own.
         req.req_pool_idx = None
         req.kv = ReqKvInfo()
         req.mamba_pool_idx = None
