@@ -233,6 +233,104 @@ def decode(
     )
 
 
+def decode_qo_indptr(num_tokens: int, device: torch.device) -> torch.Tensor:
+    """``qo_indptr`` for the two-pool decode: one q token per sequence.
+
+    Not ``cu_seqlens_q`` -- that one is per-request and differs once MTP puts
+    several draft tokens in a batch. Layer-independent, so it could be hoisted to
+    one build per forward and sliced, the way hpc_ops_backend does; nobody passes
+    ``qo_indptr`` today, so every layer rebuilds this T+1 arange.
+    """
+    return torch.arange(num_tokens + 1, dtype=torch.int32, device=device)
+
+
+def decode_fp8_2buff(
+    *,
+    q: torch.Tensor,  # [T, H, nope_row_bytes] fp8 packed nope + inline e8m0 scale
+    q_rope: torch.Tensor,  # [T, H, rope_dim] bf16
+    unified_kv: torch.Tensor,  # [rows, nope_row_bytes] fp8
+    unified_kv_rope: torch.Tensor,  # [rows, rope_dim] bf16
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,  # [H] fp32
+    v_head_dim: int,
+    qo_indptr: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Decode over the two-pool fp8 unified_kv, through aiter's v4 nm asm kernel.
+
+    Q arrives in the same packed form as the pool rows (nope fp8 + duplicated
+    e8m0 tile scales) with its rope half beside it in bf16, which is why this
+    can't share ``decode``'s single bf16 tensor. The kernel takes the row stride
+    off ``kv_buffer.size(-1)`` and only requires Q to match it, so the 512 B row
+    is not baked into the reader.
+
+    ``v_head_dim`` is an element count (448 nope + 64 rope) that happens to equal
+    the row's byte width; it comes from the caller so that nothing here reads one
+    as the other.
+    """
+    from aiter.mla import mla_decode_fwd_v4_nm
+
+    T, H, row_bytes = q.shape
+    check_two_pool_pair(
+        unified_kv,
+        unified_kv_rope,
+        rope_width=q_rope.shape[-1],
+        rope_dtype=q_rope.dtype,
+    )
+    assert row_bytes == unified_kv.shape[-1], (
+        f"aiter derives the row stride from the kv pool ({unified_kv.shape[-1]} B) "
+        f"and reads Q with that same stride, but the q row is {row_bytes} B"
+    )
+    assert q_rope.shape[:2] == (T, H), (
+        f"q pair disagrees: packed {tuple(q.shape)[:2]} vs rope "
+        f"{tuple(q_rope.shape)[:2]}"
+    )
+    # the asm kernel walks all four as flat buffers, it has no stride arguments
+    assert q.is_contiguous(), f"q must be contiguous, strides {q.stride()}"
+    assert (
+        q_rope.is_contiguous()
+    ), f"q_rope must be contiguous, strides {q_rope.stride()}"
+    assert (
+        attn_sink.dtype == torch.float32 and attn_sink.numel() == H
+    ), f"sink must be {H} fp32 values, got {attn_sink.numel()} x {attn_sink.dtype}"
+
+    if qo_indptr is None:
+        qo_indptr = decode_qo_indptr(T, q.device)
+    # num_seqs comes from qo_indptr.numel()-1 and the kernel writes
+    # num_seqs * max_seqlen_q rows into `out`, so both have to be sized off q's
+    # own T. A qo_indptr built from a padded token count writes past `out`.
+    assert qo_indptr.shape[0] >= T + 1
+    assert (
+        kv_indptr.shape[0] >= T + 1
+    ), f"kv_indptr holds {kv_indptr.shape[0]} entries, kernel reads {T + 1}"
+    qo_indptr = qo_indptr[: T + 1]
+
+    rows = unified_kv.shape[0]
+    out = q_rope.new_empty((T, H, v_head_dim))
+    # num_kv_splits stays None: the wrapper's occupancy heuristic picks it, folds
+    # the cross-split merge back into `out`, and leaves the final bf16 there
+    # whether or not it split. Pinning it to 1 costs 6.9x at bs=1 kv=2048.
+    mla_decode_fwd_v4_nm(
+        q,
+        q_rope,
+        unified_kv.view(rows, 1, 1, row_bytes),
+        unified_kv_rope.view(rows, 1, 1, unified_kv_rope.shape[-1]),
+        out,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        1,  # max_seqlen_q; qo_indptr is per-token so every sequence is one token
+        sink=attn_sink,
+    )
+    # Guard, not a live path. A CG-padded row gets seq_len 1, so the builders
+    # hand it a one-row segment on the ring slot ReqToTokenPool reserves for
+    # padding -- never an empty one. If that fill value ever goes to 0 the asm
+    # kernel divides by an all-sink denominator and leaves the row NaN, where the
+    # Triton reader returns zeros; match Triton. Launch-shaped, so CG-safe.
+    empty = kv_indptr[1 : T + 1] == kv_indptr[:T]
+    return out.masked_fill_(empty[:, None, None], 0)
+
+
 @triton.jit
 def _fill_compress_tail_kernel(
     indices_ptr,  # [*] int32 (out)
