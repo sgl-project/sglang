@@ -69,11 +69,19 @@ def _resolve_trtllm_sparse_decode():
 
 @lru_cache(maxsize=1)
 def _resolve_flash_attn_varlen_func():
-    """The dense varlen kernel behind the packed sparse-decode fallback.
+    """Resolve the packed sparse-decode attention kernel.
 
-    Classic flash_attn (FA2, Ampere/Hopper) is preferred when installed;
-    flash-attn-4's cute interface serves the same call shape on Blackwell.
+    SM121 uses the Qwen3.8 KDA kernel. Other architectures prefer classic
+    flash_attn (FA2) when installed, then flash-attn-4's cute interface.
     """
+    from sglang.srt.utils import is_sm121
+
+    if is_sm121():
+        from sglang.kernels.ops.attention import (
+            qwen38_qsa_sm121_varlen,
+        )
+
+        return qwen38_qsa_sm121_varlen
     try:
         from flash_attn import flash_attn_varlen_func
 

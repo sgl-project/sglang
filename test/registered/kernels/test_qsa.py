@@ -4,6 +4,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
@@ -26,6 +27,10 @@ from sglang.srt.layers.attention.qsa.mqa import (
     qsa_mqa_prefill,
 )
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+from sglang.srt.layers.attention.qsa.sparse_attn import (
+    qwen_sparse_fa2_cu_seqlens_triton,
+    qwen_sparse_kv_extraction_compact_triton,
+)
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
@@ -60,6 +65,23 @@ def test_is_sm120_matches_exact_capability(monkeypatch, capability, expected):
 
 
 @pytest.mark.parametrize(
+    ("capability", "expected"),
+    [((12, 1), True), ((12, 0), False), ((10, 0), False)],
+)
+def test_is_sm121_matches_exact_capability(monkeypatch, capability, expected):
+    from sglang.srt.utils import common
+
+    common.is_sm121.cache_clear()
+    monkeypatch.setattr(common, "is_cuda", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+
+    try:
+        assert common.is_sm121() is expected
+    finally:
+        common.is_sm121.cache_clear()
+
+
+@pytest.mark.parametrize(
     ("sm100", "sm120", "expected_enabled"),
     [(False, True, True), (True, False, True), (False, False, False)],
     ids=["sm120", "sm100", "other-sm12x"],
@@ -83,6 +105,189 @@ def test_qsa_trtllm_sparse_decode_arch_gate(
         assert resolver() is expected
     finally:
         resolver.cache_clear()
+
+
+def test_qsa_sm121_resolves_kda_varlen_kernel(monkeypatch):
+    resolver = qsa_backend_module._resolve_flash_attn_varlen_func
+    resolver.cache_clear()
+    monkeypatch.setattr("sglang.srt.utils.is_sm121", lambda: True)
+
+    try:
+        assert resolver() is qwen38_qsa_sm121_varlen
+    finally:
+        resolver.cache_clear()
+
+
+def _qsa_packed_varlen_reference(q, k, v, cu_seqlens_k, scale):
+    rows = []
+    queries_per_kv = q.shape[1] // k.shape[1]
+    for row in range(q.shape[0]):
+        start = int(cu_seqlens_k[row])
+        end = int(cu_seqlens_k[row + 1])
+        keys = k[start:end].repeat_interleave(queries_per_kv, dim=1).float()
+        values = v[start:end].repeat_interleave(queries_per_kv, dim=1).float()
+        scores = torch.einsum("hd,khd->hk", q[row].float(), keys) * scale
+        rows.append(torch.einsum("hk,khd->hd", scores.softmax(-1), values))
+    return torch.stack(rows).to(q.dtype)
+
+
+@pytest.mark.parametrize(
+    ("lengths", "num_q_heads", "num_kv_heads", "head_dim"),
+    [
+        ([1], 12, 1, 256),
+        ([17, 64, 65], 24, 2, 256),
+        ([511, 2048, 2051], 12, 1, 256),
+        ([7, 127], 24, 2, 256),
+    ],
+)
+def test_qsa_sm121_kda_varlen_matches_torch_reference(
+    lengths, num_q_heads, num_kv_heads, head_dim
+):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 1):
+        return
+    torch.manual_seed(2026)
+    device = torch.device("cuda")
+    q = torch.randn(
+        len(lengths), num_q_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    total_k = sum(lengths)
+    k = torch.randn(
+        total_k, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v = torch.randn_like(k)
+    cu_q = torch.arange(len(lengths) + 1, dtype=torch.int32, device=device)
+    cu_k = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
+    scale = head_dim**-0.5
+
+    actual = qwen38_qsa_sm121_varlen(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max_seqlen_q=1,
+        max_seqlen_k=max(lengths),
+        softmax_scale=scale,
+        causal=True,
+    )
+    expected = _qsa_packed_varlen_reference(q, k, v, cu_k.cpu(), scale)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_qsa_sm121_kda_varlen_cuda_graph_replays_dynamic_lengths():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 1):
+        return
+    torch.manual_seed(2027)
+    device = torch.device("cuda")
+    batch, num_q_heads, num_kv_heads, head_dim = 3, 12, 1, 256
+    capacity = 3 * 2051
+    q = torch.randn(batch, num_q_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(
+        capacity, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v = torch.randn_like(k)
+    cu_q = torch.arange(batch + 1, dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0, 17, 82, 593], dtype=torch.int32, device=device)
+    scale = head_dim**-0.5
+
+    # Compile and validate the contract before capture.
+    qwen38_qsa_sm121_varlen(q, k, v, cu_q, cu_k, max_seqlen_k=2051, softmax_scale=scale)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = qwen38_qsa_sm121_varlen(
+            q, k, v, cu_q, cu_k, max_seqlen_k=2051, softmax_scale=scale
+        )
+
+    replay_lengths = torch.tensor([0, 64, 2115, 3139], dtype=torch.int32, device=device)
+    cu_k.copy_(replay_lengths)
+    q.normal_()
+    k.normal_()
+    v.normal_()
+    graph.replay()
+    expected = _qsa_packed_varlen_reference(q, k, v, replay_lengths.cpu(), scale)
+    torch.testing.assert_close(captured, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_qsa_sm121_compaction_and_attention_match_sparse_reference():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 1):
+        return
+    torch.manual_seed(2028)
+    device = torch.device("cuda")
+    batch, topk = 3, FINAL_TOPK
+    num_q_heads, num_kv_heads, head_dim = 24, 2, 256
+    sequence_lengths = torch.tensor([17, 1050, 4096], dtype=torch.int32)
+    valid_counts_cpu = [17, 911, topk]
+    max_sequence_length = int(sequence_lengths.max())
+
+    req_to_token = torch.arange(
+        batch * max_sequence_length, dtype=torch.int32, device=device
+    ).reshape(batch, max_sequence_length)
+    indices = torch.full((batch, topk), -1, dtype=torch.int32, device=device)
+    for row, valid_count in enumerate(valid_counts_cpu):
+        indices[row, :valid_count] = torch.randperm(
+            int(sequence_lengths[row]), device=device, dtype=torch.int64
+        )[:valid_count].to(torch.int32)
+
+    slots = torch.full_like(indices, -1)
+    for row, valid_count in enumerate(valid_counts_cpu):
+        slots[row, :valid_count] = req_to_token[row, indices[row, :valid_count].long()]
+
+    pool_size = batch * max_sequence_length
+    q = torch.randn(batch, num_q_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k_cache = torch.randn(
+        pool_size, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v_cache = torch.randn_like(k_cache)
+    valid_counts = torch.empty(batch, dtype=torch.int32, device=device)
+    cu_k = torch.empty(batch + 1, dtype=torch.int32, device=device)
+    cu_q = torch.arange(batch + 1, dtype=torch.int32, device=device)
+    qwen_sparse_fa2_cu_seqlens_triton(
+        sequence_lengths.to(device),
+        indices,
+        valid_counts,
+        cu_k,
+        batch,
+        topk,
+    )
+    packed_k = torch.empty(
+        batch * topk,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    packed_v = torch.empty_like(packed_k)
+    qwen_sparse_kv_extraction_compact_triton(
+        k_cache,
+        v_cache,
+        req_to_token,
+        torch.arange(batch, dtype=torch.int32, device=device),
+        indices,
+        sequence_lengths.to(device),
+        cu_k,
+        packed_k,
+        packed_v,
+        batch,
+        topk,
+    )
+
+    scale = head_dim**-0.5
+    actual = qwen38_qsa_sm121_varlen(
+        q,
+        packed_k,
+        packed_v,
+        cu_q,
+        cu_k,
+        max_seqlen_k=topk,
+        softmax_scale=scale,
+    )
+    expected = qsa_sparse_attention(q, k_cache, v_cache, slots, scale)
+    assert valid_counts.tolist() == valid_counts_cpu
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 def test_qwen4_exp_indexer_config_is_read_from_text_config():
