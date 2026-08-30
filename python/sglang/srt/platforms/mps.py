@@ -10,7 +10,6 @@ through to the base ``SRTPlatform``.
 
 from __future__ import annotations
 
-import platform as _platform
 from typing import Optional
 
 import torch
@@ -69,7 +68,7 @@ class MpsDeviceMixin(DeviceMixin):
         # MPS currently has no set_device/current_device API.
 
     def get_device_name(self, device_id: int = 0) -> str:
-        return f"Apple MPS ({_platform.machine()})"
+        return str(torch.backends.mps.get_name())
 
     def get_device_uuid(self, device_id: int = 0) -> str:
         # There is no stable public GPU UUID in the PyTorch MPS API.

@@ -406,13 +406,14 @@ def validate_standard_mps_server_args(server_args: Any):
     deep inside model loading; anything else is left to fail naturally.
     """
 
+    cfg = resolving_view(server_args)
     supported_attention_backends = {None, "torch_native"}
     for field in (
         "attention_backend",
         "prefill_attention_backend",
         "decode_attention_backend",
     ):
-        value = getattr(server_args, field, None)
+        value = getattr(cfg, field, None)
         normalized = getattr(value, "value", value)
         normalized = None if normalized is None else str(normalized).lower()
         if normalized not in supported_attention_backends:
@@ -421,7 +422,7 @@ def validate_standard_mps_server_args(server_args: Any):
                 f"torch_native attention backend; got {field}={value!r}"
             )
 
-    sampling_backend = getattr(server_args, "sampling_backend", None)
+    sampling_backend = getattr(cfg, "sampling_backend", None)
     normalized_sampling = getattr(sampling_backend, "value", sampling_backend)
     normalized_sampling = (
         None if normalized_sampling is None else str(normalized_sampling).lower()
@@ -432,7 +433,7 @@ def validate_standard_mps_server_args(server_args: Any):
             f"pytorch sampling backend; got sampling_backend={sampling_backend!r}"
         )
 
-    quantization = getattr(server_args, "quantization", None)
+    quantization = getattr(cfg, "quantization", None)
     if quantization not in (None, "unquant"):
         raise ValueError(
             "The standard Torch MPS path currently supports only unquantized "
@@ -440,9 +441,9 @@ def validate_standard_mps_server_args(server_args: Any):
         )
 
     if (
-        getattr(server_args, "tp_size", 1) != 1
-        or getattr(server_args, "pp_size", 1) != 1
-        or getattr(server_args, "dp_size", 1) != 1
+        getattr(cfg, "tp_size", 1) != 1
+        or getattr(cfg, "pp_size", 1) != 1
+        or getattr(cfg, "dp_size", 1) != 1
     ):
         raise ValueError(
             "The standard Torch MPS path requires tp_size=1, pp_size=1, "
