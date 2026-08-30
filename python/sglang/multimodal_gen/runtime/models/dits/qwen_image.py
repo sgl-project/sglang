@@ -20,6 +20,10 @@ from sglang.kernels.ops.diffusion import (
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
 )
+from sglang.kernels.ops.diffusion.norm.norm_scale_shift_jit import (
+    try_fused_bias_mul_add,
+    try_fused_bias_scale_residual_norm_scale_shift,
+)
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
 from sglang.multimodal_gen.runtime.distributed import (
@@ -107,6 +111,14 @@ def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
 
 
 _get_qkv_projections = get_qkv_projections
+
+
+def _defer_modelopt_output_bias(quant_config: Optional[QuantizationConfig]) -> bool:
+    return (
+        quant_config is not None
+        and hasattr(quant_config, "get_name")
+        and quant_config.get_name() in {"modelopt_fp8", "modelopt_fp4"}
+    )
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -524,6 +536,7 @@ class QwenImageCrossAttention(nn.Module):
         self.parallel_attention = parallel_attention
         self.added_kv_proj_dim = added_kv_proj_dim
         self.prefix = prefix
+        self.defer_output_bias = _defer_modelopt_output_bias(quant_config)
 
         self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
 
@@ -617,6 +630,7 @@ class QwenImageCrossAttention(nn.Module):
                 self.dim,
                 bias=out_bias,
                 input_is_parallel=True,
+                skip_bias_add=self.defer_output_bias,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_add_out",
             )
@@ -631,6 +645,7 @@ class QwenImageCrossAttention(nn.Module):
                     self.dim,
                     bias=out_bias,
                     input_is_parallel=True,
+                    skip_bias_add=self.defer_output_bias,
                     quant_config=quant_config,
                     prefix=f"{prefix}.to_out.0",
                 )
@@ -802,13 +817,13 @@ class QwenImageCrossAttention(nn.Module):
         )
 
         # Apply output projections
-        img_attn_output, _ = self.to_out[0](img_attn_output)
+        img_attn_output, img_attn_bias = self.to_out[0](img_attn_output)
         if len(self.to_out) > 1:
             (img_attn_output,) = self.to_out[1](img_attn_output)  # dropout
 
-        txt_attn_output, _ = self.to_add_out(txt_attn_output)
+        txt_attn_output, txt_attn_bias = self.to_add_out(txt_attn_output)
 
-        return img_attn_output, txt_attn_output
+        return img_attn_output, txt_attn_output, img_attn_bias, txt_attn_bias
 
 
 class QwenImageGELU(nn.Module):
@@ -863,6 +878,7 @@ class QwenImageFeedForward(nn.Module):
     ) -> None:
         super().__init__()
         inner_dim = dim * mult
+        self.defer_output_bias = _defer_modelopt_output_bias(quant_config)
         if replicated:
             # Keep the whole FFN resident on every rank: no per-block
             # all-reduce. Only worth it when the branch's token count is small
@@ -871,6 +887,7 @@ class QwenImageFeedForward(nn.Module):
                 inner_dim,
                 dim_out,
                 bias=True,
+                skip_bias_add=self.defer_output_bias,
                 quant_config=quant_config,
                 prefix=f"{prefix}.net.2",
             )
@@ -880,6 +897,7 @@ class QwenImageFeedForward(nn.Module):
                 dim_out,
                 bias=True,
                 input_is_parallel=True,
+                skip_bias_add=self.defer_output_bias,
                 quant_config=quant_config,
                 prefix=f"{prefix}.net.2",
             )
@@ -897,11 +915,16 @@ class QwenImageFeedForward(nn.Module):
             ]
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_with_bias(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         hidden_states = self.net[0](hidden_states)
         hidden_states = self.net[1](hidden_states)
-        hidden_states, _ = self.net[2](hidden_states)
-        return hidden_states
+        return self.net[2](hidden_states)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states, bias = self.forward_with_bias(hidden_states)
+        return hidden_states if bias is None else hidden_states + bias
 
 
 class QwenImageTransformerBlock(nn.Module):
@@ -1058,6 +1081,25 @@ class QwenImageTransformerBlock(nn.Module):
     ) -> torch.Tensor:
         return self.fuse_mul_add(a, b, c, k)
 
+    def _bias_mul_add(
+        self,
+        a: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        b: torch.Tensor,
+        c: torch.Tensor,
+        *,
+        use_bcg_helpers: bool,
+    ) -> torch.Tensor:
+        if bias is not None and not use_bcg_helpers:
+            fused = try_fused_bias_mul_add(a, bias, b, c)
+            if fused is not None:
+                return fused
+        if bias is not None:
+            a = a + bias
+        if use_bcg_helpers:
+            return self._mul_add(a, b, c)
+        return self.fuse_mul_add(a, b, c)
+
     def _modulate(
         self,
         x: torch.Tensor,
@@ -1066,6 +1108,7 @@ class QwenImageTransformerBlock(nn.Module):
         index: Optional[torch.Tensor] = None,
         gate_x: Optional[torch.Tensor] = None,
         residual_x: Optional[torch.Tensor] = None,
+        x_bias: Optional[torch.Tensor] = None,
         use_bcg_helpers: bool = False,
     ) -> Union[
         Tuple[torch.Tensor, torch.Tensor],
@@ -1078,6 +1121,8 @@ class QwenImageTransformerBlock(nn.Module):
 
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         if index is not None:
+            if x_bias is not None:
+                x = x + x_bias
             actual_batch = x.shape[0]
             shift0, shift1 = (
                 shift[:actual_batch],
@@ -1128,6 +1173,24 @@ class QwenImageTransformerBlock(nn.Module):
             scale_result = scale.unsqueeze(1)
             gate_result = gate.unsqueeze(1)
         if is_scale_residual:
+            if x_bias is not None and not use_bcg_helpers:
+                fused = try_fused_bias_scale_residual_norm_scale_shift(
+                    residual_x,
+                    x,
+                    x_bias,
+                    gate_x,
+                    getattr(norm_module.norm, "weight", None),
+                    getattr(norm_module.norm, "bias", None),
+                    scale_result,
+                    shift_result,
+                    norm_module.norm_type,
+                    norm_module.eps,
+                )
+                if fused is not None:
+                    modulated, residual_out = fused
+                    return modulated, residual_out, gate_result
+            if x_bias is not None:
+                x = x + x_bias
             if use_bcg_helpers:
                 modulated, residual_out = self._scale_residual_norm_scale_shift(
                     norm_module,
@@ -1234,7 +1297,12 @@ class QwenImageTransformerBlock(nn.Module):
         )
 
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
-        img_attn_output, txt_attn_output = attn_output
+        (
+            img_attn_output,
+            txt_attn_output,
+            img_attn_bias,
+            txt_attn_bias,
+        ) = attn_output
         # Process image stream - norm2 + MLP
         img_modulated2, hidden_states, img_gate2 = self._modulate(
             img_attn_output,
@@ -1243,20 +1311,32 @@ class QwenImageTransformerBlock(nn.Module):
             modulate_index,
             gate_x=img_gate1,
             residual_x=hidden_states,
+            x_bias=img_attn_bias,
             use_bcg_helpers=use_bcg_helpers,
         )
-        img_mlp_output = self.img_mlp(img_modulated2)
+        if isinstance(self.img_mlp, QwenImageFeedForward):
+            img_mlp_output, img_mlp_bias = self.img_mlp.forward_with_bias(
+                img_modulated2
+            )
+        else:
+            img_mlp_output = self.img_mlp(img_modulated2)
+            img_mlp_bias = None
 
         if img_mlp_output.dim() == 2:
             img_mlp_output = img_mlp_output.unsqueeze(0)
-        if use_bcg_helpers:
-            hidden_states = self._mul_add(img_mlp_output, img_gate2, hidden_states)
-        else:
-            hidden_states = self.fuse_mul_add(img_mlp_output, img_gate2, hidden_states)
+        hidden_states = self._bias_mul_add(
+            img_mlp_output,
+            img_mlp_bias,
+            img_gate2,
+            hidden_states,
+            use_bcg_helpers=use_bcg_helpers,
+        )
 
         # Process text stream - norm2 + MLP
         txt_shift2, txt_scale2, txt_gate2_raw = txt_mod2.chunk(3, dim=-1)
         if use_bcg_helpers:
+            if txt_attn_bias is not None:
+                txt_attn_output = txt_attn_output + txt_attn_bias
             (
                 txt_modulated2,
                 encoder_hidden_states,
@@ -1268,6 +1348,15 @@ class QwenImageTransformerBlock(nn.Module):
                 shift=txt_shift2,
                 scale=txt_scale2,
             )
+        elif txt_attn_bias is not None:
+            txt_modulated2, encoder_hidden_states, _ = self._modulate(
+                txt_attn_output,
+                txt_mod2,
+                self.txt_norm2,
+                gate_x=txt_gate1,
+                residual_x=encoder_hidden_states,
+                x_bias=txt_attn_bias,
+            )
         else:
             txt_modulated2, encoder_hidden_states = self.txt_norm2(
                 residual=encoder_hidden_states,
@@ -1277,18 +1366,23 @@ class QwenImageTransformerBlock(nn.Module):
                 scale=txt_scale2,
             )
         txt_gate2 = txt_gate2_raw.unsqueeze(1)
-        txt_mlp_output = self.txt_mlp(txt_modulated2)
+        if isinstance(self.txt_mlp, QwenImageFeedForward):
+            txt_mlp_output, txt_mlp_bias = self.txt_mlp.forward_with_bias(
+                txt_modulated2
+            )
+        else:
+            txt_mlp_output = self.txt_mlp(txt_modulated2)
+            txt_mlp_bias = None
 
         if txt_mlp_output.dim() == 2:
             txt_mlp_output = txt_mlp_output.unsqueeze(0)
-        if use_bcg_helpers:
-            encoder_hidden_states = self._mul_add(
-                txt_mlp_output, txt_gate2, encoder_hidden_states
-            )
-        else:
-            encoder_hidden_states = self.fuse_mul_add(
-                txt_mlp_output, txt_gate2, encoder_hidden_states
-            )
+        encoder_hidden_states = self._bias_mul_add(
+            txt_mlp_output,
+            txt_mlp_bias,
+            txt_gate2,
+            encoder_hidden_states,
+            use_bcg_helpers=use_bcg_helpers,
+        )
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
