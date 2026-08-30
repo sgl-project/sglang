@@ -28,11 +28,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - suite: nightly-stage-c-2-gpu-mi350
-            runner: linux-mi35x-gpu-2
-          # Use 8-GPU MI35X pool for 4-GPU suite.
-          - suite: nightly-stage-c-4-gpu-mi350
-            runner: linux-mi35x-gpu-8
+          # VERIFICATION BRANCH: only the 8-GPU suite hosts the checkpoint test.
           - suite: nightly-stage-c-8-gpu-mi350
             runner: linux-mi35x-gpu-8
     runs-on: ${{ matrix.runner }}
@@ -91,15 +87,43 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Run miles CI suite ${{ matrix.suite }}
-        timeout-minutes: 180
+      # ----------------------------------------------------------------------
+      # VERIFICATION BRANCH for radixark/miles#2816. Not for merge: the miles
+      # checkout inside the image is patched from a PR ref before the test runs.
+      # ----------------------------------------------------------------------
+      - name: Reproduce the nvrx failure on the unpatched image
         run: |
-          touch "${GITHUB_WORKSPACE}/github_summary.md"
-          TEST_EXIT_CODE=0
           bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles \
             -e PYTHONPATH=/root/miles:/opt/tilelang \
-            -e GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
-            python3 tests/ci/run_suite.py --hw rocm --suite ${{ matrix.suite }} --cadence nightly \
-            ${{ (github.event_name != 'workflow_dispatch' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
-          cat "${GITHUB_WORKSPACE}/github_summary.md" >> "$GITHUB_STEP_SUMMARY" || true
-          exit ${TEST_EXIT_CODE}
+            python3 /sglang-checkout/scripts/ci/amd/verify_async_ckpt_strategy.py nvrx
+
+      - name: Apply miles PR 2816 to the in-image checkout
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles bash -c '
+            set -eux
+            git fetch --no-tags --depth=1 origin refs/pull/2816/head
+            git checkout FETCH_HEAD -- \
+              miles/backends/megatron_utils/arguments.py \
+              tests/fast/backends/megatron_utils/test_arguments_async_strategy.py
+            git --no-pager diff --stat HEAD
+          '
+
+      - name: Run the new unit test against the real megatron
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles \
+            -e PYTHONPATH=/root/miles:/opt/tilelang \
+            python3 -m pytest -v --no-header -p no:cacheprovider \
+            tests/fast/backends/megatron_utils/test_arguments_async_strategy.py
+
+      - name: Confirm the fix on the patched image
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles \
+            -e PYTHONPATH=/root/miles:/opt/tilelang \
+            python3 /sglang-checkout/scripts/ci/amd/verify_async_ckpt_strategy.py mcore
+
+      - name: Run the checkpoint test that the nightly fails on
+        timeout-minutes: 90
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles \
+            -e PYTHONPATH=/root/miles:/opt/tilelang \
+            python3 tests/e2e/ckpt/test_qwen3_4B_ckpt.py
