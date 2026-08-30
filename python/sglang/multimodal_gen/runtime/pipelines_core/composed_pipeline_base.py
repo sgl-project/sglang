@@ -517,6 +517,22 @@ class ComposedPipelineBase(ABC):
             excluded_components=self.preload_residency_excluded_components,
         )
 
+    @staticmethod
+    def _validate_direct_gpu_component_selection(
+        model_index: dict[str, Any], server_args: ServerArgs
+    ) -> None:
+        unavailable = sorted(
+            component_name
+            for component_name in server_args.component_direct_gpu_weight_loading
+            if component_name not in model_index or model_index[component_name] is None
+        )
+        if unavailable:
+            raise ValueError(
+                "--component-direct-gpu-weight-loading selects component(s) "
+                "that are not available in this pipeline: "
+                f"{', '.join(unavailable)}"
+            )
+
     def load_modules(
         self,
         server_args: ServerArgs,
@@ -583,6 +599,7 @@ class ComposedPipelineBase(ABC):
         model_index.pop("boundary_ratio", None)
         # used by Wan2.2 ti2v
         model_index.pop("expand_timesteps", None)
+        self._validate_direct_gpu_component_selection(model_index, server_args)
 
         # some sanity checks
         assert (

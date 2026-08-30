@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
@@ -12,6 +13,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ResidencyState,
     WarmupPhasePeak,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    ComponentResidencyError,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     ComponentOffloadStrategy,
     ResidentStrategy,
@@ -20,6 +24,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding 
     RealtimeTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 def _server_args(*, supports_auto_residency=True):
@@ -591,6 +596,44 @@ def _manager_for_stage(stage, modules):
     manager.refresh_pipeline(pipeline)
     manager.begin_request([stage], SimpleNamespace(is_warmup=False), server_args)
     return manager, server_args
+
+
+def _server_args_with_component_offload(component_name):
+    server_args = ServerArgs.__new__(ServerArgs)
+    server_args.component_residency = {component_name: "component-offload"}
+    return server_args
+
+
+def test_explicit_component_offload_requires_a_declared_request_use():
+    stage = _Stage()
+    pipeline = SimpleNamespace(
+        modules={"auxiliary": torch.nn.Linear(2, 2)},
+        _stage_name_mapping={"stage": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args_with_component_offload("auxiliary")
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.refresh_pipeline(pipeline)
+
+    with pytest.raises(
+        ComponentResidencyError,
+        match="'auxiliary'.*ComponentUse declaration",
+    ):
+        manager.begin_request([stage], SimpleNamespace(is_warmup=False), server_args)
+
+
+def test_declared_component_use_admits_explicit_component_offload():
+    stage = _Stage(ComponentUse("stage", "auxiliary"))
+    pipeline = SimpleNamespace(
+        modules={"auxiliary": torch.nn.Linear(2, 2)},
+        _stage_name_mapping={"stage": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args_with_component_offload("auxiliary")
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.refresh_pipeline(pipeline)
+
+    manager.begin_request([stage], SimpleNamespace(is_warmup=False), server_args)
 
 
 def test_single_component_stage_is_prepared_at_stage_entry():

@@ -30,8 +30,9 @@ from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, is_sm100_supported, retry
+from sglang.srt.utils import is_hip, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -1656,7 +1657,7 @@ class ModelConfig:
             if self.quantization not in optimized_quantization_methods:
                 # Don't warn for MXFP4/MXFP8 on SM100 since they have optimized kernels
                 if not (
-                    self.quantization in ["mxfp4", "mxfp8"] and is_sm100_supported()
+                    self.quantization in ["mxfp4", "mxfp8"] and get_platform().is_sm100
                 ):
                     logger.warning(
                         "%s quantization is not fully "

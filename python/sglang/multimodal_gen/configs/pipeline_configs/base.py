@@ -203,6 +203,9 @@ class PipelineConfig:
     # False when changing component placement after a calibration request is
     # known to alter the pipeline's numerical path.
     supports_auto_residency: bool = True
+    # Components that cannot fall back to a native Transformers/Diffusers
+    # implementation because their pipeline requires SGLang-specific behavior.
+    native_only_components: tuple[str, ...] = ()
 
     model_path: str = ""
     pipeline_config_path: str | None = None
