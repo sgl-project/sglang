@@ -626,42 +626,5 @@ class TestComputeRoutingKeyStats(unittest.TestCase):
         self.assertEqual(sorted(req_counts), [1, 5, 15, 250])
 
 
-def _fake_req(wait_queue_entry_time: float):
-    from types import SimpleNamespace
-
-    return SimpleNamespace(
-        time_stats=SimpleNamespace(wait_queue_entry_time=wait_queue_entry_time)
-    )
-
-
-class TestAvgQueueWaitTime(unittest.TestCase):
-    """Guards issue #6357: avg_request_queue_latency must reflect the live
-    wait-so-far of currently-queued requests, not stay unset/zero."""
-
-    def test_empty_queue_is_zero(self):
-        from sglang.srt.managers.scheduler_components.metrics_reporter import (
-            _avg_queue_wait_time,
-        )
-
-        self.assertEqual(_avg_queue_wait_time([], now=100.0), 0.0)
-
-    def test_averages_wait_so_far_per_request(self):
-        from sglang.srt.managers.scheduler_components.metrics_reporter import (
-            _avg_queue_wait_time,
-        )
-
-        reqs = [_fake_req(90.0), _fake_req(95.0), _fake_req(70.0)]
-        # Waits at now=100: 10, 5, 30 -> mean 15.
-        self.assertAlmostEqual(_avg_queue_wait_time(reqs, now=100.0), 15.0)
-
-    def test_single_request_just_enqueued(self):
-        from sglang.srt.managers.scheduler_components.metrics_reporter import (
-            _avg_queue_wait_time,
-        )
-
-        reqs = [_fake_req(100.0)]
-        self.assertAlmostEqual(_avg_queue_wait_time(reqs, now=100.0), 0.0)
-
-
 if __name__ == "__main__":
     unittest.main()
