@@ -49,6 +49,7 @@ import uvloop
 import zmq
 
 from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
     resolved_view,
     resolving_view,
 )
@@ -1630,7 +1631,6 @@ class Engine(EngineScoreMixin, EngineBase):
 
 
 def _set_envs_and_config(server_args: ServerArgs):
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     # Set global environments
