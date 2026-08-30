@@ -88,8 +88,6 @@ class MlaBmmFusionPlan:
 
 
 if _is_cuda:
-    from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
-
     # TODO(yuwei): remove this wrapper after sgl-kernel registers its own fake/meta impl
     # Wrap bmm_fp8 as a custom op so torch.compile does not trace into
     # torch.cuda.current_blas_handle() (which returns a non-Tensor).
@@ -101,7 +99,9 @@ if _is_cuda:
         A_scale: torch.Tensor,
         B_scale: torch.Tensor,
     ) -> None:
-        _raw_bmm_fp8(A, B, A_scale, B_scale, out.dtype, out)
+        from sgl_kernel import bmm_fp8
+
+        bmm_fp8(A, B, A_scale, B_scale, out.dtype, out)
 
     def bmm_fp8(A, B, A_scale, B_scale, dtype, out=None):
         if out is None:
