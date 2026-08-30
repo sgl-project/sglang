@@ -76,6 +76,20 @@ def handle_nccl_pre_warm(server_args: Any):
         declare_resolution(server_args, "_handle_nccl_pre_warm", pre_warm_nccl=False)
 
 
+def handle_symm_mem_device_support(server_args: Any):
+    cfg = resolving_view(server_args)
+    # The symm-mem allocator compiles a CUDA plugin and links -lnccl, so off
+    # CUDA/HIP (e.g. Ascend NPU) it fails deep in a build step rather than here.
+    if cfg.enable_symm_mem and not (is_cuda() or is_hip()):
+        logger.warning(
+            "--enable-symm-mem is not supported on non CUDA/HIP devices "
+            "(NCCL symmetric memory is unavailable). Disabling symmetric memory."
+        )
+        declare_resolution(
+            server_args, "_handle_symm_mem_device_support", enable_symm_mem=False
+        )
+
+
 def handle_xpu_backends(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.device == "xpu":
