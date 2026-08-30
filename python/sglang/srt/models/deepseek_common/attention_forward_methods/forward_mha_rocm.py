@@ -12,11 +12,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_ln
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
+    all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
-    filter_dcp_local_kv_indices,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
@@ -264,6 +265,130 @@ class DeepseekMHARocmForwardMixin:
             positions, hidden_states, forward_batch, zero_allocator
         )
 
+    def forward_normal_chunked_kv_rocm_prepare(
+        self: DeepseekV2AttentionMLA,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
+        """Prepare for the chunked-prefix pass: leave mha_one_shot unset.
+
+        The suffix attention runs first over the in-hand extend tokens alone, so
+        this is the plain ROCm prepare -- assembling the whole sequence here is
+        exactly what the chunked path exists to avoid.
+        """
+        return self.forward_normal_rocm_prepare(
+            positions, hidden_states, forward_batch, zero_allocator
+        )
+
+    def _merge_prefix_chunk_rocm(
+        self: DeepseekV2AttentionMLA,
+        accum_output: torch.Tensor,
+        accum_lse: torch.Tensor,
+        output: torch.Tensor,
+        lse: torch.Tensor,
+    ):
+        """ROCm stand-in for merge_state_v2, which is registered for CUDA only.
+
+        Both aiter extend kernels hand back natural-log LSEs -- measured for
+        flash_attn_varlen_func, and mla_reduce_v1 uses expf/logf -- so this takes
+        the natural-log combine, not the base-2 one the gluon decode chain uses.
+        """
+        return dcp_lse_combine_ln(
+            output, lse, accum_output, accum_lse, accum_output.dtype
+        )
+
+    def forward_normal_chunked_kv_rocm_core(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """ROCm twin of forward_normal_chunked_kv_core.
+
+        Separate from the shared one because its accumulation calls
+        merge_state_v2, which is registered for CUDA only.
+        """
+        has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
+            forward_batch.extend_prefix_lens_cpu
+        )
+        if has_extend_prefix and forward_batch.num_prefix_chunks is None:
+            forward_batch.prepare_chunked_prefix_cache_info(q.device)
+            # aiter is the only ROCm backend whose handler returns
+            # MHA_CHUNKED_KV, so no probe for the hook: this is its own
+            # backend, and it builds the route's asm work partitions here.
+            resolve_attn_backend(forward_batch).init_mha_chunk_metadata(forward_batch)
+
+        forward_batch.mha_return_lse = has_extend_prefix
+        forward_batch.set_attn_attend_prefix_cache(False)
+        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+
+        if has_extend_prefix:
+            attn_output, lse = attn_output
+            forward_batch.set_attn_attend_prefix_cache(True)
+            attn_output = self._chunked_prefix_attn_mha_rocm(
+                q=q,
+                accum_output=attn_output,
+                accum_lse=lse,
+                forward_batch=forward_batch,
+            )
+
+        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _chunked_prefix_attn_mha_rocm(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        accum_output: torch.Tensor,
+        accum_lse: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Fold each prefix chunk into the running (output, lse) accumulator.
+
+        One chunk's K/V at a time is the whole point: it bounds both the
+        cross-rank gather this issues under DCP and the byte extent aiter's fmha
+        indexes with 32-bit offsets.
+        """
+        assert forward_batch.num_prefix_chunks is not None
+        for i in range(forward_batch.num_prefix_chunks):
+            forward_batch.set_prefix_chunk_idx(i)
+
+            kv_a_normed, k_pe = self._get_mla_kv_buffer_rocm(
+                forward_batch.prefix_chunk_kv_indices[i], q.dtype, forward_batch
+            )
+            # Under DCP this rank holds 1/W of the chunk; a no-op otherwise.
+            kv_a_normed, k_pe = all_gather_kv_cache_for_mha_chunk_extend(
+                kv_a_normed,
+                k_pe,
+                forward_batch.prefix_chunk_seq_lens_cpu[i],
+                forward_batch.prefix_chunk_starts_cpu[i],
+            )
+            kv = self.kv_b_proj(kv_a_normed)[0]
+            kv = kv.view(
+                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            k_nope = kv[..., : self.qk_nope_head_dim]
+            v = kv[..., self.qk_nope_head_dim :]
+            k = self._concat_and_cast_mha_k_rocm(k_nope, k_pe)
+
+            output, lse = self.attn_mha(
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache=False,
+                key_value_num_tokens=k.shape[0],
+            )
+            accum_output, accum_lse = self._merge_prefix_chunk_rocm(
+                accum_output, accum_lse, output, lse
+            )
+            del kv, k, v, output, lse
+
+        return accum_output
+
     def _concat_and_cast_mha_k_rocm(
         self: DeepseekV2AttentionMLA,
         k_nope: torch.Tensor,
@@ -302,8 +427,13 @@ class DeepseekMHARocmForwardMixin:
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
+        """Fetch latent KV rows. kv_indices must already be DCP-local.
+
+        Filtering here instead would double-filter the chunked path, whose
+        indices come out of filter_dcp_local_chunk_kv_indices in
+        prepare_chunked_kv_indices -- 1/W of 1/W of the chunk.
+        """
         if _use_aiter_gfx95:
-            kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )

@@ -1123,8 +1123,13 @@ def _dcp_lse_combine_pair_kernel(
     b_lse_stride_h: tl.int64,
     DIM: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
+    IS_LSE_BASE_ON_E: tl.constexpr,
 ):
-    """Merge two partial attentions over DISJOINT key sets, given base-2 LSEs.
+    """Merge two partial attentions over DISJOINT key sets.
+
+    ``IS_LSE_BASE_ON_E`` picks the base the LSEs are in: the gluon decode chain
+    carries base-2, aiter's extend kernels carry natural log. The weights themselves are
+    base-invariant; only the exp/log pair and the returned LSE's base change.
 
     Grid: (tokens, heads), one program per output row.
     """
@@ -1148,8 +1153,8 @@ def _dcp_lse_combine_pair_kernel(
     # turn that into out 0 / lse -inf. The two comparable kernels in this repo
     # (merge_state_kernel, _dcp_lse_combine_kernel) both return NaN here.
     m_safe = tl.where(m == float("-inf"), 0.0, m)
-    w_a = tl.math.exp2(lse_a - m_safe)
-    w_b = tl.math.exp2(lse_b - m_safe)
+    w_a = tl.exp(lse_a - m_safe) if IS_LSE_BASE_ON_E else tl.math.exp2(lse_a - m_safe)
+    w_b = tl.exp(lse_b - m_safe) if IS_LSE_BASE_ON_E else tl.math.exp2(lse_b - m_safe)
     denom = w_a + w_b
 
     offs = tl.arange(0, BLOCK_DIM)
@@ -1175,8 +1180,51 @@ def _dcp_lse_combine_pair_kernel(
         acc.to(out_ptr.dtype.element_ty),
         mask=mask,
     )
-    lse = tl.where(denom == 0.0, float("-inf"), m_safe + tl.log2(denom))
+    combined = m_safe + (tl.log(denom) if IS_LSE_BASE_ON_E else tl.log2(denom))
+    lse = tl.where(denom == 0.0, float("-inf"), combined)
     tl.store(out_lse_ptr + tok * out_lse_stride_t + head * out_lse_stride_h, lse)
+
+
+def _dcp_lse_combine_pair(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    is_lse_base_on_e: bool,
+):
+    """Shared body of the two public combines; see them for the contract."""
+    n_tokens, n_heads, dim = out_a.shape
+    out = torch.empty((n_tokens, n_heads, dim), dtype=out_dtype, device=out_a.device)
+    lse = torch.empty((n_tokens, n_heads), dtype=torch.float32, device=out_a.device)
+    if n_tokens == 0:
+        return out, lse
+
+    _dcp_lse_combine_pair_kernel[(n_tokens, n_heads)](
+        out,
+        lse,
+        out_a,
+        lse_a,
+        out_b,
+        lse_b,
+        out.stride(0),
+        out.stride(1),
+        out_a.stride(0),
+        out_a.stride(1),
+        out_b.stride(0),
+        out_b.stride(1),
+        lse.stride(0),
+        lse.stride(1),
+        lse_a.stride(0),
+        lse_a.stride(1),
+        lse_b.stride(0),
+        lse_b.stride(1),
+        DIM=dim,
+        BLOCK_DIM=triton.next_power_of_2(dim),
+        IS_LSE_BASE_ON_E=is_lse_base_on_e,
+        **_AMD_LAUNCH_KWARGS,
+    )
+    return out, lse
 
 
 def dcp_lse_combine_base2(
@@ -1207,33 +1255,27 @@ def dcp_lse_combine_base2(
     so reusing it here would mean a ``torch.stack`` copy of both partials on
     every call.
     """
-    n_tokens, n_heads, dim = out_a.shape
-    out = torch.empty((n_tokens, n_heads, dim), dtype=out_dtype, device=out_a.device)
-    lse = torch.empty((n_tokens, n_heads), dtype=torch.float32, device=out_a.device)
-    if n_tokens == 0:
-        return out, lse
-
-    _dcp_lse_combine_pair_kernel[(n_tokens, n_heads)](
-        out,
-        lse,
-        out_a,
-        lse_a,
-        out_b,
-        lse_b,
-        out.stride(0),
-        out.stride(1),
-        out_a.stride(0),
-        out_a.stride(1),
-        out_b.stride(0),
-        out_b.stride(1),
-        lse.stride(0),
-        lse.stride(1),
-        lse_a.stride(0),
-        lse_a.stride(1),
-        lse_b.stride(0),
-        lse_b.stride(1),
-        DIM=dim,
-        BLOCK_DIM=triton.next_power_of_2(dim),
-        **_AMD_LAUNCH_KWARGS,
+    return _dcp_lse_combine_pair(
+        out_a, lse_a, out_b, lse_b, out_dtype, is_lse_base_on_e=False
     )
-    return out, lse
+
+
+def dcp_lse_combine_ln(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+    out_dtype: torch.dtype,
+):
+    """``dcp_lse_combine_base2`` for NATURAL-log LSEs.
+
+    aiter's extend kernels carry natural log -- measured for
+    ``flash_attn_varlen_func(return_lse=True)``, and ``mla_reduce_v1`` uses
+    expf/logf throughout -- while the gluon decode chain carries base-2. The
+    base is named here rather than scaled at the call site because a missing
+    log2(e) has no runtime symptom: the merge still returns finite numbers, and
+    only long prefixes make the error visible.
+    """
+    return _dcp_lse_combine_pair(
+        out_a, lse_a, out_b, lse_b, out_dtype, is_lse_base_on_e=True
+    )

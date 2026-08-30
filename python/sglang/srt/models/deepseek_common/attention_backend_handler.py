@@ -19,11 +19,10 @@ MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
 # ROCm runs dedicated MHA/MLA implementations (forward_mha_rocm.py /
 # forward_mla_rocm.py) so the shared CUDA paths carry no AMD branches. Backend
 # handlers keep returning the generic method; the platform swap happens here.
-# MHA_CHUNKED_KV has no ROCm entry because its accumulation step needs the
-# CUDA-only merge_state_v2 kernel.
 _ROCM_FORWARD_METHODS = {
     AttnForwardMethod.MHA: AttnForwardMethod.MHA_ROCM,
     AttnForwardMethod.MHA_ONE_SHOT: AttnForwardMethod.MHA_ONE_SHOT_ROCM,
+    AttnForwardMethod.MHA_CHUNKED_KV: AttnForwardMethod.MHA_CHUNKED_KV_ROCM,
     AttnForwardMethod.MLA: AttnForwardMethod.MLA_ROCM,
 }
 
@@ -203,6 +202,18 @@ def handle_attention_aiter(attn, forward_batch):
         # heads take the generic elementwise branch -- the same one the non-DCP
         # return below has always used.
         if get_parallel().dcp_enabled:
+            # One-shot assembles prefix + extend into one tensor per layer, and
+            # chunked prefill redoes that for every chunk, so both its gather
+            # and its K/V grow with the sequence. Past the chunk capacity, fold
+            # the prefix in a chunk at a time instead -- same crossover the
+            # non-DCP dispatch uses in _support_mha_one_shot.
+            sum_seq_lens = (
+                sum(forward_batch.seq_lens_cpu)
+                if forward_batch.seq_lens_cpu is not None
+                else 0
+            )
+            if sum_seq_lens > forward_batch.get_max_chunk_capacity():
+                return AttnForwardMethod.MHA_CHUNKED_KV
             return AttnForwardMethod.MHA_ONE_SHOT
         return AttnForwardMethod.MHA
     else:
