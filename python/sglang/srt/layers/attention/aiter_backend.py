@@ -264,6 +264,7 @@ class AiterAttnBackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.kv_index_translator = model_runner.kv_index_translator
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
@@ -1432,10 +1433,10 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 kv_indices, kv_indptr, qo_indptr, _ = (
                     forward_batch.spec_info.generate_attn_arg_prefill(
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                        forward_batch.seq_lens_sum,
-                        self.req_to_token,
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        paged_kernel_lens=forward_batch.seq_lens,
+                        paged_kernel_lens_sum=forward_batch.seq_lens_sum,
+                        translator=self.kv_index_translator,
                     )
                 )
                 self.forward_metadata = ForwardMetadata(
@@ -3329,6 +3330,7 @@ class AiterIndicesUpdaterPrefill:
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.kv_index_translator = model_runner.kv_index_translator
         self.update = self.update_single_wrapper
 
         self.kv_indices = None
@@ -3401,10 +3403,10 @@ class AiterIndicesUpdaterPrefill:
         else:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
-                    self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    paged_kernel_lens=paged_kernel_lens,
+                    paged_kernel_lens_sum=paged_kernel_lens_sum,
+                    translator=self.kv_index_translator,
                 )
             )
 
@@ -3418,6 +3420,7 @@ class AiterMlaIndicesUpdaterPrefill:
 
         # Buffers and wrappers
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.kv_index_translator = model_runner.kv_index_translator
         self.update = self.update_single_wrapper
 
         self.kv_indptr = None
@@ -3479,10 +3482,10 @@ class AiterMlaIndicesUpdaterPrefill:
         else:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    kv_lens,
-                    kv_lens_sum,
-                    self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    paged_kernel_lens=kv_lens,
+                    paged_kernel_lens_sum=kv_lens_sum,
+                    translator=self.kv_index_translator,
                 )
             )
 

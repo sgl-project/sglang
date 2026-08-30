@@ -4,7 +4,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 
@@ -58,12 +58,17 @@ class NgramVerifyInput(SpecInput):
 
     def generate_attn_arg_prefill(
         self,
+        *,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
-        req_to_token: torch.Tensor,
+        translator: KVIndexTranslator,
+        sliding_window: bool = False,
     ):
-        bs = len(req_pool_indices)
+        """CSR verify args, gathered straight into the packed stream. The lens
+        are widened here and handed to the translator, so nothing materializes
+        a ``[bs, max_pages]`` rectangle to repack from."""
+        bs = req_pool_indices.numel()
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
 
@@ -75,20 +80,16 @@ class NgramVerifyInput(SpecInput):
             * self.draft_token_num
         )
 
-        kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * bs,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        total_tokens = paged_kernel_lens_sum + self.draft_token_num * bs
+        kv_indices = torch.empty(total_tokens, dtype=torch.int32, device=self.device)
 
-        create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            None,
-            kv_indices,
-            req_to_token.size(1),
+        translator.fill_packed_read_stream(
+            req_pool_indices=req_pool_indices,
+            seq_lens=paged_kernel_lens,
+            indptr=cum_kv_seq_len,
+            total_tokens=total_tokens,
+            out=kv_indices,
+            sliding_window=sliding_window,
         )
 
         # Pad custom_mask when CUDA graph pads batch size beyond the actual number of requests.

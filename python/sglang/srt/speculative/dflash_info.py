@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -126,15 +126,20 @@ class DFlashVerifyInput(SpecInput):
 
     def generate_attn_arg_prefill(
         self,
+        *,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
-        req_to_token: torch.Tensor,
+        translator: KVIndexTranslator,
         kv_start_idx: Optional[torch.Tensor] = None,
         kv_indices_buf: Optional[torch.Tensor] = None,
+        sliding_window: bool = False,
     ):
+        """CSR verify args, gathered straight into the packed stream. The lens
+        are widened here and handed to the translator, so nothing materializes
+        a ``[bs, max_pages]`` rectangle to repack from."""
         device = req_pool_indices.device
-        bs = len(req_pool_indices)
+        bs = req_pool_indices.numel()
 
         layout = self.ragged_verify_layout
         if layout is not None and layout.bs != bs:
@@ -172,14 +177,14 @@ class DFlashVerifyInput(SpecInput):
                 dtype=torch.int32,
                 device=device,
             )
-        create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            kv_start_idx,
-            kv_indices,
-            req_to_token.size(1),
+        translator.fill_packed_read_stream(
+            req_pool_indices=req_pool_indices,
+            seq_lens=paged_kernel_lens,
+            indptr=cum_kv_seq_len,
+            total_tokens=paged_kernel_lens_sum + kv_indices_extra,
+            out=kv_indices,
+            kv_start_idx=kv_start_idx,
+            sliding_window=sliding_window,
         )
         mask = self.custom_mask
         if mask is not None:
