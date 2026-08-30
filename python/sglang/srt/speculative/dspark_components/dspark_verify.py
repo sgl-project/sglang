@@ -115,6 +115,8 @@ class TargetVerifyExecutor:
         layout: Optional[RaggedVerifyLayout],
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
+        asd_adapter=None,
+        req_pool_indices: Optional[torch.Tensor] = None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
@@ -124,18 +126,37 @@ class TargetVerifyExecutor:
         override.
         """
         if folded_accept:
+            if asd_adapter is not None:
+                asd_adapter.require_unfolded_accept()
             return self.verify_epilogue.read_accept(bs)
 
-        correct_len, bonus, cap_trim_lens = accept_draft_tokens(
-            candidates=verify_ids_2d,
-            target_logits=target_logits,
-            draft_block=draft_block,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            gamma=self.gamma,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            cutoff_layout=layout,
-        )
+        def native_accept():
+            return accept_draft_tokens(
+                candidates=verify_ids_2d,
+                target_logits=target_logits,
+                draft_block=draft_block,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                gamma=self.gamma,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                cutoff_layout=layout,
+            )
+
+        if asd_adapter is None:
+            correct_len, bonus, cap_trim_lens = native_accept()
+        else:
+            if req_pool_indices is None:
+                raise RuntimeError(
+                    "DSpark ASD acceptance requires request-pool indices"
+                )
+            correct_len, bonus, cap_trim_lens = asd_adapter.accept_or_native(
+                candidates=verify_ids_2d,
+                target_logits=target_logits,
+                cutoff_verify_lens=(None if layout is None else layout.verify_lens),
+                req_pool_indices=req_pool_indices,
+                all_greedy=(sampling_info is None or sampling_info.is_all_greedy),
+                native_accept=native_accept,
+            )
         if self._simulate_acc_len > 0:
             correct_len = self._simulated_correct_len(
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
