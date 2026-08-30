@@ -201,6 +201,9 @@ class PipelineConfig:
     native_only_components: ClassVar[tuple[str, ...]] = ()
     task_type: ModelTaskType = ModelTaskType.I2I
     skip_input_image_preprocess: bool = False
+    # Components that cannot fall back to a native Transformers/Diffusers
+    # implementation because their pipeline requires SGLang-specific behavior.
+    native_only_components: tuple[str, ...] = ()
 
     model_path: str = ""
     pipeline_config_path: str | None = None
