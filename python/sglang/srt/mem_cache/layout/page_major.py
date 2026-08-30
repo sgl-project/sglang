@@ -57,14 +57,11 @@ def build_mha_views(
         kernel_id(t) = (t // ps) * (ps * 2 * layer_num) + t % ps
 
     with layer ``l``'s K at block ``2l`` and its V at block ``2l+1``. Each view
-    is then a contiguous ``(num_pages * 2 * layer_num * ps, head_num,
-    head_dim)`` tensor — the stock per-layer shape — so one block table serves
-    every layer and the stock scatter serves the writes.
+    is a contiguous ``(num_pages * 2 * layer_num * ps, head_num, head_dim)``.
 
-    Views overlap by ``ps`` rows per block, which is safe because a kernel-facing id
-    always resolves inside its own block; the last view runs
-    ``(2*layer_num - 1) * ps`` rows past the envelope, so ``raw`` needs the
-    tail pad (``UnifiedKVPool.view_tail_pad_bytes``).
+    Views overlap by ``ps`` rows per block, safe because an id always resolves
+    inside its own block; the last view runs ``(2*layer_num - 1) * ps`` rows
+    past the envelope, so ``raw`` needs ``UnifiedKVPool.view_tail_pad_bytes``.
     """
     assert head_dim == v_head_dim, (
         f"build_mha_views requires uniform rows (head_dim == v_head_dim); "

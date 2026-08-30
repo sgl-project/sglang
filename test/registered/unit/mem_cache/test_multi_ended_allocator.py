@@ -1938,11 +1938,9 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             "v2p_page[virt_pages] * page_size + offsets.",
         )
 
-        # The composite's translate is the KERNEL-FACING id, which is the
-        # physical page scaled by the sub-pool's block count -- it is NOT the
-        # physical token id this helper returns. The two agree only when the
-        # multiplier collapses to 1, which no dense sub-pool does; asserting
-        # equality here would pin the id spaces together again.
+        # The composite emits KERNEL-FACING ids, not the physical token ids
+        # this helper returns; they coincide only at multiplier 1, which no
+        # sub-pool uses.
         swa_mult = allocator.swa_kernel_page_multiplier
         self.assertEqual(swa_mult, 2 * swa_spec.layer_num)
         composite_out = allocator.translate_loc_from_full_to_swa(v_tokens)

@@ -3178,22 +3178,11 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
 
 class PageMajorMHATokenToKVPool(MHATokenToKVPool):
-    """MHA pool with the page-major (layer-major within a page) page-granularity envelope layout.
+    """MHA pool with the page-major page-granularity envelope layout.
 
-    TEMPORARILY NON-CONSTRUCTIBLE: the strided 4-D view builder and its write
-    kernel were removed; ServerArgs rejects the static page-major arm at boot
-    until the per-layer-view reimplementation lands.
-
-    All layers/slots share one contiguous ``uint8`` ``_raw`` buffer; per-layer K/V
-    are 4-D strided views ``(num_pages, page_size, head_num, head_dim*)`` built by
-    ``mem_cache/layout/page_major.py``. Token id ``t`` -> page ``t // page_size``,
-    slot ``t % page_size``; the reserved padding slot 0 lives in page 0. At
-    ``page_size == 1`` a page is a single slot (token-granularity envelope).
-
-    Supported: the standard CUDA Triton attention + native move path. The tiled KV
-    copy kernel, CPU offloading, and the spec-decode prefix-commit kernel all assume
-    the per-layer contiguous 3-D layout; here they fail loudly rather than silently
-    mis-indexing the strided views.
+    NON-CONSTRUCTIBLE: the strided 4-D view builder and its write kernel are
+    gone, and ServerArgs rejects the static page-major arm at boot. The class
+    stays as the seat for the per-layer-view reimplementation.
     """
 
     def __init__(

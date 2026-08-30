@@ -498,22 +498,16 @@ class UnifiedKVPool:
 
 
 class UnifiedMHATokenToKVPool(MHATokenToKVPool):
-    """MHA KV pool whose per-layer `k_buffer`/`v_buffer` are kernel-facing views into a
-    `UnifiedKVPool` (`build_mha_views`; requires uniform K/V rows,
-    which `MHASubPoolSpec` enforces).
+    """MHA KV pool whose per-layer `k_buffer`/`v_buffer` are `build_mha_views`
+    views into a `UnifiedKVPool` (requires uniform K/V rows).
 
-    Per-layer views are stock-shaped `(n_rows, head_num, head_dim)` contiguous
-    tensors and locs are kernel-facing ids
+    Views are contiguous `(n_rows, head_num, head_dim)`; locs are
 
         kernel_id(t) = (t // ps) * (ps * 2 * layer_num) + t % ps
 
-    which are layer- AND K/V-independent (each view's storage_offset folds in
-    its block origin: layer l's K at block 2l, V at 2l+1). Every inherited
-    read/write method therefore works unmodified — the JIT `store_cache`
-    scatter is stride-driven off the views' own metadata and the views report
-    `is_contiguous()`. Relocation is the exception: compaction passes REAL
-    physical token ids, so it copies whole page envelopes on the raw buffer
-    (mirrors `UnifiedMLATokenToKVPool`).
+    which is layer- and K/V-independent, each view's storage_offset folding in
+    its block origin (layer l's K at block 2l, V at 2l+1). `move_kv_cache` is
+    the exception: compaction passes REAL physical token ids.
     """
 
     def __init__(
@@ -572,10 +566,9 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         """
         if tgt_loc.numel() == 0:
             return
-        # The envelope view below starts at byte 0, so this sub-pool's region
-        # must too (mirrors UnifiedMLATokenToKVPool.move_kv_cache). A non-zero
-        # anchor would make compaction copy the wrong sub-pool's bytes, and
-        # silently: the ids stay in range and only the KV content is wrong.
+        # The envelope view below starts at byte 0, so this sub-pool must be
+        # anchored there; a non-zero anchor moves another sub-pool's bytes, and
+        # the ids stay in range so nothing downstream notices.
         assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
         ps = self.page_size
         tgt_pages = tgt_loc.view(-1, ps)[:, 0] // ps

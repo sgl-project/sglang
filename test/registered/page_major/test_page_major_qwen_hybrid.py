@@ -43,11 +43,9 @@ class TestUnifiedQwenHybridTriton(DefaultServerBase):
 
     model = DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST
 
-    # Measured in this harness: baseline (static pools) and the envelope layout
-    # both ~0.86; the 0.80 threshold leaves margin for run-to-run noise while
-    # still catching the prefill-state corruption the envelope layout hit before
-    # the gather/scatter fix in gdn_backend.forward_extend (which dropped it to
-    # ~0.61).
+    # Measured ~0.86 in this harness on both the static pools and the envelope
+    # layout; 0.80 leaves noise margin and still catches a corrupted prefill
+    # state, which reads ~0.61.
     gsm8k_threshold = 0.80
     num_gsm8k_questions = 200
     num_shots = 5

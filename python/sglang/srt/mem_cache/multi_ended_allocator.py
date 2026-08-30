@@ -134,11 +134,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.entry_bytes = spec.entry_bytes()
         self.min_slot_index = unified_buffer.min_slot_index(sub_pool_name)
         self.is_id_owner = is_id_owner
-        # Dense (kernel-facing) index space scale, derived from the sub-pool
-        # spec that owns the layout — the same rule `view_tail_pad_bytes`
-        # follows, so no construction site can pair per-layer views with a
-        # physical-id multiplier. `kernel_page_multiplier=` overrides it only
-        # for tests that pin the multiplier-1 collapse.
+        # Kernel-facing page-stride scale, from the spec that owns the layout.
+        # `kernel_page_multiplier=` overrides it only for tests pinning the
+        # multiplier-1 collapse.
         self.kernel_page_multiplier = (
             spec.blocks_per_page()
             if kernel_page_multiplier is None

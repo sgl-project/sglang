@@ -54,13 +54,9 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 )
 
 _DEV = "cpu"
-# The pool's stock `set_kv_buffer` dispatches on the PLATFORM
-# (memory_pool._is_cuda, resolved at import), not on the tensors it is handed:
-# on a CUDA box it routes into the CUDA-only `sglang::store_cache` op, which
-# cannot run CPU tensors. Tests that drive that production write path therefore
-# build on the device the platform advertises -- which also gives the store path
-# its REAL kernel coverage there instead of the naive index-assignment fallback.
-# Everything else in this file is byte-layout arithmetic and stays on CPU.
+# `set_kv_buffer` dispatches on the PLATFORM (memory_pool._is_cuda, resolved at
+# import), not on the tensors it is handed, so cases driving it must build on
+# the platform's device. The rest of this file is byte arithmetic, so CPU.
 _STORE_DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Small-but-nontrivial MHA geometry: L=2 layers, H=2 heads, D=4, so every byte
