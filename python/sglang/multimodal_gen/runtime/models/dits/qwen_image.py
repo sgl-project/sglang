@@ -19,8 +19,6 @@ from sglang.kernels.ops.diffusion import (
     fused_gelu_active,
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
-)
-from sglang.kernels.ops.diffusion.norm.norm_scale_shift_jit import (
     try_fused_bias_mul_add,
     try_fused_bias_scale_residual_norm_scale_shift,
 )

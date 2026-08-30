@@ -373,6 +373,8 @@ _EXPORTS: dict[str, str] = {
     "rmsnorm_tanh_residual": "norm.native_bf16_rmsnorm_triton",
     "norm_infer": "norm.norm_triton",
     "rms_norm_fn": "norm.norm_triton",
+    "try_fused_bias_mul_add": "norm.norm_scale_shift_jit",
+    "try_fused_bias_scale_residual_norm_scale_shift": "norm.norm_scale_shift_jit",
     "triton_one_pass_rms_norm": "norm.rmsnorm_onepass_triton",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "can_use_fused_scale_residual_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
