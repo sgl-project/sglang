@@ -247,19 +247,19 @@ class KVIndexTranslator:
         out: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-    ) -> torch.Tensor:
-        """`build_index_table(out=...)` for a caller that wants the tensor back
-        rather than the table: trtllm_mla / flashmla consume a block table
-        directly, its rows already being the index table's rows.
+    ) -> None:
+        """`build_index_table(into=...)` for a caller that owns a bare block
+        table rather than a KVReadTables: trtllm_mla / flashmla consume that
+        table directly, its rows already being the index table's rows.
         """
         assert (
             self.is_translating
         ), "KVIndexTranslator.fill_read_table on a pool that needs no translation"
-        return self.build_index_table(
+        self.build_index_table(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             into=KVReadTables(full=out, sliding_window=None),
-        ).ids
+        )
 
     def index_table_for_batch(self, forward_batch) -> KVIndexTable:
         """Eager per-batch view, memoized in one slot keyed by batch identity

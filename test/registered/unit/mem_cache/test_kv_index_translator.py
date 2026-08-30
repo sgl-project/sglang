@@ -279,8 +279,7 @@ class TestBuildInto(unittest.TestCase):
 
         width_pages = req_to_token.shape[1] // ps + 3  # wider than the span
         out = torch.full((len(lens), width_pages), -1, dtype=torch.int32)
-        got = src.fill_read_table(out=out, req_pool_indices=rows, seq_lens=seq_lens)
-        self.assertIs(got, out)
+        src.fill_read_table(out=out, req_pool_indices=rows, seq_lens=seq_lens)
 
         want = _reference_table(
             req_to_token,
