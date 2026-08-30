@@ -462,6 +462,8 @@ class SchedulerInvariantChecker:
         return has_leak, messages
 
     def _check_tree_cache(self):
+        if not envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():
+            return
         if (
             self.tree_cache.is_tree_cache()
             and (self.is_hybrid_swa and self.tree_cache.supports_swa())
