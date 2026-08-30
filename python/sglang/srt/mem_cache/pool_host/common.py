@@ -107,14 +107,19 @@ def get_allocator_from_storage(allocator_type):
         return HostTensorAllocator()
 
 
-def get_allocator_type() -> str:
-    """The host-allocator kind the published HiCache configuration asks for."""
+# The values get_allocator_from_storage() maps to something other than
+# HostTensorAllocator.
+_OWNED_MEMORY_ALLOCATOR_TYPES = ("shm", "mooncake", "mori")
 
-    backend = get_memory().hicache_storage_backend
+
+def allocator_type_of(cfg) -> str:
+    """The host-allocator kind a config-shaped object asks for."""
+
+    backend = cfg.hicache_storage_backend
     if backend == "shm":
         return "shm"
     if backend == "dynamic":
-        extra_config_str = get_memory().hicache_storage_backend_extra_config
+        extra_config_str = cfg.hicache_storage_backend_extra_config
         if extra_config_str:
             try:
                 config = json.loads(extra_config_str)
@@ -123,6 +128,23 @@ def get_allocator_type() -> str:
             except Exception:
                 pass
     return backend or "default"
+
+
+def get_allocator_type() -> str:
+    """The host-allocator kind the published HiCache configuration asks for."""
+
+    return allocator_type_of(get_memory())
+
+
+def host_allocator_owns_memory(cfg) -> bool:
+    """Whether ``cfg`` selects an allocator that owns its host memory.
+
+    The config-shaped form of the ``type(allocator) is HostTensorAllocator``
+    test in alloc_with_host_register(), for callers that must decide before any
+    pool exists. Over-reports if mooncake or mori is selected but its allocator
+    is unavailable, which is the safe direction.
+    """
+    return allocator_type_of(cfg) in _OWNED_MEMORY_ALLOCATOR_TYPES
 
 
 # Only these may be unregistered. A buffer that came from hipHostMalloc was

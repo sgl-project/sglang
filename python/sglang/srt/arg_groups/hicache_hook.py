@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ def handle_hicache(server_args: Any):
     """Normalize hicache-related knobs into a valid runtime configuration.
 
     Resolution order:
+    0) ROCm <-> I/O compatibility (may rewrite io backend).
     1) Layout <-> I/O compatibility for direct conflicts.
     2) Storage <-> layout compatibility (may rewrite layout).
     """
@@ -48,6 +50,11 @@ def handle_hicache(server_args: Any):
         return
 
     validate_hicache_host_memory_mode(server_args)
+
+    # Step 0: must run before step 1, so the downgrade lands on the same
+    # configuration as an explicit --hicache-io-backend direct, whose default
+    # page_first layout step 1 then rewrites.
+    resolve_hicache_rocm_io_compatibility(server_args)
 
     # Step 1: Initial layout-io compatibility normalization.
     resolve_layout_io_compatibility(server_args)
@@ -121,6 +128,34 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
         "logical slot accounting with per-rank physical translation at "
         "the transfer boundary (dcp_size=%d).",
         cfg.dcp_size,
+    )
+
+
+def resolve_hicache_rocm_io_compatibility(server_args: Any):
+    """Downgrade to direct where ROCm cannot address the host pool from the GPU."""
+    cfg = resolving_view(server_args)
+    if not get_platform().is_hip or cfg.hicache_io_backend != "kernel":
+        return
+
+    # Imported here so the allocator-type mapping keeps one definition, the one
+    # alloc_with_host_register() also relies on.
+    from sglang.srt.mem_cache.pool_host.common import (
+        allocator_type_of,
+        host_allocator_owns_memory,
+    )
+
+    if not host_allocator_owns_memory(cfg):
+        return
+
+    declare_resolution(
+        server_args,
+        "_resolve_hicache_rocm_io_compatibility",
+        hicache_io_backend="direct",
+    )
+    logger.warning(
+        "Kernel io backend cannot address the host memory owned by the %s "
+        "allocator on ROCm, switching to direct io backend",
+        allocator_type_of(cfg),
     )
 
 
