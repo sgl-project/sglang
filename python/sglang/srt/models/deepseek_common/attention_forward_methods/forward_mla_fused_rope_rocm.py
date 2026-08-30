@@ -21,10 +21,12 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 if _is_cuda:
+
     def bmm_fp8(A, B, A_scale, B_scale, dtype, out=None):
         from sgl_kernel import bmm_fp8 as raw_bmm_fp8
 
         return raw_bmm_fp8(A, B, A_scale, B_scale, dtype, out)
+
 
 if _is_hip:
     from sglang.kernels.ops.attention.rocm_mla_decode_rope import (
