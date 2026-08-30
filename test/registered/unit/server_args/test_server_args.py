@@ -659,8 +659,8 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
 
 
 class TestCakeLinearAttnBackend(unittest.TestCase):
-    @patch("sglang.srt.arg_groups.attention_hook.is_cuda", return_value=False)
-    def test_shared_backend_selects_cake_for_prefill_and_decode(self, _mock_is_cuda):
+    @override_platform(is_cuda=False)
+    def test_shared_backend_selects_cake_for_prefill_and_decode(self):
         server_args = ServerArgs(model_path="dummy", linear_attn_backend="cake")
 
         handle_linear_attn_backend(server_args)
@@ -669,8 +669,8 @@ class TestCakeLinearAttnBackend(unittest.TestCase):
         self.assertIsNone(resolution_result(server_args, "linear_attn_decode_backend"))
         self.assertIsNone(resolution_result(server_args, "linear_attn_prefill_backend"))
 
-    @patch("sglang.srt.arg_groups.attention_hook.is_cuda", return_value=False)
-    def test_per_phase_override_wins_over_shared_cake_backend(self, _mock_is_cuda):
+    @override_platform(is_cuda=False)
+    def test_per_phase_override_wins_over_shared_cake_backend(self):
         server_args = ServerArgs(
             model_path="dummy",
             linear_attn_backend="cake",
@@ -684,8 +684,8 @@ class TestCakeLinearAttnBackend(unittest.TestCase):
         )
         self.assertIsNone(resolution_result(server_args, "linear_attn_prefill_backend"))
 
-    @patch("sglang.srt.utils.is_sm100_supported", return_value=True)
-    def test_kimi_k3_default_respects_shared_cake_backend(self, _mock_sm100):
+    @override_platform(is_sm100=True)
+    def test_kimi_k3_default_respects_shared_cake_backend(self):
         server_args = ServerArgs(
             model_path="dummy",
             linear_attn_backend="cake",
@@ -696,8 +696,8 @@ class TestCakeLinearAttnBackend(unittest.TestCase):
 
         self.assertIsNone(resolution_result(server_args, "linear_attn_decode_backend"))
 
-    @patch("sglang.srt.utils.is_sm100_supported", return_value=True)
-    def test_kimi_k3_default_keeps_default_triton_decode(self, _mock_sm100):
+    @override_platform(is_sm100=True)
+    def test_kimi_k3_default_keeps_default_triton_decode(self):
         server_args = ServerArgs(model_path="dummy", mamba_ssm_dtype="bfloat16")
 
         apply_kimi_k3_linear_attn_defaults(server_args)
@@ -706,12 +706,9 @@ class TestCakeLinearAttnBackend(unittest.TestCase):
             resolution_result(server_args, "linear_attn_decode_backend"), "triton"
         )
 
-    @patch(
-        "sglang.srt.utils.is_sm100_supported",
-        return_value=True,
-    )
+    @override_platform(is_sm100=True)
     def test_kimi_linear_equal_head_d128_defaults_prefill_and_decode_to_cake(
-        self, _mock_sm100
+        self,
     ):
         server_args = ServerArgs(
             model_path="dummy",
@@ -735,11 +732,8 @@ class TestCakeLinearAttnBackend(unittest.TestCase):
             resolution_result(server_args, "linear_attn_prefill_backend"), "cake"
         )
 
-    @patch(
-        "sglang.srt.utils.is_sm100_supported",
-        return_value=True,
-    )
-    def test_kimi_linear_tp_shapes_default_ssm_state_to_bfloat16(self, _mock_sm100):
+    @override_platform(is_sm100=True)
+    def test_kimi_linear_tp_shapes_default_ssm_state_to_bfloat16(self):
         hf_config = SimpleNamespace(
             linear_attn_config={"num_heads": 32, "head_dim": 128}
         )
@@ -764,12 +758,9 @@ class TestCakeLinearAttnBackend(unittest.TestCase):
                     "cake",
                 )
 
-    @patch(
-        "sglang.srt.utils.is_sm100_supported",
-        return_value=True,
-    )
+    @override_platform(is_sm100=True)
     def test_kimi_linear_equal_head_d128_respects_explicit_fp32_ssm_state(
-        self, _mock_sm100
+        self,
     ):
         server_args = ServerArgs(
             model_path="dummy", mamba_ssm_dtype="float32", tp_size=2
@@ -788,12 +779,9 @@ class TestCakeLinearAttnBackend(unittest.TestCase):
         self.assertIsNone(resolution_result(server_args, "linear_attn_decode_backend"))
         self.assertIsNone(resolution_result(server_args, "linear_attn_prefill_backend"))
 
-    @patch(
-        "sglang.srt.utils.is_sm100_supported",
-        return_value=True,
-    )
+    @override_platform(is_sm100=True)
     def test_kimi_linear_rejects_nondivisible_empty_or_non_d128_contract(
-        self, _mock_sm100
+        self,
     ):
         for tp_size, num_heads, head_dim in (
             (3, 32, 128),
@@ -825,9 +813,9 @@ class TestCakeLinearAttnBackend(unittest.TestCase):
                     resolution_result(server_args, "linear_attn_prefill_backend")
                 )
 
-    @patch("sglang.srt.utils.is_sm100_supported", return_value=True)
+    @override_platform(is_sm100=True)
     def test_kimi_k3_default_keeps_triton_decode_for_other_shared_backend(
-        self, _mock_sm100
+        self,
     ):
         server_args = ServerArgs(
             model_path="dummy",
