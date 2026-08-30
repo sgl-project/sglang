@@ -86,9 +86,32 @@ def build_doc(sess: int, start: int, target_chars: int) -> str:
     return "".join(parts)
 
 
+# Workload-defined tool mix: each round the harness samples a tool from this
+# distribution and instructs the model to call it (a benchmark property, not
+# left to the model's preference, which skews heavily toward quick tools).
+TOOL_MIX = {"quick_fs": 0.5, "web_search": 0.2, "run_tests": 0.2, "code_edit": 0.1}
+
+TOOL_EXAMPLE = {
+    "quick_fs": '{"path": "src/"}',
+    "web_search": '{"query": "proper fix for this failure"}',
+    "code_edit": '{"file": "src/main.py", "change": "guard the empty case"}',
+    "run_tests": '{"scope": "all"}',
+}
+
+
 def sample_latency(tool: str, rng: random.Random, scale: float = 1.0) -> float:
     mu, sigma = TOOL_TABLE[tool]
     return rng.lognormvariate(mu, sigma) * scale
+
+
+def sample_tool(rng: random.Random) -> str:
+    """Workload-defined tool mix (the harness instructs the model per round)."""
+    x, acc = rng.random(), 0.0
+    for name, w in TOOL_MIX.items():
+        acc += w
+        if x < acc:
+            return name
+    return "quick_fs"
 
 
 def tool_result_text(tool: str, rng: random.Random) -> str:
@@ -178,14 +201,18 @@ async def run_session(sid, args, client, model, out_f, lock):
     rng = random.Random(args.seed * 100003 + sid)
     s = Session(sid, args.base_chars, args.growth_chars)
     for r in range(args.rounds):
+        # --- instruct the tool for this round (workload-defined mix) ---
+        intended = sample_tool(rng)
+        s.messages.append({"role": "user", "content": (
+            f"Next step: use the `{intended}` tool with arguments like "
+            f"`{TOOL_EXAMPLE[intended]}`.")})
         # --- action turn: model emits a tool call; prefix cached server-side ---
         hist, prompt_a = await run_action_turn(client, model, s.messages, args.action_tokens)
         s.messages.append(hist)
         calls = hist.get("tool_calls") or []
-        if not calls:  # model replied in prose; treat as a quick_fs tick
+        if not calls:  # model replied in prose; use the intended tool anyway
             calls = [{"id": f"fallback_{sid}_{r}", "type": "function",
-                      "function": {"name": "quick_fs", "arguments": "{}"}}]
-            s.messages.append({"role": "user", "content": "Please use one of the tools."})
+                      "function": {"name": intended, "arguments": TOOL_EXAMPLE[intended]}}]
         # --- tool gap: parallel calls overlap; wait for the slowest ---
         tools_called = [tc["function"]["name"] for tc in calls]
         gaps = [sample_latency(t, rng, args.latency_scale) for t in tools_called]
@@ -200,7 +227,8 @@ async def run_session(sid, args, client, model, out_f, lock):
         s.messages.append({"role": "assistant", "content": "Continuing."})
         s.grow()
         rec = {
-            "sid": sid, "round": r, "tools": tools_called, "gap_s": round(gap, 3),
+            "sid": sid, "round": r, "tools": tools_called, "intended": intended,
+            "gap_s": round(gap, 3),
             "ttft_action_ms": None, "ttft_cont_ms": round(ttft_c, 1),
             "prompt_action": prompt_a, "prompt_cont": prompt_c,
             "ts": time.time(),

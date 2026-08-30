@@ -1,0 +1,10 @@
+===== KV-bench summary =====
+config: N=8 rounds=6 seed=7 wall=37s requests=48
+cont TTFT    ms: p50=146 p90=400 mean=201
+evicted(miss): 1/48 = 2.1%
+  hit  TTFT p50=143ms prompt p50=7318
+  miss TTFT p50=817ms prompt p50=5841
+  fast-tool(<=1s) n=47 miss=2%
+  slow-tool(>1s)  n=1 miss=0%
+wasted recompute tokens (miss turns): 5841
+total continuation prompt tokens: 324476
