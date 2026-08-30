@@ -250,7 +250,23 @@ class TeaCacheMixin:
             self.previous_modulated_input_negative = modulated_inp.clone()
             self.accumulated_rel_l1_distance_negative = new_accum
 
+        self._maybe_record_decision(should_calc)
         return should_calc
+
+    def _maybe_record_decision(self, should_calc: bool) -> None:
+        """Append this step's compute/skip decision to the request's
+        decision_trace, if record_decision_trace was requested (see
+        compile_trajectory_gate.TrajectoryGate.require_decision_trace_match).
+        """
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        forward_batch = get_forward_context().forward_batch
+        if forward_batch is not None and getattr(
+            forward_batch, "record_decision_trace", False
+        ):
+            forward_batch.decision_trace.append(should_calc)
 
     def _get_teacache_context(self) -> TeaCacheContext | None:
         """

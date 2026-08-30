@@ -51,6 +51,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument("--dit-precision", default="unspecified")
     parser.add_argument(
+        "--regional-compile",
+        action="store_true",
+        help=(
+            "Compile only the matching submodules declared by the model's "
+            "_compile_conditions instead of the whole transformer. Only some "
+            "models declare _compile_conditions (e.g. ZImageTransformer2DModel "
+            "does not); passing this for an unsupported model raises "
+            "'no matching submodules' rather than falling back silently."
+        ),
+    )
+    parser.add_argument(
         "--enable-cfg-parallel",
         action="store_true",
         help=(
@@ -113,10 +124,11 @@ def _run_rollout(
     model_path: str,
     num_gpus: int,
     sampling_kwargs: dict[str, Any],
-    regional_compile: bool,
+    compile_candidate: bool,
     warmup: bool,
     enable_cfg_parallel: bool = False,
     cache_dit_config: str | None = None,
+    regional_compile: bool = True,
 ) -> RolloutResult:
     from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
         DiffGenerator,
@@ -126,8 +138,12 @@ def _run_rollout(
         "local_mode": True,
         "model_path": model_path,
         "num_gpus": num_gpus,
-        "enable_torch_compile": regional_compile,
-        "regional_compile": regional_compile,
+        "enable_torch_compile": compile_candidate,
+        # Whole-module compile if the model declares no _compile_conditions
+        # (e.g. ZImageTransformer2DModel); regional compile raises "no
+        # matching submodules" for those models instead of silently falling
+        # back, so this must match what the model actually supports.
+        "regional_compile": compile_candidate and regional_compile,
         "enable_cfg_parallel": enable_cfg_parallel,
     }
     if cache_dit_config is not None:
@@ -172,6 +188,7 @@ def build_manifest(args: argparse.Namespace) -> CompiledPlanManifest:
         "guidance_scale": args.guidance_scale,
         "seed": args.seed,
         "return_trajectory_latents": True,
+        "record_decision_trace": True,
         "save_output": False,
     }
     if args.num_frames is not None:
@@ -181,7 +198,7 @@ def build_manifest(args: argparse.Namespace) -> CompiledPlanManifest:
         model_path=args.model_path,
         num_gpus=args.num_gpus,
         sampling_kwargs=sampling_kwargs,
-        regional_compile=False,
+        compile_candidate=False,
         warmup=False,
         enable_cfg_parallel=args.enable_cfg_parallel,
         cache_dit_config=args.cache_dit_config,
@@ -190,10 +207,11 @@ def build_manifest(args: argparse.Namespace) -> CompiledPlanManifest:
         model_path=args.model_path,
         num_gpus=args.num_gpus,
         sampling_kwargs=sampling_kwargs,
-        regional_compile=True,
+        compile_candidate=True,
         warmup=True,
         enable_cfg_parallel=args.enable_cfg_parallel,
         cache_dit_config=args.cache_dit_config,
+        regional_compile=args.regional_compile,
     )
 
     ref_latents = torch.as_tensor(reference.result.trajectory_latents)
@@ -220,6 +238,17 @@ def build_manifest(args: argparse.Namespace) -> CompiledPlanManifest:
         if not passes_thresholds(checkpoint_metrics[checkpoint_name], thresholds):
             status = "rejected"
             break
+
+    # Only meaningful when cache-dit/teacache is active (args.cache_mode != "none");
+    # both traces come back empty otherwise, and an empty-vs-empty match would be a
+    # vacuous pass, not a real decision-trace validation.
+    reference_trace = list(getattr(reference.result, "decision_trace", None) or [])
+    candidate_trace = list(getattr(candidate.result, "decision_trace", None) or [])
+    decision_trace_matched: bool | None = None
+    if reference_trace or candidate_trace:
+        decision_trace_matched = reference_trace == candidate_trace
+        if not decision_trace_matched:
+            status = "rejected"
 
     signature = CompileWorkloadSignature(
         model_revision=args.model_path,
@@ -253,11 +282,12 @@ def build_manifest(args: argparse.Namespace) -> CompiledPlanManifest:
     return CompiledPlanManifest(
         signature=signature,
         regions=(),
-        compile_options={"regional_compile": True},
+        compile_options={"regional_compile": args.regional_compile},
         gate_digest=signature.digest(),
         status=status,
         checkpoint_metrics=checkpoint_metrics,
         benchmark=benchmark,
+        decision_trace_matched=decision_trace_matched,
     )
 
 

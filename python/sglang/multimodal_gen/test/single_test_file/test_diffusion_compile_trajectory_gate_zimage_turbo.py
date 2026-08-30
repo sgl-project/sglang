@@ -93,7 +93,6 @@ class TestDiffusionCompileTrajectoryGateZImageTurbo(CustomTestCase):
             "--guidance-scale",
             "0.0",
             "--enable-torch-compile",
-            "--regional-compile",
             "--compile-trajectory-gate-manifest",
             str(manifest_path),
         ]

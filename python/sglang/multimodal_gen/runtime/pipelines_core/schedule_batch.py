@@ -191,6 +191,10 @@ class Req:
     trajectory_latents: torch.Tensor | None = None
     rollout_trajectory_data: RolloutTrajectoryData | None = None
     trajectory_audio_latents: torch.Tensor | None = None
+    # Per-step cache skip/compute decisions, recorded when record_decision_trace is
+    # set (see cache.teacache.TeaCacheMixin._compute_teacache_decision). Feeds
+    # compile_trajectory_gate.TrajectoryGate.require_decision_trace_match.
+    decision_trace: list[bool] = field(default_factory=list)
 
     # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
     extra: dict[str, Any] = field(default_factory=dict)
@@ -461,6 +465,7 @@ class OutputBatch:
     trajectory_latents: torch.Tensor | None = None
     rollout_trajectory_data: RolloutTrajectoryData | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
+    decision_trace: list[bool] | None = None
     error: str | None = None
     output_file_paths: list[str] | None = None
 
@@ -480,6 +485,7 @@ class OutputBatch:
         self.trajectory_latents = None
         self.rollout_trajectory_data = None
         self.trajectory_decoded = None
+        self.decision_trace = None
         self.output_file_paths = None
         self.raw_frame_batches = None
         self.noise_pred = None
