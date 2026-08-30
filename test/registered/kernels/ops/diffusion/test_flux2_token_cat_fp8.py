@@ -1,3 +1,4 @@
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -49,3 +50,7 @@ def test_flux2_token_cat_fp8_rejects_cuda_graph_capture() -> None:
     scale = torch.ones((1,), device="cuda", dtype=torch.float32)
     with patch("torch.cuda.is_current_stream_capturing", return_value=True):
         assert try_flux2_token_cat_fp8(attention, mlp, scale) is None
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
