@@ -147,12 +147,8 @@ DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
 DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 
 # Nightly tests
-# Models other registered tests already exercise are not listed here: a
-# regression on Llama-3.1-8B, Qwen3-8B/4B, Mixtral BF16, Llama-3.1-8B-FP8 or
-# GLM-4.5-Air-FP8 surfaces in the quant / moe / e2e suites that use them as their
-# base model, so re-running gsm8k on them buys nothing. What remains is what this
-# eval is the only coverage for, which is mostly the neuralmagic FP8 quantizations.
-# (The former TP1 list held only models in that first group, so it is gone.)
+# Deliberate omission: a model another registered suite already uses as its base
+# model is left out, since a regression there surfaces in that suite instead.
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = (
     "meta-llama/Llama-3.1-70B-Instruct,Qwen/Qwen2-57B-A14B-Instruct"
 )
