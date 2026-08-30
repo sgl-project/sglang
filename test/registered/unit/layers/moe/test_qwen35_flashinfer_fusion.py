@@ -59,14 +59,17 @@ def test_supported_forward_modes(forward_mode, expected):
     assert is_supported_forward_mode(forward_mode) is expected
 
 
-def test_framework_capacity_is_maximum_of_all_sources():
+def test_framework_capacity_is_maximum_of_all_sources(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.qwen35_flashinfer_fusion.cutedsl_moe_max_num_tokens",
+        lambda _server_args: 8192,
+    )
     graph = SimpleNamespace(
         decode=SimpleNamespace(max_bs=512, bs=[1, 64, 256]),
         prefill=SimpleNamespace(max_bs=4096, bs=[1024, 2048, 4096]),
     )
     server_args = SimpleNamespace(
         cuda_graph_config=graph,
-        cutedsl_moe_max_num_tokens=lambda: 8192,
     )
     runner = SimpleNamespace(server_args=server_args, max_running_requests=2048)
 
