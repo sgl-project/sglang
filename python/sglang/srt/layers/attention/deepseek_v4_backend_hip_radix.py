@@ -1326,8 +1326,14 @@ class DeepseekV4HipRadixBackend(
         attn_sink: torch.Tensor,
         core_attn_metadata: DSV4AttnMetadata,
         save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """unified_kv paged-attention path over the bf16 unified_kv"""
+        """unified_kv paged-attention path over the unified_kv pool.
+
+        ``q_rope`` is what tells the two layouts apart: present means ``q`` is a
+        packed fp8 row and the pool is the two-pool fp8 one, so decode goes to
+        the asm reader; absent means both are plain bf16 and it goes to Triton.
+        """
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 
         pool = self.token_to_kv_pool
@@ -1390,6 +1396,25 @@ class DeepseekV4HipRadixBackend(
                 )
             else:
                 raise ValueError(f"bad compress_ratio {compress_ratio}")
+            if q_rope is not None:
+                # softmax_scale is not passed on: the asm kernel hardcodes
+                # 1/sqrt(512), which is what self.softmax_scale already is for
+                # V4's head_dim=512. The other readers here take it explicitly,
+                # so a head_dim change would leave only this one mis-scaled.
+                assert self.softmax_scale == 512**-0.5, (
+                    "the v4 nm asm kernel hardcodes 1/sqrt(512), this backend is "
+                    f"at {self.softmax_scale}"
+                )
+                return runtime.decode_fp8_2buff(
+                    q=q,
+                    q_rope=q_rope,
+                    unified_kv=unified,
+                    unified_kv_rope=pool.get_unified_kv_rope(layer_id),
+                    kv_indices=kv_indices,
+                    kv_indptr=kv_indptr,
+                    attn_sink=attn_sink,
+                    v_head_dim=layer.v_head_dim,
+                )
             return runtime.decode(
                 q=q,
                 unified_kv=unified,
@@ -1584,6 +1609,7 @@ class DeepseekV4HipRadixBackend(
         compress_ratio: Literal[0, 4, 128],
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
+        q_rope: Optional[torch.Tensor] = None,
         **_,
     ) -> torch.Tensor:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
@@ -1612,6 +1638,7 @@ class DeepseekV4HipRadixBackend(
                 attn_sink=attn_sink,
                 core_attn_metadata=core_attn_metadata,
                 save_kv_cache=save_kv_cache,
+                q_rope=q_rope,
             )
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):

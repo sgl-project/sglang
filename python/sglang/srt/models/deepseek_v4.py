@@ -1342,6 +1342,7 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
+        q_rope_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
         # kv_score depends only on x, so its CP all-gather can start before the
@@ -1470,6 +1471,7 @@ class MQALayer(MqaAttentionBase):
                 bf16_store=bf16_store,
                 fp8_2buff=fp8_2buff,
                 swa_rope_cache=swa_rope_cache,
+                q_rope_out=q_rope_out,
             )
             # On the verify path the kernel normed + RoPE'd kv in place and wrote
             # nothing, so hand it back: the caller feeds it to attention as the
@@ -1626,11 +1628,39 @@ class MQALayer(MqaAttentionBase):
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
-        tp_slice, q_padded, q_out = slice(None), None, None
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
+            is_unified_kv_triton,
+        )
+
+        unified = is_unified_kv_triton()
+        # The v4 nm asm reader takes Q in the pool's own packed form, so fp8
+        # decode wants a contiguous fp8 buffer of exactly the local heads --
+        # q_padded below is a FlashMLA layout and buys nothing here. Prefill is
+        # unaffected: it never reaches the fused store (M8).
+        unified_fp8_decode = (
+            unified
+            and is_unified_kv_fp8()
+            and forward_batch.forward_mode.is_decode_or_idle()
+        )
+
+        tp_slice, q_padded, q_out, q_rope = slice(None), None, None, None
         # Above this the SM120 route is the prefill kernel, which takes
         # arbitrary h_q, so the decode pad below would just be sliced back off.
         skip_decode_pad = is_sm120_supported() and x.shape[0] > SM120_DECODE_MAX_TOKENS
-        if self.attn_tp_size > 1:
+        if unified_fp8_decode:
+            # width and dtype come off the pools themselves; the kernel reads Q
+            # with the kv row stride, so the two must not drift
+            kv_pool = get_token_to_kv_pool()
+            nope_pool = kv_pool.get_unified_kv(self.layer_id)
+            rope_pool = kv_pool.get_unified_kv_rope(self.layer_id)
+            q_out = nope_pool.new_empty(
+                (x.shape[0], self.n_local_heads, nope_pool.shape[-1])
+            )
+            q_rope = rope_pool.new_empty(
+                (x.shape[0], self.n_local_heads, rope_pool.shape[-1])
+            )
+        elif self.attn_tp_size > 1:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
@@ -1691,6 +1721,7 @@ class MQALayer(MqaAttentionBase):
                 attn_backend,
                 q_out,
                 x_quant=x_quant,
+                q_rope_out=q_rope,
             )
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
@@ -1701,11 +1732,8 @@ class MQALayer(MqaAttentionBase):
         # _forward_prepare* deliberately left the store off and the backend does
         # its normal causally-indexed store from attn_k = kv.
         attn_k = kv if kv is not None else q
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
 
-        if is_unified_kv_triton():
+        if unified:
             o = attn_backend.forward(
                 q=q_out if q_out is not None else q,
                 k=attn_k,
@@ -1714,6 +1742,7 @@ class MQALayer(MqaAttentionBase):
                 forward_batch=forward_batch,
                 compress_ratio=self.compress_ratio,
                 attn_sink=attn_sink[: self.n_local_heads],
+                q_rope=q_rope,
                 save_kv_cache=kv is not None,
             )
         else:

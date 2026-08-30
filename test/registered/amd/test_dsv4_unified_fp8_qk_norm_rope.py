@@ -3,8 +3,10 @@
 Under SGLANG_DSV4_UNIFIED_KV_FP8 ``fused_qk_norm_rope_swa_store`` delegates to
 aiter, which packs K into a 512 B fp8 nope row (448 B payload + 14 B duplicated
 E8M0 tile scales) plus a bf16 rope row and scatters both into the SWA ring.
-These tests pin that layout, which the decode reader depends on, and that Q
-comes back unquantized.
+These tests pin that layout, which the decode reader depends on, and which of the
+two forms Q comes back in: the same packed pair when the caller supplies a rope
+buffer (what the v4 nm asm reader takes), plain rotated bf16 when it does not
+(what the Triton reader takes).
 """
 
 import unittest
@@ -102,7 +104,15 @@ class _StoreCase(CustomTestCase):
 
 @unittest.skipUnless(_HAS_GROUP_QUANT, "needs aiter's group-quant kernel on gfx95x")
 class TestUnifiedFp8QkNormRope(_StoreCase):
-    def _call(self, nope_pool=None, rope_pool=None, k_nope=None, k_rope=None):
+    def _call(
+        self,
+        nope_pool=None,
+        rope_pool=None,
+        k_nope=None,
+        k_rope=None,
+        q_out=None,
+        q_rope_out=None,
+    ):
         return fused_qk_norm_rope_swa_store(
             q=self.q,
             kv=self.kv,
@@ -122,6 +132,8 @@ class TestUnifiedFp8QkNormRope(_StoreCase):
             swa_rope_cache=rope_pool,
             k_nope_out=k_nope,
             k_rope_out=k_rope,
+            q_out=q_out,
+            q_rope_out=q_rope_out,
         )
 
     def test_pool_rows_equal_the_dense_packed_output(self):
@@ -204,6 +216,68 @@ class TestUnifiedFp8QkNormRope(_StoreCase):
         got = q_out[:, 0].float()
         torch.testing.assert_close(got[:, :NOPE_DIM], ref_nope, rtol=2e-2, atol=2e-2)
         torch.testing.assert_close(got[:, NOPE_DIM:], ref_pe, rtol=2e-2, atol=2e-2)
+
+    def test_q_is_packed_like_k_when_a_rope_buffer_is_given(self):
+        """the v4 nm asm reader wants Q in the same 512 B form as the pool rows
+
+        Pinned against the bf16 Q the same call produces without the rope buffer,
+        so this is the quantization of a known-good rotated Q rather than a
+        second reimplementation of norm+rope.
+        """
+        q_packed = torch.empty(
+            self.T,
+            NUM_HEADS,
+            DSV4_FP8_NOPE_ROW_BYTES,
+            dtype=torch.float8_e4m3fn,
+            device=DEVICE,
+        )
+        q_rope = torch.empty(
+            self.T, NUM_HEADS, ROPE_DIM, dtype=torch.bfloat16, device=DEVICE
+        )
+        got = self._call(q_out=q_packed, q_rope_out=q_rope)
+        self.assertIs(got, q_packed)
+
+        ref = self._call().float()  # bf16 Q, same input
+        ref_nope, ref_pe = ref[..., :NOPE_DIM], ref[..., NOPE_DIM:]
+
+        raw = q_packed.view(torch.uint8)
+        exp = _ref_tile_scales(ref_nope.reshape(-1, NOPE_DIM)).reshape(
+            self.T, NUM_HEADS, NUM_TILES
+        )
+        scale_bytes = raw[..., SCALE_OFF : SCALE_OFF + SCALE_BYTES].reshape(
+            self.T, NUM_HEADS, NUM_TILES, 2
+        )
+        torch.testing.assert_close(
+            scale_bytes[..., 0].int() - 127, exp.int(), rtol=0, atol=0
+        )
+        self.assertTrue(torch.equal(scale_bytes[..., 0], scale_bytes[..., 1]))
+
+        scale = torch.exp2(scale_bytes[..., 0].float() - 127)
+        dq = (
+            raw[..., :NOPE_DIM]
+            .view(torch.float8_e4m3fn)
+            .float()
+            .reshape(self.T, NUM_HEADS, NUM_TILES, DSV4_FP8_QUANT_TILE)
+            * scale.unsqueeze(-1)
+        ).reshape(self.T, NUM_HEADS, NOPE_DIM)
+        # atol is half an fp8 step at the *tile's* absmax, not a per-element
+        # relative error -- a small value sharing a tile with a large one carries
+        # the large one's step. Measured 0.125 worst case at absmax 3.9, and the
+        # parts that must be exact (scale bytes above, rope below) are pinned as
+        # such.
+        torch.testing.assert_close(dq, ref_nope, rtol=5e-2, atol=5e-2)
+        torch.testing.assert_close(q_rope.float(), ref_pe, rtol=0, atol=0)
+
+    def test_fp8_q_without_a_rope_buffer_is_rejected(self):
+        q_packed = torch.empty(
+            self.T,
+            NUM_HEADS,
+            DSV4_FP8_NOPE_ROW_BYTES,
+            dtype=torch.float8_e4m3fn,
+            device=DEVICE,
+        )
+        with self.assertRaises(AssertionError):
+            self._call(q_out=q_packed)
 
     def test_strided_q_out_is_filled_without_touching_the_padding(self):
         """attn_tp_size > 1 hands us a slice of a head-padded [T, 64, D] buffer
