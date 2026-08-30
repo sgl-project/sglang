@@ -133,7 +133,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 is_mhc = hc_hidden_size is not None
                 hs = hc_hidden_size if is_mhc else hidden_size
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+                    "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
                 }
                 if not is_mhc:
                     # Only Kimi K3 supplies num_blocks: its PP bank is token-major
@@ -141,7 +141,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     residual_shape = (
                         (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
                         if pp_proxy_residual_num_blocks is not None
-                        else (max_bs, hidden_size)
+                        else (max_num_token, hidden_size)
                     )
                     pp_proxy_tensors["residual"] = torch.zeros(
                         residual_shape, dtype=dtype
@@ -356,7 +356,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         hidden_size: int,
         dtype: torch.dtype,
         enable_mamba_track: bool,
-        pp_size: int,
+        pp_size: int = 1,
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,

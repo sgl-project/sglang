@@ -156,7 +156,7 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
 
 
 class NPUMXFP8LinearMethod(_NPULinearMethodBase):
-    """Ascend NPU MXFP8 linear method for LLM (SRT) models.
+    """NPU MXFP8 linear method for LLM (SRT) models.
 
     Shared kernel for both the online config path (``--quantization mxfp8``) and
     the offline ModelSlimMXFP8Scheme (which delegates to this as ``self.kernel``).
@@ -343,7 +343,7 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
 
 
 class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
-    """Ascend NPU W4A8 online quantization: MXFP4 weights + MXFP8 activations.
+    """NPU W4A8 online quantization: MXFP4 weights + MXFP8 activations.
 
     This is a *true* W4(weight) A8(activation) path: it mirrors the offline
     ``W4A8_MXFP`` kernel (``NPUMXFP4W4A8OfflineLinearMethod``) exactly — the only
@@ -363,7 +363,7 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         BF16/FP16 activation → npu_dynamic_mx_quant(dst=float8_e4m3fn)  (A8, FP8)
         → npu_quant_matmul(x2_dtype=float4_e2m1fn_x2, group_sizes=[0, 0, block])
 
-    Hardware: Ascend 950 (A5) + a recent torch_npu with the FP4 npu_quant_matmul
+    Hardware: A5 NPU + a recent torch_npu with the FP4 npu_quant_matmul
     (same requirement as the offline W4A8 path — see that class's docstring).
     """
 
@@ -513,7 +513,7 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
 
 
 class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
-    """Ascend NPU offline W4A8 (ModelSlim ``W4A8_MXFP``): packed-FP4 weights + MXFP8 activations.
+    """NPU offline W4A8 (ModelSlim ``W4A8_MXFP``): packed-FP4 weights + MXFP8 activations.
 
     Kernel for the offline ModelSlimMXFP4W4A8Scheme (delegated as ``self.kernel``).
     The msmodelslim ``W4A8_MXFP`` checkpoint stores weights as *packed FP4*
@@ -626,7 +626,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
 
 
 class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
-    """Ascend NPU W4A4 online quantization: single-level MXFP4.
+    """NPU W4A4 online quantization: single-level MXFP4.
 
     True W4(weight) A4(activation): both weights and activations are quantised to
     single-level MXFP4 (``float4_e2m1fn_x2``), unlike the W4A8 path which keeps FP8
@@ -642,8 +642,8 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
         → npu_quant_matmul(x1_dtype = x2_dtype = float4_e2m1fn_x2,
                            group_sizes=[1, 1, MXFP4_BLOCK_SIZE])
 
-    Triggered by ``--quantization mxfp4`` on Ascend NPU. Hardware: Ascend 950 (A5)
-    with a recent torch_npu exposing ``float4_e2m1fn_x2``.
+    Triggered by ``--quantization mxfp4`` on NPU. Hardware: A5 NPU with a recent
+    torch_npu exposing ``float4_e2m1fn_x2``.
     """
 
     def create_weights(
@@ -765,7 +765,7 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
 
 
 class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
-    """Ascend NPU offline W4A4 (ModelSlim ``W4A4_MXFP4``): packed FP4 weights.
+    """NPU offline W4A4 (ModelSlim ``W4A4_MXFP4``): packed FP4 weights.
 
     Kernel for the offline ``ModelSlimMXFP4Scheme`` (delegated as ``self.kernel``).
     The msmodelslim ``W4A4_MXFP4`` checkpoint stores weights as packed ``uint8``
@@ -796,7 +796,7 @@ class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
 
 
 class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
-    """Ascend NPU W4A4 online quantization: dual-level MXFP4 (higher accuracy).
+    """NPU W4A4 online quantization: dual-level MXFP4 (higher accuracy).
 
     This is the sole online ``--quantization mxfp4`` linear path. Instead of a single
     UE8M0 (power-of-2) block scale, dual-level MX quant produces a finer L0 (FP8 E4M3)
@@ -819,9 +819,8 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
         BF16/FP16 activation → npu_dynamic_dual_level_mx_quant  (A4, dual-level)
         → npu_dual_level_quant_matmul(act, weight, act_l0, w_l0, act_l1, w_l1)
 
-    Reference: Diffusion ``NPUMXFP4DiffusionLinearMethod`` / MindIE-SD
-    ``W4A4MXFP4DualQuantLinear``. Hardware: Ascend 950 (A5) only — the
-    ``DualLevelQuantBatchMatmul`` op is unavailable on A2/A3.
+    Reference: Diffusion ``NPUMXFP4DiffusionLinearMethod``. Hardware: A5 NPU
+    only — the ``DualLevelQuantBatchMatmul`` op is unavailable on A2/A3.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
