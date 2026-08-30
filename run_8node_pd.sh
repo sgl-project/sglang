@@ -2,6 +2,8 @@
 
 # ===== Cleanup =====
 unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY ASCEND_LAUNCH_BLOCKING
+unset SGLANG_ENABLE_SPEC_V2 SGLANG_SIMULATE_ACC_LEN SGLANG_SIMULATE_ACC_METHOD
+unset SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS
 
 pkill -9 python  2>/dev/null || true
 pkill -9 sglang 2>/dev/null || true
@@ -46,7 +48,7 @@ export SGLANG_OPT_FP8_WO_A_GEMM=False
 export MF_HYBM_USE_VMM_SEGMENT=1
 export ASCEND_MF_TRANSFER_PROTOCOL="device_urma"
 # [DEEPEP]
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=35
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
 export TRANSFORMERS_VERBOSITY=error
 
 # [多机]
@@ -62,11 +64,11 @@ MODEL_PATH=/mnt/share/y00882530/1600B
 SERVED_MODEL_NAME=dsv4
 
 # ===== Cluster Config ===========================================
-# 每组 2 节点, 每节点 8 NPU => 16 NPU / 组
-# 并行策略: DP4 x TP4 = 16 (attention/dense), EP16 (MoE all-to-all)
+# Prefill/Decode 每组 4 节点, 每节点 8 NPU => 32 NPU / 组
+# Attention: Prefill DP16 x TP2; Decode DP32 x TP1
 # ================================================================
 
-# Prefill 节点 (2 nodes)
+# Prefill 节点 (4 nodes)
 P_IPS=(
   "141.61.133.101"
   "141.61.133.102"
@@ -80,7 +82,7 @@ P_IFS=(
   "eth2"
 )
 
-# Decode 节点 (2 nodes)
+# Decode 节点 (4 nodes)
 D_IPS=(
   "141.61.133.105"
   "141.61.133.106"
@@ -100,8 +102,8 @@ P_NNODES=${#P_IPS[@]}
 D_NNODES=${#D_IPS[@]}
 
 # 并行度 (enable-dp-attention 模式下总NPU = TP_SIZE):
-#   P: TP = P_NNODES * 8 = 16, DP4  => DP4TP16, EP16
-#   D: TP = D_NNODES * 8 = 16, DP4  => DP4TP16, EP16
+#   P: TP = P_NNODES * 8 = 32, DP16 => attention TP2
+#   D: TP = D_NNODES * 8 = 32, DP32 => attention TP1
 P_TP_SIZE=$(( P_NNODES * NUM_NPUS_PER_NODE ))
 D_TP_SIZE=$(( D_NNODES * NUM_NPUS_PER_NODE ))
 P_DP_SIZE=16
@@ -160,10 +162,11 @@ for i in "${!P_IPS[@]}"; do
       --disaggregation-bootstrap-port 8998 \
       --trust-remote-code \
       --attention-backend ascend \
+      --enable-dynamic-batch-tokenizer \
       --tokenizer-worker-num 16 \
       --device npu \
       --watchdog-timeout 9000 \
-      --max-running-requests 64 \
+      --max-running-requests 256 \
       --mem-fraction-static 0.83 \
       --quantization fp8 \
       --max-prefill-tokens 2048000 \
@@ -182,13 +185,9 @@ done
 for i in "${!D_IPS[@]}"; do
   if [[ "$LOCAL_HOST1" == "${D_IPS[$i]}" || "$LOCAL_HOST2" == "${D_IPS[$i]}" ]]; then
     export HCCL_SOCKET_IFNAME="${D_IFS[$i]}"
-    export DEEPEP_HCCL_BUFFSIZE=400
+    export DEEPEP_HCCL_BUFFSIZE=900
     # [MTP]
-    export SGLANG_ENABLE_SPEC_V2=1
     export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-    export SGLANG_SIMULATE_ACC_LEN=2.5
-    export SGLANG_SIMULATE_ACC_METHOD="multinomial"
-    export SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS=1
     export SGLANG_NPU_USE_MULTI_STREAM=1
 
     echo "========================================"
@@ -214,6 +213,7 @@ for i in "${!D_IPS[@]}"; do
       --tp-size ${D_TP_SIZE} \
       --dp ${D_DP_SIZE} \
       --enable-dp-attention \
+      --enable-dp-attention-local-control-broadcast \
       --enable-dp-lm-head \
       --load-balance-method round_robin \
       --disaggregation-mode decode \
@@ -222,7 +222,7 @@ for i in "${!D_IPS[@]}"; do
       --attention-backend ascend \
       --device npu \
       --watchdog-timeout 9000 \
-      --max-running-requests 64 \
+      --max-running-requests 256 \
       --mem-fraction-static 0.86 \
       --quantization fp8 \
       --max-prefill-tokens 2048000 \
@@ -230,10 +230,10 @@ for i in "${!D_IPS[@]}"; do
       --kv-cache-dtype "fp8_e4m3" \
       --moe-a2a-backend deepep \
       --deepep-mode auto \
-      --cuda-graph-bs 1 2 4 16 \
+      --cuda-graph-bs 1 2 4 8 \
       --tokenizer-worker-num 8 \
       --speculative-algorithm EAGLE \
-      --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3 \
+      --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
       --enable-metrics
 
     exit 1
