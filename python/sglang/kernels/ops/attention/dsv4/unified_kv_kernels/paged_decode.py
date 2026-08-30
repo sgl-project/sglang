@@ -56,7 +56,6 @@ import functools
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_hip
@@ -908,6 +907,10 @@ def sparse_attn_v4_paged_decode(
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
     """
     if _is_gfx1250_supported:
+        # aiter ships only on ROCm, and this module is imported by a CPU-registered
+        # test, so the import has to sit behind the same gate as the call.
+        from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+
         return pa_decode_sparse(
             q,
             unified_kv,
