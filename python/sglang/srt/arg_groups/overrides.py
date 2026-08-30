@@ -75,7 +75,9 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.utils.common import (
+    get_device_capability,
     get_quantization_config,
+    is_cuda,
     is_gfx95_supported,
     xpu_has_xmx_support,
 )
