@@ -54,6 +54,9 @@ class _FakeServerArgs:
     def should_configure_layerwise_offload_for_lazy_component(self, component_name):
         return component_name in self.layerwise_components
 
+    def should_use_fsdp_for_component(self, _component_name):
+        return False
+
 
 class TestDeploymentBytesRoot(unittest.TestCase):
     """A hub repo id is not a directory; the component path always is."""
