@@ -73,18 +73,16 @@ class SessionSlot:
         """Save KV state from a finishing request into this slot."""
         self.req_pool_idx = req.req_pool_idx
         self.kv_committed_len = req.kv_committed_len
-        # The slot's protected prefix is the first request's tree lock; later
-        # turns must not move it.
-        protected_len = (
-            req.kv.cache_protected_len if is_first else self.kv.cache_protected_len
-        )
-        self.kv = copy.copy(req.kv)
-        self.kv.cache_protected_len = protected_len
 
         if is_first:
             self.last_node = req.last_node
             self.swa_uuid_for_lock = req.swa_uuid_for_lock
             self.skip_lock_node_ids = req.skip_lock_node_ids
+        else:
+            # The protected prefix is the first request's tree lock; nothing hands
+            # KV to the tree after that, so later turns must not have moved it.
+            assert req.kv.cache_protected_len == self.kv.cache_protected_len
+        self.kv = copy.copy(req.kv)
 
         self.mamba_pool_idx = req.mamba_pool_idx
         self.mamba_ping_pong_track_buffer = req.mamba_ping_pong_track_buffer
