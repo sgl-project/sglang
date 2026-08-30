@@ -161,7 +161,7 @@ class TestW4AFP8DeepEPNormalPostReorder(CustomTestCase):
         self.assertEqual(len(calls), 1)
 
     def test_triton_fallback_receives_neutral_routed_scale(self):
-        """Without Gluon the Triton kernel runs, still with the neutral scale."""
+        """Off CUDA the Triton kernel runs, still with the neutral scale."""
 
         calls = []
 
@@ -184,7 +184,7 @@ class TestW4AFP8DeepEPNormalPostReorder(CustomTestCase):
 
         self._run_deepep_normal(
             {
-                "deepep_post_reorder_gluon_kernel": None,
+                "_is_cuda": False,
                 "deepep_post_reorder_triton_kernel": _KernelLauncher(fake_post_reorder),
             }
         )
