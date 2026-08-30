@@ -2222,20 +2222,18 @@ class FlashInferIndicesUpdaterPrefill:
             if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
-                        req_pool_indices,
-                        paged_kernel_lens,
-                        paged_kernel_lens_sum,
-                        self.req_to_token,
+                        paged_kernel_lens=paged_kernel_lens,
+                        paged_kernel_lens_sum=paged_kernel_lens_sum,
+                        index_table=kv_view,
                         kv_start_idx=kv_start_idx,
                     )
                 )
             else:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
-                        req_pool_indices,
-                        paged_kernel_lens,
-                        paged_kernel_lens_sum,
-                        self.req_to_token,
+                        paged_kernel_lens=paged_kernel_lens,
+                        paged_kernel_lens_sum=paged_kernel_lens_sum,
+                        index_table=kv_view,
                     )
                 )
 
