@@ -121,8 +121,9 @@ from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
+    get_platform,
 )
-from sglang.srt.utils import is_blackwell_supported, is_hip, is_npu, make_layers
+from sglang.srt.utils import is_hip, is_npu, make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -1405,7 +1406,7 @@ class KimiK3DeltaAttention(nn.Module):
         # Same SM bound rationale as the MLA gate stream.
         self._bfa_alt_stream = bfa_alt_stream
         self._bfa_bs_limit = (
-            (128 if is_blackwell_supported() else 64)
+            (128 if get_platform().is_blackwell else 64)
             if bfa_alt_stream is not None
             else 0
         )
@@ -2050,7 +2051,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # on their own and the overlap only adds sync overhead (same
             # bound as deepseek_v4).
             self._gate_bs_limit = (
-                (128 if is_blackwell_supported() else 64)
+                (128 if get_platform().is_blackwell else 64)
                 if self._gate_alt_stream is not None
                 else 0
             )

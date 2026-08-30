@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
@@ -104,12 +104,10 @@ def _make_req(req_pool_idx, token_ids, cache_protected_len, tree):
     """Mock Req with fields needed by _evict_swa and cache_finished_req."""
     req = SimpleNamespace(
         req_pool_idx=req_pool_idx,
+        is_holding_kv=True,
         origin_input_ids=token_ids,
         output_ids=[],
-        cache_protected_len=cache_protected_len,
-        kv=SimpleNamespace(
-            swa_evicted_seqlen=0,
-        ),
+        kv=ReqKvInfo(cache_protected_len=cache_protected_len),
         extra_key=None,
         cache_salt=None,
         last_node=tree.root_node,
