@@ -21,7 +21,9 @@ register_mps_ci(est_time=240, suite="stage-b-e2e-mps")
 MODEL_PATH = os.environ.get("SGLANG_MPS_TEST_MODEL", "Qwen/Qwen3-0.6B")
 
 
-@unittest.skipUnless(torch.backends.mps.is_available(), "requires Apple MPS")
+@unittest.skipUnless(
+    hasattr(torch, "mps") and torch.mps.is_available(), "requires Apple MPS"
+)
 class TestQwen3TorchMps(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -45,9 +47,7 @@ class TestQwen3TorchMps(CustomTestCase):
         return response.json()
 
     def test_standard_runner_reuses_radix_cache(self):
-        # The existing MLX CI job exports SGLANG_USE_MLX=1 for legacy tests.
-        # Remove it from this child process so the smoke test exercises the
-        # ordinary TpModelWorker + ModelRunner path explicitly.
+        # Ensure the child uses Torch rather than the MLX runner.
         env = os.environ.copy()
         env.pop("SGLANG_USE_MLX", None)
         process = popen_launch_server(

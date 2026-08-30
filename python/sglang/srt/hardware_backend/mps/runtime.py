@@ -28,14 +28,14 @@ def validate_mps_runtime() -> None:
             "srt_mps extra"
         )
 
-    mps_backend = getattr(torch.backends, "mps", None)
-    is_mps_available = getattr(mps_backend, "is_available", None)
+    mps_module = getattr(torch, "mps", None)
+    is_mps_available = getattr(mps_module, "is_available", None)
     if not callable(is_mps_available) or not is_mps_available():
         raise RuntimeError(
             "The SGLang MPS backend requires an available PyTorch MPS device"
         )
     for memory_api in ("recommended_max_memory", "driver_allocated_memory"):
-        if not callable(getattr(torch.mps, memory_api, None)):
+        if not callable(getattr(mps_module, memory_api, None)):
             raise RuntimeError(
                 f"The SGLang MPS backend requires torch.mps.{memory_api} from "
                 "the tested Torch 2.13.x runtime"
@@ -47,14 +47,7 @@ def validate_mps_model_config(
     *,
     lora_enabled: bool = False,
 ) -> None:
-    """Reject checkpoint-derived execution modes outside the MPS contract.
-
-    ``ServerArgs.quantization`` only records an explicit CLI choice.  A
-    checkpoint can declare quantization in its Hugging Face config, which is
-    resolved later into ``ModelConfig.quantization``.  Validate that effective
-    value before model loading, and again at the platform binding boundary for
-    programmatic ``ModelRunner`` construction.
-    """
+    """Validate checkpoint-derived MPS constraints."""
     quantization = getattr(model_config, "quantization", None)
     if quantization not in (None, "unquant"):
         raise ValueError(
