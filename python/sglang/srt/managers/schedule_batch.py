@@ -820,6 +820,7 @@ class ReqKvInfo:
 
     # The request's own KV is [cache_protected_len, kv_allocated_len).
     cache_protected_len: int = 0  # tree cache owns [0, here) (matched or inserted)
+    kv_committed_len: int = 0  # KV content committed up to here, <= kv_allocated_len
     kv_allocated_len: int = 0
 
     # SWA slots in [swa_dead_lo(page_size), swa_evicted_seqlen) are already freed.
@@ -922,7 +923,6 @@ class Req(ReqDllmMixin):
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
 
         # For req-level memory management
-        self.kv_committed_len = 0
         self.kv = ReqKvInfo()
         self.retraction_backup: Optional[RetractionBackup] = None
 
@@ -1286,8 +1286,8 @@ class Req(ReqDllmMixin):
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
-            return min(self.kv_committed_len, len(self.origin_input_ids))
-        return self.kv_committed_len
+            return min(self.kv.kv_committed_len, len(self.origin_input_ids))
+        return self.kv.kv_committed_len
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
         """Record one step accepted draft count (excludes bonus token) into the histogram."""
@@ -1749,7 +1749,7 @@ class Req(ReqDllmMixin):
         self.mamba_needs_clear = False
         self.already_computed = 0
         assert not self.is_holding_kv, "expect it is already released"
-        self.kv_committed_len = 0
+        self.kv.kv_committed_len = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
@@ -1937,7 +1937,7 @@ def mamba_lazy_spec_in_window(
     kv_committed_len lags device seq_lens by up to one verify under overlap;
     the 2x window absorbs it.
     """
-    seq_len = req.kv_committed_len
+    seq_len = req.kv.kv_committed_len
     window = 2 * max_draft_tokens
     return seq_len // mamba_track_interval != (seq_len + window) // mamba_track_interval
 
@@ -2513,7 +2513,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # TODO(th4): co-locate this req.kv bookkeeping with the real KV
             # allocation in alloc_for_extend above; they are currently a few
             # steps apart and should become one owned-kv allocation step.
-            req.kv_committed_len = seq_len
+            req.kv.kv_committed_len = seq_len
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -2902,7 +2902,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         if self.spec_algorithm.is_none():
-            new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
+            new_pages = sum(
+                1 for r in requests if r.kv.kv_committed_len % page_size == 0
+            )
             return new_pages * page_size + num_beam_member_rows(requests)
 
         return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
@@ -2912,7 +2914,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reserve = get_alloc_reserve_per_decode()
         total = 0
         for r in requests:
-            x = max(0, r.kv_committed_len + reserve - r.kv.kv_allocated_len)
+            x = max(0, r.kv.kv_committed_len + reserve - r.kv.kv_allocated_len)
             cur = r.kv.kv_allocated_len
             nxt = cur + x
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
@@ -3222,7 +3224,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Update req-level memory management fields
         for req in self.reqs:
             req.decode_batch_idx += 1
-            req.kv_committed_len += 1
+            req.kv.kv_committed_len += 1
 
         # New-tensor avoids racing model_worker_batch refs queued for
         # overlap forward.

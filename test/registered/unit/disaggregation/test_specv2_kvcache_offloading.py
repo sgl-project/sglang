@@ -34,10 +34,11 @@ def _make_mock_req(
     req = MagicMock()
     req.rid = rid
     req.req_pool_idx = req_pool_idx
-    req.kv_committed_len = kv_committed_len
-    req.kv = ReqKvInfo(kv_allocated_len=kv_allocated_len)
+    req.kv = ReqKvInfo(
+        kv_committed_len=kv_committed_len, kv_allocated_len=kv_allocated_len
+    )
     req.prefix_indices = list(range(prefix_indices_len))
-    req.effective_kv_committed_len = lambda: req.kv_committed_len
+    req.effective_kv_committed_len = lambda: req.kv.kv_committed_len
     return req
 
 
