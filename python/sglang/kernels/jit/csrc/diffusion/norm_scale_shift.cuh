@@ -1,4 +1,4 @@
-// Minimal native-CUDA fast path for Qwen-Image diffusion norm-scale-shift.
+// Minimal native-CUDA fast path for generic bf16 hidden=3072 norm-scale-shift.
 //
 // Supported shape family:
 //   - bf16 activations, B == 1, hidden dim == 3072
@@ -36,7 +36,7 @@ constexpr float kInvHidden = 1.0f / float(kHidden);
 static_assert(kThreads == 192);
 static_assert(kWarps == 6);
 
-struct QwenImageNormParams {
+struct NormScaleShiftParams {
   void* y;
   void* res_out;
   const void* x;
@@ -66,7 +66,7 @@ SGL_DEVICE float cta_reduce_sum(float v, int warp, int lane, float* scratch) {
 }
 
 template <bool kHasResidual>
-__global__ void qwen_image_norm_scale_shift_kernel(const QwenImageNormParams __grid_constant__ params) {
+__global__ void norm_scale_shift_kernel(const NormScaleShiftParams __grid_constant__ params) {
   using namespace device;
   using Vec = AlignedVector<bf16_t, kVecElems>;
 
@@ -135,14 +135,14 @@ __global__ void qwen_image_norm_scale_shift_kernel(const QwenImageNormParams __g
   yv.store(static_cast<bf16_t*>(params.y) + row_offset + elem_offset);
 }
 
-inline uint32_t verify_qwen_geometry(host::SymbolicSize& num_rows) {
+inline uint32_t verify_nss_geometry(host::SymbolicSize& num_rows) {
   using namespace host;
   RuntimeCheck(num_rows.unwrap() > 0, "num_rows must be positive");
   RuntimeCheck(num_rows.unwrap() <= int64_t(UINT32_MAX), "num_rows out of range");
   return static_cast<uint32_t>(num_rows.unwrap());
 }
 
-struct QwenImageNormScaleShiftKernel {
+struct NormScaleShiftKernel {
   static void
   run(tvm::ffi::TensorView y,
       tvm::ffi::TensorView x,
@@ -157,8 +157,8 @@ struct QwenImageNormScaleShiftKernel {
     TensorMatcher({N, kHidden}).with_dtype<bf16_t>().with_device(device).verify(x).verify(y);
     TensorMatcher({kHidden}).with_dtype<bf16_t>().with_device(device).verify(scale).verify(shift);
 
-    const uint32_t grid = verify_qwen_geometry(N);
-    const auto params = QwenImageNormParams{
+    const uint32_t grid = verify_nss_geometry(N);
+    const auto params = NormScaleShiftParams{
         .y = y.data_ptr(),
         .res_out = nullptr,
         .x = x.data_ptr(),
@@ -168,11 +168,11 @@ struct QwenImageNormScaleShiftKernel {
         .shift = shift.data_ptr(),
         .eps = static_cast<float>(eps),
     };
-    LaunchKernel(grid, kThreads, device.unwrap())(qwen_image_norm_scale_shift_kernel<false>, params);
+    LaunchKernel(grid, kThreads, device.unwrap())(norm_scale_shift_kernel<false>, params);
   }
 };
 
-struct QwenImageScaleResidualNormScaleShiftKernel {
+struct ScaleResidualNormScaleShiftKernel {
   static void
   run(tvm::ffi::TensorView y,
       tvm::ffi::TensorView res_out,
@@ -196,8 +196,8 @@ struct QwenImageScaleResidualNormScaleShiftKernel {
         .verify(res_out);
     TensorMatcher({kHidden}).with_dtype<bf16_t>().with_device(device).verify(gate).verify(scale).verify(shift);
 
-    const uint32_t grid = verify_qwen_geometry(N);
-    const auto params = QwenImageNormParams{
+    const uint32_t grid = verify_nss_geometry(N);
+    const auto params = NormScaleShiftParams{
         .y = y.data_ptr(),
         .res_out = res_out.data_ptr(),
         .x = x.data_ptr(),
@@ -207,7 +207,7 @@ struct QwenImageScaleResidualNormScaleShiftKernel {
         .shift = shift.data_ptr(),
         .eps = static_cast<float>(eps),
     };
-    LaunchKernel(grid, kThreads, device.unwrap())(qwen_image_norm_scale_shift_kernel<true>, params);
+    LaunchKernel(grid, kThreads, device.unwrap())(norm_scale_shift_kernel<true>, params);
   }
 };
 

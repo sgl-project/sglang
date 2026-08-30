@@ -4,6 +4,7 @@ from unittest.mock import Mock
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -11,19 +12,21 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestHiddenStateServerMode(CustomTestCase):
-    @staticmethod
-    def _make_tokenizer_manager(mode):
+    def _make_tokenizer_manager(self, mode):
+        # The server-side hidden-state mode is a bag leaf.
+        override = get_context().override_server_args(
+            enable_return_hidden_states=mode is not None,
+            return_hidden_states_mode=mode,
+        )
+        override.install()
+        self.addCleanup(override.restore)
         manager = TokenizerManager.__new__(TokenizerManager)
         manager.context_len = 128
         manager.num_reserved_tokens = 0
         manager.allow_auto_truncate = False
         manager.validate_total_tokens = False
         manager.is_generation = True
-        manager.server_args = SimpleNamespace(
-            enable_return_hidden_states=mode is not None,
-            return_hidden_states_mode=mode,
-            enable_custom_logit_processor=False,
-        )
+        manager.server_args = SimpleNamespace(enable_custom_logit_processor=False)
         manager._validate_token_ids_logprob = Mock()
         return manager
 

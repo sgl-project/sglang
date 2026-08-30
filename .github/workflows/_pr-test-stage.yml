@@ -64,26 +64,11 @@ on:
         default: false
 
       scheduled:
-        description: >
-          This is a nightly/weekly run, not a per-commit one. Turns on the three
-          things that differ, none of which any per-commit stage wants: per-file
-          budgets derived from est_time (a scheduled suite mixes 30s and 2h
-          tests), the full jit_kernel grids, and metrics upload. Shards also run
-          one at a time unless the caller was dispatched with full_parallel,
-          leaving the pool to per-commit CI.
-        type: boolean
-        default: false
-      precision_baseline:
-        description: >
-          Export the rolling-baseline env that test_nightly_precision_regression.py
-          reads. Kept separate from `scheduled` because HF_TOKEN is part of that
-          set: the baseline-store token is scoped to that one repo, so exporting
-          it on a stage that does not need it shadows the runner's own token and
-          turns every gated model into a 404.
+        description: 'The caller is a nightly or weekly workflow, not a per-commit one. Switches on per-file timeouts derived from est_time, the full jit_kernel grids, metrics upload, and serial shards unless dispatched with full_parallel.'
         type: boolean
         default: false
       job_timeout_minutes:
-        description: 'Job-level cap, covering install and warmup on top of run_timeout_minutes. A scheduled stage needs far more than a per-commit one.'
+        description: 'Job-level cap, covering install and warmup on top of run_timeout_minutes.'
         type: string
         default: '240'
 
@@ -98,8 +83,16 @@ env:
   SGLANG_ENABLE_ASYNC_ASSERT: ${{ startsWith(inputs.self_name, 'base-a') && 'false' || 'true' }}
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SGLANG_JIT_KERNEL_RUN_FULL_TESTS: ${{ inputs.scheduled && '1' || '' }}
-  SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
+  SGLANG_JIT_KERNEL_RUN_FULL_TESTS: ${{ inputs.scheduled && '1' || '0' }}
+  # is_h200_system() (test_utils.py) raises the server-launch ceiling from 600s
+  # to 3600s. Only the scheduled 8-gpu-h200 suites load models that need it;
+  # per-commit stages keep the short ceiling so a hung launch fails fast.
+  IS_H200: ${{ (inputs.scheduled && inputs.runner_config == '8-gpu-h200') && '1' || '0' }}
+  # Scheduled suites pull hundreds of GB of checkpoints; the hub's 10s etag
+  # default times out on a cold cache.
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 300
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ (inputs.scheduled || fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
 
@@ -107,8 +100,10 @@ jobs:
   run:
     name: ${{ inputs.self_name }} (${{ matrix.partition }})
     # Runs on schedule / parallel-dispatch / non-failed PR with main_package or sgl_kernel changes.
+    # Temporarily skip the broken GB300 runner before GitHub tries to allocate it.
     if: |
       always() &&
+      inputs.runner_config != '4-gpu-gb300' &&
       ((github.event_name == 'schedule' || fromJson(inputs.caller_inputs).test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
       (fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).sgl_kernel == 'true')
     # runs-on resolved from runs_on_map; check-changes already substituted
@@ -190,13 +185,10 @@ jobs:
           curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
             "$URL" -o /tmp/partition-model.json
 
-      # Written through $GITHUB_ENV rather than the step's `env:`, because
-      # HF_TOKEN must be left ALONE on every other stage. The baseline-store
-      # token is scoped to that one repo, and an `env:` entry sets the key
-      # unconditionally -- both a wrong value and an empty one shadow the
-      # runner's own HF_TOKEN, turning every gated model into a 401.
+      # Only test_nightly_precision_regression.py reads these; the others are
+      # inert wherever it does not run.
       - name: Export precision baseline env
-        if: inputs.precision_baseline
+        if: inputs.scheduled
         env:
           BASELINE_HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}
         run: |
@@ -206,7 +198,7 @@ jobs:
             echo "SGLANG_PRECISION_HF_REVISION=${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}"
             echo "SGLANG_PRECISION_COMMIT=${{ github.sha }}"
             echo "SGLANG_PRECISION_FORCE_UPDATE=${{ fromJson(inputs.caller_inputs).force_baseline_update && '1' || '0' }}"
-            echo "HF_TOKEN=${BASELINE_HF_TOKEN}"
+            echo "SGLANG_PRECISION_HF_TOKEN=${BASELINE_HF_TOKEN}"
           } >> "$GITHUB_ENV"
 
       - name: Run test
@@ -215,6 +207,9 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
           RUNNER_LABELS: ${{ fromJson(fromJson(inputs.check_changes).runs_on_map)[inputs.runner_config] }}
           GPU_CONFIG: ${{ inputs.runner_config }}
+          # Read only by test_runai_model_loader.py (nightly 1-gpu); inert elsewhere.
+          # Left unconditional because an `env:` key cannot be omitted, and an empty
+          # value would reach the runai streamer as a malformed limit.
           RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd test

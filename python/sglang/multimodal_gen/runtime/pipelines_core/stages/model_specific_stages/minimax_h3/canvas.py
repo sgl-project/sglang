@@ -105,40 +105,42 @@ def _keyframe_canvas_size(shape: Any) -> tuple[int, int]:
     geometry = str(shape["geometry"])
     if geometry != "resolved_v2":
         raise ValueError(
-            "fl2va keyframe preparation requires pre-queue resolved_v2 "
+            "keyframe preparation requires pre-queue resolved_v2 "
             f"geometry, got {geometry!r}"
         )
     return int(shape["width"]), int(shape["height"])
 
 
 def _validate_keyframe_materials(plan: Any, keyframes: list[Any]) -> tuple[int, ...]:
-    if str(plan.task) != "fl2va":
-        raise ValueError("keyframe target-canvas materials require plan.task='fl2va'")
+    if str(plan.task) not in {"fl2va", "ref2va"}:
+        raise ValueError(
+            "keyframe target-canvas materials require plan.task='fl2va' or 'ref2va'"
+        )
     semantic_indices = tuple(material.frame_index for material in keyframes)
     if semantic_indices not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES:
         raise ValueError(
-            "fl2va keyframes must use one of the ordered frame_index signatures "
+            "MiniMax H3 keyframes must use one of the ordered frame_index signatures "
             f"{MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES!r}, got {semantic_indices!r}"
         )
     frame_count = plan.shape.get("frame_count")
     if isinstance(frame_count, bool) or not isinstance(frame_count, int):
-        raise ValueError("fl2va keyframe preparation requires an integer frame_count")
+        raise ValueError("keyframe preparation requires an integer frame_count")
     if frame_count <= 1:
-        raise ValueError("fl2va keyframe preparation requires frame_count > 1")
+        raise ValueError("keyframe preparation requires frame_count > 1")
     expected_pixels = tuple(
         frame_count - 1 if index == -1 else index for index in semantic_indices
     )
     resolved_pixels = tuple(material.resolved_frame_index for material in keyframes)
     if resolved_pixels != expected_pixels:
         raise ValueError(
-            "fl2va keyframe resolved_frame_index values disagree with semantic "
+            "keyframe resolved_frame_index values disagree with semantic "
             f"anchors: expected {expected_pixels!r}, got {resolved_pixels!r}"
         )
     return semantic_indices
 
 
 def minimax_h3_prepared_keyframes(batch: Any, plan: Any) -> dict[str, Any]:
-    """Resolve + prepare one or two fl2va keyframes once per request.
+    """Resolve + prepare one or two first/last keyframes once per request.
 
     The target canvas is shared across keyframes and must already be frozen by
     the pre-queue probe/resolve hook.
@@ -154,7 +156,7 @@ def minimax_h3_prepared_keyframes(batch: Any, plan: Any) -> dict[str, Any]:
         cached_images = cached.get("images") or ()
         if cached_indices != semantic_indices or len(cached_images) != len(keyframes):
             raise ValueError(
-                "cached fl2va keyframe preparation disagrees with the resolved plan"
+                "cached keyframe preparation disagrees with the resolved plan"
             )
         return cached
 

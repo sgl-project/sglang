@@ -18,6 +18,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -87,6 +88,10 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     swiglu_alpha: Optional[torch.Tensor] = None
     swiglu_beta: Optional[torch.Tensor] = None
     swiglu_limit: Optional[torch.Tensor] = None
+
+    # Bailing clamps after SiLU, which the kernel only implements in its
+    # SwigluStep variant.
+    use_swiglu_step: bool = False
 
     # TP/EP topology (forwarded to the FlashInfer kernel)
     moe_tp_size: int = 1
@@ -235,6 +240,7 @@ def _run_flashinfer_cutlass(
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
         activation_type=_activation_type(runner_config),
         enable_alltoall=enable_alltoall,
+        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
     )[0]
 
     if quant_info.quant_type in ("bf16", "fp8"):
@@ -384,9 +390,14 @@ def fused_experts_none_to_flashinfer_mxfp4(
         ep_rank=quant_info.moe_ep_rank,
         use_w4_group_scaling=not use_mxfp8_act_scaling,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-        activation_type=ActivationType.Swiglu,
+        activation_type=(
+            ActivationType.SwigluStep
+            if quant_info.use_swiglu_step
+            else ActivationType.Swiglu
+        ),
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
         output=out,
+        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
     )
 
     if do_pad:

@@ -25,6 +25,8 @@ constexpr uint32_t kBroadcastRowsPerBlock = 4;
 constexpr uint32_t kBroadcastColsPerBlock = 256;
 constexpr uint32_t kMaxGrid = 65535;
 constexpr uintptr_t kAlignment = 16;
+constexpr uint32_t kTransposeTile = 32;
+constexpr uint32_t kTransposeBlockSize = 256;
 
 enum class GateMode : int { kFull, kBroadcastRow };
 
@@ -107,6 +109,55 @@ __global__ void residual_gate_add_scalar_kernel(
   for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < numel; index += stride) {
     const T gate_value = kGateMode == GateMode::kFull ? gate[index] : SGLANG_LDG(gate + index % hidden_size);
     out[index] = residual_gate_value(residual[index], update[index], gate_value);
+  }
+}
+
+/**
+ * Fuse the residual-gate update when the residual/output use the common
+ * ``[batch, hidden, tokens]`` backing layout exposed as ``[batch, tokens,
+ * hidden]``, while update remains contiguous in the logical layout.
+ *
+ * Loading update in logical row-major order and consuming it transposed from
+ * shared memory keeps both update reads and residual/output traffic coalesced.
+ */
+template <typename T>
+__global__ void residual_gate_add_transposed_kernel(
+    T* __restrict__ out,
+    const T* __restrict__ residual,
+    const T* __restrict__ update,
+    const T* __restrict__ gate,
+    int64_t tokens,
+    int64_t hidden_size) {
+  __shared__ T update_tile[kTransposeTile][kTransposeTile + 1];
+
+  const int64_t batch = blockIdx.z;
+  const int64_t token_base = static_cast<int64_t>(blockIdx.x) * kTransposeTile;
+  const int64_t hidden_base = static_cast<int64_t>(blockIdx.y) * kTransposeTile;
+  const int64_t batch_offset = batch * tokens * hidden_size;
+
+#pragma unroll
+  for (uint32_t item = threadIdx.x; item < kTransposeTile * kTransposeTile; item += kTransposeBlockSize) {
+    const uint32_t token_in_tile = item / kTransposeTile;
+    const uint32_t hidden_in_tile = item % kTransposeTile;
+    const int64_t token = token_base + token_in_tile;
+    const int64_t hidden = hidden_base + hidden_in_tile;
+    if (token < tokens && hidden < hidden_size) {
+      update_tile[token_in_tile][hidden_in_tile] = update[batch_offset + token * hidden_size + hidden];
+    }
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (uint32_t item = threadIdx.x; item < kTransposeTile * kTransposeTile; item += kTransposeBlockSize) {
+    const uint32_t hidden_in_tile = item / kTransposeTile;
+    const uint32_t token_in_tile = item % kTransposeTile;
+    const int64_t token = token_base + token_in_tile;
+    const int64_t hidden = hidden_base + hidden_in_tile;
+    if (token < tokens && hidden < hidden_size) {
+      const int64_t transposed_offset = batch_offset + hidden * tokens + token;
+      out[transposed_offset] = residual_gate_value(
+          residual[transposed_offset], update_tile[token_in_tile][hidden_in_tile], SGLANG_LDG(gate + hidden));
+    }
   }
 }
 
@@ -200,6 +251,49 @@ struct ResidualGateAddKernel {
           numel,
           hidden_size);
     }
+  }
+
+  static void run_transposed(
+      tvm::ffi::TensorView out, tvm::ffi::TensorView residual, tvm::ffi::TensorView update, tvm::ffi::TensorView gate) {
+    using namespace host;
+
+    auto B = SymbolicSize{"batch"};
+    auto S = SymbolicSize{"tokens"};
+    auto D = SymbolicSize{"hidden_size"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({B, S, D}).with_strides({-1, 1, -1}).with_dtype<T>().with_device(device).verify(out).verify(residual);
+    TensorMatcher({B, S, D}).with_strides({-1, -1, 1}).with_dtype<T>().with_device(device).verify(update);
+    TensorMatcher({1, 1, D}).with_strides({-1, -1, 1}).with_dtype<T>().with_device(device).verify(gate);
+
+    const int64_t batch = B.unwrap();
+    const int64_t tokens = S.unwrap();
+    const int64_t hidden_size = D.unwrap();
+    CHECK_HOST(batch > 0 && tokens > 0 && hidden_size > 0) << "transposed residual-gate tensors must be non-empty";
+    CHECK_HOST(
+        batch <= kMaxGrid && div_ceil(tokens, int64_t{kTransposeTile}) <= kMaxGrid &&
+        div_ceil(hidden_size, int64_t{kTransposeTile}) <= kMaxGrid)
+        << "transposed residual-gate grid exceeds CUDA limits";
+    const int64_t batch_stride = tokens * hidden_size;
+    CHECK_HOST(
+        out.stride(0) == batch_stride && out.stride(2) == tokens && residual.stride(0) == batch_stride &&
+        residual.stride(2) == tokens)
+        << "residual/output must use the transposed dense layout";
+    CHECK_HOST(update.stride(0) == batch_stride && update.stride(1) == hidden_size) << "update must be contiguous";
+
+    auto* out_ptr = static_cast<T*>(out.data_ptr());
+    const auto* residual_ptr = static_cast<const T*>(residual.data_ptr());
+    const auto* update_ptr = static_cast<const T*>(update.data_ptr());
+    const auto* gate_ptr = static_cast<const T*>(gate.data_ptr());
+    CHECK_HOST(out_ptr != residual_ptr && out_ptr != update_ptr && out_ptr != gate_ptr)
+        << "output must not alias an input";
+
+    const dim3 grid(
+        static_cast<uint32_t>(div_ceil(tokens, int64_t{kTransposeTile})),
+        static_cast<uint32_t>(div_ceil(hidden_size, int64_t{kTransposeTile})),
+        static_cast<uint32_t>(batch));
+    LaunchKernel(grid, kTransposeBlockSize, device.unwrap())(
+        residual_gate_add_transposed_kernel<T>, out_ptr, residual_ptr, update_ptr, gate_ptr, tokens, hidden_size);
   }
 };
 

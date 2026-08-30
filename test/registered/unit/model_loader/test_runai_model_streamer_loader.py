@@ -220,6 +220,7 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
         remapper = SimpleNamespace(confidence_head=None)
         model = SimpleNamespace(
             config=SimpleNamespace(n_routed_experts=1),
+            num_fused_shared_experts=0,
             named_parameters=lambda: [
                 ("stages.0.self_attn.wo_a.weight", param),
             ],

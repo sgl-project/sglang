@@ -56,6 +56,7 @@ _NON_PERSISTENT_BUFFER_PATTERNS = (
     "inv_freq",
     "freqs_cis",
     "_weight_fp32",
+    "expert_mask_gpu",
 )
 
 
