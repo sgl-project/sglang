@@ -207,6 +207,8 @@ class TestGetDcpLens(CustomTestCase):
 
         group = FakeDcpGroup()
         backend = TritonAttnBackend.__new__(TritonAttnBackend)
+        # GQA, not MLA: the K/V heads here are the replicated set.
+        backend.use_mla = False
         backend.forward_metadata = SimpleNamespace(
             custom_mask=None,
             kv_indptr=torch.zeros(2, dtype=torch.int32),
