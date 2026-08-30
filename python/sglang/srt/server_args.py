@@ -84,6 +84,7 @@ from sglang.srt.utils.common import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
     is_hopper_with_cuda_12_3,
     is_host_cpu_arm64,
@@ -8790,10 +8791,10 @@ class ServerArgs:
                     "All operations will run eagerly through the graph capture/replay path."
                 )
         if cfg.enable_deepseek_v4_fp4_indexer and not (
-            is_sm100_supported() or is_sm120_supported()
+            is_sm100_supported() or is_sm120_supported() or is_gfx95_supported()
         ):
             raise ValueError(
-                "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
+                "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 or gfx95 GPUs with "
                 "DeepGEMM FP4 indexer support."
             )
         # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
