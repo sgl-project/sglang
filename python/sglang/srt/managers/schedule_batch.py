@@ -818,17 +818,13 @@ class ReqKvInfo:
     # Device KV a request holds outside the prefix cache. Always present on the Req;
     # whether any KV is held is `req.req_pool_idx is not None` (Req.is_holding_kv).
 
-    # [0, cache_protected_len) is owned by the tree cache (matched or inserted);
-    # the request's own KV is [cache_protected_len, kv_allocated_len).
-    cache_protected_len: int = 0
+    # The request's own KV is [cache_protected_len, kv_allocated_len).
+    cache_protected_len: int = 0  # tree cache owns [0, here) (matched or inserted)
     kv_allocated_len: int = 0
 
-    # SWA eviction inside the request's own segment: slots in
-    # [swa_dead_lo(page_size), swa_evicted_seqlen) have already been freed as the
-    # window slid past them; tokens in [0, swa_evict_floor) are never window-evicted
-    # (prefill-aware SWA models keep the prompt/image KV resident during decode).
-    swa_evict_floor: int = 0
-    swa_evicted_seqlen: int = 0
+    # SWA slots in [swa_dead_lo(page_size), swa_evicted_seqlen) are already freed.
+    swa_evict_floor: int = 0  # [0, here) never window-evicted (prefill-aware SWA)
+    swa_evicted_seqlen: int = 0  # SWA eviction cursor
 
     def swa_dead_lo(self, page_size: int) -> int:
         # Lowest SWA position this request may free itself: above the tree-owned
