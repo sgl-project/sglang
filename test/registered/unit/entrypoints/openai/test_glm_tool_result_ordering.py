@@ -11,6 +11,9 @@ from jinja2.ext import loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 from sglang.srt.entrypoints.openai.encoding_glm import (
+    _GLM_TOOL_RESULT_SORT_END,
+    _GLM_TOOL_RESULT_SORT_START,
+    glm_template_for_request,
     order_glm_tool_results,
     resolve_glm_tool_result_template,
 )
@@ -70,7 +73,9 @@ def _assistant(*call_ids):
 
 
 def _result(call_id=None, content=None):
-    message = {"role": "tool", "content": content or f"result-{call_id}"}
+    if content is None:
+        content = f"result-{call_id}"
+    message = {"role": "tool", "content": content}
     if call_id is not None:
         message["tool_call_id"] = call_id
     return message
@@ -121,10 +126,6 @@ class TestGlmToolResultOrdering(CustomTestCase):
         ordered = order_glm_tool_results(messages)
 
         self.assertEqual(
-            [message["content"][0]["tool_call_id"] for message in ordered[1:]],
-            ["a", "b", "c"],
-        )
-        self.assertEqual(
             [message["content"][0]["output"] for message in ordered[1:]],
             ["result-a", "result-b", "result-c"],
         )
@@ -143,6 +144,12 @@ class TestGlmToolResultOrdering(CustomTestCase):
                     ],
                 }
             ],
+            "malformed int entry": [
+                {
+                    "role": "tool",
+                    "content": [{"tool_call_id": "a", "output": "result-a"}, 5],
+                }
+            ],
         }
         for name, results in cases.items():
             with self.subTest(name=name):
@@ -150,13 +157,27 @@ class TestGlmToolResultOrdering(CustomTestCase):
                 self.assertEqual(order_glm_tool_results(messages), messages)
 
     def test_duplicate_or_missing_call_ids_preserve_received_order(self):
+        # Results arrive reversed and reference only valid ids, so a sorter
+        # that skips call-id validation would reorder them.
         for name, call_ids in {
-            "duplicate": ("a", "a"),
-            "missing": ("a", None),
+            "duplicate": ("a", "a", "b"),
+            "missing": ("a", None, "b"),
         }.items():
             with self.subTest(name=name):
-                messages = [_assistant(*call_ids), _result("a"), _result("b")]
+                messages = [_assistant(*call_ids), _result("b"), _result("a")]
                 self.assertEqual(order_glm_tool_results(messages), messages)
+
+    def test_non_assistant_tool_calls_do_not_authorize_reorder(self):
+        messages = [
+            {
+                "role": "system",
+                "content": "",
+                "tool_calls": _assistant("a", "b")["tool_calls"],
+            },
+            _result("b"),
+            _result("a"),
+        ]
+        self.assertEqual(order_glm_tool_results(messages), messages)
 
     def test_each_contiguous_result_block_uses_its_own_calls(self):
         messages = [
@@ -188,12 +209,14 @@ class TestGlmToolResultTemplate(CustomTestCase):
         )
 
     def test_quadratic_glm_template_is_replaced(self):
+        """A no-op resolve would pass the golden battery (original renders
+        equal original); this pins that the pinned region is actually gone."""
         resolved = _resolve()
 
         self.assertIsNotNone(resolved)
-        self.assertNotIn("namespace(tool_calls=none)", resolved)
-        self.assertNotIn("has_dup_tool_result_id(block_start", resolved)
-        self.assertIn("render_tool_response(messages[k])", resolved)
+        start = _TEMPLATE.index(_GLM_TOOL_RESULT_SORT_START)
+        end = _TEMPLATE.find(_GLM_TOOL_RESULT_SORT_END, start)
+        self.assertNotIn(_TEMPLATE[start:end], resolved)
 
     def test_legacy_glm_architecture_is_supported(self):
         self.assertIsNotNone(_resolve(architecture="GlmMoeDsaForCausalLM"))
@@ -202,10 +225,19 @@ class TestGlmToolResultTemplate(CustomTestCase):
         self.assertIsNone(_resolve(architecture="LlamaForCausalLM"))
 
     def test_unrecognized_template_is_not_rewritten(self):
-        self.assertIsNone(_resolve(template="already linear"))
-        self.assertIsNone(
-            _resolve(template="has_dup_tool_result_id without known block")
-        )
+        start = _TEMPLATE.index(_GLM_TOOL_RESULT_SORT_START)
+        end = _TEMPLATE.find(_GLM_TOOL_RESULT_SORT_END, start)
+        cases = {
+            "no anchor": "already linear",
+            "non-string": None,
+            "duplicate start anchor": _TEMPLATE + "\n" + _GLM_TOOL_RESULT_SORT_START,
+            # With no end anchor, find() returns -1 and template[start:-1]
+            # equals exactly the pinned region, so the digest alone would pass.
+            "region with no end anchor": _TEMPLATE[:end] + "X",
+        }
+        for name, template in cases.items():
+            with self.subTest(name=name):
+                self.assertIsNone(_resolve(template=template))
 
     def test_edited_sort_region_is_not_rewritten(self):
         """An upstream edit inside the excised region must disable the patch,
@@ -214,6 +246,24 @@ class TestGlmToolResultTemplate(CustomTestCase):
             "ns_chk.can_sort = false", "ns_chk.can_sort = true"
         )
         self.assertIsNone(_resolve(template=tampered))
+
+
+class TestGlmTemplateForRequest(CustomTestCase):
+    def test_request_chat_template_disables_the_patch(self):
+        for name, kwargs in {
+            "absent": None,
+            "empty": {},
+            "unrelated key": {"thinking": True},
+        }.items():
+            with self.subTest(name=name):
+                self.assertEqual(glm_template_for_request("patched", kwargs), "patched")
+        for name, kwargs in {
+            "custom string": {"chat_template": "CUSTOM"},
+            "explicit none": {"chat_template": None},
+        }.items():
+            with self.subTest(name=name):
+                self.assertIsNone(glm_template_for_request("patched", kwargs))
+        self.assertIsNone(glm_template_for_request(None, None))
 
 
 class TestGlmToolResultGoldenEquivalence(CustomTestCase):
@@ -257,9 +307,9 @@ class TestGlmToolResultGoldenEquivalence(CustomTestCase):
                 {"tool_call_id": "b", "output": "result-b"},
                 {"tool_call_id": "a", "type": "tool_reference", "output": "result-a"},
             ],
-            "none output": [
-                {"tool_call_id": "a", "output": None},
-                {"tool_call_id": "b", "output": "result-b"},
+            "none output first, reversed": [
+                {"tool_call_id": "b", "output": None},
+                {"tool_call_id": "a", "output": "result-a"},
             ],
             "tool_reference output": [
                 {
@@ -275,6 +325,12 @@ class TestGlmToolResultGoldenEquivalence(CustomTestCase):
                     [_assistant("a", "b"), {"role": "tool", "content": content}],
                     tools=_TOOLS,
                 )
+
+    def test_cross_type_ids_follow_template_stringification(self):
+        """The template's id macro stringifies, so int call ids match str
+        result ids; without str() coercion the block is not reordered."""
+        messages = [_assistant(5, 7), _result("7"), _result("5")]
+        self._assert_equivalent(messages)
 
     def test_tool_reference_message_content(self):
         messages = [

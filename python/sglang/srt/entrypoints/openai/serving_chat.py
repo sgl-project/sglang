@@ -1363,11 +1363,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 self._handle_last_assistant_message(openai_compatible_messages, request)
             )
 
-            # The reorder is only valid for the patched template, so a
-            # request-supplied chat_template disables both together.
-            glm_tool_result_template = self._glm_tool_result_template
-            if "chat_template" in (request.chat_template_kwargs or {}):
-                glm_tool_result_template = None
+            glm_tool_result_template = encoding_glm.glm_template_for_request(
+                self._glm_tool_result_template, request.chat_template_kwargs
+            )
             if glm_tool_result_template is not None:
                 openai_compatible_messages = encoding_glm.order_glm_tool_results(
                     openai_compatible_messages

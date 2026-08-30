@@ -39,7 +39,7 @@ def _canonical_tool_output(item: Any) -> Any:
     # "type") would send the split-off entry down a different template branch.
     if not isinstance(item, Mapping):
         return item
-    return {key: item[key] for key in ("tool_call_id", "id", "output") if key in item}
+    return {"output": item["output"]} if "output" in item else {}
 
 
 def _is_list_of_tool_outputs(message: Mapping[str, Any]) -> bool:
@@ -77,11 +77,7 @@ def _order_tool_result_block(
 
         for unit, item in units:
             result_id = _tool_call_id(item)
-            if (
-                result_id is None
-                or result_id in results_by_id
-                or result_id not in seen_call_ids
-            ):
+            if result_id in results_by_id or result_id not in seen_call_ids:
                 return None
             results_by_id[result_id] = unit
 
@@ -123,6 +119,17 @@ def order_glm_tool_results(
     return ordered_messages
 
 
+def glm_template_for_request(
+    cached_template: Optional[str],
+    chat_template_kwargs: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """A request-supplied chat_template wins; the reorder is only valid for the
+    patched stock template, so the two are enabled or disabled together."""
+    if cached_template is None or "chat_template" in (chat_template_kwargs or {}):
+        return None
+    return cached_template
+
+
 def resolve_glm_tool_result_template(
     *, hf_config: Any, tokenizer: Any
 ) -> Optional[str]:
@@ -134,7 +141,7 @@ def resolve_glm_tool_result_template(
     ):
         return None
 
-    template = getattr(tokenizer, "chat_template", None)
+    template = tokenizer.chat_template
     if (
         not isinstance(template, str)
         or template.count(_GLM_TOOL_RESULT_SORT_START) != 1
