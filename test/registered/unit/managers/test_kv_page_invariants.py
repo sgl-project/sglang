@@ -49,6 +49,7 @@ class _FakeReq:
         self.req_pool_idx = rpi
         self.kv_committed_len = committed
         self.kv = SimpleNamespace(kv_allocated_len=allocated, swa_evicted_seqlen=0)
+        self.is_holding_kv = True
 
 
 class _FakeSlot:

@@ -1,12 +1,10 @@
-# Nightly CUDA tests. One job per runner_config; the test list for each comes
-# from the `nightly-test-{runner_config}` suite in the registry, so a test
-# reaches a machine by declaring `runner_config=` on register_cuda_ci and never
-# by editing this file. Machine details live in scripts/ci/runner_configs.yml.
+# Nightly CUDA tests. One job per runner_config, running that machine's
+# `nightly-test-{runner_config}` suite -- a test reaches a machine by declaring
+# `runner_config=` on register_cuda_ci, never by editing this file.
 #
-# Everything scheduled onto one machine type shares a job and is split by
-# auto_partition; per-file time budgets come from each test's own est_time
-# (--timeout-from-est-time), so a slow test no longer sets the cap for the
-# fast ones sharing its job.
+# Jobs go through the same _pr-test-stage.yml as the per-commit suites; what a
+# scheduled run needs on top is its `scheduled` input, so runner resolution,
+# rust-ext reuse and shard sizing are not reimplemented here.
 name: Nightly Test (Nvidia)
 
 on:
@@ -29,8 +27,13 @@ on:
           - '8-gpu-h200'
           - '8-gpu-b200'
           - 'diffusion'
+      full_parallel:
+        description: 'Run all shards of a job at once (faster, but competes with per-commit CI for machines). Off by default: one shard at a time.'
+        required: false
+        type: boolean
+        default: false
       force_baseline_update:
-        description: 'Refresh the precision rolling baseline instead of comparing (sets SGLANG_PRECISION_FORCE_UPDATE=1). Dispatch once after an intentional forward-path dtype/precision change stales the baseline; later scheduled runs compare against it and go green.'
+        description: 'Refresh the precision rolling baseline instead of comparing. Dispatch once after an intentional forward-path precision change stales it; later runs compare against the new one.'
         required: false
         type: boolean
         default: false
@@ -46,115 +49,145 @@ on:
         required: false
         type: string
         default: 'all'
+      full_parallel:
+        description: 'Run all shards of a job at once (faster, but competes with per-commit CI for machines). Off by default: one shard at a time.'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: nightly-test-nvidia-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
+
 jobs:
-  # Partition counts target roughly 2.5-3h per partition, from the summed
-  # est_time of each suite. max_parallel reflects how many machines of that
-  # type the pool can give us at once.
-  nightly-1-gpu-large:
-    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '1-gpu-large')
-    uses: ./.github/workflows/_scheduled-test-stage.yml
+  # run_all_tests skips the paths-filter, so main_package is 'true' and
+  # sgl_kernel stays empty: every test runs, and no job waits on a wheel this
+  # workflow never builds. pr_test_yml points back here so shard sizing reads
+  # this file's own run_timeout_minutes.
+  check-changes:
+    uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
-      stage: nightly
+      git_ref: ${{ inputs.ref || '' }}
+      pr_test_yml: '.github/workflows/nightly-test-nvidia.yml'
+      run_all_tests: true
+      force_continue_on_error: true
+    secrets: inherit
+
+  nightly-1-gpu-large:
+    needs: check-changes
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '1-gpu-large')
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: nightly-test-1-gpu-large
       runner_config: 1-gpu-large
-      runs_on: 1-gpu-h100
-      partition_ids: '[0, 1]'
-      partition_count: 2
-      max_parallel: 2
-      run_timeout_minutes: 180
-      ref: ${{ inputs.ref }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '120'
+      job_timeout_minutes: '180'
+      scheduled: true
     secrets: inherit
 
   nightly-2-gpu-large:
+    needs: check-changes
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '2-gpu-large')
-    uses: ./.github/workflows/_scheduled-test-stage.yml
+    uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      stage: nightly
+      self_name: nightly-test-2-gpu-large
       runner_config: 2-gpu-large
-      runs_on: 2-gpu-h100
-      # Two 2h tests (VLM eval + VLM perf) dominate; 3 partitions splits them
-      # apart, 2 would leave one partition carrying both.
-      partition_ids: '[0, 1, 2]'
-      partition_count: 3
-      max_parallel: 2
-      run_timeout_minutes: 240
-      ref: ${{ inputs.ref }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '240'
+      job_timeout_minutes: '300'
+      scheduled: true
     secrets: inherit
 
   nightly-4-gpu-h100:
+    needs: check-changes
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-h100')
-    uses: ./.github/workflows/_scheduled-test-stage.yml
+    uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      stage: nightly
+      self_name: nightly-test-4-gpu-h100
       runner_config: 4-gpu-h100
-      runs_on: 4-gpu-h100
-      run_timeout_minutes: 120
-      ref: ${{ inputs.ref }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '120'
+      job_timeout_minutes: '180'
+      scheduled: true
     secrets: inherit
 
   nightly-4-gpu-b200:
+    needs: check-changes
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-b200')
-    uses: ./.github/workflows/_scheduled-test-stage.yml
+    uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      stage: nightly
+      self_name: nightly-test-4-gpu-b200
       runner_config: 4-gpu-b200
-      runs_on: 4-gpu-b200
-      run_timeout_minutes: 300
-      ref: ${{ inputs.ref }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '150'
+      job_timeout_minutes: '210'
+      scheduled: true
     secrets: inherit
 
   nightly-4-gpu-gb300:
+    needs: check-changes
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-gb300')
-    uses: ./.github/workflows/_scheduled-test-stage.yml
+    uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      stage: nightly
+      self_name: nightly-test-4-gpu-gb300
       runner_config: 4-gpu-gb300
-      # Nightly keeps its own GB300 pool, separate from the per-commit
-      # `4-gpu-gb300` label used by base-c.
-      runs_on: 4-gpu-gb300-nightly
-      partition_ids: '[0, 1, 2, 3]'
-      partition_count: 4
-      max_parallel: 4
-      run_timeout_minutes: 300
-      ref: ${{ inputs.ref }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '360'
+      job_timeout_minutes: '420'
+      scheduled: true
+      # aarch64: the rust-ext cache key is x86_64-only, same reason base-c skips it.
+      skip_prebuilt_rust_ext: true
     secrets: inherit
 
   nightly-8-gpu-h200:
+    needs: check-changes
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '8-gpu-h200')
-    uses: ./.github/workflows/_scheduled-test-stage.yml
+    uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      stage: nightly
+      self_name: nightly-test-8-gpu-h200
       runner_config: 8-gpu-h200
-      runs_on: 8-gpu-h200
-      partition_ids: '[0, 1, 2, 3]'
-      partition_count: 4
-      max_parallel: 2
-      run_timeout_minutes: 300
-      ref: ${{ inputs.ref }}
-      force_baseline_update: ${{ inputs.force_baseline_update || false }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '300'
+      job_timeout_minutes: '360'
+      scheduled: true
     secrets: inherit
 
   nightly-8-gpu-b200:
+    needs: check-changes
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '8-gpu-b200')
-    uses: ./.github/workflows/_scheduled-test-stage.yml
+    uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      stage: nightly
+      self_name: nightly-test-8-gpu-b200
       runner_config: 8-gpu-b200
-      runs_on: 8-gpu-b200
-      partition_ids: '[0, 1, 2, 3]'
-      partition_count: 4
-      max_parallel: 2
-      run_timeout_minutes: 300
-      ref: ${{ inputs.ref }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '360'
+      job_timeout_minutes: '420'
+      scheduled: true
     secrets: inherit
 
-  # SGLang-Diffusion nightly benchmark. Not a registry suite: it drives
-  # run_comparison.py and publishes a dashboard rather than running test files,
-  # so it stays a hand-written job.
+  # Hand-written because it is not a registry suite: it drives run_comparison.py
+  # and publishes a dashboard rather than running test files.
   nightly-test-diffusion:
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == 'diffusion')
     runs-on: 4-gpu-h100
@@ -169,7 +202,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Install dependencies
         run: |
@@ -227,7 +260,14 @@ jobs:
   # Consolidate performance metrics from all jobs
   consolidate-metrics:
     if: github.repository == 'sgl-project/sglang' && always()
+    # Every scheduled stage uploads metrics now, so all of them must finish
+    # before the download step globs `*metrics-*`.
     needs:
+      - nightly-1-gpu-large
+      - nightly-2-gpu-large
+      - nightly-4-gpu-h100
+      - nightly-4-gpu-b200
+      - nightly-4-gpu-gb300
       - nightly-8-gpu-h200
       - nightly-8-gpu-b200
     runs-on: ubuntu-latest

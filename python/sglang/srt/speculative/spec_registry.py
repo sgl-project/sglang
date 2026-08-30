@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
+
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -92,9 +94,6 @@ class CustomSpecAlgo:
     def supports_target_verify_for_draft(self) -> bool:
         return False
 
-    def supports_target_verify_war_read_done(self) -> bool:
-        return False
-
     def supports_ragged_verify(self) -> bool:
         return False
 
@@ -111,7 +110,9 @@ class CustomSpecAlgo:
         pass
 
     def create_worker(self, server_args: ServerArgs) -> Type:
-        if not server_args.disable_overlap_schedule and not self.supports_overlap:
+
+        cfg = resolving_view(server_args)
+        if not cfg.disable_overlap_schedule and not self.supports_overlap:
             raise ValueError(
                 f"Speculative algorithm {self.name} does not support overlap scheduling."
             )
@@ -155,10 +156,14 @@ class CustomSpecAlgo:
     def build_disagg_draft_input(
         self,
         batch: ScheduleBatch,
-        server_args: ServerArgs,
         last_tokens_tensor: torch.Tensor,
         future_map: FutureMap,
     ) -> Optional[SpecInput]:
+        """Build the disaggregation draft input for ``batch``, or ``None``.
+
+        The speculative config comes from ``runtime_context.get_spec()``, which
+        follows a runtime override where the startup record does not.
+        """
         return None
 
 

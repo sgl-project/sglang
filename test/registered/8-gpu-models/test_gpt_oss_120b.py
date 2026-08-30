@@ -7,8 +7,8 @@ from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on both H200 and B200: registered once per runner_config below
 # Higher est_time due to 6 variants with both performance and accuracy tests
-register_cuda_ci(est_time=1800, stage="nightly", runner_config="8-gpu-h200")
-register_cuda_ci(est_time=1800, stage="nightly", runner_config="8-gpu-b200")
+register_cuda_ci(est_time=690, stage="nightly", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=690, stage="nightly", runner_config="8-gpu-b200")
 
 GPT_OSS_120B_MXFP4_MODEL_PATH = "openai/gpt-oss-120b"
 GPT_OSS_120B_EAGLE3_DRAFT_MODEL_PATH = "lmsys/EAGLE3-gpt-oss-120b-bf16"

@@ -30,14 +30,24 @@ under its own default configuration.
 """
 
 import unittest
+from types import SimpleNamespace
 
+from sglang.srt.arg_groups.kv_cache_hook import handle_page_major_kv_layout
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _accepts(backend: str, *, use_mla: bool, unified: bool = True) -> bool:
+def _accepts(
+    backend: str,
+    *,
+    use_mla: bool,
+    unified: bool = True,
+    linear_decode: str | None = None,
+    linear_prefill: str | None = None,
+) -> bool:
     """Run just `_handle_page_major_kv_layout` against a minimal stand-in.
 
     ServerArgs' real constructor pulls in a model config; this exercises the
@@ -53,15 +63,20 @@ def _accepts(backend: str, *, use_mla: bool, unified: bool = True) -> bool:
         "prefill_attention_backend": None,
         "decode_attention_backend": None,
         "linear_attn_backend": "triton",
-        "linear_attn_decode_backend": None,
-        "linear_attn_prefill_backend": None,
+        "linear_attn_decode_backend": linear_decode,
+        "linear_attn_prefill_backend": linear_prefill,
         "mamba_backend": "triton",
     }.items():
         object.__setattr__(sa, name, value)
-    sa.use_mla_backend = lambda: use_mla
-    sa._resolved_attention_backends = lambda: [backend]
+    object.__setattr__(
+        sa,
+        "_model_config",
+        SimpleNamespace(
+            attention_arch=AttentionArch.MLA if use_mla else AttentionArch.MHA
+        ),
+    )
     try:
-        ServerArgs._handle_page_major_kv_layout(sa)
+        handle_page_major_kv_layout(sa)
         return True
     except AssertionError:
         return False
@@ -113,6 +128,17 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 self.assertFalse(
                     _accepts(backend, use_mla=use_mla),
                     f"{backend} has no dense-id remapping and must be rejected",
+                )
+
+    def test_helion_linear_attention_is_kda_only(self):
+        for unified in (True, False):
+            for phase in ("decode", "prefill"):
+                kwargs = {f"linear_{phase}": "helion"}
+                self.assertTrue(
+                    _accepts("triton", use_mla=True, unified=unified, **kwargs)
+                )
+                self.assertFalse(
+                    _accepts("triton", use_mla=False, unified=unified, **kwargs)
                 )
 
 

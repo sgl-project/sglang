@@ -7,8 +7,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn.functional import scaled_dot_product_attention
 from torch.nn.utils.parametrizations import weight_norm
+
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 
 from .bigvgan import AttrDict, BigVGAN
 
@@ -52,6 +57,21 @@ class CausalAttention(nn.Module):
         self.num_heads = num_heads
         self.scale = self.head_dim**-0.5
         self.proj = nn.Linear(out_dim, out_dim)
+        self.attn = (
+            USPAttention(
+                num_heads=num_heads,
+                head_size=self.head_dim,
+                causal=True,
+                supported_attention_backends={
+                    AttentionBackendEnum.FA,
+                    AttentionBackendEnum.TORCH_SDPA,
+                },
+                default_attention_backend=AttentionBackendEnum.TORCH_SDPA,
+                skip_sequence_parallel=True,
+            )
+            if current_platform.is_cuda()
+            else None
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
@@ -62,20 +82,33 @@ class CausalAttention(nn.Module):
         )
         q, k, v = (
             qkv.reshape(B, N, 3, self.num_heads, self.head_dim)
-            .permute(2, 0, 3, 1, 4)
+            .permute(2, 0, 1, 3, 4)
             .unbind(0)
         )
 
-        x = scaled_dot_product_attention(
-            q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
-        )
+        if self.attn is None:
+            x = F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=True,
+            ).transpose(1, 2)
+        else:
+            input_dtype = q.dtype
+            if self.attn.backend != AttentionBackendEnum.TORCH_SDPA:
+                # released audio VAE stays FP32; an explicit fused backend
+                # owns only the attention compute precision
+                q, k, v = (tensor.to(self.attn.dtype) for tensor in (q, k, v))
+            x = self.attn(q, k, v).to(input_dtype)
 
         if self.in_dim > self.out_dim:
-            x = torch.mean(x, dim=1)
+            x = torch.mean(x, dim=2)
             if self.in_dim // self.num_heads != self.out_dim:
                 x = nn.functional.adaptive_avg_pool1d(x, self.out_dim)
         else:
-            x = x.transpose(1, 2).reshape(B, N, -1)
+            x = x.reshape(B, N, -1)
         x = self.proj(x)
         return x
 

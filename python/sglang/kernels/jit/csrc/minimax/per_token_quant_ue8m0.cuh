@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
@@ -151,11 +151,10 @@ __global__ __launch_bounds__(1024, 2) void  //
 
   // Read this token's kTopK destinations once (fully unrolled).
   const auto* src2dst_row = params.src2dst + static_cast<uint64_t>(token_id) * kTopK;
-  const auto* topk_ids_row = params.topk_ids + static_cast<uint64_t>(token_id) * kTopK;
   int32_t dst_rows[kTopK];
 #pragma unroll
   for (uint32_t i = 0; i < kTopK; ++i) {
-    dst_rows[i] = (topk_ids_row[i] >= 0) ? src2dst_row[i] : -1;
+    dst_rows[i] = src2dst_row[i];
   }
 
   const uint32_t group_id = tid / kThreadsPerGroup;
@@ -277,4 +276,4 @@ void per_token_quant_ue8m0(tvm::ffi::TensorView x, tvm::ffi::TensorView x_q, tvm
       .enable_pdl(kUsePDL)(kernel, params);
 }
 
-}  // namespace
+}  // namespace sglang

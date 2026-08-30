@@ -7,9 +7,14 @@
 #pragma once
 #include <version>
 
-/// NOTE: fallback to a minimal source_location implementation
 #if defined(__cpp_lib_source_location)
 #include <source_location>
+#endif
+
+namespace sglang {
+
+/// NOTE: fallback to a minimal source_location implementation
+#if defined(__cpp_lib_source_location)
 
 using source_location_t = std::source_location;
 
@@ -38,3 +43,5 @@ struct source_location_fallback {
 using source_location_t = source_location_fallback;
 
 #endif
+
+}  // namespace sglang

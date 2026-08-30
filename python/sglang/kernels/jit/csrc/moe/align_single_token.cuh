@@ -17,7 +17,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 struct AlignSingleTokenParams {
   const int32_t* __restrict__ topk_ids;  // [1, topk]
@@ -104,4 +104,4 @@ struct AlignSingleTokenKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
