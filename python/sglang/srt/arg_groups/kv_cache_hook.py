@@ -186,6 +186,22 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "both build a decode host pool."
             )
 
+    # Neither ratio carries a static default any more: `None` means the operator
+    # did not set it and no model family declared one, so the generic value
+    # lands here, after the family declarations have had their say. Stating it
+    # as a default on the field instead is what made a family ask "is this
+    # still the default?" -- a question that stops being answerable the moment
+    # any other pass declares the field, and that an operator who happens to
+    # type the default value gets the wrong answer to.
+    generic: dict = {}
+    resolved = resolved_view(server_args)
+    if resolved.mamba_full_memory_ratio is None:
+        generic["mamba_full_memory_ratio"] = 0.9
+    if resolved.swa_full_tokens_ratio is None:
+        generic["swa_full_tokens_ratio"] = 0.8
+    if generic:
+        declare_resolution(server_args, "_handle_kv_cache_ratios", **generic)
+
     # Validate the effective ratio: model branches may declare a reset
     # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
     # the user input before it ever takes effect.
