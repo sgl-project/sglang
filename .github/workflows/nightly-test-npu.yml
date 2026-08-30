@@ -1,4 +1,5 @@
 name: Nightly Test (NPU)
+#2
 on:
   schedule:
     - cron: '0 16 * * *'  # Execute at 0:00 a.m. Beijing Time every day
