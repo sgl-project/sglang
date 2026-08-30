@@ -148,6 +148,13 @@ def _record_component_attn_backend(backend_name: str, reason: str | None) -> boo
     return True
 
 
+def record_component_attn_backend(
+    backend: AttentionBackendEnum, reason: str | None = None
+) -> bool:
+    """Record a component backend selected outside layer construction."""
+    return _record_component_attn_backend(backend.name.lower(), reason)
+
+
 def _log_component_attn_backend_summary(
     context: ComponentAttnBackendContext | None,
 ) -> None:
@@ -417,11 +424,21 @@ def component_attn_backend_context_manager(
     attn_backend: AttentionBackendEnum | None,
     component_name: str | None = None,
     allow_global_backend_fallback: bool = False,
-    require_backend_selection: bool = False,
+    require_backend_selection: bool | None = None,
+    require_component_backend_selection: bool | None = None,
 ) -> Generator[None, None, None]:
     if attn_backend is None and component_name is None:
         yield
         return
+
+    if require_backend_selection is None:
+        require_backend_selection = (
+            require_component_backend_selection
+            if require_component_backend_selection is not None
+            else attn_backend is not None
+        )
+    elif require_component_backend_selection is not None:
+        raise ValueError("Specify only one component backend selection requirement")
 
     token = component_attn_backend_context.set(
         ComponentAttnBackendContext(

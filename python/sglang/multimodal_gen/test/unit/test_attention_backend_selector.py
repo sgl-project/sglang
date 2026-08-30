@@ -172,6 +172,36 @@ class TestAttentionBackendFallback(unittest.TestCase):
         self.assertIs(backend, _FakeFABackend)
         self.assertIsNone(_FakePlatform.selected_backend)
 
+    def test_component_override_requires_an_sglang_attention_layer(self):
+        with self.assertRaisesRegex(
+            ValueError, "did not construct any SGLang-selectable attention layers"
+        ):
+            with component_attn_backend_context_manager(
+                AttentionBackendEnum.FA, component_name="vae"
+            ):
+                pass
+
+        self.assertIsNone(get_component_attn_backend_context())
+
+    def test_component_override_preserves_load_error_and_resets_context(self):
+        with self.assertRaisesRegex(RuntimeError, "component failed"):
+            with component_attn_backend_context_manager(
+                AttentionBackendEnum.FA, component_name="vae"
+            ):
+                raise RuntimeError("component failed")
+
+        self.assertIsNone(get_component_attn_backend_context())
+
+    def test_automatic_component_backend_may_skip_sglang_attention_layer(self):
+        with component_attn_backend_context_manager(
+            AttentionBackendEnum.TORCH_SDPA,
+            component_name="text_encoder",
+            require_component_backend_selection=False,
+        ):
+            pass
+
+        self.assertIsNone(get_component_attn_backend_context())
+
     def test_implicit_preference_falls_back_for_missing_capability(self):
         backend = self._resolve(
             AttentionBackendEnum.AITER,
@@ -310,6 +340,10 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
                 return None
 
             @staticmethod
+            def should_direct_gpu_weight_load_component(_component_name):
+                return False
+
+            @staticmethod
             def should_use_fsdp_for_component(_component_name):
                 return False
 
@@ -384,6 +418,10 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
                 return "fa"
 
             @staticmethod
+            def should_direct_gpu_weight_load_component(_component_name):
+                return False
+
+            @staticmethod
             def should_use_fsdp_for_component(_component_name):
                 return False
 
@@ -445,6 +483,10 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
                 return "fa"
 
             @staticmethod
+            def should_direct_gpu_weight_load_component(_component_name):
+                return False
+
+            @staticmethod
             def should_use_fsdp_for_component(_component_name):
                 return False
 
@@ -489,6 +531,10 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
             @staticmethod
             def requested_component_attention_backend(_component_name):
                 return None
+
+            @staticmethod
+            def should_direct_gpu_weight_load_component(_component_name):
+                return False
 
             @staticmethod
             def should_use_fsdp_for_component(_component_name):
