@@ -1,0 +1,101 @@
+---
+title: "Qwen3.8 Flash Next NVMe PLE streaming"
+description: "Serve Qwen3.8 Flash Next on memory-constrained NVIDIA systems by reading sparse PLE rows from local NVMe."
+---
+
+Qwen3.8 Flash Next includes a large PLE n-gram embedding table. SGLang can keep
+that table in its original sharded safetensors files and read only the rows used
+by each forward pass. The remaining model weights stay on the GPU.
+
+This path is intended for a single NVIDIA GPU with local NVMe storage. It
+currently supports tensor parallel size 1 and an FP8 E4M3 PLE table.
+
+## Prerequisites
+
+- Linux on an NVIDIA CUDA system
+- A local model snapshot that contains `model.safetensors.index.json` and all
+  referenced safetensors files
+- A filesystem that supports `O_DIRECT`
+- The `io_uring_setup`, `io_uring_enter`, and `io_uring_register` system calls
+
+<Warning>
+  Docker's default seccomp profile may block `io_uring`. Add the three syscalls
+  above to the container's seccomp allowlist. SGLang reports an actionable
+  `Operation not permitted` error when the profile blocks ring creation.
+</Warning>
+
+## Start the server
+
+Set `MODEL_PATH` to the local snapshot for
+`RadixArk/Qwen3.8-Flash-Next-NVFP4`:
+
+```bash
+export MODEL_PATH=/models/Qwen3.8-Flash-Next-NVFP4
+export SGLANG_QWEN4_PLE_NVME_PATH="$MODEL_PATH"
+export SGLANG_QWEN4_PLE_NVME_BACKEND=io_uring
+export SGLANG_QWEN4_PLE_NVME_QUEUE_DEPTH=512
+
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --quantization modelopt_fp4 \
+  --fp4-gemm-backend flashinfer_cutlass \
+  --page-size 64 \
+  --mamba-radix-cache-strategy extra_buffer \
+  --mamba-track-interval 64 \
+  --chunked-prefill-size 512 \
+  --max-running-requests 1 \
+  --context-length 32768 \
+  --mem-fraction-static 0.84 \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --cuda-graph-backend-decode disabled \
+  --cuda-graph-backend-prefill disabled
+```
+
+The NVMe gather starts before the decoder layer immediately preceding PLE. The
+reader performs the host I/O on a background thread, then copies the selected
+FP8 rows through pinned memory and converts them to BF16 on the GPU.
+
+## Configuration
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `SGLANG_QWEN4_PLE_NVME_PATH` | empty | Local snapshot path. An empty value keeps the normal resident embedding. |
+| `SGLANG_QWEN4_PLE_NVME_BACKEND` | `io_uring` | Row reader. Use `mmap` only for correctness checks or filesystems without `O_DIRECT`. |
+| `SGLANG_QWEN4_PLE_NVME_QUEUE_DEPTH` | `512` | Maximum in-flight reads in the persistent ring. |
+| `SGLANG_QWEN4_PLE_NVME_MAX_BATCH_PAGES` | `4096` | Number of aligned page buffers allocated by the native reader. Larger requests are chunked. |
+| `SGLANG_QWEN4_PLE_NVME_CACHE_PAGES` | `0` | Application-level LRU page count. Zero relies on direct reads without retaining pages. |
+| `SGLANG_QWEN4_PLE_NVME_LOG_INTERVAL` | `1000` | Emit aggregate row-read timing every N gathers. Zero disables timing logs. |
+
+The native reader is bundled in the SGLang wheel as a Rust extension. Source
+installs build it through SGLang's Rust extension loader on first use.
+
+## Verify the endpoint
+
+```bash
+curl http://127.0.0.1:30000/v1/models
+```
+
+During startup, the log reports the PLE table size, file count, and row count.
+After the configured log interval, it also reports aggregate read latency.
+
+## Troubleshooting
+
+### `Operation not permitted` when creating the reader
+
+The process cannot call `io_uring_setup`. Update the container seccomp profile
+to allow the three `io_uring` syscalls listed in the prerequisites.
+
+### `Invalid argument` from a direct read
+
+The checkpoint filesystem does not satisfy `O_DIRECT` alignment or support.
+Move the snapshot to a local NVMe filesystem, or set
+`SGLANG_QWEN4_PLE_NVME_BACKEND=mmap` for a correctness test.
+
+### Snapshot or shard validation errors
+
+Keep the index and all referenced shard files in one local snapshot directory.
+The reader validates contiguous PLE shard indices, tensor dimensions, dtype,
+and the model-config row count before serving requests.

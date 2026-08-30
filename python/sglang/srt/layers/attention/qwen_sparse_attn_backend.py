@@ -16,6 +16,9 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.qsa_decode import (
+    sparse_gqa_decode_physical_triton,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     QSA_VARIANT_COMPRESSED,
@@ -1664,6 +1667,13 @@ class QwenSparseAttnBackend(AttentionBackend):
                 topk_indices,
                 trtllm_decode,
             )
+
+        if torch.cuda.get_device_capability(q.device) == (12, 1):
+            slots = self._logical_to_physical(topk_indices, metadata)
+            output = sparse_gqa_decode_physical_triton(
+                q, k_buffer, v_buffer, slots, layer.scaling
+            )
+            return output.reshape(q.shape[0], -1)
 
         flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
         batch, topk = topk_indices.shape
