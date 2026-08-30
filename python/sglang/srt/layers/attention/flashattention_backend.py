@@ -701,6 +701,31 @@ class FlashAttentionBackend(AttentionBackend):
             m.max_seq_len_k = self.max_context_len
         self.forward_metadata = m
 
+    def _spec_read_seq_len_delta(
+        self, forward_mode: ForwardMode, spec_info: Optional[SpecInput]
+    ) -> int:
+        """Columns past ``seq_lens`` this mode's whole-sequence read covers —
+        the translated table's fill must reach ``cache_seqlens``. Takes the
+        two fields rather than a ForwardBatch: the captured build slices its
+        batch and has none.
+
+        Zero for the prefix-only shapes: normal decode/extend, the topk>1
+        split (drafts read via the expand metadata), draft-extend whose lens
+        already include the window, and draft-extend's idle batch. The ragged
+        verify layout's per-row lens are bounded by the draft window, so its
+        upper bound rides the same delta."""
+        if spec_info is None:
+            return 0
+        if forward_mode.is_target_verify() and self.topk <= 1:
+            return self.speculative_num_draft_tokens
+        if (
+            forward_mode.is_decode_or_idle()
+            and self.topk <= 1
+            and self.speculative_num_steps > 0
+        ):
+            return self.speculative_step_id + 1
+        return 0
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
@@ -1084,7 +1109,15 @@ class FlashAttentionBackend(AttentionBackend):
             self.kv_index_translator.is_translating and metadata.page_table is not None
         )
         if _unified_read:
-            kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
+            delta = self._spec_read_seq_len_delta(
+                forward_batch.forward_mode, forward_batch.spec_info
+            )
+            if delta:
+                kv_view = self.kv_index_translator.widened_index_table(
+                    forward_batch, seq_len_delta=delta
+                )
+            else:
+                kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
             metadata.page_table = kv_view.ids
             if self.use_sliding_window_kv_pool:
                 metadata.swa_page_table = kv_view.sliding_window_ids
