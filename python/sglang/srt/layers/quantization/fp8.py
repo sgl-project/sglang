@@ -128,6 +128,7 @@ _mxfp8_to_block_fp8_required = mxfp8_block_convert_required() or get_bool_env_va
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_ONLINE_MXFP8_MAX_CHUNK_BYTES = 64 * 1024 * 1024
 
 
 def _require_fp4_dtype():
@@ -1144,7 +1145,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         """
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        if is_checkpoint_fp8_serialized:
+        loads_quantized_weights = is_checkpoint_fp8_serialized or (
+            use_mxfp8 and not is_fp4_expert
+        )
+        if loads_quantized_weights:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
 
         tp_size = get_parallel().tp_size
@@ -1365,10 +1369,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             else {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
 
-        # If loading fp8 checkpoint, pass the weight loaders.
-        # If loading an fp16 checkpoint, do not (we will quantize in
-        #   process_weights_after_loading()
-        if quant_config.is_checkpoint_fp8_serialized:
+        # Serialized and load-time MXFP8 scales are populated through the MoE
+        # weight loader. Other online paths create scales only in
+        # process_weights_after_loading().
+        if loads_quantized_weights:
             set_weight_attrs(w13_weight_scale, extra_weight_attrs)
             set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
@@ -1403,6 +1407,185 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
+    @staticmethod
+    def _should_skip_loaded_expert(
+        layer: torch.nn.Module,
+        param: torch.nn.Parameter,
+        expert_id: Optional[int],
+    ) -> bool:
+        if expert_id is None or getattr(param, "_sglang_require_global_experts", False):
+            return False
+
+        # Preserve the canonical loader's EPLB/explicit-placement mapping. A
+        # logical expert may map to more than one physical expert there.
+        from sglang.srt.eplb.expert_location import (
+            get_global_expert_location_metadata,
+        )
+
+        if get_global_expert_location_metadata() is not None:
+            return False
+        return layer._map_global_expert_id_to_local_expert_id(expert_id) == -1
+
+    @staticmethod
+    def _mxfp8_scale_weight_name(weight_name: str) -> str:
+        if "weight" in weight_name:
+            prefix, suffix = weight_name.rsplit("weight", 1)
+            return f"{prefix}weight_scale_inv{suffix}"
+        return f"{weight_name}.weight_scale_inv"
+
+    @classmethod
+    def get_online_mxfp8_weight_loader(cls, layer, original_weight_loader):
+        """Quantize BF16/FP16 MoE expert shards as the checkpoint streams in."""
+
+        expert_id_unset = object()
+        backend = get_moe_runner_backend()
+        use_flashinfer_quantizer = (
+            is_blackwell_supported()
+            and is_flashinfer_available()
+            and (
+                backend.is_flashinfer_trtllm() or backend.is_flashinfer_trtllm_routed()
+            )
+        )
+
+        def load_quantized_tensor(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: Optional[str],
+            expert_id,
+        ) -> None:
+            kwargs: Dict[str, Any] = {
+                "weight_name": weight_name,
+                "shard_id": shard_id,
+            }
+            if expert_id is not expert_id_unset:
+                kwargs["expert_id"] = expert_id
+            original_weight_loader(param, loaded_weight, **kwargs)
+
+        def mxfp8_online_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: Optional[str],
+            expert_id=expert_id_unset,
+        ) -> None:
+            is_expert_weight = param is layer.w13_weight or param is layer.w2_weight
+            if not is_expert_weight:
+                load_quantized_tensor(
+                    param,
+                    loaded_weight,
+                    weight_name,
+                    shard_id,
+                    expert_id,
+                )
+                return
+            if expert_id is not expert_id_unset and cls._should_skip_loaded_expert(
+                layer, param, expert_id
+            ):
+                return
+            if loaded_weight.ndim < 2 or not loaded_weight.is_floating_point():
+                raise ValueError(
+                    "Online MXFP8 weight conversion expects floating-point MoE "
+                    f"expert matrices, got shape={tuple(loaded_weight.shape)} "
+                    f"and dtype={loaded_weight.dtype}."
+                )
+            if loaded_weight.shape[-1] % 32 != 0:
+                raise ValueError(
+                    "Online MXFP8 weight conversion requires expert weight K "
+                    f"to be a multiple of 32, got shape {tuple(loaded_weight.shape)}."
+                )
+
+            quantizer_name = "FlashInfer" if use_flashinfer_quantizer else "Triton"
+            logger.info_once(
+                f"Running online MXFP8 quantization for MoE expert weights "
+                f"with the {quantizer_name} quantizer."
+            )
+            source_weight = loaded_weight.contiguous()
+            k = source_weight.shape[-1]
+            source_weight_2d = source_weight.view(-1, k)
+
+            # Fused checkpoints can present every expert in one tensor. Keep
+            # their accumulated output on CPU; per-expert loaders accumulate
+            # directly on the parameter device. In both cases, move only
+            # bounded source row chunks through the accelerator.
+            output_device = (
+                param.device
+                if expert_id is not expert_id_unset and expert_id is not None
+                else torch.device("cpu")
+            )
+            rows_per_chunk = max(
+                1,
+                _ONLINE_MXFP8_MAX_CHUNK_BYTES // (k * source_weight.element_size()),
+            )
+            qweight_2d = torch.empty(
+                source_weight_2d.shape,
+                dtype=torch.float8_e4m3fn,
+                device=output_device,
+            )
+            weight_scale_2d = torch.empty(
+                (source_weight_2d.shape[0], k // 32),
+                dtype=torch.uint8,
+                device=output_device,
+            )
+            for row_start in range(0, source_weight_2d.shape[0], rows_per_chunk):
+                row_end = min(row_start + rows_per_chunk, source_weight_2d.shape[0])
+                source_chunk = (
+                    source_weight_2d[row_start:row_end].to(param.device).contiguous()
+                )
+                if use_flashinfer_quantizer:
+                    from sglang.srt.layers.quantization.fp8_utils import (
+                        flashinfer_mxfp8_quantize,
+                    )
+
+                    qweight_chunk, weight_scale_chunk = flashinfer_mxfp8_quantize(
+                        source_chunk, False
+                    )
+                else:
+                    qweight_chunk, weight_scale_chunk = mxfp8_group_quantize(
+                        source_chunk
+                    )
+                qweight_2d[row_start:row_end].copy_(qweight_chunk.to(output_device))
+                weight_scale_2d[row_start:row_end].copy_(
+                    weight_scale_chunk.view(torch.uint8)
+                    .contiguous()
+                    .view(row_end - row_start, k // 32)
+                    .to(output_device)
+                )
+
+            qweight = qweight_2d.view(source_weight.shape)
+            weight_scale = weight_scale_2d.view(*source_weight.shape[:-1], k // 32)
+
+            load_quantized_tensor(
+                param,
+                qweight,
+                weight_name,
+                shard_id,
+                expert_id,
+            )
+            scale_param = (
+                layer.w2_weight_scale_inv
+                if param is layer.w2_weight
+                else layer.w13_weight_scale_inv
+            )
+            load_quantized_tensor(
+                scale_param,
+                weight_scale,
+                cls._mxfp8_scale_weight_name(weight_name),
+                shard_id,
+                expert_id,
+            )
+
+        return mxfp8_online_weight_loader
+
+    def prepare_weight_loader(self, layer, weight_loader):
+        if (
+            not self.use_mxfp8
+            or self.is_fp4_expert
+            or self.quant_config.is_checkpoint_fp8_serialized
+        ):
+            return weight_loader
+        return self.get_online_mxfp8_weight_loader(layer, weight_loader)
+
     def create_weights(
         self,
         layer: Module,
@@ -1413,6 +1596,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        extra_weight_attrs["weight_loader"] = self.prepare_weight_loader(
+            layer, extra_weight_attrs["weight_loader"]
+        )
         Fp8MoEMethod.create_fp8_moe_weight_(
             layer=layer,
             num_experts=num_experts,
@@ -1587,9 +1773,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
             return
         elif self.use_mxfp8:
-            self._process_mxfp8_moe_weights(
-                layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
-            )
+            self._process_mxfp8_moe_weights(layer, quantize=False)
             return
 
         # If ROCm, normalize the weights and scales to e4m3fnuz
@@ -1825,7 +2009,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ):
             num_experts, m, k = weight_shape
             aligned_m = ((m + 127) // 128) * 128
-            scale = scale.view(num_experts, aligned_m, k // 32)
+            scale = scale.contiguous().view(num_experts, m, k // 32)
+            if aligned_m != m:
+                scale = F.pad(scale, (0, 0, 0, aligned_m - m))
             num_warps = 8
             scale = _swizzle_mxfp8_sf(scale, num_warps)
             # convert_layout may pad for alignment; we can't view back to the
