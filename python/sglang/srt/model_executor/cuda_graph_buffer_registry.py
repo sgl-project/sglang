@@ -939,6 +939,8 @@ def build_prefill_registry(
                 )
         reg.register_slot(slot, bind=bind)
 
+    # PP stage inputs live outside ForwardBatch; adopt runner-owned buffers for
+    # stable addresses and clear padding because prefill executes every bucket row.
     if source is not None:
         pp = getattr(source, "pp_proxy_tensors", None)
         if pp is not None:
@@ -954,7 +956,10 @@ def build_prefill_registry(
                 reg.register_slot(
                     GraphSlot(
                         name=f"pp_proxy_tensors.{_key}",
-                        shape_fn=lambda _bs, _mt, _s=tuple(_backing.shape): _s,
+                        shape_fn=lambda _bs, mt, _tail=tuple(_backing.shape[1:]): (
+                            mt,
+                            *_tail,
+                        ),
                         dtype=_backing.dtype,
                         axis="tokens",
                         padding_policy=PaddingPolicy.ZERO,
