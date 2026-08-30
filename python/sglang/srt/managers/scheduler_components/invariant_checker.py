@@ -330,7 +330,7 @@ class SchedulerInvariantChecker:
                     req,
                     f"req {req.rid}",
                     req.req_pool_idx,
-                    req.kv_committed_len,
+                    req.kv.kv_committed_len,
                     req.kv.kv_allocated_len,
                 )
         sess = getattr(self.tree_cache, "slots", None)
@@ -341,7 +341,7 @@ class SchedulerInvariantChecker:
                         slot,
                         f"slot {sid[:8]}",
                         slot.req_pool_idx,
-                        slot.kv_committed_len,
+                        slot.kv.kv_committed_len,
                         slot.kv.kv_allocated_len,
                     )
 

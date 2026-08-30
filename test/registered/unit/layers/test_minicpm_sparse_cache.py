@@ -68,7 +68,6 @@ def make_pool_and_req(capacity: int = 64):
     req = SimpleNamespace(
         req_pool_idx=None,
         inflight_middle_chunks=0,
-        kv_committed_len=0,
     )
     req_pool_idx = pool.alloc([req])[0]
     return pool, req, req_pool_idx, allocator

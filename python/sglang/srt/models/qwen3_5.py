@@ -1244,6 +1244,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.head_dim,
             self.rotary_emb.rotary_dim,
             has_gate=self.attn_output_gate,
+            mrope_axis_map=(self.rotary_emb.axis_map if positions.dim() == 2 else None),
         )
         seq_len = hidden_states.shape[0]
         q = q_out.view(seq_len, -1)
