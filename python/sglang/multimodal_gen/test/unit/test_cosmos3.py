@@ -923,6 +923,10 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
             num_inference_steps=30,
             num_frames=5,
             metrics=None,
+            # Req.__getattr__ proxies unknown attrs to sampling_params; the
+            # decode stage reads batch.candidate_spec directly, so mirror
+            # that here since SimpleNamespace doesn't proxy.
+            candidate_spec=None,
         )
 
         output = stage.forward(batch, types.SimpleNamespace(vae_cpu_offload=False))
@@ -2174,6 +2178,7 @@ class TestCosmos3CandidateReduction(unittest.TestCase):
 
     def _decode_action(self, action_latents, candidate_spec, raw_action_dim=None):
         stage = Cosmos3DecodingStage.__new__(Cosmos3DecodingStage)
+        stage.log_info = lambda *_args, **_kwargs: None
         batch = types.SimpleNamespace(
             action_latents=action_latents,
             extra={"raw_action_dim": raw_action_dim}
