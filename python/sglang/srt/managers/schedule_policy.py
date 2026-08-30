@@ -926,7 +926,23 @@ class PrefillAdder:
             int(self.rem_total_tokens),
         )
         if _rem_tokens <= 0:
-            _rem_tokens = self.rem_dllm_tokens
+            # rem_total_tokens charges max_new_tokens upfront per staging row,
+            # so it goes negative long before the KV pool is full. Grant one
+            # whole block or nothing: the denoise algorithms reshape with
+            # view(B, block_size), which admits neither a larger nor a ragged row.
+            _rem_tokens = (
+                self.dllm_block_size
+                if self.rem_dllm_tokens >= self.dllm_block_size
+                else 0
+            )
+        else:
+            # A positive sub-block budget rounds down to 0, it does NOT take
+            # the whole-block fallback: the fallback only overrides a
+            # rem_total_tokens driven negative by the upfront max_new_tokens
+            # charge, while a small positive budget is genuine and a full
+            # block would overshoot it. The min above caps at block_size, so
+            # this yields exactly one block or nothing.
+            _rem_tokens = _rem_tokens // self.dllm_block_size * self.dllm_block_size
 
         return _rem_tokens
 
