@@ -81,7 +81,6 @@ class TreeNode:
         # store hash values of each page
         self.hash_value: Optional[List[str]] = None
         # Namespace-aware hashes used only for external KV events.
-        self.event_hash_value: Optional[List[str]] = None
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -1059,12 +1058,6 @@ class SWARadixCache(BasePrefixCache):
                 node.hash_value = list(node.hash_value) + list(child.hash_value)
             else:
                 node.hash_value = None
-            if node.event_hash_value is not None and child.event_hash_value is not None:
-                node.event_hash_value = list(node.event_hash_value) + list(
-                    child.event_hash_value
-                )
-            else:
-                node.event_hash_value = None
 
             self.full_lru_list.remove_node(child)
             if not child.swa_tombstone:
@@ -1135,9 +1128,6 @@ class SWARadixCache(BasePrefixCache):
         new_node.parent.children[key.child_key(self.page_size)] = new_node
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
-        )
-        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
-            child.event_hash_value, split_len, self.page_size
         )
 
         # insert the new node and child into the lru lists, insert

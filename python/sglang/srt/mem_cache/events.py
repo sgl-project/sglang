@@ -29,7 +29,6 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.mem_cache.utils import (
-    compute_node_event_hash_values,
     compute_node_hash_values,
     hash_str_to_int64,
 )
@@ -89,25 +88,19 @@ class KVCacheEventRecorder:
         """Hash values to publish for ``node``, computing them if not yet set."""
         if node.hash_value is None:
             node.hash_value = compute_node_hash_values(node, self.page_size)
-        if node.key.cache_salt is not None:
-            return compute_node_event_hash_values(node, self.page_size)
         return node.hash_value
 
     def _parent_block_hash(self, node: Any) -> Optional[int]:
         """The hash the first page of ``node`` links back to.
 
         ``None`` when the parent is the tree root: a root carries an empty
-        ``hash_value`` and no event hash, so it contributes no link. Every other
-        node on the path has a parent, which is what distinguishes the two.
+        ``hash_value``, so it contributes no link. Every other node on the path
+        has a parent, which is what distinguishes the two.
         """
         parent = node.parent
         if parent is None or parent.parent is None:
             return None
-        if node.key.cache_salt is not None:
-            parent_hash_values = parent.event_hash_value
-            assert parent_hash_values is not None
-        else:
-            parent_hash_values = parent.hash_value
+        parent_hash_values = parent.hash_value
         if not parent_hash_values:
             return None
         return hash_str_to_int64(parent_hash_values[-1])

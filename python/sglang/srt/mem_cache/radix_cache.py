@@ -258,7 +258,6 @@ class TreeNode:
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
         # Namespace-aware hashes used only for external KV events.
-        self.event_hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
 
@@ -720,9 +719,6 @@ class RadixCache(BasePrefixCache):
         # Split hash_value if it was already computed, otherwise leave as None
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
-        )
-        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
-            child.event_hash_value, split_len, self.page_size
         )
 
         return new_node

@@ -105,7 +105,6 @@ class TreeNode:
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
         # Namespace-aware hashes used only for external KV events.
-        self.event_hash_value: Optional[List[str]] = None
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -1230,9 +1229,6 @@ class MambaRadixCache(BasePrefixCache):
         new_node.parent.children[key.child_key(self.page_size)] = new_node
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
-        )
-        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
-            child.event_hash_value, split_len, self.page_size
         )
 
         # insert the new node and child into the full lru list, insert

@@ -750,7 +750,7 @@ class TestRadixCache(unittest.TestCase):
         ]
         self.assertNotEqual(unsalted_hashes, stored[0].block_hashes)
 
-    def test_cache_salt_event_hashes_are_preserved_across_node_split(self):
+    def test_cache_salt_hashes_are_preserved_across_node_split(self):
         cache = RadixCache.create_simulated(page_size=2, enable_kv_cache_events=True)
         original = RadixKey(array("q", [1, 2, 3, 4]), cache_salt="tenant-a")
         cache.insert(
@@ -762,7 +762,7 @@ class TestRadixCache(unittest.TestCase):
         original_node = cache.match_prefix(
             MatchPrefixParams(key=original)
         ).last_device_node
-        original_hashes = list(original_node.event_hash_value)
+        original_hashes = list(original_node.hash_value)
 
         cache.insert(
             InsertParams(
@@ -776,7 +776,7 @@ class TestRadixCache(unittest.TestCase):
         split_parent = split_child.parent
 
         self.assertEqual(
-            split_parent.event_hash_value + split_child.event_hash_value,
+            split_parent.hash_value + split_child.hash_value,
             original_hashes,
         )
 
