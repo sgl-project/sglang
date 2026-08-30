@@ -1185,12 +1185,17 @@ class UnifiedRadixCacheSuite:
             key=key_2p,
             value=value_2p[: len(key_2p)],
             prev_prefix_len=0,
+            track_adopted_ranges=True,
         )
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
         result = cache.insert(params)
         self.assertEqual(result.prefix_len, len(seq_1p))
+        self.assertEqual(
+            result.adopted_ranges[ComponentType.FULL],
+            [(len(seq_1p), len(seq_2p))],
+        )
         self.assertEqual(
             allocator.available_size(),
             initial_avail - len(seq_1p) - (len(seq_2p) - len(seq_1p)),
@@ -1204,12 +1209,17 @@ class UnifiedRadixCacheSuite:
             key=key_3p,
             value=value_3p[: len(key_3p)],
             prev_prefix_len=len(seq_2p),
+            track_adopted_ranges=True,
         )
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
         result = cache.insert(params)
         self.assertEqual(result.prefix_len, len(seq_2p))
+        self.assertEqual(
+            result.adopted_ranges[ComponentType.FULL],
+            [(len(seq_2p), len(seq_3p))],
+        )
         # alloc(3p), freed 0 (prev_prefix_len covers entire overlap), stored 1p new → net -3p
         self.assertEqual(allocator.available_size(), avail_before - len(seq_3p))
         cache.sanity_check()
