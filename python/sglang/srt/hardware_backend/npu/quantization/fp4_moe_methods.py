@@ -9,10 +9,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _get_float4_e2m1fn_x2_dtype,
     _get_float8_e8m0fnu_dtype,
 )
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import set_weight_attrs
 
@@ -21,6 +23,44 @@ if TYPE_CHECKING:
 
 # MXFP4 group size, fixed at 32 by the msmodelslim export format.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _configure_dsv4_deepep_dispatcher(layer: torch.nn.Module) -> None:
+    """Select the DSV4 FP4 DeepEP wire format without changing other MoEs."""
+    dispatcher = getattr(layer, "dispatcher", None)
+    if dispatcher is None:
+        return
+
+    # This method is only instantiated for DSV4 FP4 experts on A5 today, but
+    # retain the former BF16 setting if that selection changes in the future.
+    if not is_npu_arch35():
+        dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+        return
+
+    # Import lazily to avoid importing the MoE backend during quant method
+    # module initialization.
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+
+    if not get_moe_a2a_backend().is_deepep():
+        dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+        return
+
+    low_latency_dtype = envs.SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE.get()
+    if low_latency_dtype not in {"mxfp8", "bf16"}:
+        raise ValueError(
+            "SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE must be one of "
+            "'mxfp8' or 'bf16' for A5 DSV4 DeepEP low-latency dispatch; "
+            f"got {low_latency_dtype!r}."
+        )
+
+    # The concrete dispatcher selects one mode-specific value. Normal (prefill)
+    # remains BF16, while low-latency (decode) defaults to MXFP8.
+    dispatcher.set_quant_config(
+        {
+            "normal_dispatcher_output_dtype": "bf16",
+            "low_latency_dispatcher_output_dtype": low_latency_dtype,
+        }
+    )
 
 
 def _wrap_mxfp4_scale_weight_loader(weight_loader):
@@ -152,8 +192,7 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
 
-        if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+        _configure_dsv4_deepep_dispatcher(layer)
 
     def apply(
         self,
@@ -507,8 +546,37 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
     )
 
 
-def _pair_pack_mxfp_act_scale(scale: torch.Tensor) -> torch.Tensor:
-    """``[M, K/32] -> [M, K/64, 2]`` MX per-token scale layout for the A5 GMM."""
+def _pair_pack_mxfp_act_scale(
+    scale: torch.Tensor, input_shape: Optional[tuple[int, int]] = None
+) -> torch.Tensor:
+    """Adapt MXFP activation scales to the A5 GMM ``[M, K/64, 2]`` layout.
+
+    Low-latency DeepEP MXFP8 returns a flat E8M0 scale buffer, one byte for
+    every 32 activation elements. The grouped-matmul kernel expects those
+    bytes paired on the final dimension instead.
+    """
+    if scale.ndim == 1:
+        if input_shape is None or len(input_shape) != 2:
+            raise ValueError(
+                "A flat MXFP activation scale requires its two-dimensional "
+                "activation input shape."
+            )
+        num_tokens, hidden_size = input_shape
+        if hidden_size % (2 * MXFP4_BLOCK_SIZE) != 0:
+            raise ValueError(
+                "MXFP activation hidden size must be divisible by "
+                f"{2 * MXFP4_BLOCK_SIZE}; got {hidden_size}."
+            )
+        expected_num_scales = num_tokens * (hidden_size // MXFP4_BLOCK_SIZE)
+        if scale.numel() != expected_num_scales:
+            raise ValueError(
+                "Invalid flat MXFP activation scale length: expected "
+                f"{expected_num_scales} for input shape {input_shape}, got "
+                f"{scale.numel()}."
+            )
+        scale = scale.reshape(num_tokens, hidden_size // MXFP4_BLOCK_SIZE)
+
+    # ``[M, K/32] -> [M, K/64, 2]`` MX per-token scale layout for the A5 GMM.
     if scale.ndim != 2:
         return scale
     if scale.shape[-1] % 2 != 0:
@@ -553,7 +621,9 @@ def w4a8_mxfp_gmm(
         scale=None,
         antiquant_scale=[weight_scale],
         scale_dtype=None,
-        per_token_scale=[_pair_pack_mxfp_act_scale(x_scale)],
+        per_token_scale=[
+            _pair_pack_mxfp_act_scale(x_scale, input_shape=tuple(x.shape))
+        ],
         split_item=2,
         group_type=0,
         group_list=group_list,

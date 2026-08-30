@@ -1,3 +1,5 @@
+import inspect
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -20,13 +22,19 @@ from sglang.srt.hardware_backend.npu.quantization import fp4_moe_methods
 from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
     NPUW4A4Fp4MoEMethod,
     _apply_swiglu_limit_npu,
+    _configure_dsv4_deepep_dispatcher,
     _pair_pack_mxfp_act_scale,
     _reshape_mxfp4_scale_for_npu,
     npu_apply_without_routing_weights_w4a4_mxfp,
     w4a8_mxfp_gmm,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.token_dispatcher import deepep
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+
+
+_NOT_PASSED = object()
 
 
 class TestFP4MethodGate(unittest.TestCase):
@@ -124,6 +132,264 @@ class TestPairPackMxfpActScale(unittest.TestCase):
         with self.assertRaises(ValueError):
             _pair_pack_mxfp_act_scale(torch.zeros(2, 3))
 
+    def test_unflattens_low_latency_deepep_scale_as_view(self):
+        # DeepEP returns one flat E8M0 scale per 32-element block.  Passing
+        # that flat buffer to GMM would use the wrong scale layout and either
+        # fail or dequantize activations incorrectly.
+        flat = torch.arange(4, dtype=torch.uint8)
+        packed = _pair_pack_mxfp_act_scale(flat, input_shape=(2, 64))
+
+        self.assertEqual(tuple(packed.shape), (2, 1, 2))
+        self.assertEqual(packed.data_ptr(), flat.data_ptr())
+        self.assertTrue(torch.equal(packed, torch.tensor([[[0, 1]], [[2, 3]]])))
+
+    def test_rejects_low_latency_deepep_scale_with_wrong_length(self):
+        with self.assertRaises(ValueError):
+            _pair_pack_mxfp_act_scale(
+                torch.zeros(3, dtype=torch.uint8), input_shape=(2, 64)
+            )
+
+
+class TestDsv4DeepEPMxfp8DispatcherConfig(unittest.TestCase):
+    @staticmethod
+    def _deepep_backend():
+        return SimpleNamespace(is_deepep=lambda: True)
+
+    def test_a5_deepep_defaults_low_latency_dispatch_to_mxfp8(self):
+        dispatcher = MagicMock()
+        layer = SimpleNamespace(dispatcher=dispatcher)
+
+        with (
+            patch.object(fp4_moe_methods, "is_npu_arch35", return_value=True),
+            patch(
+                "sglang.srt.layers.moe.get_moe_a2a_backend",
+                return_value=self._deepep_backend(),
+            ),
+            patch.dict(os.environ, {}, clear=True),
+        ):
+            _configure_dsv4_deepep_dispatcher(layer)
+
+        dispatcher.set_quant_config.assert_called_once_with(
+            {
+                "normal_dispatcher_output_dtype": "bf16",
+                "low_latency_dispatcher_output_dtype": "mxfp8",
+            }
+        )
+
+    def test_non_deepep_ignores_the_low_latency_quant_environment(self):
+        dispatcher = MagicMock()
+        layer = SimpleNamespace(dispatcher=dispatcher)
+
+        with (
+            patch.object(fp4_moe_methods, "is_npu_arch35", return_value=True),
+            patch(
+                "sglang.srt.layers.moe.get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_deepep=lambda: False),
+            ),
+            envs.SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE.override("invalid"),
+        ):
+            _configure_dsv4_deepep_dispatcher(layer)
+
+        dispatcher.set_quant_config.assert_called_once_with(
+            {"dispatcher_output_dtype": "bf16"}
+        )
+
+    def test_a5_deepep_allows_bf16_low_latency_fallback(self):
+        dispatcher = MagicMock()
+        layer = SimpleNamespace(dispatcher=dispatcher)
+
+        with (
+            patch.object(fp4_moe_methods, "is_npu_arch35", return_value=True),
+            patch(
+                "sglang.srt.layers.moe.get_moe_a2a_backend",
+                return_value=self._deepep_backend(),
+            ),
+            envs.SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE.override("bf16"),
+        ):
+            _configure_dsv4_deepep_dispatcher(layer)
+
+        dispatcher.set_quant_config.assert_called_once_with(
+            {
+                "normal_dispatcher_output_dtype": "bf16",
+                "low_latency_dispatcher_output_dtype": "bf16",
+            }
+        )
+
+    def test_a5_deepep_rejects_an_invalid_low_latency_quant_mode(self):
+        layer = SimpleNamespace(dispatcher=MagicMock())
+
+        with (
+            patch.object(fp4_moe_methods, "is_npu_arch35", return_value=True),
+            patch(
+                "sglang.srt.layers.moe.get_moe_a2a_backend",
+                return_value=self._deepep_backend(),
+            ),
+            envs.SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE.override("invalid"),
+            self.assertRaisesRegex(ValueError, "SGLANG_NPU_DSV4"),
+        ):
+            _configure_dsv4_deepep_dispatcher(layer)
+
+    def test_non_a5_ignores_the_low_latency_quant_environment(self):
+        dispatcher = MagicMock()
+        layer = SimpleNamespace(dispatcher=dispatcher)
+
+        with (
+            patch.object(fp4_moe_methods, "is_npu_arch35", return_value=False),
+            patch(
+                "sglang.srt.layers.moe.get_moe_a2a_backend",
+                return_value=self._deepep_backend(),
+            ),
+            envs.SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE.override("invalid"),
+        ):
+            _configure_dsv4_deepep_dispatcher(layer)
+
+        dispatcher.set_quant_config.assert_called_once_with(
+            {"dispatcher_output_dtype": "bf16"}
+        )
+
+
+class _LowLatencyBuffer:
+    def __init__(self):
+        self.kwargs = None
+
+    def low_latency_dispatch(
+        self,
+        hidden_states,
+        topk_ids,
+        num_max_dispatch_tokens_per_rank,
+        num_experts,
+        *,
+        use_fp8,
+        quant_mode=_NOT_PASSED,
+        **kwargs,
+    ):
+        self.kwargs = {"use_fp8": use_fp8, "quant_mode": quant_mode, **kwargs}
+        return torch.empty(0), torch.empty(0), object(), object(), object()
+
+
+class _LegacyLowLatencyBuffer:
+    def low_latency_dispatch(
+        self,
+        hidden_states,
+        topk_ids,
+        num_max_dispatch_tokens_per_rank,
+        num_experts,
+        *,
+        use_fp8,
+        **kwargs,
+    ):
+        return torch.empty(0), torch.empty(0), object(), object(), object()
+
+
+class TestDeepEPLowLatencyMxfp8Dispatch(unittest.TestCase):
+    @staticmethod
+    def _dispatcher(quant_mode, buffer):
+        dispatcher = object.__new__(deepep._DeepEPDispatcherImplLowLatency)
+        dispatcher.quant_config = {}
+        dispatcher.use_fp8 = False
+        dispatcher.use_nvfp4 = False
+        dispatcher.low_latency_quant_mode = quant_mode
+        dispatcher._low_latency_quant_mode_runtime_checked = False
+        dispatcher.num_max_dispatch_tokens_per_rank = 2
+        dispatcher.num_experts = 2
+        dispatcher.return_recv_hook = False
+        dispatcher._get_buffer = lambda: buffer
+        return dispatcher
+
+    def test_mxfp8_passes_the_kernel_quant_mode(self):
+        buffer = _LowLatencyBuffer()
+        dispatcher = self._dispatcher("mx_fp8_e4m3", buffer)
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(deepep, "_deepep_precompile_tp_barrier"),
+        ):
+            dispatcher._dispatch_core(
+                torch.zeros(1, 64),
+                torch.zeros(1, 1, dtype=torch.int64),
+                torch.ones(1, 1),
+            )
+
+        self.assertEqual(buffer.kwargs["quant_mode"], "mx_fp8_e4m3")
+
+    def test_mxfp8_ops_strategy_uses_legacy_mxfp8_flags(self):
+        buffer = _LowLatencyBuffer()
+        dispatcher = self._dispatcher("mx_fp8_e4m3", buffer)
+
+        with (
+            patch.dict(os.environ, {"DEEP_USE_MODE": "ops"}, clear=True),
+            patch.object(deepep, "_deepep_precompile_tp_barrier"),
+        ):
+            dispatcher._dispatch_core(
+                torch.zeros(1, 64),
+                torch.zeros(1, 1, dtype=torch.int64),
+                torch.ones(1, 1),
+            )
+
+        self.assertTrue(buffer.kwargs["use_fp8"])
+        self.assertTrue(buffer.kwargs["use_ue8m0"])
+        self.assertEqual(buffer.kwargs["quant_mode"], "mx_fp8_e4m3")
+
+    def test_mxfp8_rejects_an_unsupported_low_latency_strategy(self):
+        dispatcher = self._dispatcher("mx_fp8_e4m3", _LowLatencyBuffer())
+
+        with (
+            patch.dict(os.environ, {"DEEP_USE_MODE": "alltoall"}, clear=True),
+            self.assertRaisesRegex(RuntimeError, "DEEP_USE_MODE"),
+        ):
+            dispatcher._dispatch_core(
+                torch.zeros(1, 64),
+                torch.zeros(1, 1, dtype=torch.int64),
+                torch.ones(1, 1),
+            )
+
+    def test_mxfp8_checks_runtime_interface_once_per_dispatcher(self):
+        buffer = _LowLatencyBuffer()
+        dispatcher = self._dispatcher("mx_fp8_e4m3", buffer)
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(deepep, "_deepep_precompile_tp_barrier"),
+            patch.object(
+                deepep.inspect, "signature", wraps=inspect.signature
+            ) as signature,
+        ):
+            dispatcher._dispatch_core(
+                torch.zeros(1, 64),
+                torch.zeros(1, 1, dtype=torch.int64),
+                torch.ones(1, 1),
+            )
+            dispatcher._dispatch_core(
+                torch.zeros(1, 64),
+                torch.zeros(1, 1, dtype=torch.int64),
+                torch.ones(1, 1),
+            )
+
+        self.assertEqual(signature.call_count, 1)
+
+    def test_bf16_does_not_pass_a_quant_mode(self):
+        buffer = _LowLatencyBuffer()
+        dispatcher = self._dispatcher(None, buffer)
+
+        with patch.object(deepep, "_deepep_precompile_tp_barrier"):
+            dispatcher._dispatch_core(
+                torch.zeros(1, 64),
+                torch.zeros(1, 1, dtype=torch.int64),
+                torch.ones(1, 1),
+            )
+
+        self.assertIs(buffer.kwargs["quant_mode"], _NOT_PASSED)
+
+    def test_mxfp8_rejects_legacy_runtime_without_quant_mode(self):
+        dispatcher = self._dispatcher("mx_fp8_e4m3", _LegacyLowLatencyBuffer())
+
+        with self.assertRaisesRegex(RuntimeError, "quant_mode"):
+            dispatcher._dispatch_core(
+                torch.zeros(1, 64),
+                torch.zeros(1, 1, dtype=torch.int64),
+                torch.ones(1, 1),
+            )
+
 
 class TestW4A8MxfpGmmInputScale(unittest.TestCase):
     def setUp(self):
@@ -165,6 +431,28 @@ class TestW4A8MxfpGmmInputScale(unittest.TestCase):
         self.assertIs(call_kwargs["per_token_scale"][0], self.input_scale)
         self.assertEqual(call_kwargs["group_list"].dtype, torch.int64)
         self.assertTrue(torch.equal(call_kwargs["group_list"], self.group_list))
+
+    def test_flat_deepep_scale_skips_dynamic_quant_after_layout_adaptation(self):
+        flat_scale = torch.arange(4, dtype=torch.uint8)
+        expected = torch.randn(2, 32)
+        with (
+            patch.object(
+                torch.ops.npu, "npu_dynamic_mx_quant", create=True
+            ) as dynamic_quant,
+            patch.object(
+                torch.ops.npu,
+                "npu_grouped_matmul",
+                return_value=[expected],
+                create=True,
+            ) as grouped_matmul,
+        ):
+            output = self._call_gmm(flat_scale)
+
+        dynamic_quant.assert_not_called()
+        self.assertIs(output, expected)
+        packed_scale = grouped_matmul.call_args.kwargs["per_token_scale"][0]
+        self.assertEqual(tuple(packed_scale.shape), (2, 1, 2))
+        self.assertEqual(packed_scale.data_ptr(), flat_scale.data_ptr())
 
     def test_missing_scale_uses_dynamic_quant(self):
         quantized = torch.empty(2, 64, dtype=torch.float8_e4m3fn)
