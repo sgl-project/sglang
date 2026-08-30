@@ -83,6 +83,10 @@ class _FakeReq:
         self.skip_lock_node_ids = {}
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
+
+    def detach_kv(self):
+        kv, self.kv = self.kv, ReqKvInfo()
+        return kv
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
@@ -177,27 +181,17 @@ def test_nth_mid_abort_nukes_session_slot():
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
     tree_cache = StreamingSession(inner)
 
-    # Session already has a slot from a previous turn.
-    tree_cache.slots["session-a"] = SessionSlot(
-        kv=ReqKvInfo(
-            req_pool_idx=0,
-            kv_committed_len=50,
-            kv_allocated_len=50,
-            swa_evicted_seqlen=0,
-            cache_protected_len=0,
-        ),
-        last_node=None,
-    )
-
-    # Mid-processing abort: req has the SESSION slot's pool_idx (restore_to_req ran).
+    # Mid-processing abort: restore_to_req ran, so the req runs on the slot's
+    # record, which this turn has grown to committed=60 / allocated=65.
     req = _FakeReq("session-a", req_pool_idx=0, committed=60, allocated=65)
     req.finished_reason = FINISH_ABORT("client disconnected")
+    tree_cache.slots["session-a"] = SessionSlot(kv=req.kv, last_node=None)
 
     tree_cache.cache_finished_req(req)
 
     # Slot wiped — deleted from slots dict.
     assert "session-a" not in tree_cache.slots
-    # All KV freed: [0, 65) from release_session (slot extended to req's allocated).
+    # All KV freed: [0, 65) from release_session.
     assert len(allocator.freed) == 1
     assert allocator.freed[0].tolist() == list(range(65))
     # Pool slot returned.

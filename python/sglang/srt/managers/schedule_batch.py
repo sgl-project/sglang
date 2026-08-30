@@ -1282,6 +1282,11 @@ class Req(ReqDllmMixin):
             or self.mamba_host_hit_length > 0
         )
 
+    def detach_kv(self) -> ReqKvInfo:
+        # Hand the KV record to a new holder; the req keeps a fresh empty one.
+        kv, self.kv = self.kv, ReqKvInfo()
+        return kv
+
     def effective_kv_committed_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
