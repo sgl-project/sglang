@@ -36,6 +36,7 @@ def _make_req(freq=0.0, presence=0.0, min_tokens=0, stop_ids=None, eos_id=2):
     req.sampling_params.presence_penalty = presence
     req.sampling_params.min_new_tokens = min_tokens
     req.sampling_params.stop_token_ids = stop_ids
+    req.eos_token_ids = None
     req.tokenizer.additional_stop_token_ids = None
     req.tokenizer.eos_token_id = eos_id
     return req
@@ -346,6 +347,20 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
             )
         # Non-stop tokens should be fine
         self.assertEqual(logits[0, 0].item(), 0.0)
+
+    def test_blocks_model_eos_without_tokenizer_eos(self):
+        """Model-config EOS remains blocked when tokenizer EOS metadata is missing."""
+        req = _make_req(min_tokens=3, eos_id=None)
+        req.eos_token_ids = {6}
+        batch = _make_batch([req])
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedMinNewTokensPenalizer}
+        )
+        pen = orch.penalizers[BatchedMinNewTokensPenalizer]
+
+        logits = torch.zeros(1, VOCAB_SIZE)
+        pen.apply(logits)
+        self.assertTrue(torch.isneginf(logits[0, 6]))
 
     def test_filter_keeps_subset(self):
         """Test that filter keeps the second request (min_tokens=5) and drops the first."""

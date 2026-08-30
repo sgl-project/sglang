@@ -158,6 +158,9 @@ class TestSamplingParamsSubclass(unittest.TestCase):
                     params._adjust(server_args)
 
                 self.assertEqual((params.width, params.height), expected)
+                self.assertEqual(
+                    (params.requested_width, params.requested_height), requested
+                )
                 mock_warning.assert_called_once_with(
                     "GLM-Image requires dimensions divisible by %s; adjusted "
                     "requested resolution from %sx%s to %sx%s",
@@ -459,8 +462,10 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         )
 
     def test_dataclasses_replace_preserves_explicit_fields(self):
-        """`dataclasses.replace` drops `_explicit_fields`; DiffGenerator must restore it."""
-        import dataclasses
+        """Per-prompt clones retain explicit and model-internal fields."""
+        from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+            _replace_sampling_params_for_prompt,
+        )
 
         server_args = MagicMock()
         server_args.backend = "sglang"
@@ -484,24 +489,41 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertIn("width", sampling_params_orig._explicit_fields)
         self.assertIn("height", sampling_params_orig._explicit_fields)
 
-        cloned = dataclasses.replace(
+        cloned = _replace_sampling_params_for_prompt(
             sampling_params_orig,
             prompt="new",
             output_file_name=None,
             image_path="/tmp/in2.png",
         )
-        self.assertFalse(hasattr(cloned, "_explicit_fields"))
-
-        # Mirror the restore done in DiffGenerator.generate().
-        cloned._explicit_fields = getattr(
-            sampling_params_orig, "_explicit_fields", set()
-        ) | {"prompt", "output_file_name", "image_path"}
 
         explicit = set(cloned.build_request_extra()["explicit_fields"])
         self.assertIn("width", explicit)
         self.assertIn("height", explicit)
         self.assertIn("prompt", explicit)
         self.assertIn("image_path", explicit)
+
+    def test_per_prompt_clone_preserves_glm_image_crop_size(self):
+        from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+            _replace_sampling_params_for_prompt,
+        )
+
+        sampling_params_orig = GlmImageSamplingParams(
+            prompt="orig",
+            width=1024,
+            height=1024,
+        )
+        sampling_params_orig.requested_width = 1000
+        sampling_params_orig.requested_height = 999
+
+        cloned = _replace_sampling_params_for_prompt(
+            sampling_params_orig,
+            prompt="new",
+            output_file_name=None,
+            image_path=None,
+        )
+
+        self.assertEqual((cloned.width, cloned.height), (1024, 1024))
+        self.assertEqual((cloned.requested_width, cloned.requested_height), (1000, 999))
 
 
 if __name__ == "__main__":

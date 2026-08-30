@@ -232,7 +232,7 @@ def test_kda_prefill_cake_returns_native_interior_state_tracking():
     torch.testing.assert_close(
         state_cake.float(), state_ref.float(), atol=1e-2, rtol=1e-2
     )
-    assert data["beta"].stride(-2) == 32
+    assert data["beta"].stride(-2) == 12 + 16
 
 
 @pytest.mark.parametrize("num_heads", [4, 8, 16, 32])

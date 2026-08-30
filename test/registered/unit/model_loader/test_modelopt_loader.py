@@ -696,6 +696,28 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
+    def test_fp8_pb_wo_dispatches_to_native_block_fp8(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.self_attn.q_proj": {"quant_algo": "FP8_PB_WO"},
+                },
+                "packed_modules_mapping": {},
+            }
+        )
+
+        # Type dispatch only needs a LinearBase instance; skip GPU weight setup.
+        linear = ReplicatedLinear.__new__(ReplicatedLinear)
+        method = quant_config.get_quant_method(
+            linear, "model.layers.0.self_attn.q_proj"
+        )
+
+        self.assertIsInstance(method, Fp8LinearMethod)
+        self.assertEqual(method.quant_config.weight_block_size, [128, 128])
+        self.assertTrue(method.quant_config.is_checkpoint_fp8_serialized)
+        self.assertEqual(method.quant_config.activation_scheme, "dynamic")
+
     def test_incomplete_inline_config_falls_back_to_hf_quant_config_file(self):
         packed_modules_mapping = {
             "qkv_proj": ["q_proj", "k_proj", "v_proj"],
