@@ -745,6 +745,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         full_cell_size = (
             self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
             + self._swa_per_token * self._draft_swa_full_layers_num
+            + self._draft_cell_size
         )
         full_tokens = (
             int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size
