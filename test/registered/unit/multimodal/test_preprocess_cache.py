@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import io
 import os
 import tempfile
 import unittest
@@ -29,6 +30,13 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestMediaIdentity(unittest.TestCase):
+    def test_lazy_pil_decode_failure_is_client_error(self):
+        malformed_png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJSwAAAABJRU5ErkJggg=="
+        )
+        with self.assertRaisesRegex(ValueError, "Could not decode image"):
+            snapshot_media(Image.open(io.BytesIO(malformed_png)))
+
     def test_hash_format_is_strict_and_normalized(self):
         digest = "AB" * 32
         self.assertEqual(

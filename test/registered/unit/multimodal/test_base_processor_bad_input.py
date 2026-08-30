@@ -8,7 +8,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import base64
 import binascii
+import errno
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -16,6 +18,9 @@ import requests
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.processors.transformers_auto import (
+    TransformersAutoMultimodalProcessor,
+)
 from sglang.srt.utils.common import CLIENT_MEDIA_EXCEPTIONS
 from sglang.test.test_utils import CustomTestCase
 
@@ -62,6 +67,27 @@ class TestBadInputIsClientError(CustomTestCase):
         # PIL raises UnidentifiedImageError, an OSError -- not a ValueError.
         self._assert_client_error(b"definitely not an image", Modality.IMAGE)
 
+    def test_malformed_image_bytes(self):
+        image = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJSwAAAABJRU5ErkJggg=="
+        )
+        for discard_alpha_channel in (True, False):
+            with self.subTest(discard_alpha_channel=discard_alpha_channel):
+                with self.assertRaises(ValueError) as ctx:
+                    _StubProcessor._load_single_item(
+                        image,
+                        Modality.IMAGE,
+                        discard_alpha_channel=discard_alpha_channel,
+                    )
+                self.assertIsInstance(ctx.exception.__cause__.__cause__, OSError)
+
+    def test_transformers_loader_rejects_lazy_decode_failure(self):
+        image = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJSwAAAABJRU5ErkJggg=="
+        )
+        with self.assertRaisesRegex(ValueError, "Could not decode image"):
+            TransformersAutoMultimodalProcessor._load_images(None, [image])
+
     def test_undecodable_audio_bytes(self):
         # soundfile raises LibsndfileError, a RuntimeError -- not a ValueError.
         self._assert_client_error(b"definitely not audio", Modality.AUDIO)
@@ -90,6 +116,48 @@ class TestServerFaultStaysServerError(CustomTestCase):
 
     def test_decoder_oom(self):
         self._assert_server_error(MemoryError("out of memory"))
+
+    def test_image_loader_os_error(self):
+        with patch(
+            "sglang.srt.multimodal.processors.base_processor.load_image",
+            side_effect=OSError("too many open files"),
+        ):
+            with self.assertRaises(RuntimeError):
+                _StubProcessor._load_single_item(b"payload", Modality.IMAGE)
+
+    def test_image_load_resource_error(self):
+        image = MagicMock()
+        image.load.side_effect = OSError(errno.EMFILE, "too many open files")
+        with patch(
+            "sglang.srt.multimodal.processors.base_processor.load_image",
+            return_value=(image, None),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                _StubProcessor._load_single_item(b"payload", Modality.IMAGE)
+        self.assertEqual(ctx.exception.__cause__.errno, errno.EMFILE)
+
+    def test_image_convert_resource_error(self):
+        image = MagicMock()
+        image.mode = "RGBA"
+        image.convert.side_effect = OSError(errno.ENOMEM, "out of memory")
+        with patch(
+            "sglang.srt.multimodal.processors.base_processor.load_image",
+            return_value=(image, None),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                _StubProcessor._load_single_item(b"payload", Modality.IMAGE)
+        self.assertEqual(ctx.exception.__cause__.errno, errno.ENOMEM)
+
+    def test_image_convert_decode_error(self):
+        image = MagicMock()
+        image.mode = "RGBA"
+        image.convert.side_effect = OSError("broken image stream")
+        with patch(
+            "sglang.srt.multimodal.processors.base_processor.load_image",
+            return_value=(image, None),
+        ):
+            with self.assertRaisesRegex(ValueError, "Could not decode image"):
+                _StubProcessor._load_single_item(b"payload", Modality.IMAGE)
 
 
 class TestClientMediaExceptions(CustomTestCase):

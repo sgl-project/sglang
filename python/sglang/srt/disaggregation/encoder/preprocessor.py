@@ -37,6 +37,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
+    fully_load_pil_image,
     load_audio,
     load_image,
     load_video,
@@ -317,12 +318,8 @@ class EncoderPreprocessor:
                     else False
                 )
                 img, _ = load_image(data, gpu_image_decode)
-                if (
-                    discard_alpha_channel
-                    and not isinstance(img, torch.Tensor)
-                    and img.mode != "RGB"
-                ):
-                    img = img.convert("RGB")
+                if discard_alpha_channel and not isinstance(img, torch.Tensor):
+                    img = fully_load_pil_image(img, mode="RGB")
                 if (
                     media_metadata
                     and self.encoder_media_processor_config.preserve_media_metadata
