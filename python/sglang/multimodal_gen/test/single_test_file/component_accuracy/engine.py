@@ -452,7 +452,9 @@ class AccuracyEngine:
         )
         if mapping:
             source_state, _ = hf_to_custom_state_dict(
-                source_state, get_param_names_mapping(mapping)
+                source_state,
+                get_param_names_mapping(mapping),
+                valid_target_names=set(target.state_dict()),
             )
 
         lookup = build_state_lookup(source_state)
