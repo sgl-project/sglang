@@ -140,6 +140,7 @@ class ComponentLoader(ABC):
     # Gates only --component-direct-gpu-weight-loading.<name>. The checkpoint
     # source stays component-specific because its streaming ABI is loader-owned.
     supports_direct_gpu_weight_loading = False
+    supports_fsdp_inference = False
 
     _loaders_registered = False
 
@@ -183,6 +184,21 @@ class ComponentLoader(ABC):
             server_args.pipeline_config, "native_only_components", ()
         )
         return component_name in native_only_components
+
+    def validate_native_fallback(
+        self, _server_args: ServerArgs, _component_name: str
+    ) -> None:
+        """Validate that fallback preserves the exact component's runtime contract."""
+        pass
+
+    def disable_unsupported_component_fsdp(
+        self, server_args: ServerArgs, component_name: str
+    ) -> None:
+        if (
+            not self.supports_fsdp_inference
+            and server_args.should_use_fsdp_for_component(component_name)
+        ):
+            server_args.disable_fsdp_for_component(component_name)
 
     def _load_customized_with_context(
         self,
@@ -250,6 +266,7 @@ class ComponentLoader(ABC):
             raise ComponentCheckpointUnsupportedError(
                 f"{component_name!r} does not support direct GPU weight loading"
             )
+        self.disable_unsupported_component_fsdp(server_args, component_name)
         component_quantization = server_args.component_quantizations.get(component_name)
         if (
             component_quantization is not None
@@ -303,6 +320,7 @@ class ComponentLoader(ABC):
                     f"Failed to load customized {component_name}; native fallback "
                     "is disabled for this component configuration."
                 ) from e
+            self.validate_native_fallback(server_args, component_name)
             if native_loader_required:
                 logger.info("%s", e)
             elif "Unsupported model architecture" in str(e):

@@ -61,6 +61,9 @@ class _FakeServerArgs:
     def should_direct_gpu_weight_load_component(self, component_name):
         return self.component_direct_gpu_weight_loading.get(component_name, False)
 
+    def should_use_fsdp_for_component(self, _component_name):
+        return False
+
 
 class TestDeploymentBytesRoot(unittest.TestCase):
     """A hub repo id is not a directory; the component path always is."""

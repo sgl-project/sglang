@@ -42,6 +42,7 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
             encoder_parallel="replicate",
             resolve_component_attention_backend=lambda _name: (None, None),
             should_direct_gpu_weight_load_component=lambda _name: False,
+            should_use_fsdp_for_component=lambda _name: False,
         )
 
     def _component_config(self, architecture, *, quantized):

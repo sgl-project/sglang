@@ -166,7 +166,6 @@ def register(cache, token_ids, session_id, generation=None):
             ).last_device_node,
             origin_input_ids=array("q", token_ids),
             output_ids=array("q"),
-            kv_committed_len=len(token_ids),
             extra_key=None,
         )
     )

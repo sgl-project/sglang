@@ -63,7 +63,11 @@ from sglang.srt.observability.trace import (
     TraceReqContext,
     trace_set_thread_info,
 )
-from sglang.srt.runtime_context import get_memory, get_schedule
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_observability,
+    get_schedule,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
@@ -213,7 +217,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-        self.enable_trace = server_args.enable_trace
+        self.enable_trace = get_observability().enable_trace
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
