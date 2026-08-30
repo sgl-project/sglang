@@ -17,6 +17,7 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import set_weight_attrs
+from sglang.srt.hardware_backend.npu.swiglu_quant import swiglu_quant
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -330,19 +331,27 @@ def npu_fused_experts_w4a4_mxfp(
         output_dtype=original_dtype,
     )
     assert swiglu_limit is not None
-    hidden_states = torch.ops.npu.npu_clipped_swiglu(
+    hidden_states, hidden_states_scale = swiglu_quant(
         hidden_states,
-        group_index=expert_tokens,
-        alpha=1,
+        group_list=expert_tokens,
+        group_list_type=0,
+        need_quant=True,
+        do_limit=True,
         limit=swiglu_limit,
-        bias=0,
-        interleaved=False,
     )
+    # hidden_states = torch.ops.npu.npu_clipped_swiglu(
+    #     hidden_states,
+    #     group_index=expert_tokens,
+    #     alpha=1,
+    #     limit=swiglu_limit,
+    #     bias=0,
+    #     interleaved=False,
+    # )
     # _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
     # hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     hidden_states = w4a8_mxfp_gmm(
         input=hidden_states,
-        input_scale=None,
+        input_scale=hidden_states_scale,
         weight=w2,
         weight_scale=w2_weight_scale_inv,
         group_list_type=0,
@@ -407,19 +416,27 @@ def npu_fused_experts_w4a4_mxfp_decode(
         output_dtype=original_dtype,
     )
     assert swiglu_limit is not None
-    hidden_states = torch.ops.npu.npu_clipped_swiglu(
+    hidden_states, hidden_states_scale = swiglu_quant(
         hidden_states,
-        group_index=expert_tokens,
-        alpha=1,
+        group_list=expert_tokens,
+        group_list_type=0,
+        need_quant=True,
+        do_limit=True,
         limit=swiglu_limit,
-        bias=0,
-        interleaved=False,
     )
+    # hidden_states = torch.ops.npu.npu_clipped_swiglu(
+    #     hidden_states,
+    #     group_index=expert_tokens,
+    #     alpha=1,
+    #     limit=swiglu_limit,
+    #     bias=0,
+    #     interleaved=False,
+    # )
     # _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
     # hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     hidden_states = w4a8_mxfp_gmm(
         input=hidden_states,
-        input_scale=None,
+        input_scale=hidden_states_scale,
         weight=w2,
         weight_scale=w2_weight_scale_inv,
         group_list_type=group_list_type,
@@ -525,19 +542,27 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
         output_dtype=output_dtype,
     )
     assert layer.moe_runner_config.swiglu_limit is not None
-    hidden_states = torch.ops.npu.npu_clipped_swiglu(
+    hidden_states, hidden_states_scale = swiglu_quant(
         hidden_states,
-        group_index=group_list,
-        alpha=1,
+        group_list=group_list,
+        group_list_type=0,
+        need_quant=True,
+        do_limit=True,
         limit=layer.moe_runner_config.swiglu_limit,
-        bias=0,
-        interleaved=False,
     )
+    # hidden_states = torch.ops.npu.npu_clipped_swiglu(
+    #     hidden_states,
+    #     group_index=group_list,
+    #     alpha=1,
+    #     limit=layer.moe_runner_config.swiglu_limit,
+    #     bias=0,
+    #     interleaved=False,
+    # )
     # _apply_swiglu_limit_npu(hidden_states, layer.moe_runner_config.swiglu_limit)
     # hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     return w4a8_mxfp_gmm(
         input=hidden_states,
-        input_scale=None,
+        input_scale=hidden_states_scale,
         weight=layer.w2_weight,
         weight_scale=layer.w2_weight_scale_inv,
         group_list_type=group_list_type,

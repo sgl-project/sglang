@@ -448,12 +448,13 @@ class DeepseekV2MLP(nn.Module):
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         elif self.swiglu_limit is not None:
             if _is_npu:
-                _g, _u = gate_up.chunk(2, dim=-1)
-                _lim = float(self.swiglu_limit)
-                gate_up = torch.cat(
-                    [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
+                x = torch.ops.npu.npu_clipped_swiglu(
+                    gate_up,
+                    alpha=1,
+                    limit=self.swiglu_limit,
+                    bias=0,
+                    interleaved=False,
                 )
-                x = self.act_fn(gate_up)
             else:
                 M, N = gate_up.shape
                 x = gate_up.new_empty((M, N // 2))
