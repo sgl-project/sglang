@@ -477,9 +477,9 @@ def register_fake_ops(tp_size: int):
         out_dtype,
         is_vnni,
     ):
-        M = mat1.shape[0]
-        N = mat2.shape[0]
-        return mat1.new_empty(M, N, dtype=out_dtype)
+        sizes = list(mat1.shape)
+        sizes[-1] = mat2.shape[0]
+        return mat1.new_empty(sizes, dtype=out_dtype)
 
     @register_cpu_compile_fake("mxfp4_scaled_mm_cpu")
     def _(mat1, mat2, scales2, bias, is_vnni):

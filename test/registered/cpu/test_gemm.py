@@ -186,15 +186,14 @@ class TestGemm(CustomTestCase):
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
     @parametrize(
-        M=[1, 11],
+        M=[1, 11, 97],
+        N=[128, 224],
+        K=[512, 576],
         scale_as_vector=[False, True],
         has_bias=[False, True],
         prepack=[False, True],
     )
-    def test_fp8_per_tensor_gemm(self, M, scale_as_vector, has_bias, prepack):
-        """A scalar weight scale must dequantize the entire FP8 matrix."""
-        N = 128
-        K = 512
+    def test_fp8_per_tensor_gemm(self, M, N, K, scale_as_vector, has_bias, prepack):
         data = torch.randn(M, K, dtype=torch.bfloat16) / 10
         weight = torch.randn(N, K).to(torch.float8_e4m3fn)
         scale = torch.tensor(0.01, dtype=torch.float32)
@@ -218,6 +217,28 @@ class TestGemm(CustomTestCase):
             prepack,
         )
 
+        atol = rtol = precision[ref.dtype]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
+    def test_fp8_per_tensor_gemm_3d_input(self):
+        """Activations keep their leading dims: [*, K] @ [N, K]^T -> [*, N]."""
+        B, M, N, K = 2, 3, 128, 512
+        data = torch.randn(B, M, K, dtype=torch.bfloat16) / 10
+        weight = torch.randn(N, K).to(torch.float8_e4m3fn)
+        scale = torch.tensor(0.01, dtype=torch.float32)
+
+        ref = (torch.matmul(data.float(), weight.float().T) * scale).bfloat16()
+
+        out = torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
+            data,
+            torch.ops.sgl_kernel.convert_weight_packed(weight),
+            scale,
+            None,
+            data.dtype,
+            True,
+        )
+
+        self.assertEqual(out.shape, (B, M, N))
         atol = rtol = precision[ref.dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 

@@ -1041,7 +1041,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        if use_intel_amx_backend(layer):
+        if use_intel_amx_backend(layer) and not isinstance(x, tuple):
             return torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
                 x,
                 layer.weight,
