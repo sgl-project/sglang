@@ -558,7 +558,7 @@ class TestViewMemo(unittest.TestCase):
 class TestWriteLoc(unittest.TestCase):
     """The two-phase write contract: phase 1 (`rebind_write_loc`) rebinds the
     full side once at ForwardBatch construction; phase 2 derives the
-    sliding-window write loc at the per-batch build, POINTWISE from the dense
+    sliding-window write loc on demand, POINTWISE from the full-side
     values. Value-based derivation is the property under test: pads, slices,
     and fresh copies of the loc must all derive correctly with no handover
     and no stored per-forward state."""
@@ -573,12 +573,7 @@ class TestWriteLoc(unittest.TestCase):
         return src, allocator, rows, seq_lens, virt, want_full, want_swa
 
     def _field(self, src, rows, seq_lens, kernel_loc):
-        return src.build_index_table(
-            req_pool_indices=rows,
-            seq_lens=seq_lens,
-            max_pages=4,
-            out_cache_loc=kernel_loc,
-        ).sliding_window_write_loc
+        return src.sliding_window_write_loc_for(kernel_loc)
 
     def test_rebind_translates_full_side_only(self):
         for ps in (1, 4):
@@ -652,20 +647,12 @@ class TestWriteLoc(unittest.TestCase):
         fb = _FakeForwardBatch(out_cache_loc=loc)
         src.rebind_write_loc(fb)
         self.assertIs(fb.out_cache_loc, loc, "disabled rebind must be a no-op")
-        view = src.build_index_table(
-            req_pool_indices=torch.tensor([0]),
-            seq_lens=torch.tensor([1]),
-            out_cache_loc=loc,
-        )
-        self.assertTrue(torch.equal(view.sliding_window_write_loc, loc + 100))
+        self.assertTrue(torch.equal(src.sliding_window_write_loc_for(loc), loc + 100))
 
     def test_no_loc_or_no_swa_side_yields_none(self):
-        # Unified swa composite, but the build was given no write loc.
+        # Unified swa composite, but there is no write loc this forward.
         src, _, rows, seq_lens, _, _, _ = self._built(n=2)
-        view = src.build_index_table(
-            req_pool_indices=rows, seq_lens=seq_lens, max_pages=4
-        )
-        self.assertIsNone(view.sliding_window_write_loc)
+        self.assertIsNone(src.sliding_window_write_loc_for(None))
         # Passthrough on a non-SWA pool: a loc is given, but there is no swa
         # id space to derive into.
         plain = KVIndexTranslator(
@@ -675,12 +662,9 @@ class TestWriteLoc(unittest.TestCase):
             page_size=1,
             device=_DEV,
         )
-        view = plain.build_index_table(
-            req_pool_indices=torch.tensor([0]),
-            seq_lens=torch.tensor([1]),
-            out_cache_loc=torch.tensor([3], dtype=torch.int64),
+        self.assertIsNone(
+            plain.sliding_window_write_loc_for(torch.tensor([3], dtype=torch.int64))
         )
-        self.assertIsNone(view.sliding_window_write_loc)
 
     def test_rebind_retires_the_view_memo(self):
         ps = 1

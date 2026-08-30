@@ -30,7 +30,6 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTable
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -678,20 +677,17 @@ class TritonAttnBackend(AttentionBackend):
                 )
                 return
 
-            index_table = self._apply_cuda_graph_metadata(
+            self._apply_cuda_graph_metadata(
                 bs=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 forward_mode=forward_mode,
                 spec_info=spec_info,
-                out_cache_loc=forward_batch.out_cache_loc,
             )
             out_cache_loc_full_physical = self._fill_cuda_graph_write_locs(
                 forward_batch, bs
             )
-            swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(
-                forward_batch, index_table
-            )
+            swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
             self.forward_metadata = self._build_cuda_graph_forward_metadata(
                 bs,
                 forward_mode,
@@ -700,20 +696,19 @@ class TritonAttnBackend(AttentionBackend):
                 out_cache_loc_full_physical,
             )
         else:
-            index_table = self._apply_cuda_graph_metadata(
+            self._apply_cuda_graph_metadata(
                 bs=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 forward_mode=forward_mode,
                 spec_info=spec_info,
-                out_cache_loc=forward_batch.out_cache_loc,
             )
             # Metadata view is reused from capture; just refill the buffers.
             self._fill_cuda_graph_write_locs(forward_batch, bs)
-            self._fill_cuda_graph_swa_out_cache_loc(forward_batch, index_table)
+            self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
 
     def _fill_cuda_graph_swa_out_cache_loc(
-        self, forward_batch: ForwardBatch, index_table: KVIndexTable
+        self, forward_batch: ForwardBatch
     ) -> Optional[torch.Tensor]:
         """Refill the SWA write-target buffer from the batch's derived
         sliding-window write loc, returning the [:n] view (None for non-SWA /
@@ -727,10 +722,8 @@ class TritonAttnBackend(AttentionBackend):
             or out_cache_loc.shape[0] > self.cuda_graph_swa_out_cache_loc.shape[0]
         ):
             return None
-        swa_write_loc = index_table.sliding_window_write_loc
-        assert swa_write_loc is not None, (
-            "sliding-window refill: the batch's index table carries no "
-            "sliding_window_write_loc — was it built without out_cache_loc?"
+        swa_write_loc = self.kv_index_translator.sliding_window_write_loc_for(
+            out_cache_loc
         )
         n = out_cache_loc.shape[0]
         self.cuda_graph_swa_out_cache_loc[n:].zero_()
@@ -992,9 +985,9 @@ class TritonAttnBackend(AttentionBackend):
 
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_out_cache_loc = self.kv_index_translator.index_table_for_batch(
-                forward_batch
-            ).sliding_window_write_loc
+            swa_out_cache_loc = self.kv_index_translator.sliding_window_write_loc_for(
+                forward_batch.out_cache_loc
+            )
 
         self.forward_metadata = ForwardMetadata(
             attn_logits,
@@ -1261,11 +1254,8 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        out_cache_loc: Optional[torch.Tensor] = None,
-    ) -> KVIndexTable:
-        """Shared capture+replay body for the cuda-graph init path; returns
-        the captured index table so the swa write-loc refill can consume its
-        `sliding_window_write_loc` without a second build.
+    ) -> None:
+        """Shared capture+replay body for the cuda-graph init path.
 
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
@@ -1274,7 +1264,6 @@ class TritonAttnBackend(AttentionBackend):
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             into=self.kv_read_tables,
-            out_cache_loc=out_cache_loc,
         )
         if forward_mode.is_decode_or_idle():
             assert spec_info is None, "Multi-step cuda graph init is not done here."
@@ -1299,7 +1288,6 @@ class TritonAttnBackend(AttentionBackend):
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
             )
-        return index_table
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1

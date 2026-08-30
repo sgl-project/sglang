@@ -557,13 +557,11 @@ class TestFactoryDenseViews(unittest.TestCase):
         self.assertTrue(source.is_translating)
         source.rebind_write_loc(fb)
         self.assertTrue(torch.equal(fb.out_cache_loc, expected_full))
-        table = source.build_index_table(
-            req_pool_indices=torch.tensor([0], dtype=torch.int64),
-            seq_lens=torch.tensor([1], dtype=torch.int64),
-            max_pages=1,
-            out_cache_loc=fb.out_cache_loc,
+        self.assertTrue(
+            torch.equal(
+                source.sliding_window_write_loc_for(fb.out_cache_loc), expected_swa
+            )
         )
-        self.assertTrue(torch.equal(table.sliding_window_write_loc, expected_swa))
 
 
 if __name__ == "__main__":

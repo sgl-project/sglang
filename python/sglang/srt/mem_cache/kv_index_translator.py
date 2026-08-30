@@ -85,8 +85,6 @@ class KVIndexTable(msgspec.Struct, frozen=True):
     entry_page_size: int  # what one entry covers: 1 = a token, N = a page of N
     is_translated: bool  # entries are already kernel-facing ids
     sliding_window_ids: Optional[torch.Tensor]  # SWA models: the parallel swa array
-    # SWA model's per batch sliding-window WRITE loc.
-    sliding_window_write_loc: Optional[torch.Tensor] = None
 
     def sliding_window_read_ids(self) -> torch.Tensor:
         """Which array a sliding-window gather reads: the parallel swa array
@@ -185,7 +183,6 @@ class KVIndexTranslator:
         seq_lens: torch.Tensor,
         max_pages: Optional[int] = None,
         into: Optional[KVReadTables] = None,
-        out_cache_loc: Optional[torch.Tensor] = None,
     ) -> KVIndexTable:
         """The one per-batch entry point.
 
@@ -194,9 +191,6 @@ class KVIndexTranslator:
         returns the table WHOLE, so a caller needing a stable pointer (a
         captured graph bakes it) passes its own tables in ``into``;
         ``into=None`` allocates of width ``max_pages`` instead.
-
-        ``out_cache_loc`` is the batch's already-kernel-facing write loc; the
-        index table returns the matching ``sliding_window_write_loc``.
         """
         if not self.is_translating:
             return KVIndexTable(
@@ -206,7 +200,6 @@ class KVIndexTranslator:
                 entry_page_size=1,
                 is_translated=False,
                 sliding_window_ids=None,
-                sliding_window_write_loc=self._translated_swa_write_loc(out_cache_loc),
             )
 
         bs = int(req_pool_indices.numel())
@@ -261,7 +254,6 @@ class KVIndexTranslator:
             entry_page_size=self.page_size,
             is_translated=True,
             sliding_window_ids=out_swa,
-            sliding_window_write_loc=self._translated_swa_write_loc(out_cache_loc),
         )
 
     def fill_read_table(
@@ -312,7 +304,6 @@ class KVIndexTranslator:
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             max_pages=max_pages,
-            out_cache_loc=forward_batch.out_cache_loc,
         )
         self._index_table_memo = (weakref.ref(forward_batch), view)
         return view
@@ -333,11 +324,11 @@ class KVIndexTranslator:
             return
         forward_batch.out_cache_loc = self._translate_full(forward_batch.out_cache_loc)
 
-    def _translated_swa_write_loc(
+    def sliding_window_write_loc_for(
         self, out_cache_loc: Optional[torch.Tensor]
     ) -> Optional[torch.Tensor]:
-        """Phase 2: this batch's sliding-window write loc, or None when there
-        is no loc this forward or the pool has no sliding-window id space."""
+        """This batch's sliding-window write loc, or None when there is no loc
+        this forward or the pool has no sliding-window id space."""
         if out_cache_loc is None or self._swa_write_loc_from_full is None:
             return None
         return self._swa_write_loc_from_full(out_cache_loc)
