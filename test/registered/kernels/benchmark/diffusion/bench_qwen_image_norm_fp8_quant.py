@@ -26,6 +26,9 @@ EPS = 1e-6
 @marker.parametrize("residual_path", [False, True], [False, True])
 @marker.benchmark("impl", ["split", "fused"], unit="us")
 def benchmark(rows: int, residual_path: bool, impl: str):
+    if impl == "fused" and torch.cuda.get_device_capability()[0] < 10:
+        marker.skip("Fused Qwen-Image norm+FP8 quant requires NVIDIA Blackwell")
+
     generator = torch.Generator(device=DEVICE)
     generator.manual_seed(20260831 + rows + int(residual_path))
     x = torch.randn((1, rows, HIDDEN), dtype=DTYPE, device=DEVICE, generator=generator)

@@ -60,6 +60,11 @@ def _row_bf16(t, device: torch.device):
 
 @cache_once
 def norm_scale_shift_module() -> Module:
+    device = torch.device("cuda", torch.cuda.current_device())
+    if not _blackwell_or_newer(device):
+        raise RuntimeError(
+            "Qwen-Image norm-scale-shift JIT kernels require NVIDIA Blackwell or newer"
+        )
     return load_jit(
         "norm_scale_shift_native",
         cuda_files=["diffusion/norm_scale_shift.cuh"],
