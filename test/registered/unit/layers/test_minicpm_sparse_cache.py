@@ -68,7 +68,6 @@ def make_pool_and_req(capacity: int = 64):
     req = SimpleNamespace(
         req_pool_idx=None,
         inflight_middle_chunks=0,
-        kv_committed_len=0,
     )
     req_pool_idx = pool.alloc([req])[0]
     return pool, req, req_pool_idx, allocator
@@ -226,7 +225,7 @@ def test_streaming_session_release_frees_compressed_slots():
     )
     session.slots["session-a"] = SessionSlot(
         req_pool_idx=req_pool_idx,
-        kv=SimpleNamespace(kv_allocated_len=16),
+        kv=SimpleNamespace(kv_allocated_len=16, cache_protected_len=0),
     )
 
     session.release_session("session-a")

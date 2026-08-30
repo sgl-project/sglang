@@ -17,7 +17,8 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
-from sglang.srt.utils.common import is_hip, is_npu, torch_release
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -164,7 +165,9 @@ def check_server_args(server_args: Any):
     ), "schedule_conservativeness must be non-negative"
 
     if cfg.model_impl == "mindspore":
-        assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
+        assert (
+            get_platform().is_npu
+        ), "MindSpore model impl is only supported on Ascend npu."
 
     # Check metrics labels
     if (
@@ -410,7 +413,7 @@ def check_two_batch_overlap(server_args: Any):
     cfg = resolving_view(server_args)
 
     cp_tbo = (
-        is_hip()
+        get_platform().is_hip
         and cfg.enable_dsa_prefill_context_parallel
         and cfg.dsa_prefill_cp_mode == "round-robin-split"
     )
