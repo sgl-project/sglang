@@ -1184,12 +1184,11 @@ def _exportable_value(value: str) -> str:
     try:
         value.encode()
     except UnicodeEncodeError:
-        return _NON_UTF8_PREFIX + base64.b64encode(
-            value.encode(errors="surrogateescape")
-        ).decode()
+        return (
+            _NON_UTF8_PREFIX
+            + base64.b64encode(value.encode(errors="surrogateescape")).decode()
+        )
     return value
-
-
 
 
 def _print_deprecated_env(old_name: str, new_name: Optional[str] = None):

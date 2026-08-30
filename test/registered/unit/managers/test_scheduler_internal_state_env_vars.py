@@ -107,7 +107,9 @@ class TestSchedulerInternalStateEnvVars(unittest.TestCase):
     def test_a_non_utf8_value_is_encoded_rather_than_dropped(self):
         """An undecodable byte in one variable must not cost the whole response its json encoding."""
         with envs.SGLANG_EXPOSE_OWN_ENV_VARS.override(True):
-            with patch.dict("os.environ", {"SGLANG_LOG_SCHEDULER_STATUS_TARGET": "bad-\udcff"}):
+            with patch.dict(
+                "os.environ", {"SGLANG_LOG_SCHEDULER_STATUS_TARGET": "bad-\udcff"}
+            ):
                 internal_state = self._get_internal_state()
 
         exported = internal_state["env_vars"]["SGLANG_LOG_SCHEDULER_STATUS_TARGET"]
