@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.runtime_context import (
+    get_parallel,
     mamba_cache_chunk_size,
 )
 
@@ -59,8 +60,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 import logging
-
-from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
