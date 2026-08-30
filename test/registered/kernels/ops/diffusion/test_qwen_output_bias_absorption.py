@@ -9,7 +9,6 @@ from sglang.kernels.ops.diffusion import (
     try_fused_bias_mul_add,
     try_fused_bias_scale_residual_norm_scale_shift,
 )
-from sglang.kernels.ops.diffusion.common.platform import is_cuda
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     ScaleResidualLayerNormScaleShift,
@@ -22,9 +21,7 @@ register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="4-gpu-b
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 requires_sm103 = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not is_cuda()
-    or torch.cuda.get_device_capability() != (10, 3),
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
     reason="Qwen-Image output-bias fusion is validated on SM103",
 )
 
