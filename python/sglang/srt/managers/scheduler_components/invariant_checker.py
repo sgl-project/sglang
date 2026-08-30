@@ -182,6 +182,8 @@ class SchedulerInvariantChecker:
                 full_page_msg = f", leaked_full_pages={leaked_full_pages or None}"
             mamba_allocator = self.req_to_token_pool.mamba_allocator
             free_mamba_pages = set(mamba_allocator.free_slots.tolist())
+            for released_slots in getattr(mamba_allocator, "release_slots", ()):
+                free_mamba_pages.update(released_slots.tolist())
             cached_mamba_pages = set(
                 self.tree_cache.all_mamba_values_flatten().tolist()
             )
