@@ -45,7 +45,6 @@ class SessionSlot:
     virtual_node: _VirtualNode = field(default_factory=_VirtualNode)
 
     # KV pool state
-    req_pool_idx: Optional[int] = None
     kv: ReqKvInfo = field(default_factory=ReqKvInfo)
 
     # First req's radix tree node (for dec_lock_ref on session close)
@@ -63,15 +62,8 @@ class SessionSlot:
     mamba_last_track_seqlen: Any = None
     mamba_branching_seqlen: Any = None
 
-    @property
-    def is_holding_kv(self) -> bool:
-        """Whether this slot currently holds KV pool resources."""
-        return self.req_pool_idx is not None
-
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
-        self.req_pool_idx = req.req_pool_idx
-
         if is_first:
             self.last_node = req.last_node
             self.swa_uuid_for_lock = req.swa_uuid_for_lock
@@ -93,7 +85,6 @@ class SessionSlot:
 
         # Ownership moved to the slot; clear the req's references so a later
         # alloc/retract path cannot mistake slot-owned mamba state for its own.
-        req.req_pool_idx = None
         req.kv = ReqKvInfo()
         req.mamba_pool_idx = None
         req.mamba_ping_pong_track_buffer = None
@@ -104,7 +95,6 @@ class SessionSlot:
 
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
-        req.req_pool_idx = self.req_pool_idx
         req.kv = copy.copy(self.kv)
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
         req.skip_lock_node_ids = self.skip_lock_node_ids
@@ -189,7 +179,7 @@ class StreamingSession(BasePrefixCache):
         return session_id in self.slots
 
     def any_holding_kv(self) -> bool:
-        return any(s.is_holding_kv for s in self.slots.values())
+        return any(s.kv.is_held for s in self.slots.values())
 
     # -- Try-handle entries for composition (see class docstring) --
 
@@ -217,7 +207,7 @@ class StreamingSession(BasePrefixCache):
         if not _is_streaming(req):
             return None
         slot = self.slots.get(req.session.session_id)
-        if slot is None or not slot.is_holding_kv:
+        if slot is None or not slot.kv.is_held:
             return None
         if req.to_finish is not None:
             req.session.abort_req()
@@ -290,7 +280,7 @@ class StreamingSession(BasePrefixCache):
         self._free_tail(slot, req, prefix_len)
 
         device_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :prefix_len
+            req.kv.req_pool_idx, :prefix_len
         ].to(dtype=torch.int64)
 
         return MatchResult(
@@ -330,7 +320,6 @@ class StreamingSession(BasePrefixCache):
                 # return the (possibly extra_buffer ping-pong) slots to
                 # the mamba pool; otherwise the abort orphans them.
                 slot = SessionSlot(
-                    req_pool_idx=req.req_pool_idx,
                     kv=copy.copy(req.kv),
                     last_node=req.last_node,
                     swa_uuid_for_lock=req.swa_uuid_for_lock,
@@ -347,7 +336,6 @@ class StreamingSession(BasePrefixCache):
                 slot.kv.kv_allocated_len, req.kv.kv_allocated_len
             )
             self.release_session(session_id)
-            req.req_pool_idx = None
             req.kv = ReqKvInfo()
             req.session.abort_req()
             return True
@@ -386,7 +374,7 @@ class StreamingSession(BasePrefixCache):
             return False
         if chunked:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.extend_range.end
+                req.kv.req_pool_idx, : req.extend_range.end
             ]
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return True
@@ -441,9 +429,7 @@ class StreamingSession(BasePrefixCache):
         protected_len = slot.kv.cache_protected_len
         lock_node = slot.last_node
         tokens_freed = (
-            max(0, slot.kv.kv_allocated_len - protected_len)
-            if slot.is_holding_kv
-            else 0
+            max(0, slot.kv.kv_allocated_len - protected_len) if slot.kv.is_held else 0
         )
         logger.info(
             "Session KV released: %s (%d tokens freed)", session_id, tokens_freed
@@ -458,12 +444,12 @@ class StreamingSession(BasePrefixCache):
                 ),
             )
 
-        if slot.is_holding_kv:
+        if slot.kv.is_held:
             start = protected_len
             end = slot.kv.kv_allocated_len
             if start < end:
                 kv_indices = self.req_to_token_pool.req_to_token[
-                    slot.req_pool_idx, start:end
+                    slot.kv.req_pool_idx, start:end
                 ]
                 self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(slot)
@@ -483,9 +469,10 @@ class StreamingSession(BasePrefixCache):
         total = 0
         for slot in self.slots.values():
             in_batch = (
-                active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
+                active_pool_idxs is not None
+                and slot.kv.req_pool_idx in active_pool_idxs
             )
-            if slot.is_holding_kv and not in_batch:
+            if slot.kv.is_held and not in_batch:
                 allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
                 total += allocated - slot.kv.cache_protected_len
         return total
@@ -499,9 +486,10 @@ class StreamingSession(BasePrefixCache):
         total = 0
         for slot in self.slots.values():
             in_batch = (
-                active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
+                active_pool_idxs is not None
+                and slot.kv.req_pool_idx in active_pool_idxs
             )
-            if slot.is_holding_kv and not in_batch:
+            if slot.kv.is_held and not in_batch:
                 allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
                 total += allocated - max(
                     slot.kv.cache_protected_len, slot.kv.swa_evicted_seqlen
@@ -513,9 +501,9 @@ class StreamingSession(BasePrefixCache):
 
         def _owned(s):
             in_batch = (
-                active_pool_idxs is not None and s.req_pool_idx in active_pool_idxs
+                active_pool_idxs is not None and s.kv.req_pool_idx in active_pool_idxs
             )
-            return s.is_holding_kv and not in_batch
+            return s.kv.is_held and not in_batch
 
         return sum(_owned(s) for s in self.slots.values())
 
@@ -529,7 +517,8 @@ class StreamingSession(BasePrefixCache):
         total = 0
         for slot in self.slots.values():
             in_batch = (
-                active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
+                active_pool_idxs is not None
+                and slot.kv.req_pool_idx in active_pool_idxs
             )
             if in_batch:
                 continue
@@ -559,7 +548,9 @@ class StreamingSession(BasePrefixCache):
         decoding pushes allocated above committed, or when retract retry's
         logit-reserve pulls prefix_len below committed.
         """
-        self._free_kv_aligned(slot.req_pool_idx, prefix_len, slot.kv.kv_allocated_len)
+        self._free_kv_aligned(
+            slot.kv.req_pool_idx, prefix_len, slot.kv.kv_allocated_len
+        )
         slot.kv.kv_allocated_len = prefix_len
         slot.kv.kv_committed_len = min(slot.kv.kv_committed_len, prefix_len)
         slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, prefix_len)
@@ -574,7 +565,7 @@ class StreamingSession(BasePrefixCache):
         be released to avoid token/KV mismatch.
         """
         target = len(req.origin_input_ids) + finished_len
-        self._free_kv_aligned(req.req_pool_idx, target, req.kv.kv_allocated_len)
+        self._free_kv_aligned(req.kv.req_pool_idx, target, req.kv.kv_allocated_len)
         req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
         req.kv.kv_committed_len = min(req.kv.kv_committed_len, target)
         req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, target)

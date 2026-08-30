@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -24,8 +24,8 @@ class _FakeReqToTokenPool:
         self.free_slots = []
 
     def free(self, req):
-        self.free_slots.append(req.req_pool_idx)
-        req.req_pool_idx = None
+        self.free_slots.append(req.kv.req_pool_idx)
+        req.kv.req_pool_idx = None
 
 
 class _FakeInnerCache:
@@ -67,8 +67,8 @@ class _FakeReq:
             abort_req=lambda: None,
             _inflight=False,
         )
-        self.req_pool_idx = req_pool_idx
-        self.kv = SimpleNamespace(
+        self.kv = ReqKvInfo(
+            req_pool_idx=req_pool_idx,
             kv_committed_len=committed,
             kv_allocated_len=allocated,
             swa_evicted_seqlen=0,
@@ -112,8 +112,8 @@ def test_preabort_detaches_session_and_preserves_slot():
     )
     tree_cache = StreamingSession(inner)
     tree_cache.slots["session-a"] = SessionSlot(
-        req_pool_idx=0,
-        kv=SimpleNamespace(
+        kv=ReqKvInfo(
+            req_pool_idx=0,
             kv_committed_len=48,
             kv_allocated_len=48,
             swa_evicted_seqlen=0,
@@ -135,7 +135,7 @@ def test_preabort_detaches_session_and_preserves_slot():
     assert req.session is None
     # Slot untouched.
     slot = tree_cache.slots["session-a"]
-    assert slot.req_pool_idx == 0
+    assert slot.kv.req_pool_idx == 0
     assert slot.kv.kv_committed_len == 48
     assert slot.kv.kv_allocated_len == 48
     assert len(result.device_indices) == 0
@@ -160,7 +160,7 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     # Slot must NOT be created.
     assert "session-a" not in tree_cache.slots
     # Transient pool slot freed.
-    assert req.req_pool_idx is None
+    assert req.kv.req_pool_idx is None
     assert req_to_token_pool.free_slots == [0]
     assert len(allocator.freed) == 1
     assert allocator.freed[0].tolist() == list(range(20))
@@ -179,8 +179,8 @@ def test_nth_mid_abort_nukes_session_slot():
 
     # Session already has a slot from a previous turn.
     tree_cache.slots["session-a"] = SessionSlot(
-        req_pool_idx=0,
-        kv=SimpleNamespace(
+        kv=ReqKvInfo(
+            req_pool_idx=0,
             kv_committed_len=50,
             kv_allocated_len=50,
             swa_evicted_seqlen=0,
@@ -202,7 +202,7 @@ def test_nth_mid_abort_nukes_session_slot():
     assert allocator.freed[0].tolist() == list(range(65))
     # Pool slot returned.
     assert req_to_token_pool.free_slots == [0]
-    assert req.req_pool_idx is None
+    assert req.kv.req_pool_idx is None
 
 
 def test_release_session_threads_mamba_skip_ids():
@@ -220,8 +220,8 @@ def test_release_session_threads_mamba_skip_ids():
 
     lock_node = SimpleNamespace(id=42)
     tree_cache.slots["session-a"] = SessionSlot(
-        req_pool_idx=0,
-        kv=SimpleNamespace(
+        kv=ReqKvInfo(
+            req_pool_idx=0,
             kv_committed_len=50,
             kv_allocated_len=50,
             swa_evicted_seqlen=0,
