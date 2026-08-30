@@ -838,7 +838,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if is_insert:
             insert_params = InsertParams(
-                prev_prefix_len=req.cache_protected_len,
+                prev_prefix_len=req.kv.cache_protected_len,
                 priority=getattr(req, "priority", 0) or 0,
             )
 
@@ -859,7 +859,7 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_indices_full = kv_indices
             tail_free_start = None
             if effective_cache_len < len(token_ids):
-                tail_free_start = max(effective_cache_len, req.cache_protected_len)
+                tail_free_start = max(effective_cache_len, req.kv.cache_protected_len)
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
 
@@ -883,8 +883,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free_segments(segments)
         else:
             self.token_to_kv_pool_allocator.free_segment(
-                kv_indices[req.cache_protected_len :],
-                start_pos=req.cache_protected_len,
+                kv_indices[req.kv.cache_protected_len :],
+                start_pos=req.kv.cache_protected_len,
             )
 
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
@@ -925,7 +925,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
-            prev_prefix_len=req.cache_protected_len,
+            prev_prefix_len=req.kv.cache_protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
         )
@@ -981,14 +981,14 @@ class UnifiedRadixCache(BasePrefixCache):
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
         assert (
-            req.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+            req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1
+        ), f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
         assert new_prefix_len <= len(
             new_indices
         ), f"{new_prefix_len=}, {len(new_indices)=}"
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
+            (req.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
+            new_indices[req.kv.cache_protected_len :],
         )
 
         self._dec_req_lock(req)
@@ -1014,7 +1014,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         else:
             req.prefix_indices = new_indices
-        req.cache_protected_len = len(new_indices)
+        req.kv.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         # carry the skip set so this node's dec releases only what we locked
