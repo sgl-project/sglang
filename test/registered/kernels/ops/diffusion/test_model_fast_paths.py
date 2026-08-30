@@ -81,7 +81,6 @@ from sglang.multimodal_gen.runtime.models.dits.flux_2 import (
     _flux2_norm_modulate,
     _flux2_swiglu,
 )
-from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.models.dits.glm_image import (
     _eager_ln_modulate as _glm_eager_ln_modulate,
 )
@@ -111,6 +110,7 @@ from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
     VaeFastPathGate,
 )
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanRMS_norm
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
