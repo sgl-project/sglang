@@ -4,7 +4,7 @@ from sglang.multimodal_gen.configs.models.decoders.ltx_2_5_diffusion_decoder imp
     LTX25DiffusionDecoderConfig,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    ComponentLoader,
+    PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     load_safetensors_state_dict,
@@ -13,13 +13,10 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-    get_diffusers_component_config,
-)
 from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 
-class DiffusionDecoderLoader(ComponentLoader):
+class DiffusionDecoderLoader(PlainStateDictComponentLoader):
     """Loader for the standalone, replicated LTX-2.5 diffusion decoder."""
 
     component_names = ["diffusion_decoder"]
@@ -32,7 +29,10 @@ class DiffusionDecoderLoader(ComponentLoader):
         component_name: str = "diffusion_decoder",
         *args,
     ):
-        config = get_diffusers_component_config(component_path=component_model_path)
+        config = self.load_component_config(component_model_path, component_name)
+        component_weights_path = self.resolve_component_weights_path(
+            component_model_path, server_args, component_name
+        )
         class_name = config.pop("_class_name", None)
         if class_name is None:
             raise ValueError(
@@ -57,6 +57,6 @@ class DiffusionDecoderLoader(ComponentLoader):
             model = model_cls(decoder_config).to(device=target_device, dtype=dtype)
 
         model.load_state_dict(
-            load_safetensors_state_dict(component_model_path), strict=True
+            load_safetensors_state_dict(component_weights_path), strict=True
         )
         return model

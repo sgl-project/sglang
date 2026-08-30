@@ -50,10 +50,10 @@ from sglang.srt.observability.trace import (
     trace_set_thread_info,
 )
 from sglang.srt.runtime_context import (
-    configured_tp_size,
     get_observability,
     get_parallel,
     get_serving,
+    publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, random_uuid, set_prometheus_multiproc_dir
@@ -404,6 +404,9 @@ class DPDispatcher:
         self._pending_send_at: Dict[str, float] = {}
         # Set when _result_listener gives up; makes alive_ranks report empty.
         self._listener_failed = False
+        # The event loop only keeps weak references to tasks, so the long-lived
+        # loops started in `start()` need a strong reference to survive GC.
+        self.background_tasks: Set[asyncio.Task] = set()
 
         # Prometheus gauge: pending requests per DP rank. Lives in the main
         # process (the dispatcher), unlike the per-worker EncoderMetricsCollector.
@@ -443,9 +446,14 @@ class DPDispatcher:
 
     def start(self) -> None:
         logger.info(f"DP dispatcher started: {self.dp_size} ranks (all remote)")
-        asyncio.create_task(self._result_listener())
-        asyncio.create_task(self._worker_watchdog())
-        asyncio.create_task(self._cleanup_stale_mappings())
+        for coro in (
+            self._result_listener(),
+            self._worker_watchdog(),
+            self._cleanup_stale_mappings(),
+        ):
+            task = asyncio.create_task(coro)
+            self.background_tasks.add(task)
+            task.add_done_callback(self.background_tasks.discard)
 
     def _drop_pending_and_mapping(self, rank: int, req_id: str) -> None:
         # dispatch / broadcast failure: no follow-up /send expected.
@@ -1474,6 +1482,7 @@ def launch_dp_worker(
     dispatch_path: str,
     result_path: str,
 ):
+    publish(server_args, role="encoder")
     try:
         configure_logger(server_args, prefix=f" encode_dp_worker[{dp_rank}]")
         asyncio.run(
@@ -1529,7 +1538,7 @@ def launch_local_runtime(server_args: ServerArgs) -> EncoderRuntime:
 
     send_sockets: List[zmq.Socket] = []
     tp_processes: List[mp.Process] = []
-    for rank in range(1, configured_tp_size()):
+    for rank in range(1, get_parallel().tp_size):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(
             get_zmq_socket(zmq_context, zmq.PUSH, schedule_path, bind=False)
@@ -1569,10 +1578,10 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
     HTTP uses this entry point today.  gRPC can reuse it later without
     importing HTTP application state or Uvicorn.
     """
-    if get_parallel().dp_size <= 1 or server_args.tp_size != 1:
+    if get_parallel().dp_size <= 1 or get_parallel().tp_size != 1:
         raise ValueError(
             "Encoder DP mode requires --dp-size > 1 and --tp-size 1; got "
-            f"dp_size={get_parallel().dp_size}, tp_size={server_args.tp_size}."
+            f"dp_size={get_parallel().dp_size}, tp_size={get_parallel().tp_size}."
         )
     dp_size = get_parallel().dp_size
     logger.info(f"Launching encoder in DP mode: dp_size={dp_size}")
