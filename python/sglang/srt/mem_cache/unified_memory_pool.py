@@ -548,6 +548,7 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             enable_kv_cache_copy=False,
             kv_cache_layout="page_major",
         )
+        self.kernel_page_blocks = spec.blocks_per_page()
 
     def _create_buffers(self):
         self.k_buffer = self._k_views
@@ -641,7 +642,7 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         max_slots = unified_buffer.max_slots(sub_pool_name)
         self._num_pages = max_slots // page_size
         self._page_bytes = page_size * spec.entry_bytes()
-        self._view_rows = self._num_pages * spec.layer_num * page_size
+        self._view_rows = self._num_pages * spec.blocks_per_page() * page_size
 
         super().__init__(
             # OOB checks bound locs by `size + page_size`; kernel-facing ids run to
@@ -655,6 +656,7 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
             device=unified_buffer.device,
             enable_memory_saver=False,  # buffer owned by UnifiedKVPool
         )
+        self.kernel_page_blocks = spec.blocks_per_page()
 
     def _create_buffers(self):
         self.kv_buffer = self._kv_views

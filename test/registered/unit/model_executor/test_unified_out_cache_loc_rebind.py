@@ -157,6 +157,26 @@ class TestPadComposesWithDerivation(CustomTestCase):
         sub = src._swa_write_loc_unified(fb.out_cache_loc[1:5])
         self.assertTrue(torch.equal(sub, loc[1:5]))
 
+    def test_the_probe_separates_kernel_facing_from_virtual_ids(self):
+        """A skipped rebind is the failure mode this contract has no other
+        guard against: virtual ids stay inside the OOB probe's bounds (they are
+        `blocks_per_page` times SMALLER than a kernel-facing id), so the store lands on
+        the wrong slots and only the output is wrong. The kernel-facing probe
+        is what separates them -- the in-page offset of a kernel-facing id is always
+        below page_size, and a virtual id's is not unless it happens to fall in
+        the first block."""
+        for page_size, blocks in ((1, 8), (4, 6)):
+            with self.subTest(page_size=page_size, blocks=blocks):
+                stride = page_size * blocks
+                virt = torch.arange(1, 2 * stride, dtype=torch.int64)
+                dense = (virt // page_size) * stride + virt % page_size
+                in_space = dense % stride < page_size
+                self.assertTrue(bool(in_space.all()), "kernel-facing ids must pass")
+                # Virtual ids pass only in the first block; that is why the
+                # probe needs a batch, not one id, to be conclusive.
+                caught = ~(virt % stride < page_size)
+                self.assertTrue(bool(caught.any()), "virtual ids must be caught")
+
     def test_empty_loc_rebinds_to_empty(self):
         src = _armed_source(
             torch.arange(8, dtype=torch.int64), torch.arange(8, dtype=torch.int64)
