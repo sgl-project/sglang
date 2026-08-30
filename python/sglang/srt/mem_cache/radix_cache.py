@@ -99,17 +99,21 @@ class TreeNode:
             return None
         return self.hash_value[-1]
 
-    # Nodes with a pending return prediction sort by that prediction (the one
-    # expected to return *latest* is evicted first); nodes without one are
-    # evicted before any predicted node (a session that ended without a tool
-    # call is not coming back). With no predictions in the tree this reduces
-    # to plain LRU (monotonic shift of last_access_time).
-    _NO_PREDICTION_BIAS = 1e18
+    # Eviction ordering (tool-retention policy), lexicographic on:
+    #   1. -predicted_return  (the leaf expected to return *latest* is evicted
+    #      first — Belady-style; -inf for leaves without a prediction, i.e.
+    #      sessions that ended without a tool call are not coming back and go
+    #      first of all)
+    #   2. last_access_time   (tie-break among equal predictions: LRU — with
+    #      homogeneous tools all predictions are ~equal and this recovers LRU)
+    # With the policy off, no leaf ever has a prediction and every key is
+    # (0.0, last_access_time): exactly plain LRU.
+    _NO_PREDICTION = float("-inf")
 
-    def _evict_key(self) -> float:
+    def _evict_key(self):
         if self.predicted_return > 0.0:
-            return -self.predicted_return
-        return self.last_access_time - TreeNode._NO_PREDICTION_BIAS
+            return (-self.predicted_return, self.last_access_time)
+        return (self.__class__._NO_PREDICTION, self.last_access_time)
 
     def __lt__(self, other: "TreeNode"):
         return self._evict_key() < other._evict_key()
@@ -257,20 +261,30 @@ class RadixCache(BasePrefixCache):
         )
 
         # Tool-retention: if this output ended in a tool call, the session will
-        # come back after the tool's execution latency — annotate the leaf so
-        # eviction spares it until then (and prefers evicting it last).
+        # come back after the tool's execution latency — annotate the inserted
+        # chain so eviction spares it until then (and prefers evicting it last).
         if self.retention_policy is not None and self._last_insert_leaf is not None:
             tool = self.retention_policy.detect_tool(req.output_ids)
             if tool is not None:
-                leaf = self._last_insert_leaf
-                leaf.predicted_return = self.retention_policy.predict_return(tool)
-                leaf.retention_tool = tool
+                pr = self.retention_policy.predict_return(tool)
+                # Propagate the prediction UP the session's chain (while the
+                # chain is unshared): eviction is segment-granular, so when the
+                # tail segment is evicted the parent becomes the new leaf and
+                # must inherit the protection — otherwise the rest of the
+                # session would look like a dead session and be evicted first.
+                node = self._last_insert_leaf
+                while node is not None and node is not self.root_node:
+                    node.predicted_return = pr
+                    node.retention_tool = tool
+                    if node.parent is None or len(node.parent.children) > 1:
+                        break  # parent is shared with other sessions: stop
+                    node = node.parent
                 self.retention_policy.n_annotated += 1
                 if self.retention_policy.n_annotated == 1:
                     logger.info(
                         "tool retention: first annotated leaf (tool=%s, return in %.2fs)",
                         tool,
-                        leaf.predicted_return - time.monotonic(),
+                        pr - time.monotonic(),
                     )
 
         self.token_to_kv_pool_allocator.free(
@@ -341,12 +355,15 @@ class RadixCache(BasePrefixCache):
 
         leaves = self._collect_leaves()
         if self.retention_policy is not None:
-            # Expired predictions (session never returned) fall back to LRU.
+            # A prediction whose time has passed means the session is overdue —
+            # typically queued and about to resume — which makes it the MOST
+            # urgent to protect, not a dead session. Clamp it to `now`: overdue
+            # leaves order after fresh ones (evicted last among predicted,
+            # LRU tie-break) instead of looking like a high-priority victim.
             now = time.monotonic()
             for x in leaves:
                 if 0 < x.predicted_return < now:
-                    x.predicted_return = 0.0
-                    x.retention_tool = None
+                    x.predicted_return = now
         heapq.heapify(leaves)
 
         num_evicted = 0
