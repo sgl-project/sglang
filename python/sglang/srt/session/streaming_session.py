@@ -46,7 +46,6 @@ class SessionSlot:
 
     # KV pool state
     req_pool_idx: Optional[int] = None
-    kv_committed_len: int = 0
     kv: ReqKvInfo = field(default_factory=ReqKvInfo)
 
     # First req's radix tree node (for dec_lock_ref on session close)
@@ -72,7 +71,6 @@ class SessionSlot:
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
         self.req_pool_idx = req.req_pool_idx
-        self.kv_committed_len = req.kv_committed_len
 
         if is_first:
             self.last_node = req.last_node
@@ -107,7 +105,6 @@ class SessionSlot:
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
         req.req_pool_idx = self.req_pool_idx
-        req.kv_committed_len = self.kv_committed_len
         req.kv = copy.copy(self.kv)
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
         req.skip_lock_node_ids = self.skip_lock_node_ids
@@ -252,7 +249,7 @@ class StreamingSession(BasePrefixCache):
         # fall back to radix cache (full prefill). Once context >= page_size,
         # streaming session kicks in with page-aligned KV reuse.
         if is_npu() and self.page_size > 1:
-            expected_prefix_len = min(slot.kv_committed_len, len(params.key))
+            expected_prefix_len = min(slot.kv.kv_committed_len, len(params.key))
             aligned_prefix_len = (
                 expected_prefix_len // self.page_size
             ) * self.page_size
@@ -270,7 +267,7 @@ class StreamingSession(BasePrefixCache):
         # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
         # already applied). min handles retract retry where committed_len
         # can exceed len(token_ids) by 1.
-        prefix_len = min(req.kv_committed_len, len(params.key))
+        prefix_len = min(req.kv.kv_committed_len, len(params.key))
 
         # Streaming sessions are append-only (session_controller rollback
         # ensures req_nodes always points to the last successful req).
@@ -282,8 +279,8 @@ class StreamingSession(BasePrefixCache):
         # Floor-align prefix_len to page boundary (NPU workaround).
         if is_npu() and self.page_size > 1:
             prefix_len = (prefix_len // self.page_size) * self.page_size
-            req.kv_committed_len = min(req.kv_committed_len, prefix_len)
-            slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
+            req.kv.kv_committed_len = min(req.kv.kv_committed_len, prefix_len)
+            slot.kv.kv_committed_len = min(slot.kv.kv_committed_len, prefix_len)
 
         # Free orphaned tail: alloc_for_extend will overwrite
         # req_to_token[prefix_len:] with new indices. The range
@@ -370,7 +367,7 @@ class StreamingSession(BasePrefixCache):
         # req clock (under overlap + honest committed the clock lags the in-flight
         # verify by ~1, which would short-change inheritance). Clamp to allocated
         # to keep committed <= allocated for prepare_for_decode.
-        slot.kv_committed_len = min(target, slot.kv.kv_allocated_len)
+        slot.kv.kv_committed_len = min(target, slot.kv.kv_allocated_len)
 
         # Update req_nodes to this successfully finished request.
         req.session.finish_req(req)
@@ -564,10 +561,10 @@ class StreamingSession(BasePrefixCache):
         """
         self._free_kv_aligned(slot.req_pool_idx, prefix_len, slot.kv.kv_allocated_len)
         slot.kv.kv_allocated_len = prefix_len
-        slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
+        slot.kv.kv_committed_len = min(slot.kv.kv_committed_len, prefix_len)
         slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, prefix_len)
         req.kv.kv_allocated_len = prefix_len
-        req.kv_committed_len = min(req.kv_committed_len, prefix_len)
+        req.kv.kv_committed_len = min(req.kv.kv_committed_len, prefix_len)
         req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, prefix_len)
 
     def _trim_overshoot(self, req: Req, finished_len: int) -> None:
@@ -579,7 +576,7 @@ class StreamingSession(BasePrefixCache):
         target = len(req.origin_input_ids) + finished_len
         self._free_kv_aligned(req.req_pool_idx, target, req.kv.kv_allocated_len)
         req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
-        req.kv_committed_len = min(req.kv_committed_len, target)
+        req.kv.kv_committed_len = min(req.kv.kv_committed_len, target)
         req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, target)
         req.output_ids = req.output_ids[:finished_len]
 

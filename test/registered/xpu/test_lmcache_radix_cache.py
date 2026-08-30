@@ -72,10 +72,9 @@ def _make_req(rid, req_pool_idx, token_ids, tree):
         extra_key=None,
         cache_salt=None,
         last_node=tree.root_node,
-        kv=SimpleNamespace(cache_protected_len=0),
+        kv=SimpleNamespace(cache_protected_len=0, kv_committed_len=len(token_ids)),
         priority=0,
         kv_committed_freed=False,
-        kv_committed_len=len(token_ids),
     )
     req.pop_committed_kv_cache = lambda: len(token_ids)
     return req
@@ -165,7 +164,9 @@ class TestLMCRadixCacheXPU(unittest.TestCase):
             req_pool_idx = req_to_token_pool.alloc(
                 [
                     SimpleNamespace(
-                        req_pool_idx=None, inflight_middle_chunks=0, kv_committed_len=0
+                        req_pool_idx=None,
+                        inflight_middle_chunks=0,
+                        kv=SimpleNamespace(kv_committed_len=0),
                     )
                 ]
             )[0]
