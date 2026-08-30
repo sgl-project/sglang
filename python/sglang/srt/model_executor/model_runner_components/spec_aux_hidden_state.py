@@ -48,6 +48,15 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_draft_cell_size_per_token: int | None = None
     # Fixed per-rank draft KV allocation, including the pool sentinel page.
     dflash_draft_fixed_bytes: int = 0
+    # Frozen checkpoint-derived identity for bounded request-private draft KV.
+    dflash_compact_architecture: str = ""
+    dflash_compact_num_layers: int = 0
+    dflash_compact_layer_types: Any = None
+    dflash_compact_checkpoint_window_tokens: int = 0
+    dflash_compact_attention_window_left: int = -1
+    dflash_compact_block_size: int = 0
+    dflash_compact_config_source: str = ""
+    dflash_compact_config_revision: str = ""
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -126,7 +135,7 @@ def _resolve_eagle_aux_hidden_state(
                 config.eagle_aux_hidden_state_layer_ids = eagle_config[
                     "eagle_aux_hidden_state_layer_ids"
                 ]
-            except:
+            except (AttributeError, KeyError, TypeError):
                 # if there is no aux layer, set to None
                 config.eagle_aux_hidden_state_layer_ids = None
 
@@ -146,7 +155,10 @@ def _resolve_dflash_aux_hidden_state(
                 "Compact DFlash cache supports the DFLASH algorithm only, "
                 f"got speculative_algorithm={spec_algorithm}"
             )
-        from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+        from sglang.srt.speculative.dflash_utils import (
+            parse_dflash_draft_config,
+            resolve_uniform_swa_dflash_compact_capability,
+        )
 
         # Select target layers to capture for building draft context features.
         draft_model_config = ModelConfig.from_server_args(
@@ -220,15 +232,52 @@ def _resolve_dflash_aux_hidden_state(
         )
         config.dflash_draft_cell_size_per_token = legacy_draft_cell_size
         if _compact_dflash_enabled():
-            config.dflash_draft_cell_size_per_token = _compact_dflash_linear_budget(
-                legacy_draft_cell_size
+            capability = resolve_uniform_swa_dflash_compact_capability(
+                draft_model_config.hf_config,
+                get_spec().speculative_draft_window_size,
+                get_spec().speculative_num_draft_tokens,
             )
+            if not capability.eligible:
+                raise RuntimeError(
+                    "DFLASH compact cache rejected checkpoint semantics: "
+                    f"architecture={capability.architecture}; "
+                    + "; ".join(capability.rejection_reasons)
+                )
             config.dflash_draft_fixed_bytes = _compact_dflash_fixed_bytes(
                 legacy_draft_cell_size,
                 owner_count=_compact_dflash_owner_count(attn_dp_size=attn_dp_size),
-                window_size=get_spec().speculative_draft_window_size,
-                block_size=get_spec().speculative_num_draft_tokens,
+                window_size=capability.checkpoint_window_tokens,
+                block_size=capability.block_size,
                 page_size=get_schedule().page_size,
+            )
+            # Remove the target-capacity-linear term only after both checkpoint
+            # eligibility and exact fixed bytes have been frozen successfully.
+            config.dflash_draft_cell_size_per_token = _compact_dflash_linear_budget(
+                legacy_draft_cell_size, capability_eligible=capability.eligible
+            )
+            config.dflash_compact_architecture = capability.architecture
+            config.dflash_compact_num_layers = capability.num_layers
+            config.dflash_compact_layer_types = capability.layer_types
+            config.dflash_compact_checkpoint_window_tokens = int(
+                capability.checkpoint_window_tokens
+            )
+            config.dflash_compact_attention_window_left = int(
+                capability.attention_window_left
+            )
+            config.dflash_compact_block_size = capability.block_size
+            config.dflash_compact_config_source = str(
+                getattr(
+                    draft_model_config.hf_config,
+                    "_name_or_path",
+                    get_spec().speculative_draft_model_path,
+                )
+                or get_spec().speculative_draft_model_path
+                or ""
+            )
+            config.dflash_compact_config_revision = str(
+                getattr(draft_model_config.hf_config, "_commit_hash", None)
+                or get_spec().speculative_draft_model_revision
+                or ""
             )
 
 
@@ -260,9 +309,23 @@ def _compact_dflash_owner_count(*, attn_dp_size: int) -> int:
     return owner_count
 
 
-def _compact_dflash_linear_budget(legacy_bytes_per_token: int | None) -> int | None:
+def _compact_dflash_linear_budget(
+    legacy_bytes_per_token: int | None, *, capability_eligible: bool = False
+) -> int | None:
     """Replace the legacy capacity-linear term only in compact mode."""
-    return 0 if _compact_dflash_enabled() else legacy_bytes_per_token
+    if not _compact_dflash_enabled():
+        return legacy_bytes_per_token
+    if not capability_eligible:
+        raise RuntimeError(
+            "Compact DFlash linear budget cannot be removed before checkpoint "
+            "capability is eligible"
+        )
+    if legacy_bytes_per_token is None or int(legacy_bytes_per_token) <= 0:
+        raise RuntimeError(
+            "Compact DFlash linear budget requires exact positive draft bytes/token, "
+            f"got {legacy_bytes_per_token!r}"
+        )
+    return 0
 
 
 def _compact_dflash_enabled() -> bool:

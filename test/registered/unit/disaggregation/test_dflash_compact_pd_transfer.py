@@ -63,6 +63,16 @@ def _scheduler(*, compact=True):
             use_compact_draft_cache=compact,
             draft_window_size=2048,
             draft_model=SimpleNamespace(layers=layers),
+            compact_capability=(
+                SimpleNamespace(
+                    eligible=True,
+                    num_layers=5,
+                    checkpoint_window_tokens=2048,
+                    attention_window_left=2047,
+                )
+                if compact
+                else None
+            ),
         ),
     )
 

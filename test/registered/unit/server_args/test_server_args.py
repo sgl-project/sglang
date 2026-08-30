@@ -1621,6 +1621,7 @@ class TestDFlashCompactCacheArgs(CustomTestCase):
                 "--speculative-dflash-compact-cache",
                 "--speculative-draft-window-size",
                 "2048",
+                "--disable-radix-cache",
             ]
         )
         self.assertTrue(args.speculative_dflash_compact_cache)
@@ -1640,6 +1641,42 @@ class TestDFlashCompactCacheArgs(CustomTestCase):
         args.speculative_dflash_compact_cache = True
         args.speculative_draft_window_size = None
         with self.assertRaisesRegex(ValueError, "requires.*draft-window-size"):
+            handle_speculative_decoding(args)
+
+    def test_compact_cache_rejects_unsafe_runtime_features_early(self):
+        cases = (
+            ("disable_radix_cache", False, "disable-radix-cache"),
+            ("enable_hierarchical_cache", True, "HiCache"),
+            ("hicache_storage_backend", "file", "HiCache"),
+            ("enable_unified_memory", True, "unified memory"),
+            ("disaggregation_decode_enable_radix_cache", True, "Decode radix"),
+            ("page_size", 16, "page-size 1"),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field):
+                args = ServerArgs(model_path="dummy")
+                args.speculative_algorithm = "DFLASH"
+                args.speculative_dflash_compact_cache = True
+                args.speculative_draft_window_size = 2048
+                args.disable_radix_cache = True
+                setattr(args, field, value)
+                with self.assertRaisesRegex(ValueError, message):
+                    handle_speculative_decoding(args)
+
+    def test_feature_off_does_not_require_pure_swa_runtime_flags(self):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "DFLASH"
+        args.speculative_dflash_compact_cache = False
+        args.speculative_draft_window_size = None
+        args.disable_radix_cache = False
+        args.enable_hierarchical_cache = True
+        args.device = "cuda"
+        args.speculative_draft_model_path = "dummy-draft"
+        args.speculative_num_draft_tokens = 8
+        with patch(
+            "sglang.srt.utils.hf_transformers_utils.get_config",
+            return_value=SimpleNamespace(architectures=[]),
+        ):
             handle_speculative_decoding(args)
 
 

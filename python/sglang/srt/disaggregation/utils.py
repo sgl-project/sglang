@@ -693,16 +693,30 @@ def get_dflash_draft_kv_transfer_spec(
     if memory.enable_unified_memory:
         return reject("unified memory is unsupported")
 
-    window_size = getattr(draft_worker, "draft_window_size", None)
     layers = getattr(getattr(draft_worker, "draft_model", None), "layers", ())
     if not layers:
         return reject("draft layers are missing")
-    layer_windows = tuple(
-        int(getattr(layer.self_attn, "sliding_window_size", -1)) + 1 for layer in layers
-    )
-    if any(window <= 0 for window in layer_windows) or len(set(layer_windows)) != 1:
-        return reject("draft layer windows are invalid or heterogeneous")
-    checkpoint_window = layer_windows[0]
+    window_size = getattr(draft_worker, "draft_window_size", None)
+    if compact_requested:
+        capability = getattr(draft_worker, "compact_capability", None)
+        if capability is None or not capability.eligible:
+            return reject("checkpoint-derived compact capability is unavailable")
+        checkpoint_window = int(capability.checkpoint_window_tokens)
+        if len(layers) != int(capability.num_layers):
+            return reject("loaded draft layer count differs from frozen capability")
+        layer_windows = tuple(
+            int(getattr(layer.self_attn, "sliding_window_size", -1)) for layer in layers
+        )
+        if layer_windows != (int(capability.attention_window_left),) * len(layers):
+            return reject("loaded draft attention windows differ from capability")
+    else:
+        layer_windows = tuple(
+            int(getattr(layer.self_attn, "sliding_window_size", -1)) + 1
+            for layer in layers
+        )
+        if any(window <= 0 for window in layer_windows) or len(set(layer_windows)) != 1:
+            return reject("draft layer windows are invalid or heterogeneous")
+        checkpoint_window = layer_windows[0]
     if window_size is None or int(window_size) != checkpoint_window:
         return reject("runtime and checkpoint draft windows differ")
     if int(getattr(draft_token_to_kv_pool, "layer_num", -1)) != len(layers):

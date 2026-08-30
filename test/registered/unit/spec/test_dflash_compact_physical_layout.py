@@ -43,7 +43,7 @@ def test_tp2_geometry_and_fixed_bytes(monkeypatch):
     assert value.physical_tokens == 4160
 
     _enable_compact_budget(monkeypatch)
-    assert _compact_dflash_linear_budget(10_240) == 0
+    assert _compact_dflash_linear_budget(10_240, capability_eligible=True) == 0
     assert (
         _compact_dflash_fixed_bytes(
             10_240,
@@ -54,6 +54,21 @@ def test_tp2_geometry_and_fixed_bytes(monkeypatch):
         )
         == 42_608_640
     )
+
+
+def test_linear_budget_is_removed_only_after_capability_and_bytes_freeze(monkeypatch):
+    _enable_compact_budget(monkeypatch)
+    with pytest.raises(RuntimeError, match="before checkpoint capability"):
+        _compact_dflash_linear_budget(10_240)
+    with pytest.raises(RuntimeError, match="exact positive draft bytes/token"):
+        _compact_dflash_linear_budget(None, capability_eligible=True)
+
+    monkeypatch.setattr(
+        spec_aux_hidden_state,
+        "get_spec",
+        lambda: SimpleNamespace(speculative_dflash_compact_cache=False),
+    )
+    assert _compact_dflash_linear_budget(10_240) == 10_240
 
 
 def test_fixed_bytes_include_one_sentinel_page(monkeypatch):
@@ -69,6 +84,17 @@ def test_fixed_bytes_include_one_sentinel_page(monkeypatch):
         )
         == (layout.physical_tokens + 1) * 10_240
     )
+
+
+@pytest.mark.parametrize(
+    ("owners", "window", "block"),
+    [(1, 2048, 8), (2, 2048, 16), (4, 4096, 16)],
+)
+def test_fixed_rows_scale_only_with_owner_span(owners, window, block):
+    layout = _layout(owners=owners, window=window, block=block, page=1)
+    expected_span = window + 4 * block
+    assert layout.owner_span == expected_span
+    assert layout.physical_tokens == owners * expected_span
 
 
 def test_fixed_budget_rejects_paged_modulo_aliasing(monkeypatch):

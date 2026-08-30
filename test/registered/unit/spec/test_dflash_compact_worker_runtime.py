@@ -6,6 +6,7 @@ import torch
 from sglang.srt.speculative.dflash_compact_physical_layout import (
     CompactDFlashPhysicalLayout,
 )
+from sglang.srt.speculative.dflash_utils import DFlashCompactCapability
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -364,3 +365,59 @@ def test_compact_worker_rejects_unsafe_cache_geometry_before_draft_load(
             nccl_port=1,
             target_worker=target_worker,
         )
+
+
+def _capability_identity_worker(*, frozen_window=2048, runtime_window_left=2047):
+    capability = DFlashCompactCapability(
+        eligible=True,
+        architecture="FuturePureSwaDFlashModel",
+        num_layers=2,
+        layer_types=("sliding_attention", "sliding_attention"),
+        checkpoint_window_tokens=2048,
+        attention_window_left=2047,
+        block_size=16,
+        rejection_reasons=(),
+    )
+    frozen = SimpleNamespace(
+        dflash_compact_architecture=capability.architecture,
+        dflash_compact_num_layers=capability.num_layers,
+        dflash_compact_layer_types=capability.layer_types,
+        dflash_compact_checkpoint_window_tokens=frozen_window,
+        dflash_compact_attention_window_left=capability.attention_window_left,
+        dflash_compact_block_size=capability.block_size,
+        dflash_compact_config_source="fixture",
+        dflash_compact_config_revision="revision",
+    )
+    worker = object.__new__(_worker_module().DFlashWorkerV2)
+    worker.compact_capability = capability
+    worker._target_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(spec_aux_config=frozen)
+    )
+    worker.draft_model = SimpleNamespace(
+        layers=[
+            SimpleNamespace(
+                self_attn=SimpleNamespace(sliding_window_size=runtime_window_left)
+            )
+            for _ in range(2)
+        ]
+    )
+    worker.draft_model_runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(_name_or_path="fixture", _commit_hash="revision")
+        )
+    )
+    return worker
+
+
+def test_runtime_revalidates_frozen_capability_identity_and_attention_window_left():
+    worker = _capability_identity_worker()
+    worker._validate_compact_capability_identity()
+
+    with pytest.raises(RuntimeError, match="target/draft capability identity mismatch"):
+        _capability_identity_worker(
+            frozen_window=4096
+        )._validate_compact_capability_identity()
+    with pytest.raises(RuntimeError, match="loaded attention windows differ"):
+        _capability_identity_worker(
+            runtime_window_left=2048
+        )._validate_compact_capability_identity()

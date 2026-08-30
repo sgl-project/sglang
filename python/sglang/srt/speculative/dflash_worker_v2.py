@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 from dataclasses import replace
@@ -35,6 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_position,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_memory,
     get_schedule,
@@ -57,6 +59,7 @@ from sglang.srt.speculative.dflash_utils import (
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
+    resolve_uniform_swa_dflash_compact_capability,
 )
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
@@ -373,6 +376,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.device = target_worker.device
         self._compact_physical_layout: Optional[CompactDFlashPhysicalLayout] = None
         self._compact_owner_generation: Optional[torch.Tensor] = None
+        self.compact_capability = None
         if self.use_compact_draft_cache and not self.use_draft_window:
             raise RuntimeError(
                 "Compact DFlash cache requires --speculative-draft-window-size"
@@ -387,6 +391,21 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "Compact DFlash cache requires --disable-radix-cache; "
                 "owner-local draft rings do not preserve target prefix-cache state"
             )
+        if self.use_compact_draft_cache and (
+            getattr(get_memory(), "enable_hierarchical_cache", False)
+            or getattr(get_memory(), "hicache_storage_backend", None) is not None
+        ):
+            raise RuntimeError("Compact DFlash cache does not support HiCache")
+        if self.use_compact_draft_cache and getattr(
+            get_memory(), "enable_unified_memory", False
+        ):
+            raise RuntimeError("Compact DFlash cache does not support unified memory")
+        if self.use_compact_draft_cache and getattr(
+            get_disagg(), "disaggregation_decode_enable_radix_cache", False
+        ):
+            raise RuntimeError("Compact DFlash cache does not support Decode radix")
+        if self.use_compact_draft_cache and torch.device(self.device).type != "cuda":
+            raise RuntimeError("Compact DFlash cache currently supports CUDA only")
 
         self._warned_sampling_fallback = False
         self._draft_probs_buf = None
@@ -424,6 +443,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self.block_size,
                     model_block_size,
                 )
+        if self.use_compact_draft_cache:
+            self.compact_capability = resolve_uniform_swa_dflash_compact_capability(
+                self.draft_model_runner.model_config.hf_config,
+                self.draft_window_size,
+                self.block_size,
+            )
+            self._validate_compact_capability_identity()
         self.draft_model.set_block_size(self.block_size)
         self.speculative_num_draft_tokens = int(self.block_size)
 
@@ -507,6 +533,65 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+
+    def _validate_compact_capability_identity(self) -> None:
+        capability = self.compact_capability
+        if capability is None or not capability.eligible:
+            reasons = () if capability is None else capability.rejection_reasons
+            architecture = (
+                "<missing>" if capability is None else capability.architecture
+            )
+            raise RuntimeError(
+                "DFLASH compact runtime rejected checkpoint semantics: "
+                f"architecture={architecture}; " + "; ".join(reasons)
+            )
+
+        frozen = self._target_worker.model_runner.spec_aux_config
+        frozen_identity = (
+            getattr(frozen, "dflash_compact_architecture", ""),
+            int(getattr(frozen, "dflash_compact_num_layers", 0)),
+            tuple(getattr(frozen, "dflash_compact_layer_types", ()) or ()),
+            int(getattr(frozen, "dflash_compact_checkpoint_window_tokens", 0)),
+            int(getattr(frozen, "dflash_compact_attention_window_left", -1)),
+            int(getattr(frozen, "dflash_compact_block_size", 0)),
+        )
+        if capability.identity() != frozen_identity:
+            raise RuntimeError(
+                "Compact DFlash target/draft capability identity mismatch: "
+                f"target={frozen_identity}, draft={capability.identity()}"
+            )
+
+        hf_config = self.draft_model_runner.model_config.hf_config
+        runtime_source = str(
+            getattr(hf_config, "_name_or_path", None)
+            or get_spec().speculative_draft_model_path
+            or ""
+        )
+        runtime_revision = str(
+            getattr(hf_config, "_commit_hash", None)
+            or get_spec().speculative_draft_model_revision
+            or ""
+        )
+        if runtime_source != getattr(
+            frozen, "dflash_compact_config_source", ""
+        ) or runtime_revision != getattr(frozen, "dflash_compact_config_revision", ""):
+            raise RuntimeError(
+                "Compact DFlash target/draft config source or revision mismatch"
+            )
+
+        layers = tuple(getattr(self.draft_model, "layers", ()))
+        runtime_windows = tuple(
+            int(getattr(layer.self_attn, "sliding_window_size", -1)) for layer in layers
+        )
+        expected_windows = (int(capability.attention_window_left),) * int(
+            capability.num_layers
+        )
+        if runtime_windows != expected_windows:
+            raise RuntimeError(
+                "Compact DFlash loaded attention windows differ from frozen "
+                f"checkpoint semantics: expected={expected_windows}, "
+                f"actual={runtime_windows}"
+            )
 
     @property
     def draft_worker(self):
@@ -638,6 +723,47 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._compact_physical_layout.owner_span,
                 self._compact_physical_layout.physical_tokens,
                 physical_bytes,
+            )
+            capability = self.compact_capability
+            logger.info(
+                "DFLASH_COMPACT_CAPABILITY_JSON %s",
+                json.dumps(
+                    {
+                        "eligible": True,
+                        "architecture": capability.architecture,
+                        "all_swa": True,
+                        "num_layers": capability.num_layers,
+                        "layer_types": capability.layer_types,
+                        "checkpoint_window": capability.checkpoint_window_tokens,
+                        "runtime_window": int(self.draft_window_size),
+                        "attention_window_left": capability.attention_window_left,
+                        "block": int(self.block_size),
+                        "owners": owner_count,
+                        "owner_span": self._compact_physical_layout.owner_span,
+                        "request_rows": self._compact_physical_layout.physical_tokens,
+                        "content_rows": 0,
+                        "physical_rows": self._compact_physical_layout.physical_tokens,
+                        "sentinel_rows": int(self.page_size),
+                        "bytes_per_token": physical_bytes
+                        // (
+                            self._compact_physical_layout.physical_tokens
+                            + int(self.page_size)
+                        ),
+                        "bytes_per_rank": physical_bytes,
+                        "draft_config_source": getattr(
+                            self._target_worker.model_runner.spec_aux_config,
+                            "dflash_compact_config_source",
+                            "",
+                        ),
+                        "draft_model_revision": getattr(
+                            self._target_worker.model_runner.spec_aux_config,
+                            "dflash_compact_config_revision",
+                            "",
+                        ),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
             )
             return
 
