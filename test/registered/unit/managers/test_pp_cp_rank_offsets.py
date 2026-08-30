@@ -37,7 +37,10 @@ def _fake_group() -> SimpleNamespace:
 
 
 def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
-    group = _fake_group()
+    tp_group = _fake_group()
+    attn_tp_group = _fake_group()
+    attn_cp_group = _fake_group()
+    world_group = _fake_group()
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
         recv_from_rpc=None,
@@ -45,13 +48,13 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
         input_blocker=None,
         mm_receiver=None,
         ps=ps,
-        tp_group=group,
-        tp_cpu_group=group,
-        attn_tp_group=group,
-        attn_tp_cpu_group=group,
-        attn_cp_group=group,
-        attn_cp_cpu_group=group,
-        world_group=group,
+        tp_group=tp_group,
+        tp_cpu_group=tp_group,
+        attn_tp_group=attn_tp_group,
+        attn_tp_cpu_group=attn_tp_group,
+        attn_cp_group=attn_cp_group,
+        attn_cp_cpu_group=attn_cp_group,
+        world_group=world_group,
         server_args=SimpleNamespace(
             enable_dp_attention=True,
             enable_dp_attention_local_control_broadcast=False,
@@ -61,6 +64,88 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
         stream_output=lambda *args, **kwargs: None,
         get_last_batch=lambda: None,
     )
+
+
+class TestRequestReceiverBroadcast(unittest.TestCase):
+    def test_local_control_skips_full_tp_broadcast_for_decode_dp(self):
+        # Decode uses pure DP attention (attn_tp=attn_cp=1). The DP controller
+        # sends control requests to every local leader, so no per-tick Gloo
+        # broadcast should remain in SchedulerRequestReceiver.
+        ps = SimpleNamespace(
+            attn_tp_rank=0,
+            attn_cp_rank=0,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            tp_size=32,
+        )
+        receiver = _make_receiver(ps)
+        control_req = SimpleNamespace(kind="control")
+        parallel = SimpleNamespace(
+            config=SimpleNamespace(
+                enable_dp_attention=True,
+                enable_dp_attention_local_control_broadcast=True,
+            )
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "broadcast_pyobj"
+            ) as broadcast,
+        ):
+            result = receiver._broadcast_reqs_across_ranks([control_req])
+
+        self.assertEqual(result, [control_req])
+        broadcast.assert_not_called()
+
+    def test_default_control_uses_full_tp_broadcast(self):
+        ps = SimpleNamespace(
+            attn_tp_rank=0,
+            attn_cp_rank=0,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            tp_size=32,
+        )
+        receiver = _make_receiver(ps)
+        control_req = SimpleNamespace(kind="control")
+        parallel = SimpleNamespace(
+            config=SimpleNamespace(
+                enable_dp_attention=True,
+                enable_dp_attention_local_control_broadcast=False,
+            )
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "is_ep_scale_joiner",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "broadcast_pyobj",
+                side_effect=lambda requests, *_args, **_kwargs: requests,
+            ) as broadcast,
+        ):
+            result = receiver._broadcast_reqs_across_ranks([control_req])
+
+        self.assertEqual(result, [control_req])
+        broadcast.assert_called_once_with(
+            [control_req],
+            receiver.tp_group.rank,
+            receiver.tp_cpu_group,
+            src=receiver.tp_group.ranks[0],
+        )
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
