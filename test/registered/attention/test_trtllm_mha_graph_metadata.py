@@ -18,7 +18,10 @@ from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
     Q_MODE_STRIDED,
     update_trtllm_mha_graph_metadata,
 )
-from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.layers.attention.trtllm_mha_backend import (
+    TRTLLMHAAttnBackend,
+    TRTLLMMHACudaGraphVariant,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -45,6 +48,8 @@ def _make_backend_for_hook_test(
     backend.speculative_num_draft_tokens = speculative_num_draft_tokens
     backend.expand_encoder_only_verify = False
     backend.decode_seq_len_splits = decode_seq_len_splits
+    backend.decode_adaptive_scheduler = False
+    backend.set_cuda_graph_variant(None)
     backend.decode_cuda_graph_metadata = {}
     backend.target_verify_metadata = {}
     backend.draft_extend_metadata = {}
@@ -85,10 +90,16 @@ def test_cuda_graph_metadata_launch_runs_in_graph_hook(monkeypatch):
     assert calls == []
     assert backend.forward_metadata is backend.decode_cuda_graph_metadata[2]
 
+    backend.set_cuda_graph_variant(TRTLLMMHACudaGraphVariant(seq_len_splits=2))
+    backend.init_forward_metadata_out_graph(fb, in_capture=True)
+    assert backend.forward_metadata is backend.decode_cuda_graph_metadata[2]
+    assert backend.forward_metadata.decode_seq_len_splits == 2
+
 
 def test_single_request_skips_decode_split_preparation():
     backend = _make_backend_for_hook_test(decode_seq_len_splits=2)
     metadata = SimpleNamespace(
+        decode_seq_len_splits=2,
         is_ragged_verify=False,
         cache_seqlens_int32=torch.tensor([7], dtype=torch.int32),
         page_table=torch.tensor([[1, 2]], dtype=torch.int32),
@@ -99,7 +110,7 @@ def test_single_request_skips_decode_split_preparation():
         decode_sorted_swa_page_table=None,
     )
 
-    backend._prepare_decode_seq_len_splits(metadata)
+    backend._prepare_decode_request_order(metadata)
 
     assert metadata.decode_seq_len_order is None
     assert metadata.decode_sorted_seq_lens is None
