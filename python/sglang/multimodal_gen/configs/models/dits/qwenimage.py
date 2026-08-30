@@ -54,6 +54,11 @@ class QwenImageArchConfig(DiTArchConfig):
         }
     )
 
+    # Serialized ModelOpt checkpoints keep the added Q/K/V projections as
+    # separate modules, including their BF16 fallback layers. Do not apply the
+    # runtime-only fused mapping while inferring their quantized tensor layout.
+    quant_param_names_mapping: dict = field(default_factory=dict)
+
     def __post_init__(self):
         super().__post_init__()
         self.out_channels = self.out_channels or self.in_channels
