@@ -3136,6 +3136,20 @@ def kill_itself_when_parent_died():
         )
 
 
+def ignore_external_stop_signals():
+    """Make a worker subprocess ignore SIGINT and SIGTERM.
+
+    Shutdown is owned by the tokenizer manager (drain, then ShutdownReq, then
+    SIGKILL via kill_process_tree); stop signals delivered to the whole process
+    group must not kill workers mid-forward before the drain runs. SIGKILL and
+    SIGQUIT are unaffected.
+    """
+    if sys.platform == "win32":
+        return
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
 class UvicornAccessLogFilter(logging.Filter):
     """Filter uvicorn access logs by request path.
 
