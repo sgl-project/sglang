@@ -10,7 +10,7 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -181,6 +181,597 @@ def _scrub_error_message(message: str, status_code: int) -> str:
     return cleaned or "Request failed"
 
 
+def convert_to_chat_completion_request(
+    anthropic_request: AnthropicMessagesRequest,
+    *,
+    merge_inline_system: bool,
+    wrap_reasoning_history: Optional[Callable[[str], str]] = None,
+    supports_native_reasoning_history: Optional[Callable[[], bool]] = None,
+    apply_reasoning_enabled: Optional[
+        Callable[[ChatCompletionRequest, bool], None]
+    ] = None,
+) -> ChatCompletionRequest:
+    """Convert an Anthropic Messages request to an OpenAI ChatCompletion request."""
+    openai_messages = []
+
+    def _convert_anthropic_image_source_to_openai_part(
+        source: Any,
+    ) -> Optional[dict]:
+        # Source may arrive as a Pydantic model (typed ImageBlock.source)
+        # or as a raw dict when parsed from a nested tool_result payload.
+        if isinstance(source, BaseModel):
+            source = source.model_dump(exclude_none=True)
+        if not isinstance(source, dict):
+            return None
+
+        source_type = source.get("type")
+        if source_type == "base64":
+            media_type = source.get("media_type", "image/png")
+            data = source.get("data", "")
+            if not data:
+                return None
+            return {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{media_type};base64,{data}",
+                },
+            }
+
+        url = source.get("url")
+        if url:
+            return {
+                "type": "image_url",
+                "image_url": {
+                    "url": url,
+                },
+            }
+
+        return None
+
+    def _text_from_search_result(item: dict[str, Any]) -> str:
+        search_parts = []
+        title = item.get("title")
+        if title:
+            search_parts.append(f"Title: {title}")
+
+        source = item.get("source")
+        if isinstance(source, dict):
+            source_text = source.get("url") or source.get("text")
+            if source_text:
+                search_parts.append(f"Source: {source_text}")
+        elif source:
+            search_parts.append(f"Source: {source}")
+
+        content = item.get("content")
+        content_parts = []
+        if isinstance(content, str):
+            content_parts.append(content)
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text" and part.get("text"):
+                    content_parts.append(part["text"])
+        if content_parts:
+            search_parts.append("Content: " + "\n".join(content_parts))
+
+        return "\n".join(search_parts)
+
+    def _convert_tool_result_content(
+        content: Any,
+    ) -> tuple[list[Union[str, list[dict]]], str]:
+        if isinstance(content, list):
+            tool_content_parts = []
+            tool_text_parts = []
+
+            for raw_item in content:
+                # Items may be typed Pydantic blocks (after request
+                # validation) or raw dicts (from legacy callers). Coerce
+                # to dict so the existing key-based logic still works.
+                if isinstance(raw_item, BaseModel):
+                    item = raw_item.model_dump(exclude_none=True)
+                elif isinstance(raw_item, dict):
+                    item = raw_item
+                else:
+                    continue
+
+                item_type = item.get("type")
+                if item_type == "text":
+                    text = item.get("text", "")
+                    if text:
+                        tool_text_parts.append(text)
+                        tool_content_parts.append({"type": "text", "text": text})
+                elif item_type == "image":
+                    image_part = _convert_anthropic_image_source_to_openai_part(
+                        item.get("source")
+                    )
+                    if image_part is not None:
+                        tool_content_parts.append(image_part)
+                elif item_type == "tool_reference":
+                    # Anthropic uses `tool_name`; the SGLang chat template
+                    # matches on `name`. Translate at the boundary.
+                    ref_name = item.get("tool_name") or item.get("name")
+                    if ref_name:
+                        tool_content_parts.append(
+                            {"type": "tool_reference", "name": ref_name}
+                        )
+                elif item_type == "search_result":
+                    search_text = _text_from_search_result(item)
+                    if search_text:
+                        tool_text_parts.append(search_text)
+                        tool_content_parts.append({"type": "text", "text": search_text})
+
+            tool_text = "\n".join(tool_text_parts)
+            # GLM templates expand references only at the start of a tool
+            # message, so isolate reference runs without changing part order.
+            tool_content_groups: list[list[dict]] = []
+            for part in tool_content_parts:
+                is_reference = part["type"] == "tool_reference"
+                if (
+                    not tool_content_groups
+                    or (tool_content_groups[-1][0]["type"] == "tool_reference")
+                    != is_reference
+                ):
+                    tool_content_groups.append([])
+                tool_content_groups[-1].append(part)
+
+            tool_contents: list[Union[str, list[dict]]] = []
+            for group in tool_content_groups:
+                if len(group) == 1 and group[0]["type"] == "text":
+                    tool_contents.append(group[0]["text"])
+                else:
+                    tool_contents.append(group)
+            return tool_contents or [""], tool_text
+
+        tool_text = str(content) if content else ""
+        return [tool_text], tool_text
+
+    def _convert_assistant_thinking_blocks(
+        blocks: list[AnthropicContentBlock],
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Reconstruct prior-turn thinking as ``(reasoning_content, text)``.
+
+        At most one is set: encoders that frame the reasoning channel take
+        it as ``reasoning_content``, everything else gets it re-wrapped and
+        spliced into content.
+
+        ``redacted_thinking`` carries encrypted bytes that no local
+        parser can interpret, so we raise rather than silently drop it.
+        On non-reasoning models (no detector configured) the rewrap is
+        best-effort: we log a warning and drop the thinking text so a
+        history echo doesn't 400 the whole request — the prior thinking
+        is opaque context the model didn't need anyway.
+        """
+        if any(block.type == "redacted_thinking" for block in blocks):
+            raise ValueError("Anthropic redacted_thinking history is not supported")
+
+        thinking_parts = [
+            block.thinking
+            for block in blocks
+            if block.type == "thinking" and block.thinking
+        ]
+        if not thinking_parts:
+            return None, None
+
+        reasoning_text = "\n".join(thinking_parts)
+        if (
+            supports_native_reasoning_history is not None
+            and supports_native_reasoning_history()
+        ):
+            return reasoning_text, None
+        if wrap_reasoning_history is None:
+            raise ValueError(
+                "Cannot convert thinking history without a reasoning adapter"
+            )
+        try:
+            return None, wrap_reasoning_history(reasoning_text)
+        except ValueError as e:
+            logger.warning(
+                "Dropping prior-turn thinking history (%d blocks): %s",
+                len(thinking_parts),
+                e,
+            )
+            return None, None
+
+    system_parts: list[str] = []
+    if anthropic_request.system:
+        if isinstance(anthropic_request.system, str):
+            if anthropic_request.system.strip():
+                system_parts.append(anthropic_request.system)
+        else:
+            for block in anthropic_request.system:
+                if block.type == "text" and block.text:
+                    system_parts.append(block.text)
+
+    if merge_inline_system:
+        for msg in anthropic_request.messages:
+            if msg.role != "system":
+                continue
+            text = _extract_system_text(msg.content)
+            if text:
+                system_parts.append(text)
+
+    if system_parts:
+        openai_messages.append({"role": "system", "content": "\n".join(system_parts)})
+
+    def _emit_user_message(parts: list[dict]) -> None:
+        """Append accumulated parts as a user message, then clear them.
+
+        Used to flush content collected BEFORE a tool_result so the
+        wire order stays user(pre) → tool → user(post). Without this
+        flush, text/image parts that appeared before a tool_result
+        block would be moved AFTER the tool message at end of loop.
+        """
+        if not parts:
+            return
+        if len(parts) == 1 and parts[0]["type"] == "text":
+            openai_messages.append({"role": "user", "content": parts[0]["text"]})
+        else:
+            openai_messages.append({"role": "user", "content": list(parts)})
+        parts.clear()
+
+    # Convert messages
+    for msg in anthropic_request.messages:
+        if msg.role == "system" and merge_inline_system:
+            continue
+        if isinstance(msg.content, str):
+            openai_messages.append({"role": msg.role, "content": msg.content})
+            continue
+
+        # Complex content with blocks
+        openai_msg = {"role": msg.role}
+        content_parts: list[dict] = []
+        tool_calls: list[dict] = []
+
+        if msg.role == "assistant":
+            reasoning_content, reasoning_history = _convert_assistant_thinking_blocks(
+                msg.content
+            )
+            if reasoning_content is not None:
+                openai_msg["reasoning_content"] = reasoning_content
+            if reasoning_history is not None:
+                content_parts.append({"type": "text", "text": reasoning_history})
+
+        for block in msg.content:
+            # ``thinking``/``redacted_thinking`` blocks are surfaced via
+            # the reasoning-history reconstruction above; skip them here
+            # to avoid double-injecting their text into the prompt.
+            if block.type in ("thinking", "redacted_thinking"):
+                continue
+
+            # ``is not None`` (not truthy) so an empty-string text block
+            # still produces a placeholder text part — without it, an
+            # assistant turn whose only content is "" vanishes and
+            # subsequent user→user pairs trip strict chat templates.
+            if block.type == "text" and block.text is not None:
+                content_parts.append({"type": "text", "text": block.text})
+
+            elif block.type == "image" and block.source:
+                image_part = _convert_anthropic_image_source_to_openai_part(
+                    block.source
+                )
+                if image_part is not None:
+                    content_parts.append(image_part)
+
+            elif block.type == "search_result":
+                search_text = _text_from_search_result(block.model_dump())
+                if search_text:
+                    content_parts.append({"type": "text", "text": search_text})
+
+            elif block.type == "tool_use":
+                tool_call = {
+                    "id": block.id or f"call_{uuid.uuid4().hex}",
+                    "type": "function",
+                    "function": {
+                        "name": block.name or "",
+                        "arguments": json.dumps(block.input or {}),
+                    },
+                }
+                tool_calls.append(tool_call)
+
+            elif block.type == "tool_result":
+                tool_contents, tool_text = _convert_tool_result_content(block.content)
+
+                # Use tool_use_id (per spec) with fallback to id
+                tool_call_id = block.tool_use_id or block.id or ""
+
+                # Tool results from user become separate tool messages.
+                # Flush any pending text/image first so the wire order
+                # is preserved (a tool_result that arrived AFTER a text
+                # block must come AFTER that text in OpenAI form too).
+                if msg.role == "user":
+                    _emit_user_message(content_parts)
+                    for tool_content in tool_contents:
+                        openai_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": tool_content,
+                            }
+                        )
+                else:
+                    content_parts.append(
+                        {
+                            "type": "text",
+                            "text": f"Tool result: {tool_text}",
+                        }
+                    )
+
+        # Attach tool calls to assistant messages
+        if tool_calls:
+            openai_msg["tool_calls"] = tool_calls
+
+        # Attach content
+        if content_parts:
+            if len(content_parts) == 1 and content_parts[0]["type"] == "text":
+                openai_msg["content"] = content_parts[0]["text"]
+            else:
+                openai_msg["content"] = content_parts
+            openai_messages.append(openai_msg)
+        elif tool_calls:
+            openai_messages.append(openai_msg)
+        elif msg.role == "user":
+            # User turn that was entirely tool_results — the tool
+            # messages were already emitted above, nothing left.
+            continue
+        else:
+            # Assistant turn with no content and no tool_calls: emit
+            # an empty-string placeholder so strict templates still
+            # see a valid role-alternation sequence.
+            openai_msg["content"] = ""
+            openai_messages.append(openai_msg)
+
+    # Build ChatCompletionRequest
+    request_data = {
+        "messages": openai_messages,
+        "model": anthropic_request.model,
+        "max_tokens": anthropic_request.max_tokens,
+        "stream": anthropic_request.stream or False,
+    }
+
+    if anthropic_request.temperature is not None:
+        request_data["temperature"] = anthropic_request.temperature
+    if anthropic_request.top_p is not None:
+        request_data["top_p"] = anthropic_request.top_p
+    if anthropic_request.top_k is not None:
+        request_data["top_k"] = anthropic_request.top_k
+    if anthropic_request.stop_sequences is not None:
+        request_data["stop"] = anthropic_request.stop_sequences
+
+    # Enable usage in stream so we can report it
+    if anthropic_request.stream:
+        request_data["stream_options"] = StreamOptions(
+            include_usage=True,
+            continuous_usage_stats=True,
+        )
+
+    chat_request = ChatCompletionRequest(**request_data)
+
+    if anthropic_request.thinking is not None:
+        # The protocol layer already enforces SDK shape:
+        #   enabled  -> budget_tokens required (>=1024), display optional
+        #   disabled -> neither budget_tokens nor display allowed
+        #   adaptive -> budget_tokens forbidden, display optional
+        # So by the time we get here ``budget_tokens`` can only be
+        # set on ``enabled``. The local backend has no equivalent
+        # hard-cap knob, so we log a WARNING instead of rejecting —
+        # the Anthropic SDK would have accepted the request and we
+        # mirror that. Operators see the unenforced budget in logs.
+        if anthropic_request.thinking.budget_tokens is not None:
+            logger.warning(
+                "Anthropic thinking.budget_tokens=%d is accepted for "
+                "SDK compatibility but the local backend has no "
+                "equivalent hard-cap knob — the budget is not enforced",
+                anthropic_request.thinking.budget_tokens,
+            )
+        # Claude 4.7's ``adaptive`` is treated identically to ``enabled``
+        # because the local backend has no auto-throttle equivalent.
+        # Anything other than ``disabled`` enables reasoning.
+        enabled = anthropic_request.thinking.type != "disabled"
+        if anthropic_request.thinking.display == "omitted":
+            # Anthropic 4.7 spec: keep reasoning ON but hide reasoning
+            # text from the client. The OpenAI streaming pipeline has
+            # no equivalent suppress knob — log so operators can see
+            # the request, then proceed with normal reasoning emission.
+            logger.warning(
+                "Anthropic thinking.display='omitted' is accepted for "
+                "SDK compatibility but reasoning text will still be "
+                "emitted to the client"
+            )
+        if apply_reasoning_enabled is None:
+            raise ValueError(
+                "Cannot convert Anthropic thinking without a reasoning adapter"
+            )
+        apply_reasoning_enabled(chat_request, enabled)
+
+    # Claude 4.7 ``output_config``: map ``effort`` onto the OpenAI
+    # ``reasoning_effort`` knob. ``xhigh`` collapses to ``max`` because
+    # the OpenAI Literal does not include the Anthropic-only ``xhigh``.
+    # ``task_budget`` is a soft hint forwarded as a custom param so the
+    # model can see it without it becoming a hard cap (``max_tokens``
+    # is still the hard cap).
+    if anthropic_request.output_config is not None:
+        oc = anthropic_request.output_config
+        if oc.effort is not None:
+            chat_request.reasoning_effort = "max" if oc.effort == "xhigh" else oc.effort
+        if oc.task_budget is not None:
+            # Custom params are silently ignored by backends that
+            # don't recognise them; logging it makes the propagation
+            # visible.
+            logger.info(
+                "Anthropic output_config.task_budget hint: %d %s",
+                oc.task_budget.total,
+                oc.task_budget.type,
+            )
+
+    # ``betas`` is the Anthropic SDK's opt-in feature list (e.g.
+    # ``["thinking-2025-08-04"]``). The local backend has no
+    # equivalent beta system; accept-and-log so requests don't 400.
+    if anthropic_request.betas:
+        logger.info(
+            "Anthropic request opted into betas %s — no-op locally",
+            anthropic_request.betas,
+        )
+
+    # Convert tools. Deferred tools stay in the list with defer_loading=True;
+    # the chat template hides them from the initial <tools> block and renders
+    # them on demand when a tool_reference block names them.
+    if anthropic_request.tools:
+        converted_tools = []
+        for tool in anthropic_request.tools:
+            if is_server_tool(tool):
+                # Anthropic server-side tools (web_search_*, computer_*,
+                # bash_*, text_editor_*) have no client-side input_schema
+                # because Anthropic provides the implementation. We can't
+                # forward them to the OpenAI tools array (which requires a
+                # schema), so skip with a visible log.
+                logger.info(
+                    "Skipping built-in Anthropic server tool %r (type=%r): "
+                    "no native support in the OpenAI-compatible backend",
+                    tool.name,
+                    tool.type,
+                )
+                continue
+
+            # Custom tools always have a validated input_schema
+            # (enforced at Pydantic parse time).
+            converted_tools.append(
+                Tool(
+                    type="function",
+                    defer_loading=tool.defer_loading,
+                    function={
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "parameters": tool.input_schema,
+                    },
+                )
+            )
+
+        if converted_tools:
+            chat_request.tools = converted_tools
+
+    # Convert tool choice. ``any``/``tool`` express a hard requirement
+    # ("the model MUST call a tool"); if every requested tool was a
+    # server-side Anthropic built-in that we just skipped, there is
+    # no tool the model could call. Silently downgrading to "no tool"
+    # would deceive the caller, so raise an explicit 400.
+    if anthropic_request.tool_choice is not None:
+        tc_type = anthropic_request.tool_choice.type
+        if tc_type == "none":
+            chat_request.tool_choice = "none"
+        elif chat_request.tools:
+            if tc_type == "auto":
+                chat_request.tool_choice = "auto"
+            elif tc_type == "any":
+                chat_request.tool_choice = "required"
+            elif tc_type == "tool":
+                tool_name = anthropic_request.tool_choice.name
+                # ``Tool.function`` is a ``Function`` Pydantic model, not
+                # a dict — access by attribute. A dict ``.get`` would
+                # AttributeError and surface as a 500 instead of the
+                # intended 400 / happy path.
+                if not any(t.function.name == tool_name for t in chat_request.tools):
+                    raise ValueError(
+                        f"tool_choice references tool {tool_name!r} but it "
+                        f"is not in the forwarded tools list "
+                        f"(server-side Anthropic tools cannot be selected)"
+                    )
+                chat_request.tool_choice = ToolChoice(
+                    type="function",
+                    function=ToolChoiceFuncName(name=tool_name),
+                )
+        elif tc_type in ("any", "tool"):
+            raise ValueError(
+                f"tool_choice={tc_type!r} requires at least one custom "
+                f"tool; all supplied tools were server-side Anthropic "
+                f"built-ins which the OpenAI-compatible backend cannot "
+                f"invoke"
+            )
+    elif chat_request.tools:
+        chat_request.tool_choice = "auto"
+
+    return chat_request
+
+
+def convert_response(
+    response: ChatCompletionResponse,
+) -> AnthropicMessagesResponse:
+    """Convert an OpenAI ChatCompletionResponse to an Anthropic Messages response."""
+    if not response.choices:
+        return AnthropicMessagesResponse(
+            content=[TextBlock(text="")],
+            model=response.model,
+            stop_reason="end_turn",
+            usage=AnthropicUsage(input_tokens=0, output_tokens=0),
+        )
+
+    choice = response.choices[0]
+    content: list[AnthropicContentBlock] = []
+
+    # Add reasoning content as a thinking block. signature is omitted
+    # entirely when the backend doesn't provide one — empty strings
+    # would fail downstream Anthropic signature verifiers.
+    if choice.message.reasoning_content:
+        content.append(ThinkingBlock(thinking=choice.message.reasoning_content))
+
+    # Add text content
+    if choice.message.content:
+        content.append(TextBlock(text=choice.message.content))
+
+    # Add tool calls
+    if choice.message.tool_calls:
+        for tool_call in choice.message.tool_calls:
+            raw_args = tool_call.function.arguments
+            try:
+                tool_input = json.loads(raw_args)
+            except (json.JSONDecodeError, TypeError):
+                # Surface invalid tool arguments so an empty-dict
+                # tool call is never indistinguishable from a real
+                # one when something downstream goes wrong.
+                logger.warning(
+                    "Tool %r emitted invalid JSON arguments: %r — "
+                    "defaulting to empty input",
+                    tool_call.function.name,
+                    (raw_args or "")[:200],
+                )
+                tool_input = {}
+
+            content.append(
+                ToolUseBlock(
+                    id=tool_call.id,
+                    name=tool_call.function.name,
+                    input=tool_input,
+                )
+            )
+
+    # Map stop reason
+    finish_reason = choice.finish_reason or "stop"
+    if finish_reason not in STOP_REASON_MAP:
+        logger.warning(
+            "Unmapped OpenAI finish_reason %r; defaulting to end_turn",
+            finish_reason,
+        )
+    stop_reason = STOP_REASON_MAP.get(finish_reason, "end_turn")
+
+    # Anthropic requires ``content`` to contain at least one block.
+    # Empty string completions (max_tokens=1 stop, content filter, etc.)
+    # would otherwise ship ``content=[]`` and break strict SDK parsers.
+    if not content:
+        content.append(TextBlock(text=""))
+
+    return AnthropicMessagesResponse(
+        id=f"msg_{uuid.uuid4().hex}",
+        content=content,
+        model=response.model,
+        stop_reason=stop_reason,
+        usage=_anthropic_usage_from_openai(
+            response.usage,
+            include_input=True,
+            include_output=True,
+        ),
+    )
+
+
 class AnthropicServing:
     """Handler for Anthropic Messages API requests.
 
@@ -229,508 +820,17 @@ class AnthropicServing:
     def _convert_to_chat_completion_request(
         self, anthropic_request: AnthropicMessagesRequest
     ) -> ChatCompletionRequest:
-        """Convert an Anthropic Messages request to an OpenAI ChatCompletion request."""
-        openai_messages = []
-
-        def _convert_anthropic_image_source_to_openai_part(
-            source: Any,
-        ) -> Optional[dict]:
-            # Source may arrive as a Pydantic model (typed ImageBlock.source)
-            # or as a raw dict when parsed from a nested tool_result payload.
-            if isinstance(source, BaseModel):
-                source = source.model_dump(exclude_none=True)
-            if not isinstance(source, dict):
-                return None
-
-            source_type = source.get("type")
-            if source_type == "base64":
-                media_type = source.get("media_type", "image/png")
-                data = source.get("data", "")
-                if not data:
-                    return None
-                return {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{media_type};base64,{data}",
-                    },
-                }
-
-            url = source.get("url")
-            if url:
-                return {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": url,
-                    },
-                }
-
-            return None
-
-        def _text_from_search_result(item: dict[str, Any]) -> str:
-            search_parts = []
-            title = item.get("title")
-            if title:
-                search_parts.append(f"Title: {title}")
-
-            source = item.get("source")
-            if isinstance(source, dict):
-                source_text = source.get("url") or source.get("text")
-                if source_text:
-                    search_parts.append(f"Source: {source_text}")
-            elif source:
-                search_parts.append(f"Source: {source}")
-
-            content = item.get("content")
-            content_parts = []
-            if isinstance(content, str):
-                content_parts.append(content)
-            elif isinstance(content, list):
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    if part.get("type") == "text" and part.get("text"):
-                        content_parts.append(part["text"])
-            if content_parts:
-                search_parts.append("Content: " + "\n".join(content_parts))
-
-            return "\n".join(search_parts)
-
-        def _convert_tool_result_content(
-            content: Any,
-        ) -> tuple[list[Union[str, list[dict]]], str]:
-            if isinstance(content, list):
-                tool_content_parts = []
-                tool_text_parts = []
-
-                for raw_item in content:
-                    # Items may be typed Pydantic blocks (after request
-                    # validation) or raw dicts (from legacy callers). Coerce
-                    # to dict so the existing key-based logic still works.
-                    if isinstance(raw_item, BaseModel):
-                        item = raw_item.model_dump(exclude_none=True)
-                    elif isinstance(raw_item, dict):
-                        item = raw_item
-                    else:
-                        continue
-
-                    item_type = item.get("type")
-                    if item_type == "text":
-                        text = item.get("text", "")
-                        if text:
-                            tool_text_parts.append(text)
-                            tool_content_parts.append({"type": "text", "text": text})
-                    elif item_type == "image":
-                        image_part = _convert_anthropic_image_source_to_openai_part(
-                            item.get("source")
-                        )
-                        if image_part is not None:
-                            tool_content_parts.append(image_part)
-                    elif item_type == "tool_reference":
-                        # Anthropic uses `tool_name`; the SGLang chat template
-                        # matches on `name`. Translate at the boundary.
-                        ref_name = item.get("tool_name") or item.get("name")
-                        if ref_name:
-                            tool_content_parts.append(
-                                {"type": "tool_reference", "name": ref_name}
-                            )
-                    elif item_type == "search_result":
-                        search_text = _text_from_search_result(item)
-                        if search_text:
-                            tool_text_parts.append(search_text)
-                            tool_content_parts.append(
-                                {"type": "text", "text": search_text}
-                            )
-
-                tool_text = "\n".join(tool_text_parts)
-                # GLM templates expand references only at the start of a tool
-                # message, so isolate reference runs without changing part order.
-                tool_content_groups: list[list[dict]] = []
-                for part in tool_content_parts:
-                    is_reference = part["type"] == "tool_reference"
-                    if (
-                        not tool_content_groups
-                        or (tool_content_groups[-1][0]["type"] == "tool_reference")
-                        != is_reference
-                    ):
-                        tool_content_groups.append([])
-                    tool_content_groups[-1].append(part)
-
-                tool_contents: list[Union[str, list[dict]]] = []
-                for group in tool_content_groups:
-                    if len(group) == 1 and group[0]["type"] == "text":
-                        tool_contents.append(group[0]["text"])
-                    else:
-                        tool_contents.append(group)
-                return tool_contents or [""], tool_text
-
-            tool_text = str(content) if content else ""
-            return [tool_text], tool_text
-
-        def _convert_assistant_thinking_blocks(
-            blocks: list[AnthropicContentBlock],
-        ) -> tuple[Optional[str], Optional[str]]:
-            """Reconstruct prior-turn thinking as ``(reasoning_content, text)``.
-
-            At most one is set: encoders that frame the reasoning channel take
-            it as ``reasoning_content``, everything else gets it re-wrapped and
-            spliced into content.
-
-            ``redacted_thinking`` carries encrypted bytes that no local
-            parser can interpret, so we raise rather than silently drop it.
-            On non-reasoning models (no detector configured) the rewrap is
-            best-effort: we log a warning and drop the thinking text so a
-            history echo doesn't 400 the whole request — the prior thinking
-            is opaque context the model didn't need anyway.
-            """
-            if any(block.type == "redacted_thinking" for block in blocks):
-                raise ValueError("Anthropic redacted_thinking history is not supported")
-
-            thinking_parts = [
-                block.thinking
-                for block in blocks
-                if block.type == "thinking" and block.thinking
-            ]
-            if not thinking_parts:
-                return None, None
-
-            reasoning_text = "\n".join(thinking_parts)
-            if self.openai_serving_chat.supports_native_reasoning_history():
-                return reasoning_text, None
-
-            try:
-                return None, self.openai_serving_chat.wrap_reasoning_history(
-                    reasoning_text
-                )
-            except ValueError as e:
-                logger.warning(
-                    "Dropping prior-turn thinking history (%d blocks): %s",
-                    len(thinking_parts),
-                    e,
-                )
-                return None, None
-
-        system_parts: list[str] = []
-        if anthropic_request.system:
-            if isinstance(anthropic_request.system, str):
-                if anthropic_request.system.strip():
-                    system_parts.append(anthropic_request.system)
-            else:
-                for block in anthropic_request.system:
-                    if block.type == "text" and block.text:
-                        system_parts.append(block.text)
-
-        if self._merge_inline_system:
-            for msg in anthropic_request.messages:
-                if msg.role != "system":
-                    continue
-                text = _extract_system_text(msg.content)
-                if text:
-                    system_parts.append(text)
-
-        if system_parts:
-            openai_messages.append(
-                {"role": "system", "content": "\n".join(system_parts)}
-            )
-
-        def _emit_user_message(parts: list[dict]) -> None:
-            """Append accumulated parts as a user message, then clear them.
-
-            Used to flush content collected BEFORE a tool_result so the
-            wire order stays user(pre) → tool → user(post). Without this
-            flush, text/image parts that appeared before a tool_result
-            block would be moved AFTER the tool message at end of loop.
-            """
-            if not parts:
-                return
-            if len(parts) == 1 and parts[0]["type"] == "text":
-                openai_messages.append({"role": "user", "content": parts[0]["text"]})
-            else:
-                openai_messages.append({"role": "user", "content": list(parts)})
-            parts.clear()
-
-        # Convert messages
-        for msg in anthropic_request.messages:
-            if msg.role == "system" and self._merge_inline_system:
-                continue
-            if isinstance(msg.content, str):
-                openai_messages.append({"role": msg.role, "content": msg.content})
-                continue
-
-            # Complex content with blocks
-            openai_msg = {"role": msg.role}
-            content_parts: list[dict] = []
-            tool_calls: list[dict] = []
-
-            if msg.role == "assistant":
-                reasoning_content, reasoning_history = (
-                    _convert_assistant_thinking_blocks(msg.content)
-                )
-                if reasoning_content is not None:
-                    openai_msg["reasoning_content"] = reasoning_content
-                if reasoning_history is not None:
-                    content_parts.append({"type": "text", "text": reasoning_history})
-
-            for block in msg.content:
-                # ``thinking``/``redacted_thinking`` blocks are surfaced via
-                # the reasoning-history reconstruction above; skip them here
-                # to avoid double-injecting their text into the prompt.
-                if block.type in ("thinking", "redacted_thinking"):
-                    continue
-
-                # ``is not None`` (not truthy) so an empty-string text block
-                # still produces a placeholder text part — without it, an
-                # assistant turn whose only content is "" vanishes and
-                # subsequent user→user pairs trip strict chat templates.
-                if block.type == "text" and block.text is not None:
-                    content_parts.append({"type": "text", "text": block.text})
-
-                elif block.type == "image" and block.source:
-                    image_part = _convert_anthropic_image_source_to_openai_part(
-                        block.source
-                    )
-                    if image_part is not None:
-                        content_parts.append(image_part)
-
-                elif block.type == "search_result":
-                    search_text = _text_from_search_result(block.model_dump())
-                    if search_text:
-                        content_parts.append({"type": "text", "text": search_text})
-
-                elif block.type == "tool_use":
-                    tool_call = {
-                        "id": block.id or f"call_{uuid.uuid4().hex}",
-                        "type": "function",
-                        "function": {
-                            "name": block.name or "",
-                            "arguments": json.dumps(block.input or {}),
-                        },
-                    }
-                    tool_calls.append(tool_call)
-
-                elif block.type == "tool_result":
-                    tool_contents, tool_text = _convert_tool_result_content(
-                        block.content
-                    )
-
-                    # Use tool_use_id (per spec) with fallback to id
-                    tool_call_id = block.tool_use_id or block.id or ""
-
-                    # Tool results from user become separate tool messages.
-                    # Flush any pending text/image first so the wire order
-                    # is preserved (a tool_result that arrived AFTER a text
-                    # block must come AFTER that text in OpenAI form too).
-                    if msg.role == "user":
-                        _emit_user_message(content_parts)
-                        for tool_content in tool_contents:
-                            openai_messages.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "content": tool_content,
-                                }
-                            )
-                    else:
-                        content_parts.append(
-                            {
-                                "type": "text",
-                                "text": f"Tool result: {tool_text}",
-                            }
-                        )
-
-            # Attach tool calls to assistant messages
-            if tool_calls:
-                openai_msg["tool_calls"] = tool_calls
-
-            # Attach content
-            if content_parts:
-                if len(content_parts) == 1 and content_parts[0]["type"] == "text":
-                    openai_msg["content"] = content_parts[0]["text"]
-                else:
-                    openai_msg["content"] = content_parts
-                openai_messages.append(openai_msg)
-            elif tool_calls:
-                openai_messages.append(openai_msg)
-            elif msg.role == "user":
-                # User turn that was entirely tool_results — the tool
-                # messages were already emitted above, nothing left.
-                continue
-            else:
-                # Assistant turn with no content and no tool_calls: emit
-                # an empty-string placeholder so strict templates still
-                # see a valid role-alternation sequence.
-                openai_msg["content"] = ""
-                openai_messages.append(openai_msg)
-
-        # Build ChatCompletionRequest
-        request_data = {
-            "messages": openai_messages,
-            "model": anthropic_request.model,
-            "max_tokens": anthropic_request.max_tokens,
-            "stream": anthropic_request.stream or False,
-        }
-
-        if anthropic_request.temperature is not None:
-            request_data["temperature"] = anthropic_request.temperature
-        if anthropic_request.top_p is not None:
-            request_data["top_p"] = anthropic_request.top_p
-        if anthropic_request.top_k is not None:
-            request_data["top_k"] = anthropic_request.top_k
-        if anthropic_request.stop_sequences is not None:
-            request_data["stop"] = anthropic_request.stop_sequences
-
-        # Enable usage in stream so we can report it
-        if anthropic_request.stream:
-            request_data["stream_options"] = StreamOptions(
-                include_usage=True,
-                continuous_usage_stats=True,
-            )
-
-        chat_request = ChatCompletionRequest(**request_data)
-
-        if anthropic_request.thinking is not None:
-            # The protocol layer already enforces SDK shape:
-            #   enabled  -> budget_tokens required (>=1024), display optional
-            #   disabled -> neither budget_tokens nor display allowed
-            #   adaptive -> budget_tokens forbidden, display optional
-            # So by the time we get here ``budget_tokens`` can only be
-            # set on ``enabled``. The local backend has no equivalent
-            # hard-cap knob, so we log a WARNING instead of rejecting —
-            # the Anthropic SDK would have accepted the request and we
-            # mirror that. Operators see the unenforced budget in logs.
-            if anthropic_request.thinking.budget_tokens is not None:
-                logger.warning(
-                    "Anthropic thinking.budget_tokens=%d is accepted for "
-                    "SDK compatibility but the local backend has no "
-                    "equivalent hard-cap knob — the budget is not enforced",
-                    anthropic_request.thinking.budget_tokens,
-                )
-            # Claude 4.7's ``adaptive`` is treated identically to ``enabled``
-            # because the local backend has no auto-throttle equivalent.
-            # Anything other than ``disabled`` enables reasoning.
-            enabled = anthropic_request.thinking.type != "disabled"
-            if anthropic_request.thinking.display == "omitted":
-                # Anthropic 4.7 spec: keep reasoning ON but hide reasoning
-                # text from the client. The OpenAI streaming pipeline has
-                # no equivalent suppress knob — log so operators can see
-                # the request, then proceed with normal reasoning emission.
-                logger.warning(
-                    "Anthropic thinking.display='omitted' is accepted for "
-                    "SDK compatibility but reasoning text will still be "
-                    "emitted to the client"
-                )
-            self.openai_serving_chat.apply_reasoning_enabled(chat_request, enabled)
-
-        # Claude 4.7 ``output_config``: map ``effort`` onto the OpenAI
-        # ``reasoning_effort`` knob. ``xhigh`` collapses to ``max`` because
-        # the OpenAI Literal does not include the Anthropic-only ``xhigh``.
-        # ``task_budget`` is a soft hint forwarded as a custom param so the
-        # model can see it without it becoming a hard cap (``max_tokens``
-        # is still the hard cap).
-        if anthropic_request.output_config is not None:
-            oc = anthropic_request.output_config
-            if oc.effort is not None:
-                chat_request.reasoning_effort = (
-                    "max" if oc.effort == "xhigh" else oc.effort
-                )
-            if oc.task_budget is not None:
-                # Custom params are silently ignored by backends that
-                # don't recognise them; logging it makes the propagation
-                # visible.
-                logger.info(
-                    "Anthropic output_config.task_budget hint: %d %s",
-                    oc.task_budget.total,
-                    oc.task_budget.type,
-                )
-
-        # ``betas`` is the Anthropic SDK's opt-in feature list (e.g.
-        # ``["thinking-2025-08-04"]``). The local backend has no
-        # equivalent beta system; accept-and-log so requests don't 400.
-        if anthropic_request.betas:
-            logger.info(
-                "Anthropic request opted into betas %s — no-op locally",
-                anthropic_request.betas,
-            )
-
-        # Convert tools. Deferred tools stay in the list with defer_loading=True;
-        # the chat template hides them from the initial <tools> block and renders
-        # them on demand when a tool_reference block names them.
-        if anthropic_request.tools:
-            converted_tools = []
-            for tool in anthropic_request.tools:
-                if is_server_tool(tool):
-                    # Anthropic server-side tools (web_search_*, computer_*,
-                    # bash_*, text_editor_*) have no client-side input_schema
-                    # because Anthropic provides the implementation. We can't
-                    # forward them to the OpenAI tools array (which requires a
-                    # schema), so skip with a visible log.
-                    logger.info(
-                        "Skipping built-in Anthropic server tool %r (type=%r): "
-                        "no native support in the OpenAI-compatible backend",
-                        tool.name,
-                        tool.type,
-                    )
-                    continue
-
-                # Custom tools always have a validated input_schema
-                # (enforced at Pydantic parse time).
-                converted_tools.append(
-                    Tool(
-                        type="function",
-                        defer_loading=tool.defer_loading,
-                        function={
-                            "name": tool.name,
-                            "description": tool.description or "",
-                            "parameters": tool.input_schema,
-                        },
-                    )
-                )
-
-            if converted_tools:
-                chat_request.tools = converted_tools
-
-        # Convert tool choice. ``any``/``tool`` express a hard requirement
-        # ("the model MUST call a tool"); if every requested tool was a
-        # server-side Anthropic built-in that we just skipped, there is
-        # no tool the model could call. Silently downgrading to "no tool"
-        # would deceive the caller, so raise an explicit 400.
-        if anthropic_request.tool_choice is not None:
-            tc_type = anthropic_request.tool_choice.type
-            if tc_type == "none":
-                chat_request.tool_choice = "none"
-            elif chat_request.tools:
-                if tc_type == "auto":
-                    chat_request.tool_choice = "auto"
-                elif tc_type == "any":
-                    chat_request.tool_choice = "required"
-                elif tc_type == "tool":
-                    tool_name = anthropic_request.tool_choice.name
-                    # ``Tool.function`` is a ``Function`` Pydantic model, not
-                    # a dict — access by attribute. A dict ``.get`` would
-                    # AttributeError and surface as a 500 instead of the
-                    # intended 400 / happy path.
-                    if not any(
-                        t.function.name == tool_name for t in chat_request.tools
-                    ):
-                        raise ValueError(
-                            f"tool_choice references tool {tool_name!r} but it "
-                            f"is not in the forwarded tools list "
-                            f"(server-side Anthropic tools cannot be selected)"
-                        )
-                    chat_request.tool_choice = ToolChoice(
-                        type="function",
-                        function=ToolChoiceFuncName(name=tool_name),
-                    )
-            elif tc_type in ("any", "tool"):
-                raise ValueError(
-                    f"tool_choice={tc_type!r} requires at least one custom "
-                    f"tool; all supplied tools were server-side Anthropic "
-                    f"built-ins which the OpenAI-compatible backend cannot "
-                    f"invoke"
-                )
-        elif chat_request.tools:
-            chat_request.tool_choice = "auto"
-
-        return chat_request
+        return convert_to_chat_completion_request(
+            anthropic_request,
+            merge_inline_system=self._merge_inline_system,
+            wrap_reasoning_history=lambda reasoning_text: self.openai_serving_chat.wrap_reasoning_history(
+                reasoning_text
+            ),
+            supports_native_reasoning_history=self.openai_serving_chat.supports_native_reasoning_history,
+            apply_reasoning_enabled=lambda request, enabled: self.openai_serving_chat.apply_reasoning_enabled(
+                request, enabled
+            ),
+        )
 
     async def _handle_non_streaming(
         self,
@@ -1259,80 +1359,7 @@ class AnthropicServing:
     def _convert_response(
         self, response: ChatCompletionResponse
     ) -> AnthropicMessagesResponse:
-        """Convert an OpenAI ChatCompletionResponse to an Anthropic Messages response."""
-        if not response.choices:
-            return AnthropicMessagesResponse(
-                content=[TextBlock(text="")],
-                model=response.model,
-                stop_reason="end_turn",
-                usage=AnthropicUsage(input_tokens=0, output_tokens=0),
-            )
-
-        choice = response.choices[0]
-        content: list[AnthropicContentBlock] = []
-
-        # Add reasoning content as a thinking block. signature is omitted
-        # entirely when the backend doesn't provide one — empty strings
-        # would fail downstream Anthropic signature verifiers.
-        if choice.message.reasoning_content:
-            content.append(ThinkingBlock(thinking=choice.message.reasoning_content))
-
-        # Add text content
-        if choice.message.content:
-            content.append(TextBlock(text=choice.message.content))
-
-        # Add tool calls
-        if choice.message.tool_calls:
-            for tool_call in choice.message.tool_calls:
-                raw_args = tool_call.function.arguments
-                try:
-                    tool_input = json.loads(raw_args)
-                except (json.JSONDecodeError, TypeError):
-                    # Surface invalid tool arguments so an empty-dict
-                    # tool call is never indistinguishable from a real
-                    # one when something downstream goes wrong.
-                    logger.warning(
-                        "Tool %r emitted invalid JSON arguments: %r — "
-                        "defaulting to empty input",
-                        tool_call.function.name,
-                        (raw_args or "")[:200],
-                    )
-                    tool_input = {}
-
-                content.append(
-                    ToolUseBlock(
-                        id=tool_call.id,
-                        name=tool_call.function.name,
-                        input=tool_input,
-                    )
-                )
-
-        # Map stop reason
-        finish_reason = choice.finish_reason or "stop"
-        if finish_reason not in STOP_REASON_MAP:
-            logger.warning(
-                "Unmapped OpenAI finish_reason %r; defaulting to end_turn",
-                finish_reason,
-            )
-        stop_reason = STOP_REASON_MAP.get(finish_reason, "end_turn")
-
-        # Anthropic requires ``content`` to contain at least one block.
-        # Empty string completions (max_tokens=1 stop, content filter, etc.)
-        # would otherwise ship ``content=[]`` and break strict SDK parsers.
-        if not content:
-            content.append(TextBlock(text=""))
-
-        return AnthropicMessagesResponse(
-            id=f"msg_{uuid.uuid4().hex}",
-            content=content,
-            model=response.model,
-            stop_reason=stop_reason,
-            usage=_anthropic_usage_from_openai(
-                response.usage,
-                include_input=True,
-                include_output=True,
-            ),
-        )
+        return convert_response(response)
 
     def _convert_openai_error_response(self, response) -> JSONResponse:
         """Forward an upstream OpenAI-handler error as an Anthropic error.
