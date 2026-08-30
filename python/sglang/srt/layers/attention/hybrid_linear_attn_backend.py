@@ -39,11 +39,14 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
 
 logger = logging.getLogger(__name__)
+if is_npu():
+    FLA_CHUNK_SIZE_NPU = 64
 _validate_mamba_replay_state_indices = (
     envs.SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES.get()
 )
@@ -344,6 +347,7 @@ class MambaAttnBackendBase(AttentionBackend):
         cache last_recurrent_state, unaligned cache intermediate `h` at the last
         chunk boundary."""
         state_chunk_size = self.mamba_chunk_size
+        h_chunk_size = FLA_CHUNK_SIZE_NPU if is_npu() else state_chunk_size
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
@@ -355,7 +359,7 @@ class MambaAttnBackendBase(AttentionBackend):
         if isinstance(self, Mamba2AttnBackend):
             num_h_states = extend_seq_lens // state_chunk_size
         else:
-            num_h_states = (extend_seq_lens - 1) // state_chunk_size + 1
+            num_h_states = (extend_seq_lens - 1) // h_chunk_size + 1
 
         track_ssm_src_offset = torch.zeros_like(num_h_states)
         track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
@@ -376,6 +380,15 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_h_src = offset_masked[not_aligned] + (
             lens_masked[not_aligned] // state_chunk_size
         )
+        if is_npu():
+            track_ssm_h_src = (
+                offset_masked[not_aligned]
+                + (
+                    (lens_masked[not_aligned] // state_chunk_size)
+                    * state_chunk_size
+                )
+                // h_chunk_size
+            )
         track_ssm_h_dst = dst_masked[not_aligned]
 
         return (
