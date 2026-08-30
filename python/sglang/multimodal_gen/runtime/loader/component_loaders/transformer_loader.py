@@ -154,6 +154,7 @@ class TransformerLoader(ComponentLoader):
 
     allow_global_attention_backend_fallback = False
     supports_online_quantization_override = True
+    supports_fsdp_inference = True
 
     component_names = [
         "transformer",
@@ -216,13 +217,16 @@ class TransformerLoader(ComponentLoader):
             requested_distributed_execution.append(
                 f"kv_gather_degree={server_args.kv_gather_degree}"
             )
+        if server_args.should_use_fsdp_for_component(component_name):
+            requested_distributed_execution.append("FSDP")
         if requested_distributed_execution:
             raise RuntimeError(
                 f"Native Diffusers fallback for transformer component "
                 f"{component_name!r} cannot honor requested distributed execution: "
                 f"{', '.join(requested_distributed_execution)}. Use an SGLang-native "
                 "transformer implementation or set tp_size, sp_degree, "
-                "ulysses_degree, ring_degree, and kv_gather_degree to 1."
+                "ulysses_degree, ring_degree, and kv_gather_degree to 1 without "
+                "FSDP."
             )
 
     def load_customized(
@@ -460,8 +464,9 @@ class TransformerLoader(ComponentLoader):
         )
         if direct_gpu_weight_loading:
             logger.warning(
-                "Direct GPU weight loading is enabled for %s; the complete checkpoint "
-                "state dict and materialized model weights may coexist on GPU during startup",
+                "Direct GPU weight loading is enabled for %s; compatible checkpoint "
+                "tensors become model storage, while transformed tensors may still "
+                "require temporary GPU allocations",
                 component_name,
             )
 

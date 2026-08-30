@@ -533,9 +533,11 @@ RUN pip uninstall -y aiter
 # block AITER_COMMIT overrides that predate that rule. The working tree was just
 # produced by a fresh `git clone` above, so there are no real user changes to
 # preserve.
+# cherry pick 8578af1 commit for v4 fp4 indexer kv-cache fix, may be removed in next aiter upgrade
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
+ && git cherry-pick --no-commit 8578af153f4fa1e007fede7e3c1e1b373f07af4c \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
 

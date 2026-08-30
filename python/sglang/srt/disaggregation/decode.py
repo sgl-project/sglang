@@ -193,7 +193,7 @@ class DecodeReqToTokenPool:
             len(reusing) <= 1
         ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
-            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
+            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv.kv_committed_len > 0
             for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
@@ -1360,7 +1360,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     count_retracted=True,
                     extra_reserved_reqs=len(preallocated_reqs) + 1,
                 )
-            decode_req.req.cache_protected_len = total_prefix_len
+            decode_req.req.kv.cache_protected_len = total_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
             kv_transfer_page_size = page_size
@@ -1783,7 +1783,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
         fill_len = self._pre_alloc_fill_len(req)
-        req.kv_committed_len = fill_len
+        req.kv.kv_committed_len = fill_len
 
         if prefix_len > 0:
             self.req_to_token_pool.write(
@@ -1889,7 +1889,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.prefix_indices = (
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
-        req.set_extend_range(total_prefix_len, req.kv_committed_len)
+        req.set_extend_range(total_prefix_len, req.kv.kv_committed_len)
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -2634,8 +2634,10 @@ class SchedulerDisaggregationDecodeMixin:
                 # Truncate fill_len to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).
-                if req.kv_committed_len is not None:
-                    req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
+                if req.kv.kv_committed_len is not None:
+                    req.set_extend_range(
+                        len(req.prefix_indices), req.kv.kv_committed_len
+                    )
             else:
                 waiting_queue.append(req)
 

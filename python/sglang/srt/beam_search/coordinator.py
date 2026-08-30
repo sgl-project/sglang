@@ -442,7 +442,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 prefix_len=group.prompt_len,
                 # All rows are synchronized; the leader's committed length
                 # covers the KV computed through this step.
-                seq_len=group.leader.kv_committed_len,
+                seq_len=group.leader.kv.kv_committed_len,
             )
             group.pending_orphans.append(StagedOrphans(tick, old_map, new_map))
             # Length placeholder only; the DAG owns history and member rows
