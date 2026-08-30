@@ -1903,7 +1903,9 @@ class DeepseekV4AttnBackend(
         grows the arena; the previous one is retired but kept referenced, as
         already-captured graphs still address it.
         """
-        from sglang.kernels.ops.attention.dsv4.mxfp4_dsv4_decode_sm90 import _num_sm_parts
+        from sglang.kernels.ops.attention.dsv4.mxfp4_dsv4_decode_sm90 import (
+            _num_sm_parts,
+        )
 
         arena = self._mxfp4_accum_arenas.get(h_q)
         num_sm_parts = _num_sm_parts(b, 1, h_q, self.device)
@@ -1954,7 +1956,9 @@ class DeepseekV4AttnBackend(
             FlashMLASchedMeta,
             flash_mla_with_kvcache_dsv4_mxfp4,
         )
-        from sglang.kernels.ops.attention.dsv4.mxfp4_k_cache import MXFP4_BYTES_PER_TOKEN
+        from sglang.kernels.ops.attention.dsv4.mxfp4_k_cache import (
+            MXFP4_BYTES_PER_TOKEN,
+        )
 
         assert (
             q.ndim == 3 and q.shape[2] == 512
