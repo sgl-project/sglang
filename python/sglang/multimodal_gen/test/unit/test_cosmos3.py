@@ -561,6 +561,45 @@ class TestCosmos3SamplingParamsDataType(unittest.TestCase):
 
         self.assertEqual(params.data_type, DataType.VIDEO)
 
+    def test_adjust_fans_out_candidate_spec_image_and_prompt(self):
+        # This is the chokepoint every entry point runs _adjust() through
+        # (the action HTTP endpoint and DiffGenerator.generate_action
+        # alike -- see #35331), so a single image/prompt with candidate_spec
+        # set must be fanned out here regardless of which entry point built
+        # the SamplingParams, or the denoiser only ever produces one
+        # candidate to reduce.
+        params = Cosmos3SamplingParams(
+            prompt="pick up the block",
+            action_mode="policy",
+            num_frames=17,
+            image_path="observation.png",
+            candidate_spec=CandidateTrajectorySpec(count=3, reducer="mean"),
+            num_outputs_per_prompt=3,
+        )
+
+        params._adjust(_cosmos3_server_args())
+
+        self.assertEqual(params.image_path, ["observation.png"] * 3)
+        self.assertEqual(params.prompt, ["pick up the block"] * 3)
+
+    def test_adjust_is_idempotent_when_image_path_already_a_list(self):
+        # The action HTTP endpoint (entrypoints/action/cosmos3.py) already
+        # fans out image_path/prompt itself before _adjust runs; _adjust
+        # must not fan out a second time.
+        params = Cosmos3SamplingParams(
+            prompt=["pick up the block"] * 2,
+            action_mode="policy",
+            num_frames=17,
+            image_path=["observation.png"] * 2,
+            candidate_spec=CandidateTrajectorySpec(count=2, reducer="mean"),
+            num_outputs_per_prompt=2,
+        )
+
+        params._adjust(_cosmos3_server_args())
+
+        self.assertEqual(params.image_path, ["observation.png"] * 2)
+        self.assertEqual(params.prompt, ["pick up the block"] * 2)
+
 
 class TestCosmos3ActionEndpoint(unittest.TestCase):
     @staticmethod
