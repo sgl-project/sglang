@@ -16,7 +16,9 @@ from sglang.srt.models.ernie45_vl import Ernie4_5_VLMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 from sglang.srt.utils import is_npu, logger
 
 _is_npu = is_npu()
