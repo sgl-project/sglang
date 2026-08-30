@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -26,6 +27,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -44,6 +46,11 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+# The only LogitsProcessorOutput fields populated at CUDA-graph capture time:
+# capture runs inside the model forward, so the Sampler has not filled the
+# logprob / prefill / diffusion parts yet.
+_LPO_CAPTURE_FIELDS = ("next_token_logits", "hidden_states")
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -125,7 +132,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         )
         size = shape_key.size
         if self._shared_output_buffer is None:
-            self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
+            # The first capture is the largest shape, so the warmup output's own
+            # row count is the required capacity. A body whose row unit is tokens
+            # rather than requests needs more than ``size`` rows; ``max`` keeps the
+            # existing full-``size`` allocation for bodies that shard or prune.
+            self._shared_output_buffer = self._alloc_full_buffer(
+                warmup_out, max(size, self._output_rows(warmup_out, size))
+            )
         with BreakableCUDAGraphCapture(
             cuda_graph=graph,
             pool=self._pool,
@@ -143,10 +156,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_inputs[shape_key] = capture_inputs
 
     def _output_rows(self, output: Any, cap: int) -> int:
-        """Leading-dim row count actually produced by the body, clamped to ``cap``.
+        """Leading-dim row count actually produced by the body.
 
         A body that shards or prunes its output along dim 0 returns fewer than
-        ``cap`` rows; everything else returns exactly ``cap``.
+        ``cap`` rows; everything else returns exactly ``cap``. The one shape that
+        exceeds ``cap`` is a LogitsProcessorOutput whose row unit is tokens
+        instead of requests -- see that branch.
         """
         if torch.is_tensor(output):
             return min(cap, output.shape[0])
@@ -155,7 +170,44 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return min([cap, *rows])
         if isinstance(output, (list, tuple)) and output:
             return min(self._output_rows(o, cap) for o in output if o is not None)
+        if isinstance(output, LogitsProcessorOutput):
+            # Rows here are tokens, not requests: a speculative verify body emits
+            # ``cap * num_draft_tokens`` rows for ``cap`` requests. Clamping to
+            # ``cap`` makes verify read a fraction of the logits and index
+            # accept_index past the end of the tensor, so report the real count.
+            self._assert_lpo_capturable(output)
+            rows = [
+                tensor.shape[0]
+                for tensor in (output.next_token_logits, output.hidden_states)
+                if tensor is not None
+            ]
+            if not rows:
+                return cap
+            if min(rows) != max(rows):
+                raise ValueError(
+                    f"BCG LogitsProcessorOutput fields disagree on row count: {rows}"
+                )
+            return rows[0]
         return cap
+
+    @staticmethod
+    def _assert_lpo_capturable(output: LogitsProcessorOutput) -> None:
+        """Fail loudly if a capture-time LogitsProcessorOutput carries more than
+        ``_LPO_CAPTURE_FIELDS``.
+
+        Field introspection is deliberate here: it is a completeness guard, so a
+        future capture point that also fills logprob or diffusion fields fails
+        instead of silently dropping them from the replay buffer.
+        """
+        for field in dataclasses.fields(output):
+            if field.name in _LPO_CAPTURE_FIELDS:
+                continue
+            if getattr(output, field.name) is not None:
+                raise TypeError(
+                    "BCG cannot capture a LogitsProcessorOutput with "
+                    f"{field.name!r} set; only {_LPO_CAPTURE_FIELDS} are "
+                    "populated at capture time"
+                )
 
     def _alloc_full_buffer(self, output: Any, size: int) -> Any:
         """A same-structure buffer as ``output`` but with ``size`` leading rows."""
@@ -174,6 +226,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
             return [self._alloc_full_buffer(o, size) for o in output]
+        if isinstance(output, LogitsProcessorOutput):
+            self._assert_lpo_capturable(output)
+            return LogitsProcessorOutput(
+                next_token_logits=self._alloc_full_buffer(
+                    output.next_token_logits, size
+                ),
+                hidden_states=self._alloc_full_buffer(output.hidden_states, size),
+            )
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _slice_output(self, output: Any, num_tokens: int) -> Any:
@@ -187,6 +247,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
             return [self._slice_output(item, num_tokens) for item in output]
+        if isinstance(output, LogitsProcessorOutput):
+            return LogitsProcessorOutput(
+                next_token_logits=self._slice_output(
+                    output.next_token_logits, num_tokens
+                ),
+                hidden_states=self._slice_output(output.hidden_states, num_tokens),
+            )
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _copy_output_to_buffer(
@@ -225,6 +292,18 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 )
             for item, buffer in zip(output, output_buffer):
                 self._copy_output_to_buffer(item, buffer, num_tokens)
+            return
+        if isinstance(output, LogitsProcessorOutput) and isinstance(
+            output_buffer, LogitsProcessorOutput
+        ):
+            self._copy_output_to_buffer(
+                output.next_token_logits,
+                output_buffer.next_token_logits,
+                num_tokens,
+            )
+            self._copy_output_to_buffer(
+                output.hidden_states, output_buffer.hidden_states, num_tokens
+            )
             return
         raise TypeError(
             "Unsupported BCG output buffer pair: "
