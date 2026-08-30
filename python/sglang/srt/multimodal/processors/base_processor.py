@@ -551,15 +551,16 @@ class BaseMultimodalProcessor(ABC):
         override: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         merged = copy.deepcopy(base or {})
-        for key, value in (override or {}).items():
-            if isinstance(value, dict) and isinstance(merged.get(key), dict):
-                merged[key] = BaseMultimodalProcessor._deep_merge_dicts(
-                    merged[key], value
-                )
-            elif isinstance(value, dict):
-                merged[key] = BaseMultimodalProcessor._deep_merge_dicts({}, value)
-            else:
-                merged[key] = copy.deepcopy(value)
+
+        def merge_into(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+            for key, value in source.items():
+                if isinstance(value, dict) and isinstance(target.get(key), dict):
+                    merge_into(target[key], value)
+                else:
+                    target[key] = copy.deepcopy(value)
+
+        if override:
+            merge_into(merged, override)
         return merged
 
     def _get_runtime_request(self):

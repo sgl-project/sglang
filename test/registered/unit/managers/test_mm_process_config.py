@@ -822,6 +822,35 @@ class TestProcessMmDataKwargs(CustomTestCase):
         )
         self.assertTrue(call_kwargs.kwargs.get("custom_flag"))
 
+    def test_runtime_processor_kwargs_deep_merge_nested_dicts(self):
+        config = {
+            "image": {
+                "size": {"longest_edge": 2048, "shortest_edge": 1024},
+                "max_pixels": 5000000,
+            }
+        }
+        proc, mock_proc, _ = self._make_base_processor(config)
+        request = MagicMock(
+            processor_kwargs={"images_kwargs": {"size": {"height": 512}}},
+            mm_process_config={"image": {"size": {"shortest_edge": 768}}},
+            io_kwargs=None,
+        )
+
+        with proc.request_context(request):
+            proc.process_mm_data("test", images=["img1"])
+
+        self.assertEqual(
+            mock_proc.__call__.call_args.kwargs.get("images_kwargs"),
+            {
+                "size": {
+                    "longest_edge": 2048,
+                    "shortest_edge": 768,
+                    "height": 512,
+                },
+                "max_pixels": 5000000,
+            },
+        )
+
     def test_runtime_processor_kwargs_reject_reserved_keys(self):
         proc, _, _ = self._make_base_processor({})
         request = MagicMock(
