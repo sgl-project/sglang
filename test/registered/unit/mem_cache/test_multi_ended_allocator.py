@@ -926,7 +926,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
 
     def test_swa_translate_loc_from_full_to_swa_dtype_assertion(self):
         """REGRESSION: wrong-dtype `out=` (int32 instead of int64) raises
-        AssertionError. Guards against reintroducing a narrowed SWA rail: the
+        AssertionError. Guards against reintroducing a narrowed SWA write loc: the
         allocator emits int64 and consumers narrow at their own buffer."""
         _, allocator, _ = self._build()
         v = allocator.alloc(4)

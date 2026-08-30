@@ -23,7 +23,7 @@ always PHYSICAL. Two routing contracts are pinned here:
    `UnifiedSWAKVPool` asserts it's present (the unified memory pool always precomputes
    it); `HybridLinearKVPool` falls back to `loc` for a static (non-shared) pool,
    where `loc` is itself already physical.
-2. SWA. The swa-physical loc rides the backend `swa_out_cache_loc` rail
+2. SWA. The swa-physical loc rides the backend `swa_out_cache_loc` slot
    (`KVWriteLoc.swa_loc`) and is written directly.
 
 Pure dispatch tests: the inner sub-pools are recording stubs, so no GPU / real
@@ -127,7 +127,7 @@ class TestUnifiedSWARouting(unittest.TestCase):
 
         self.assertEqual(len(pool.swa_kv_pool.calls), 1)
         forwarded, kwargs = pool.swa_kv_pool.calls[0]
-        # SWA write rides the backend rail: forward the swa-physical loc directly.
+        # SWA write rides the backend slot: forward the swa-physical loc directly.
         self.assertIs(forwarded, swa_phys)
         self.assertNotIn("already_physical", kwargs)
         # Full pool untouched for an SWA layer.
@@ -138,7 +138,7 @@ class TestUnifiedSWARouting(unittest.TestCase):
         virtual_loc = torch.tensor([10, 11, 12], dtype=torch.int64)
 
         layer = types.SimpleNamespace(layer_id=1)  # SWA layer
-        # No swa_loc bundled -> the rail contract is violated; must assert
+        # No swa_loc bundled -> the write-loc contract is violated; must assert
         # rather than silently writing wrong (un-translated) locations.
         with self.assertRaises(AssertionError):
             pool.set_kv_buffer(
