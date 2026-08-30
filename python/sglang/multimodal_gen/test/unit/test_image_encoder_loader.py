@@ -233,6 +233,7 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
                 native_only_components=(),
             ),
             resolve_component_attention_backend=lambda _name: (None, None),
+            requested_component_attention_backend=lambda _name: None,
             explicit_residency_mode=lambda _name: None,
             require_component_resident=mock.Mock(),
             should_use_fsdp_for_component=lambda _name: False,

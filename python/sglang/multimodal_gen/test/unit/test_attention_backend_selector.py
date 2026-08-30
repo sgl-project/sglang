@@ -309,6 +309,10 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
             def requested_component_attention_backend(_component_name):
                 return None
 
+            @staticmethod
+            def should_use_fsdp_for_component(_component_name):
+                return False
+
         _Loader.allow_global_attention_backend_fallback = allow_global_backend_fallback
         with (
             patch.object(ComponentLoader, "for_component_type", return_value=_Loader()),
@@ -379,6 +383,10 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
             def requested_component_attention_backend(_component_name):
                 return "fa"
 
+            @staticmethod
+            def should_use_fsdp_for_component(_component_name):
+                return False
+
         with (
             patch.object(ComponentLoader, "for_component_type", return_value=_Loader()),
             patch(
@@ -436,6 +444,10 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
             def requested_component_attention_backend(_component_name):
                 return "fa"
 
+            @staticmethod
+            def should_use_fsdp_for_component(_component_name):
+                return False
+
         with (
             patch.object(ComponentLoader, "for_component_type", return_value=_Loader()),
             patch(
@@ -477,6 +489,10 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
             @staticmethod
             def requested_component_attention_backend(_component_name):
                 return None
+
+            @staticmethod
+            def should_use_fsdp_for_component(_component_name):
+                return False
 
         with (
             patch.object(ComponentLoader, "for_component_type", return_value=_Loader()),
