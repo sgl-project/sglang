@@ -193,7 +193,7 @@ def match_prefix_for_req(
         len(req.prefix_indices) + req.host_hit_length, max_len
     )
     if match_result.mamba_branching_seqlen is not None:
-        req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+        req.kv.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
         req.kv.cache_protected_len = match_result.cache_protected_len
     return match_result
@@ -833,7 +833,7 @@ class PrefillAdder:
         backstopped by the fail-loud RuntimeError in `alloc_req_slots`. FIXME: if
         over-admission crashes under pressure, make this more conservative (e.g.
         multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
-        if self._mamba_slot_cost and req.mamba_pool_idx is None:
+        if self._mamba_slot_cost and req.kv.mamba_pool_idx is None:
             return self._mamba_slot_cost
         return 0
 

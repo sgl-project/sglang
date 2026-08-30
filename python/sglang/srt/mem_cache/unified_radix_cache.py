@@ -2870,7 +2870,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def swa_retain_floor(self, req) -> int | None:
         if not self.is_mamba_enabled or self._sliding_window_size is None:
             return None
-        checkpoint = req.mamba_last_track_seqlen
+        checkpoint = req.kv.mamba_last_track_seqlen
         if checkpoint is None:
             return None
         return checkpoint - self._sliding_window_size

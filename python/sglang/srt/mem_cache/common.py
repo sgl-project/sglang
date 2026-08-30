@@ -159,8 +159,8 @@ def retraction_backup(
         return True
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    req.retraction_backup = unified_cache.retraction_backup(req)
-    return req.retraction_backup is not None
+    req.kv.retraction_backup = unified_cache.retraction_backup(req)
+    return req.kv.retraction_backup is not None
 
 
 def retraction_restore(
@@ -179,23 +179,23 @@ def retraction_restore(
         return
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    assert req.retraction_backup is not None
-    unified_cache.retraction_restore(req, req.retraction_backup)
-    req.retraction_backup = None
+    assert req.kv.retraction_backup is not None
+    unified_cache.retraction_restore(req, req.kv.retraction_backup)
+    req.kv.retraction_backup = None
 
 
 def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> None:
     if backend == "cpu_tensor":
-        req.retraction_backup = None
+        req.kv.retraction_backup = None
         return
     if backend != "host_pool":
         raise ValueError(f"Unknown retraction backup backend: {backend}")
-    if req.retraction_backup is None:
+    if req.kv.retraction_backup is None:
         return
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    unified_cache.retraction_discard(req.retraction_backup)
-    req.retraction_backup = None
+    unified_cache.retraction_discard(req.kv.retraction_backup)
+    req.kv.retraction_backup = None
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
@@ -206,11 +206,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             tree_cache.supports_mamba()
         ), "Only MambaRadixCache allow freeing before alloc"
         # TODO (csy, hanming): clean up this early allocation logic
-        if req.mamba_pool_idx is not None:
+        if req.kv.mamba_pool_idx is not None:
             tree_cache.req_to_token_pool.mamba_allocator.free(
-                req.mamba_pool_idx.unsqueeze(-1)
+                req.kv.mamba_pool_idx.unsqueeze(-1)
             )
-            req.mamba_pool_idx = None
+            req.kv.mamba_pool_idx = None
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
@@ -234,7 +234,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         not tree_cache.supports_mamba()
     ):
         assert (
-            req.mamba_pool_idx is not None
+            req.kv.mamba_pool_idx is not None
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
