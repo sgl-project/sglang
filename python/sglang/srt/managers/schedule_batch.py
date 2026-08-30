@@ -831,7 +831,7 @@ class ReqKvInfo:
     # Host-side KV backup the request holds across a retraction (unified cache).
     retraction_backup: Optional[RetractionBackup] = None
 
-    # Mamba state: an independent resource, present iff mamba_pool_idx is not None.
+    # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
     mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
     mamba_next_track_idx: Optional[int] = None  # 0 or 1
