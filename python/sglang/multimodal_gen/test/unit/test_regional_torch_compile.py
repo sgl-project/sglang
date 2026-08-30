@@ -247,6 +247,7 @@ def test_build_compile_workload_signature_distinguishes_cfg_parallel(
     stage.server_args = SimpleNamespace(
         model_paths={},
         model_path="toy-model",
+        transformer_weights_path=None,
         pipeline_config=None,
         enable_cfg_parallel=enable_cfg_parallel,
     )
