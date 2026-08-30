@@ -87,6 +87,13 @@ _FLUX2_SWIGLU_SIGS = _FLUX2_SWIGLU.verified_sigs
 assert _FLUX2_SWIGLU_SIGS is not None
 
 
+def _can_use_nvfp4_swiglu_quant_fusion(capability: Any) -> bool:
+    # The end-to-end accuracy and performance validation for this fusion was
+    # done on SM103.  SM100 currently produces a deterministic but materially
+    # different FLUX.2 image, so keep B200/GB200 on the existing unfused path.
+    return capability is not None and (capability.major, capability.minor) == (10, 3)
+
+
 def _flux2_norm_modulate(
     norm: nn.Module,
     x: torch.Tensor,
@@ -240,8 +247,7 @@ class Flux2FeedForward(nn.Module):
         self._enable_nvfp4_swiglu_quant = False
         capability = current_platform.get_device_capability()
         if (
-            capability is not None
-            and capability.major == 10
+            _can_use_nvfp4_swiglu_quant_fusion(capability)
             and isinstance(self.linear_in.quant_method, ModelOptFp4LinearMethod)
             and isinstance(self.linear_out.quant_method, ModelOptFp4LinearMethod)
             and self.linear_in.output_size_per_partition % 128 == 0
