@@ -946,7 +946,7 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "musa"
         return "musa:{}".format(device_id)
 
-    if hasattr(torch, "mps") and torch.mps.is_available():
+    if is_mps():
         if device_id is None:
             return "mps"
         return "mps:{}".format(device_id)

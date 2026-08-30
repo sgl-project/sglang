@@ -75,6 +75,7 @@ class MpsDeviceMixin(DeviceMixin):
         if callable(synchronize):
             synchronize()
 
+
 class MpsSRTPlatform(MpsDeviceMixin, SRTPlatform):
     """Built-in SRT platform for Apple Silicon MPS."""
 
