@@ -8,6 +8,7 @@ it here instead of re-deriving it from model architectures themselves.
 from __future__ import annotations
 
 import ast
+import hashlib
 import logging
 from collections.abc import Mapping
 from pathlib import Path
@@ -23,6 +24,11 @@ _MAX_DSV4_ENCODER_BYTES = 1 << 20
 
 _GLM_TOOL_RESULT_SORT_START = "    {%- set ns_a = namespace(tool_calls=none) -%}"
 _GLM_TOOL_RESULT_SORT_END = "\n{% endif -%}\n{%- elif m.role == 'system' -%}"
+# sha256 of the excised region in the zai-org/GLM-5.3-Flash template at HF
+# revision 04c4e9e9; order_glm_tool_results replicates exactly that region.
+_GLM_TOOL_RESULT_SORT_SHA256 = (
+    "f585e1f2937c781d8ce1234622eb032d99268e5f876f06c752599f2dd29c821a"
+)
 _GLM_LINEAR_TOOL_RESULT_RENDER = """    {%- for k in range(block_start, ns_blk.end + 1) -%}
         {{- render_tool_response(messages[k]) -}}
     {%- endfor -%}"""
@@ -33,6 +39,14 @@ def _tool_call_id(item: Any) -> Optional[str]:
         return None
     value = item.get("tool_call_id") or item.get("id")
     return str(value) if value else None
+
+
+def _canonical_tool_output(item: Any) -> Any:
+    # The template's sorted path renders only entry.output; other keys (e.g. a
+    # "type") would send the split-off entry down a different template branch.
+    if not isinstance(item, Mapping):
+        return item
+    return {key: item[key] for key in ("tool_call_id", "id", "output") if key in item}
 
 
 def _is_list_of_tool_outputs(message: Mapping[str, Any]) -> bool:
@@ -61,9 +75,9 @@ def _order_tool_result_block(
     results_by_id = {}
     for message in tool_results:
         if _is_list_of_tool_outputs(message):
-            result_items = message["content"]
             units = [
-                ({"role": "tool", "content": [item]}, item) for item in result_items
+                ({"role": "tool", "content": [_canonical_tool_output(item)]}, item)
+                for item in message["content"]
             ]
         else:
             units = [(message, message)]
@@ -128,15 +142,25 @@ def resolve_glm_tool_result_template(
         return None
 
     template = getattr(tokenizer, "chat_template", None)
-    if not isinstance(template, str) or "has_dup_tool_result_id" not in template:
-        return None
-    if template.count(_GLM_TOOL_RESULT_SORT_START) != 1:
+    if (
+        not isinstance(template, str)
+        or template.count(_GLM_TOOL_RESULT_SORT_START) != 1
+    ):
         return None
 
     start = template.index(_GLM_TOOL_RESULT_SORT_START)
     end = template.find(_GLM_TOOL_RESULT_SORT_END, start)
-    if end < 0:
+    if (
+        end < 0
+        or hashlib.sha256(template[start:end].encode("utf-8")).hexdigest()
+        != _GLM_TOOL_RESULT_SORT_SHA256
+    ):
+        logger.info(
+            "GLM chat template does not match the known quadratic tool-result "
+            "ordering region; keeping the stock template."
+        )
         return None
+    logger.info("Replacing quadratic GLM tool-result ordering with a linear render.")
     return template[:start] + _GLM_LINEAR_TOOL_RESULT_RENDER + template[end:]
 
 
