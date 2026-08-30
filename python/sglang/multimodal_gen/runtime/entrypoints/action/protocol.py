@@ -458,6 +458,17 @@ def _build_candidate_spec(options: dict[str, Any]) -> CandidateTrajectorySpec | 
     than one candidate gets a "mean" reduction by default (Cosmos3's action
     output is a continuous action-chunk tensor, so a per-channel mean is the
     framework-registered reducer that applies without a model-specific rule).
+
+    Not wired to ``validate_candidate_admission()``: ``--batching-max-size``
+    (default 1, meaning dynamic batching is off) governs merging *different*
+    requests into one physical batch, not a single request's own
+    ``num_outputs_per_prompt``/candidate count, which today's scheduler
+    always executes in full (as one physical batch, or sequentially per
+    ``supports_sequential_multi_output_inference()`` -- never truncated).
+    Checking it here would incorrectly reject every candidate_count > 1 by
+    default. A real execution-batch ceiling for candidate groups is
+    scheduler-internal state and belongs in the phase-3 scheduling work the
+    RFC's rollout plan defers until after this adapter is benchmarked.
     """
     candidate_count = options.get("candidate_count")
     if candidate_count is None:
@@ -707,6 +718,8 @@ def action_generation_response(
         response["cache"] = output["cache"]
     if "parallel" in output:
         response["parallel"] = output["parallel"]
+    if "candidate_metrics" in output:
+        response["candidate_metrics"] = output["candidate_metrics"]
     return response
 
 

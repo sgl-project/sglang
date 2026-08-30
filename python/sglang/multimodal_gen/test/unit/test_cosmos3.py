@@ -674,6 +674,24 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
         response = action_generation_response(output, _cosmos3_server_args())
 
         self.assertEqual(len(response["data"]), 1)
+        self.assertNotIn("candidate_metrics", response)
+
+    def test_response_surfaces_candidate_metrics(self):
+        output = {
+            "request_id": "cosmos-action-5",
+            "actions": torch.zeros(16, 10).numpy(),
+            "candidate_metrics": {
+                "count": 3,
+                "reducer": "mean",
+                "reduce_time_ms": 1.23,
+            },
+            "parameters": {},
+        }
+
+        response = action_generation_response(output, _cosmos3_server_args())
+
+        self.assertEqual(response["candidate_metrics"]["count"], 3)
+        self.assertEqual(response["candidate_metrics"]["reducer"], "mean")
 
     def test_action_decode_skips_vae(self):
         class FailIfDecoded:
@@ -1303,6 +1321,7 @@ class TestCosmos3CandidateReduction(unittest.TestCase):
             request_id="req-0",
             num_inference_steps=4,
             num_frames=1,
+            metrics=None,
         )
         server_args = types.SimpleNamespace()
         output = stage.forward(batch, server_args)
@@ -1319,6 +1338,18 @@ class TestCosmos3CandidateReduction(unittest.TestCase):
             torch.as_tensor(payload["actions"]), torch.full((2, 3), 1.0)
         )
         self.assertNotIn("candidates", payload)
+        self.assertNotIn("candidate_metrics", payload)
+
+    def test_candidate_spec_reports_reduction_metrics(self):
+        spec = CandidateTrajectorySpec(count=2, reducer="mean")
+        action_latents = torch.stack(
+            [torch.full((2, 3), v) for v in (0.0, 2.0)], dim=0
+        )
+        payload = self._decode_action(action_latents, candidate_spec=spec)
+        self.assertIn("candidate_metrics", payload)
+        self.assertEqual(payload["candidate_metrics"]["count"], 2)
+        self.assertEqual(payload["candidate_metrics"]["reducer"], "mean")
+        self.assertGreaterEqual(payload["candidate_metrics"]["reduce_time_ms"], 0.0)
 
     def test_count_one_candidate_spec_is_identical_to_no_spec(self):
         spec = CandidateTrajectorySpec(count=1, reducer="none")

@@ -11,6 +11,7 @@ per-request from ``batch.data_type`` and the presence of
 
 import copy
 import json
+import time
 from typing import Any
 
 import numpy as np
@@ -1659,14 +1660,30 @@ class Cosmos3DecodingStage(PipelineStage):
             if action_pred is None:
                 raise RuntimeError("Cosmos3 action request produced no action tensor")
             candidate_spec = batch.candidate_spec
+            candidate_metrics = None
             if candidate_spec is not None:
+                reduce_start = time.perf_counter()
                 try:
                     reduced_action = reduce_candidates(action_pred, candidate_spec)
                 except CandidateContractError as exc:
                     raise RuntimeError(
                         f"Cosmos3 candidate-trajectory reduction failed: {exc}"
                     ) from exc
+                reduce_time_ms = (time.perf_counter() - reduce_start) * 1000
                 actions_out = reduced_action.numpy()
+                # See #35331's metrics integration point (candidate count,
+                # reducer time); batch.metrics may be None under warmup/perf
+                # suppression, so this is best-effort logging, not required
+                # for correctness.
+                if batch.metrics is not None:
+                    batch.metrics.record_stage(
+                        "candidate_reduction", reduce_time_ms / 1000
+                    )
+                candidate_metrics = {
+                    "count": candidate_spec.count,
+                    "reducer": candidate_spec.reducer,
+                    "reduce_time_ms": reduce_time_ms,
+                }
             else:
                 actions_out = action_pred[0].numpy()
             payload = {
@@ -1680,6 +1697,8 @@ class Cosmos3DecodingStage(PipelineStage):
                     "num_frames": batch.num_frames,
                 },
             }
+            if candidate_metrics is not None:
+                payload["candidate_metrics"] = candidate_metrics
             if candidate_spec is not None and candidate_spec.return_candidates:
                 payload["candidates"] = action_pred.numpy()
             return OutputBatch(
