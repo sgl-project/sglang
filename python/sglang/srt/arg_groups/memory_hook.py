@@ -9,9 +9,14 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
+    post_capture_kv_sizing_planned,
+    resolved_view,
     resolving_view,
+    use_mla_backend,
 )
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +45,12 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
 
       The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
     """
+    from sglang.srt.arg_groups.cuda_graph_hook import (
+        generate_cpu_graph_batch_sizes,
+        generate_decode_cuda_graph_batch_sizes,
+        generate_prefill_cuda_graph_batch_sizes,
+    )
+
     cfg = resolving_view(server_args)
     # A copy, so an earlier declaration keeps the value it recorded.
     cuda_graph_config = copy.deepcopy(cfg.cuda_graph_config)
@@ -139,10 +150,8 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
     # Set cuda graph batch sizes
     if cfg.device != "cpu":
         if decode_cuda_graph_config.bs is None:
-            decode_cuda_graph_config.bs = (
-                server_args._generate_decode_cuda_graph_batch_sizes(
-                    decode_cuda_graph_config.max_bs
-                )
+            decode_cuda_graph_config.bs = generate_decode_cuda_graph_batch_sizes(
+                server_args, decode_cuda_graph_config.max_bs
             )
         else:
             decode_cuda_graph_config.max_bs = max(decode_cuda_graph_config.bs)
@@ -164,7 +173,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
                 torch_compile_max_bs=cfg.torch_compile_max_bs
                 or decode_cuda_graph_config.max_bs,
             )
-            decode_cuda_graph_config.bs = server_args._generate_cpu_graph_batch_sizes()
+            decode_cuda_graph_config.bs = generate_cpu_graph_batch_sizes(server_args)
 
         assert (
             cfg.torch_compile_max_bs > 0
@@ -175,7 +184,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         # Refer to pr #15927, by default we set the prefill max_bs to the chunked prefill size.
         # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
         # To avoid the performance regression, we set max_bs to 2048 by default.
-        if not server_args.use_mla_backend():
+        if not use_mla_backend(server_args):
             prefill_cuda_graph_config.max_bs = cfg.chunked_prefill_size
         else:
             prefill_cuda_graph_config.max_bs = 2048
@@ -194,10 +203,8 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
             )
 
     if prefill_cuda_graph_config.bs is None:
-        prefill_cuda_graph_config.bs = (
-            server_args._generate_prefill_cuda_graph_batch_sizes(
-                prefill_cuda_graph_config.max_bs
-            )
+        prefill_cuda_graph_config.bs = generate_prefill_cuda_graph_batch_sizes(
+            prefill_cuda_graph_config.max_bs
         )
 
     if cuda_graph_config != cfg.cuda_graph_config:
@@ -208,7 +215,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         )
 
     if cfg.mem_fraction_static is None:
-        if server_args.post_capture_kv_sizing_planned():
+        if post_capture_kv_sizing_planned(server_args):
             # Post-capture sizing measures free memory after graph capture, so
             # skip the graph/activation reserve; keep only the floor + parallel slack.
             reserved_mem = 1536
@@ -230,11 +237,11 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
             reserved_mem += activation_tokens * 1.5
             # Some adjustments for large parallel size
             reserved_mem += cfg.tp_size * cfg.pp_size / 8 * 1024
-            reserved_mem += server_args.reserve_for_graph_mb()
+            reserved_mem += reserve_for_graph_mb(server_args)
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
             # Reserve headroom for DeepEP all-to-all buffers on top of the floor.
-            reserved_mem += server_args.reserve_for_deepep_a2a_mb()
+            reserved_mem += reserve_for_deepep_a2a_mb(server_args)
 
         declare_resolution(
             server_args,
@@ -250,14 +257,14 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         # so we adjust the mem_fraction_static accordingly. The VLM encoder
         # only runs on the prefill stage, so PD decode engines do not need
         # this headroom; prefill engines and normal (non-PD) engines do.
-        model_config = server_args.get_model_config()
+        model_config = model_config_of(server_args)
         if (
             model_config.is_multimodal
             and not cfg.language_only
             and not cfg.language_model_only
             and cfg.disaggregation_mode != "decode"
         ):
-            server_args.adjust_mem_fraction_for_vlm(model_config)
+            adjust_mem_fraction_for_vlm(server_args, model_config)
 
     # If symm mem is enabled and prealloc size is not set, set it to 4GB
     if cfg.enable_symm_mem and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set():
@@ -266,3 +273,103 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
             "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
             "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
         )
+
+
+def reserve_for_graph_mb(server_args: Any) -> float:
+
+    cfg = resolving_view(server_args)
+    decode_cuda_graph_config = cfg.cuda_graph_config.decode
+    prefill_cuda_graph_config = cfg.cuda_graph_config.prefill
+
+    reserved_mem = 0.0
+    if (
+        cfg.disaggregation_mode != "prefill"
+        and decode_cuda_graph_config.backend != Backend.DISABLED
+    ):
+        reserved_mem += decode_cuda_graph_config.max_bs * 2
+
+    if (
+        resolved_view(server_args).enable_dp_attention
+        and cfg.disaggregation_mode != "prefill"
+    ):
+        # DP attention needs more padding for some operations, and much more for large
+        # cuda graph max bs (torch allocator / implementation inefficiencies).
+        reserved_mem += decode_cuda_graph_config.max_bs * cfg.dp_size * 3
+        if decode_cuda_graph_config.max_bs > 300:
+            reserved_mem += decode_cuda_graph_config.max_bs * cfg.dp_size * 1.5
+
+    if (
+        cfg.disaggregation_mode != "decode"
+        and prefill_cuda_graph_config.backend != Backend.DISABLED
+    ):
+        if not use_mla_backend(server_args):
+            # Only non-torch memory is counted; torch memory is reused by cuda graph capture.
+            reserved_mem += len(prefill_cuda_graph_config.bs) * 8
+        else:
+            # MLA backend overhead is much higher than expected with fa3.
+            reserved_mem += 1.5 * 1024
+
+        if (
+            prefill_cuda_graph_config.backend == Backend.BREAKABLE
+            and resolved_view(server_args).moe_a2a_backend == "deepep"
+        ):
+            # Prefill-BCG DeepEP delta (bridge pool + NVL first-touch
+            # during capture); decode-side DeepEP is a baseline cost.
+            reserved_mem += 1 * 1024
+
+    return reserved_mem
+
+
+def reserve_for_deepep_a2a_mb(server_args: Any) -> float:
+    # DeepEP all-to-all buffers captured in the decode graph are real extra
+    # allocations, reserved on top of the floor.
+
+    cfg = resolving_view(server_args)
+    decode_cuda_graph_config = cfg.cuda_graph_config.decode
+    if (
+        cfg.disaggregation_mode != "prefill"
+        and decode_cuda_graph_config.backend != Backend.DISABLED
+        and resolved_view(server_args).moe_a2a_backend == "deepep"
+    ):
+        return 2 * 1024
+    return 0.0
+
+
+def adjust_mem_fraction_for_vlm(server_args: Any, model_config):
+    cfg = resolving_view(server_args)
+    vision_config = getattr(model_config.hf_config, "vision_config", None)
+    if vision_config is None:
+        return
+
+    # roughly reduce the mem_fraction_static base on params of Vit
+    original_server_arg_mem_fraction = cfg.mem_fraction_static
+    # a base mem_fraction_static factor for regular Vit
+    base_mem_fraction_reduction_ratio = 0.95
+
+    vit_num_layers = getattr(vision_config, "num_hidden_layers", 24)
+    vit_hidden_size = getattr(vision_config, "hidden_size", 1024)
+
+    # baseline ViT params (ViT-L/14)
+    baseline_vit_layers = 24
+    baseline_vit_hidden_size = 1024
+
+    # weight params count
+    current_complexity_score = vit_num_layers * (vit_hidden_size**2)
+    baseline_complexity_score = baseline_vit_layers * (baseline_vit_hidden_size**2)
+    complexity_ratio = (
+        current_complexity_score / baseline_complexity_score
+        if baseline_complexity_score > 0
+        else 1.0
+    )
+
+    # every time the complexity grows 100%, adjust final factor for 10%
+    sensitivity_scale = 0.1
+    dynamic_adjustment_factor = 1.0 - sensitivity_scale * (complexity_ratio - 1.0)
+    dynamic_adjustment_factor = max(0.8, min(1.05, dynamic_adjustment_factor))
+
+    final_overall_factor = base_mem_fraction_reduction_ratio * dynamic_adjustment_factor
+    declare_resolution(
+        server_args,
+        "adjust_mem_fraction_for_vlm",
+        mem_fraction_static=original_server_arg_mem_fraction * final_overall_factor,
+    )

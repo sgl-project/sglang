@@ -22,10 +22,12 @@ class TestGptOssSm120(BaseTestGptOss):
         self.run_test(
             model_variant="20b",
             quantization="mxfp4",
+            # high and medium sit below low because max_tokens=4096 truncates
+            # 70% / 34% of their answers, not because the model degrades.
             expected_score_of_reasoning_effort={
-                "low": 0.34,
-                "medium": 0.34,
-                "high": 0.27,
+                "low": 0.48,
+                "medium": 0.39,
+                "high": 0.26,
             },
         )
 

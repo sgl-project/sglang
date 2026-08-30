@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_parallel,
+    get_platform,
     get_spec,
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
@@ -81,8 +82,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import ceil_align, is_cuda, is_sm90_supported, is_xpu
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -91,7 +91,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
-_is_sm120 = is_sm120_supported()
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
@@ -147,7 +146,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if _is_sm120 or _is_xpu:
+    if get_platform().is_sm120 or _is_xpu:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -574,7 +573,7 @@ class DeepseekV4AttnBackend(
             model_runner.server_args, "dsv4_prefill_backend", "auto"
         )
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
-            if not is_sm90_supported():
+            if not get_platform().is_sm90:
                 raise ValueError(
                     "DeepSeek-V4 flashmla_sparse_q8 prefill requires SM90 CUDA GPUs."
                 )
@@ -708,7 +707,7 @@ class DeepseekV4AttnBackend(
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
             force_deep_gemm_metadata=(
-                self.enable_deepseek_v4_fp4_indexer and _is_sm120
+                self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
@@ -1380,7 +1379,7 @@ class DeepseekV4AttnBackend(
             return
 
         assert isinstance(metadata, DSV4Metadata)
-        use_sparse_prefill = not _is_sm120 and (
+        use_sparse_prefill = not get_platform().is_sm120 and (
             num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
             or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
         )
@@ -1761,7 +1760,7 @@ class DeepseekV4AttnBackend(
             # sparse_prefill_fwd does not support SM120.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
-                and not _is_sm120
+                and not get_platform().is_sm120
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -1787,7 +1786,7 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if _is_sm120:
+            if get_platform().is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )
