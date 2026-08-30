@@ -707,7 +707,8 @@ class FlashAttentionBackend(AttentionBackend):
         """Columns past ``seq_lens`` this mode's whole-sequence read covers —
         the translated table's fill must reach ``cache_seqlens``. Takes the
         two fields rather than a ForwardBatch: the captured build slices its
-        batch and has none.
+        batch and has none. Now read by both builds, so eager and replay
+        widen identically.
 
         Zero for the prefix-only shapes: normal decode/extend, the topk>1
         split (drafts read via the expand metadata), draft-extend whose lens
@@ -2797,13 +2798,11 @@ class FlashAttentionBackend(AttentionBackend):
                     # Page table built on-device (self-guards on cache_seqlens);
                     # max_seq_len_k left unset -- unread here (scheduler_metadata
                     # is normal-decode-only).
-                    # Spec is asserted off under the unified pool, so this
-                    # captured view is always the passthrough (req_to_token).
                     self._set_decode_page_metadata(
                         metadata,
                         req_pool_indices,
                         seq_lens,
-                        self.speculative_step_id + 1,
+                        self._spec_read_seq_len_delta(forward_mode, spec_info),
                     )
 
                 else:
@@ -2904,7 +2903,10 @@ class FlashAttentionBackend(AttentionBackend):
                         else self.max_context_len
                     )
                     self._set_decode_page_metadata(
-                        metadata, req_pool_indices, seq_lens, 0
+                        metadata,
+                        req_pool_indices,
+                        seq_lens,
+                        self._spec_read_seq_len_delta(forward_mode, spec_info),
                     )
 
                 self._maybe_update_local_attn_metadata_for_replay(
