@@ -1628,12 +1628,14 @@ class TestDFlashCompactCacheArgs(CustomTestCase):
         self.assertEqual(args.speculative_draft_window_size, 2048)
 
     def test_compact_cache_requires_dflash(self):
-        args = ServerArgs(model_path="dummy")
-        args.speculative_algorithm = "EAGLE"
-        args.speculative_dflash_compact_cache = True
-        args.speculative_draft_window_size = 2048
-        with self.assertRaisesRegex(ValueError, "requires.*DFLASH"):
-            handle_speculative_decoding(args)
+        for algorithm in ("EAGLE", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                args = ServerArgs(model_path="dummy")
+                args.speculative_algorithm = algorithm
+                args.speculative_dflash_compact_cache = True
+                args.speculative_draft_window_size = 2048
+                with self.assertRaisesRegex(ValueError, "requires.*DFLASH"):
+                    handle_speculative_decoding(args)
 
     def test_compact_cache_requires_window(self):
         args = ServerArgs(model_path="dummy")
