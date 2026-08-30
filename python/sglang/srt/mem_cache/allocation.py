@@ -582,6 +582,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     for req in batch.reqs:
         req.kv.kv_allocated_len += token_per_req
+        req.kv.kv_committed_len += token_per_req
 
     return out_cache_loc
 
