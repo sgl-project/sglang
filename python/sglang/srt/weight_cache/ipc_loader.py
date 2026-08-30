@@ -22,6 +22,7 @@ from sglang.srt.model_loader.loader import (
     BaseModelLoader,
     _initialize_model,
 )
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 from .protocol import (
     CacheConfig,
@@ -495,7 +496,6 @@ class IpcModelLoader(BaseModelLoader):
         try:
             # Build engine's config fingerprint
             from sglang.srt.layers.dp_attention import get_moe_cp_size
-            from sglang.srt.runtime_context import get_exec, get_parallel
 
             ps = get_parallel()
             tp_size = ps.tp_size

@@ -69,7 +69,7 @@ def page_aligned_decode_alloc_lens(
         cur = r.kv.kv_allocated_len
         nxt = max(
             cur,
-            (r.kv_committed_len + reserve + page_size - 1) // page_size * page_size,
+            (r.kv.kv_committed_len + reserve + page_size - 1) // page_size * page_size,
         )
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
