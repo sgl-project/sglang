@@ -3653,6 +3653,17 @@ class HybridLinearKVPool(KVCache):
         # virtual->physical mamba-slot translate for the HiCache offload path;
         # identity for a static pool, the allocator's `translate` for the unified pool.
         self._mamba_translate = lambda ids: ids
+        # virtual -> kernel-facing full-KV translate for the MLA entry points
+        # that still receive VIRTUAL ids: `get_mla_kv_buffer`, whose callers
+        # pass ForwardBatch-built read indices (prefix_chunk_kv_indices /
+        # fetch_mha_one_shot_kv_indices), read straight out of req_to_token.
+        # `set_mla_kv_buffer` does NOT translate: its loc is out_cache_loc,
+        # rebound to kernel-facing ids at ForwardBatch construction. The two
+        # doors take different id spaces on purpose -- deleting this because
+        # the setter no longer uses it would double-translate the chunked-
+        # prefix read into v2p[dense_id // ps], off the end of the table.
+        # Identity for a static pool, `translate_kv_loc_for_kernel` for the unified
+        # pool (wired in init_unified_mamba_pools).
         self._full_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:

@@ -348,7 +348,12 @@ class KVIndexTranslator:
         """
         full_stride = self.page_size * self._full_page_multiplier
         offset = kernel_loc % full_stride  # == virtual_token % page_size
-        virt_page = self._full_p2v_table[kernel_loc // full_stride]
+        # An unmapped physical page reads back as -1; clamp before the second
+        # gather rather than letting torch wrap it onto the v2p table's last
+        # element. That element happens to be the -1 trailing sentinel, so the
+        # final clamp would still reach the sink -- but only by way of two
+        # unrelated invariants, and neither is this function's to rely on.
+        virt_page = self._full_p2v_table[kernel_loc // full_stride].clamp_(min=0)
         swa_stride = self.page_size * self._swa_page_multiplier
         return (self._swa_v2p_table[virt_page] * swa_stride + offset).clamp_(min=0)
 
