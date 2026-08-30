@@ -189,6 +189,13 @@ sglang serve --model-path Tongyi-MAI/Z-Image-Turbo
 - `--vae-cpu-offload`: Use CPU offload for VAE.
 - `--pin-cpu-memory`: Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument".
 
+#### 4.2.3 Known LoRA examples
+
+Use `--lora-path` at startup or the [LoRA management API](/docs/sglang-diffusion/api/openai_api#lora-management) to load an adapter. Known Z-Image-Turbo examples include:
+
+- [`tarn59/pixel_art_style_lora_z_image_turbo`](https://huggingface.co/tarn59/pixel_art_style_lora_z_image_turbo)
+- [`wcde/Z-Image-Turbo-DeJPEG-Lora`](https://huggingface.co/wcde/Z-Image-Turbo-DeJPEG-Lora)
+
 ## 5. Benchmark
 
 Test Environment:

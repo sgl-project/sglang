@@ -189,6 +189,13 @@ sglang serve --model-path Qwen/Qwen-Image-Edit-2511
 - `--vae-cpu-offload`: Use CPU offload for VAE.
 - `--pin-cpu-memory`: Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument".
 
+#### 4.2.3 Known LoRA examples
+
+Use `--lora-path` at startup or the [LoRA management API](/docs/sglang-diffusion/api/openai_api#lora-management) to load an adapter. Known Qwen-Image-Edit examples include:
+
+- [`ostris/qwen_image_edit_inpainting`](https://huggingface.co/ostris/qwen_image_edit_inpainting)
+- [`lightx2v/Qwen-Image-Edit-2511-Lightning`](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning)
+
 ## 5. Benchmark
 
 Test Environment:

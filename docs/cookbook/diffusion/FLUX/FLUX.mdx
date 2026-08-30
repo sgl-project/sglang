@@ -193,6 +193,14 @@ sglang serve --model-path black-forest-labs/FLUX.1-dev
 - `--vae-cpu-offload`: Use CPU offload for VAE.
 - `--pin-cpu-memory`: Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument".
 
+#### 4.2.3 Known LoRA examples
+
+Use `--lora-path` at startup or the [LoRA management API](/docs/sglang-diffusion/api/openai_api#lora-management) to load an adapter. Known FLUX examples include:
+
+- [`dvyio/flux-lora-simple-illustration`](https://huggingface.co/dvyio/flux-lora-simple-illustration)
+- [`XLabs-AI/flux-furry-lora`](https://huggingface.co/XLabs-AI/flux-furry-lora)
+- [`XLabs-AI/flux-RealismLora`](https://huggingface.co/XLabs-AI/flux-RealismLora)
+
 ## 5. Benchmark
 
 ### 5.1 Speedup Benchmark

@@ -14,6 +14,10 @@ local directories may also work when their model metadata matches a supported
 pipeline, so the list is intentionally a set of known public entry points rather
 than an exhaustive list of every compatible checkpoint.
 
+Use the linked [Diffusion Cookbook](/cookbook/diffusion/intro) recipes for model
+behavior, launch commands, optimizations, adapters, and hardware-specific
+guidance.
+
 <Tabs>
   <Tab title="Image and 3D">
     <DiffusionModelCatalog category="image" />
@@ -25,132 +29,3 @@ than an exhaustive list of every compatible checkpoint.
     <DiffusionModelCatalog category="world" />
   </Tab>
 </Tabs>
-
-<Note>
-Wan 2.2 TI2V 5B currently has known quality issues when used for image-to-video
-generation.
-</Note>
-
-## Optimization support
-
-Optimization support depends on the pipeline implementation, attention backend,
-checkpoint format, hardware, and launch topology. A missing model-specific
-example does not mean that an optimization is unsupported. Use the feature
-documentation below to check its requirements and fallbacks.
-
-<CardGroup cols={2}>
-  <Card title="Performance overview" href="/docs/sglang-diffusion/performance-optimization">
-    Choose speed, memory, and quality tradeoffs before enabling individual features.
-  </Card>
-  <Card title="Attention backends" href="/docs/sglang-diffusion/attention_backends">
-    Check dense, sparse, and platform-specific backend requirements.
-  </Card>
-  <Card title="Caching acceleration" href="/docs/sglang-diffusion/caching-acceleration">
-    Configure Cache-DiT, TeaCache, and Spectrum where their pipeline hooks apply.
-  </Card>
-  <Card title="Parallelism" href="/docs/sglang-diffusion/parallelism">
-    Configure tensor, sequence, CFG, and encoder parallel execution.
-  </Card>
-  <Card title="Quantization" href="/docs/sglang-diffusion/quantization">
-    Check loader and checkpoint-format support for each component.
-  </Card>
-  <Card title="Deployment modes" href="/docs/sglang-diffusion/deployment_cookbook">
-    Combine residency, offload, parallelism, and performance modes safely.
-  </Card>
-</CardGroup>
-
-## Component overrides
-
-Individual pipeline components can be replaced with `--<component>-path`. The
-value can be a Hugging Face repo ID or a local component directory. Config files
-use the equivalent `component_paths.<component>` mapping.
-
-```bash Command
-sglang generate \
-  --model-path black-forest-labs/FLUX.2-dev \
-  --vae-path black-forest-labs/FLUX.2-small-decoder \
-  --transformer-path /models/flux2/transformer
-```
-
-```yaml Config
-model_path: black-forest-labs/FLUX.2-dev
-component_paths:
-  vae: black-forest-labs/FLUX.2-small-decoder
-  transformer: /models/flux2/transformer
-```
-
-Use the component name from `model_index.json` or the native pipeline's
-registered module name.
-
-<AccordionGroup>
-  <Accordion title="VAE components">
-    Use `vae`, `video_vae`, or `audio_vae`. `vae` is the common image-generation
-    override; the modality-specific names only apply to pipelines that expose
-    separate video or audio VAEs.
-  </Accordion>
-  <Accordion title="Transformer and DiT components">
-    Use `transformer`, `video_dit`, or `audio_dit`. `transformer` is the standard
-    main-denoiser override. For pre-quantized weights, see
-    [Quantization](./quantization).
-  </Accordion>
-  <Accordion title="Text encoders and preprocessors">
-    Supported keys include `text_encoder`, `text_encoder_2`, `tokenizer`,
-    `processor`, and `image_processor`. Replacement encoders often require their
-    matching preprocessing assets.
-  </Accordion>
-  <Accordion title="Auxiliary components">
-    Pipeline-specific keys include `scheduler`, `spatial_upsampler`, `vocoder`,
-    `connectors`, `dual_tower_bridge`, `image_encoder`, and
-    `vision_language_encoder`.
-  </Accordion>
-</AccordionGroup>
-
-Two concrete VAE overrides used by SGLang Diffusion docs or tests are:
-
-- `black-forest-labs/FLUX.2-small-decoder`: decoder-only FLUX.2 VAE
-- `fal/FLUX.2-Tiny-AutoEncoder`: tested compact FLUX.2 VAE
-
-Component overrides are valid only when the selected pipeline exposes that
-component. An override does not enable quantization by itself: the checkpoint
-must contain metadata for a format supported by its loader. See
-[Quantized Component Repositories](./quantization#quantized-component-repositories).
-
-## Verified LoRA examples
-
-These adapters have been manually validated. Unlisted LoRAs are not necessarily
-incompatible; standard Diffusers and SD-style adapters may also work when their
-base architecture matches.
-
-<AccordionGroup>
-  <Accordion title="MiniMax-H3">
-    - `larryvrh/MiniMax-H3-Turbo-Lora`
-    - `lightx2v/Minimax-h3-Turbo`
-    - `fal/MiniMax-H3-Realism-People-LoRA`
-  </Accordion>
-  <Accordion title="Wan 2.2">
-    - `lightx2v/Wan2.2-Distill-Loras`
-    - `Cseti/wan2.2-14B-Arcane_Jinx-lora-v1`
-  </Accordion>
-  <Accordion title="Wan 2.1">
-    - `lightx2v/Wan2.1-Distill-Loras`
-  </Accordion>
-  <Accordion title="Z-Image-Turbo">
-    - `tarn59/pixel_art_style_lora_z_image_turbo`
-    - `wcde/Z-Image-Turbo-DeJPEG-Lora`
-  </Accordion>
-  <Accordion title="Qwen-Image">
-    - `lightx2v/Qwen-Image-Lightning`
-    - `flymy-ai/qwen-image-realism-lora`
-    - `prithivMLmods/Qwen-Image-HeadshotX`
-    - `starsfriday/Qwen-Image-EVA-LoRA`
-  </Accordion>
-  <Accordion title="Qwen-Image-Edit">
-    - `ostris/qwen_image_edit_inpainting`
-    - `lightx2v/Qwen-Image-Edit-2511-Lightning`
-  </Accordion>
-  <Accordion title="FLUX">
-    - `dvyio/flux-lora-simple-illustration`
-    - `XLabs-AI/flux-furry-lora`
-    - `XLabs-AI/flux-RealismLora`
-  </Accordion>
-</AccordionGroup>

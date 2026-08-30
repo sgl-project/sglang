@@ -109,28 +109,10 @@ html.dark table tbody tr:nth-child(even) td,
   line-height: 1.35;
 }
 
-.sgd-model-entry-tasks {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-  margin-top: 8px;
-}
-
-.sgd-model-entry-tasks span {
-  padding: 2px 7px;
-  border: 1px solid rgb(203, 213, 225);
-  border-radius: 999px;
-  background: rgb(248, 250, 252);
-  color: rgb(51, 65, 85);
-  font-size: 0.7rem;
-  font-weight: 650;
-  line-height: 1.4;
-}
-
 .sgd-model-entry-ids {
   display: grid;
   gap: 5px;
-  margin-top: 14px;
+  margin-top: 10px;
 }
 
 .sgd-model-entry .sgd-model-entry-ids code {
@@ -876,13 +858,6 @@ html.dark .sgd-model-entry,
 html.dark .sgd-model-entry-header h3,
 [data-theme="dark"] .sgd-model-entry-header h3 {
   color: rgb(241, 245, 249);
-}
-
-html.dark .sgd-model-entry-tasks span,
-[data-theme="dark"] .sgd-model-entry-tasks span {
-  border-color: rgb(71, 85, 105);
-  background: rgb(30, 41, 59);
-  color: rgb(203, 213, 225);
 }
 
 html.dark .sgd-model-entry .sgd-model-entry-ids code,

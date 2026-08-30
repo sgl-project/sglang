@@ -1,10 +1,10 @@
 // Keep explicit model IDs aligned with multimodal_gen/registry.py. The unit
 // test for this component reports registry entries missing from the catalog.
-const MODEL_CATALOG = {
+export const DiffusionModelCatalog = ({ category }) => {
+  const MODEL_CATALOG = {
   image: [
     {
       name: "FLUX",
-      tasks: ["T2I", "image editing", "multi-reference"],
       modelIds: [
         "black-forest-labs/FLUX.1-dev",
         "black-forest-labs/FLUX.2-dev",
@@ -18,33 +18,35 @@ const MODEL_CATALOG = {
     },
     {
       name: "Qwen-Image",
-      tasks: ["T2I", "image editing", "layered image"],
       modelIds: [
         "Qwen/Qwen-Image",
         "nvidia/Qwen-Image-NVFP4",
         "Qwen/Qwen-Image-2512",
+      ],
+      cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image",
+    },
+    {
+      name: "Qwen-Image Edit / Layered",
+      modelIds: [
         "Qwen/Qwen-Image-Edit",
         "Qwen/Qwen-Image-Edit-2509",
         "Qwen/Qwen-Image-Edit-2511",
         "Qwen/Qwen-Image-Layered",
       ],
-      cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image",
+      cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image-Edit",
     },
     {
       name: "Z-Image",
-      tasks: ["T2I"],
       modelIds: ["Tongyi-MAI/Z-Image", "Tongyi-MAI/Z-Image-Turbo"],
       cookbook: "/cookbook/diffusion/Z-Image/Z-Image-Turbo",
     },
     {
       name: "Krea-2",
-      tasks: ["T2I"],
       modelIds: ["krea/Krea-2"],
       cookbook: "/cookbook/diffusion/Krea/Krea-2",
     },
     {
       name: "LongCat-Image",
-      tasks: ["T2I", "image editing"],
       modelIds: [
         "meituan-longcat/LongCat-Image",
         "meituan-longcat/LongCat-Image-Edit",
@@ -54,7 +56,6 @@ const MODEL_CATALOG = {
     },
     {
       name: "Stable Diffusion 3 / 3.5",
-      tasks: ["T2I"],
       modelIds: [
         "stabilityai/stable-diffusion-3-medium",
         "stabilityai/stable-diffusion-3-medium-diffusers",
@@ -66,7 +67,6 @@ const MODEL_CATALOG = {
     },
     {
       name: "SANA",
-      tasks: ["T2I", "512px / 1024px"],
       modelIds: [
         "Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers",
         "Efficient-Large-Model/SANA1.5_4.8B_1024px_diffusers",
@@ -78,7 +78,6 @@ const MODEL_CATALOG = {
     },
     {
       name: "Ideogram 4",
-      tasks: ["T2I", "typography"],
       modelIds: [
         "ideogram-ai/ideogram-4-fp8",
         "ideogram-ai/ideogram-4-nf4",
@@ -90,13 +89,11 @@ const MODEL_CATALOG = {
     },
     {
       name: "ERNIE-Image",
-      tasks: ["T2I", "prompt enhancement"],
       modelIds: ["baidu/ERNIE-Image", "baidu/ERNIE-Image-Turbo"],
       cookbook: "/cookbook/diffusion/Ernie-Image/Ernie-Image",
     },
     {
       name: "FireRed-Image",
-      tasks: ["image editing"],
       modelIds: [
         "FireRedTeam/FireRed-Image-Edit-1.0",
         "FireRedTeam/FireRed-Image-Edit-1.1",
@@ -104,25 +101,21 @@ const MODEL_CATALOG = {
     },
     {
       name: "JoyAI-Image",
-      tasks: ["image editing"],
       modelIds: ["jdopensource/JoyAI-Image-Edit-Diffusers"],
     },
     {
       name: "GLM-Image",
-      tasks: ["T2I", "AR + diffusion"],
       modelIds: ["zai-org/GLM-Image"],
       note: "Resolved by the GLM-Image family detector.",
     },
     {
       name: "Hunyuan3D 2",
-      tasks: ["text / image to 3D"],
       modelIds: ["tencent/Hunyuan3D-2"],
     },
   ],
   video: [
     {
       name: "Wan 2.1",
-      tasks: ["T2V", "I2V", "inpainting"],
       modelIds: [
         "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         "Wan-AI/Wan2.1-T2V-14B-Diffusers",
@@ -134,7 +127,6 @@ const MODEL_CATALOG = {
     },
     {
       name: "Wan 2.2",
-      tasks: ["T2V", "I2V", "TI2V"],
       modelIds: [
         "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
         "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
@@ -145,7 +137,6 @@ const MODEL_CATALOG = {
     },
     {
       name: "FastWan / TurboWan",
-      tasks: ["T2V", "I2V", "TI2V", "distilled"],
       modelIds: [
         "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
         "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
@@ -158,18 +149,17 @@ const MODEL_CATALOG = {
       cookbook: "/cookbook/diffusion/Wan/Wan2.2",
     },
     {
-      name: "LTX",
-      tasks: ["T2V", "I2V", "audio", "one / two-stage"],
-      modelIds: [
-        "Lightricks/LTX-2",
-        "Lightricks/LTX-2.3",
-        "Lightricks/LTX-2.5-Diffusers",
-      ],
+      name: "LTX 2 / 2.3",
+      modelIds: ["Lightricks/LTX-2", "Lightricks/LTX-2.3"],
       cookbook: "/cookbook/diffusion/LTX/LTX2 & LTX2.3",
     },
     {
+      name: "LTX 2.5",
+      modelIds: ["Lightricks/LTX-2.5-Diffusers"],
+      cookbook: "/cookbook/diffusion/LTX/LTX2.5",
+    },
+    {
       name: "HunyuanVideo",
-      tasks: ["T2V"],
       modelIds: [
         "hunyuanvideo-community/HunyuanVideo",
         "FastVideo/FastHunyuan-diffusers",
@@ -177,7 +167,6 @@ const MODEL_CATALOG = {
     },
     {
       name: "LongLive 2.0",
-      tasks: ["T2V", "I2V", "long video"],
       modelIds: [
         "Rabinovich/LongLive-2.0-5B-Diffusers",
         "Efficient-Large-Model/LongLive-2.0-5B",
@@ -186,39 +175,33 @@ const MODEL_CATALOG = {
     },
     {
       name: "MiniMax-H3",
-      tasks: ["T2VA", "FL2VA", "Ref2VA"],
       modelIds: ["MiniMaxAI/MiniMax-H3", "MiniMax/MiniMax-H3"],
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3",
     },
     {
       name: "MOVA",
-      tasks: ["video + audio", "360p / 720p"],
       modelIds: ["OpenMOSS-Team/MOVA-360p", "OpenMOSS-Team/MOVA-720p"],
       note: "Resolved by the MOVA resolution detector.",
       cookbook: "/cookbook/diffusion/MOVA/MOVA",
     },
     {
       name: "JoyAI-Echo",
-      tasks: ["video + audio", "multi-shot"],
       modelIds: ["jdopensource/JoyAI-Echo"],
       cookbook: "/cookbook/diffusion/JoyEcho/JoyEcho",
     },
     {
       name: "SANA-Video",
-      tasks: ["T2V", "480p"],
       modelIds: ["Efficient-Large-Model/SANA-Video_2B_480p_diffusers"],
       cookbook: "/cookbook/diffusion/SANA-Video/SANA-Video",
     },
     {
       name: "LingBot Video MoE",
-      tasks: ["T2V", "30B-A3B"],
       modelIds: ["robbyant/lingbot-video-moe-30b-a3b"],
       note: "Resolved by the LingBot Video MoE family detector.",
       cookbook: "/cookbook/diffusion/LingBot-Video/LingBot-Video-MoE",
     },
     {
       name: "Helios",
-      tasks: ["T2V", "720p"],
       modelIds: [
         "BestWishYsh/Helios-Base",
         "BestWishYsh/Helios-Mid",
@@ -229,7 +212,6 @@ const MODEL_CATALOG = {
   world: [
     {
       name: "Cosmos 3",
-      tasks: ["T2I", "T2V", "I2V", "robot policy"],
       modelIds: [
         "nvidia/Cosmos3-Nano",
         "nvidia/Cosmos3-Nano-Policy-DROID",
@@ -242,17 +224,19 @@ const MODEL_CATALOG = {
     },
     {
       name: "LingBotWorld",
-      tasks: ["realtime", "camera control", "causal state"],
       modelIds: [
         "IPostYellow/lingbot-world-fast-diffusers",
         "robbyant/lingbot-world-fast-diffusers",
-        "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
       ],
+      cookbook: "/cookbook/diffusion/LingBot-World/LingBot-World",
+    },
+    {
+      name: "LingBotWorld 2.0",
+      modelIds: ["robbyant/lingbot-world-v2-14b-causal-fast-diffusers"],
       cookbook: "/cookbook/diffusion/LingBot-World/LingBot-World-2.0",
     },
     {
       name: "SANA-WM",
-      tasks: ["world model", "bidirectional", "streaming"],
       modelIds: [
         "Efficient-Large-Model/SANA-WM_bidirectional",
         "Efficient-Large-Model/SANA-WM_streaming",
@@ -261,14 +245,12 @@ const MODEL_CATALOG = {
     },
     {
       name: "Pi0.5",
-      tasks: ["robot action", "OpenPI / LeRobot"],
       modelIds: ["lerobot/pi05_base", "lerobot/pi05_libero_base"],
       cookbook: "/cookbook/vla/OpenPI/Pi0.5",
     },
   ],
-};
+  };
 
-export const DiffusionModelCatalog = ({ category }) => {
   const models = MODEL_CATALOG[category] || [];
 
   return (
@@ -277,11 +259,6 @@ export const DiffusionModelCatalog = ({ category }) => {
         <article key={model.name} className="sgd-model-entry">
           <header className="sgd-model-entry-header">
             <h3>{model.name}</h3>
-            <div className="sgd-model-entry-tasks">
-              {model.tasks.map((task) => (
-                <span key={task}>{task}</span>
-              ))}
-            </div>
           </header>
           <div className="sgd-model-entry-ids">
             {model.modelIds.map((modelId) => (
