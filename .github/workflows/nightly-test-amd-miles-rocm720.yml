@@ -28,8 +28,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # VERIFICATION BRANCH: only the 8-GPU suite hosts the checkpoint test.
-          - suite: nightly-stage-c-8-gpu-mi350
+          # VERIFICATION BRANCH. The strategy probe only needs the ROCm image, so it
+          # runs on the smaller pool and reports long before the 8-GPU pool frees up;
+          # the checkpoint test the nightly fails on needs all 8.
+          - mode: probe
+            runner: linux-mi35x-gpu-2
+          - mode: e2e
             runner: linux-mi35x-gpu-8
     runs-on: ${{ matrix.runner }}
     steps:
@@ -122,6 +126,7 @@ jobs:
             python3 /sglang-checkout/scripts/ci/amd/verify_async_ckpt_strategy.py mcore
 
       - name: Run the checkpoint test that the nightly fails on
+        if: matrix.mode == 'e2e'
         timeout-minutes: 90
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles \
