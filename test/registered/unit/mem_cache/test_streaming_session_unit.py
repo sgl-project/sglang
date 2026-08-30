@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -67,7 +67,7 @@ class _FakeReq:
             abort_req=lambda: None,
             _inflight=False,
         )
-        self.kv = SimpleNamespace(
+        self.kv = ReqKvInfo(
             req_pool_idx=req_pool_idx,
             kv_committed_len=committed,
             kv_allocated_len=allocated,
@@ -112,7 +112,7 @@ def test_preabort_detaches_session_and_preserves_slot():
     )
     tree_cache = StreamingSession(inner)
     tree_cache.slots["session-a"] = SessionSlot(
-        kv=SimpleNamespace(
+        kv=ReqKvInfo(
             req_pool_idx=0,
             kv_committed_len=48,
             kv_allocated_len=48,
@@ -179,7 +179,7 @@ def test_nth_mid_abort_nukes_session_slot():
 
     # Session already has a slot from a previous turn.
     tree_cache.slots["session-a"] = SessionSlot(
-        kv=SimpleNamespace(
+        kv=ReqKvInfo(
             req_pool_idx=0,
             kv_committed_len=50,
             kv_allocated_len=50,
@@ -220,7 +220,7 @@ def test_release_session_threads_mamba_skip_ids():
 
     lock_node = SimpleNamespace(id=42)
     tree_cache.slots["session-a"] = SessionSlot(
-        kv=SimpleNamespace(
+        kv=ReqKvInfo(
             req_pool_idx=0,
             kv_committed_len=50,
             kv_allocated_len=50,

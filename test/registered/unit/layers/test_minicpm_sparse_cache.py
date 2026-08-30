@@ -7,6 +7,7 @@ import torch
 from sglang.srt.layers.attention.minicpm.cache import (
     attach_compressed_cache,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
@@ -224,9 +225,7 @@ def test_streaming_session_release_frees_compressed_slots():
         )
     )
     session.slots["session-a"] = SessionSlot(
-        kv=SimpleNamespace(
-            req_pool_idx=req_pool_idx, kv_allocated_len=16, cache_protected_len=0
-        ),
+        kv=ReqKvInfo(req_pool_idx=req_pool_idx, kv_allocated_len=16),
     )
 
     session.release_session("session-a")

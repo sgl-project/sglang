@@ -723,7 +723,7 @@ class SchedulerPPMixin:
                 latencies.append(latency_ms)
 
                 # Release KV and Mamba cache
-                if req.is_holding_kv:
+                if req.kv.is_held:
                     kv_indices = self.req_to_token_pool.req_to_token[
                         req.kv.req_pool_idx, : req.extend_range.end
                     ]

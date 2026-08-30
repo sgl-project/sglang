@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -46,24 +47,20 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
 class _FakeReq:
     def __init__(self, rid, rpi, committed, allocated):
         self.rid = rid
-        self.kv = SimpleNamespace(
+        self.kv = ReqKvInfo(
             req_pool_idx=rpi,
             kv_committed_len=committed,
             kv_allocated_len=allocated,
-            swa_evicted_seqlen=0,
         )
-        self.is_holding_kv = True
 
 
 class _FakeSlot:
     def __init__(self, rpi, committed, allocated):
-        self.kv = SimpleNamespace(
+        self.kv = ReqKvInfo(
             req_pool_idx=rpi,
             kv_committed_len=committed,
             kv_allocated_len=allocated,
-            swa_evicted_seqlen=0,
         )
-        self.is_holding_kv = True
 
 
 class TestKVPageInvariants(CustomTestCase):

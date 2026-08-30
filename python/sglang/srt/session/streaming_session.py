@@ -62,11 +62,6 @@ class SessionSlot:
     mamba_last_track_seqlen: Any = None
     mamba_branching_seqlen: Any = None
 
-    @property
-    def is_holding_kv(self) -> bool:
-        """Whether this slot currently holds KV pool resources."""
-        return self.kv.req_pool_idx is not None
-
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
         if is_first:
@@ -184,7 +179,7 @@ class StreamingSession(BasePrefixCache):
         return session_id in self.slots
 
     def any_holding_kv(self) -> bool:
-        return any(s.is_holding_kv for s in self.slots.values())
+        return any(s.kv.is_held for s in self.slots.values())
 
     # -- Try-handle entries for composition (see class docstring) --
 
@@ -212,7 +207,7 @@ class StreamingSession(BasePrefixCache):
         if not _is_streaming(req):
             return None
         slot = self.slots.get(req.session.session_id)
-        if slot is None or not slot.is_holding_kv:
+        if slot is None or not slot.kv.is_held:
             return None
         if req.to_finish is not None:
             req.session.abort_req()
@@ -434,9 +429,7 @@ class StreamingSession(BasePrefixCache):
         protected_len = slot.kv.cache_protected_len
         lock_node = slot.last_node
         tokens_freed = (
-            max(0, slot.kv.kv_allocated_len - protected_len)
-            if slot.is_holding_kv
-            else 0
+            max(0, slot.kv.kv_allocated_len - protected_len) if slot.kv.is_held else 0
         )
         logger.info(
             "Session KV released: %s (%d tokens freed)", session_id, tokens_freed
@@ -451,7 +444,7 @@ class StreamingSession(BasePrefixCache):
                 ),
             )
 
-        if slot.is_holding_kv:
+        if slot.kv.is_held:
             start = protected_len
             end = slot.kv.kv_allocated_len
             if start < end:
@@ -479,7 +472,7 @@ class StreamingSession(BasePrefixCache):
                 active_pool_idxs is not None
                 and slot.kv.req_pool_idx in active_pool_idxs
             )
-            if slot.is_holding_kv and not in_batch:
+            if slot.kv.is_held and not in_batch:
                 allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
                 total += allocated - slot.kv.cache_protected_len
         return total
@@ -496,7 +489,7 @@ class StreamingSession(BasePrefixCache):
                 active_pool_idxs is not None
                 and slot.kv.req_pool_idx in active_pool_idxs
             )
-            if slot.is_holding_kv and not in_batch:
+            if slot.kv.is_held and not in_batch:
                 allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
                 total += allocated - max(
                     slot.kv.cache_protected_len, slot.kv.swa_evicted_seqlen
@@ -510,7 +503,7 @@ class StreamingSession(BasePrefixCache):
             in_batch = (
                 active_pool_idxs is not None and s.kv.req_pool_idx in active_pool_idxs
             )
-            return s.is_holding_kv and not in_batch
+            return s.kv.is_held and not in_batch
 
         return sum(_owned(s) for s in self.slots.values())
 
