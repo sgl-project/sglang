@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""KVIndexTranslator — the read-path id-space choke point.
+"""KVIndexTranslator — the read-path id translator.
 
 Covers, CPU-only (the builder's pure-torch reference path; GPU parity of the
 Triton kernel is a later CUDA CI pin):
@@ -19,7 +19,7 @@ Triton kernel is a later CUDA CI pin):
     req_pool_indices objects — zero tensor ops, no copies (the property that
     makes backend re-pointing byte-identical for every non-unified server);
   - static SWA pools keep their legacy full->swa mapping on the view;
-  - the canonical table matches the hand formula
+  - the read table matches the hand formula
         entry[b, c] = clamp(v2p[req_to_token[req[b], c*ps] // ps] * mult, 0)
     over the REAL SWA composite's tables (full AND swa, ps in {1, 4},
     multiplier in {1, 2L}), with the swa table built from VIRTUAL ids;
@@ -118,7 +118,7 @@ def _make_source(allocator, req_to_token, ps):
 
 
 def _reference_table(req_to_token, req_pool_indices, seq_lens, v2p, mult, ps, width):
-    """Independent python derivation of the canonical formula."""
+    """Independent python derivation of the read-table formula."""
     bs = req_pool_indices.numel()
     out = torch.zeros((bs, width), dtype=torch.int32)
     for b in range(bs):
@@ -177,10 +177,10 @@ def _alloc_and_fill(allocator, ps, lens):
     )
 
 
-class TestCanonicalBuild(unittest.TestCase):
+class TestReadTableBuild(unittest.TestCase):
 
-    def test_canonical_matches_reference_dense_and_strided(self):
-        """The load-bearing formula pin: full AND swa canonical tables equal
+    def test_read_table_matches_reference_dense_and_strided(self):
+        """The load-bearing formula pin: full AND swa read tables equal
         the independent per-element derivation, across page sizes and both
         multiplier regimes (strided=1, dense=2L). The swa table agreeing with
         a formula over VIRTUAL ids is also the never-chained-through-
@@ -224,11 +224,11 @@ class TestCanonicalBuild(unittest.TestCase):
                 )
                 self.assertTrue(
                     torch.equal(view.ids, want_full),
-                    f"full canonical off-formula (ps={ps}, mult={full_mult})",
+                    f"full read table off-formula (ps={ps}, mult={full_mult})",
                 )
                 self.assertTrue(
                     torch.equal(view.sliding_window_ids, want_swa),
-                    f"swa canonical off-formula (ps={ps}, mult={swa_mult})",
+                    f"swa read table off-formula (ps={ps}, mult={swa_mult})",
                 )
 
     def test_sink_routing(self):
@@ -259,11 +259,11 @@ class TestCanonicalBuild(unittest.TestCase):
 
 class TestBuildInto(unittest.TestCase):
     """fill_read_table fills a backend-owned padded block table's live prefix with
-    FULL-side canonical entries — the trtllm_mla / flashmla consumption route
-    (their rows ARE the canonical rows)."""
+    FULL-side read-table entries — the trtllm_mla / flashmla consumption route
+    (their rows ARE the read table's rows)."""
 
     def test_prefix_filled_tail_sentinel_preserved_width_capped(self):
-        """Three contracts in one batch: entries equal the canonical formula,
+        """Three contracts in one batch: entries equal the read-table formula,
         lanes past each row's live pages keep the backend's -1 sentinel
         (prefix-only — a tail write scatters the trtllm sentinel contract),
         and a table padded WIDER than the req_to_token page span (trtllm's
@@ -389,7 +389,7 @@ class TestPoolOwnership(unittest.TestCase):
 
     def test_disabled_source_is_strict_passthrough(self):
         """Consequence of the guard: such a runner must see RAW virtual ids on
-        the read rail — they index its own pool directly. A translate here is
+        the read table — they index its own pool directly. A translate here is
         the out-of-bounds bug the ownership identity exists to prevent."""
         alloc = _build_composite(ps=1)
         req_to_token = torch.arange(16, dtype=torch.int32, device=_DEV).view(2, 8)
@@ -405,7 +405,7 @@ class TestPoolOwnership(unittest.TestCase):
             req_pool_indices=rows,
             seq_lens=torch.tensor([3, 2], dtype=torch.int32, device=_DEV),
         )
-        # Read rail: the EXACT objects a static-pool backend reads today.
+        # Read table: the EXACT objects a static-pool backend reads today.
         self.assertIs(view.ids, req_to_token)
         self.assertIs(view.row_ids, rows)
         self.assertFalse(view.is_translated)

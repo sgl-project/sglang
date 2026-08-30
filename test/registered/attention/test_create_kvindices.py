@@ -77,7 +77,7 @@ class TestCreateKvIndices(CustomTestCase):
 
     def _run_page_table_test(self, batch, ps, with_window_start):
         """ENTRY_PAGE_SIZE > 1: the source is a PAGE-granular table (the unified
-        pool's canonical); the kernel must reconstruct token ids by the affine
+        pool's read table); the kernel must reconstruct token ids by the affine
         rule token = entry * ps + pos % ps — including the kv_start_idx
         (sliding-window) offset path, whose pos is an absolute token position."""
         max_batch, max_pages = 64, 128
