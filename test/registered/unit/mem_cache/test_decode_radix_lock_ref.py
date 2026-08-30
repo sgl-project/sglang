@@ -76,14 +76,15 @@ class MockReq:
         )
         self.output_ids = array("q", [fill_ids[-1]] if len(fill_ids) > 1 else [])
         self.req_pool_idx = req_pool_idx
-        self.cache_protected_len = cache_protected_len
         self.last_node = last_node
         self.extra_key = None
         self.cache_salt = None
         self.prefix_indices = torch.empty(0, dtype=torch.int64)
         self.priority = 0
         self.kv_committed_len = len(fill_ids)
-        self.kv = SimpleNamespace(kv_allocated_len=len(fill_ids))
+        self.kv = SimpleNamespace(
+            kv_allocated_len=len(fill_ids), cache_protected_len=cache_protected_len
+        )
 
     def get_fill_ids(self):
         return self.full_untruncated_fill_ids[: self.extend_range.end]
@@ -368,7 +369,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.output_ids = [99]
         req.last_node = object()
         req.finished_reason = None
-        req.cache_protected_len = 0
+        req.kv.cache_protected_len = 0
         req.swa_uuid_for_lock = 123
         req.swa_prefix_lock_released = False
         req.pd_rebootstrap_in_progress = False
