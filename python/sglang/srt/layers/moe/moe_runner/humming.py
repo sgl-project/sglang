@@ -22,7 +22,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerCore,
     RunnerInput,
     RunnerOutput,
-    register_fused_func,
     register_post_permute,
     register_pre_permute,
 )
@@ -99,7 +98,23 @@ class HummingMoeQuantInfo(MoeQuantInfo):
     layer: torch.nn.Module
 
 
-@register_custom_op()
+def _humming_moe_runner_core_run_fake(
+    moe_runner_id: int,
+    gemm_type: str,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_num_tokens: torch.Tensor | None = None,
+    expected_m: int | None = None,
+    hidden_states_scale: torch.Tensor | None = None,
+    apply_routed_scaling_factor: bool = True,
+) -> torch.Tensor:
+    runner = HummingRunnerCore.runner_cores[moe_runner_id]
+    output_dtype = runner.config.params_dtype or hidden_states.dtype
+    return torch.empty_like(hidden_states, dtype=output_dtype)
+
+
+@register_custom_op(fake_impl=_humming_moe_runner_core_run_fake)
 def humming_moe_runner_core_run(
     moe_runner_id: int,
     gemm_type: str,
@@ -152,7 +167,33 @@ class HummingRunnerCore(MoeRunnerCore):
         self.num_experts = config.num_local_experts
         self.global_num_experts = config.num_experts
         self.activation = config.activation
+        self.gemm1_alpha = config.gemm1_alpha
+        self.gemm1_clamp_limit = config.gemm1_clamp_limit
         self.swiglu_limit = config.swiglu_limit
+        assert not (
+            self.gemm1_clamp_limit is not None and self.swiglu_limit is not None
+        ), "gemm1_clamp_limit and swiglu_limit use different SwiGLU clamp semantics"
+        if self.activation == "situ":
+            if not config.is_gated:
+                raise ValueError("Humming SiTU requires a gated MoE.")
+            if self.gemm1_alpha is None or self.gemm1_clamp_limit is None:
+                raise ValueError(
+                    "Humming SiTU requires gemm1_alpha (beta) and "
+                    "gemm1_clamp_limit (linear_beta)."
+                )
+            if (
+                not math.isfinite(self.gemm1_alpha)
+                or self.gemm1_alpha <= 0
+                or not math.isfinite(self.gemm1_clamp_limit)
+                or self.gemm1_clamp_limit <= 0
+            ):
+                raise ValueError(
+                    "Humming SiTU beta and linear_beta must be finite and positive."
+                )
+            if config.gate_up_interleaved:
+                raise ValueError(
+                    "Humming SiTU requires a non-interleaved [gate; up] layout."
+                )
         self.layer: torch.nn.Module | None = None
         self.humming_gemm_configs = {}
         HummingRunnerCore.runner_cores[id(self)] = self
@@ -402,6 +443,15 @@ class HummingRunnerCore(MoeRunnerCore):
             from sgl_kernel import gelu_and_mul
 
             gelu_and_mul(inputs, outputs)
+        elif self.activation == "situ":
+            from sglang.kernels.ops.kimi_k3.activation import situ_and_mul
+
+            situ_and_mul(
+                inputs,
+                outputs,
+                beta=self.gemm1_alpha,
+                linear_beta=self.gemm1_clamp_limit,
+            )
         else:
             raise ValueError(f"Unsupported activation: {self.activation}")
 
@@ -419,17 +469,18 @@ class HummingRunnerCore(MoeRunnerCore):
         use_fused_masked_act_quant = (
             w2_meta.a_dtype == dtypes.float8e4m3
             and w2_meta.input_scale_group_size == 128
-            and self.activation == "silu"
+            and self.activation in ("silu", "situ")
             and gate_up.dtype == torch.bfloat16
             and intermediate % 256 == 0
             and num_threads <= 1024
             and num_experts <= min(256, num_threads)
+            and self.config.top_k is not None
+            and self.config.top_k > 0
         )
         if use_fused_masked_act_quant:
-            from sglang.kernels.ops.attention.dsv4.moe import (
-                silu_and_mul_masked_post_quant,
-            )
-
+            # Keep these outputs independent from the alternating workspaces:
+            # quanted_down_input aliases gate_up_output and cannot be written
+            # while the fused activation kernel is still reading gate_up.
             down_input = torch.empty(
                 (num_experts, max_tokens, intermediate),
                 dtype=torch.float8_e4m3fn,
@@ -440,16 +491,39 @@ class HummingRunnerCore(MoeRunnerCore):
                 dtype=torch.float32,
                 device=gate_up.device,
             )
-            silu_and_mul_masked_post_quant(
-                gate_up,
-                down_input,
-                down_scale,
-                128,
-                expert_num_tokens,
-                scale_ue8m0=False,
-                topk=self.config.top_k,
-                swiglu_limit=self.swiglu_limit,
-            )
+            if self.activation == "situ":
+                from sglang.kernels.ops.kimi_k3 import (
+                    situ_and_mul_masked_post_quant,
+                )
+
+                situ_and_mul_masked_post_quant(
+                    input=gate_up,
+                    output=down_input,
+                    output_scale=down_scale,
+                    quant_group_size=128,
+                    masked_m=expert_num_tokens,
+                    beta=self.gemm1_alpha,
+                    linear_beta=self.gemm1_clamp_limit,
+                    scale_ue8m0=False,
+                    topk=self.config.top_k,
+                    transposed=False,
+                    swizzle=False,
+                )
+            else:
+                from sglang.kernels.ops.attention.dsv4.moe import (
+                    silu_and_mul_masked_post_quant,
+                )
+
+                silu_and_mul_masked_post_quant(
+                    gate_up,
+                    down_input,
+                    down_scale,
+                    128,
+                    expert_num_tokens,
+                    scale_ue8m0=False,
+                    topk=self.config.top_k,
+                    swiglu_limit=self.swiglu_limit,
+                )
             return down_input.flatten(0, 1), down_scale.flatten(0, 1)
 
         self.apply_activation(
@@ -775,32 +849,6 @@ class HummingRunnerCore(MoeRunnerCore):
         )
 
         return buffers["down_output"]
-
-
-@register_fused_func("none", "humming")
-def fused_experts_none_to_humming(
-    dispatch_output: StandardDispatchOutput,
-    quant_info: HummingMoeQuantInfo,
-    runner_config: MoeRunnerConfig,
-) -> StandardCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-
-    hidden_states = dispatch_output.hidden_states
-    topk_output = dispatch_output.topk_output
-    topk_ids = topk_output.topk_ids
-    topk_weights = topk_output.topk_weights
-
-    runner_input = HummingRunnerInput(
-        hidden_states=hidden_states,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        gemm_type=get_standard_humming_moe_gemm_type(),
-    )
-
-    runner_core = HummingRunnerCore(runner_config)
-    runner_output = runner_core.run(runner_input, quant_info, {})
-
-    return StandardCombineInput(hidden_states=runner_output.hidden_states)
 
 
 def _validate_deepep_dispatch_input(
