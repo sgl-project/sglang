@@ -58,6 +58,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
+    apply_nvfp4_gemm_swiglu_quant,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -235,7 +237,33 @@ class Flux2FeedForward(nn.Module):
             prefix=f"{prefix}.linear_out" if prefix else "linear_out",
         )
 
+        self._enable_nvfp4_swiglu_quant = False
+        capability = current_platform.get_device_capability()
+        if (
+            capability is not None
+            and capability.major == 10
+            and isinstance(self.linear_in.quant_method, ModelOptFp4LinearMethod)
+            and isinstance(self.linear_out.quant_method, ModelOptFp4LinearMethod)
+            and self.linear_in.output_size_per_partition % 128 == 0
+            and self.linear_in.input_size_per_partition % 16 == 0
+            and self.linear_in.bias is None
+            and self.linear_out.bias is None
+        ):
+            # These flags are consumed after checkpoint loading.  Keep the
+            # regular weight layout as well so graph/compile fallback remains
+            # available.
+            self.linear_in._interleave_for_swiglu_fusion = True
+            self.linear_out._accepts_prequantized_fp4 = True
+            self._enable_nvfp4_swiglu_quant = True
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            self._enable_nvfp4_swiglu_quant
+            and getattr(self.linear_in, "_swiglu_fusion_ready", False)
+            and not torch.compiler.is_compiling()
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            return apply_nvfp4_gemm_swiglu_quant(self.linear_in, self.linear_out, x)
         x, _ = self.linear_in(x)
         x = self.act_fn(x)
         x, _ = self.linear_out(x)
