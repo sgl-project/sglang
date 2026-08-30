@@ -34,6 +34,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import sglang
+from sglang.srt.arg_groups.overrides import attention_backends_of, resolved_view
 
 _PACKAGE_ROOT = Path(next(iter(sglang.__path__))) / "srt"
 
@@ -181,7 +182,7 @@ class TestSplitBackendsReachTheDecisions(CustomTestCase):
             ("decode_attention_backend", "flashinfer"),
         ):
             object.__setattr__(args, name, value)
-        self.assertIn("flashinfer", args.get_attention_backends())
+        self.assertIn("flashinfer", attention_backends_of(resolved_view(args)))
 
     def test_support_triton_is_the_regression_being_guarded(self):
         from sglang.srt.utils.common import support_triton
