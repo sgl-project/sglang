@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(
     est_time=189,
     stage="base-c",
-    runner_config="deepep-4-gpu-h100",
+    runner_config="4-gpu-h100",
     disabled="Temporarily disabled until the next Mooncake release includes the PyTorch 2.13 collective forwarding fix.",
 )
 

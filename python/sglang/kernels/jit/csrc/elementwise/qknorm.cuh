@@ -15,7 +15,7 @@
 #include <cuda_fp16.h>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 struct QKNormParams {
   void* __restrict__ q;
@@ -254,4 +254,4 @@ using QKNormKernel = std::conditional_t<
     QKNormKernelCTA<kHeadDim, kUsePDL, DType>,
     QKNormKernelWarp<kHeadDim, kUsePDL, DType>>;
 
-}  // namespace
+}  // namespace sglang

@@ -31,7 +31,7 @@
 
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 using namespace device;
 
@@ -181,4 +181,4 @@ struct DSV3RouterGemmKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING
+from typing import NamedTuple
 
 import torch
 
@@ -12,15 +13,20 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.runtime_context import get_exec, get_flags, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_forward,
+    get_model,
+    get_parallel,
+    get_server_args,
+    get_spec,
+)
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
 
-if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
-
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils.common import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +42,7 @@ class MoeA2ABackend(Enum):
     ASCEND_TP = "ascend_tp"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
+    DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
     CUSTOMIZED = "customized"
 
@@ -75,6 +82,9 @@ class MoeA2ABackend(Enum):
     def is_megamoe(self):
         return self == MoeA2ABackend.MEGAMOE
 
+    def is_deepep_v2(self):
+        return self == MoeA2ABackend.DEEPEP_V2
+
     def is_pplx(self):
         return self == MoeA2ABackend.PPLX
 
@@ -91,7 +101,73 @@ class MoeA2ABackend(Enum):
         )
 
 
-class MoeRunnerBackend(Enum):
+class _MoeRunnerBackendPredicates:
+    value: str
+
+    def is_auto(self):
+        return self.value == MoeRunnerBackend.AUTO.value
+
+    def is_hpc_ops(self):
+        return self.value == MoeRunnerBackend.HPC_OPS.value
+
+    def is_deep_gemm(self):
+        return self.value == MoeRunnerBackend.DEEP_GEMM.value
+
+    def is_triton(self):
+        return self.value == MoeRunnerBackend.TRITON.value
+
+    def is_ascend(self):
+        return self.value == MoeRunnerBackend.ASCEND.value
+
+    def is_triton_kernels(self):
+        return self.value == MoeRunnerBackend.TRITON_KERNELS.value
+
+    def is_flashinfer_trtllm(self):
+        # experimental_sgl_trtllm shares the TRT-LLM FP8 kernels + layout, so it inherits
+        # trtllm weight-prep here; divergent sites check is_experimental_sgl_trtllm() first.
+        return self.value in (
+            MoeRunnerBackend.FLASHINFER_TRTLLM.value,
+            MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM.value,
+        )
+
+    def is_experimental_sgl_trtllm(self):
+        return self.value == MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM.value
+
+    def is_flashinfer_trtllm_routed(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED.value
+
+    def is_flashinfer_cutlass(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_CUTLASS.value
+
+    def is_flashinfer_cutedsl(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_CUTEDSL.value
+
+    def is_flashinfer_mxfp4(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_MXFP4.value
+
+    def is_cutlass(self):
+        return self.value == MoeRunnerBackend.CUTLASS.value
+
+    def is_marlin(self):
+        # experimental_sgl_marlin shares the marlin weight repack, quant-method
+        # selection, and base fused path; divergent sites (the LoRA MoE dispatch)
+        # check is_experimental_sgl_marlin() first.
+        return self.value in (
+            MoeRunnerBackend.MARLIN.value,
+            MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN.value,
+        )
+
+    def is_experimental_sgl_marlin(self):
+        return self.value == MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN.value
+
+    def is_humming(self):
+        return self.value == MoeRunnerBackend.HUMMING.value
+
+    def is_aiter(self):
+        return self.value == MoeRunnerBackend.AITER.value
+
+
+class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
 
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
@@ -110,68 +186,58 @@ class MoeRunnerBackend(Enum):
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
+    INTEL_XPU = "intel_xpu"
 
-    def is_auto(self):
-        return self == MoeRunnerBackend.AUTO
 
-    def is_hpc_ops(self):
-        return self == MoeRunnerBackend.HPC_OPS
+@dataclass(frozen=True)
+class RegisteredMoeRunnerBackend(_MoeRunnerBackendPredicates):
+    """Identifier for an MoE runner backend supplied by an extension."""
 
-    def is_deep_gemm(self):
-        return self == MoeRunnerBackend.DEEP_GEMM
+    value: str
 
-    def is_triton(self):
-        return self == MoeRunnerBackend.TRITON
 
-    def is_ascend(self):
-        return self == MoeRunnerBackend.ASCEND
+MoeRunnerBackendLike = MoeRunnerBackend | RegisteredMoeRunnerBackend
+_REGISTERED_MOE_RUNNER_BACKEND_NAMES: set[str] = set()
 
-    def is_triton_kernels(self):
-        return self == MoeRunnerBackend.TRITON_KERNELS
 
-    def is_flashinfer_trtllm(self):
-        # experimental_sgl_trtllm shares the TRT-LLM FP8 kernels + layout, so it inherits
-        # trtllm weight-prep here; divergent sites check is_experimental_sgl_trtllm() first.
-        return self in (
-            MoeRunnerBackend.FLASHINFER_TRTLLM,
-            MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM,
-        )
+def register_moe_runner_backend_name(name: str) -> None:
+    """Register a backend name supplied by an out-of-tree extension."""
 
-    def is_experimental_sgl_trtllm(self):
-        return self == MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM
+    if not name:
+        raise ValueError("MoE runner backend name must not be empty")
+    try:
+        MoeRunnerBackend(name)
+    except ValueError:
+        _REGISTERED_MOE_RUNNER_BACKEND_NAMES.add(name)
+    else:
+        raise ValueError(f"MoE runner backend {name!r} is already built in")
 
-    def is_flashinfer_trtllm_routed(self):
-        return self == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
 
-    def is_flashinfer_cutlass(self):
-        return self == MoeRunnerBackend.FLASHINFER_CUTLASS
+def resolve_moe_runner_backend(
+    backend: str | MoeRunnerBackendLike,
+) -> MoeRunnerBackendLike:
+    """Resolve a built-in or registered backend identifier."""
 
-    def is_flashinfer_cutedsl(self):
-        return self == MoeRunnerBackend.FLASHINFER_CUTEDSL
+    if isinstance(backend, (MoeRunnerBackend, RegisteredMoeRunnerBackend)):
+        return backend
+    try:
+        return MoeRunnerBackend(backend)
+    except ValueError:
+        if backend in _REGISTERED_MOE_RUNNER_BACKEND_NAMES:
+            return RegisteredMoeRunnerBackend(backend)
+        raise ValueError(
+            f"MoE runner backend {backend!r} is neither built in nor registered"
+        ) from None
 
-    def is_flashinfer_mxfp4(self):
-        return self == MoeRunnerBackend.FLASHINFER_MXFP4
+    def is_intel_xpu(self):
+        return self == MoeRunnerBackend.INTEL_XPU
 
-    def is_cutlass(self):
-        return self == MoeRunnerBackend.CUTLASS
 
-    def is_marlin(self):
-        # experimental_sgl_marlin shares the marlin weight repack, quant-method
-        # selection, and base fused path; divergent sites (the LoRA MoE dispatch)
-        # check is_experimental_sgl_marlin() first.
-        return self in (
-            MoeRunnerBackend.MARLIN,
-            MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN,
-        )
+class DeepEPv2Fp8ScaleFormat(NamedTuple):
+    """DeepGEMM FP8 activation-scale layout expected from DeepEP v2."""
 
-    def is_experimental_sgl_marlin(self):
-        return self == MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN
-
-    def is_humming(self):
-        return self == MoeRunnerBackend.HUMMING
-
-    def is_aiter(self):
-        return self == MoeRunnerBackend.AITER
+    tma_aligned: bool
+    ue8m0: bool
 
 
 class DeepEPMode(Enum):
@@ -231,10 +297,11 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     0. Parse server argument.
     1. Parse deprecated environment variables.
     2. If quant_config contains input_global_scale → NVFP4 path.
-    3. Parse quant config
-    4. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes hidden_states internally).
-    5. Otherwise default for NPU → BF16 (the default for NPU).
-    6. Otherwise → FP8 (the default for most models like DeepSeek-V3).
+    3. Parse a mode-specific dtype from quant_config.
+    4. Parse a generic dtype from quant_config.
+    5. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes hidden_states internally).
+    6. Otherwise default for NPU → BF16 (the default for NPU).
+    7. Otherwise → FP8 (the default for most models like DeepSeek-V3).
     """
 
     # 0. Parse server argument.
@@ -257,12 +324,23 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
         if input_global_scale is not None:
             return DispatcherOutputDtype.NVFP4
 
-        # 3. Parse quant config to determine the output dtype of dispatcher
+        # 3. Some MoE kernels require different wire formats for prefill and
+        # decode. Prefer a mode-specific override when the dispatcher exposes
+        # its concrete mode (normal or low_latency).
+        dispatch_mode = getattr(self, "dispatch_mode", None)
+        if dispatch_mode is not None:
+            mode_dispatcher_output_dtype = self.quant_config.get(
+                f"{dispatch_mode.value}_dispatcher_output_dtype", None
+            )
+            if mode_dispatcher_output_dtype is not None:
+                return DispatcherOutputDtype(mode_dispatcher_output_dtype)
+
+        # 4. Parse quant config to determine the output dtype of dispatcher
         dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
         if dispatcher_output_dtype is not None:
             return DispatcherOutputDtype(dispatcher_output_dtype)
 
-    # 4. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
+    # 5. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
     if (
         get_moe_runner_backend().is_flashinfer_cutedsl()
         or get_moe_runner_backend().is_cutlass()
@@ -270,11 +348,11 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     ):
         return DispatcherOutputDtype.BF16
 
-    # 5. Default on NPU → BF16
+    # 6. Default on NPU → BF16
     if _is_npu:
         return DispatcherOutputDtype.BF16
 
-    # 6. Default → FP8
+    # 7. Default → FP8
     return DispatcherOutputDtype.FP8
 
 
@@ -295,32 +373,61 @@ def get_ascend_dispatcher_output_dtype(dispatcher):
     return DispatcherOutputDtype.BF16
 
 
-def initialize_moe_config(server_args: ServerArgs):
+def get_deepep_v2_fp8_scale_format() -> DeepEPv2Fp8ScaleFormat:
+    """Resolve the FP8 scale layout DeepEP v2 must pre-quantize into."""
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    return DeepEPv2Fp8ScaleFormat(
+        tma_aligned=(
+            deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+            or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ),
+        ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+
+
+def initialize_moe_config():
+    """Seed the MoE runtime flags from the published configuration.
+
+    Reads the bags: `moe_a2a_backend` and its siblings are resolution's
+    answers, and the record carries the operator's input. Called once per
+    process after publish
+    (scheduler init, the benchmark work functions).
+    """
+    exec_moe = get_exec().moe
+    overlap = get_exec().overlap
+    spec = get_spec()
     moe = get_flags().moe
-    moe.a2a_backend = MoeA2ABackend(server_args.moe_a2a_backend)
-    moe.runner_backend = MoeRunnerBackend(server_args.moe_runner_backend)
+    moe.a2a_backend = MoeA2ABackend(exec_moe.moe_a2a_backend)
+    moe.runner_backend = resolve_moe_runner_backend(exec_moe.moe_runner_backend)
     moe.speculative_runner_backend = (
-        MoeRunnerBackend(server_args.speculative_moe_runner_backend)
-        if server_args.speculative_moe_runner_backend is not None
+        resolve_moe_runner_backend(spec.speculative_moe_runner_backend)
+        if spec.speculative_moe_runner_backend is not None
         else moe.runner_backend
     )
     moe.speculative_a2a_backend = (
-        MoeA2ABackend(server_args.speculative_moe_a2a_backend)
-        if server_args.speculative_moe_a2a_backend is not None
+        MoeA2ABackend(spec.speculative_moe_a2a_backend)
+        if spec.speculative_moe_a2a_backend is not None
         else moe.a2a_backend
     )
-    moe.deepep_mode = DeepEPMode(server_args.deepep_mode)
-    moe.deepep_config = server_args.deepep_config or ""
-    moe.tbo_enabled = server_args.enable_two_batch_overlap
-    moe.sbo_enabled = server_args.enable_single_batch_overlap
+    moe.deepep_mode = DeepEPMode(exec_moe.deepep_mode)
+    moe.deepep_config = exec_moe.deepep_config or ""
+    moe.tbo_enabled = overlap.enable_two_batch_overlap
+    moe.sbo_enabled = overlap.enable_single_batch_overlap
     if moe.sbo_enabled and is_cuda():
         if torch.cuda.get_device_capability()[0] == 9:
             raise ValueError(
                 "SBO (single batch overlap) is not supported on SM90 GPUs with latest sgl-deep-gemm wheel. Please try removing --enable-single-batch-overlap argument."
             )
-    moe.tbo_token_distribution_threshold = server_args.tbo_token_distribution_threshold
-    moe.disable_fp4_allgather = server_args.disable_flashinfer_cutlass_moe_fp4_allgather
-    moe.quantization = server_args.quantization
+    moe.tbo_token_distribution_threshold = overlap.tbo_token_distribution_threshold
+    moe.disable_fp4_allgather = exec_moe.disable_flashinfer_cutlass_moe_fp4_allgather
+    moe.quantization = get_model().quantization
+    # Seeded with the user's intent; each model's gate refines the ACTIVE
+    # value for its own build (install_shared_experts_fusion_decision).
+    moe.disable_shared_experts_fusion = exec_moe.disable_shared_experts_fusion
+    moe.speculative_disable_shared_experts_fusion = (
+        exec_moe.disable_shared_experts_fusion
+    )
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -330,14 +437,14 @@ def get_moe_a2a_backend() -> MoeA2ABackend:
     return moe.a2a_backend
 
 
-def get_moe_runner_backend() -> MoeRunnerBackend:
+def get_moe_runner_backend() -> MoeRunnerBackendLike:
     moe = get_flags().moe
     if moe.runner_backend is None:
         moe.runner_backend = MoeRunnerBackend.AUTO
     return moe.runner_backend
 
 
-def get_speculative_moe_runner_backend() -> MoeRunnerBackend:
+def get_speculative_moe_runner_backend() -> MoeRunnerBackendLike:
     moe = get_flags().moe
     if moe.speculative_runner_backend is None:
         logger.warning(
@@ -355,6 +462,86 @@ def get_speculative_moe_a2a_backend() -> MoeA2ABackend:
         )
         moe.speculative_a2a_backend = MoeA2ABackend.NONE
     return moe.speculative_a2a_backend
+
+
+def is_shared_experts_fusion_disabled() -> bool:
+    """The ACTIVE shared-experts-fusion decision for the model being built.
+
+    Written (both ways) by each MoE model's gate before its layers construct;
+    falls back to the config intent when no gate has run (models without an
+    auto-disable gate read the intent directly off the bag instead).
+
+    Construction-time only: a forward reads what its build baked in
+    (``num_fused_shared_experts`` on the layer). During a draft's build this
+    flag holds the DRAFT's decision, so a forward-time read would race the
+    build window — refuse it loudly."""
+    from sglang.srt.model_executor.forward_context import has_forward_context
+
+    if has_forward_context():
+        raise AssertionError(
+            "is_shared_experts_fusion_disabled() called inside a forward: the "
+            "fusion decision is construction-time state (it can hold the draft's "
+            "value while a draft builds). Read the value your build baked in, "
+            "e.g. the layer's num_fused_shared_experts."
+        )
+    moe = get_flags().moe
+    if moe.disable_shared_experts_fusion is None:
+
+        return get_exec().moe.disable_shared_experts_fusion
+    return moe.disable_shared_experts_fusion
+
+
+@contextmanager
+def draft_model_build_scope():
+    """Brackets a draft model's CONSTRUCTION: the gates it runs record their
+    fusion decision on the speculative leaf as well, and the target's ACTIVE
+    value returns on exit.
+
+    Deliberately does not touch ``runner_backend`` — swapping that is
+    ``speculative_moe_backend_context``'s job and has to bracket the draft's
+    whole lifecycle (build + capture + forward), which not every worker does.
+    """
+    moe = get_flags().moe
+    original_fusion = moe.disable_shared_experts_fusion
+    original_scope = moe.in_speculative_scope
+    try:
+        moe.in_speculative_scope = True
+        yield
+    finally:
+        moe.in_speculative_scope = original_scope
+        moe.disable_shared_experts_fusion = original_fusion
+
+
+def install_shared_experts_fusion_decision(
+    model_class, hf_config, quant_config
+) -> None:
+    """Decide whether this runner's model fuses its shared experts, and install
+    the answer for the model it is about to build.
+
+    Called from the loader's single model-instantiation point, so the decision
+    is made once per runner — before any layer exists — and the model classes
+    are pure readers (``is_shared_experts_fusion_disabled``). A model family
+    that can auto-disable exposes the conditions as
+    ``shared_experts_fusion_disable_reason(hf_config, quant_config)``; families
+    without one follow the user's intent.
+
+    Inside ``draft_model_build_scope`` the answer also lands on the speculative
+    leaf, so a flags dump afterwards shows both runners' decisions.
+    """
+
+    disabled = get_exec().moe.disable_shared_experts_fusion
+    if not disabled:
+        gate = getattr(model_class, "shared_experts_fusion_disable_reason", None)
+        reason = gate(hf_config, quant_config) if gate is not None else None
+        if reason:
+            log_info_on_rank0(
+                logger, f"{reason} Shared experts fusion optimization is disabled."
+            )
+            disabled = True
+    moe = get_flags().moe
+    moe.disable_shared_experts_fusion = disabled
+    if moe.in_speculative_scope:
+        moe.speculative_disable_shared_experts_fusion = disabled
 
 
 def get_deepep_mode() -> DeepEPMode:
@@ -388,9 +575,15 @@ def is_sbo_enabled() -> bool:
 
 
 def is_deepep_class_backend() -> bool:
-    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, Mori, or PPLX)."""
+    """Return whether A2A combine occurs inside a DeepEP-family dispatcher."""
     b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori() or b.is_pplx()
+    return (
+        b.is_deepep()
+        or b.is_deepep_v2()
+        or b.is_mooncake()
+        or b.is_mori()
+        or b.is_pplx()
+    )
 
 
 def uses_per_rank_fused_shared_slots() -> bool:
@@ -443,6 +636,15 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         and is_dp_attention_enabled()
         and get_flags().moe.quantization == "modelopt_fp4"
         and get_parallel().moe_ep_size == get_parallel().attn_dp_size
+    )
+
+
+def is_moe_input_scattered_across_dp_ranks() -> bool:
+    """Whether sparse MoE routing runs on a DP-local token shard."""
+    return (
+        not get_moe_a2a_backend().is_none()
+        or should_use_flashinfer_cutlass_moe_fp4_allgather()
+        or get_parallel().dwdp_size > 1
     )
 
 
@@ -526,6 +728,7 @@ def speculative_moe_backend_context():
     """
     Context manager to temporarily use the speculative MoE backend for draft model operations.
     This ensures that draft models in speculative decoding use the configured speculative backend.
+
     """
     moe = get_flags().moe
     original_backend = moe.runner_backend
@@ -545,14 +748,17 @@ def speculative_moe_a2a_backend_context():
     moe = get_flags().moe
     original_backend = moe.a2a_backend
     original_disable_fp4_allgather = moe.disable_fp4_allgather
+    original_speculative_context = moe.speculative_context
     try:
         moe.a2a_backend = get_speculative_moe_a2a_backend()
         # Disable FP4 allgather for spec decode since MTP layers are unquantized
         moe.disable_fp4_allgather = True
+        moe.speculative_context = True
         yield
     finally:
         moe.a2a_backend = original_backend
         moe.disable_fp4_allgather = original_disable_fp4_allgather
+        moe.speculative_context = original_speculative_context
 
 
 # The type of method in top-K routing, for use in torch custom op
@@ -582,6 +788,41 @@ class RoutingMethodType(IntEnum):
 
 AITER_PADDING_SIZE = 128
 TRITON_PADDING_SIZE = 128
+
+# Row-stride padding, in bytes, applied to XPU MoE expert weights whose K dim
+# lands on an L3 aliasing stride (see xpu_moe_ld_padding_elems). 64B matches
+# the 32 bf16 elements used by the sgl-kernel-xpu MoE benchmark. Expressed in
+# bytes because the aliasing is a property of the row's byte size, so this
+# stays correct if the path ever carries a non-bf16 weight dtype.
+#
+# Measured on BMG: halving this to 32B still clears the aliasing but runs ~6%
+# slower than not padding at all on hidden=7168 shapes (0.94x), presumably by
+# misaligning the grouped GEMM's row loads. Doubling it to 128B gains nothing
+# over 64B. Re-measure before changing.
+XPU_MOE_LD_PADDING_BYTES = 64
+
+
+def xpu_moe_ld_padding_elems(k_dim: int, itemsize: int) -> int:
+    """Extra elements to add to an XPU MoE weight's row stride (leading dim).
+
+    The Xe20 grouped GEMM walks B row-by-row over the K dim, so the row stride
+    in bytes decides which L3 set each row lands in. The L3 set index is
+    derived by XOR-folding address bits; when the row byte size is a multiple
+    of 2048 with an odd cofactor >= 3 (K = 3072, 7168, ... in bf16) successive
+    rows collapse onto a small number of sets and thrash. Padding the stride
+    (without changing the logical shape) breaks the aliasing.
+
+    Returns 0 when the shape is already well distributed, so callers can use
+    this to decide whether to allocate a padded buffer at all.
+    """
+    row_bytes = k_dim * itemsize
+    if row_bytes <= 0 or XPU_MOE_LD_PADDING_BYTES % itemsize != 0:
+        return 0
+    trailing_zeros = (row_bytes & -row_bytes).bit_length() - 1
+    odd_cofactor = row_bytes >> trailing_zeros
+    if trailing_zeros >= 11 and odd_cofactor >= 3:
+        return XPU_MOE_LD_PADDING_BYTES // itemsize
+    return 0
 
 
 # Unit of padding - context dependent

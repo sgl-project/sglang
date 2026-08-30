@@ -18,6 +18,16 @@ class _FakeAllocator:
         self.freed.append(free_index.clone())
 
 
+class _FakeReqToTokenPool:
+    def __init__(self, req_to_token):
+        self.req_to_token = req_to_token
+        self.free_slots = []
+
+    def free(self, req):
+        self.free_slots.append(req.req_pool_idx)
+        req.req_pool_idx = None
+
+
 class _FakeInnerCache:
     def __init__(self, req_to_token_pool, allocator, page_size, match_results=None):
         self.req_to_token_pool = req_to_token_pool
@@ -58,16 +68,17 @@ class _FakeReq:
             _inflight=False,
         )
         self.req_pool_idx = req_pool_idx
-        self.kv_committed_len = committed
         self.kv = SimpleNamespace(
+            kv_committed_len=committed,
             kv_allocated_len=allocated,
             swa_evicted_seqlen=0,
+            cache_protected_len=0,
         )
         self.origin_input_ids = list(range(committed))
         self.output_ids = []
         self.extra_key = None
+        self.cache_salt = None
         self.last_node = None
-        self.cache_protected_len = 0
         self.swa_uuid_for_lock = None
         self.skip_lock_node_ids = {}
         self.mamba_pool_idx = None
@@ -84,7 +95,7 @@ def test_preabort_detaches_session_and_preserves_slot():
     """Pre-aborted req (to_finish set before match_prefix) is detached from
     the session: session=None, abort_req() called. Slot stays intact."""
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(
         req_to_token_pool,
@@ -102,9 +113,12 @@ def test_preabort_detaches_session_and_preserves_slot():
     tree_cache = StreamingSession(inner)
     tree_cache.slots["session-a"] = SessionSlot(
         req_pool_idx=0,
-        kv_committed_len=48,
-        kv=SimpleNamespace(kv_allocated_len=48, swa_evicted_seqlen=0),
-        cache_protected_len=16,
+        kv=SimpleNamespace(
+            kv_committed_len=48,
+            kv_allocated_len=48,
+            swa_evicted_seqlen=0,
+            cache_protected_len=16,
+        ),
     )
 
     req = _FakeReq("session-a", req_pool_idx=1, committed=1, allocated=1)
@@ -122,7 +136,7 @@ def test_preabort_detaches_session_and_preserves_slot():
     # Slot untouched.
     slot = tree_cache.slots["session-a"]
     assert slot.req_pool_idx == 0
-    assert slot.kv_committed_len == 48
+    assert slot.kv.kv_committed_len == 48
     assert slot.kv.kv_allocated_len == 48
     assert len(result.device_indices) == 0
 
@@ -132,7 +146,7 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     slot is created from req state and nuked via release_session."""
     page_size = 1
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
     tree_cache = StreamingSession(inner)
@@ -158,7 +172,7 @@ def test_nth_mid_abort_nukes_session_slot():
     in req_nodes for next turn's re-prefill."""
     page_size = 1
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
     tree_cache = StreamingSession(inner)
@@ -166,10 +180,13 @@ def test_nth_mid_abort_nukes_session_slot():
     # Session already has a slot from a previous turn.
     tree_cache.slots["session-a"] = SessionSlot(
         req_pool_idx=0,
-        kv_committed_len=50,
-        kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
+        kv=SimpleNamespace(
+            kv_committed_len=50,
+            kv_allocated_len=50,
+            swa_evicted_seqlen=0,
+            cache_protected_len=0,
+        ),
         last_node=None,
-        cache_protected_len=0,
     )
 
     # Mid-processing abort: req has the SESSION slot's pool_idx (restore_to_req ran).
@@ -196,7 +213,7 @@ def test_release_session_threads_mamba_skip_ids():
     from sglang.srt.mem_cache.unified_cache.components import ComponentType
 
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
     tree_cache = StreamingSession(inner)
@@ -204,10 +221,13 @@ def test_release_session_threads_mamba_skip_ids():
     lock_node = SimpleNamespace(id=42)
     tree_cache.slots["session-a"] = SessionSlot(
         req_pool_idx=0,
-        kv_committed_len=50,
-        kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
+        kv=SimpleNamespace(
+            kv_committed_len=50,
+            kv_allocated_len=50,
+            swa_evicted_seqlen=0,
+            cache_protected_len=0,
+        ),
         last_node=lock_node,
-        cache_protected_len=0,
         skip_lock_node_ids={ComponentType.MAMBA: {42}},
     )
 
@@ -234,7 +254,7 @@ def test_trim_overshoot_postcondition():
     """
     page_size = 1
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     tree_cache = StreamingSession(
         _FakeInnerCache(req_to_token_pool, allocator, page_size)
@@ -251,7 +271,7 @@ def test_trim_overshoot_postcondition():
     tree_cache._trim_overshoot(req, finished_len=12)
 
     target = 38
-    assert req.kv_committed_len == target
+    assert req.kv.kv_committed_len == target
     assert req.kv.kv_allocated_len == target
     assert req.kv.swa_evicted_seqlen == target
     assert len(req.output_ids) == 12

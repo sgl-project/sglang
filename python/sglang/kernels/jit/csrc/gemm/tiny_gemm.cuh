@@ -143,10 +143,6 @@ __global__ __launch_bounds__(N_SPLIT* K / kTinyKGemmVecSize, 1)  // control the 
   PDLTriggerSecondary<kUsePDL>();
 }
 
-}  // namespace sglang
-
-using namespace sglang;
-
 template <uint32_t N, uint32_t K, uint32_t kMaxM, uint32_t N_SPLIT, typename OutT, bool kUsePDL>
 struct TinyNGemmKernel {
   static constexpr uint32_t kBlockSize = K / kTinyNGemmVecSize;
@@ -229,3 +225,5 @@ struct TinyKGemmKernel {
             x_stride);
   }
 };
+
+}  // namespace sglang

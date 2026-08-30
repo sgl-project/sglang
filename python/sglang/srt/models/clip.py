@@ -6,19 +6,46 @@ from typing import Iterable, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
-from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask
 
-from sglang.srt.layers.activation import QuickGELU
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.activation import QuickGELU, get_act_fn
 from sglang.srt.layers.conv import Conv2dLayer
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.model_runner import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, flatten_nested_list
+
+
+def prepare_clip_attention_mask(
+    input_shape: torch.Size,
+    dtype: torch.dtype,
+    device: torch.device,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    if attention_mask is None:
+        return None
+    batch_size, sequence_length = input_shape
+    causal_mask = torch.full(
+        (sequence_length, sequence_length),
+        torch.finfo(dtype).min,
+        dtype=dtype,
+        device=device,
+    )
+    causal_mask = torch.triu(causal_mask, diagonal=1)
+    causal_mask = causal_mask[None, None].expand(batch_size, 1, -1, -1)
+    if attention_mask.dim() == 2:
+        attention_mask = attention_mask[:, None, None, :].to(dtype=dtype)
+        attention_mask = (1.0 - attention_mask) * torch.finfo(dtype).min
+    return causal_mask + attention_mask
 
 
 class CLIPVisionEmbeddings(nn.Module):
@@ -88,9 +115,18 @@ class CLIPTextEmbeddings(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
     ) -> torch.Tensor:
-        seq_length = (
-            input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[-2]
-        )
+        if input_ids is not None:
+            seq_length = input_ids.shape[-1]
+        elif inputs_embeds is not None:
+            seq_length = inputs_embeds.shape[-2]
+        else:
+            raise ValueError("Either input_ids or inputs_embeds must be provided.")
+
+        max_positions = self.position_embedding.weight.shape[0]
+        if seq_length > max_positions:
+            raise ValueError(
+                f"Sequence length {seq_length} exceeds the maximum {max_positions}."
+            )
 
         if position_ids is None:
             position_ids = self.position_ids[:, :seq_length]
@@ -109,7 +145,7 @@ class CLIPMLP(nn.Module):
     def __init__(
         self,
         config,
-        act_layer: Type[nn.Module] = QuickGELU,
+        act_layer: Optional[Type[nn.Module]] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -120,7 +156,12 @@ class CLIPMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("fc1", prefix),
         )
-        self.act = act_layer()
+        if act_layer is not None:
+            self.act = act_layer()
+        elif config.hidden_act == "quick_gelu":
+            self.act = QuickGELU()
+        else:
+            self.act = get_act_fn(config.hidden_act)
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
@@ -135,29 +176,90 @@ class CLIPMLP(nn.Module):
         return x
 
 
+class CLIPAttention(nn.Module):
+    def __init__(
+        self,
+        config: Union[CLIPTextConfig, CLIPVisionConfig],
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        causal: bool = False,
+    ) -> None:
+        super().__init__()
+        parallel = get_parallel()
+        self.num_heads = config.num_attention_heads // parallel.attn_tp_size
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.causal = causal
+        self.dropout = config.attention_dropout
+        self.scale = self.head_dim**-0.5
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=config.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=config.num_attention_heads,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
+            tp_rank=parallel.attn_tp_rank,
+            tp_size=parallel.attn_tp_size,
+        )
+        self.proj = RowParallelLinear(
+            input_size=config.hidden_size,
+            output_size=config.hidden_size,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("proj", prefix),
+            tp_rank=parallel.attn_tp_rank,
+            tp_size=parallel.attn_tp_size,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch_size, sequence_length, _ = hidden_states.shape
+        qkv, _ = self.qkv_proj(hidden_states)
+        query, key, value = qkv.chunk(3, dim=-1)
+        qkv_shape = (batch_size, sequence_length, self.num_heads, self.head_dim)
+        query = query.view(qkv_shape).transpose(1, 2)
+        key = key.view(qkv_shape).transpose(1, 2)
+        value = value.view(qkv_shape).transpose(1, 2)
+        output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=self.causal and attention_mask is None,
+            scale=self.scale,
+        )
+        output = output.transpose(1, 2).reshape(
+            batch_size, sequence_length, self.num_heads * self.head_dim
+        )
+        output, _ = self.proj(output)
+        return output
+
+
 class CLIPEncoderLayer(nn.Module):
 
     def __init__(
         self,
         config: CLIPVisionConfig,
-        act_layer: Type[nn.Module] = QuickGELU,
+        act_layer: Optional[Type[nn.Module]] = None,
         norm_layer: Type[nn.Module] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        causal: bool = False,
     ) -> None:
         super().__init__()
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=config.layer_norm_eps)
         self.layer_norm1 = norm_layer(config.hidden_size)
         self.layer_norm2 = norm_layer(config.hidden_size)
-        self.self_attn = VisionAttention(
-            embed_dim=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            projection_size=config.hidden_size,
-            use_qkv_parallel=True,
-            flatten_batch=True,
+        self.self_attn = CLIPAttention(
+            config,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
+            causal=causal,
         )
         self.mlp = CLIPMLP(
             config,
@@ -210,20 +312,29 @@ class CLIPEncoder(nn.Module):
         config: CLIPVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        num_hidden_layers_override: Optional[int] = None,
+        act_layer: Optional[Type[nn.Module]] = None,
+        causal: bool = False,
     ) -> None:
         super().__init__()
 
         self.config = config
 
-        num_hidden_layers = config.num_hidden_layers
+        num_hidden_layers = (
+            config.num_hidden_layers
+            if num_hidden_layers_override is None
+            else num_hidden_layers_override
+        )
         norm_layer = partial(nn.LayerNorm, eps=config.layer_norm_eps)
         self.layers = nn.ModuleList(
             [
                 CLIPEncoderLayer(
                     config=config,
+                    act_layer=act_layer,
                     norm_layer=norm_layer,
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_idx}", prefix),
+                    causal=causal,
                 )
                 for layer_idx in range(num_hidden_layers)
             ]
@@ -265,6 +376,7 @@ class CLIPTextTransformer(nn.Module):
             config=config,
             quant_config=quant_config,
             prefix=add_prefix("encoder", prefix),
+            causal=True,
         )
         self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
@@ -281,12 +393,13 @@ class CLIPTextTransformer(nn.Module):
         input_shape = input_ids.size()
         input_ids = input_ids.view(-1, input_shape[-1])
         hidden_states = self.embeddings(input_ids, position_ids)
-        causal_attention_mask = _create_4d_causal_attention_mask(
-            input_ids.shape, hidden_states.dtype, device=hidden_states.device
+        attention_mask = prepare_clip_attention_mask(
+            input_ids.shape,
+            hidden_states.dtype,
+            hidden_states.device,
+            attention_mask,
         )
-        encoder_outputs = self.encoder(
-            hidden_states, attention_mask, causal_attention_mask
-        )
+        encoder_outputs = self.encoder(hidden_states, attention_mask=attention_mask)
         last_hidden_state = self.final_layer_norm(encoder_outputs)
         return last_hidden_state
 
@@ -311,7 +424,7 @@ class CLIPTextModel(nn.Module):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
     ):
-        return self.text_model(input_ids, position_ids)
+        return self.text_model(input_ids, position_ids=position_ids)
 
 
 class CLIPVisionTransformer(nn.Module):

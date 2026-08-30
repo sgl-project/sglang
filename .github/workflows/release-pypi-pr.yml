@@ -34,7 +34,7 @@ jobs:
       - name: Generate PR wheel version
         id: gen_version
         run: |
-          LATEST_TAG=$(python3 python/tools/get_version_tag.py)
+          LATEST_TAG=$(python3 scripts/release/get_version_tag.py)
           BASE_VERSION=${LATEST_TAG#v}
           echo "Latest release tag: ${LATEST_TAG}"
 

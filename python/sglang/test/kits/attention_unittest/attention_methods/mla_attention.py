@@ -203,7 +203,7 @@ class TinyMLAModelConfig:
     def get_max_num_attention_heads(self) -> int:
         return self.num_attention_heads
 
-    def get_num_kv_heads(self, tp_size: int) -> int:
+    def get_num_kv_heads(self, tp_size: int, dcp_size: int = 1) -> int:
         return 1
 
 
