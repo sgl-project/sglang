@@ -7,10 +7,45 @@ from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     _align_pipeline_layers,
     capture_decode_graph,
+    has_standard_gqa_for_all_local_layers,
+    index_attention_layers_by_global_id,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def test_standard_gqa_gate_uses_pipeline_local_layer_range():
+    # PP rank owns layers [23, 46), while the full model has 92 layers.
+    assert has_standard_gqa_for_all_local_layers(
+        attention_layer_count=23, start_layer=23, end_layer=46
+    )
+    assert not has_standard_gqa_for_all_local_layers(
+        attention_layer_count=22, start_layer=23, end_layer=46
+    )
+
+
+def test_standard_gqa_gate_is_unchanged_without_pipeline_parallelism():
+    assert has_standard_gqa_for_all_local_layers(
+        attention_layer_count=92, start_layer=0, end_layer=92
+    )
+
+
+def test_pipeline_attention_metadata_is_indexed_by_global_layer_id():
+    layer23 = SimpleNamespace(layer_id=23)
+    layer24 = SimpleNamespace(layer_id=24)
+    companion24 = object()
+
+    attention, companions = index_attention_layers_by_global_id(
+        [layer23, layer24], [None, companion24]
+    )
+
+    assert len(attention) == 25
+    assert all(layer is None for layer in attention[:23])
+    assert attention[23] is layer23
+    assert attention[24] is layer24
+    assert companions[23] is None
+    assert companions[24] is companion24
 
 
 def test_model_runner_can_override_decode_graph_runner(monkeypatch):
