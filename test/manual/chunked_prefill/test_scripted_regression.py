@@ -509,7 +509,7 @@ class TestRegressionGptOss(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
-        committed = r.req.kv_committed_len
+        committed = r.req.kv.kv_committed_len
         assert committed > 0
 
         assert len(r.req.prefix_indices) <= committed, (
