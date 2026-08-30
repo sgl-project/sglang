@@ -97,6 +97,7 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     norm_eps: float = 1e-5
     qk_norm_eps: float = 1e-5
     final_norm_eps: float = 1e-5
+    qkv_checkpoint_grouped: bool = True
     checkpoint_uses_diffusers_layout: bool = False
     adaln_affine_input_dim: int | None = None
 

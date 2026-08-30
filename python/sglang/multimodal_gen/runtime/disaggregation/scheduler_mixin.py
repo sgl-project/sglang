@@ -50,6 +50,10 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
+from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
+    attach_cuda_tensors,
+    detach_cuda_tensors,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import expand_request_outputs
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
@@ -800,6 +804,31 @@ class SchedulerDisaggMixin:
             )
 
         return data
+
+    def _broadcast_recv_reqs(self: Scheduler, recv_reqs):
+        """ComfyUI multi-rank recv: pickle the Req skeleton, NCCL the CUDA tensors.
+
+        The general SP/CFG/TP path stays in ``Scheduler.recv_reqs`` as the
+        original whole-list ``broadcast_pyobj``. This helper is only the
+        ComfyUI overlay and does not use disagg extract.
+        """
+        is_rank0 = self.gpu_id == 0
+        if is_rank0:
+            assert recv_reqs is not None, "rank 0 must pass the ZMQ poll result"
+            skeleton, tensors = detach_cuda_tensors(recv_reqs)
+        else:
+            skeleton, tensors = None, None
+
+        skeleton = self._broadcast_to_all_ranks(skeleton)
+        tensors = self._broadcast_tensor_dict_to_all_ranks(tensors)
+        if is_rank0:
+            return recv_reqs
+        if not skeleton:
+            return []
+        local_device = torch.device(
+            f"{current_platform.device_type}:{self.worker.local_rank}"
+        )
+        return attach_cuda_tensors(skeleton, tensors or {}, device=local_device)
 
     def _is_multi_rank(self: Scheduler) -> bool:
         sa = self.server_args

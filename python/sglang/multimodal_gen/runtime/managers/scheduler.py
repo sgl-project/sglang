@@ -16,6 +16,11 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
+from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
+    materialize_cuda_refs,
+    release_retained_producer_tensors,
+    spill_cuda_tensors,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     ReleaseMemoryOccupationReqInput,
@@ -733,6 +738,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     output_batch.output = spill_large_arrays_to_file_refs(
                         output_batch.output
                     )
+                with self._record_return_stage(
+                    output_batch, "Scheduler.return_result.spill_cuda"
+                ):
+                    # The previous reply has already been mapped: the client
+                    # only sends the next hop after materializing the last one.
+                    release_retained_producer_tensors()
+                    spill_cuda_tensors(output_batch, in_place=True)
 
             with self._record_return_stage(
                 output_batch, "Scheduler.return_result.pickle"
@@ -1117,7 +1129,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
     def recv_reqs(self) -> List[tuple[bytes, Any]]:
         """
-        For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj
+        For non-main schedulers, reqs are broadcasted from main using
+        broadcast_pyobj. ``--comfyui-mode`` multi-rank instead keeps CUDA
+        tensors on NCCL so per-step latents do not pickle onto the gloo group.
         """
         if self.receiver is not None:
             try:
@@ -1142,30 +1156,37 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         else:
             recv_reqs = None
 
-        # TODO: fix this condition
-        if self.server_args.sp_degree != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.worker.sp_group.rank,
-                self.worker.sp_cpu_group,
-                src=self.worker.sp_group.ranks[0],
-            )
+        # Rebuild CUDA IPC handles on rank 0 (no-op when the payload has none).
+        if recv_reqs is not None:
+            recv_reqs = materialize_cuda_refs(recv_reqs)
 
-        if self.server_args.enable_cfg_parallel:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.worker.cfg_group.rank,
-                self.worker.cfg_cpu_group,
-                src=self.worker.cfg_group.ranks[0],
-            )
+        if self.server_args.comfyui_mode and self._is_multi_rank():
+            recv_reqs = self._broadcast_recv_reqs(recv_reqs)
+        else:
+            # TODO: fix this condition
+            if self.server_args.sp_degree != 1:
+                recv_reqs = broadcast_pyobj(
+                    recv_reqs,
+                    self.worker.sp_group.rank,
+                    self.worker.sp_cpu_group,
+                    src=self.worker.sp_group.ranks[0],
+                )
 
-        if self.server_args.tp_size > 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.worker.tp_group.rank,
-                self.worker.tp_cpu_group,
-                src=self.worker.tp_group.ranks[0],
-            )
+            if self.server_args.enable_cfg_parallel:
+                recv_reqs = broadcast_pyobj(
+                    recv_reqs,
+                    self.worker.cfg_group.rank,
+                    self.worker.cfg_cpu_group,
+                    src=self.worker.cfg_group.ranks[0],
+                )
+
+            if self.server_args.tp_size > 1:
+                recv_reqs = broadcast_pyobj(
+                    recv_reqs,
+                    self.worker.tp_group.rank,
+                    self.worker.tp_cpu_group,
+                    src=self.worker.tp_group.ranks[0],
+                )
 
         assert recv_reqs is not None
 

@@ -60,6 +60,8 @@ or `MiniMax/MiniMax-H3` on ModelScope. Select the checkpoint variant with
 `--model-variant`: `fl2va` serves both `t2va` and `fl2va`, while `ref2va`
 serves reference-conditioned requests. SGLang owns the checkpoint-directory
 mapping; do not point `--model-path` at a manually downloaded subdirectory.
+The same FL2VA / Ref2VA split applies in
+[ComfyUI integrated mode](#comfyui-integrated-mode).
 
 <Warning>
 Review the license and usage terms in the MiniMax-H3 model card before production or commercial use. SGLang support does not grant additional model usage rights.
@@ -250,6 +252,27 @@ The current `torch.compile` path changes the model's numerical output, so no
 recommended lossless preset enables it implicitly. An explicit
 `--enable-torch-compile true` remains available for controlled experiments, but
 do not use it to generate consistency ground truth.
+
+### ComfyUI integrated mode
+
+The [ComfyUI plugin](/docs/sglang-diffusion/comfyui) can run H3 as a per-step
+DiT backend. ComfyUI keeps CLIP, VAE, and the sampler loop. SGLang loads only
+the transformer under `--comfyui-mode`.
+
+Copy `python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion` into ComfyUI
+`custom_nodes/`. Load a shipped graph and set `SGLDOptions.model_type` to
+`minimax_h3`:
+
+| Graph | Task | DiT filename |
+| --- | --- | --- |
+| `minimax_h3_t2v_sgld.json` | T2V / I2VA / FL2VA | `minimax_h3_fl2va_*.safetensors` |
+| `minimax_h3_r2v_sgld.json` | Reference-to-video | `minimax_h3_ref2va_*.safetensors` |
+| `minimax_h3_t2v_sgld_upscaler.json` | Low-res then 3D ×2 | `fl2va` DiT |
+
+Pruned BF16 / FP8 files from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models)
+are the usual loader inputs. GGUF goes in `SGLDOptions.transformer_weights_path`.
+On a 24 GB card put the 32B CLIP on CPU and enable DiT layerwise offload; use
+`kitchen_int8` or GGUF rather than the full unpruned BF16 DiT.
 
 ### Advanced: precomputed AdaLN cache
 
