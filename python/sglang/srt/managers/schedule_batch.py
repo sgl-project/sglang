@@ -887,6 +887,9 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        # Output length at the last proactive demotion; re-demotion requires
+        # another proactive_demotion_min_output_len tokens on top of this.
+        self.last_demote_output_len = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates
         # extend_range, never mutates this array's length.
@@ -1053,9 +1056,6 @@ class Req(ReqDllmMixin):
         self.is_retracted = False
         # Indicates if the req has ever been demoted.
         self.is_demoted = False
-        # Indicates if the req has once been demoted and recovered. If so, the
-        # req will be demoted when getting into the running batch or need demotion.
-        self.is_demoted_recovered = False
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
@@ -1725,11 +1725,6 @@ class Req(ReqDllmMixin):
         else:
             self.is_retracted = True
         self.retracted_stain = True
-        if self.is_demoted_recovered:
-            self.is_demoted_recovered = False
-            logger.warning(
-                "req %s: demoted-recovered request is being demoted again", self.rid
-            )
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None

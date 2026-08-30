@@ -52,7 +52,7 @@ class _FakeBatch:
         self.reqs = [self.reqs[i] for i in keep_indices]
 
 
-def _make_demotion_candidate(rid, seqlen, output_len):
+def _make_demotion_candidate(rid, seqlen, output_len, *, last_demote_output_len=0):
     return SimpleNamespace(
         rid=rid,
         seqlen=seqlen,
@@ -60,21 +60,20 @@ def _make_demotion_candidate(rid, seqlen, output_len):
         origin_input_ids=[0] * (seqlen - output_len),
         is_retracted=False,
         is_demoted=False,
-        is_demoted_recovered=False,
+        last_demote_output_len=last_demote_output_len,
         finished=lambda: False,
         sampling_params=SimpleNamespace(max_new_tokens=128),
         time_stats=SimpleNamespace(set_retract_time=MagicMock()),
     )
 
 
-def _make_demotion_scheduler(batch, *, budget, waiting_queue=(), enable_metrics=False):
+def _make_demotion_scheduler(batch, *, budget, enable_metrics=False):
     """Scheduler stub wired to a real DecodePreallocQueue so add_demoted_req
     performs its actual budget deduction."""
     prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
     prealloc_queue.demotion_queue = []
     scheduler = SimpleNamespace(
         running_batch=batch,
-        waiting_queue=list(waiting_queue),
         enable_overlap=False,
         remain_cpu_demote_tokens=budget,
         server_args=SimpleNamespace(
@@ -329,37 +328,29 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         self.assertEqual(scheduler.remain_cpu_demote_tokens, -5)
         self.assertFalse(medium.is_demoted)
 
-    def test_demote_recovered_waiting_victim_without_batch_lookup(self):
-        """A demoted-recovered candidate lives in the waiting queue, not the
-        running batch; looking it up via batch.reqs.index() raised ValueError
-        and crashed the scheduler."""
-        running = _make_demotion_candidate("running", 20, 15)
-        recovered = _make_demotion_candidate("recovered", 40, 35)
-        recovered.is_demoted_recovered = True
-        batch = _FakeBatch([running])
-        scheduler = _make_demotion_scheduler(
-            batch, budget=30, waiting_queue=[recovered]
+    def test_redemotion_requires_incremental_output(self):
+        """Re-demotion must require min_output_len tokens generated since the
+        last demotion; comparing total output length alone re-demoted a
+        just-recovered request that had generated almost nothing new."""
+        # Total output 30 but only 5 new tokens since the last demotion.
+        recovered = _make_demotion_candidate(
+            "recovered", 35, 30, last_demote_output_len=25
         )
+        fresh = _make_demotion_candidate("fresh", 33, 30)
+        batch = _FakeBatch([recovered, fresh])
+        scheduler = _make_demotion_scheduler(batch, budget=100)
 
-        with patch(
-            "sglang.srt.disaggregation.decode.release_req", return_value=True
-        ) as module_release:
-            self.assertTrue(
-                SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
-                    scheduler
-                )
+        self.assertTrue(
+            SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
+                scheduler
             )
-
-        # The waiting-queue victim goes through the module-level release path;
-        # the running batch is untouched by it.
-        module_release.assert_called_once()
-        self.assertIs(module_release.call_args.kwargs["req"], recovered)
-        self.assertTrue(module_release.call_args.kwargs["is_demoted"])
-        self.assertEqual(scheduler.waiting_queue, [])
-        self.assertEqual(batch.release_calls, [])
-        self.assertEqual(batch.reqs, [running])
+        )
         demotion_queue = scheduler.disagg_decode_prealloc_queue.demotion_queue
-        self.assertEqual([entry.req for entry in demotion_queue], [recovered])
+        self.assertEqual([entry.req for entry in demotion_queue], [fresh])
+        self.assertEqual(batch.reqs, [recovered])
+        self.assertFalse(recovered.is_demoted)
+        # Demotion records the output length the next wave must build on.
+        self.assertEqual(fresh.last_demote_output_len, 30)
 
 
 if __name__ == "__main__":

@@ -69,7 +69,6 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     ReqKvInfo,
     ScheduleBatch,
-    release_req,
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -888,6 +887,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self, req: Req, demoted_start_time: Optional[float] = None
     ) -> None:
         req.is_demoted = True
+        req.last_demote_output_len = len(req.output_ids)
         demoted_tokens = req.seqlen
         self.scheduler.remain_cpu_demote_tokens -= demoted_tokens
         self.demotion_queue.append(
@@ -942,7 +942,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 get_disagg().disaggregation_decode_retraction_backup,
             )
             req.is_demoted = False
-            req.is_demoted_recovered = True
             self.scheduler.remain_cpu_demote_tokens += entry.demoted_tokens
             resumed_reqs.append(req)
             indices_to_remove.add(i)
@@ -2552,16 +2551,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         pass
 
 
-def _matches_fixed_demotion_rule(
-    req: Req, *, max_input_len: int, min_output_len: int
-) -> bool:
-    """Fixed demotion rule: short-input requests whose output has grown long."""
-    return (
-        len(req.origin_input_ids) <= max_input_len
-        and len(req.output_ids) >= min_output_len
-    )
-
-
 class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
@@ -2764,45 +2753,18 @@ class SchedulerDisaggregationDecodeMixin:
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
-        num_remain_used_batch = num_not_used_batch
 
         # pop req from waiting queue
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
 
-        # A demoted-recovered request re-enters the running batch only after
-        # it stops matching the fixed demotion rule; otherwise it would be
-        # demoted again on the next pressure wave.
-        max_input_len = self.server_args.proactive_demotion_max_input_len
-        min_output_len = self.server_args.proactive_demotion_min_output_len
         for i in range(len(self.waiting_queue)):
             req = self.waiting_queue[i]
             # we can only add at least `num_not_used_batch` new batch to the running queue
-            if (num_remain_used_batch > 0
-                and (
-                    not req.is_demoted_recovered
-                    or not _matches_fixed_demotion_rule(
-                        req,
-                        max_input_len=max_input_len,
-                        min_output_len=min_output_len,
-                    ))):
+            if i < num_not_used_batch:
                 can_run_list.append(req)
-                num_remain_used_batch -= 1
             else:
                 waiting_queue.append(req)
-                if req.is_demoted_recovered:
-                    logger.warning(
-                        "Demoted request is promoted again, rid=%s, input_len=%s, output_len=%s",
-                        req.rid,
-                        len(req.origin_input_ids),
-                        len(req.output_ids),
-                    )
-                
-        # Need to double check the promoted demote recovered req if there are slots.
-        for req in waiting_queue[:num_remain_used_batch]:
-            req.is_demoted_recovered = False
-        can_run_list.extend(waiting_queue[:num_remain_used_batch])
-        waiting_queue = waiting_queue[num_remain_used_batch:]
 
         if self.enable_priority_preemption and waiting_queue:
             victims = self._swap_out_by_priority(running_batch, waiting_queue)
@@ -2882,24 +2844,14 @@ class SchedulerDisaggregationDecodeMixin:
                 not req.finished()
                 and not req.is_retracted
                 and not req.is_demoted
-                and _matches_fixed_demotion_rule(
-                    req,
-                    max_input_len=max_input_len,
-                    min_output_len=min_output_len,
-                )
+                and len(req.origin_input_ids) <= max_input_len
+                and len(req.output_ids) - req.last_demote_output_len
+                >= min_output_len
             )
 
         demoted_any = False
         candidates = [req for req in batch.reqs if is_demotion_candidate(req)]
         candidates.sort(key=lambda req: req.seqlen, reverse=True)
-        # Put demoted_recovered requests in the waiting queue to the front of
-        # the candidates list to be demoted first.
-        demoted_recovered_candidates = [
-            req
-            for req in self.waiting_queue
-            if req.is_demoted_recovered and is_demotion_candidate(req)
-        ]
-        candidates = demoted_recovered_candidates + candidates
         demoted_reqs = []
         while self.remain_cpu_demote_tokens > 0:
             if not candidates:
@@ -2907,27 +2859,14 @@ class SchedulerDisaggregationDecodeMixin:
 
             victim = candidates.pop(0)
             victim_index = next(
-                (i for i, r in enumerate(batch.reqs) if r is victim), None
+                i for i, r in enumerate(batch.reqs) if r is victim
             )
-            if victim_index is not None:
-                backup_saved = batch.release_req(
-                    victim_index,
-                    max(0, batch.batch_size() - 1),
-                    self.server_args,
-                    is_demoted=True,
-                )
-            else:
-                self.waiting_queue = [r for r in self.waiting_queue if r is not victim]
-                backup_saved = release_req(
-                    req=victim,
-                    remaing_req_count=batch.batch_size(),
-                    server_args=self.server_args,
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tree_cache=self.tree_cache,
-                    hisparse_coordinator=self.hisparse_coordinator,
-                    is_demoted=True,
-                )
+            backup_saved = batch.release_req(
+                victim_index,
+                max(0, batch.batch_size() - 1),
+                self.server_args,
+                is_demoted=True,
+            )
             if backup_saved:
                 victim.time_stats.set_retract_time()
                 self.disagg_decode_prealloc_queue.add_demoted_req(victim)
@@ -2943,20 +2882,19 @@ class SchedulerDisaggregationDecodeMixin:
                     victim,
                 )
 
-            if victim_index is not None:
-                batch.filter_batch(
-                    keep_indices=[
-                        index
-                        for index, _ in enumerate(batch.reqs)
-                        if index != victim_index
-                    ]
+            batch.filter_batch(
+                keep_indices=[
+                    index
+                    for index, _ in enumerate(batch.reqs)
+                    if index != victim_index
+                ]
+            )
+            batch.batch_is_full = False
+            self.new_token_ratio_tracker.current = (
+                NewTokenRatioTracker.estimate_new_token_ratio_after_retract(
+                    batch.reqs
                 )
-                batch.batch_is_full = False
-                self.new_token_ratio_tracker.current = (
-                    NewTokenRatioTracker.estimate_new_token_ratio_after_retract(
-                        batch.reqs
-                    )
-                )
+            )
             logger.warning(
                 "Proactive decode demotion: req=%s seqlen=%s output_len=%s",
                 victim.rid,
