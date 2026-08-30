@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -296,6 +297,30 @@ class RadixAttention(nn.Module):
                 save_kv_cache,
                 **kwargs,
             )
+
+    def save_kv_cache_only(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        backend = get_attn_backend()
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not self.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
+        swa_loc = None
+        if hasattr(backend, "forward_metadata") and backend.forward_metadata is not None:
+            swa_loc = getattr(backend.forward_metadata, "swa_out_cache_loc", None)
+        scales = backend._kv_write_scales(self) if hasattr(backend, "_kv_write_scales") else ()
+        backend.token_to_kv_pool.set_kv_buffer(
+            self,
+            KVWriteLoc(cache_loc, swa_loc),
+            k,
+            v,
+            *scales,
+        )
 
 
 def _unified_attention_with_output_impl(
