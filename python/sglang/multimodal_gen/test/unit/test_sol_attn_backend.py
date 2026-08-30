@@ -7,6 +7,7 @@ import torch
 from sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn import (
     SolAttnBackend,
     SolAttnImpl,
+    _get_sol_attn_runtime_config,
     _parse_layer_ranges,
 )
 from sglang.multimodal_gen.runtime.platforms.cuda import CudaPlatformBase
@@ -42,6 +43,32 @@ class TestSolAttnBackend(unittest.TestCase):
 
     def test_parse_layer_ranges(self):
         self.assertEqual(_parse_layer_ranges("0,1,3-5"), frozenset({0, 1, 3, 4, 5}))
+
+    def test_dense_backend_aliases(self):
+        for raw, expected in (
+            ("fa", "fa"),
+            ("sage", "sage_attn"),
+            ("sage_attn", "sage_attn"),
+        ):
+            server_args = MagicMock()
+            server_args.attention_backend_config = {"dense_backend": raw}
+            with patch(
+                "sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn.get_global_server_args",
+                return_value=server_args,
+            ):
+                self.assertEqual(
+                    _get_sol_attn_runtime_config()["dense_backend"], expected
+                )
+        server_args = MagicMock()
+        server_args.attention_backend_config = {"dense_backend": "torch_sdpa"}
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn.get_global_server_args",
+                return_value=server_args,
+            ),
+            self.assertRaises(ValueError),
+        ):
+            _get_sol_attn_runtime_config()
 
     def test_backend_head_size(self):
         self.assertEqual(SolAttnBackend.get_supported_head_sizes(), [128])

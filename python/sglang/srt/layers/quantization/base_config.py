@@ -10,10 +10,14 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 import torch
 from torch import nn
 
+from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
+
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.base import MoeQuantInfo
     from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+    from sglang.srt.layers.moe.utils import MoeRunnerBackendLike
     from sglang.srt.models.utils import WeightsMapper
 
 
@@ -84,6 +88,7 @@ class LinearMethodBase(QuantizeMethodBase):
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
+    runner: MoeRunner | None = None
 
     def create_weights(
         self,
@@ -122,9 +127,20 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             f"{type(self).__name__} must implement get_triton_quant_info()"
         )
 
+    def get_moe_quant_info(
+        self, layer: torch.nn.Module, runner_backend: MoeRunnerBackendLike
+    ) -> MoeQuantInfo:
+        if runner_backend.is_triton():
+            return self.get_triton_quant_info(layer)
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose quant info for {runner_backend.value!r}"
+        )
+
 
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
+
+    weight_block_size: Optional[List[int]] = None
 
     def __init__(self):
         super().__init__()
@@ -198,12 +214,9 @@ class QuantizationConfig(ABC):
 
         # If user specified generic "modelopt", auto-detect the specific method
         if user_quant == "modelopt":
-            if quant_algo == "MXFP8":
-                return "mxfp8"
-            elif quant_algo == "FP8":
-                return "modelopt_fp8"
-            elif "NVFP4" in quant_algo or "FP4" in quant_algo:
-                return "modelopt_fp4"
+            canonical_method = canonicalize_modelopt_quant_algo(quant_algo)
+            if canonical_method is not None:
+                return canonical_method
 
         # The hf_quant_config may be a parsed quant config, so we need to check the
         # quant_method.

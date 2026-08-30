@@ -3,12 +3,9 @@
 import dataclasses
 import multiprocessing as mp
 import os
-import signal
 import sys
-import threading
 import time
 
-import psutil
 import uvicorn
 
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
@@ -24,7 +21,10 @@ from sglang.multimodal_gen.runtime.server_args import (
     prepare_server_args,
     set_global_server_args,
 )
-from sglang.multimodal_gen.runtime.utils.common import is_port_available
+from sglang.multimodal_gen.runtime.utils.common import (
+    is_port_available,
+    kill_process_tree,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import init_diffusion_tracing
 from sglang.multimodal_gen.utils import kill_itself_when_parent_died
@@ -51,45 +51,6 @@ def _find_available_port(
     raise RuntimeError(
         f"No available port found after {max_attempts} attempts (start={start})"
     )
-
-
-def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
-    """Kill the process and all its child processes."""
-    # Remove sigchld handler to avoid spammy logs.
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-
-    if parent_pid is None:
-        parent_pid = os.getpid()
-        include_parent = False
-
-    try:
-        itself = psutil.Process(parent_pid)
-    except psutil.NoSuchProcess:
-        return
-
-    children = itself.children(recursive=True)
-    for child in children:
-        if child.pid == skip_pid:
-            continue
-        try:
-            child.kill()
-        except psutil.NoSuchProcess:
-            pass
-
-    if include_parent:
-        try:
-            if parent_pid == os.getpid():
-                itself.kill()
-                sys.exit(0)
-
-            itself.kill()
-
-            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
-            # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGQUIT)
-        except psutil.NoSuchProcess:
-            pass
 
 
 def _process_names(processes) -> str:
@@ -585,12 +546,12 @@ def launch_http_server_only(server_args):
     )
 
 
-def parse_url_string(url_str: str) -> list[str]:
+def parse_url_string(url_str: str | None) -> list[str]:
     """Parse a semicolon-separated URL string into a list.
 
     Example: "tcp://10.0.0.1:35000;tcp://10.0.0.2:35000" -> ["tcp://...", "tcp://..."]
     """
-    return [u.strip() for u in url_str.split(";") if u.strip()]
+    return [u.strip() for u in (url_str or "").split(";") if u.strip()]
 
 
 def launch_disagg_server(server_args: ServerArgs):
@@ -605,12 +566,23 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder result: scheduler_port + 3
     """
     configure_logger(server_args)
+    set_global_server_args(server_args)
 
-    for name, val in [
-        ("--encoder-urls", server_args.encoder_urls),
-        ("--denoiser-urls", server_args.denoiser_urls),
-        ("--decoder-urls", server_args.decoder_urls),
-    ]:
+    glm_distributed_mode_enabled = (
+        type(server_args.pipeline_config).__name__ == "GlmImagePipelineConfig"
+        and server_args.srt_encoder_url is not None
+        and server_args.encoder_urls is None
+        and server_args.decoder_urls is None
+    )
+    required_urls = [("--denoiser-urls", server_args.denoiser_urls)]
+    if not glm_distributed_mode_enabled:
+        required_urls.extend(
+            [
+                ("--encoder-urls", server_args.encoder_urls),
+                ("--decoder-urls", server_args.decoder_urls),
+            ]
+        )
+    for name, val in required_urls:
         if val is None:
             raise ValueError(f"{name} is required for --disagg-role server")
 
@@ -644,6 +616,9 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_ep,
     )
 
+    denoiser_options = (
+        {"denoiser_capacity_per_worker": 1} if glm_distributed_mode_enabled else {}
+    )
     diffusion_server = DiffusionServer(
         frontend_endpoint=frontend_endpoint,
         encoder_work_endpoints=encoder_work_endpoints,
@@ -654,6 +629,9 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
+        server_args=server_args,
+        glm_distributed_mode_enabled=glm_distributed_mode_enabled,
+        **denoiser_options,
     )
     diffusion_server.start()
 
@@ -726,6 +704,44 @@ def launch_disagg_role(server_args: ServerArgs):
         "ulysses_degree": role_par["ulysses_degree"],
         "ring_degree": role_par["ring_degree"],
     }
+    role_tp = role_par["tp_size"] or 1
+    role_sp = role_par["sp_degree"] or 1
+    cfg_degree = (
+        server_args.cfg_parallel_degree if server_args.enable_cfg_parallel else 1
+    )
+    cfg_parallel_explicit = server_args.is_arg_explicitly_set(
+        "enable_cfg_parallel"
+    ) or server_args.is_arg_explicitly_set("cfg_parallel_degree")
+    required_devices = role_tp * role_sp * cfg_degree * server_args.dp_size
+    if not cfg_parallel_explicit and (
+        required_devices > server_args.num_gpus
+        or server_args.num_gpus % required_devices != 0
+    ):
+        logger.warning(
+            "Disabling auto-enabled CFG parallel for %s role because tp=%d, "
+            "sp=%d, cfg=%d, dp=%d is incompatible with %d devices",
+            role_type.value,
+            role_tp,
+            role_sp,
+            cfg_degree,
+            server_args.dp_size,
+            server_args.num_gpus,
+        )
+        role_overrides["enable_cfg_parallel"] = False
+        role_overrides["cfg_parallel_degree"] = 1
+        cfg_degree = 1
+        required_devices = role_tp * role_sp * server_args.dp_size
+
+    if (
+        required_devices > server_args.num_gpus
+        or server_args.num_gpus % required_devices != 0
+    ):
+        raise ValueError(
+            f"Invalid parallelism for {role_type.value} role: "
+            f"tp={role_tp}, sp={role_sp}, cfg={cfg_degree}, "
+            f"dp={server_args.dp_size} requires groups of {required_devices} "
+            f"devices, but num_gpus={server_args.num_gpus}"
+        )
 
     base_dict = {
         f.name: getattr(server_args, f.name)

@@ -10,7 +10,7 @@ storing model-agnostic native cache snapshots.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 import mlx.core as mx
 import torch
@@ -95,6 +95,7 @@ class MlxAuxiliaryStatePool:
         self.mamba_cache = None
         self.mem_usage = 0
         self._snapshots: dict[int, dict[int, _CacheSnapshot]] = {}
+        self._alloc_iter: Optional[Iterator[torch.Tensor]] = None
         self.clear()
 
     def _tensor(self, indices: Any) -> torch.Tensor:
@@ -108,7 +109,31 @@ class MlxAuxiliaryStatePool:
     def available_size(self) -> int:
         return int(self.free_slots.numel())
 
+    def schedulable_available_size(self) -> int:
+        return self.available_size()
+
+    def alloc_group_begin(self, num_reqs: int) -> None:
+        self._alloc_iter = None
+        if num_reqs > 0:
+            slots = self._do_alloc(num_reqs)
+            if slots is not None:
+                self._alloc_iter = iter(slots.split(1))
+
+    def alloc_group_end(self) -> None:
+        if self._alloc_iter is not None:
+            remaining = list(self._alloc_iter)
+            if remaining:
+                self.free(torch.cat(remaining))
+        self._alloc_iter = None
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        if self._alloc_iter is not None and need_size == 1:
+            slot = next(self._alloc_iter, None)
+            if slot is not None:
+                return slot
+        return self._do_alloc(need_size)
+
+    def _do_alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > self.available_size():
             return None
         slots = self.free_slots[:need_size].clone()
@@ -128,6 +153,7 @@ class MlxAuxiliaryStatePool:
         self.free_slots = torch.cat([self.free_slots, indices])
 
     def clear(self) -> None:
+        self._alloc_iter = None
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
@@ -227,6 +253,7 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
             size=auxiliary_state_size,
             device=device,
         )
+        self.mamba_allocator = self.mamba_pool
         # The unified radix base MAMBA component still reads ``mamba_pool``.
         # Keep the MLX-owned name beside it so local code can avoid model-
         # specific terminology.
@@ -352,7 +379,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                 source_value
             )
             if forked_value is None:
-                self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
                 forked_value = (
                     self.cache.req_to_token_pool.auxiliary_state_pool.fork_from(
                         source_value

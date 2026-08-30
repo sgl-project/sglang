@@ -193,7 +193,7 @@ def match_prefix_for_req(
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
-        req.cache_protected_len = match_result.cache_protected_len
+        req.kv.cache_protected_len = match_result.cache_protected_len
     return match_result
 
 
@@ -292,6 +292,13 @@ class SchedulePolicy:
             # Turn off the expensive prefix matching and sorting when the #queue is large.
             return CacheAgnosticPolicy.FCFS
         return self.policy
+
+    def waiting_queue_prefix_matched(self, waiting_queue: List[Req]) -> bool:
+        policy = self._determine_active_policy(waiting_queue)
+        return (
+            isinstance(policy, CacheAwarePolicy)
+            or self.tree_cache.supports_fast_match_prefix()
+        )
 
     def _validate_and_adjust_policy(
         self, policy: str, tree_cache: BasePrefixCache
@@ -1320,7 +1327,7 @@ class PrefillAdder:
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
-                req.cache_protected_len = prefix_len
+                req.kv.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
@@ -1491,7 +1498,7 @@ class PrefillAdder:
                 )
                 release_counter += 1
                 self.running_batch.release_req(
-                    i, len(self.running_batch.reqs) - release_counter, server_args
+                    i, len(self.running_batch.reqs) - release_counter
                 )
             else:
                 keep_indices.append(i)
