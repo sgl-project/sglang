@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from triton_kernels.tensor_details.ragged_tensor import RaggedTensorMetadata
 
 from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
+from sglang.srt.utils.custom_op import register_custom_op
 
 try:
     from triton_kernels.tensor import make_ragged_tensor_metadata
@@ -1539,6 +1540,10 @@ def _eplb_remap_enabled() -> bool:
     )
 
 
+@register_custom_op(
+    op_name="mask_topk_ids_padded_region",
+    mutates_args=["topk_ids"],
+)
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -1558,10 +1563,14 @@ def _mask_topk_ids_padded_region(
         topk_ids[indices >= num_token_non_padded, :] = fill_value
 
 
+@register_custom_op(
+    op_name="zero_topk_weights_padded_region",
+    mutates_args=["topk_weights"],
+)
 def _zero_topk_weights_padded_region(
     topk_weights: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
-):
+) -> None:
     if num_token_non_padded is None:
         return
     if _can_fuse_padded_region(topk_weights):
