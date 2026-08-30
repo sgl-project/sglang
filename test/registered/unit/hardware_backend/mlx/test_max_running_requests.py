@@ -121,7 +121,6 @@ def _fake_req():
     return SimpleNamespace(
         req_pool_idx=None,
         inflight_middle_chunks=0,
-        kv_committed_len=0,
         mamba_pool_idx=None,
         mamba_ping_pong_track_buffer=None,
     )

@@ -12,7 +12,6 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
-from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -245,13 +244,13 @@ def tf32_hc_prenorm_gemm(
     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
 
 
-def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+def update_deep_gemm_config(gpu_id: int):
     # deep_gemm.set_pdl can initialize CUDA state, so run it only after the
     # scheduler/TP worker has been forked and assigned a GPU.
     if envs.SGLANG_DEEPGEMM_PDL.get() and hasattr(deep_gemm, "set_pdl"):
         deep_gemm.set_pdl(True)
 
-    compile_utils.update_deep_gemm_config(gpu_id, server_args)
+    compile_utils.update_deep_gemm_config(gpu_id)
 
 
 @contextmanager

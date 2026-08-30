@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import pickle
 import sys
 import threading
@@ -27,7 +28,7 @@ from sglang.srt.disaggregation.encoder.receiver import (
     _encoder_media_item,
     _select_mm_processor_prompt,
 )
-from sglang.srt.disaggregation.encoder.server import MMEncoder
+from sglang.srt.disaggregation.encoder.server import BadRequestError, MMEncoder
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.managers.tokenizer_manager import (
     _reject_missing_dispatched_encoder_embedding,
@@ -502,6 +503,17 @@ def test_kimi_k3_epd_selects_matching_jpeg_decode_mode(
 
     assert output is expected
     load.assert_called_once_with(b"jpeg", expected_decode_mode)
+
+
+def test_kimi_k3_epd_rejects_lazy_pil_decode_failure():
+    malformed_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJSwAAAABJRU5ErkJggg=="
+    )
+    encoder = _encoder()
+    encoder.preprocessor.use_image_processor_gpu = False
+
+    with pytest.raises(BadRequestError, match="Could not decode image"):
+        encoder.preprocessor._load_single_item(malformed_png, Modality.IMAGE)
 
 
 def test_kimi_k3_epd_verifies_content_hash_before_decode():
