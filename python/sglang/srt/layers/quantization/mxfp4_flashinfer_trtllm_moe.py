@@ -57,6 +57,10 @@ class Mxfp4FlashinferTrtllmMoEMethod:
 
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
+        # Applies flashinfer trtllm directly instead of going through a
+        # MoeRunner; FusedMoE still reads `.runner`, and this class is not a
+        # FusedMoEMethodBase subclass so it inherits no default.
+        self.runner = None
 
         swiglu_limit = moe_runner_config.swiglu_limit
         self._gemm1_clamp_limit_tensor = (

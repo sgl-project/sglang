@@ -87,15 +87,14 @@ def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> No
         return
     leader = group.leader
     start = group.prompt_len
-    end = leader.kv.kv_allocated_len if leader.kv is not None else start
+    end = leader.kv.kv_allocated_len
     if end > start:
         # The rewind below is required: without it the leader's own per-Req
         # release frees this decode region a second time.
         slots = req_to_token_pool.req_to_token[group.all_rows, start:end]
         token_to_kv_pool_allocator.free(slots.flatten().unique())
-        if leader.kv is not None:
-            leader.kv_committed_len = start
-            leader.kv.kv_allocated_len = start
+        leader.kv_committed_len = start
+        leader.kv.kv_allocated_len = start
     req_to_token_pool.free_rows(group.member_rows_cpu.tolist())
     group.member_rows = None
     group.member_rows_cpu = None

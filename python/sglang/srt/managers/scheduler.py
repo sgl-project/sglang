@@ -292,14 +292,16 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import get_context, publish
+from sglang.srt.runtime_context import get_context, get_spec, publish
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
-from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
+from sglang.srt.speculative.eagle_utils import (
+    get_draft_recurrent_hidden_state_spec_from_config,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -470,38 +472,38 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         self.enable_hisparse = get_memory().enable_hisparse
-        self.enable_dp_attention = get_parallel().config.enable_dp_attention
+        self.enable_dp_attention = get_parallel().enable_dp_attention
         self.enable_unified_memory = get_memory().enable_unified_memory
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
             compute_dp_attention_world_info(
-                get_parallel().config.enable_dp_attention,
+                get_parallel().enable_dp_attention,
                 tp_rank,
-                get_parallel().config.tp_size,
-                get_parallel().config.dp_size,
-                get_parallel().config.attn_cp_size,
+                get_parallel().tp_size,
+                get_parallel().dp_size,
+                get_parallel().attn_cp_size,
             )
         )
         self.ps = ParallelState(
             tp_rank=tp_rank,
-            tp_size=get_parallel().config.tp_size,
+            tp_size=get_parallel().tp_size,
             pp_rank=pp_rank,
-            pp_size=get_parallel().config.pp_size,
+            pp_size=get_parallel().pp_size,
             dp_rank=dp_rank,
-            dp_size=get_parallel().config.dp_size,
+            dp_size=get_parallel().dp_size,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=attn_tp_size,
             attn_cp_rank=attn_cp_rank,
-            attn_cp_size=get_parallel().config.attn_cp_size,
-            attn_dcp_rank=tp_rank % get_parallel().config.dcp_size,
-            attn_dcp_size=get_parallel().config.dcp_size,
+            attn_cp_size=get_parallel().attn_cp_size,
+            attn_dcp_rank=tp_rank % get_parallel().dcp_size,
+            attn_dcp_size=get_parallel().dcp_size,
             attn_dp_rank=attn_dp_rank,
             attn_dp_size=attn_dp_size,
             moe_ep_rank=moe_ep_rank,
-            moe_ep_size=get_parallel().config.ep_size,
+            moe_ep_size=get_parallel().ep_size,
             moe_dp_rank=moe_dp_rank,
-            moe_dp_size=get_parallel().config.moe_dp_size,
+            moe_dp_size=get_parallel().moe_dp_size,
             gpu_id=gpu_id,
         )
 
@@ -577,6 +579,12 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        if self.enable_hierarchical_cache:
+            cache_controller = self.tree_cache.cache_controller
+            if cache_controller is not None:
+                cache_controller.load_fence_stream = (
+                    self.tp_worker.model_runner.forward_stream
+                )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -598,7 +606,6 @@ class Scheduler(
                     else self.tp_cpu_group
                 ),
                 tree_cache=self.tree_cache,
-                server_args=self.server_args,
             )
         else:
             self.decode_offload_manager = None
@@ -1088,7 +1095,7 @@ class Scheduler(
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
                 min_free_slots=min_free_slots
             )
-        if not get_parallel().config.pp_max_micro_batch_size:
+        if not get_parallel().pp_max_micro_batch_size:
             get_context().override(
                 "scheduler.pp_max_micro_batch_size_default",
                 pp_max_micro_batch_size=max(
@@ -1293,7 +1300,6 @@ class Scheduler(
                     attn_tp_size=self.ps.attn_tp_size,
                     cpu_group=self.tp_cpu_group,
                     device_group=self.tp_group.device_group,
-                    server_args=self.server_args,
                     metrics_collector=(
                         self.metrics_collector
                         if self.metrics_reporter.enable_metrics
@@ -1375,11 +1381,18 @@ class Scheduler(
         )
 
         if self.spec_algorithm.carries_draft_hidden_states():
-            # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
-            # worker, so a single accessor covers both shapes.
-            draft_runner = self.draft_worker.draft_worker.draft_runner
+            # Derive the rank-uniform PD wire schema from config because only the
+            # last prefill PP stage owns a draft runner.
+            draft_model_config = ModelConfig.from_server_args(
+                self.server_args,
+                model_path=get_spec().speculative_draft_model_path,
+                model_revision=get_spec().speculative_draft_model_revision,
+                is_draft_model=True,
+            )
             disagg_hidden_size, disagg_hidden_states_dtype = (
-                get_draft_recurrent_hidden_state_spec(draft_runner)
+                get_draft_recurrent_hidden_state_spec_from_config(
+                    draft_model_config, self.spec_algorithm
+                )
             )
         else:
             disagg_hidden_size = 16  # minimal padding size for RDMA
@@ -1432,7 +1445,7 @@ class Scheduler(
                 gloo_group=self.attn_tp_cpu_group,
                 tp_rank=self.ps.tp_rank,
                 tp_size=self.ps.tp_size,
-                dp_size=get_parallel().config.dp_size,
+                dp_size=get_parallel().dp_size,
                 gpu_id=self.ps.gpu_id,
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
@@ -2806,7 +2819,7 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
-            buffer_mode = self.server_args.hicache_host_memory_mode == "buffer_only"
+            buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
             last_host_node = req.last_host_node
             # Buffer mode host-backups nothing, so match_prefix anchors at
             # root; re-anchor on the deepest device node. The anchor is only
@@ -2846,7 +2859,39 @@ class Scheduler(
                     tree_cache.get_last_hash_value(last_host_node),
                     prefix_keys,
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
+                    extra_key=req.extra_key,
+                    cache_salt=req.cache_salt,
                 )
+
+    def _retry_missed_storage_prefetches(self):
+        """Re-issue the availability check for queued requests whose prefetch
+        missed. Pacing counts scheduling passes so TP ranks re-issue on the
+        same pass; a sweep (the admission loop stops at the first
+        unschedulable request) covers the whole queue."""
+        interval = get_memory().hicache_storage_prefetch_retry_poll_interval
+        if interval <= 0 or not self.waiting_queue:
+            return
+        max_attempts = get_memory().hicache_storage_prefetch_retry_max_attempts
+        for req in self.waiting_queue:
+            if self.tree_cache.pop_storage_prefetch_miss(req.rid):
+                req.storage_prefetch_retry_pending = True
+                req.storage_prefetch_retry_wait_polls = 0
+            if (
+                not req.storage_prefetch_retry_pending
+                or req.storage_prefetch_retry_attempts >= max_attempts
+            ):
+                continue
+            req.storage_prefetch_retry_wait_polls += 1
+            if req.storage_prefetch_retry_wait_polls <= interval:
+                continue
+            req.storage_prefetch_retry_pending = False
+            req.storage_prefetch_retry_attempts += 1
+            logger.debug(
+                "HiCache storage prefetch retry req=%s attempt=%d",
+                req.rid,
+                req.storage_prefetch_retry_attempts,
+            )
+            self._prefetch_kvcache(req)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -3271,6 +3316,15 @@ class Scheduler(
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
             ret, need_sync=need_mlp_sync
         )
+        # Decode->extend conversion keeps a heterogeneous dp step replayable.
+        converted = self.dp_attn_adapter.maybe_convert_decode_to_extend(ret)
+        if converted is running_batch and converted.forward_mode.is_extend():
+            # The converted batch re-enters via the last_batch extend-merge
+            # next iteration; empty running_batch or it merges with itself.
+            running_batch = ScheduleBatch(
+                reqs=[], batch_is_full=running_batch.batch_is_full
+            )
+        ret = converted
         self._arm_prefill_decode_interval(ret)
 
         # Handle ngram embedding
@@ -3291,7 +3345,7 @@ class Scheduler(
         beam_width: Optional[int] = None,
         running_batch: Optional[ScheduleBatch] = None,
     ) -> int:
-        pp_budget = get_parallel().config.pp_max_micro_batch_size - running_bs
+        pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
         available = self.req_to_token_pool.available_size()
 
         active_batch = running_batch or self.running_batch
@@ -3345,6 +3399,8 @@ class Scheduler(
 
         if self.enable_hierarchical_cache or get_memory().enable_flexkv:
             self.tree_cache.check_hicache_events()
+            if self.enable_hicache_storage:
+                self._retry_missed_storage_prefetches()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -3487,21 +3543,23 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache)
             if (
                 self.enable_hicache_storage
-                and self.server_args.hicache_host_memory_mode == "buffer_only"
+                and get_memory().hicache_host_memory_mode == "buffer_only"
             ):
                 # Buffer mode: surface a staged prefetch as the request's host
                 # hit (consumed through init_load_back) plus its SWA window,
                 # which consumption allocates and the request lock pins —
-                # uncharged, the batch alloc can OOM. Set AFTER
+                # uncharged, the batch alloc can OOM. Planned against the same
+                # live prefix admission uses, so only the splice-able span
+                # tail is charged and unusable holds are freed. Set AFTER
                 # init_next_round_input (which recomputes host_hit). Mamba
                 # (fenced in init_hicache) will need the same charge via
                 # mamba_host_hit_length.
-                held_tokens = self.tree_cache.staged_prefetch_tokens(req.rid)
+                held_tokens, held_swa_tokens = self.tree_cache.plan_staged_splice(
+                    req.rid, len(req.prefix_indices)
+                )
                 if held_tokens > 0:
                     req.host_hit_length = held_tokens
-                    req.swa_host_hit_length = (
-                        self.tree_cache.staged_prefetch_swa_tokens(req.rid)
-                    )
+                    req.swa_host_hit_length = held_swa_tokens
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3589,7 +3647,7 @@ class Scheduler(
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.swa_evict_floor = req.extend_range.end
+                req.kv.swa_evict_floor = req.extend_range.end
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -3680,9 +3738,7 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
-            )
+            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
@@ -3943,7 +3999,9 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3954,12 +4012,14 @@ class Scheduler(
                         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)
-                # Sync D2H so the result processor can read CPU tensors.
+                # Only the last PP rank owns real results requiring D2H; other ranks
+                # consume device tensors rebuilt from the output ring.
                 batch_result.copy_done = self.device_module.Event()
-                batch_result.copy_to_cpu(
-                    return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
-                )
+                if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
+                    batch_result.copy_to_cpu(
+                        return_logprob=batch.return_logprob,
+                        return_hidden_states=batch.return_hidden_states,
+                    )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
@@ -4391,7 +4451,7 @@ class Scheduler(
                 if tc.enable_storage:
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
-                    if self.server_args.hicache_host_memory_mode == "buffer_only":
+                    if get_memory().hicache_host_memory_mode == "buffer_only":
                         # Queued writes, staged prefetches, and in-flight
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
@@ -4544,7 +4604,12 @@ class Scheduler(
         # Resolved config (pristine server_args + post-publish overrides) so a
         # readback reflects values changed via /set_internal_state, not startup.
         ret = get_context().resolved_server_args_dict()
-        ret["world_size"] = compute_world_size(get_parallel().config)
+        ret["world_size"] = compute_world_size(
+            enable_dp_attention=get_parallel().enable_dp_attention,
+            dp_size=get_parallel().dp_size,
+            tp_size=get_parallel().tp_size,
+            pp_size=get_parallel().pp_size,
+        )
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         draft_graph_memory_usage = (
             None if self.draft_worker is None else self.draft_worker.graph_memory_usage
@@ -4590,9 +4655,8 @@ class Scheduler(
         if envs.SGLANG_EXPOSE_OWN_ENV_VARS.get():
             ret["env_vars"] = exportable_env_vars()
 
-        # These fields are not msgpack-serializable (a config object and a bound
-        # signal handler); no reader consumes them.
-        ret.pop("model_config", None)
+        # A bound signal handler is not msgpack-serializable, and no reader
+        # consumes it.
         ret.pop("custom_sigquit_handler", None)
 
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
@@ -4945,7 +5009,6 @@ class Scheduler(
             # discarded. Non-decode modes ignore offload_kv (they never offload).
             retract_all(
                 reqs=retract_reqs,
-                server_args=self.server_args,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tree_cache=self.tree_cache,
@@ -5015,7 +5078,7 @@ class Scheduler(
 
         old_ep_size = ElasticEPStateManager.get_effective_ep_size()
         new_ep_size = recv_req.new_ep_size
-        max_ep_size = get_parallel().config.max_ep_size or old_ep_size
+        max_ep_size = get_parallel().max_ep_size or old_ep_size
 
         logger.debug(
             "[Elastic EP][scale] request received: new_ep_size=%d "
@@ -5220,7 +5283,7 @@ def dispatch_event_loop(scheduler: Scheduler):
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
-        elif get_parallel().config.pp_size > 1:
+        elif get_parallel().pp_size > 1:
             scheduler.event_loop_pp()
         elif scheduler.enable_overlap_mlx:
             scheduler.event_loop_overlap_mlx()
@@ -5229,14 +5292,14 @@ def dispatch_event_loop(scheduler: Scheduler):
         else:
             scheduler.event_loop_normal()
     elif disaggregation_mode == DisaggregationMode.PREFILL:
-        if get_parallel().config.pp_size > 1:
+        if get_parallel().pp_size > 1:
             scheduler.event_loop_pp_disagg_prefill()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_prefill()
         else:
             scheduler.event_loop_normal_disagg_prefill()
     elif disaggregation_mode == DisaggregationMode.DECODE:
-        if get_parallel().config.pp_size > 1:
+        if get_parallel().pp_size > 1:
             scheduler.event_loop_pp_disagg_decode()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_decode()
@@ -5277,15 +5340,15 @@ def configure_scheduler_process(
     prefix = ""
     if shown_dp is not None:
         prefix += f" DP{shown_dp}"
-    if get_parallel().config.pp_size > 1:
+    if get_parallel().pp_size > 1:
         prefix += f" PP{pp_rank}"
-    if get_parallel().config.attn_cp_size > 1:
+    if get_parallel().attn_cp_size > 1:
         prefix += f" ATTN_CP{attn_cp_rank}"
-    if get_parallel().config.moe_dp_size > 1:
+    if get_parallel().moe_dp_size > 1:
         prefix += f" MOE_DP{moe_dp_rank}"
-    if get_parallel().config.tp_size > 1:
+    if get_parallel().tp_size > 1:
         prefix += f" TP{shown_tp}"
-    if get_parallel().config.ep_size > 1:
+    if get_parallel().ep_size > 1:
         prefix += f" EP{shown_moe_ep}"
 
     # Config the process
@@ -5299,9 +5362,9 @@ def configure_scheduler_process(
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():
         set_gpu_proc_affinity(
-            get_parallel().config.pp_size,
-            get_parallel().config.tp_size,
-            get_parallel().config.nnodes,
+            get_parallel().pp_size,
+            get_parallel().tp_size,
+            get_parallel().nnodes,
             gpu_id,
         )
     if not envs.SGLANG_NUMA_BIND_V2.get():
