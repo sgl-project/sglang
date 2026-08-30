@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from sglang.srt.layers.attention.dsa_backend import _new_aiter_mla_output
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dsa_attention import (
@@ -38,6 +39,15 @@ register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
 class TestDSAAttentionBackendCorrectness(CustomTestCase):
     CASES = make_dsa_dense_fallback_cases("dsa")
     SPARSE_CASES = make_dsa_sparse_cases("dsa")
+
+    def test_aiter_mla_output_allocation_contract(self):
+        q = torch.empty((2, 16, 576), dtype=torch.float8_e4m3fn)
+        output = _new_aiter_mla_output(q, (2, 16, 512))
+
+        self.assertEqual(output.shape, (2, 16, 512))
+        self.assertEqual(output.dtype, torch.bfloat16)
+        self.assertEqual(output.element_size(), 2)
+
     # PCG/BCG split-op extend coverage is *not* added here — DSA's
     # MHA_ONE_SHOT dense fallback passes K as concatenated prefix+extend
     # (length = sum(seq_lens)) to `module.attn`, but
