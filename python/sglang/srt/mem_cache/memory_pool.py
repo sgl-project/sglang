@@ -300,7 +300,7 @@ class ReqToTokenPool:
         #         sum(1 for i in reusing if reqs[i].inflight_middle_chunks > 0) <= 1
         #     ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
-            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
+            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv.kv_committed_len > 0
             for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
