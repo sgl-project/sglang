@@ -63,15 +63,16 @@ class SessionSlot:
 
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
+        kv = req.detach_kv()
         if is_first:
             self.last_node = req.last_node
             self.swa_uuid_for_lock = req.swa_uuid_for_lock
             self.skip_lock_node_ids = req.skip_lock_node_ids
             # The slot takes over the request's KV record.
-            self.kv = req.kv
+            self.kv = kv
         else:
             # Later turns run on the slot's record (see restore_to_req).
-            assert req.kv is self.kv
+            assert kv is self.kv
 
         self.mamba_pool_idx = req.mamba_pool_idx
         self.mamba_ping_pong_track_buffer = req.mamba_ping_pong_track_buffer
@@ -80,9 +81,8 @@ class SessionSlot:
         self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
         self.mamba_branching_seqlen = req.mamba_branching_seqlen
 
-        # Ownership moved to the slot; clear the req's references so a later
-        # alloc/retract path cannot mistake slot-owned mamba state for its own.
-        req.kv = ReqKvInfo()
+        # The mamba state moved to the slot too; clear the req's references so a
+        # later alloc/retract path cannot mistake slot-owned state for its own.
         req.mamba_pool_idx = None
         req.mamba_ping_pong_track_buffer = None
         req.mamba_next_track_idx = None
@@ -307,6 +307,7 @@ class StreamingSession(BasePrefixCache):
         # in req_nodes (finish_req was never called -> last successful
         # req). Next request re-prefills from scratch.
         if isinstance(req.finished_reason, FINISH_ABORT):
+            kv = req.detach_kv()
             if slot is None:
                 # First-request mid-processing abort: create ephemeral
                 # slot from req state so release_session handles cleanup.
@@ -316,7 +317,7 @@ class StreamingSession(BasePrefixCache):
                 # return the (possibly extra_buffer ping-pong) slots to
                 # the mamba pool; otherwise the abort orphans them.
                 slot = SessionSlot(
-                    kv=req.kv,
+                    kv=kv,
                     last_node=req.last_node,
                     swa_uuid_for_lock=req.swa_uuid_for_lock,
                     skip_lock_node_ids=req.skip_lock_node_ids,
@@ -329,9 +330,8 @@ class StreamingSession(BasePrefixCache):
                 req.mamba_pool_idx = None
                 req.mamba_ping_pong_track_buffer = None
             else:
-                assert req.kv is slot.kv
+                assert kv is slot.kv
             self.release_session(session_id)
-            req.kv = ReqKvInfo()
             req.session.abort_req()
             return True
 

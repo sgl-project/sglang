@@ -83,6 +83,10 @@ class _FakeReq:
         self.skip_lock_node_ids = {}
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
+
+    def detach_kv(self):
+        kv, self.kv = self.kv, ReqKvInfo()
+        return kv
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
