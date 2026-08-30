@@ -69,7 +69,11 @@ class TestDiffusionCompileTrajectoryGateZImageTurbo(CustomTestCase):
         self.assertTrue(manifest_path.exists())
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(len(manifest), 1)
-        self.assertEqual(manifest[0]["status"], "validated")
+        self.assertEqual(
+            manifest[0]["status"],
+            "validated",
+            f"manifest not validated: {json.dumps(manifest[0], indent=2)}",
+        )
 
     def _generate(self, *, width: int, height: int, manifest_path: Path) -> str:
         cmd = [
