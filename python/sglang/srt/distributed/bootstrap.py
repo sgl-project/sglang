@@ -29,6 +29,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
     get_serving,
@@ -82,12 +83,10 @@ def init_torch_distributed(
     backend = _resolve_backend(device=device, server_args=server_args)
 
     before_avail_memory = get_available_gpu_memory(device, ps.gpu_id)
-    if not server_args.enable_p2p_check:
+    if not get_parallel().enable_p2p_check:
         monkey_patch_p2p_access_check()
 
-    dist_init_method = _resolve_dist_init_method(
-        server_args=server_args, dist_port=dist_port
-    )
+    dist_init_method = _resolve_dist_init_method(dist_port=dist_port)
     _set_all_reduce_flags(server_args=server_args)
 
     if not is_draft_worker:
@@ -135,7 +134,7 @@ def init_torch_distributed(
             _prewarm_tp_lm_head_all_to_all()
 
     maybe_wait_for_gated_launch(
-        host=server_args.host, port=server_args.gated_launch_port
+        host=get_serving().host, port=get_parallel().gated_launch_port
     )
 
     # Draft workers reuse the target pool config and may exist on only one PP stage;
@@ -177,7 +176,7 @@ def _resolve_backend(*, device: str, server_args: ServerArgs) -> str:
     return backend
 
 
-def _resolve_dist_init_method(*, server_args: ServerArgs, dist_port: int) -> str:
+def _resolve_dist_init_method(*, dist_port: int) -> str:
     # Allow external orchestrators (e.g. trainpi) to override the distributed
     # init method.  When set to "env://", torch uses MASTER_ADDR/MASTER_PORT
     # env-vars and an externally-created TCPStore, completely avoiding port
@@ -185,8 +184,8 @@ def _resolve_dist_init_method(*, server_args: ServerArgs, dist_port: int) -> str
     dist_init_method_override = envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
     if dist_init_method_override:
         dist_init_method = dist_init_method_override
-    elif server_args.dist_init_addr:
-        na = NetworkAddress.parse(server_args.dist_init_addr)
+    elif get_parallel().dist_init_addr:
+        na = NetworkAddress.parse(get_parallel().dist_init_addr)
         dist_init_method = na.to_tcp()
     else:
         dist_init_method = NetworkAddress(
@@ -240,7 +239,7 @@ def _init_parallel_groups(
 ) -> None:
     is_ep_joiner = server_args.is_ep_joiner
     is_scale_joiner = server_args.is_ep_scale_joiner
-    rank_offset = server_args.ep_join_rank_offset if is_scale_joiner else 0
+    rank_offset = get_parallel().ep_join_rank_offset if is_scale_joiner else 0
     world_size = (
         rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
     )
@@ -252,10 +251,10 @@ def _init_parallel_groups(
         rank=rank,
         local_rank=gpu_id,
         distributed_init_method=dist_init_method,
-        timeout=server_args.dist_timeout,
+        timeout=get_parallel().dist_timeout,
         moe_a2a_backend=get_exec().moe.moe_a2a_backend,
         recovered_rank=is_ep_joiner,
-        max_world_size=server_args.max_ep_size,
+        max_world_size=get_parallel().max_ep_size,
     )
     initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
@@ -265,7 +264,7 @@ def _init_parallel_groups(
         attention_context_model_parallel_size=attn_cp_size,
         moe_data_model_parallel_size=moe_dp_size,
         decode_context_parallel_size=dcp_size,
-        duplicate_tp_group=server_args.enable_pdmux,
+        duplicate_tp_group=get_disagg().enable_pdmux,
         duplicate_attn_cp_group=(
             is_hip()
             and server_args.enable_two_batch_overlap
@@ -274,7 +273,7 @@ def _init_parallel_groups(
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         recovered_rank=is_ep_joiner,
         rank_offset=rank_offset,
-        max_world_size=server_args.max_ep_size,
+        max_world_size=get_parallel().max_ep_size,
     )
     _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(
