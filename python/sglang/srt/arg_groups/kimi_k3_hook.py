@@ -87,7 +87,7 @@ def apply_kimi_k3_linear_attn_defaults(
     native_kimi_linear = _uses_native_kimi_linear_unbounded_kda(
         server_args, model_arch=model_arch, hf_config=hf_config
     )
-    if native_kimi_linear and is_sm100_supported():
+    if native_kimi_linear and get_platform().is_sm100:
         changes = {}
         ssm_dtype = cfg.mamba_ssm_dtype
         if ssm_dtype is None:
