@@ -162,13 +162,7 @@ class TestLMCRadixCacheXPU(unittest.TestCase):
             # commit it as a finished request (inserts into radix + stores to
             # LMCache on tree.store_stream).
             req_pool_idx = req_to_token_pool.alloc(
-                [
-                    SimpleNamespace(
-                        req_pool_idx=None,
-                        inflight_middle_chunks=0,
-                        kv=SimpleNamespace(kv_committed_len=0),
-                    )
-                ]
+                [SimpleNamespace(req_pool_idx=None, inflight_middle_chunks=0)]
             )[0]
             kv_slots = allocator.alloc(self.INPUT_LEN)
             self.assertIsNotNone(kv_slots)
