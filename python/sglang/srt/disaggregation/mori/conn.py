@@ -49,6 +49,7 @@ from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
+_TAG_ABORT = b"ABORT"
 
 
 def _normalize_state_indices_per_component(
@@ -642,11 +643,52 @@ class MoriKVManager(CommonKVManager):
             return None
         return payload
 
+    def _handle_abort_message(self, msg: List[bytes]) -> None:
+        """Handle best-effort ABORT notifications from the decode side."""
+        if len(msg) < 2:
+            logger.warning("Malformed ABORT message: too few frames (%d)", len(msg))
+            return
+
+        try:
+            bootstrap_room = int(msg[1].decode("ascii"))
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("Malformed ABORT message: invalid room field %r", msg[1])
+            return
+
+        with self.transfer_lock:
+            current = self.request_status.get(bootstrap_room)
+            if current is None:
+                logger.debug(
+                    "ABORT for room %s is not tracked; ignoring",
+                    bootstrap_room,
+                )
+                return
+            if current == KVPoll.Success:
+                logger.debug(
+                    "ABORT for room %s already succeeded; ignoring",
+                    bootstrap_room,
+                )
+                return
+            if current == KVPoll.Failed:
+                return
+
+            self.update_status(bootstrap_room, KVPoll.Failed)
+
+        logger.debug("Room %s marked Failed via ABORT from decode", bootstrap_room)
+
     def _start_bootstrap_thread(self) -> None:
         def bootstrap_worker():
             while True:
                 try:
                     msg = self.server_socket.recv_multipart()
+                    if not msg:
+                        continue
+
+                    tag = msg[0]
+                    if tag == _TAG_ABORT:
+                        self._handle_abort_message(msg)
+                        continue
+
                     payload = self._validate_message(msg)
                     if payload is None:
                         continue
@@ -1331,6 +1373,10 @@ class MoriKVManager(CommonKVManager):
 
         targets: List[TransferTarget] = []
         with self.transfer_lock:
+            current = self.request_status.get(bootstrap_room)
+            if current is None or current == KVPoll.Failed:
+                return []
+
             transfer_infos = self.transfer_infos.get(bootstrap_room)
             if not transfer_infos:
                 raise RuntimeError(
@@ -1654,8 +1700,11 @@ class MoriKVReceiver(CommonKVReceiver):
     def abort(self):
         if self.bootstrap_room is None:
             return
+        bootstrap_room = self.bootstrap_room
         super().abort()
         self.clear()
+        with self.kv_mgr.failure_lock:
+            self.kv_mgr.failure_records.pop(bootstrap_room, None)
 
 
 class MoriKVBootstrapServer(CommonKVBootstrapServer):

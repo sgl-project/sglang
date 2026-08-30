@@ -202,8 +202,7 @@ if _use_aiter:
 
 
 if _is_cuda:
-    from sgl_kernel import fp8_scaled_mm
-
+    from sglang.kernels.ops.gemm import fp8_scaled_mm
     from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
@@ -2120,7 +2119,9 @@ def validate_fp8_block_shape(
 ) -> None:
     """Validate block quantization shapes for tensor parallelism."""
 
-    tp_size = getattr(layer, "tp_size", get_parallel().tp_size)
+    # Lazy: a ``getattr`` default would read the published bag even for a
+    # layer that carries its own tp_size.
+    tp_size = layer.tp_size if hasattr(layer, "tp_size") else get_parallel().tp_size
     block_n, block_k = block_size[0], block_size[1]
 
     # Required by row parallel

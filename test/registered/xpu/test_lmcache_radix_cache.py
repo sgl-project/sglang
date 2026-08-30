@@ -72,7 +72,7 @@ def _make_req(rid, req_pool_idx, token_ids, tree):
         extra_key=None,
         cache_salt=None,
         last_node=tree.root_node,
-        cache_protected_len=0,
+        kv=SimpleNamespace(cache_protected_len=0),
         priority=0,
         kv_committed_freed=False,
         kv_committed_len=len(token_ids),

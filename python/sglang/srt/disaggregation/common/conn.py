@@ -180,10 +180,11 @@ class CommonKVManager(BaseKVManager):
         self.enable_deferred_decode_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
         )
+        self._dcp_pack_buffers = None
         # for p/d multi node infer
         self.bootstrap_host = get_serving().host
         self.bootstrap_port = get_disagg().disaggregation_bootstrap_port
-        self.dist_init_addr = get_parallel().config.dist_init_addr
+        self.dist_init_addr = get_parallel().dist_init_addr
         parallel = get_parallel()
         self.attn_tp_size = parallel.attn_tp_size
         self.attn_tp_rank = parallel.attn_tp_rank
@@ -194,19 +195,16 @@ class CommonKVManager(BaseKVManager):
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
         self.system_dp_size = (
-            1
-            if get_parallel().config.enable_dp_attention
-            else get_parallel().config.dp_size
+            1 if get_parallel().enable_dp_attention else get_parallel().dp_size
         )
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0
         )
-        self.pp_size = get_parallel().config.pp_size
+        self.pp_size = get_parallel().pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
-            self.is_hybrid_mla_backend
-            or get_parallel().config.enable_dsa_cache_layer_split
+            self.is_hybrid_mla_backend or get_parallel().enable_dsa_cache_layer_split
         )
 
         hybrid_decode_pulls_all_ranks = (
@@ -319,7 +317,7 @@ class CommonKVManager(BaseKVManager):
         return (
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
-            and not get_parallel().config.enable_dsa_cache_layer_split
+            and not get_parallel().enable_dsa_cache_layer_split
         )
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
@@ -354,6 +352,25 @@ class CommonKVManager(BaseKVManager):
                 f"src={src_token_lens}, dst={dst_token_lens}"
             )
         return src_token_lens
+
+    def _register_staging_memory(self, ptr: int, size: int) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support staging memory registration"
+        )
+
+    def _init_dcp_pack_buffers_once(self, dcp_size: int) -> None:
+        if self._dcp_pack_buffers is not None:
+            return
+        if not self.kv_args.kv_item_lens:
+            return
+        from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
+
+        self._dcp_pack_buffers = init_dcp_pack_buffers(
+            self._register_staging_memory,
+            self.kv_args,
+            len(self.transfer_queues),
+            dcp_size,
+        )
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
@@ -548,6 +565,7 @@ class CommonKVManager(BaseKVManager):
             # The room concluded and was cleared. Recording a failure now would
             # leave an entry that a later request reusing this bootstrap_room
             # would pick up as its own root cause.
+            logger.debug("Dropping late status for cleared room %s", bootstrap_room)
             return
         if status == KVPoll.Success:
             self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
@@ -973,7 +991,7 @@ class CommonKVManager(BaseKVManager):
         `Connection refused`, and the leader's `prefill_port_table` ends
         up missing rows.
         """
-        if not self.dist_init_addr or get_parallel().config.nnodes == 1:
+        if not self.dist_init_addr or get_parallel().nnodes == 1:
             return local_port
 
         if not (dist.is_available() and dist.is_initialized()):
@@ -1025,8 +1043,8 @@ class CommonKVManager(BaseKVManager):
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
-            "load_balance_method": get_parallel().config.load_balance_method,
-            "enable_dsa_cache_layer_split": get_parallel().config.enable_dsa_cache_layer_split,
+            "load_balance_method": get_parallel().load_balance_method,
+            "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1408,12 +1426,11 @@ class CommonKVSender(BaseKVSender):
             return
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        if get_parallel().config.dp_size > 1 and not req_has_disagg_prefill_dp_rank:
-            if get_parallel().config.load_balance_method != "follow_bootstrap_room":
+        if get_parallel().dp_size > 1 and not req_has_disagg_prefill_dp_rank:
+            if get_parallel().load_balance_method != "follow_bootstrap_room":
                 self._register_prefill_dp_rank()
             elif (
-                self.kv_mgr.attn_dp_rank
-                != self.bootstrap_room % get_parallel().config.dp_size
+                self.kv_mgr.attn_dp_rank != self.bootstrap_room % get_parallel().dp_size
             ):
                 # follow_bootstrap_room was overridden by external routed_dp_rank
                 if envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get():
@@ -1424,7 +1441,7 @@ class CommonKVSender(BaseKVSender):
                         f"follow_bootstrap_room conflict: dispatched to dp_rank "
                         f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
                         f"{self.bootstrap_room} implies dp_rank "
-                        f"{self.bootstrap_room % get_parallel().config.dp_size}. "
+                        f"{self.bootstrap_room % get_parallel().dp_size}. "
                         f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
                         f"to allow mixed routing.",
                     )
@@ -1498,7 +1515,7 @@ class CommonKVSender(BaseKVSender):
 
         if (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
-            and not get_parallel().config.enable_dsa_cache_layer_split
+            and not get_parallel().enable_dsa_cache_layer_split
         ):
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,

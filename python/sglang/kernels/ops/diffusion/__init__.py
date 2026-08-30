@@ -222,6 +222,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Paired interleaved RoPE with fp64 Diffusers semantics.",
     ),
     (
+        "diffusion.helios_qk_rope",
+        KernelBackend.JIT,
+        "rope.helios_qk_rope_jit:fused_inplace_helios_qk_rope",
+        _CUDA,
+        "Paired in-place Helios transposed Q/K RoPE.",
+    ),
+    (
         "diffusion.hunyuan_qkv_rope_pack",
         KernelBackend.TRITON,
         "rope.hunyuan_qkv_pack_triton:hunyuan_qkv_rope_pack",
@@ -410,6 +417,8 @@ _EXPORTS: dict[str, str] = {
     "fused_rope_rotate_half_bitexact": "rope.rope_rotate_half_bitexact",
     "can_use_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
     "fused_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
+    "can_use_helios_qk_rope": "rope.helios_qk_rope_jit",
+    "fused_inplace_helios_qk_rope": "rope.helios_qk_rope_jit",
     "apply_rotary_embedding": "rope.rotary_triton",
     # Activation-function fusions
     "can_use_fused_bias_glu": "activation.sana_conv_post_triton",
