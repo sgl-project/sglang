@@ -270,6 +270,26 @@ class ServerArgs:
                     validate_mps_runtime()
 
             run_resolution_pipeline(self)
+
+            # The standard Torch MPS path supports a narrow slice of the
+            # execution modes, and the checkpoint-derived ones (a quantized or
+            # multimodal config) are only knowable from the model config. Run
+            # these checks after every declaration is visible, but before this
+            # resolution attempt is allowed to remain marked as finished.
+            cfg = resolving_view(self)
+            if (
+                cfg.device == "mps"
+                and not use_mlx()
+                and str(cfg.model_path).lower() not in ("none", "dummy")
+            ):
+                validate_standard_mps_server_args(self)
+                lora_enabled = bool(cfg.enable_lora) or (
+                    cfg.enable_lora is None and bool(cfg.lora_paths)
+                )
+                validate_mps_model_config(
+                    model_config_of(self),
+                    lora_enabled=lora_enabled,
+                )
         except BaseException:
             self._resolution_failed = True
             raise
@@ -277,24 +297,6 @@ class ServerArgs:
             self._input_frozen = False
         # Also mark the dummy/absent-model path, which returns early from the pipeline.
         self._resolution_finished = True
-
-        # The standard Torch MPS path supports a narrow slice of the execution
-        # modes, and the checkpoint-derived ones (a quantized or multimodal
-        # config) are only knowable from the model config. Reading that config
-        # has to stay out of the resolution walk, so both checks land here,
-        # once every declaration is visible. Skipped for none/dummy, which
-        # never reach the end of the pipeline and have no checkpoint.
-        cfg = resolving_view(self)
-        if (
-            cfg.device == "mps"
-            and not use_mlx()
-            and str(cfg.model_path).lower() not in ("none", "dummy")
-        ):
-            validate_standard_mps_server_args(self)
-            validate_mps_model_config(
-                model_config_of(self),
-                lora_enabled=bool(getattr(self, "enable_lora", False)),
-            )
 
     @property
     def launch_command(self) -> str | None:
