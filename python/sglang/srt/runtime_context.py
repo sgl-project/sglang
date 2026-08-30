@@ -247,13 +247,72 @@ class ParallelContext:
     def clear_derived_widths(self) -> None:
         self._derived.clear()
 
-    def _derived_width(self, name, getter):
-        """A width the leaves imply: the stamp, else the live group.
+    # The leaves the quotients are computed from, with the value that means
+    # "this dimension is not in play". A leaf that is neither overridden,
+    # stamped, nor published takes its neutral value: a test that says
+    # `override(tp_size=8, attn_dp_size=2)` is stating a two-dimensional
+    # topology, and requiring it to also spell out `moe_ep_size=1` would be
+    # asking it to state the absence of every dimension it is not using.
+    _LEAVES = {
+        "tp_size": 1,
+        "attn_cp_size": 1,
+        "attn_dp_size": 1,
+        "moe_ep_size": 1,
+        "moe_dp_size": 1,
+        "dcp_size": 1,
+        "dcp_enabled": False,
+    }
 
-        The fallback keeps a process that installed groups without going
-        through `initialize_model_parallel` working. When neither is there,
-        the failure says which of the two is missing rather than surfacing a
-        group getter's bare assertion.
+    def _widths_from_leaves(self) -> dict:
+        """The quotients, computed from whatever the leaves say right now.
+
+        Three of the seven inputs -- `attn_dp_size`, `moe_ep_size`,
+        `dcp_enabled` -- are also *outputs*: the derivation normalises a
+        configured value and hands it back under the same name. So the leaves
+        are read from their sources directly (override, stamp, published bag)
+        rather than through the properties, which for those three would come
+        straight back here and recurse.
+        """
+        leaves = {}
+        stated = False
+        config = self._config
+        for leaf, neutral in self._LEAVES.items():
+            if leaf in self._overrides:
+                leaves[leaf] = self._overrides[leaf]
+                stated = True
+            elif leaf in self._derived:
+                leaves[leaf] = self._derived[leaf]
+                stated = True
+            elif config is not None and leaf in config._fields:
+                leaves[leaf] = getattr(config, leaf)
+                stated = True
+            else:
+                leaves[leaf] = neutral
+        if not stated:
+            # Every leaf fell back to its neutral value, so the answer would be
+            # 1 for every width -- a plausible-looking number invented out of
+            # nothing. A caller in this state has stated no topology at all,
+            # which is the failure the message below is for.
+            raise ValueError("no parallel leaf is stated")
+        return derive_parallel_widths(**leaves)
+
+    def _derived_width(self, name, getter):
+        """A width the leaves imply: the stamp, else the live group, else the
+        leaves themselves.
+
+        The live-group fallback keeps a process that installed groups without
+        going through `initialize_model_parallel` working, and it stays ahead of
+        the leaf derivation on purpose: where a group exists it *is* the truth,
+        and elastic scale-up moves the group without restamping (see
+        `world_size`, which is not a quotient and so is not derived here).
+
+        The leaf derivation is last, so it only answers where no group has been
+        built. That is the case a test is in when it states a topology --
+        `override(tp_size=8, attn_dp_size=2)` now yields `attn_tp_size == 4`
+        instead of raising, so a caller can override the inputs rather than the
+        answer. When even the leaves are unavailable, the failure says which of
+        the three is missing rather than surfacing a group getter's bare
+        assertion.
         """
         overrides = self._overrides
         if name in overrides:
@@ -263,13 +322,19 @@ class ParallelContext:
             return derived[name]
         try:
             return getter()
-        except (AssertionError, AttributeError, RuntimeError) as exc:
+        except (AssertionError, AttributeError, RuntimeError):
+            pass
+        try:
+            return self._widths_from_leaves()[name]
+        except (AssertionError, AttributeError, KeyError, ValueError) as exc:
             raise RuntimeError(
                 f"derived parallel width {name!r} is not available: it is "
                 "computed from the configured leaves when the process groups "
                 "are built (initialize_model_parallel / "
-                "initialize_dp_attention), and neither a stamp nor a live "
-                "group is present"
+                "initialize_dp_attention). No stamp, no live group, and the "
+                "leaves it derives from are not readable either -- publish a "
+                "parallel config, or state the leaves with "
+                "get_parallel().override(...)"
             ) from exc
 
     @contextmanager

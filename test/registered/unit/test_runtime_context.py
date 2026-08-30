@@ -1446,6 +1446,41 @@ class TestDerivedWidths(_IsolatedOverrides):
             )
         )
 
+    def test_a_width_follows_the_leaves_when_no_group_is_built(self):
+        """State the inputs, not the answer.
+
+        The quotients used to be readable only from a stamp or a live process
+        group, so a caller with neither could override `attn_tp_size` itself
+        but not the `tp_size` and `attn_dp_size` it divides -- overriding the
+        inputs raised. A test stating a topology had to state the conclusion
+        too, and the two could disagree.
+        """
+        parallel = get_parallel()
+        with parallel.override(tp_size=8, attn_dp_size=2):
+            self.assertEqual(parallel.attn_tp_size, 4)
+            self.assertEqual(parallel.moe_tp_size, 8)
+        with parallel.override(tp_size=8, moe_ep_size=4, moe_dp_size=2):
+            self.assertEqual(parallel.moe_tp_size, 1)
+
+    def test_an_unstated_topology_still_fails(self):
+        """Neutral leaves are for the dimensions a caller is not using, not for
+        a caller that stated nothing: every width would come back 1, which is a
+        plausible-looking number invented out of nothing."""
+        with self.assertRaises(RuntimeError) as caught:
+            get_parallel().attn_tp_size
+        self.assertIn("not available", str(caught.exception))
+
+    def test_a_stamp_and_a_live_group_both_win_over_the_leaves(self):
+        """Order is stamp, then live group, then the leaves. Where a group
+        exists it is the truth -- elastic scale-up moves the group without
+        restamping -- so the leaf derivation only answers where there is none.
+        """
+        parallel = get_parallel()
+        parallel.stamp_derived_widths(attn_tp_size=7)
+        self.addCleanup(parallel.clear_derived_widths)
+        with parallel.override(tp_size=8, attn_dp_size=2):
+            self.assertEqual(parallel.attn_tp_size, 7)
+
     def test_the_quotients_come_from_the_leaves(self):
         widths = derive_parallel_widths(
             tp_size=8,
