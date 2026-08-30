@@ -306,6 +306,9 @@ class ServerArgs(DisaggServerArgsMixin):
     component_paths: dict[str, str] = field(default_factory=dict)
     # Exact weight-file overrides retain the base component configuration.
     component_weights_paths: dict[str, str] = field(default_factory=dict)
+    # Opt in one component to a loader-specific direct-GPU weight path.  The
+    # existing --direct-gpu-weight-loading remains the primary-DiT control.
+    component_direct_gpu_weight_loading: dict[str, bool] = field(default_factory=dict)
     # Explicit quantization override for one component. Self-describing
     # checkpoints remain auto-detected and do not need this override.
     component_quantizations: dict[str, str] = field(default_factory=dict)
@@ -1752,6 +1755,16 @@ class ServerArgs(DisaggServerArgsMixin):
             component_weights_paths[component] = path
         self.component_paths = component_paths
         self.component_weights_paths = component_weights_paths
+        normalized_direct_gpu_loading: dict[str, bool] = {}
+        for component, enabled in self.component_direct_gpu_weight_loading.items():
+            component_name = str(component).strip().replace("-", "_")
+            if not component_name or not isinstance(enabled, bool):
+                raise ValueError(
+                    "Component direct GPU loading entries require a component and "
+                    "a boolean value"
+                )
+            normalized_direct_gpu_loading[component_name] = enabled
+        self.component_direct_gpu_weight_loading = normalized_direct_gpu_loading
         normalized_quantizations: dict[str, str] = {}
         for component, quantization in self.component_quantizations.items():
             component = str(component).strip().replace("-", "_")
@@ -2914,6 +2927,52 @@ class ServerArgs(DisaggServerArgsMixin):
             alias_suffix="-weights-path",
         )
 
+    @staticmethod
+    def _extract_component_direct_gpu_weight_loading(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, bool], list[str]]:
+        """Extract exact component direct-GPU loading toggles.
+
+        Dynamic boolean flags mirror ``StoreBoolean``: an omitted value means
+        true, while an explicit ``true`` or ``false`` works with either an
+        equals form or a following argument.
+        """
+        values: dict[str, bool] = {}
+        remaining: list[str] = []
+        prefixes = (
+            "--component-direct-gpu-weight-loading.",
+            "--component_direct_gpu_weight_loading.",
+        )
+        i = 0
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            prefix = next(
+                (candidate for candidate in prefixes if key_part.startswith(candidate)),
+                None,
+            )
+            if prefix is None:
+                remaining.append(arg)
+                i += 1
+                continue
+
+            component = key_part[len(prefix) :].replace("-", "_")
+            value = "true"
+            if "=" in arg:
+                value = arg.split("=", 1)[1]
+            elif i + 1 < len(unknown_args):
+                next_value = unknown_args[i + 1].lower()
+                if next_value in ("true", "false"):
+                    i += 1
+                    value = next_value
+
+            if not component or value.lower() not in ("true", "false"):
+                remaining.append(arg)
+            else:
+                values[component] = value.lower() == "true"
+            i += 1
+        return values, remaining
+
     @classmethod
     def _extract_component_quantizations(
         cls,
@@ -3019,6 +3078,9 @@ class ServerArgs(DisaggServerArgsMixin):
         dynamic_quantizations, remaining = cls._extract_component_quantizations(
             unknown_args
         )
+        dynamic_direct_gpu_loading, remaining = (
+            cls._extract_component_direct_gpu_weight_loading(remaining)
+        )
         dynamic_ignored_layers, remaining = (
             cls._extract_component_quantization_ignored_layers(remaining)
         )
@@ -3062,6 +3124,13 @@ class ServerArgs(DisaggServerArgsMixin):
             existing.update(dynamic_quantizations)
             provided_args["component_quantizations"] = existing
             explicit_arg_names.add("component_quantizations")
+        if dynamic_direct_gpu_loading:
+            existing = dict(
+                provided_args.get("component_direct_gpu_weight_loading") or {}
+            )
+            existing.update(dynamic_direct_gpu_loading)
+            provided_args["component_direct_gpu_weight_loading"] = existing
+            explicit_arg_names.add("component_direct_gpu_weight_loading")
         if dynamic_ignored_layers:
             existing = dict(
                 provided_args.get("component_quantization_ignored_layers") or {}
@@ -3371,24 +3440,38 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
 
     def _validate_direct_gpu_weight_loading(self) -> None:
-        if not self.direct_gpu_weight_loading:
-            return
-        if not current_platform.is_cuda():
-            raise ValueError("--direct-gpu-weight-loading requires CUDA")
-        if (
-            self.should_cpu_offload_component("transformer")
-            or self.residency_mode("transformer") == LAYERWISE_OFFLOAD
-        ):
-            raise ValueError(
-                "--direct-gpu-weight-loading requires a GPU-resident DiT; disable "
-                "DiT CPU and layerwise offload"
-            )
-        if self.use_fsdp_inference:
-            raise ValueError(
-                "--direct-gpu-weight-loading does not support FSDP inference"
-            )
-        if self.tp_size != 1:
-            raise ValueError("--direct-gpu-weight-loading requires --tp-size 1")
+        if self.direct_gpu_weight_loading:
+            if not current_platform.is_cuda():
+                raise ValueError("--direct-gpu-weight-loading requires CUDA")
+            if (
+                self.should_cpu_offload_component("transformer")
+                or self.residency_mode("transformer") == LAYERWISE_OFFLOAD
+            ):
+                raise ValueError(
+                    "--direct-gpu-weight-loading requires a GPU-resident DiT; "
+                    "disable DiT CPU and layerwise offload"
+                )
+            if self.use_fsdp_inference:
+                raise ValueError(
+                    "--direct-gpu-weight-loading does not support FSDP inference"
+                )
+            if self.tp_size != 1:
+                raise ValueError("--direct-gpu-weight-loading requires --tp-size 1")
+
+        for component_name, enabled in self.component_direct_gpu_weight_loading.items():
+            if not enabled:
+                continue
+            if not current_platform.is_cuda():
+                raise ValueError("--component-direct-gpu-weight-loading requires CUDA")
+            if self.should_start_component_on_cpu(component_name):
+                raise ValueError(
+                    "--component-direct-gpu-weight-loading requires "
+                    f"{component_name!r} to be resident"
+                )
+
+    def should_direct_gpu_weight_load_component(self, component_name: str) -> bool:
+        """Return whether an exact component opted into direct GPU loading."""
+        return self.component_direct_gpu_weight_loading.get(component_name, False)
 
     def _validate_parallelism(self):
         if self.kv_gather_degree < 1:

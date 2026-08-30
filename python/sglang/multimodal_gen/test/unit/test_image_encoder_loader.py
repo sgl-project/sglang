@@ -41,6 +41,7 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
             component_quantizations={},
             encoder_parallel="replicate",
             resolve_component_attention_backend=lambda _name: (None, None),
+            should_direct_gpu_weight_load_component=lambda _name: False,
             should_use_fsdp_for_component=lambda _name: False,
         )
 
@@ -236,6 +237,7 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
             require_component_resident=mock.Mock(),
             should_use_fsdp_for_component=lambda _name: False,
             should_start_component_on_cpu=lambda _name: False,
+            should_direct_gpu_weight_load_component=lambda _name: False,
             revision=None,
             trust_remote_code=False,
         )
