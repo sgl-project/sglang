@@ -495,13 +495,10 @@ class CommonKVManager(BaseKVManager):
         targets: Optional[List[Tuple[str, int]]] = None,
         failure_reason: Optional[str] = None,
     ) -> Optional[KVPoll]:
-        """Returns the status that was emitted, or None for a cleared room.
+        """Returns the status emitted, or None for a cleared room.
 
-        One transfer worker owns a room, but it can conclude the room more than
-        once: a staging chunk deferred past the last one may fail after the room
-        already concluded Success, and that later failure is reported rather
-        than dropped. ``targets`` defaults to every non-dummy decode endpoint of
-        the room.
+        Runs more than once for a room when a staging chunk is deferred past the
+        last one. ``targets`` defaults to the room's non-dummy decode endpoints.
         """
         if bootstrap_room not in self.request_status:
             # The sender already cleared this room. Concluding now would
