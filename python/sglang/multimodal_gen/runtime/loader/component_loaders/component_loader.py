@@ -137,6 +137,9 @@ class ComponentLoader(ABC):
     # Gates only --component-quantizations.<name>. Quantization declared by a
     # checkpoint is discovered and admitted by the component's normal loader.
     supports_online_quantization_override = False
+    # Gates only --component-direct-gpu-weight-loading.<name>. The checkpoint
+    # source stays component-specific because its streaming ABI is loader-owned.
+    supports_direct_gpu_weight_loading = False
     supports_fsdp_inference = False
 
     _loaders_registered = False
@@ -181,13 +184,15 @@ class ComponentLoader(ABC):
             )
         return None
 
+    def supports_direct_gpu_weight_loading_for_component(
+        self, _component_name: str
+    ) -> bool:
+        return self.supports_direct_gpu_weight_loading
+
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
-        native_only_components = getattr(
-            server_args.pipeline_config, "native_only_components", ()
-        )
-        return component_name in native_only_components
+        return component_name in server_args.pipeline_config.native_only_components
 
     def validate_native_fallback(
         self, _server_args: ServerArgs, _component_name: str
@@ -217,6 +222,12 @@ class ComponentLoader(ABC):
             attn_backend,
             component_name=component_attn_name,
             allow_global_backend_fallback=allow_global_backend_fallback,
+            require_component_backend_selection=(
+                attn_backend is None
+                or not server_args.is_component_attention_backend_automatic(
+                    component_attn_name
+                )
+            ),
         ):
             load_kwargs = self.customized_load_kwargs_for_component(
                 server_args, component_name
@@ -239,6 +250,12 @@ class ComponentLoader(ABC):
             attn_backend,
             component_name=component_attn_name,
             allow_global_backend_fallback=allow_global_backend_fallback,
+            require_component_backend_selection=(
+                attn_backend is None
+                or not server_args.is_component_attention_backend_automatic(
+                    component_attn_name
+                )
+            ),
         ):
             component = self.load_native(
                 component_model_path,
@@ -265,6 +282,12 @@ class ComponentLoader(ABC):
         """
         self._native_load_manages_placement = False
         self.component_load_precision(server_args, component_name)
+        if server_args.should_direct_gpu_weight_load_component(
+            component_name
+        ) and not self.supports_direct_gpu_weight_loading_for_component(component_name):
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} does not support direct GPU weight loading"
+            )
         self.disable_unsupported_component_fsdp(server_args, component_name)
         component_quantization = server_args.component_quantizations.get(component_name)
         if (
@@ -738,6 +761,12 @@ class PipelineComponentLoader:
                 component_name=component_attn_name,
                 allow_global_backend_fallback=(
                     loader.allow_global_attention_backend_fallback
+                ),
+                require_component_backend_selection=(
+                    component_attn_backend is None
+                    or not server_args.is_component_attention_backend_automatic(
+                        component_attn_name
+                    )
                 ),
             ):
                 return loader.load(
