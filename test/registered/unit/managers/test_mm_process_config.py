@@ -403,8 +403,12 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
     def test_consumer_slot_uses_global_tp_rank(self):
         from sglang.srt.multimodal.transport.memory_pool import resolve_consumer_rank
 
-        parallel = SimpleNamespace(tp_rank=6, attn_tp_rank=2)
-        with patch("sglang.srt.runtime_context.get_parallel", return_value=parallel):
+        # State the topology on the context, not by stubbing the accessor:
+        # `memory_pool` imports `get_parallel` at module scope, so a patch on
+        # the defining module never reaches the copy doing the reading.
+        from sglang.srt.runtime_context import get_parallel
+
+        with get_parallel().override(tp_rank=6, attn_tp_rank=2):
             self.assertEqual(resolve_consumer_rank(8), 6)
 
     def test_complete_group_acknowledges_each_consumer_slot(self):

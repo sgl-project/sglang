@@ -409,7 +409,7 @@ async def lifespan(fast_api_app: FastAPI):
             if server_args.sidecar is not None:
                 from sglang.srt.entrypoints.sidecar import start_sidecar
 
-                sidecar = start_sidecar(server_args)
+                sidecar = start_sidecar()
 
         # Execute the general warmup
         warmup_thread = threading.Thread(
@@ -485,6 +485,7 @@ app.include_router(v1_loads_router)
 
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 from sglang.srt.runtime_context import (
+    describe_kv_events_publisher,
     get_disagg,
     get_exec,
     get_lora,
@@ -832,8 +833,8 @@ async def server_info():
             "version": __version__,
             # Structured KV-event publisher descriptor for KV-aware routers.
             # `None` when publishing is disabled or misconfigured; see
-            # `ServerArgs.describe_kv_events_publisher` for the precise contract.
-            "kv_events": server_args.describe_kv_events_publisher(),
+            # `runtime_context.describe_kv_events_publisher` for the contract.
+            "kv_events": describe_kv_events_publisher(server_args),
         }
     )
 
