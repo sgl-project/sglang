@@ -27,6 +27,9 @@ from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.lora.adapter_dense_payload import (
+    AdapterDensePayload,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
     normalize_lora_state_dict,
 )
@@ -183,6 +186,8 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_alpha = None
         self.lora_path = None
         self.lora_nickname = "default"
+        self.dense_payloads: dict[str, AdapterDensePayload] = {}
+        self._dense_payload_applied: set[str] = set()
 
         # Initialize from server_args
         self.device = get_local_torch_device()
@@ -860,6 +865,12 @@ class LoRAPipeline(ComposedPipelineBase):
 
         raw_state_dict = load_file(lora_local_path)
         adapter_config = load_peft_config(lora_local_path)
+        config = self.server_args.pipeline_config.dit_config.arch_config
+        param_names_mapping_fn = get_param_names_mapping(
+            config.param_names_mapping
+            or self.modules["transformer"].param_names_mapping
+        )
+        self._store_dense_payload(raw_state_dict, param_names_mapping_fn, lora_nickname)
         lora_state_dict = normalize_lora_state_dict(
             raw_state_dict,
             logger=logger,
@@ -871,13 +882,6 @@ class LoRAPipeline(ComposedPipelineBase):
 
         if lora_nickname in self.lora_adapters:
             self.lora_adapters[lora_nickname].clear()
-
-        config = self.server_args.pipeline_config.dit_config.arch_config
-
-        param_names_mapping_fn = get_param_names_mapping(
-            config.param_names_mapping
-            or self.modules["transformer"].param_names_mapping
-        )
         lora_param_names_mapping_fn = get_param_names_mapping(
             config.lora_param_names_mapping
             or self.modules["transformer"].lora_param_names_mapping
@@ -1007,6 +1011,11 @@ class LoRAPipeline(ComposedPipelineBase):
                 self.loaded_adapter_alphas[nickname] = alpha
                 adapter_updated = True
 
+        # File-backed merge cache is base+A/B only. Whole-parameter
+        # .diff / .set_weight must land on the live merged weight.
+        if any(name in self.dense_payloads for name in lora_nicknames):
+            cache_merged = False
+
         # Group by target to apply separately
         target_to_indices = {}
         for idx, tgt in enumerate(targets):
@@ -1123,6 +1132,9 @@ class LoRAPipeline(ComposedPipelineBase):
                         tgt_nicknames.copy(),
                         tgt_strengths.copy(),
                     )
+                    self._apply_dense_payloads(
+                        module_name, tgt_nicknames, tgt_strengths
+                    )
 
         logger.info(
             "Rank %d: LoRA adapter(s) %s applied to %d layers (targets: %s, strengths: %s, merge_mode=%s)",
@@ -1137,6 +1149,55 @@ class LoRAPipeline(ComposedPipelineBase):
             ),
             merge_mode,
         )
+
+    def _store_dense_payload(
+        self,
+        raw_state_dict: dict[str, torch.Tensor],
+        param_names_mapping_fn: Any,
+        lora_nickname: str,
+    ) -> None:
+        payload = AdapterDensePayload.from_state_dict(
+            raw_state_dict, param_names_mapping_fn
+        )
+        if payload is None:
+            self.dense_payloads.pop(lora_nickname, None)
+            return
+        self.dense_payloads[lora_nickname] = payload
+        self._dense_payload_applied.discard(lora_nickname)
+
+    def _apply_dense_payloads(
+        self,
+        module_name: str,
+        nicknames: list[str],
+        strengths: list[float],
+    ) -> None:
+        module = self.modules.get(module_name)
+        if module is None:
+            return
+        for nickname, strength in zip(nicknames, strengths):
+            payload = self.dense_payloads.get(nickname)
+            if payload is None or nickname in self._dense_payload_applied:
+                continue
+            payload.strength = float(strength)
+            applied, unmatched = payload.apply_to_module(module)
+            self._dense_payload_applied.add(nickname)
+            logger.info(
+                "Applied adapter dense payload for %s on %s: %d parameters",
+                nickname,
+                module_name,
+                applied,
+            )
+            if payload.has_gate_compress:
+                gate_misses = [item for item in unmatched if "gate_compress" in item]
+                if gate_misses:
+                    logger.warning(
+                        "Adapter %s has %d to_gate_compress tensors but this "
+                        "runtime has no matching gate modules. Low-rank and "
+                        ".diff weights are applied; running on dense attention "
+                        "is unofficial.",
+                        nickname,
+                        len(gate_misses),
+                    )
 
     def _merge_via_cache(self, name, layer, merge_cache) -> None:
         """Merge one layer through the cache instead of in place.
