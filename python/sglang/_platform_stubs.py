@@ -396,7 +396,7 @@ def install_platform_stubs() -> None:
     except ImportError:
         return
 
-    if not torch.backends.mps.is_available():
+    if not (hasattr(torch, "mps") and torch.mps.is_available()):
         return
 
     if "triton" not in sys.modules and importlib.util.find_spec("triton") is None:

@@ -404,8 +404,7 @@ class TestMpsDeviceMixin(CustomTestCase):
         mock_recommended.return_value = 800
         mock_driver.return_value = 350
         base = MpsSRTPlatform()
-        # The device budget is the Metal working set, not the host RAM total,
-        # and in-use memory must come from the driver allocation.
+        # Use Metal capacity and driver allocation for memory accounting.
         self.assertEqual(base.get_device_total_memory(), 800)
         self.assertEqual(base.get_current_memory_usage(), 350.0)
         mock_current.assert_not_called()
@@ -423,7 +422,6 @@ class TestMpsDeviceMixin(CustomTestCase):
     @patch("torch.backends.mps.get_name", return_value="Apple M-series")
     def test_device_metadata_contract(self, _mock_name):
         base = MpsSRTPlatform()
-        # MPS exposes no compute-capability analogue.
         self.assertIsNone(base.get_device_capability())
         self.assertEqual(base.get_device_name(), "Apple M-series")
 
@@ -432,8 +430,7 @@ class TestMpsDeviceMixin(CustomTestCase):
     def test_common_device_helpers_handle_mps_inline(
         self, mock_recommended, mock_driver
     ):
-        """MPS is an in-tree device, so utils.common must answer for it
-        directly instead of dispatching through the out-of-tree platform."""
+        """Handle MPS directly instead of using OOT dispatch."""
         from sglang.srt.utils import common
 
         mock_recommended.return_value = 8 << 30
@@ -449,9 +446,10 @@ class TestMpsDeviceMixin(CustomTestCase):
             patch.object(common, "is_habana_available", return_value=False),
             patch.object(torch.cuda, "is_available", return_value=False),
             patch.object(torch.xpu, "is_available", return_value=False),
+            patch.object(torch.mps, "is_available", return_value=True),
+            patch.object(torch.mps, "device_count", return_value=1),
             patch.object(common, "empty_device_cache"),
-            # `_mps_get_name` is unavailable in CPU-only Torch builds, and
-            # this file also runs in the Linux CPU suite.
+            # The Linux CPU suite has no MPS device name.
             patch("torch.backends.mps.get_name", return_value="Apple M-series"),
             patch(
                 "sglang.srt.hardware_backend.mlx.runtime.use_mlx",
@@ -468,17 +466,16 @@ class TestMpsDeviceMixin(CustomTestCase):
                 self.assertEqual(common.get_device(0), "mps:0")
                 self.assertEqual(common.get_compiler_backend(), "eager")
 
-                # Free memory is the tighter of host availability and the
-                # remaining Metal working set (here: 8Gi - 5Gi = 3Gi).
+                # Metal headroom is the tighter limit.
                 with patch.object(common.psutil, "virtual_memory") as mock_vm:
                     mock_vm.return_value.available = 6 << 30
                     self.assertEqual(common.get_available_gpu_memory("mps", 0), 3.0)
 
-                    # Host pressure can be the binding constraint instead.
+                    # Host memory can be the tighter limit.
                     mock_vm.return_value.available = 1 << 30
                     self.assertEqual(common.get_available_gpu_memory("mps", 0), 1.0)
 
-                    # Never report negative free memory when over budget.
+                    # Clamp negative Metal headroom.
                     mock_driver.return_value = 9 << 30
                     self.assertEqual(common.get_available_gpu_memory("mps", 0), 0.0)
             finally:

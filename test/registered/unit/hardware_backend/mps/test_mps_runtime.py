@@ -27,7 +27,7 @@ class TestMpsRuntime(unittest.TestCase):
     def test_runtime_does_not_require_mlx_or_metal_kernel_apis(self):
         with (
             mock.patch.object(torch, "__version__", "2.13.4"),
-            mock.patch.object(torch.backends.mps, "is_available", return_value=True),
+            mock.patch.object(torch.mps, "is_available", return_value=True),
             mock.patch.object(
                 torch.mps, "recommended_max_memory", return_value=8 << 30, create=True
             ),
@@ -50,7 +50,7 @@ class TestMpsRuntime(unittest.TestCase):
         runtime.validate_mps_runtime.cache_clear()
         with (
             mock.patch.object(torch, "__version__", "2.13.0"),
-            mock.patch.object(torch.backends.mps, "is_available", return_value=True),
+            mock.patch.object(torch.mps, "is_available", return_value=True),
             mock.patch.object(torch.mps, "recommended_max_memory", None, create=True),
             self.assertRaisesRegex(RuntimeError, "recommended_max_memory"),
         ):
@@ -58,12 +58,7 @@ class TestMpsRuntime(unittest.TestCase):
 
     @staticmethod
     def _resolve_with_gate(device, *, mlx, detected_mps=False):
-        """Drive the runtime gate the way a launch does, and report the call.
-
-        Uses a dummy model so the pipeline short-circuits before any download:
-        the gate under test runs ahead of that, which is the whole point of
-        where it sits.
-        """
+        """Resolve dummy arguments and return the patched runtime validator."""
         from sglang.srt import server_args
         from sglang.srt.server_args import ServerArgs
 
@@ -80,8 +75,7 @@ class TestMpsRuntime(unittest.TestCase):
         self._resolve_with_gate("mps", mlx=True).assert_not_called()
 
     def test_runtime_gate_follows_autodetected_platform_when_device_is_unset(self):
-        """--device is normally omitted on macOS, so the gate must key off the
-        detected platform rather than the raw (still None) device field."""
+        """Use platform detection when --device is omitted."""
         self._resolve_with_gate(
             None, mlx=False, detected_mps=True
         ).assert_called_once_with()
@@ -121,7 +115,6 @@ class TestMpsRuntime(unittest.TestCase):
             base.update(overrides)
             return types.SimpleNamespace(**base)
 
-        # The supported baseline must pass untouched.
         self.assertIsNone(validate_standard_mps_server_args(make()))
 
         for overrides, expected in (

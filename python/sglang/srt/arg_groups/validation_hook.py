@@ -400,11 +400,7 @@ def validate_experimental_sgl_marlin(server_args: Any):
 
 
 def validate_standard_mps_server_args(server_args: Any):
-    """Fail before model loading for modes the Torch MPS path cannot run.
-
-    Limited to the settings whose failure mode is otherwise a confusing crash
-    deep inside model loading; anything else is left to fail naturally.
-    """
+    """Validate execution modes supported by the Torch MPS path."""
 
     cfg = resolving_view(server_args)
     supported_attention_backends = {None, "torch_native"}

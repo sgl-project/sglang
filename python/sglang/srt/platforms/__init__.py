@@ -48,9 +48,7 @@ def _is_xpu_available() -> bool:
 
 
 def _is_mps_available() -> bool:
-    backend = getattr(torch.backends, "mps", None)
-    is_available = getattr(backend, "is_available", None)
-    return bool(callable(is_available) and is_available())
+    return bool(getattr(torch, "mps", None) is not None and torch.mps.is_available())
 
 
 def _resolve_platform() -> SRTPlatform:

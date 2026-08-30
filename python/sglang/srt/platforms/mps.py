@@ -1,12 +1,4 @@
-"""Apple Metal/MPS device operations for the in-tree SRT platform layer.
-
-PyTorch exposes Apple's GPU as ``mps`` rather than through the CUDA API.  Keep
-the implementation deliberately small: MPS is a unified-memory, single-device
-platform for now, and the SRT scheduler/allocator still uses the ordinary
-Torch model runner and KV-pool implementations.  The platform object supplies
-the device lifecycle hooks that were previously skipped because MPS fell
-through to the base ``SRTPlatform``.
-"""
+"""Apple MPS support for SRT's in-tree platform layer."""
 
 from __future__ import annotations
 
@@ -39,22 +31,18 @@ def _recommended_working_set_size() -> int:
 
 
 class MpsDeviceMixin(DeviceMixin):
-    """Device operations backed by ``torch.backends.mps``."""
+    """Device operations backed by ``torch.mps``."""
 
     _enum: PlatformEnum = PlatformEnum.MPS
     device_name: str = "mps"
     device_type: str = "mps"
 
     def get_device_total_memory(self, device_id: int = 0) -> int:
-        # Metal cannot safely keep all unified system RAM resident.  PyTorch's
-        # value maps to MTLDevice.recommendedMaxWorkingSetSize and is the
-        # authoritative capacity for model/KV-pool planning.
+        # Metal's working-set limit, not total system RAM, bounds model memory.
         return _recommended_working_set_size()
 
     def get_current_memory_usage(self, device: Optional[torch.device] = None) -> float:
-        # Driver allocation includes cached MPS buffers and, unlike
-        # current_allocated_memory(), accounts for the resident Metal working
-        # set that reduces the safe device budget.
+        # Driver allocation includes resident cached MPS buffers.
         return float(torch.mps.driver_allocated_memory())
 
     def get_device(self, local_rank: int = 0) -> torch.device:
@@ -65,13 +53,13 @@ class MpsDeviceMixin(DeviceMixin):
     def set_device(self, device: torch.device) -> None:
         if str(device).split(":", 1)[0] != "mps":
             raise ValueError(f"MPS platform cannot select device {device}")
-        # MPS currently has no set_device/current_device API.
+        # MPS has no device-selection API.
 
     def get_device_name(self, device_id: int = 0) -> str:
         return str(torch.backends.mps.get_name())
 
     def get_device_uuid(self, device_id: int = 0) -> str:
-        # There is no stable public GPU UUID in the PyTorch MPS API.
+        # PyTorch exposes no stable MPS UUID.
         return "mps:0"
 
     def get_device_capability(self, device_id: int = 0):
@@ -87,32 +75,8 @@ class MpsDeviceMixin(DeviceMixin):
         if callable(synchronize):
             synchronize()
 
-    def is_pin_memory_available(self, device=None) -> bool:
-        return False
-
-    def get_torch_distributed_backend_str(self) -> str:
-        # MPS tensors are not supported by NCCL/HCCL collectives.
-        return "gloo"
-
-
 class MpsSRTPlatform(MpsDeviceMixin, SRTPlatform):
     """Built-in SRT platform for Apple Silicon MPS."""
 
-    def init_backend(self) -> None:
-        # ServerArgs performs the same cached check early for user-facing
-        # launch failures. Keep the platform boundary authoritative for
-        # programmatic ModelRunner construction as well.
-        from sglang.srt.hardware_backend.mps.runtime import validate_mps_runtime
-
-        validate_mps_runtime()
-
     def get_default_attention_backend(self) -> str:
         return "torch_native"
-
-    def get_compile_backend(self, mode: str | None = None) -> str:
-        # Torch MPS does not yet have an SGLang graph runner.
-        return "eager"
-
-    def get_dispatch_key_name(self) -> str:
-        # This foundation deliberately uses the normal Torch fused-op path.
-        return "native"

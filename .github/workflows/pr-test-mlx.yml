@@ -162,8 +162,7 @@ jobs:
         run: |
           uv run python test/run_suite.py --hw mlx --suite stage-b-e2e-mlx
 
-  # The standard Torch MPS path shares these Apple Silicon runners but must run
-  # without SGLANG_USE_MLX so it exercises the Torch-owned runtime, not MLX.
+  # Run the Torch MPS path without SGLANG_USE_MLX.
   stage-a-unit-test-mps:
     needs: [check-changes, pr-gate]
     if: |
@@ -211,7 +210,7 @@ jobs:
 
       - name: Report torch version and MPS availability
         run: |
-          uv run python -c "import torch; print('torch', torch.__version__, 'mps', torch.backends.mps.is_available())"
+          uv run python -c "import torch; print('torch', torch.__version__, 'mps', torch.mps.is_available())"
 
       - name: Run model-free MPS unit tests
         timeout-minutes: 15

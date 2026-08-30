@@ -3688,13 +3688,8 @@ class ServerArgs:
             )
         from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
 
-        # The standard Torch MPS path must reject an unusable runtime before
-        # the pipeline resolves model paths and downloads a checkpoint, so
-        # that nothing is fetched for a runtime that was never going to work.
-        # MLX opts out: it has its own gate inside the pipeline. The raw
-        # device field is what is available this early, and on macOS --device
-        # is usually omitted, so an unset field falls back to the detected
-        # platform or this gate would be dead code on the normal launch path.
+        # Validate Torch MPS before model resolution; MLX has its own gate.
+        # Platform detection covers the usual omitted --device on macOS.
         if not use_mlx():
             requested_device = getattr(self, "device", None)
             explicitly_mps = (
@@ -3707,11 +3702,7 @@ class ServerArgs:
         try:
             run_resolution_pipeline(self)
 
-            # The standard Torch MPS path supports a narrow slice of the
-            # execution modes, and the checkpoint-derived ones (a quantized or
-            # multimodal config) are only knowable from the model config. Run
-            # these checks after every declaration is visible, but before this
-            # resolution attempt is allowed to remain marked as finished.
+            # Validate resolved arguments and checkpoint-derived constraints.
             cfg = resolving_view(self)
             if (
                 cfg.device == "mps"

@@ -403,18 +403,13 @@ class ModelRunner:
         if get_exec().features.enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
-        # Set device early so that TransferEngine init (e.g. Ascend NPU)
-        # can access the device context. torch.mps has no set_device: the
-        # single Apple GPU is always current, so there is nothing to select.
+        # Set the device before TransferEngine init. MPS has one implicit device.
         is_mps_device = str(self.device).split(":", 1)[0] == "mps"
         if is_mps_device:
             from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
             if not use_mlx():
-                # Keep the platform boundary authoritative for programmatic
-                # ModelRunner construction too, not just the CLI launch path.
-                # MPS availability only means this is a Mac, and MLX also runs
-                # on "mps" without the Torch model path.
+                # Direct ModelRunner construction bypasses the ServerArgs gate.
                 from sglang.srt.hardware_backend.mps.runtime import (
                     validate_mps_runtime,
                 )
