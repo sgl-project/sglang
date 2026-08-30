@@ -51,14 +51,19 @@ def _mtp_quant_config(quant_config):
     quantized; the loader's fusion gate has to see the same normalization the
     constructor applies, or it would answer for the target's quantization.
     """
-    # Serialized Qwen3.5 ModelOpt checkpoints keep embedded MTP weights in
-    # BF16. Disable quantization for those checkpoints; non-serialized
-    # modelopt_fp4 still converts MoE expert weights on load.
+    # Some quantized Qwen3.5/3.8 checkpoints keep embedded MTP weights in BF16.
+    # Disable quantization for serialized ModelOpt checkpoints and
+    # compressed-tensors exports that explicitly exclude the complete MTP
+    # branch; non-serialized modelopt_fp4 still converts MoE weights on load.
     if quant_config and (
         quant_config.get_name() == "modelopt_mixed"
         or (
             quant_config.get_name() == "modelopt_fp4"
             and quant_config.is_checkpoint_nvfp4_serialized
+        )
+        or (
+            quant_config.get_name() == "compressed_tensors"
+            and "re:^mtp.*" in getattr(quant_config, "ignore", [])
         )
     ):
         return None
