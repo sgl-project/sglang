@@ -25,7 +25,7 @@ use crate::message::config::{
     DefaultSamplingParams, DisaggregationMode, MmFamily, MmResample, MmSpec, ModelConfig,
     RuntimeConfig, RustServerServerArgs, ServerArgs,
 };
-use crate::utils::server::{listen_addr, value_error};
+use crate::utils::startup::{listen_addr, value_error};
 use crate::utils::{logging, runtime};
 
 /// One drained MM result (see [`Server::take_mm_result`]), consumed by
