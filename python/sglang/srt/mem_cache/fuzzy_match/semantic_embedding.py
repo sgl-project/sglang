@@ -36,7 +36,10 @@ logger = logging.getLogger(__name__)
 class SemanticEmbeddingProvider(FuzzyMatchProvider):
     """Lazy SemBlend wrapper for SGLang's fuzzy-match interface."""
 
-    _MIN_SEMBLEND_VERSION = "0.3.12"
+    # 0.3.17 is the first release whose provider defaults to copying every
+    # layer. Earlier releases zero the layers their mask flags, which costs
+    # measurable output quality on reused spans.
+    _MIN_SEMBLEND_VERSION = "0.3.17"
 
     def __init__(self, config: FuzzyMatchConfig):
         super().__init__(config)
