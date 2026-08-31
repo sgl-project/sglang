@@ -41,7 +41,12 @@ struct TopKTraitImpl {
   static constexpr uint32_t kMaxTopK = 64;
   static constexpr uint32_t kCTASize = kNumThreads;
   static constexpr uint32_t kNumWarps = kCTASize / device::kWarpThreads;
+  // Must match _MAX_NUM_BLOCKS in ops/attention/minimax_decode_topk.py.
+#ifdef USE_ROCM
   static constexpr uint32_t kMaxNumBlocks = 16384;  // block topk
+#else
+  static constexpr uint32_t kMaxNumBlocks = 4096;  // block topk
+#endif
   static constexpr uint32_t kSmallThreshold = 8 * kNumWarps;
   static constexpr uint32_t kRadixBits = 8;
   static constexpr uint32_t kRadixSize = 1 << kRadixBits;
