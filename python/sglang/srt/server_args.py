@@ -611,6 +611,7 @@ class ServerArgs:
                 "nvfp4",
                 "fp4_mx_block16",
                 "fp4_e2m1",
+                "int8",
             ],
             resolvable=True,
         ),

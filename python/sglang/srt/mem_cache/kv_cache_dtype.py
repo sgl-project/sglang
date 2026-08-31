@@ -77,6 +77,8 @@ def configure_kv_cache_dtype(
                 "torch.float4_e2m1fn_x2 support. Please use PyTorch 2.8.0+ "
                 "with CUDA 12.8+."
             )
+    elif server_args_kv_cache_dtype == "int8":
+        kv_cache_dtype = torch.int8
     else:
         raise ValueError(f"Unsupported kv_cache_dtype: {server_args_kv_cache_dtype}.")
 
