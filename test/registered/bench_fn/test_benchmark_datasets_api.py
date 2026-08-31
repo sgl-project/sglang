@@ -49,6 +49,13 @@ from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.datasets.openai_dataset import sample_openai_requests
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
+from sglang.benchmark.prefix_cache_benchmark import (
+    build_point_command,
+    make_tag,
+)
+from sglang.benchmark.prefix_cache_benchmark import (
+    parse_args as parse_prefix_cache_benchmark_args,
+)
 from sglang.benchmark.serving import (
     _BACKEND_API_PATHS,
     _EMBEDDING_BACKENDS,
@@ -1678,6 +1685,82 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             "Traceback",
         ]:
             self.assertNotIn(forbidden, stderr)
+
+
+class TestPrefixCacheSweep(unittest.TestCase):
+    def _parse(self, *extra):
+        return parse_prefix_cache_benchmark_args(
+            [
+                "--base-url",
+                "http://127.0.0.1:30000",
+                "--model",
+                "test-model",
+                "--tokenizer",
+                "test-tokenizer",
+                "--input-lens",
+                "32768",
+                "--output-lens",
+                "512",
+                "--cache-hit-percentages",
+                "50",
+                "--concurrencies",
+                "8",
+                *extra,
+            ]
+        )
+
+    def test_build_point_command(self):
+        args = self._parse("--num-prompts", "50", "--num-groups", "2")
+        tag, command = build_point_command(
+            args,
+            Path("results.jsonl"),
+            input_len=32768,
+            output_len=512,
+            cache_hit_percent=50,
+            concurrency=8,
+            repetition=1,
+        )
+
+        self.assertEqual(tag, "prefix-cache-in32768-out512-hit50-c8")
+        self.assertEqual(command[command.index("--gsp-num-groups") + 1], "2")
+        self.assertEqual(command[command.index("--gsp-prompts-per-group") + 1], "25")
+        self.assertEqual(command[command.index("--gsp-system-prompt-len") + 1], "16384")
+        self.assertEqual(command[command.index("--gsp-question-len") + 1], "16384")
+        self.assertIn("--gsp-prewarm-prefixes", command)
+
+    def test_zero_hit_uses_unique_groups_without_prewarm(self):
+        args = self._parse(
+            "--num-prompts", "50", "--num-groups", "2", "--repetitions", "2"
+        )
+        tag, command = build_point_command(
+            args,
+            Path("results.jsonl"),
+            input_len=32768,
+            output_len=512,
+            cache_hit_percent=0,
+            concurrency=1,
+            repetition=2,
+        )
+
+        self.assertEqual(tag, "prefix-cache-in32768-out512-hit0-c1-r2")
+        self.assertEqual(command[command.index("--gsp-num-groups") + 1], "50")
+        self.assertEqual(command[command.index("--gsp-prompts-per-group") + 1], "1")
+        self.assertEqual(command[command.index("--gsp-system-prompt-len") + 1], "0")
+        self.assertNotIn("--gsp-prewarm-prefixes", command)
+
+    def test_sweep_argument_validation(self):
+        with self.assertRaises(SystemExit):
+            self._parse("--num-prompts", "50", "--num-groups", "3")
+        with self.assertRaises(SystemExit):
+            self._parse("--cache-hit-percentages", "101")
+        with self.assertRaises(SystemExit):
+            self._parse("--group-distribution", "zipf")
+
+    def test_sweep_tag_supports_fractional_hit_rate(self):
+        self.assertEqual(
+            make_tag("model", 4096, 128, 33.3, 4, 1),
+            "model-in4096-out128-hit33p3-c4-r1",
+        )
 
 
 if __name__ == "__main__":

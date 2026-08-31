@@ -391,6 +391,34 @@ prefix metadata, the benchmark regenerates and replaces that cache entry automat
 Prefix prewarming requires accurate prompt lengths and a single-turn GSP workload, so
 it cannot be combined with `--gsp-fast-prepare` or `--gsp-num-turns` greater than one.
 
+For a repeatable matrix across models, use the sweep wrapper instead of maintaining a
+model-specific shell loop:
+
+```bash Command
+python3 -m sglang.benchmark.prefix_cache_benchmark \
+  --base-url http://127.0.0.1:30000 \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --tokenizer meta-llama/Llama-3.1-8B-Instruct \
+  --input-lens 32768 65536 \
+  --output-lens 512 1024 \
+  --cache-hit-percentages 0 30 50 70 90 \
+  --concurrencies 1 8 \
+  --num-prompts 50 \
+  --num-groups 2 \
+  --warmup-requests 5 \
+  --result-dir prefix-cache-results \
+  --quiet
+```
+
+The wrapper delegates every point to `sglang.benchmark.serving`, so metric definitions
+and request behavior stay in one implementation. It derives shared-prefix and unique
+suffix lengths, uses one unique group per request for the 0% control, enables prefix
+prewarming for nonzero hit rates, and writes `results.jsonl`, `summary.csv`,
+`manifest.json`, and one log per point. Restart the same command to skip completed
+points. Use `--repetitions` for repeated samples and `--dry-run` to inspect commands
+without contacting the server. Use `--quiet` to keep detailed subprocess output in the
+per-point log files while printing only matrix progress.
+
 Zipfian / power-law prefix popularity (opt-in via `--gsp-group-distribution=zipf`):
 
 ```bash Command
