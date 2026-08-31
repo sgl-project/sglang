@@ -285,7 +285,7 @@ class DecodeKVCacheOffloadManager:
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
         self.req_to_token_pool.free(req)
-        req.kv.mark_released()
+        req.kv.mark_kv_released()
         self.tree_cache.protected_size_ -= len(req.prefix_indices)
         self.offloaded_state.pop(req, None)
 

@@ -1906,6 +1906,11 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """
         return self.full_attn_allocator.virtual_to_physical
 
+    @property
+    def full_p2v_page_table(self) -> torch.Tensor:
+        """Page-level physical->virtual table of the full sub-pool."""
+        return self.full_attn_allocator.physical_to_virtual
+
     def translate_kv_loc_for_kernel(
         self,
         loc: torch.Tensor,
@@ -2256,6 +2261,11 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def full_v2p_page_table(self) -> torch.Tensor:
         """Page-level virtual->physical table of the full sub-pool."""
         return self.full_attn_allocator.virtual_to_physical
+
+    @property
+    def full_p2v_page_table(self) -> torch.Tensor:
+        """Page-level physical->virtual table of the full sub-pool."""
+        return self.full_attn_allocator.physical_to_virtual
 
     def translate_kv_loc_for_kernel(
         self,

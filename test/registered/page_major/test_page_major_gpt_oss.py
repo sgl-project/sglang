@@ -1,15 +1,12 @@
-"""
-End-to-end accuracy test for the unified memory pool on a hybrid-SWA MoE model.
+"""Unified memory pool on a hybrid-SWA MoE model, across the backend matrix.
 
-Launches gpt-oss-20b with ``--enable-unified-memory`` on the Triton attention
-backend and checks that GSM8K accuracy holds. This exercises the SWA +
-full-attention KV sub-pools stored as per-layer views in the unified
-page-major envelope.
+gpt-oss-20b is uniform-row hybrid-SWA, so its MHA and SWA sub-pools are
+per-layer views and the fa3 cell reads them through the translator's read
+tables. The resolved-default cell pins the no-pin path, since a pinned
+backend hides default-resolution breakage by construction. flashinfer is
+absent on purpose: gpt-oss uses attention sinks, which it does not support.
 
 Registered to the label-gated ``run-ci-extra`` suite (opt-in, not per-commit).
-
-Usage:
-    python3 -m unittest test_page_major_gpt_oss
 """
 
 import unittest
@@ -20,7 +17,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
 
-register_cuda_ci(est_time=420, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=1500, stage="extra-a", runner_config="1-gpu-large")
 
 _UNIFIED_COMMON_ARGS = [
     "--enable-unified-memory",
@@ -31,8 +28,8 @@ _UNIFIED_COMMON_ARGS = [
 
 
 class TestUnifiedGptOssTriton(DefaultServerBase):
-    """Unified pool on gpt-oss-20b (hybrid-SWA MoE), Triton pinned: dense
-    MHA/SWA views through the reference backend."""
+    """Unified pool on gpt-oss-20b (hybrid-SWA MoE), Triton pinned: the MHA/SWA
+    per-layer views through the reference backend."""
 
     model = DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
 
@@ -62,6 +59,20 @@ class TestUnifiedGptOssTriton(DefaultServerBase):
             f"(threshold: {self.gsm8k_threshold})"
         )
         self.assertGreaterEqual(metrics["accuracy"], self.gsm8k_threshold)
+
+
+class TestUnifiedGptOssFa3(TestUnifiedGptOssTriton):
+    """fa3 pinned: the per-layer views read through the translator's read
+    tables (eager direct-bind + captured fused copy)."""
+
+    other_args = _UNIFIED_COMMON_ARGS + ["--attention-backend", "fa3"]
+
+
+class TestUnifiedGptOssResolvedDefault(TestUnifiedGptOssTriton):
+    """No backend pin: whatever the host resolves must be in the allow-list,
+    or the server fails to boot under its own defaults."""
+
+    other_args = _UNIFIED_COMMON_ARGS
 
 
 if __name__ == "__main__":
