@@ -82,8 +82,8 @@ class TestCPUGraph(CustomTestCase):
             args._handle_gpu_memory_settings(None)
         return args
 
-    def test_cpu_prefill_backend_defaults_to_full(self):
-        self.assertEqual(default_prefill_backend(), Backend.FULL)
+    def test_cpu_prefill_backend_defaults_to_disabled(self):
+        self.assertEqual(default_prefill_backend(), Backend.DISABLED)
 
     def test_cpu_graph_backend_requires_intel_amx_for_both_phases(self):
         model_runner = SimpleNamespace(
@@ -200,12 +200,22 @@ class TestCPUGraph(CustomTestCase):
 
         self.assertEqual(compile_count, 1)
 
-    def test_cpu_graph_default_decode_and_prefill_buckets_are_generated(self):
+    def test_cpu_graph_default_decode_buckets_are_generated(self):
         args = self._resolve_cpu_graph_args()
 
         self.assertEqual(args.cuda_graph_config.decode.bs[-1], 32)
         self.assertEqual(args.cuda_graph_config.decode.max_bs, 32)
         self.assertEqual(args.torch_compile_max_bs, 32)
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+
+    def test_cpu_prefill_graph_requires_explicit_full_backend(self):
+        args = self._resolve_cpu_graph_args(
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.FULL, max_bs=512)
+            )
+        )
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.FULL)
         self.assertEqual(
             args.cuda_graph_config.prefill.bs,
             args._generate_prefill_cuda_graph_batch_sizes(

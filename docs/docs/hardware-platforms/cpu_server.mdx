@@ -229,7 +229,9 @@ Notes:
 ### CPU Graph for Decode and Prefill
 
 On Intel AMX systems, `torch.compile` can reduce Python overhead for CPU graph
-execution. Use the following command to enable both decode and prefill graphs:
+execution. Decode graph capture is enabled by default with
+`--enable-torch-compile`; CPU prefill graph capture is opt-in because the full
+prefill backend is experimental:
 
 ```bash Command
 sglang serve \
@@ -240,10 +242,10 @@ sglang serve \
     --enable-torch-compile
 ```
 
-`--enable-torch-compile` is the only CPU graph enable switch. On CPU, both
-phase backends default to `full`, so backend flags are optional. CPU decode
-graphs use batch-size buckets; CPU prefill graphs use total-token buckets.
-Custom phase settings can be provided with the shared JSON format:
+`--enable-torch-compile` is the global compile switch. On CPU, decode defaults
+to `full`, while prefill defaults to `disabled`. CPU decode graphs use
+batch-size buckets; CPU prefill graphs use total-token buckets. To enable CPU
+prefill explicitly, set its backend to `full` in the shared JSON format:
 
 ```bash Command
 sglang serve \
@@ -307,8 +309,8 @@ serve the request. CPU prefill graphs currently target text-only requests;
 multimodal prefill requests fall back to eager execution. Dynamic graphs may
 increase startup compilation time.
 
-`full` is optional in the JSON for CPU because it is the default. Set a phase
-to `disabled` to turn off that phase, for example:
+`full` is required in the JSON to enable CPU prefill. Set either phase to
+`disabled` to keep it on the eager path, for example:
 
 ```bash Command
 --enable-torch-compile \
