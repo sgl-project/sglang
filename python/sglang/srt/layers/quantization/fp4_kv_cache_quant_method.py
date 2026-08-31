@@ -42,7 +42,7 @@ import torch
 from torch import Tensor
 
 from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_MAX
-from sglang.srt.utils.common import is_sm100_supported
+from sglang.srt.runtime_context import get_platform
 
 
 class KVCacheAttentionPhase(str, Enum):
@@ -416,7 +416,7 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
             # The FP4 data type itself is identical on both architectures.
             # Reference: TRT-LLM FP8QDQLinearMethod.process_weights_after_loading_fused_qkv_linear
             # https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/linear.py
-            if is_sm100_supported():
+            if get_platform().is_sm100:
                 k_scale *= E2M1_MAX
                 v_scale *= E2M1_MAX
             k_scales_cpu[layer_id] = k_scale

@@ -22,7 +22,15 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
-from sglang.srt.runtime_context import get_context, get_observability, get_spec
+from sglang.srt.runtime_context import (
+    exports_expert_balancedness_to_prometheus,
+    get_context,
+    get_disagg,
+    get_observability,
+    get_parallel,
+    get_spec,
+    logs_expert_balancedness_to_server_log,
+)
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -39,6 +47,28 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.get()
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+CACHE_HIT_RATE_WINDOW_SECONDS = envs.SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS.get()
+
+
+class _CacheHitRateWindow:
+    def __init__(self) -> None:
+        self.samples = deque()
+        self.hit_tokens = 0
+        self.total_tokens = 0
+
+    def add(self, hit_tokens: int, total_tokens: int, now: float) -> float:
+        if total_tokens > 0:
+            self.samples.append((now, hit_tokens, total_tokens))
+            self.hit_tokens += hit_tokens
+            self.total_tokens += total_tokens
+
+        cutoff = now - CACHE_HIT_RATE_WINDOW_SECONDS
+        while self.samples and self.samples[0][0] <= cutoff:
+            _, expired_hit_tokens, expired_total_tokens = self.samples.popleft()
+            self.hit_tokens -= expired_hit_tokens
+            self.total_tokens -= expired_total_tokens
+
+        return self.hit_tokens / self.total_tokens if self.total_tokens > 0 else 0.0
 
 
 def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
@@ -118,6 +148,10 @@ class SchedulerMetricsReporter:
         self._eplb_balancedness_history = [
             deque(maxlen=window_size) for window_size in EPLB_BALANCEDNESS_WINDOW_SIZES
         ]
+        self.cache_hit_rate_window = _CacheHitRateWindow()
+        # Windowed rate for waiting-queue load estimation only; the exported
+        # cache_hit_rate stats keep their per-report semantics.
+        self.recent_cache_hit_rate = 0.0
 
     def _init_metrics(
         self,
@@ -206,7 +240,7 @@ class SchedulerMetricsReporter:
         """Initialize Forward Pass Metrics (FPM) publisher if configured."""
         self.scheduler.enable_fpm = False
         if (
-            self.scheduler.server_args.enable_forward_pass_metrics
+            get_observability().enable_forward_pass_metrics
             and self.scheduler.ps.attn_tp_rank == 0
             and self.scheduler.ps.pp_rank == self.scheduler.ps.pp_size - 1
         ):
@@ -220,7 +254,7 @@ class SchedulerMetricsReporter:
                 else 0
             )
             self.scheduler._fpm_worker_id = (
-                self.scheduler.server_args.forward_pass_metrics_worker_id
+                get_observability().forward_pass_metrics_worker_id
             )
             base_endpoint = get_observability().forward_pass_metrics_ipc_name
             if base_endpoint is None:
@@ -595,9 +629,8 @@ class SchedulerMetricsReporter:
             msg += f"#optimistic-req: {num_optimistic}, "
 
         if (
-            self.scheduler.server_args.language_only
-            and self.scheduler.server_args.encoder_transfer_backend
-            == "zmq_to_scheduler"
+            get_disagg().language_only
+            and get_disagg().encoder_transfer_backend == "zmq_to_scheduler"
         ):
             msg += (
                 f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
@@ -653,6 +686,11 @@ class SchedulerMetricsReporter:
             total_tokens = effective_input_tokens + effective_hit_tokens
             cache_hit_rate = (
                 effective_hit_tokens / total_tokens if total_tokens > 0 else 0.0
+            )
+            self.recent_cache_hit_rate = self.cache_hit_rate_window.add(
+                effective_hit_tokens,
+                total_tokens,
+                now,
             )
             self.metrics_collector.increment_effective_prefill_tokens(
                 input_tokens=effective_input_tokens,
@@ -844,9 +882,8 @@ class SchedulerMetricsReporter:
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         if (
-            self.scheduler.server_args.language_only
-            and self.scheduler.server_args.encoder_transfer_backend
-            == "zmq_to_scheduler"
+            get_disagg().language_only
+            and get_disagg().encoder_transfer_backend == "zmq_to_scheduler"
         ):
             msg += (
                 f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
@@ -974,9 +1011,7 @@ class SchedulerMetricsReporter:
         if (m := result.expert_distribution_metrics) is not None:
             balancedness = m.eplb_balancedness.item()
 
-            if (
-                self.scheduler.server_args.should_log_expert_balancedness_to_server_log()
-            ):
+            if logs_expert_balancedness_to_server_log():
                 if m.reset_server_log_history:
                     for history in self._eplb_balancedness_history:
                         history.clear()
@@ -998,10 +1033,7 @@ class SchedulerMetricsReporter:
                     f"gpu_physical_count_sum={gpu_physical_count_sum}"
                 )
 
-            if (
-                self.enable_metrics
-                and self.scheduler.server_args.should_export_expert_balancedness_to_prometheus()
-            ):
+            if self.enable_metrics and exports_expert_balancedness_to_prometheus():
                 assert self.metrics_collector is not None
                 self.metrics_collector.increment_eplb_balancedness(
                     forward_mode=batch.forward_mode.name.lower(),
@@ -1082,7 +1114,7 @@ class SchedulerMetricsReporter:
             active_lora_ids = set()
 
             # For PP mode, check all running micro batches
-            if self.scheduler.server_args.pp_size > 1:
+            if get_parallel().pp_size > 1:
                 for batch in self.scheduler.running_mbs:
                     if batch and hasattr(batch, "reqs"):
                         for req in batch.reqs:

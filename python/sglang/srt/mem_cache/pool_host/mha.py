@@ -4,7 +4,6 @@ import logging
 import threading
 from typing import Sequence
 
-import psutil
 import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
@@ -32,8 +31,8 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
-    HICACHE_HOST_MEMORY_RESERVE_BYTES,
     HostKVCache,
+    host_memory_budget_bytes,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -129,12 +128,16 @@ class MHATokenToKVPoolHost(HostKVCache):
         )
         if self.mtp_draft_device_pools:
             device_pools = (self.device_pool, *self.mtp_draft_device_pools)
-            self.packed_device_k_data_ptrs = torch.cat(
-                [pool.k_data_ptrs for pool in device_pools]
-            )
-            self.packed_device_v_data_ptrs = torch.cat(
-                [pool.v_data_ptrs for pool in device_pools]
-            )
+            if not _is_npu:
+                self.packed_device_k_data_ptrs = torch.cat(
+                    [pool.k_data_ptrs for pool in device_pools]
+                )
+                self.packed_device_v_data_ptrs = torch.cat(
+                    [pool.v_data_ptrs for pool in device_pools]
+                )
+            else:
+                self.packed_device_k_data_ptrs = None
+                self.packed_device_v_data_ptrs = None
             self.packed_device_k_buffers = [
                 buffer for pool in device_pools for buffer in pool.k_buffer
             ]
@@ -191,6 +194,11 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            registration_granularity_bytes=(
+                self.page_size * self.layout_dim
+                if self.layout in ("page_first", "page_first_direct")
+                else None
+            ),
         )
         return buffer
 
@@ -724,9 +732,8 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.page_num = anchor_host.page_num
         self.size_per_token = self.get_size_per_token()
 
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_memory_budget_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for MiniMax index-K hierarchical cache. "
@@ -792,6 +799,11 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            registration_granularity_bytes=(
+                self.page_size * self.layout_dim
+                if self.layout in ("page_first", "page_first_direct")
+                else None
+            ),
         )
 
     def get_hybrid_pool_buffer(self):
@@ -1115,6 +1127,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            registration_granularity_bytes=self.page_size * self._k_layout_dim(),
         )
         v_buffer = alloc_func(
             v_dims,
@@ -1122,6 +1135,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            registration_granularity_bytes=self.page_size * self._v_layout_dim(),
         )
         return (k_buffer, v_buffer)
 

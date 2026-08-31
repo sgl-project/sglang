@@ -58,10 +58,13 @@ RUN apt-get update && apt-get install -y software-properties-common curl && \
 RUN apt-get update && apt-get install -y \
     python3-dev \
     build-essential \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:$PATH"
+ENV PATH="/root/.local/bin:/root/.cargo/bin:$PATH"
+RUN curl --proto '=https' --retry 3 --retry-delay 2 --tlsv1.2 -sSf https://sh.rustup.rs \
+| sh -s -- -y --no-modify-path --profile minimal && rustc --version && cargo --version
 ENV VIRTUAL_ENV="/opt/venv"
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 RUN uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV}
@@ -74,6 +77,7 @@ RUN pip install --no-cache-dir torch==2.13.0+xpu torchvision==0.28.0+xpu torchau
 
 RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} sglang && \
+    git -C sglang fetch --tags --force origin && \
     cd sglang && cd python && \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install --no-cache-dir ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu && \

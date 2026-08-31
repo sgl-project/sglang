@@ -35,6 +35,8 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
+    get_self_pp_group,
+    patch_pipeline_parallel_group,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
@@ -47,10 +49,10 @@ from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.runtime_context import (
-    get_exec,
     get_spec,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
+    mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import (
@@ -677,6 +679,14 @@ def load_token_map(token_map_path: str) -> List[int]:
 
 
 @contextmanager
+def draft_pp_context():
+    # The draft model is one layer and never spans pipeline stages; give it a
+    # single-member pp group so it initializes as if pp were off.
+    with patch_pipeline_parallel_group(get_self_pp_group()):
+        yield
+
+
+@contextmanager
 def draft_tp_context(tp_group: GroupCoordinator):
     # Draft model doesn't use dp and has its own tp group.
     # We disable mscclpp now because it doesn't support 2 comm groups.
@@ -811,7 +821,7 @@ def _verify_commit_step_indices(
         return last_correct_step_indices, None
     seq_lens_pre_verify = batch.seq_lens
     seq_lens_post_verify = batch.seq_lens + accept_lens
-    mamba_track_interval = get_exec().mamba.mamba_track_interval
+    mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
     to_track_mask = (
         seq_lens_pre_verify // mamba_track_interval
         != seq_lens_post_verify // mamba_track_interval
@@ -984,7 +994,7 @@ def commit_mamba_states_after_verify(
         mamba_track_indices = batch.mamba_track_indices
         mamba_steps_to_track = None
         if mamba_track_indices is not None:
-            ti = get_exec().mamba.mamba_track_interval
+            ti = mamba_track_grid(batch.tree_cache.page_size)
             seq_pre = batch.seq_lens
             seq_post = batch.seq_lens + accept_lens
             to_track_mask = seq_pre // ti != seq_post // ti
@@ -1036,7 +1046,7 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     if mamba_extra_buffer_lazy_enabled():
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
-            get_exec().mamba.mamba_track_interval,
+            mamba_track_grid(batch.tree_cache.page_size),
             max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
