@@ -1,7 +1,7 @@
 """Native driver error paths: out-of-scope and malformed inputs are rejected.
 
 Covers ``process`` in ``rust/sglang-mm/src/driver.rs`` (via the
-``_core.qwen_vl.process_native_mm`` binding). The wire-payload parsing that
+``_core.qwen_vl.process_mm`` binding). The wire-payload parsing that
 feeds this driver (modality/shape rejection) lives in ``sglang-server``'s
 message layer and is tested with the integration PR.
 
@@ -47,13 +47,13 @@ def gif_bytes():
 
 
 @unittest.skipUnless(
-    QWEN_CORE and hasattr(QWEN_CORE, "process_native_mm"),
+    QWEN_CORE and hasattr(QWEN_CORE, "process_mm"),
     "sglang-mm native Qwen driver not built",
 )
 class TestNativeDriverErrorPaths(CustomTestCase):
     def assert_rejected(self, input_ids, images, pattern, spec=SPEC):
         with self.assertRaisesRegex(ValueError, pattern):
-            QWEN_CORE.process_native_mm(input_ids, images, spec)
+            QWEN_CORE.process_mm(input_ids, images, spec)
 
     def test_degenerate_geometry_rejected_not_panicked(self):
         """A thin image against a tight ``max_pixels`` floors a side of the
@@ -88,7 +88,7 @@ class TestNativeDriverErrorPaths(CustomTestCase):
         """GIF moved from rejected to served when the pure-Rust webp/gif/bmp
         decoders were enabled; this pins the accept side of that contract flip
         (the reject side used to be asserted here and broke in CI)."""
-        _, _, grids, _, offsets, _, _ = QWEN_CORE.process_native_mm(
+        _, _, grids, _, offsets, _, _ = QWEN_CORE.process_mm(
             IMAGE_IDS, [gif_bytes()], SPEC
         )
         self.assertEqual(len(grids), 1)

@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
+
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -68,6 +70,9 @@ class CustomSpecAlgo:
     def is_eagle(self) -> bool:
         return False
 
+    def supports_mixed_chunk(self) -> bool:
+        return False
+
     def is_eagle3(self) -> bool:
         return False
 
@@ -107,8 +112,23 @@ class CustomSpecAlgo:
     def handle_server_args(self, server_args: ServerArgs) -> None:
         pass
 
+    def resolve_max_speculative_num_draft_tokens(
+        self, server_args: ServerArgs
+    ) -> Optional[int]:
+        """Return the largest draft-token width this algorithm may use.
+
+        The default covers static algorithms and adaptive algorithms whose
+        runtime states never exceed their startup width. Overrides must not
+        return less than ``server_args.speculative_num_draft_tokens``.
+        """
+        from sglang.srt.arg_groups.overrides import resolving_view
+
+        return resolving_view(server_args).speculative_num_draft_tokens
+
     def create_worker(self, server_args: ServerArgs) -> Type:
-        if not server_args.disable_overlap_schedule and not self.supports_overlap:
+
+        cfg = resolving_view(server_args)
+        if not cfg.disable_overlap_schedule and not self.supports_overlap:
             raise ValueError(
                 f"Speculative algorithm {self.name} does not support overlap scheduling."
             )

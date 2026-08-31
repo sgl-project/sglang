@@ -15,9 +15,14 @@ class _WorkerState(threading.local):
 class MultimodalProcessorExecutor:
     """Run processor calls on isolated, thread-local processor clones."""
 
-    def __init__(self, processor: Any, max_workers: int):
-        self._processor = processor
-        self._processor_clones = [copy.deepcopy(processor) for _ in range(max_workers)]
+    def __init__(self, resolve_processor: Callable[[], Any], max_workers: int):
+        # Resolved per clone rather than captured here: a subclass keeps
+        # customizing `_processor` after `super().__init__()` has already built
+        # this pool, and a clone taken now would miss every one of those edits.
+        self._resolve_processor = resolve_processor
+        # Probe once, so a processor that cannot be cloned still falls back to
+        # synchronous processing at startup instead of failing inside a worker.
+        copy.deepcopy(resolve_processor())
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="sglang-mm-processor",
@@ -39,12 +44,10 @@ class MultimodalProcessorExecutor:
     ) -> T:
         processor = self._worker_state.processor
         if processor is None:
+            # One clone at a time: cloning reads the shared processor, which the
+            # worker path also reads for the token-count helpers.
             with self._clone_lock:
-                processor = (
-                    self._processor_clones.pop()
-                    if self._processor_clones
-                    else copy.deepcopy(self._processor)
-                )
+                processor = copy.deepcopy(self._resolve_processor())
             self._worker_state.processor = processor
         return function(*args, processor=processor, **kwargs)
 
