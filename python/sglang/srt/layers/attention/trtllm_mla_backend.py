@@ -1032,10 +1032,26 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         global causal bound, which only varies when ``q_len > 1``; with a single
         query token this rank's cyclic slice is exactly the tokens below the
         current position, so the rank-local page table and ``seq_lens`` already
-        describe the shard completely. Callers that genuinely need the global
-        bound signal it by passing ``causal_seqs``, and those are rejected here.
+        describe the shard completely.
+
+        The refusal uses three checks, each catching a spec path DCP cannot
+        serve here:
+
+        - ``q_len > 1`` catches multi-token verify / draft-extend, whose
+          per-row causal bound the kernel cannot resolve.
+        - ``causal_seqs is not None`` catches target-verify, which hands in a
+          global causal bound the kernel cannot forward.
+        - ``not return_lse`` catches draft-extend, whose return path skips the
+          cross-rank shard merge -- spec decode never requests the LSE that
+          merge needs, while plain decode always does.
+
+        The last two are what refuse the single-token (``q_len == 1``) verify
+        and draft-extend that ``q_len`` alone would let through.
         """
-        if cp_world > 1 and causal_seqs is not None:
+        q_len = query.shape[1] if query.dim() == 4 else 1
+        if get_parallel().dcp_enabled and (
+            q_len > 1 or causal_seqs is not None or not return_lse
+        ):
             raise NotImplementedError(
                 "trtllm_mla cannot forward a global causal bound to its decode "
                 "kernel, which is required for DCP with q_len > 1 (speculative "

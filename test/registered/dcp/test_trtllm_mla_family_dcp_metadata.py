@@ -112,6 +112,118 @@ class TestCuteDslMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
     backend_cls = CuteDslMLABackend
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "needs the flashinfer decode hook")
+class TestTRTLLMMLARejectsDcpMultiTokenQuery(CustomTestCase):
+    """``_run_decode_kernel`` must refuse every spec path under DCP.
+
+    trtllm-gen takes no global causal bound, which a ``q_len > 1`` batch needs
+    to resolve a per-query visible prefix. Single-token spec batches still read
+    as ``q_len == 1``, so the refusal also keys on ``causal_seqs`` (target-verify)
+    and ``not return_lse`` (draft-extend, which skips the cross-rank merge)
+    rather than the query length alone.
+    """
+
+    def _make_backend(self):
+        backend = object.__new__(TRTLLMMLABackend)
+        backend.backend = "trtllm-gen"
+        backend.qk_nope_head_dim = 128
+        backend.kv_lora_rank = 512
+        backend.qk_rope_head_dim = 64
+        backend.workspace_buffer = None
+        backend._multi_ctas_kv_counter_buffer = None
+        return backend
+
+    def _call(
+        self,
+        backend,
+        q_len,
+        *,
+        dcp_enabled,
+        kernel=None,
+        causal_seqs=None,
+        return_lse=False,
+    ):
+        parallel = SimpleNamespace(
+            dcp_enabled=dcp_enabled,
+            dcp_size=DCP_SIZE if dcp_enabled else 1,
+            dcp_rank=DCP_RANK if dcp_enabled else 0,
+        )
+        flashinfer_stub = SimpleNamespace(
+            decode=SimpleNamespace(
+                trtllm_batch_decode_with_kv_cache_mla=kernel or (lambda **kw: None)
+            )
+        )
+        with (
+            patch.object(backend_module, "get_parallel", return_value=parallel),
+            patch.object(backend_module, "flashinfer", flashinfer_stub),
+            patch.object(backend, "_compute_decode_bmm1_scale", return_value=1.0),
+        ):
+            return backend._run_decode_kernel(
+                query=torch.zeros(
+                    (2, q_len, 16, 576), dtype=torch.bfloat16, device="cuda"
+                ),
+                kv_cache=torch.zeros((4, 1, 64, 576), dtype=torch.bfloat16),
+                block_tables=torch.zeros((2, 4), dtype=torch.int32, device="cuda"),
+                seq_lens=torch.ones(2, dtype=torch.int32, device="cuda"),
+                max_seq_len=64,
+                layer=SimpleNamespace(scaling=1.0, k_scale_float=None),
+                causal_seqs=causal_seqs,
+                return_lse=return_lse,
+            )
+
+    def test_multi_token_query_under_dcp_raises(self):
+        with self.assertRaises(NotImplementedError):
+            self._call(self._make_backend(), q_len=NUM_DRAFT_TOKENS, dcp_enabled=True)
+
+    def test_explicit_causal_bound_under_dcp_raises_at_q_len_one(self):
+        # The query length is a proxy for "needs a global causal bound", so an
+        # explicit request for one is refused on its own terms. Nothing forces
+        # speculative_num_draft_tokens > 1, so a q_len == 1 target-verify is
+        # expressible and must not slip past on the proxy alone.
+        with self.assertRaises(NotImplementedError):
+            self._call(
+                self._make_backend(),
+                q_len=1,
+                dcp_enabled=True,
+                causal_seqs=torch.ones(2, dtype=torch.int32, device="cuda"),
+            )
+
+    def test_single_token_query_under_dcp_is_allowed(self):
+        # The whole premise of trtllm_mla DCP decode: q_len == 1 needs no
+        # global bound, so the guard must not swallow the decode path it
+        # exists to protect. That path returns the LSE for the cross-rank
+        # merge, which is what tells it apart from a non-merging draft-extend.
+        calls = []
+        self._call(
+            self._make_backend(),
+            q_len=1,
+            dcp_enabled=True,
+            kernel=lambda **kw: calls.append(kw),
+            return_lse=True,
+        )
+        self.assertEqual(len(calls), 1)
+
+    def test_single_token_draft_extend_under_dcp_raises(self):
+        # A single-token draft-extend also reads as q_len == 1 with no
+        # causal_seqs, but its return path skips the cross-rank shard merge:
+        # not requesting the LSE is the signal, so it must not slip past on
+        # the query length alone.
+        with self.assertRaises(NotImplementedError):
+            self._call(self._make_backend(), q_len=1, dcp_enabled=True)
+
+    def test_multi_token_query_without_dcp_is_allowed(self):
+        # Non-DCP speculative target-verify is a q_len > 1 batch and must
+        # keep working.
+        calls = []
+        self._call(
+            self._make_backend(),
+            q_len=NUM_DRAFT_TOKENS,
+            dcp_enabled=False,
+            kernel=lambda **kw: calls.append(kw),
+        )
+        self.assertEqual(len(calls), 1)
+
+
 class TestDcpDecodeLayout(CustomTestCase):
     """Rank-local length math the decode page table above is built from."""
 
