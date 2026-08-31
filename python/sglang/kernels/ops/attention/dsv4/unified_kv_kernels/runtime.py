@@ -122,7 +122,12 @@ def store_swa_into_unified(
         unified_kv_rope is not None
     ), "kv_rope and unified_kv_rope come together"
     if two_pool:
-        assert kv_rope.is_contiguous() and kv_rope.shape[0] == n_rows
+        assert (
+            kv_rope.is_contiguous()
+        ), f"kv_rope must be contiguous, got strides {kv_rope.stride()}"
+        assert (
+            kv_rope.shape[0] == n_rows
+        ), f"kv_rope holds {kv_rope.shape[0]} rows, kv holds {n_rows}"
         check_two_pool_pair(
             unified_kv,
             unified_kv_rope,
@@ -299,7 +304,9 @@ def decode_fp8_2buff(
     # num_seqs comes from qo_indptr.numel()-1 and the kernel writes
     # num_seqs * max_seqlen_q rows into `out`, so both have to be sized off q's
     # own T. A qo_indptr built from a padded token count writes past `out`.
-    assert qo_indptr.shape[0] >= T + 1
+    assert (
+        qo_indptr.shape[0] >= T + 1
+    ), f"qo_indptr holds {qo_indptr.shape[0]} entries, kernel reads {T + 1}"
     assert (
         kv_indptr.shape[0] >= T + 1
     ), f"kv_indptr holds {kv_indptr.shape[0]} entries, kernel reads {T + 1}"
@@ -612,6 +619,115 @@ def build_prefill_indices(
         num_warps=4,
     )
     return kv_indices_prefix, kv_indptr_prefix, kv_indices_extend, kv_indptr_extend
+
+
+def prefill_fp8_2buff(
+    *,
+    q: torch.Tensor,  # [T, H, nope_row_bytes] fp8 packed nope + inline e8m0 scale
+    q_rope: torch.Tensor,  # [T, H, rope_dim] bf16
+    unified_kv: torch.Tensor,  # [rows, nope_row_bytes] fp8 prefix pool
+    unified_kv_rope: torch.Tensor,  # [rows, rope_dim] bf16 prefix pool
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv_extend: torch.Tensor,  # [tokens, nope_row_bytes] fp8 packed current chunk
+    kv_extend_rope: torch.Tensor,  # [tokens, rope_dim] bf16
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,  # [H] fp32
+    softmax_scale: float,
+    v_head_dim: int,
+) -> torch.Tensor:
+    """Prefill over the two-pool fp8 unified_kv, through aiter's opus kernel.
+
+    Same two regions as ``prefill`` -- paged prefix plus this chunk's flat extend
+    -- but every latent arrives as a pair, so there are four buffers instead of
+    two. The extend pair is the packed K the fused norm+rope store hands back;
+    the ring write after attention consumes that same pair, which is why the
+    caller materialises it rather than this function quantizing here.
+
+    Unlike ``decode_fp8_2buff`` the scale is a real argument: this kernel takes
+    it, so nothing has to match a hardcoded 1/sqrt(512).
+
+    ``v_head_dim`` is an element count (448 nope + 64 rope) that happens to equal
+    the packed row's byte width; it comes from the caller so that nothing here
+    reads one as the other.
+
+    A token with neither region comes back zero rather than NaN, so unlike
+    ``decode_fp8_2buff`` there is nothing to mask off the result afterwards. An
+    empty prefix is the live case here, not a guard: chunk 0 has nothing
+    committed yet and every token's prefix segment is empty.
+    """
+    from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus
+
+    T, H, row_bytes = q.shape
+    check_two_pool_pair(
+        unified_kv,
+        unified_kv_rope,
+        rope_width=q_rope.shape[-1],
+        rope_dtype=q_rope.dtype,
+    )
+    # The kernel walks the prefix pool and the extend buffer with the same row
+    # layout, so a narrower extend row would read the next token's bytes as this
+    # one's scales instead of failing.
+    assert kv_extend.shape[-1] == row_bytes and kv_extend.dtype == unified_kv.dtype, (
+        f"extend nope row is {kv_extend.shape[-1]} x {kv_extend.dtype}, pool is "
+        f"{row_bytes} x {unified_kv.dtype}"
+    )
+    assert (
+        kv_extend_rope.shape[-1] == unified_kv_rope.shape[-1]
+        and kv_extend_rope.dtype == unified_kv_rope.dtype
+    ), (
+        f"extend rope row is {kv_extend_rope.shape[-1]} x {kv_extend_rope.dtype}, "
+        f"pool is {unified_kv_rope.shape[-1]} x {unified_kv_rope.dtype}"
+    )
+    assert kv_extend.shape[0] == kv_extend_rope.shape[0], (
+        f"extend pair disagrees: nope {kv_extend.shape[0]} rows vs rope "
+        f"{kv_extend_rope.shape[0]}"
+    )
+    assert row_bytes == unified_kv.shape[-1], (
+        f"the kernel reads Q with the kv row stride ({unified_kv.shape[-1]} B), "
+        f"but the q row is {row_bytes} B"
+    )
+    assert q_rope.shape[:2] == (T, H), (
+        f"q pair disagrees: packed {tuple(q.shape)[:2]} vs rope "
+        f"{tuple(q_rope.shape)[:2]}"
+    )
+    # no stride arguments anywhere in the op. The two pools got their
+    # is_contiguous() from check_two_pool_pair above; these are the rest.
+    for name, t in (
+        ("q", q),
+        ("q_rope", q_rope),
+        ("kv_extend", kv_extend),
+        ("kv_extend_rope", kv_extend_rope),
+    ):
+        assert t.is_contiguous(), f"{name} must be contiguous, strides {t.stride()}"
+    assert (
+        attn_sink.dtype == torch.float32 and attn_sink.numel() == H
+    ), f"sink must be {H} fp32 values, got {attn_sink.numel()} x {attn_sink.dtype}"
+    for name, indptr in (
+        ("prefix", kv_indptr_prefix),
+        ("extend", kv_indptr_extend),
+    ):
+        assert (
+            indptr.shape[0] >= T + 1
+        ), f"{name} indptr holds {indptr.shape[0]} entries, kernel reads {T + 1}"
+
+    out = q_rope.new_empty((T, H, v_head_dim))
+    return pa_sparse_prefill_fp8_opus(
+        q,
+        q_rope,
+        unified_kv,
+        unified_kv_rope,
+        kv_indices_prefix,
+        kv_indptr_prefix[: T + 1],
+        kv_extend,
+        kv_extend_rope,
+        kv_indices_extend,
+        kv_indptr_extend[: T + 1],
+        attn_sink,
+        softmax_scale,
+        out=out,
+    )
 
 
 def prefill(

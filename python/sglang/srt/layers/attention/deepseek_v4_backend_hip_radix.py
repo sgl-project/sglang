@@ -1327,12 +1327,15 @@ class DeepseekV4HipRadixBackend(
         core_attn_metadata: DSV4AttnMetadata,
         save_kv_cache: bool = True,
         q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """unified_kv paged-attention path over the unified_kv pool.
 
         ``q_rope`` is what tells the two layouts apart: present means ``q`` is a
         packed fp8 row and the pool is the two-pool fp8 one, so decode goes to
         the asm reader; absent means both are plain bf16 and it goes to Triton.
+        Prefill needs ``k_rope`` alongside it, because there the current chunk is
+        a KV source of its own and not just something to store.
         """
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 
@@ -1490,17 +1493,42 @@ class DeepseekV4HipRadixBackend(
             pad = T + 1 - kpre_p.shape[0]
             kpre_p = torch.cat([kpre_p, kpre_p[-1:].expand(pad)])
             kext_p = torch.cat([kext_p, kext_p[-1:].expand(pad)])
-        o = runtime.prefill(
-            q=q,
-            unified_kv=unified,
-            kv_indices_prefix=kpre_i,
-            kv_indptr_prefix=kpre_p,
-            kv_extend=kv,
-            kv_indices_extend=kext_i,
-            kv_indptr_extend=kext_p,
-            attn_sink=attn_sink,
-            softmax_scale=self.softmax_scale,
-        )
+        if q_rope is not None:
+            assert k_rope is not None, (
+                "fp8 prefill needs the extend rope half beside the packed nope; "
+                "q_rope came through but k_rope did not"
+            )
+            # No empty-segment mask on the result, unlike decode: this kernel
+            # returns zeros for a token with neither region where the asm decode
+            # reader leaves the row NaN. Chunk 0 tokens have an empty prefix and
+            # a non-empty extend, which both readers handle.
+            o = runtime.prefill_fp8_2buff(
+                q=q,
+                q_rope=q_rope,
+                unified_kv=unified,
+                unified_kv_rope=pool.get_unified_kv_rope(layer_id),
+                kv_indices_prefix=kpre_i,
+                kv_indptr_prefix=kpre_p,
+                kv_extend=kv,
+                kv_extend_rope=k_rope,
+                kv_indices_extend=kext_i,
+                kv_indptr_extend=kext_p,
+                attn_sink=attn_sink,
+                softmax_scale=self.softmax_scale,
+                v_head_dim=layer.v_head_dim,
+            )
+        else:
+            o = runtime.prefill(
+                q=q,
+                unified_kv=unified,
+                kv_indices_prefix=kpre_i,
+                kv_indptr_prefix=kpre_p,
+                kv_extend=kv,
+                kv_indices_extend=kext_i,
+                kv_indptr_extend=kext_p,
+                attn_sink=attn_sink,
+                softmax_scale=self.softmax_scale,
+            )
 
         # write this chunk's SWA K into the ring for future chunks / decode
         # only the final-window tokens per request
@@ -1520,6 +1548,10 @@ class DeepseekV4HipRadixBackend(
                 win=win,
                 ring_stride=ring_stride,
                 final_pos=_ring_final_pos,
+                kv_rope=None if k_rope is None else k_rope[:n_real],
+                unified_kv_rope=(
+                    None if k_rope is None else pool.get_unified_kv_rope(layer_id)
+                ),
             )
         return o
 
@@ -1610,6 +1642,7 @@ class DeepseekV4HipRadixBackend(
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
         q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
         **_,
     ) -> torch.Tensor:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
@@ -1639,6 +1672,7 @@ class DeepseekV4HipRadixBackend(
                 core_attn_metadata=core_attn_metadata,
                 save_kv_cache=save_kv_cache,
                 q_rope=q_rope,
+                k_rope=k_rope,
             )
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):

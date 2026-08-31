@@ -38,12 +38,12 @@ def check_two_pool_pair(
     row stride off the tensor, so a wider row would still land in the right place;
     a width that disagrees with the caller means the wrong pool was fetched.
     """
-    assert (
-        rope_pool is not None
-    ), "the fp8 layout needs a rope pool next to the nope pool"
-    assert (
-        nope_pool.shape[0] == rope_pool.shape[0]
-    ), f"pool rows differ: nope {nope_pool.shape[0]} vs rope {rope_pool.shape[0]}"
+    assert rope_pool is not None, (
+        "the fp8 layout needs a rope pool next to the nope pool"
+    )
+    assert nope_pool.shape[0] == rope_pool.shape[0], (
+        f"pool rows differ: nope {nope_pool.shape[0]} vs rope {rope_pool.shape[0]}"
+    )
     assert (
         nope_pool.element_size() == 1 and nope_pool.shape[-1] == DSV4_FP8_NOPE_ROW_BYTES
     ), (
@@ -54,4 +54,9 @@ def check_two_pool_pair(
         f"rope pool is {rope_pool.shape[-1]} x {rope_pool.dtype}, expected "
         f"{rope_width} x {rope_dtype}"
     )
-    assert nope_pool.is_contiguous() and rope_pool.is_contiguous()
+    assert nope_pool.is_contiguous(), (
+        f"nope pool must be contiguous, got strides {nope_pool.stride()}"
+    )
+    assert rope_pool.is_contiguous(), (
+        f"rope pool must be contiguous, got strides {rope_pool.stride()}"
+    )

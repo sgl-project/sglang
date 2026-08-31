@@ -351,17 +351,17 @@ def _fp8_2buff_store(
             f"aiter exports it={_HAS_AITER_OP}, gfx95={is_gfx95_supported()}"
         )
 
-    assert (
-        q.dim() == 2
-    ), f"aiter takes q as [T, H, D] with no split-K reduce, got {tuple(q.shape)}"
-    assert (
-        cos_cache.shape[-1] * 2 == rope_head_dim
-    ), f"rot_dim from cos_cache ({cos_cache.shape[-1] * 2}) != {rope_head_dim}"
+    assert q.dim() == 2, (
+        f"aiter takes q as [T, H, D] with no split-K reduce, got {tuple(q.shape)}"
+    )
+    assert cos_cache.shape[-1] * 2 == rope_head_dim, (
+        f"rot_dim from cos_cache ({cos_cache.shape[-1] * 2}) != {rope_head_dim}"
+    )
     # int64 is what the kernel indexes with; a silent .to() here would copy every
     # call and hide a caller that changed dtype.
-    assert (
-        positions.dtype == torch.int64
-    ), f"positions must be int64, got {positions.dtype}"
+    assert positions.dtype == torch.int64, (
+        f"positions must be int64, got {positions.dtype}"
+    )
 
     batch_id = None
     has_swa = swa_cache is not None
@@ -370,6 +370,15 @@ def _fp8_2buff_store(
         # pools, and aiter bounds-checks neither -- a short rope pool aborts the
         # process with nothing on stderr, so the pair is checked there first.
         assert swa_loc is not None, "fp8 SWA store needs swa_loc alongside the pools"
+        # int32 is the SWA loc contract across the tree (translate_loc_from_full_to_swa
+        # enforces it too), and aiter reads the dest-row array raw -- a wider dtype
+        # becomes garbage row ids and aborts with nothing on stderr
+        assert swa_loc.dtype == torch.int32, (
+            f"swa_loc must be int32, got {swa_loc.dtype}"
+        )
+        assert swa_loc.shape[0] == kv.shape[0], (
+            f"swa_loc holds {swa_loc.shape[0]} rows, kv holds {kv.shape[0]}"
+        )
         check_two_pool_pair(
             swa_cache,
             swa_rope_cache,
@@ -504,9 +513,9 @@ def fused_qk_norm_rope_swa_store(
 
     if fp8_2buff:
         assert not bf16_store, "fp8_2buff and bf16_store are different stores"
-        assert (
-            q_rms_eps == kv_rms_eps
-        ), f"aiter norms Q and K with one eps, got {q_rms_eps} / {kv_rms_eps}"
+        assert q_rms_eps == kv_rms_eps, (
+            f"aiter norms Q and K with one eps, got {q_rms_eps} / {kv_rms_eps}"
+        )
         return _fp8_2buff_store(
             q,
             kv,
