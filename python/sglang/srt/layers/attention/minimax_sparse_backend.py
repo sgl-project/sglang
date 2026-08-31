@@ -27,7 +27,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
 
 if is_npu():
     from sglang.kernels.ops.attention.minimax_sparse.common.index import (
@@ -286,7 +286,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         self.index_topk_freq = (
             max(int(envs.SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ.get()), 1)
-            if is_hip() and not is_tbo_enabled()
+            if is_hip() and is_gfx95_supported() and not is_tbo_enabled()
             else 1
         )
         self.index_cache_enabled = self.index_topk_freq > 1
