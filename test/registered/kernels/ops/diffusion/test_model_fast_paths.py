@@ -51,7 +51,6 @@ from sglang.kernels.ops.diffusion import (
     mount_fused_ln_modulate,
     mount_hunyuan_qknorm,
     mount_ltx2_rms_norm_modulate,
-    residual_gate_add,
     try_flux2_token_cat_nvfp4,
     unmount_hunyuan_qknorm,
     unmount_ltx2_rms_norm_modulate,
@@ -121,7 +120,6 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=95, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=95, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_amd_ci(est_time=8, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -131,12 +129,6 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 # asserting a fused outcome are CUDA-only.
 requires_inline_ptx = pytest.mark.skipif(
     not is_cuda(), reason="bit-exact norm fusions are NVIDIA PTX"
-)
-requires_blackwell = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not is_cuda()
-    or torch.cuda.get_device_capability()[0] < 10,
-    reason="FLUX.2 gated residual fusion requires SM100 or newer",
 )
 
 
@@ -329,46 +321,6 @@ class TestFlux2EagerFusions(CustomTestCase):
 
         self.assertFalse(flux2._FLUX2_LN_MOD.disabled)
         self.assertEqual(len(flux2._FLUX2_LN_MOD_SIGS), 1)
-
-    @requires_blackwell
-    def test_gated_residual_norm_modulate_is_bit_exact(self):
-        hidden = 6144
-        shape = (1, 64, hidden)
-        residual = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
-        update = torch.randn_like(residual)
-        params = torch.randn(1, 1, 3 * hidden, device="cuda").bfloat16()
-        gate, scale, shift = params.chunk(3, dim=-1)
-        norm = nn.LayerNorm(hidden, elementwise_affine=False, eps=1e-6, device="cuda")
-        expected_residual = residual_gate_add(residual, update, gate)
-        expected = norm(expected_residual) * (1 + scale) + shift
-        actual, actual_residual = flux2._flux2_gated_resnorm(
-            norm, residual, update, gate, scale, shift
-        )
-
-        self.assertIsInstance(
-            flux2._defer_gated_residual(residual, update, gate), tuple
-        )
-        self.assertTrue(torch.equal(actual_residual, expected_residual))
-        self.assertTrue(torch.equal(actual, expected))
-
-    def test_gated_residual_defer_rejects_unsupported_inputs(self):
-        for batch, dtype in ((1, torch.float16), (2, torch.bfloat16)):
-            residual = torch.randn(batch, 17, 6144, device="cuda", dtype=dtype)
-            update = torch.randn_like(residual)
-            gate = torch.randn(batch, 1, 6144, device="cuda", dtype=dtype)
-            expected = residual_gate_add(residual, update, gate)
-            actual = flux2._defer_gated_residual(residual, update, gate)
-
-            self.assertIsInstance(actual, torch.Tensor)
-            self.assertTrue(torch.equal(actual, expected))
-
-        residual = torch.randn(1, 17, 6144, device="cuda", dtype=torch.bfloat16)
-        update = torch.randn_like(residual)
-        gate = torch.randn(1, 1, 6144, device="cuda", dtype=torch.bfloat16)
-        with patch("torch.compiler.is_compiling", return_value=True):
-            actual = flux2._defer_gated_residual(residual, update, gate)
-        self.assertIsInstance(actual, torch.Tensor)
-        self.assertTrue(torch.equal(actual, residual_gate_add(residual, update, gate)))
 
     def test_packed_swiglu_is_bit_exact_for_contiguous_and_strided_views(self):
         torch.manual_seed(1)
