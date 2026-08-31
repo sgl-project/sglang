@@ -77,6 +77,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.weights.source import (
+    is_explicit_weight_file_reference,
+)
 from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
@@ -146,7 +149,9 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
+        "efficient-large-model/sana-video_2b_480p_diffusers",
         "sana1.5_1.6b_1024px_diffusers",
+        "sana-video_2b_480p_diffusers",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
         "glm-image",
@@ -159,6 +164,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ideogram-ai/ideogram-4-nf4",
         "lightricks/ltx-2",
         "lightricks/ltx-2.3",
+        "meituan-longcat/longcat-image",
         "ltx-2",
         "ltx-2.3",
         "minimax-h3",
@@ -181,9 +187,11 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "Ideogram4PipelineConfig",
         "LTX2PipelineConfig",
         "LTX23PipelineConfig",
+        "LongCatImagePipelineConfig",
         "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
         "SanaPipelineConfig",
+        "SanaVideoPipelineConfig",
         "ZImagePipelineConfig",
     }
 )
@@ -296,6 +304,18 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Component path overrides (key = model_index.json component name, value = path)
     component_paths: dict[str, str] = field(default_factory=dict)
+    # Exact weight-file overrides retain the base component configuration.
+    component_weights_paths: dict[str, str] = field(default_factory=dict)
+    # Opt in one component to a loader-specific direct-GPU weight path.  The
+    # existing --direct-gpu-weight-loading remains the primary-DiT control.
+    component_direct_gpu_weight_loading: dict[str, bool] = field(default_factory=dict)
+    # Explicit quantization override for one component. Self-describing
+    # checkpoints remain auto-detected and do not need this override.
+    component_quantizations: dict[str, str] = field(default_factory=dict)
+    # Component-local layer name patterns to skip during online quantization.
+    component_quantization_ignored_layers: dict[str, list[str]] = field(
+        default_factory=dict
+    )
     # Optional LTX-2.5 decoder is large enough to load only when requested.
     load_diffusion_decoder: bool = False
 
@@ -308,12 +328,6 @@ class ServerArgs(DisaggServerArgsMixin):
     # Widest timestep plan the rebuild slab is sized for; see
     # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
     minimax_h3_adaln_plan_width: int = 4
-    # Per-component transformer weight overrides (key = model_index.json component name).
-    # Pipelines use this when a checkpoint ships separate quantized weights for
-    # secondary DiT components; the generic loader consumes it without model-specific
-    # filename logic.
-    component_transformer_weights_paths: dict[str, str] = field(default_factory=dict)
-
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -357,6 +371,9 @@ class ServerArgs(DisaggServerArgsMixin):
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
     _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
+    _automatic_component_attention_backend_keys: set[str] = field(
+        default_factory=set, init=False, repr=False
+    )
     _required_resident_components: set[str] = field(
         default_factory=set, init=False, repr=False
     )
@@ -403,6 +420,7 @@ class ServerArgs(DisaggServerArgsMixin):
     warmup_mode: str | None = None
 
     warmup_resolutions: list[str] = None
+    warmup_num_frames: int | None = None
     warmup_steps: int = 1
 
     disable_autocast: bool | None = None
@@ -642,8 +660,9 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only Ideogram-4, Lightricks/LTX-2, MiniMax-H3, "
-            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
+            "[Diffusion BCG] disabled for %s: only Ideogram-4, "
+            "Lightricks/LTX-2, LongCat-Image, MiniMax-H3, "
+            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, SANA-Video, "
             "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
             "currently supported.",
             pipeline_config_name,
@@ -743,9 +762,10 @@ class ServerArgs(DisaggServerArgsMixin):
         # propose the fold group from the parallelism alone; the loader keeps it
         # only for encoders worth folding at their real post-load size
         # (finalize_encoder_folding)
-        encoder_configs = list(self.pipeline_config.text_encoder_configs) + list(
-            getattr(self.pipeline_config, "image_encoder_configs", ()) or ()
-        )
+        encoder_configs = [
+            *self.pipeline_config.text_encoder_configs,
+            self.pipeline_config.image_encoder_config,
+        ]
         for encoder_config in encoder_configs:
             encoder_config.parallel_folding_mode = mode
 
@@ -935,12 +955,31 @@ class ServerArgs(DisaggServerArgsMixin):
                     logger.info(
                         "Automatically set torch_sdpa backend for component text_encoder to preserve LTX2 official attention semantics"
                     )
+                    self._automatic_component_attention_backend_keys.add("text_encoder")
                 else:
                     logger.warning(
                         "Overriding %s backend with torch_sdpa for component text_encoder to preserve LTX2 official attention semantics",
                         text_backend,
                     )
                 self.component_attention_backends["text_encoder"] = "torch_sdpa"
+        from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+            MiniMaxH3PipelineConfig,
+        )
+
+        if (
+            self.backend != Backend.DIFFUSERS
+            and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
+            and self.attention_backend == "laser_attn"
+            and "text_encoder" not in self.component_attention_backends
+        ):
+            # Laser Attention is used only by the MiniMax-H3 transformer.
+            # SDPA is faster than Ascend FA for its Qwen3-VL text encoder.
+            logger.info(
+                "Automatically set torch_sdpa backend for the MiniMax H3 text "
+                "encoder; laser_attn applies to the transformer"
+            )
+            self.component_attention_backends["text_encoder"] = "torch_sdpa"
+            self._automatic_component_attention_backend_keys.add("text_encoder")
 
         if self.ring_degree > 1:
             if (
@@ -1127,12 +1166,22 @@ class ServerArgs(DisaggServerArgsMixin):
                     return AttentionBackendEnum[backend.upper()], backend_key
         return None, None
 
+    def is_component_attention_backend_automatic(
+        self, component_name: str | None
+    ) -> bool:
+        return (
+            component_name is not None
+            and component_name in self._automatic_component_attention_backend_keys
+        )
+
     def _adjust_warmup(self):
         if self.warmup_mode is not None and self.warmup_mode not in WARMUP_MODES:
             raise ValueError(
                 f"Invalid --warmup-mode {self.warmup_mode!r}; "
                 f"expected one of {WARMUP_MODES}."
             )
+        if self.warmup_num_frames is not None and self.warmup_num_frames <= 0:
+            raise ValueError("--warmup-num-frames must be a positive integer.")
 
         if self.enable_torch_compile and self.warmup_mode is None:
             self.warmup_mode = "server"
@@ -1142,9 +1191,11 @@ class ServerArgs(DisaggServerArgsMixin):
                 "to disable this behavior."
             )
 
-        # Explicit resolutions need a request path unless an existing server
+        # Explicit warmup shapes need a request path unless an existing server
         # default already supplies the synthetic startup request.
-        if self.warmup_resolutions is not None and self.warmup_mode in (None, "off"):
+        if (
+            self.warmup_resolutions is not None or self.warmup_num_frames is not None
+        ) and self.warmup_mode in (None, "off"):
             self.warmup_mode = "request"
 
         # BCG captures every graph during a synthetic warmup forward at startup
@@ -1506,11 +1557,11 @@ class ServerArgs(DisaggServerArgsMixin):
     def require_component_resident(
         self, component_name: str, *, feature_name: str
     ) -> None:
-        configured_mode = self.canonical_residency_mode(component_name)
+        configured_mode = self.explicit_residency_mode(component_name)
         if configured_mode is not None and configured_mode != RESIDENT:
             raise ValueError(
                 f"{feature_name} requires {component_name!r} to be resident; "
-                f"got {configured_mode!r} from --component-residency"
+                f"got {configured_mode!r} from an explicit residency option"
             )
         self._required_resident_components.add(component_name)
 
@@ -1693,6 +1744,82 @@ class ServerArgs(DisaggServerArgsMixin):
         # configure logger before use
         configure_logger(server_args=self)
 
+        component_paths: dict[str, str] = {}
+        component_weights_paths = dict(self.component_weights_paths)
+        for component, path in self.component_paths.items():
+            supports_weight_file_override = (
+                is_dit_component_name(component)
+                or is_text_encoder_component_name(component)
+                or is_image_encoder_component_name(component)
+                or is_vae_component_name(component)
+            )
+            if (
+                not supports_weight_file_override
+                or not is_explicit_weight_file_reference(path)
+            ):
+                component_paths[component] = path
+                continue
+            existing = component_weights_paths.get(component)
+            if existing is not None and existing != path:
+                raise ValueError(
+                    f"Conflicting weight overrides for component {component!r}: "
+                    f"{existing!r} and {path!r}"
+                )
+            component_weights_paths[component] = path
+        self.component_paths = component_paths
+        self.component_weights_paths = component_weights_paths
+        normalized_direct_gpu_loading: dict[str, bool] = {}
+        for component, enabled in self.component_direct_gpu_weight_loading.items():
+            component_name = str(component).strip().replace("-", "_")
+            if not component_name or not isinstance(enabled, bool):
+                raise ValueError(
+                    "Component direct GPU loading entries require a component and "
+                    "a boolean value"
+                )
+            normalized_direct_gpu_loading[component_name] = enabled
+        self.component_direct_gpu_weight_loading = normalized_direct_gpu_loading
+        normalized_quantizations: dict[str, str] = {}
+        for component, quantization in self.component_quantizations.items():
+            component = str(component).strip().replace("-", "_")
+            quantization = str(quantization).strip().lower()
+            if not component or not quantization:
+                raise ValueError(
+                    "Component quantization entries require a component and method"
+                )
+            previous = normalized_quantizations.get(component)
+            if previous is not None and previous != quantization:
+                raise ValueError(
+                    f"Conflicting quantization overrides for {component!r}: "
+                    f"{previous!r} and {quantization!r}"
+                )
+            normalized_quantizations[component] = quantization
+        self.component_quantizations = normalized_quantizations
+        normalized_ignored_layers: dict[str, list[str]] = {}
+        for component, layers in self.component_quantization_ignored_layers.items():
+            component = str(component).strip().replace("-", "_")
+            if isinstance(layers, str):
+                layers = [layers]
+            if (
+                not component
+                or not isinstance(layers, (list, tuple))
+                or not all(isinstance(layer, str) and layer.strip() for layer in layers)
+            ):
+                raise ValueError(
+                    "Component quantization ignored layers require a component "
+                    "and non-empty layer patterns"
+                )
+            normalized_ignored_layers[component] = [layer.strip() for layer in layers]
+        missing_quantization = set(normalized_ignored_layers) - set(
+            self.component_quantizations
+        )
+        if missing_quantization:
+            raise ValueError(
+                "Component quantization ignored layers require a matching "
+                "quantization override for: "
+                f"{', '.join(sorted(missing_quantization))}"
+            )
+        self.component_quantization_ignored_layers = normalized_ignored_layers
+
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
             self.disagg_role = RoleType.from_string(self.disagg_role)
@@ -1820,10 +1947,11 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=None,
             help=(
-                "The attention backend to use. For SGLang-native pipelines, use "
-                "values like fa, torch_sdpa, sage_attn, etc. For diffusers pipelines, "
-                "use diffusers attention backend names such as flash, _flash_3_hub, "
-                "sage, or xformers."
+                "The global attention backend. Native DiT components treat it as "
+                "strict; auxiliary native components use a compatible fallback when "
+                "needed. Use --component-attention-backends for a component-scoped "
+                "choice. For diffusers pipelines, use names such as flash, "
+                "_flash_3_hub, sage, or xformers."
             ),
         )
         parser.add_argument(
@@ -2139,6 +2267,16 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Specify explicit warmup resolutions. e.g., `--warmup-resolutions 256x256 720x720`",
         )
         parser.add_argument(
+            "--warmup-num-frames",
+            type=int,
+            default=ServerArgs.warmup_num_frames,
+            help=(
+                "Override the synthetic video warmup frame count. Use this with "
+                "breakable CUDA graphs when serving a non-default frame count so "
+                "the captured latent shape matches the request."
+            ),
+        )
+        parser.add_argument(
             "--warmup-steps",
             type=int,
             default=ServerArgs.warmup_steps,
@@ -2191,9 +2329,10 @@ class ServerArgs(DisaggServerArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for DiTs. "
-            "It selects only the DiT layerwise group. Cannot be used together with cache-dit "
-            "(SGLANG_CACHE_DIT_ENABLED) or use_fsdp_inference. If legacy DiT offload "
-            "flags are also provided, layerwise offload is the effective DiT mode.",
+            "It selects only the DiT layerwise group. Compatible with cache-dit: "
+            "skipped blocks are not streamed. Cannot be used together with "
+            "use_fsdp_inference. If legacy DiT offload flags are also provided, "
+            "layerwise offload is the effective DiT mode.",
         )
         parser.add_argument(
             "--layerwise-offload-components",
@@ -2730,38 +2869,38 @@ class ServerArgs(DisaggServerArgsMixin):
         )
 
     @staticmethod
-    def _extract_component_paths(
+    def _extract_dynamic_component_map(
         unknown_args: list[str],
+        *,
+        option_prefixes: tuple[str, ...],
+        alias_suffix: str,
     ) -> tuple[dict[str, str], list[str]]:
-        """
-        Extract dynamic component path args from unrecognised CLI args.
-
-        Supported forms:
-        - ``--<component>-path /path/to/component``
-        - ``--component-paths.<component> /path/to/component`` (expanded from config)
-        """
-        component_paths: dict[str, str] = {}
+        component_values: dict[str, str] = {}
         remaining: list[str] = []
         i = 0
         while i < len(unknown_args):
             arg = unknown_args[i]
             key_part = arg.split("=", 1)[0] if "=" in arg else arg
             component = None
-            if key_part.startswith("--component-paths."):
-                component = key_part[len("--component-paths.") :].replace("-", "_")
-            elif key_part.startswith("--component_paths."):
-                component = key_part[len("--component_paths.") :].replace("-", "_")
-            elif key_part.startswith("--") and key_part.endswith("-path"):
-                component = key_part[2:-5].replace("-", "_")
+            for option_prefix in option_prefixes:
+                if key_part.startswith(option_prefix):
+                    component = key_part[len(option_prefix) :].replace("-", "_")
+                    break
+            if (
+                component is None
+                and key_part.startswith("--")
+                and key_part.endswith(alias_suffix)
+            ):
+                component = key_part[2 : -len(alias_suffix)].replace("-", "_")
 
             if component is not None:
                 if "=" in arg:
-                    component_paths[component] = arg.split("=", 1)[1]
+                    component_values[component] = arg.split("=", 1)[1]
                 elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
                     "-"
                 ):
                     i += 1
-                    component_paths[component] = unknown_args[i]
+                    component_values[component] = unknown_args[i]
                 else:
                     remaining.append(arg)
                     i += 1
@@ -2770,11 +2909,138 @@ class ServerArgs(DisaggServerArgsMixin):
                 remaining.append(arg)
             i += 1
 
-        # canonicalize and validate
-        for component, path in component_paths.items():
-            path = os.path.expanduser(path)
-            component_paths[component] = path
-        return component_paths, remaining
+        return {
+            component: os.path.expanduser(value)
+            for component, value in component_values.items()
+        }, remaining
+
+    @classmethod
+    def _extract_component_paths(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract dynamic component configuration paths and aliases."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=("--component-paths.", "--component_paths."),
+            alias_suffix="-path",
+        )
+
+    @classmethod
+    def _extract_component_weights_paths(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract dynamic component weight-file paths and aliases."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=(
+                "--component-weights-paths.",
+                "--component_weights_paths.",
+            ),
+            alias_suffix="-weights-path",
+        )
+
+    @staticmethod
+    def _extract_component_direct_gpu_weight_loading(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, bool], list[str]]:
+        """Extract exact component direct-GPU loading toggles.
+
+        Dynamic boolean flags mirror ``StoreBoolean``: an omitted value means
+        true, while an explicit ``true`` or ``false`` works with either an
+        equals form or a following argument.
+        """
+        values: dict[str, bool] = {}
+        remaining: list[str] = []
+        prefixes = (
+            "--component-direct-gpu-weight-loading.",
+            "--component_direct_gpu_weight_loading.",
+        )
+        i = 0
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            prefix = next(
+                (candidate for candidate in prefixes if key_part.startswith(candidate)),
+                None,
+            )
+            if prefix is None:
+                remaining.append(arg)
+                i += 1
+                continue
+
+            component = key_part[len(prefix) :].replace("-", "_")
+            value = "true"
+            if "=" in arg:
+                value = arg.split("=", 1)[1]
+            elif i + 1 < len(unknown_args):
+                next_value = unknown_args[i + 1].lower()
+                if next_value in ("true", "false"):
+                    i += 1
+                    value = next_value
+
+            if not component or value.lower() not in ("true", "false"):
+                remaining.append(arg)
+            else:
+                values[component] = value.lower() == "true"
+            i += 1
+        return values, remaining
+
+    @classmethod
+    def _extract_component_quantizations(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract explicit per-component quantization methods."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=(
+                "--component-quantizations.",
+                "--component_quantizations.",
+            ),
+            alias_suffix="-quantization",
+        )
+
+    @staticmethod
+    def _extract_component_quantization_ignored_layers(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, list[str]], list[str]]:
+        ignored_layers: dict[str, list[str]] = {}
+        remaining: list[str] = []
+        i = 0
+        prefixes = (
+            "--component-quantization-ignored-layers.",
+            "--component_quantization_ignored_layers.",
+        )
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            prefix = next(
+                (candidate for candidate in prefixes if key_part.startswith(candidate)),
+                None,
+            )
+            if prefix is None:
+                remaining.append(arg)
+                i += 1
+                continue
+
+            component = key_part[len(prefix) :].replace("-", "_")
+            if "=" in arg:
+                values = [arg.split("=", 1)[1]]
+            else:
+                values = []
+                while i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
+                    "-"
+                ):
+                    i += 1
+                    values.append(unknown_args[i])
+            if component and values:
+                ignored_layers[component] = values
+            else:
+                remaining.append(arg)
+            i += 1
+        return ignored_layers, remaining
 
     @staticmethod
     def _extract_component_attention_backends(
@@ -2823,8 +3089,20 @@ class ServerArgs(DisaggServerArgsMixin):
         if unknown_args is None:
             unknown_args = []
 
-        # extract dynamic --<component>-path from unknown args
-        dynamic_paths, remaining = cls._extract_component_paths(unknown_args)
+        dynamic_quantizations, remaining = cls._extract_component_quantizations(
+            unknown_args
+        )
+        dynamic_direct_gpu_loading, remaining = (
+            cls._extract_component_direct_gpu_weight_loading(remaining)
+        )
+        dynamic_ignored_layers, remaining = (
+            cls._extract_component_quantization_ignored_layers(remaining)
+        )
+        # Extract the more specific weights suffix before the generic path alias.
+        dynamic_weights_paths, remaining = cls._extract_component_weights_paths(
+            remaining
+        )
+        dynamic_paths, remaining = cls._extract_component_paths(remaining)
         dynamic_attention_backends, remaining = (
             cls._extract_component_attention_backends(remaining)
         )
@@ -2850,6 +3128,30 @@ class ServerArgs(DisaggServerArgsMixin):
             existing.update(dynamic_paths)
             provided_args["component_paths"] = existing
             explicit_arg_names.add("component_paths")
+        if dynamic_weights_paths:
+            existing = dict(provided_args.get("component_weights_paths") or {})
+            existing.update(dynamic_weights_paths)
+            provided_args["component_weights_paths"] = existing
+            explicit_arg_names.add("component_weights_paths")
+        if dynamic_quantizations:
+            existing = dict(provided_args.get("component_quantizations") or {})
+            existing.update(dynamic_quantizations)
+            provided_args["component_quantizations"] = existing
+            explicit_arg_names.add("component_quantizations")
+        if dynamic_direct_gpu_loading:
+            existing = dict(
+                provided_args.get("component_direct_gpu_weight_loading") or {}
+            )
+            existing.update(dynamic_direct_gpu_loading)
+            provided_args["component_direct_gpu_weight_loading"] = existing
+            explicit_arg_names.add("component_direct_gpu_weight_loading")
+        if dynamic_ignored_layers:
+            existing = dict(
+                provided_args.get("component_quantization_ignored_layers") or {}
+            )
+            existing.update(dynamic_ignored_layers)
+            provided_args["component_quantization_ignored_layers"] = existing
+            explicit_arg_names.add("component_quantization_ignored_layers")
         if dynamic_attention_backends:
             existing = cls._parse_component_attention_backend_map(
                 provided_args.get("component_attention_backends")
@@ -3116,17 +3418,6 @@ class ServerArgs(DisaggServerArgsMixin):
             if self.dit_offload_prefetch_size < 0.0:
                 raise ValueError("dit_offload_prefetch_size must be non-negative")
 
-            is_dit_layerwise_offload_selected = self.is_dit_layerwise_offload_selected
-
-            if envs.SGLANG_CACHE_DIT_ENABLED and is_dit_layerwise_offload_selected:
-                raise ValueError(
-                    "DiT layerwise offload cannot be enabled together with cache-dit. "
-                    "cache-dit may reuse skipped blocks whose weights have been released by layerwise offload, "
-                    "causing shape mismatch errors. "
-                    "Please disable --dit-layerwise-offload, remove DiT from --layerwise-offload-components, "
-                    "or disable SGLANG_CACHE_DIT_ENABLED."
-                )
-
             if (
                 self.performance_mode == "memory"
                 or self.is_arg_explicitly_set("layerwise_offload_components")
@@ -3152,24 +3443,38 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
 
     def _validate_direct_gpu_weight_loading(self) -> None:
-        if not self.direct_gpu_weight_loading:
-            return
-        if not current_platform.is_cuda():
-            raise ValueError("--direct-gpu-weight-loading requires CUDA")
-        if (
-            self.should_cpu_offload_component("transformer")
-            or self.residency_mode("transformer") == LAYERWISE_OFFLOAD
-        ):
-            raise ValueError(
-                "--direct-gpu-weight-loading requires a GPU-resident DiT; disable "
-                "DiT CPU and layerwise offload"
-            )
-        if self.use_fsdp_inference:
-            raise ValueError(
-                "--direct-gpu-weight-loading does not support FSDP inference"
-            )
-        if self.tp_size != 1:
-            raise ValueError("--direct-gpu-weight-loading requires --tp-size 1")
+        if self.direct_gpu_weight_loading:
+            if not current_platform.is_cuda():
+                raise ValueError("--direct-gpu-weight-loading requires CUDA")
+            if (
+                self.should_cpu_offload_component("transformer")
+                or self.residency_mode("transformer") == LAYERWISE_OFFLOAD
+            ):
+                raise ValueError(
+                    "--direct-gpu-weight-loading requires a GPU-resident DiT; "
+                    "disable DiT CPU and layerwise offload"
+                )
+            if self.use_fsdp_inference:
+                raise ValueError(
+                    "--direct-gpu-weight-loading does not support FSDP inference"
+                )
+            if self.tp_size != 1:
+                raise ValueError("--direct-gpu-weight-loading requires --tp-size 1")
+
+        for component_name, enabled in self.component_direct_gpu_weight_loading.items():
+            if not enabled:
+                continue
+            if not current_platform.is_cuda():
+                raise ValueError("--component-direct-gpu-weight-loading requires CUDA")
+            if self.should_start_component_on_cpu(component_name):
+                raise ValueError(
+                    "--component-direct-gpu-weight-loading requires "
+                    f"{component_name!r} to be resident"
+                )
+
+    def should_direct_gpu_weight_load_component(self, component_name: str) -> bool:
+        """Return whether an exact component opted into direct GPU loading."""
+        return self.component_direct_gpu_weight_loading.get(component_name, False)
 
     def _validate_parallelism(self):
         if self.kv_gather_degree < 1:

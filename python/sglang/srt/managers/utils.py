@@ -21,6 +21,7 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 
@@ -108,6 +109,8 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
 
+    auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
+
     @property
     def has_sampled_token_ids(self) -> bool:
         """True when this iter sampled token ids; False when none were produced
@@ -170,7 +173,17 @@ class GenerationBatchResult:
             if holder is not None:
                 holder.map_device_tensors(_async_d2h)
 
+        self.copy_auxiliary_output_to_cpu()
+
         self.copy_done.record()
+
+    def copy_auxiliary_output_to_cpu(self) -> None:
+        if self.logits_output is None or self.auxiliary_host_output is not None:
+            return
+        device_output = self.logits_output.auxiliary_device_output
+        if device_output is not None:
+            self.auxiliary_host_output = device_output.copy_to_host(_async_d2h)
+            self.logits_output.auxiliary_device_output = None
 
     @classmethod
     def from_pp_proxy(
@@ -383,11 +396,8 @@ def compute_num_reserved_tokens() -> int:
     The current eagle implementation stores draft tokens in the output token
     slots, so the context budget has to account for them; every other algorithm
     reserves nothing. Shared by `TokenizerManager` and the rust server's
-    `server_args` blob (`RustServer._build_server_args`), which needs the same
-    number to run the total-token check in Rust. Both stamp the number once at
-    launch, so it has to cover every step an adaptive-spec run may switch to:
-    it reads the bags for the candidate-table ceiling and the current
-    `topk * steps`, not the untouched startup record.
+    `server_args` handoff (`RustServer._build_server_args`), which needs the same
+    number to run the total-token check in Rust.
     """
     spec = get_spec()
     algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
