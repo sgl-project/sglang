@@ -290,6 +290,27 @@ def load_model_with_memory_saver(
             model_config.hf_text_config.ple_offload_embedding = (
                 server_args.ple_offload_embedding
             )
+            model_config.hf_text_config.ple_offload_backend = (
+                server_args.ple_offload_backend
+            )
+            if server_args.ple_offload_backend != "file":
+                model_config.hf_text_config.ple_offload_dir = (
+                    server_args.ple_offload_dir
+                )
+            else:
+                from sglang.srt.models.qwen4_exp_ple_table import (
+                    check_file_backend_supported,
+                    default_ple_table_dir,
+                )
+
+                model_config.hf_text_config.ple_offload_dir = (
+                    server_args.ple_offload_dir
+                    or default_ple_table_dir(server_args.model_path)
+                )
+                if server_args.ple_offload_embedding and device == "cuda":
+                    check_file_backend_supported(
+                        torch.cuda.current_device() if torch.cuda.is_available() else 0
+                    )
 
     enable_cpu_backup = server_args.enable_weights_cpu_backup or (
         is_draft_worker and server_args.enable_draft_weights_cpu_backup
