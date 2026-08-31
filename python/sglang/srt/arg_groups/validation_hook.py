@@ -24,6 +24,21 @@ from sglang.srt.utils.runai_utils import is_runai_obj_uri
 logger = logging.getLogger(__name__)
 
 
+def check_pipeline_parallelism(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.pp_size <= 1:
+        return
+
+    assert (
+        cfg.disable_overlap_schedule
+    ), "Pipeline parallelism is not compatible with overlap schedule"
+    assert cfg.min_free_slots_delay is None, (
+        "--min-free-slots-delay is not supported with pipeline "
+        "parallelism: allocatable slots per microbatch are bounded by "
+        "pp-max-micro-batch-size, so the threshold may never be reached"
+    )
+
+
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
@@ -48,15 +63,7 @@ def check_server_args(server_args: Any):
         "Remove --disable-cuda-graph-padding or --enable-torch-compile."
     )
 
-    if cfg.pp_size > 1:
-        assert (
-            cfg.disable_overlap_schedule
-        ), "Pipeline parallelism is not compatible with overlap schedule"
-        assert cfg.min_free_slots_delay is None, (
-            "--min-free-slots-delay is not supported with pipeline "
-            "parallelism: allocatable slots per microbatch are bounded by "
-            "pp-max-micro-batch-size, so the threshold may never be reached"
-        )
+    check_pipeline_parallelism(server_args)
 
     assert not (
         cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention

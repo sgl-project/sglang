@@ -62,7 +62,7 @@ from sglang.srt.arg_groups.serving_hook import (
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
-    check_server_args,
+    check_pipeline_parallelism,
     check_two_batch_overlap,
 )
 from sglang.srt.entrypoints.sidecar import (
@@ -114,7 +114,7 @@ class TestPrepareServerArgs(CustomTestCase):
             speculative_algorithm="EAGLE",
         )
 
-        check_server_args(args)
+        check_pipeline_parallelism(args)
 
     def test_pipeline_parallel_speculative_rejects_overlap_schedule(self):
         args = ServerArgs(
@@ -126,7 +126,7 @@ class TestPrepareServerArgs(CustomTestCase):
         )
 
         with self.assertRaisesRegex(AssertionError, "overlap schedule"):
-            check_server_args(args)
+            check_pipeline_parallelism(args)
 
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(
