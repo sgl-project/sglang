@@ -3619,7 +3619,8 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="Unix socket path for weight cache daemon (client mode)."
-            "If not set, uses /tmp/sglang_weight_cache_rank{global_rank}.sock",
+            "If not set, derives the path from SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE "
+            "using the caller's physical GPU UUID.",
         ),
         NS("model"),
     ] = None

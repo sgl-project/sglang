@@ -1769,7 +1769,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch_output.next_token_ids,
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, next_token_ids)
-            batch_output.new_seq_lens = batch.seq_lens
+            new_seq_lens = batch.seq_lens
+            batch_output.new_seq_lens = new_seq_lens
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
@@ -1814,7 +1815,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             batch_output.next_draft_input = self._make_next_draft_input_prefill(
                 bonus_tokens=next_token_ids,
-                seq_lens=batch.seq_lens,
+                seq_lens=new_seq_lens,
             )
             return batch_output
 
