@@ -53,7 +53,7 @@ from sglang.srt.server_args import resolve_encoder_transfer_backend
 from sglang.srt.utils import ImageData
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
 
 def test_kimi_k3_encoder_transfer_backend_auto_avoids_tp_fanout():

@@ -9,7 +9,7 @@ for every group. Both are config-parsing paths, so these tests run on CPU.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 from unittest import mock

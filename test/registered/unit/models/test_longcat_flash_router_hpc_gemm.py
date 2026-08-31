@@ -13,7 +13,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.models.longcat_flash import LongcatFlashRouter  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 def _longcat_config(hidden_size, n_routed_experts, *, router_bias=False):

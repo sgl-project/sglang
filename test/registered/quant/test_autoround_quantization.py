@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=120, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=235, stage="extra-a", runner_config="1-gpu-large")
 
 MMLU_NUM_EXAMPLES = 256
 MMLU_NUM_THREADS = 32
