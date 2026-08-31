@@ -47,7 +47,7 @@ This section provides a progressive guide from quick deployment to performance t
 
 **Interactive Command Generator**: select model precision, hardware, tensor parallelism, and common knobs to generate a launch command.
 
-The generator only emits a runnable command for model, hardware, and TP tuples that NVIDIA / SGLang have validated. Selecting an unverified tuple (e.g. NVFP4 on H100/H200, BF16 with TP=4 on H100, …) is **blocked** — the command pane shows an explicit error and the verified support matrix instead of a launch line, so unvalidated commands can't be copied by accident. Optional knobs have the separate constraints and validation scopes described below.
+The generator only emits a runnable command for combinations that NVIDIA / SGLang have validated. Selecting an unverified tuple (e.g. NVFP4 on H100/H200, BF16 with TP=4 on H100, …) is **blocked** — the command pane shows an explicit error and the verified support matrix instead of a launch line, so unvalidated commands can't be copied by accident.
 
 <Nemotron3UltraDeployment />
 
@@ -64,7 +64,7 @@ The generator only emits a runnable command for model, hardware, and TP tuples t
 
 - **Mamba backend**:
 
-    The deployment generator selects FlashInfer selective-state-update kernels for decode and speculative verification; Mamba prefill continues to use Triton. On the validated NVFP4 4×GB200, TP4/EP4, EAGLE 5/1/6 workload, FlashInfer improved output throughput by 4.21% and TPOT by 4.86%, while mean TTFT regressed by 2.28% (95% CI: +0.42% to +4.14%). This is a decode-throughput tradeoff; performance on other hardware/TP tuples and without EAGLE has not been established. Select Triton to use SGLang's runtime-default selective-state-update backend.
+    The Mamba layers use the Triton SSM kernels by default. For better performance, set `--mamba-backend flashinfer` to use the FlashInfer Mamba kernels instead.
 
 - **Mamba SSM precision**:
 
@@ -72,7 +72,7 @@ The generator only emits a runnable command for model, hardware, and TP tuples t
 
 - **Mamba SSM stochastic rounding**:
 
-    When storing the Mamba states in FP16, add `--enable-mamba-cache-stochastic-rounding` to round SSM cache writes stochastically and reduce accumulation bias. It requires `--mamba-ssm-dtype float16` and CUDA; with `--mamba-backend triton` it additionally requires SM100. Use `--mamba-cache-philox-rounds` to control the number of Philox rounds (`0` uses the backend default).
+    When storing the Mamba states in FP16, add `--enable-mamba-cache-stochastic-rounding` to round SSM cache writes stochastically and reduce accumulation bias. It requires `--mamba-ssm-dtype float16` and CUDA; with the default `--mamba-backend triton` it additionally requires SM100. Use `--mamba-cache-philox-rounds` to control the number of Philox rounds (`0` uses the backend default).
 
 - **TP support**:
 
@@ -110,14 +110,11 @@ The generator only emits a runnable command for model, hardware, and TP tuples t
 
 ## 4. Model Invocation
 
-This basic non-speculative example explicitly keeps SGLang's runtime-default Triton selective-state-update backend. Use the generator above for the validated MTP-oriented recipe.
-
 ```shell Command
 python3 -m sglang.launch_server \
   --model-path nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 \
   --trust-remote-code \
   --tp 8 \
-  --mamba-backend triton \
   --mamba-radix-cache-strategy extra_buffer \
   --attention-backend trtllm_mha \
   --tool-call-parser qwen3_coder \
