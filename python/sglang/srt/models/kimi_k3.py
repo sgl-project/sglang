@@ -73,7 +73,6 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -1439,12 +1438,11 @@ class KimiK3DeltaAttention(nn.Module):
             quant_config, f"{prefix}.b_proj"
         )
 
-        # The full-rank [q, k, v, g] merged projection is explicitly sharded
-        # with attn_tp_rank/attn_tp_size, so it also supports DP attention.
-        # The low-rank fused path still uses full-TP-only projection helpers.
-        self.do_fuse_qkvbfg = (
-            self.use_full_rank_gate or self.attn_tp_size == self.tp_size
-        ) and (quant_config is None or self.use_full_rank_gate)
+        # The fused path hardcodes tp_size sharding, so require attn_tp == tp.
+        # Full-rank K3 also fuses mixed block-FP8 attention projections.
+        self.do_fuse_qkvbfg = self.attn_tp_size == self.tp_size and (
+            quant_config is None or self.use_full_rank_gate
+        )
 
         if self.do_fuse_qkvbfg and self.use_full_rank_gate:
             # Fuse only the alignment-friendly wide projections [q, k, v, g]
@@ -1466,8 +1464,8 @@ class KimiK3DeltaAttention(nn.Module):
                 prefix=f"{prefix}.fused_qkvg_proj",
             )
             self.split_sizes = [
-                3 * projection_size // self.attn_tp_size,
-                projection_size // self.attn_tp_size,
+                3 * projection_size // self.tp_size,
+                projection_size // self.tp_size,
             ]
             self.b_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -2868,10 +2866,6 @@ class KimiK3LinearModel(nn.Module):
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
 
-    packed_modules_mapping = {
-        "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
-    }
-
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -2881,15 +2875,6 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        if quant_config is not None:
-            if isinstance(quant_config, ModelSlimConfig):
-                model_mapping = {
-                    **quant_config.packed_modules_mapping.get("model", {}),
-                    **self.packed_modules_mapping,
-                }
-                quant_config.update_packed_modules_mapping({"model": model_mapping})
-            else:
-                quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
