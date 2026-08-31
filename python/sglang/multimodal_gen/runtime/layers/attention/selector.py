@@ -130,6 +130,13 @@ def _record_component_attn_backend(backend_name: str, reason: str | None) -> boo
     return True
 
 
+def record_component_attn_backend(
+    backend: AttentionBackendEnum, reason: str | None = None
+) -> bool:
+    """Record a component backend selected outside layer construction."""
+    return _record_component_attn_backend(backend.name.lower(), reason)
+
+
 def _log_component_attn_backend_summary(
     context: ComponentAttnBackendContext | None,
 ) -> None:
@@ -365,6 +372,7 @@ def component_attn_backend_context_manager(
     attn_backend: AttentionBackendEnum | None,
     component_name: str | None = None,
     allow_global_backend_fallback: bool = False,
+    require_component_backend_selection: bool = True,
 ) -> Generator[None, None, None]:
     if attn_backend is None and component_name is None:
         yield
@@ -378,12 +386,35 @@ def component_attn_backend_context_manager(
             allow_global_backend_fallback,
         )
     )
+    unused_component_name: str | None = None
+    unused_backend_name: str | None = None
+    completed = False
     try:
         yield
+        completed = True
     finally:
         context = component_attn_backend_context.get()
+        unused_component_override = (
+            completed
+            and require_component_backend_selection
+            and (
+                context is not None
+                and context.backend is not None
+                and context.component_name is not None
+                and not context.selected_backends
+            )
+        )
+        if unused_component_override:
+            unused_component_name = context.component_name
+            unused_backend_name = context.backend.name.lower()
         _log_component_attn_backend_summary(context)
         component_attn_backend_context.reset(token)
+    if unused_component_name is not None and unused_backend_name is not None:
+        raise ValueError(
+            f"Attention backend {unused_backend_name!r} was requested for component "
+            f"{unused_component_name!r}, but that component "
+            "did not construct an SGLang attention layer."
+        )
 
 
 @contextmanager
