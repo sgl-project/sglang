@@ -726,5 +726,33 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         self.assertIn(rid, tm.rid_to_state)
 
 
+class TestWaitOneResponseAfterStateFreed(CustomTestCase):
+    """A waiter built before its request finishes must still deliver the output.
+
+    Batch dispatch builds every waiter before advancing any, and the
+    scheduler-response path drops rid_to_state as soon as a request finishes.
+    """
+
+    def test_generator_built_before_finish_still_delivers_output(self):
+        tm = _make_tokenizer_manager(self)
+        tm.request_logger = Mock()
+        tm.request_metrics_exporter_manager = MagicMock()
+        tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+        rid = "freed_state_rid"
+        state = _make_req_state(rid)
+        state.obj.background = True  # skip the fastapi disconnect probe
+        tm.rid_to_state[rid] = state
+
+        async def drive():
+            waiter = tm._wait_one_response(state.obj, None)
+            await tm._handle_batch_output(_make_batch_str_output(rid))
+            self.assertNotIn(rid, tm.rid_to_state)
+            return await waiter.__anext__()
+
+        out = asyncio.run(drive())
+        self.assertEqual(out["meta_info"]["id"], rid)
+        self.assertEqual(out["text"], "hello")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -3369,6 +3369,29 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
 
+    def test_fallback_ling3_default_on(self):
+        """Ling3 public checkpoints default `thinking_option='on'` in the chat
+        template when `enable_thinking` is omitted, and the template detector
+        cannot infer that indirect assignment. The parser fallback must mirror
+        the template default: omitted kwargs enable reasoning, only an explicit
+        `enable_thinking=False` disables it. Regression: the detector shipped
+        with `explicit_enable_thinking`, which left `reasoning_content` null on
+        default requests while the model was in fact thinking."""
+        self._setup_fallback("ling3")
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "hi"}]
+        )
+        cases = [
+            (None, True),  # no chat_template_kwargs → thinking (template default)
+            ({}, True),  # empty kwargs → thinking
+            ({"enable_thinking": True}, True),  # explicit on
+            ({"enable_thinking": False}, False),  # explicit off
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=kwargs):
+                req.chat_template_kwargs = kwargs
+                self.assertEqual(self.chat._get_reasoning_from_request(req), expected)
+
     def test_fallback_no_detector_returns_false(self):
         self.chat.reasoning_parser = "qwen3"
         self.chat._reasoning_detector = None

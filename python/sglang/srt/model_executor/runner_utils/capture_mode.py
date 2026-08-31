@@ -27,6 +27,7 @@ import torch
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.runtime_context import get_flags
 
 # Detect whether the current forward pass is in capture mode.
 is_capture_mode = False
@@ -84,7 +85,6 @@ def _set_capture_dsa_variant(variant: Optional[str]) -> None:
 @contextmanager
 def model_capture_mode():
     global is_capture_mode
-    from sglang.srt.runtime_context import get_flags
 
     # Disable dispose_tensor() during capture: freeing mid-capture records data_ptr()==0 into the graph.
     is_capture_mode = True

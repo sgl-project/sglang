@@ -84,7 +84,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
@@ -94,9 +94,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
         self.draft_tp_context = (
-            draft_tp_context
-            if get_parallel().config.enable_dp_attention
-            else empty_context
+            draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
         self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)

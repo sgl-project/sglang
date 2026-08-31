@@ -15,6 +15,16 @@ from typing import (
 
 import torch
 
+from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.runtime_context import (
+    get_buffer,
+    get_exec,
+    get_parallel,
+    get_platform,
+    get_spec,
+)
+
+logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
     dequantize_k_cache_paged,
@@ -96,7 +106,6 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
-    is_sm100_supported,
     print_warning_once,
 )
 
@@ -598,7 +607,7 @@ class DeepseekSparseAttnBackend(
 
         # `flashmla_sparse_q8` is prefill-only (FP8 decode goes through
         # `flashmla_kv`); reject it as a decode backend, since argparse accepts it
-        # via the shared DSA_CHOICES list.
+        # via the shared CLI choices.
         if self.dsa_decode_impl == "flashmla_sparse_q8":
             raise ValueError(
                 "--dsa-decode-backend flashmla_sparse_q8 is not supported: "
@@ -894,7 +903,7 @@ class DeepseekSparseAttnBackend(
             forward_mode.is_target_verify()
             and next_n
             and next_n >= 2
-            and is_sm100_supported()
+            and get_platform().is_sm100
         ):
             return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
@@ -2156,7 +2165,7 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d = None
                 if (
                     self.speculative_num_draft_tokens >= 2
-                    and is_sm100_supported()
+                    and get_platform().is_sm100
                     and metadata.paged_mqa_ctx_lens_2d is not None
                     and metadata.paged_mqa_ctx_lens_2d.dim() == 2
                     and metadata.paged_mqa_ctx_lens_2d.size(0) == bs
@@ -2445,7 +2454,7 @@ class DeepseekSparseAttnBackend(
         paged_mqa_ctx_lens_2d = None
         if (
             next_n >= 2
-            and is_sm100_supported()
+            and get_platform().is_sm100
             and metadata.paged_mqa_ctx_lens_2d is not None
             and metadata.paged_mqa_ctx_lens_2d.dim() == 2
             and metadata.paged_mqa_ctx_lens_2d.size(0) == bs
@@ -2460,8 +2469,9 @@ class DeepseekSparseAttnBackend(
             schedule_src_2d = metadata.paged_mqa_ctx_lens_2d
             ctx_lens_copy_src = None
         else:
-            if next_n >= 2 and is_sm100_supported():
-                # Degenerate capture (DG-native ctx-lens layout expected but
+            if (
+                next_n >= 2 and get_platform().is_sm100
+            ):  # Degenerate capture (DG-native ctx-lens layout expected but
                 # missing); keep the whole refresh out-of-graph.
                 return
             seqlens_view = metadata.dsa_seqlens_expanded[:expanded_size]

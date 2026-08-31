@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.runtime_context import get_spec as get_spec_config
 from sglang.srt.speculative.spec_registry import (
     _RESERVED_ALIASES,
@@ -257,7 +258,6 @@ class SpeculativeAlgorithm(Enum):
     def create_worker(
         self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
-        from sglang.srt.arg_groups.overrides import resolving_view
 
         cfg = resolving_view(server_args)
         assert (

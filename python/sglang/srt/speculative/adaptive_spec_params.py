@@ -12,6 +12,10 @@ import math
 from functools import cached_property
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.overrides import (
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -49,10 +53,8 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
-    from sglang.srt.arg_groups.overrides import resolving_view
 
     cfg = resolving_view(server_args)
-    from sglang.srt.arg_groups.overrides import resolved_view
 
     if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
         return (

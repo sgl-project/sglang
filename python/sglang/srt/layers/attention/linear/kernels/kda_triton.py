@@ -27,6 +27,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
     # non-packed Triton decode() path (fused_sigmoid_gating_delta_rule_update),
     # the same fallback CPU/NPU use. Batched decode is handled via query_start_loc.
     supports_packed_decode: bool = not is_cpu() and not is_npu() and not is_xpu()
+    supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
 
     def packed_decode(
         self,
@@ -66,7 +67,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_write_pos = kwargs.get("replayssm_write_pos")
         replayssm_force_flush = kwargs.get("replayssm_force_flush")
         if (
-            replayssm_d is not None
+            lower_bound is None
+            and replayssm_d is not None
             and replayssm_k is not None
             and replayssm_g is not None
             and replayssm_write_pos is not None
@@ -230,9 +232,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         beta_is_raw: bool = False,
         return_intermediate_states: bool = False,
         **kwargs,
-    ) -> torch.Tensor:
-        # Preserve -1 padding sentinels: chunk_gated_delta_rule_fwd_h masks both
-        # state loads and stores for them.
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         return chunk_kda(
             q=q,
             k=k,

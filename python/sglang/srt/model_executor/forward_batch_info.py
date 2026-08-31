@@ -305,6 +305,17 @@ def compute_local_num_token_non_padded_cpu(
     return min(max(global_num_token_non_padded - rank_offset, 0), tokens_per_rank)
 
 
+def prefill_graph_tolerates_sum_len() -> bool:
+    """Whether MegaMoE may replay prefill graphs with local shapes."""
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
+
+    if not get_moe_a2a_backend().is_megamoe():
+        return False
+    return not (is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled())
+
+
 @dataclass
 class DSV4OutCacheLoc:
     """Per-forward-pass KV cache allocation for DeepSeek-V4 on NPU.
@@ -697,12 +708,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.original_global_num_tokens_cpu = batch.global_num_tokens
         self.global_num_tokens_cpu = global_num_tokens
+        pin_memory = is_pin_memory_available(device)
         self.global_num_tokens_gpu = torch.tensor(
-            global_num_tokens, dtype=torch.int64
+            global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
         ).to(device, non_blocking=True)
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
         self.global_num_tokens_for_logprob_gpu = torch.tensor(
-            global_num_tokens_for_logprob, dtype=torch.int64
+            global_num_tokens_for_logprob,
+            dtype=torch.int64,
+            pin_memory=pin_memory,
         ).to(device, non_blocking=True)
         self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
 
@@ -840,9 +854,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).to(
-                device, non_blocking=True
-            )
+            ret.num_token_non_padded = torch.tensor(
+                num_tokens,
+                dtype=torch.int32,
+                pin_memory=is_pin_memory_available(device),
+            ).to(device, non_blocking=True)
         ret.num_token_non_padded_cpu = num_tokens
 
         ret.init_mlp_sync_metadata(batch, device)
@@ -880,11 +896,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
+                pin_memory = is_pin_memory_available(device)
                 ret.extend_seq_lens = torch.tensor(
-                    extend_seq_lens, dtype=torch.int32
+                    extend_seq_lens, dtype=torch.int32, pin_memory=pin_memory
                 ).to(device, non_blocking=True)
                 ret.extend_prefix_lens = torch.tensor(
-                    extend_prefix_lens, dtype=torch.int32
+                    extend_prefix_lens, dtype=torch.int32, pin_memory=pin_memory
                 ).to(device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = extend_prefix_lens
                 ret.extend_seq_lens_cpu = extend_seq_lens
@@ -1330,6 +1347,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and self.is_extend_in_batch
             and prefill_cg.bs
             and max(global_num_tokens) <= max(prefill_cg.bs)
+            and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
         self.dp_padding_mode = dp_padding_mode
@@ -1432,12 +1450,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.extend_seq_lens_cpu = [int(num_tokens)]
                     self.extend_logprob_start_lens_cpu = [0]
                     bs = self.batch_size = 1
-                    # Count the dummy tokens as real, else MoE topk/all-to-all
-                    # treats this rank as empty and starves later layers.
-                    # (num_token_non_padded is None unless moe_ep_size > 1.)
-                    if self.num_token_non_padded is not None:
-                        self.num_token_non_padded.fill_(num_tokens)
-                    self.num_token_non_padded_cpu = num_tokens
+                    # Keep idle non-hybrid fabricated rows masked by default.
+                    # Hybrid-SSM needs the real count for its state update.
+                    mask_dummy_tokens = (
+                        not hybrid_ssm and self._original_forward_mode.is_idle()
+                    )
+                    if mask_dummy_tokens:
+                        if self.num_token_non_padded is not None:
+                            self.num_token_non_padded.fill_(0)
+                        self.num_token_non_padded_cpu = 0
+                    else:
+                        if self.num_token_non_padded is not None:
+                            self.num_token_non_padded.fill_(num_tokens)
+                        self.num_token_non_padded_cpu = num_tokens
                 else:
                     self.extend_num_tokens = bs
                     self.extend_seq_lens = torch.full_like(self.seq_lens, 1)

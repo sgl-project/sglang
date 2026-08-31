@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     act_and_mul_triton,
     invoke_fused_moe_kernel,
@@ -27,7 +28,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.utils import get_moe_padding_size
+from sglang.srt.layers.moe.utils import get_moe_padding_size, get_moe_runner_backend
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -37,7 +38,6 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_xpu,
-    use_intel_xpu_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -53,7 +53,6 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
-_use_sgl_xpu = use_intel_xpu_backend()
 _is_musa = is_musa()
 
 
@@ -100,6 +99,32 @@ def _clamp_swiglu_inputs_(x: torch.Tensor, limit: float) -> None:
     half = x.shape[-1] // 2
     x[..., :half].clamp_(max=limit)
     x[..., half:].clamp_(min=-limit, max=limit)
+
+
+def _validate_fused_swiglu_interleaved(
+    *,
+    activation: str,
+    is_gated: bool,
+    has_gemm1_modifiers: bool,
+    has_bias: bool,
+    is_quantized: bool,
+    apply_router_weight_on_input: bool,
+    has_hooks: bool,
+    dtype: torch.dtype,
+) -> None:
+    if not (
+        activation == "silu"
+        and is_gated
+        and not has_gemm1_modifiers
+        and not has_bias
+        and not is_quantized
+        and not apply_router_weight_on_input
+        and not has_hooks
+        and dtype == torch.bfloat16
+    ):
+        raise ValueError(
+            "fuse_swiglu_interleaved set on an incompatible fused_moe call"
+        )
 
 
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
@@ -572,27 +597,20 @@ def _fused_moe_kernel_sequence(
     )
 
     if fuse_swiglu_interleaved:
-        # W13 rows are physically interleaved (permuted once at load), so the
-        # activation MUST come from the fused up-GEMM epilogue -- a standalone
-        # activation kernel would read them as halves and be silently wrong.
-        # Fail loudly on an incompatible call rather than produce garbage.
-        assert (
-            activation == "silu"
-            and is_gated
-            and gemm1_alpha is None
-            and gemm1_limit is None
-            and swiglu_limit is None
-            and b1 is None
-            and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
-            and not apply_router_weight_on_input
-            # LoRA injects its gate_up delta into the full-width pre-activation
-            # buffer that this path eliminates.
-            and hooks is None
-            and hidden_states.dtype == torch.bfloat16
-        ), "fuse_swiglu_interleaved set on an incompatible fused_moe call"
-        # The epilogue applies silu(gate) * up in-register and writes the
-        # half-width activation directly, so intermediate_cache1 and the
-        # standalone activation launch are skipped entirely.
+        _validate_fused_swiglu_interleaved(
+            activation=activation,
+            is_gated=is_gated,
+            has_gemm1_modifiers=any(
+                value is not None for value in (gemm1_alpha, gemm1_limit, swiglu_limit)
+            ),
+            has_bias=b1 is not None,
+            is_quantized=any(
+                (use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16)
+            ),
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            has_hooks=hooks is not None,
+            dtype=hidden_states.dtype,
+        )
         intermediate_cache1 = None
         gemm1_out = intermediate_cache2 = torch.empty(
             (total_tokens, N // 2),
@@ -879,11 +897,18 @@ def _fused_moe_kernel_sequence(
         else:
             # According to micro benchmark results, torch.compile can get better performance for small token.
             if _use_moe_sum_reduce_torch_compile(num_tokens):
-                moe_sum_reduce_torch_compile(
-                    intermediate_cache3.view(*intermediate_cache3.shape),
-                    out_hidden_states,
-                    routed_scaling_factor,
-                )
+                if is_arch_support_pdl():
+                    moe_sum_reduce_triton(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states,
+                        routed_scaling_factor,
+                    )
+                else:
+                    moe_sum_reduce_torch_compile(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states,
+                        routed_scaling_factor,
+                    )
             else:
                 moe_sum_reduce(
                     intermediate_cache3.view(*intermediate_cache3.shape),
@@ -891,7 +916,9 @@ def _fused_moe_kernel_sequence(
                     routed_scaling_factor,
                 )
     elif _is_hip:
-        if _use_aiter:
+        if topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
+            pass  # we wrote directly into out_hidden_states
+        elif _use_aiter:
             moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),
                 out_hidden_states,
@@ -982,7 +1009,7 @@ def fused_experts_impl(
     else:
         assert (
             hidden_states.shape[1] == w1.shape[2] - padded_size
-        ), f"Hidden size mismatch"
+        ), "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -1114,7 +1141,7 @@ def fused_moe(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
-    if _use_sgl_xpu:
+    if _is_xpu and not get_moe_runner_backend().is_triton():
         topk_weight, topk_ids, _ = topk_output
         from sgl_kernel import fused_experts as sgl_fused_experts
 

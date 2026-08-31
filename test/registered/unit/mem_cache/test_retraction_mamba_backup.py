@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -41,7 +41,7 @@ class _Allocator:
 
 def _req_and_pool():
     req = object.__new__(Req)
-    req.req_pool_idx = 0
+    req.kv = ReqKvInfo(req_pool_idx=0)
     req.origin_input_ids = [1, 2]
     req.output_ids = [3]
     req.mamba_pool_idx = torch.tensor(1)
