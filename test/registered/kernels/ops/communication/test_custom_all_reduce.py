@@ -75,7 +75,7 @@ TEST_ALGOS = [
     AllReduceAlgo.ONE_SHOT_PULL,
     AllReduceAlgo.ONE_SHOT_PUSH,
     AllReduceAlgo.TWO_SHOT_PULL,
-    AllReduceAlgo.TWO_SHOT_SCATTER,
+    AllReduceAlgo.TWO_SHOT_PUSH,
 ]
 USE_GRAPH_OPTIONS = [False, True]
 TEST_LAYERS = 4
@@ -172,7 +172,7 @@ def _init_comm_once() -> CustomAllReduceV2:
         device,
         max_pull_size=max_size,
         max_push_size=max_size,
-        max_two_shot_scatter_size=max_size,
+        max_two_shot_push_size=max_size,
     )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
@@ -268,17 +268,17 @@ def test_multinode_only_retunes_the_eager_scatter_band() -> None:
         if bands is None:
             assert multi == single, f"{world_size=} has no multi-node entry"
             continue
-        assert multi.eager.two_shot_scatter == bands.two_shot_scatter
+        assert multi.eager.two_shot_push == bands.two_shot_push
         # the mc sub-band must stay inside the band whose fan-out it refines
-        assert bands.two_shot_scatter_mc.min_bytes >= bands.two_shot_scatter.min_bytes
-        assert bands.two_shot_scatter_mc.max_bytes <= bands.two_shot_scatter.max_bytes
+        assert bands.two_shot_push_mc.min_bytes >= bands.two_shot_push.min_bytes
+        assert bands.two_shot_push_mc.max_bytes <= bands.two_shot_push.max_bytes
         assert multi == single._replace(
             eager=single.eager._replace(**bands._asdict())
         ), f"{world_size=} multi-node override reached past the eager bands"
 
 
 @torch.inference_mode()
-def test_2shot_scatter_shares_the_1shot_plane() -> None:
+def test_2shot_push_shares_the_1shot_plane() -> None:
     nccl_group = _init_nccl_group_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     dtype = torch.bfloat16
@@ -290,20 +290,21 @@ def test_2shot_scatter_shares_the_1shot_plane() -> None:
         device,
         max_pull_size=two_shot_bytes,
         max_push_size=_ALIGN_BYTES,
-        max_two_shot_scatter_size=two_shot_bytes,
+        max_two_shot_push_size=two_shot_bytes,
     )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
     register_comm_cleanup(comm)
-    # A whole 2shot_scatter message spans one enlarged shared slot per peer.
-    # Keep the tuned 1shot limit smaller: physical capacity must not silently
-    # widen its dispatch range.
-    assert comm.scatter_slot_size * comm.world_size >= two_shot_bytes
+    # A whole 2shot_push message spans one enlarged push slot per peer, and
+    # the plane doubles its rows for the shard inbox. Keep the tuned 1shot
+    # limit smaller: physical capacity must not silently widen its dispatch
+    # range.
+    assert comm.push_slot_size * comm.world_size >= two_shot_bytes
     assert comm.max_push_size * comm.world_size < two_shot_bytes
-    assert comm.shared_slot_size == comm.scatter_slot_size
-    assert comm.shared_slot_size > comm.max_push_size
+    assert comm.push_slot_size > comm.max_push_size
+    assert comm.obj.push.has_scatter
 
-    plan = [(AllReduceAlgo.TWO_SHOT_SCATTER, two_shot_size)] * TEST_LAYERS
+    plan = [(AllReduceAlgo.TWO_SHOT_PUSH, two_shot_size)] * TEST_LAYERS
     plan += [(AllReduceAlgo.ONE_SHOT_PUSH, push_size)] * TEST_LAYERS
     plan[::2], plan[1::2] = plan[:TEST_LAYERS], plan[TEST_LAYERS:]
 

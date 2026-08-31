@@ -7,7 +7,7 @@
 //     workspaces, a CUDA-graph pointer table, or a multicast address).
 //   - 2shot_pull: reduce-scatter fused with all-gather; each rank reduces its
 //     shard in place so every workspace ends up holding the full result.
-//   - 2shot_scatter: the same reduce-scatter / all-gather split, but both
+//   - 2shot_push: the same reduce-scatter / all-gather split, but both
 //     halves push. Readiness rides in the data — the same pos-zero marker
 //     1shot_push uses, which is what "push" names here — so neither half
 //     needs a barrier and no rank ever reads a peer's input.
@@ -66,7 +66,7 @@ struct AllReducePullParams {
 };
 
 template <uint32_t kWorldSize>
-struct AllReduce2ShotScatterParams {
+struct AllReduce2ShotPushParams {
   const void* __restrict__ input;
   void* __restrict__ output;
   uint32_t num_vecs;
@@ -286,8 +286,8 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
 ///      gather half of the shared push plane, restore the scatter markers;
 ///   C: drain my gather half into the output, restoring its markers.
 template <typename T, uint32_t kWorldSize, bool kUsePDL, bool kUseMc = false>
-ALL_REDUCE_KERNEL void all_reduce_2shot_scatter_kernel(
-    const __grid_constant__ AllReduce2ShotScatterParams<kWorldSize> params) {
+ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(
+    const __grid_constant__ AllReduce2ShotPushParams<kWorldSize> params) {
   using namespace device;
   constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
   using vec_t = AlignedVector<packed_t<T>, kVecSize>;
@@ -337,7 +337,10 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_scatter_kernel(
   for (auto lid = global_tid; lid < my_len; lid += num_threads) {
     const auto vid = my_lo + lid;
     vec_t vecs[kWorldSize];
-    vecs[r].load(params.input, vid);
+#pragma unroll
+    for (uint32_t src = 0; src < kWorldSize; ++src) {
+      if (src == r) vecs[src].load(params.input, vid);
+    }
     do {
       bool has_zero = false;
 #pragma unroll
@@ -398,7 +401,7 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_scatter_kernel(
 
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  gather_epoch.flip();  // one flip: the planes share the counter
+  gather_epoch.flip();  // one flip: both regions share the plane's counter
 }
 
 template <uint32_t N>
@@ -446,7 +449,7 @@ struct AllReduceKernel {
     using namespace host;
     const auto& comm = *comm_ref.get();
     CHECK_HOST(
-        algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_scatter")
+        algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_push")
         << algo;
     CHECK_HOST(comm.get_world_size() == kWorldSize) << comm.get_world_size();
     CHECK_HOST(in.IsContiguous() && is_type<T>(in.dtype()) && in.device().device_type == kDLCUDA);
@@ -478,26 +481,25 @@ struct AllReduceKernel {
       return out;
     }
 
-    if (algo == "2shot_scatter") {
+    if (algo == "2shot_push") {
       CHECK_HOST(!use_graph);  // reads only our own input: nothing to register
       const auto& push = comm.get_push_obj();
-      const auto& scatter = comm.get_scatter_obj();
       const auto slot_vecs = div_ceil(num_vecs, kWorldSize);
       Tensor out = ffi::empty_like(in);
-      const auto params = AllReduce2ShotScatterParams<kWorldSize>{
+      const auto params = AllReduce2ShotPushParams<kWorldSize>{
           .input = in.data_ptr(),
           .output = out.data_ptr(),
           .num_vecs = num_vecs,
           .rank = push.rank,
           .slot_vecs = slot_vecs,
-          .scatter = scatter.get_workspace<kWorldSize>(int64_t{slot_vecs} * 16),
+          .scatter = push.get_scatter_workspace<kWorldSize>(int64_t{slot_vecs} * 16),
           .gather = push.get_workspace<kWorldSize>(div_ceil(nbytes, int64_t{kWorldSize})),
       };
       CHECK_HOST(!use_multicast || params.gather.mc_workspace != nullptr)
           << "multicast needs a push plane with an mc workspace";
       const auto kernel = use_multicast
-          ? all_reduce_2shot_scatter_kernel<T, kWorldSize, kUsePDL, /*kUseMc=*/true>
-          : all_reduce_2shot_scatter_kernel<T, kWorldSize, kUsePDL>;
+          ? all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL, /*kUseMc=*/true>
+          : all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL>;
       LaunchKernel(push.num_blocks, choose_block_size(num_vecs), stream)  //
           .enable_pdl(kUsePDL)(kernel, params);
       return out;

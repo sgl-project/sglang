@@ -22,16 +22,16 @@ class AllReduceAlgo(enum.Enum):
     ONE_SHOT_PUSH = enum.auto()
     ONE_SHOT_PULL = enum.auto()
     TWO_SHOT_PULL = enum.auto()
-    TWO_SHOT_SCATTER = enum.auto()
+    TWO_SHOT_PUSH = enum.auto()
 
     def supports_zero_copy(self) -> bool:
         """Whether peers can reduce straight out of the caller's own buffer.
 
-        The two push algorithms cannot: ``1shot_push`` and ``2shot_scatter``
+        The two push algorithms cannot: ``1shot_push`` and ``2shot_push``
         both publish their input to peers up front (whole, or shard-wise), so
         there is nothing for the graph pointer table to register.
         """
-        return self not in (AllReduceAlgo.ONE_SHOT_PUSH, AllReduceAlgo.TWO_SHOT_SCATTER)
+        return self not in (AllReduceAlgo.ONE_SHOT_PUSH, AllReduceAlgo.TWO_SHOT_PUSH)
 
     @property
     def algo_name(self) -> str:
@@ -42,7 +42,7 @@ _ALGO_NAMES = {
     AllReduceAlgo.ONE_SHOT_PUSH: "1shot_push",
     AllReduceAlgo.ONE_SHOT_PULL: "1shot_pull",
     AllReduceAlgo.TWO_SHOT_PULL: "2shot_pull",
-    AllReduceAlgo.TWO_SHOT_SCATTER: "2shot_scatter",
+    AllReduceAlgo.TWO_SHOT_PUSH: "2shot_push",
 }
 
 if TYPE_CHECKING:
@@ -64,6 +64,12 @@ def _init_communicator() -> None:
 class PushPlane(tvm_ffi.Object):
     """Lamport push plane: a zero-filled symmetric workspace + a local counter.
 
+    A plane whose workspaces carry ``4 * world_size`` slot rows instead of
+    ``2 * world_size`` dedicates the second half to ``2shot_push``'s
+    per-source shard slots (same slot size, same marker discipline); both
+    halves share the one counter, so every push-family kernel advances the
+    double buffer together.
+
     All buffers are owned by the caller; this object only validates and
     records them.
     """
@@ -72,6 +78,8 @@ class PushPlane(tvm_ffi.Object):
     if TYPE_CHECKING:
         rank: int
         world_size: int
+        slot_bytes: int
+        has_scatter: bool
 
     def __init__(
         self,
@@ -84,9 +92,11 @@ class PushPlane(tvm_ffi.Object):
     ) -> None:
         """
         :param workspaces: per-rank ``[2 * world_size, slot_bytes]`` uint8
-                           views of symmetric memory. The local rank's view
-                           MUST be zero-filled before first use -- the
-                           kernels poll for a pos-zero marker.
+                           views of symmetric memory (``4 * world_size``
+                           rows when the plane carries a scatter region).
+                           The local rank's view MUST be zero-filled before
+                           first use -- the kernels poll for a pos-zero
+                           marker.
         :param counter: local ``[num_blocks, 4]`` uint8 tensor, zero-filled.
         :param mc_workspace: multicast VA of the local workspace, or None.
         """
@@ -158,7 +168,6 @@ class Communicator(tvm_ffi.Object):
         def get_world_size(self) -> int: ...
         def get_push(self) -> PushPlane | None: ...
         def get_pull(self) -> PullPlane | None: ...
-        def get_scatter(self) -> PushPlane | None: ...
         def set_pull_blocks(self, num_blocks: int | None) -> None: ...
         def set_pull_multicast_blocks(self, num_blocks: int | None) -> None: ...
 
@@ -166,9 +175,8 @@ class Communicator(tvm_ffi.Object):
         self,
         push: PushPlane | None = None,
         pull: PullPlane | None = None,
-        scatter: PushPlane | None = None,
     ) -> None:
-        self.__ffi_init__(push, pull, scatter)
+        self.__ffi_init__(push, pull)
 
     @property
     def rank(self) -> int:
@@ -187,11 +195,6 @@ class Communicator(tvm_ffi.Object):
     def pull(self) -> PullPlane | None:
         """The pull plane, or None for a push-only communicator."""
         return self.get_pull()
-
-    @property
-    def scatter(self) -> PushPlane | None:
-        """2shot_scatter's shard-slot plane; shares the push plane's epoch."""
-        return self.get_scatter()
 
 
 def _init_ipc_manager() -> None:
