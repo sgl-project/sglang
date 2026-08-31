@@ -92,12 +92,19 @@ void bmm_kernel_impl(
 
   const bool use_brgemm = can_use_brgemm<at::BFloat16>(M);
 
+  // brgemm unpacks the whole K into Btmp in one shot.
+  // each thread needs [BLOCK_N, K], a runtime-sized amount that cannot live on the stack.
+  const int64_t btmp_size_per_thread = BLOCK_N * K;
+  auto btmp_buffer =
+      at::empty({at::get_num_threads(), btmp_size_per_thread}, at::device(at::kCPU).dtype(at::kBFloat16));
+  auto* __restrict__ btmp_data = btmp_buffer.data_ptr<at::BFloat16>();
+
   // parallel on [B, MB, NB]
   parallel_2d(B * MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // for brgemm, use float32 for accumulate
     alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
     // for brgemm when mat2 is float8_e4m3
-    alignas(64) at::BFloat16 Btmp[BLOCK_N * BLOCK_K];
+    at::BFloat16* __restrict__ Btmp = btmp_data + get_thread_num() * btmp_size_per_thread;
 
     loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t bs = mb / MB;
@@ -112,6 +119,7 @@ void bmm_kernel_impl(
           /*   C */ out + bs * out_strideB + mb_start * out_strideM + nb_start,
           /* Btmp*/ Btmp,
           /* Ctmp*/ Ctmp,
+          /* bias*/ nullptr,
           /*scale*/ scale,
           /*   M */ mb_size,
           /*   N */ nb_size,

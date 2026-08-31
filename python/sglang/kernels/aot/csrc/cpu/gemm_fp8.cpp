@@ -46,7 +46,6 @@ inline void copy_mul_add_stub(
     out[d] = static_cast<scalar_t>(input[d] * scale + bias[d]);
   }
 }
-
 template <typename scalar_t>
 inline void copy_add_stub(
     scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
@@ -262,7 +261,7 @@ struct tinygemm_kernel_nn {
 };
 
 template <typename scalar_t, typename packed_t, bool has_bias, int BLOCK_M, int BLOCK_N>
-struct tinygemm_kernel_nn_per_tensor {
+struct tinygemm_kernel_nn2 {
   static inline void apply(
       const scalar_t* __restrict__ A,
       const packed_t* __restrict__ B,
@@ -273,7 +272,7 @@ struct tinygemm_kernel_nn_per_tensor {
       int64_t lda,
       int64_t ldb,
       int64_t ldc) {
-    TORCH_CHECK(false, "tinygemm_kernel_nn_per_tensor: scalar path not implemented!");
+    TORCH_CHECK(false, "tinygemm_kernel_nn: scalar path not implemented!");
   }
 };
 #if defined(CPU_CAPABILITY_AVX512)
@@ -382,7 +381,7 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, float, has_bias, BLOC
 };
 
 template <bool has_bias, int BLOCK_M, int BLOCK_N>
-struct tinygemm_kernel_nn_per_tensor<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BLOCK_N> {
+struct tinygemm_kernel_nn2<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BLOCK_N> {
   static inline void apply(
       const at::BFloat16* __restrict__ A,
       const at::Float8_e4m3fn* __restrict__ B,
@@ -574,16 +573,16 @@ struct tinygemm_kernel_nn<at::BFloat16, uint8_t, uint8_t, has_bias, BLOCK_M, BLO
       ldc,                                                                            \
       block_size_K);
 
-#define LAUNCH_TINYGEMM_KERNEL_NN_PER_TENSOR(MB_SIZE, NB_SIZE)                          \
-  tinygemm_kernel_nn_per_tensor<scalar_t, packed_t, has_bias, MB_SIZE, NB_SIZE>::apply( \
-      A + mb_start * lda,                                                               \
-      B + nb_start * 2,                                                                 \
-      C + mb_start * ldc + nb_start,                                                    \
-      has_bias ? bias + nb_start : nullptr,                                             \
-      scale,                                                                            \
-      K,                                                                                \
-      lda,                                                                              \
-      ldb,                                                                              \
+#define LAUNCH_TINYGEMM_KERNEL_NN_PER_TENSOR(MB_SIZE, NB_SIZE)                \
+  tinygemm_kernel_nn2<scalar_t, packed_t, has_bias, MB_SIZE, NB_SIZE>::apply( \
+      A + mb_start * lda,                                                     \
+      B + nb_start * 2,                                                       \
+      C + mb_start * ldc + nb_start,                                          \
+      has_bias ? bias + nb_start : nullptr,                                   \
+      scale,                                                                  \
+      K,                                                                      \
+      lda,                                                                    \
+      ldb,                                                                    \
       ldc);
 
 template <typename scalar_t, typename packed_t, typename param_t, bool has_bias>
@@ -608,7 +607,7 @@ struct brgemm {
 };
 
 template <typename scalar_t, typename packed_t, bool has_bias>
-struct brgemm_per_tensor {
+struct brgemm2 {
   static inline void apply(
       const scalar_t* __restrict__ A,
       const packed_t* __restrict__ B,
@@ -624,7 +623,7 @@ struct brgemm_per_tensor {
       int ldb,
       int ldc,
       bool do_unpack = true) {
-    TORCH_CHECK(false, "struct brgemm_per_tensor: primary template not implemented!");
+    TORCH_CHECK(false, "struct brgemm2: primary template not implemented!");
   }
 };
 
@@ -673,7 +672,7 @@ struct brgemm<at::BFloat16, at::Float8_e4m3fn, float, has_bias> {
 };
 
 template <bool has_bias>
-struct brgemm_per_tensor<at::BFloat16, at::Float8_e4m3fn, has_bias> {
+struct brgemm2<at::BFloat16, at::Float8_e4m3fn, has_bias> {
   static inline void apply(
       const at::BFloat16* __restrict__ A,
       const at::Float8_e4m3fn* __restrict__ B,
@@ -830,8 +829,7 @@ void tinygemm_kernel_per_tensor(
     bool brg,
     bool do_unpack = true) {
   if (brg) {
-    brgemm_per_tensor<scalar_t, packed_t, has_bias>::apply(
-        A, B, C, Btmp, Ctmp, bias, scale, M, N, K, lda, ldb, ldc, do_unpack);
+    brgemm2<scalar_t, packed_t, has_bias>::apply(A, B, C, Btmp, Ctmp, bias, scale, M, N, K, lda, ldb, ldc, do_unpack);
     return;
   }
 
