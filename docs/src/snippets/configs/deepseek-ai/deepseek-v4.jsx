@@ -156,6 +156,8 @@ sgl-eval run aime25 \\
   defaultAccuracy: {
     flash: { gpqa_pct: 88.1, aime25_pct: 95,   gsm8k_pct: 96.13 },
     pro:   { gpqa_pct: 90.1, aime25_pct: 97.5, gsm8k_pct: 96.13 },
+    // Only GSM8K has been measured for the vision checkpoint so far.
+    "flash-vision": { gsm8k_pct: 96.36 },
   },
 
   // The eval set rendered in the benchmark card + "⚡ Reproduce" (the engine
@@ -1116,7 +1118,7 @@ sgl-eval run aime25 \\
     // bias). Prefill context parallelism is refused with the tower.
     {
       match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",

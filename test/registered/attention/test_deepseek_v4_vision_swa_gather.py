@@ -8,6 +8,9 @@ the causal builder when no image tokens are present, its triton and torch paths
 agree, and a token in a span really does reach past the 128-token window.
 """
 
+import dataclasses
+import inspect
+import re
 import unittest
 
 import torch
@@ -20,6 +23,7 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     build_vision_swa_page_indices,
     build_vision_swa_page_indices_triton,
 )
+from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
 from sglang.srt.multimodal.deepseek_v4_vl_image_processing import COMPRESS_PAD_TO
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -148,6 +152,21 @@ class TestDeepseekV4VisionSwaGather(CustomTestCase):
             tail = indices[row, length:]
             if tail.numel():
                 self.assertEqual(int(tail.max()), -1, f"row {row} tail")
+
+    def test_copy_field_lists_cover_every_metadata_field(self):
+        """DSV4AttnMetadata.copy_ must name every field of the struct.
+
+        copy_metadata asserts that its three field lists partition the struct,
+        so a field added without being listed raises only on the CUDA-graph
+        replay path -- reachable with speculative decoding and easy to miss
+        otherwise. Checking the lists here fails at import cost instead.
+        """
+        all_fields = {field.name for field in dataclasses.fields(DSV4AttnMetadata)}
+        named = set(
+            re.findall(r'"([a-z0-9_]+)"', inspect.getsource(DSV4AttnMetadata.copy_))
+        )
+        self.assertEqual(all_fields - named, set(), "field(s) missing from copy_")
+        self.assertEqual(named - all_fields, set(), "copy_ names a non-field")
 
     def test_topk_length_never_exceeds_the_indices_row(self):
         """The clamp is what stands between a bad span and an out-of-bounds read.

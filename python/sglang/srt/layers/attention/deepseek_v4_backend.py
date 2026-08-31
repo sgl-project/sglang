@@ -312,6 +312,9 @@ class DSV4AttnMetadata:
                 "c4_sparse_raw_indices",
             ],
             assign_fields=[
+                # Host-side; a graph-captured metadata is always built from a
+                # batch with no image spans, so this is False on both sides.
+                "uses_vision_window",
                 # Recomputed by the recorded init_forward_metadata_in_graph op
                 # each forward; not copied across replays.
                 "swa_out_cache_loc",
@@ -337,6 +340,7 @@ class DSV4AttnMetadata:
             "c4_sparse_topk_lengths",
         ]
         reference_assign_fields = [
+            "uses_vision_window",
             "page_table",
             "swa_page_indices",
             "swa_topk_lengths",
