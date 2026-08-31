@@ -20,6 +20,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+    compute_capture_batch_sizes,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -80,7 +83,6 @@ from sglang.srt.utils import (
     is_npu,
     is_pin_memory_available,
 )
-from sglang.srt.utils.common import get_cuda_graph_batch_size_alignment
 
 logger = logging.getLogger(__name__)
 
@@ -371,18 +373,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         capture_decode_cuda_graph = self._decode_graph_allowed
         if _is_npu and capture_decode_cuda_graph:
             width = self.draft_model_runner.decode_num_tokens_per_req()
-            alignment = get_cuda_graph_batch_size_alignment(
-                self.draft_model_runner.server_args
+            # Reuse the exact bucket filter the decode graph runner applies
+            # (including TBO alignment and the padded num_max_requests bucket)
+            # so this guard is equivalent to the capture-time filter instead of
+            # a hand-rolled approximation.
+            capture_bs = compute_capture_batch_sizes(
+                self.draft_model_runner, captured_req_width=width
             )
-            capture_bs = get_exec().graph.cuda_graph_config.decode.bs
-            if not any(bs * width % alignment == 0 for bs in capture_bs):
+            if not capture_bs:
                 capture_decode_cuda_graph = False
                 logger.warning(
-                    "Disable DSpark draft cuda graph because no configured batch "
-                    "size satisfies NPU alignment: bs=%s, width=%d, alignment=%d.",
-                    capture_bs,
+                    "Disable DSpark draft cuda graph because no batch size "
+                    "satisfies NPU alignment: width=%d.",
                     width,
-                    alignment,
                 )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)

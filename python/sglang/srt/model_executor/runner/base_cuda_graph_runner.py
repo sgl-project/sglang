@@ -61,13 +61,17 @@ def freeze_gc(enable_cudagraph_gc: bool):
             gc.collect()
 
 
-def get_batch_sizes_to_capture(
+def compute_capture_batch_sizes(
     model_runner: ModelRunner, captured_req_width: int = 1
-) -> Tuple[List[int], List[int]]:
-    """Build the (capture_bs, compile_bs) lists for the decode runner.
+) -> List[int]:
+    """Compute the valid decode-graph capture batch sizes for ``model_runner``.
 
-    Filters cuda_graph_config[decode].bs by attention-tp/cp alignment
-    constraints and clamps to req_to_token_pool.size.
+    Filters ``cuda_graph_config[decode].bs`` by attention-tp/cp alignment and
+    clamps to the request-pool size, mirroring the capture filter exactly.
+
+    Returns a sorted list that may be empty (no asserts), so callers that want
+    a graceful fallback (e.g. the DSpark draft worker on NPU) can detect the
+    "no valid bucket" case without triggering the capture-time assertion.
     """
 
     capture_bs = list(get_exec().graph.cuda_graph_config.decode.bs)
@@ -90,8 +94,18 @@ def get_batch_sizes_to_capture(
     # Model input token count = bs * alignment_width; must be a multiple of attn_tp_size.
     capture_bs = [bs for bs in capture_bs if bs * alignment_width % mul_base == 0]
     capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
-    capture_bs = list(sorted(set(capture_bs)))
+    return list(sorted(set(capture_bs)))
 
+
+def get_batch_sizes_to_capture(
+    model_runner: ModelRunner, captured_req_width: int = 1
+) -> Tuple[List[int], List[int]]:
+    """Build the (capture_bs, compile_bs) lists for the decode runner.
+
+    Filters cuda_graph_config[decode].bs by attention-tp/cp alignment
+    constraints and clamps to req_to_token_pool.size.
+    """
+    capture_bs = compute_capture_batch_sizes(model_runner, captured_req_width)
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (
         [bs for bs in capture_bs if bs <= get_exec().graph.torch_compile_max_bs]
