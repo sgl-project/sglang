@@ -184,6 +184,7 @@ class WeightCacheDaemon:
         self.config: Optional[CacheConfig] = None
         # name -> transport-specific tensor entry metadata (shape/dtype/is_param + payload metadata)
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+        self.preloaded_weights_bytes = 0
         self.transport_backend = None
 
     def _init_distributed(self, server_args, model_config):
@@ -347,6 +348,9 @@ class WeightCacheDaemon:
             **compute_env_stamp(),
         )
 
+        current_platform.empty_cache()
+        memory_before_load = torch.cuda.memory_reserved(self.gpu_id)
+
         # Build load config
         load_config = LoadConfig(
             load_format=self.load_format,
@@ -377,6 +381,10 @@ class WeightCacheDaemon:
         # memory: clients map these tensors read-only via IPC and would otherwise
         # risk observing half-written weights.
         current_platform.synchronize()
+        current_platform.empty_cache()
+        self.preloaded_weights_bytes = max(
+            0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load
+        )
 
         # Export all parameters and buffers as IPC handles
         self._export_state()
@@ -582,6 +590,7 @@ class WeightCacheDaemon:
                 # process dies while clients hold IPC mappings, their
                 # param.data (and any CUDA-graph-captured addresses) dangle.
                 pid=os.getpid(),
+                preloaded_weights_bytes=self.preloaded_weights_bytes,
             )
 
         elif req.get("type") == "ping":

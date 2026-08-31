@@ -98,7 +98,10 @@ class TestNoServerArgsMutationEntry(CustomTestCase):
         )
 
     def test_late_resolution_refuses_the_published_config(self):
-        from sglang.srt.arg_groups.overrides import declare_late_resolution
+        from sglang.srt.arg_groups.overrides import (
+            declare_late_resolution,
+            resolution_result,
+        )
         from sglang.srt.runtime_context import get_context
 
         override = get_context().override_server_args(tp_size=2)
@@ -107,7 +110,9 @@ class TestNoServerArgsMutationEntry(CustomTestCase):
 
         with self.assertRaises(ValueError):
             declare_late_resolution(published, "test", tp_size=4)
-        self.assertEqual(published.tp_size, 2)
+        # The refusal left the resolution alone: the hook's declaration stands,
+        # and the record still carries the operator's input.
+        self.assertEqual(resolution_result(published, "tp_size"), 2)
 
 
 if __name__ == "__main__":

@@ -133,6 +133,7 @@ class StagingBuffer:
         self.size_bytes = size_bytes
         self.device = device
         self.gpu_id = gpu_id
+        self._gather_stream: Optional[torch.cuda.Stream] = None
 
         torch.cuda.set_device(gpu_id)
         if custom_mem_pool is not None:
@@ -157,6 +158,11 @@ class StagingBuffer:
 
     def fits(self, required_bytes: int) -> bool:
         return required_bytes <= self.size_bytes
+
+    def get_gather_stream(self) -> torch.cuda.Stream:
+        if self._gather_stream is None:
+            self._gather_stream = torch.cuda.Stream(device=self.device)
+        return self._gather_stream
 
 
 class StagingAllocator:
@@ -350,16 +356,12 @@ def _gather_all_layers_torch(
 
     gather_idx = token_indices.view(-1, 1, 1).expand(num_tokens, num_heads, head_dim)
 
-    if not hasattr(staging_buffer, "_gather_stream"):
-        staging_buffer._gather_stream = torch.cuda.Stream(device=device)
-
-    staging_buffer._gather_stream.wait_stream(
-        torch.cuda.default_stream(torch.device(device))
-    )
+    gather_stream = staging_buffer.get_gather_stream()
+    gather_stream.wait_stream(torch.cuda.default_stream(torch.device(device)))
 
     staging_view = staging_buffer.buffer
     offset = 0
-    with torch.cuda.stream(staging_buffer._gather_stream):
+    with torch.cuda.stream(gather_stream):
         for layer_id in range(num_layers):
             dst = (
                 staging_view[offset : offset + per_layer_bytes]
@@ -389,7 +391,7 @@ def _gather_all_layers_torch(
             )
             offset += per_layer_bytes
 
-    staging_buffer._gather_stream.synchronize()
+    gather_stream.synchronize()
     return offset
 
 
@@ -430,17 +432,13 @@ def _gather_all_layers_triton(
     int_dtype = int_dtype_map.get(dtype_size, torch.int16)
     staging_typed = staging_buffer.buffer[:total_bytes].view(int_dtype)
 
-    if not hasattr(staging_buffer, "_gather_stream"):
-        staging_buffer._gather_stream = torch.cuda.Stream(device=device)
-
-    staging_buffer._gather_stream.wait_stream(
-        torch.cuda.default_stream(torch.device(device))
-    )
+    gather_stream = staging_buffer.get_gather_stream()
+    gather_stream.wait_stream(torch.cuda.default_stream(torch.device(device)))
 
     BLOCK_SIZE = 1024
     grid = (2 * num_layers, triton.cdiv(per_layer_elems, BLOCK_SIZE))
 
-    with torch.cuda.stream(staging_buffer._gather_stream):
+    with torch.cuda.stream(gather_stream):
         _fused_gather_to_staging_kernel[grid](
             layer_ptrs,
             page_idx_tensor,
@@ -454,7 +452,7 @@ def _gather_all_layers_triton(
             BLOCK_SIZE,
         )
 
-    staging_buffer._gather_stream.synchronize()
+    gather_stream.synchronize()
     return total_bytes
 
 

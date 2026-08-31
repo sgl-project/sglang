@@ -354,6 +354,49 @@ def test_npu_selector_draft_forces_greedy_sampling(monkeypatch):
     assert worker._selector_sample is None
 
 
+def test_npu_selector_accept_uses_greedy_fallback_after_refactor(monkeypatch):
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    monkeypatch.setattr(worker_mod, "_is_npu", True)
+    monkeypatch.setattr(
+        worker_mod, "is_dflash_sampling_verify_available", lambda: False
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "compute_dflash_correct_drafts_and_bonus",
+        lambda **kwargs: (torch.tensor([0]), torch.tensor([7])),
+    )
+
+    sync_sites = []
+    worker = SimpleNamespace(
+        _selector_sample=(object(), object()),
+        _selector_sampling_accept=lambda **kwargs: pytest.fail(
+            "NPU must not run selector sampling verification"
+        ),
+        _tp_sync=SimpleNamespace(sync=lambda site, tensor: sync_sites.append(site)),
+        _use_triton_accept_bonus=False,
+        block_size=2,
+    )
+
+    result = worker_mod.DFlashWorkerV2._accept_block(
+        worker,
+        candidates=torch.tensor([[9, 1]]),
+        next_token_logits=torch.tensor([[[0.0, 1.0], [1.0, 0.0]]]),
+        sampling_info=SimpleNamespace(is_all_greedy=False),
+        draft_input=object(),
+        prefix_lens=torch.tensor([3]),
+        bs=1,
+    )
+
+    accept_len, commit_lens, bonus, out_tokens, _, target_predict = result
+    assert accept_len.tolist() == [0]
+    assert commit_lens.tolist() == [1]
+    assert bonus.tolist() == [7]
+    assert out_tokens.tolist() == [[7, 0]]
+    assert target_predict.tolist() == [[1, 0]]
+    assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY]
+
+
 def test_grouped_conv_supports_runtime_block_sizes():
     """The conv indexes a position inside the block, so it must follow whatever
     block size the worker resolved -- including one that is not a power of two."""
