@@ -16,9 +16,13 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_fused_layernorm_modulate,
     can_use_linear_gelu,
     fused_gelu_active,
+    fused_layernorm_modulate_raw,
     fused_linear_gelu_tanh,
+    is_plain_layer_norm,
     mark_fused_gelu_site,
     try_fused_bias_mul_add,
     try_fused_bias_scale_residual_norm_scale_shift,
@@ -93,6 +97,72 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+_QWEN_NORM_OUT = BitExactFusionGate("Qwen-Image fused norm_out", per_signature=True)
+_QWEN_NORM_OUT_SIGS = _QWEN_NORM_OUT.verified_sigs
+assert _QWEN_NORM_OUT_SIGS is not None
+
+
+def _qwen_norm_out(
+    norm_out: AdaLayerNormContinuous,
+    hidden_states: torch.Tensor,
+    conditioning_embedding: torch.Tensor,
+) -> torch.Tensor:
+    """Bit-exact final LayerNorm and adaLN scale/shift fusion."""
+    if torch.compiler.is_compiling():
+        return norm_out(hidden_states, conditioning_embedding)
+
+    # Keep the projected modulation available for direct eager dispatch. The
+    # public custom-op wrapper costs more than this small final norm itself.
+    emb = norm_out.linear(norm_out.silu(conditioning_embedding).to(hidden_states.dtype))
+    scale, shift = torch.chunk(emb, 2, dim=1)
+    if (
+        _QWEN_NORM_OUT.disabled
+        or not is_plain_layer_norm(norm_out.norm, hidden_states.shape[-1])
+        or not can_use_fused_layernorm_modulate(hidden_states, scale, shift)
+    ):
+        return (
+            norm_out.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+        )
+
+    sig = (
+        hidden_states.dtype,
+        hidden_states.device,
+        hidden_states.shape[0],
+        hidden_states.shape[-1],
+        hidden_states.stride(-1),
+        scale.stride(0) if scale.shape[0] > 1 else hidden_states.shape[-1],
+        shift.stride(0) if shift.shape[0] > 1 else hidden_states.shape[-1],
+        norm_out.norm.eps,
+    )
+    verified = sig in _QWEN_NORM_OUT_SIGS
+    if not verified and torch.cuda.is_current_stream_capturing():
+        return (
+            norm_out.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+        )
+    try:
+        fused = fused_layernorm_modulate_raw(
+            hidden_states, scale, shift, norm_out.norm.eps
+        )
+    except Exception as exc:
+        _QWEN_NORM_OUT.on_exception(exc, logger=logger)
+        return (
+            norm_out.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+        )
+    if verified:
+        return fused
+    reference = (
+        norm_out.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+    )
+    return _QWEN_NORM_OUT.accept_or_fallback(
+        fused,
+        reference,
+        sig=sig,
+        logger=logger,
+        mismatch_msg=(
+            "Qwen-Image fused norm_out is not bit-exact on this platform; "
+            "falling back to eager"
+        ),
+    )
 
 
 def _attn_mask_meta_local_pad(attn_mask_meta) -> int:
@@ -2069,7 +2139,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     + controlnet_block_samples[index_block // interval_control]
                 )
         # Use only the image part (hidden_states) from the dual-stream blocks
-        hidden_states = self.norm_out(hidden_states, temb_txt)
+        hidden_states = _qwen_norm_out(self.norm_out, hidden_states, temb_txt)
 
         output, _ = self.proj_out(hidden_states)
         return output
