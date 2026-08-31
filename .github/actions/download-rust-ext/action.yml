@@ -1,8 +1,9 @@
 name: 'Download prebuilt Rust extensions'
 description: >
   Put rust-ext-build's PyO3 extension modules in the checkout and set
-  SGLANG_BUILD_RUST_EXTS=none for the job, so install skips the cargo build.
-  Sets nothing when neither source has them, leaving install to compile.
+  SGLANG_BUILD_RUST_EXTS=none and SGLANG_RUST_BUILD_MODE=never for the job, so
+  install skips the cargo build and runtime trusts these fingerprinted modules.
+  Sets nothing when neither source has them, leaving source builds enabled.
 
 inputs:
   artifact_name:
@@ -49,8 +50,10 @@ runs:
       if: steps.artifact.outcome != 'success'
       uses: actions/cache/restore@v4
       with:
-        path: python/sglang/srt/rust_extensions/_*.so
-        key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
+        path: |
+          python/sglang/srt/rust_extensions/_*.so
+          python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
+        key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
 
     # Job-wide, but only setup.py reads it, and only while building.
     # Whether the modules suit this interpreter is not decided here:
@@ -65,6 +68,9 @@ runs:
            || [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
             echo "hit=true" >> "$GITHUB_OUTPUT"
             echo "SGLANG_BUILD_RUST_EXTS=none" >> "$GITHUB_ENV"
+            # A source checkout normally ignores in-package native artifacts
+            # because they may be stale. These are fingerprint-keyed CI bytes.
+            echo "SGLANG_RUST_BUILD_MODE=never" >> "$GITHUB_ENV"
         else
             echo "hit=false" >> "$GITHUB_OUTPUT"
         fi

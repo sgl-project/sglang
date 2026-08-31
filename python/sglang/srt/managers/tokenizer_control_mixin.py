@@ -81,7 +81,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.server_args import LoRARef, ServerArgs
+from sglang.srt.server_args import LoRARef
 from sglang.srt.utils import (
     get_bool_env_var,
     normalize_serialized_named_tensor_payloads,
@@ -158,7 +158,7 @@ class TokenizerControlMixin:
     FanOutCommunicator, as opposed to data-plane inference requests multiplexed by rid.
     """
 
-    def init_communicators(self: TokenizerManager, server_args: ServerArgs):
+    def init_communicators(self: TokenizerManager):
         dispatch_pairs = []
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
@@ -179,8 +179,8 @@ class TokenizerControlMixin:
         )
         if primary_group_control:
             control_fan_out = (
-                worker_count + self.server_args.tp_size - 1
-            ) // self.server_args.tp_size
+                worker_count + get_parallel().tp_size - 1
+            ) // get_parallel().tp_size
         else:
             control_fan_out = worker_count
 

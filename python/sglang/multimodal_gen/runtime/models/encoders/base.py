@@ -164,6 +164,10 @@ class EncoderTensorParallelMixin:
     # states or sharding contract cannot use the generic loader lifecycle.
     manages_checkpoint_quantization = False
 
+    @staticmethod
+    def should_materialize_checkpoint_weight(name: str) -> bool:
+        return True
+
     @classmethod
     def configure_component_paths(
         cls,
