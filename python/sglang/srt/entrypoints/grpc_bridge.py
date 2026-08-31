@@ -7,7 +7,6 @@ TokenizerManager's event loop.
 """
 
 import asyncio
-import dataclasses
 import json
 import logging
 from types import SimpleNamespace
@@ -15,8 +14,10 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from pydantic import ValidationError
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.runtime_context import (
+    describe_kv_events_publisher,
     get_lora,
     get_serving,
 )
@@ -417,16 +418,16 @@ class RuntimeHandle:
         if embedding_model_spec is not None:
             result["embedding"] = resolved_embedding_plan(
                 embedding_model_spec,
-                server_args=self.server_args,
+                config=resolving_view(self.server_args),
                 model_config=model_config,
             )
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = dataclasses.asdict(self.tokenizer_manager.server_args)
+        result: Dict[str, Any] = self.tokenizer_manager.server_args.resolved_dict()
         result.update(self.scheduler_info)
-        result["kv_events"] = (
-            self.tokenizer_manager.server_args.describe_kv_events_publisher()
+        result["kv_events"] = describe_kv_events_publisher(
+            self.tokenizer_manager.server_args
         )
         return json.dumps(msgspec_to_builtins(result), default=str)
 

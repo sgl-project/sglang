@@ -83,15 +83,15 @@ class DSV4ReqToTokenTablesMixin:
         Prefix matching can happen before a request slot is allocated, so the
         page ids are temporarily carried by ``Req`` and installed by ``alloc``.
         """
-        if req.req_pool_idx is None:
+        if req.kv.req_pool_idx is None:
             req.c128_prefix_page_ids = page_ids
             return
         self._dsv4_allocator.replace_req_c128_prefix(
-            int(req.req_pool_idx), page_ids, self
+            int(req.kv.req_pool_idx), page_ids, self
         )
 
     def alloc(self, reqs):
-        fresh = [req.req_pool_idx is None for req in reqs]
+        fresh = [req.kv.req_pool_idx is None for req in reqs]
         indices = super().alloc(reqs)
         if indices is None:
             return None

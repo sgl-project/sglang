@@ -280,10 +280,8 @@ class StorageAttachment:
 
         existing_collector = cache.storage_metrics_collector
         if existing_collector is None:
-            from sglang.srt.runtime_context import get_server_args
 
             storage_cls = resolve_collector_class(
-                get_server_args(),
                 STAT_LOGGER_ROLE_STORAGE,
                 StorageMetricsCollector,
             )
