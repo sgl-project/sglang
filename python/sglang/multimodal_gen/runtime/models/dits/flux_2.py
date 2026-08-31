@@ -30,6 +30,7 @@ from sglang.kernels.ops.diffusion import (
     is_plain_layer_norm,
     residual_gate_add,
     try_flux2_token_cat_fp8,
+    try_flux2_token_cat_nvfp4,
     try_fused_flux2_qkv_epilogue,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
@@ -62,8 +63,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
     ModelOptFp8Config,
     ModelOptFp8LinearMethod,
+    apply_nvfp4_gemm_prequantized,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -722,6 +725,15 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         self._enable_fp8_token_cat = self.tp_size == 1 and isinstance(
             self.to_out.quant_method, ModelOptFp8LinearMethod
         )
+        self._enable_nvfp4_token_cat = False
+        capability = current_platform.get_device_capability()
+        if (
+            self.tp_size == 1
+            and capability is not None
+            and (capability.major, capability.minor) == (10, 3)
+            and isinstance(self.to_out.quant_method, ModelOptFp4LinearMethod)
+        ):
+            self._enable_nvfp4_token_cat = True
         if self.tp_size > 1:
             self._patch_to_out_weight_loader()
 
@@ -823,19 +835,33 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         # Handle the feedforward (FF) logic
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
 
-        # Write both branches directly to the static-FP8 GEMM input. This
-        # avoids materializing the full-width BF16 concatenation and launching
-        # a second quantization kernel in every single-stream block.
+        # Concatenate and parallel output projection. FP8 writes a packed
+        # GEMM input; SM103 NVFP4 writes packed values and swizzled scales.
+        # Both avoid a full-width BF16 cat materialization.
+        output_shape = (*hidden_states.shape[:-1], self.out_dim)
         quantized = None
+        packed = None
         if self._enable_fp8_token_cat:
             quantized = try_flux2_token_cat_fp8(
                 hidden_states, mlp_hidden_states, self.to_out.input_scale
             )
-        if quantized is None:
-            hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
-        else:
+        elif self._enable_nvfp4_token_cat:
+            packed = try_flux2_token_cat_nvfp4(
+                hidden_states, mlp_hidden_states, self.to_out.input_scale_inv
+            )
+        if quantized is not None:
             hidden_states = quantized
-        hidden_states, _ = self.to_out(hidden_states)
+            hidden_states, _ = self.to_out(hidden_states)
+        elif packed is not None:
+            hidden_states = apply_nvfp4_gemm_prequantized(
+                self.to_out,
+                *packed,
+                output_dtype=hidden_states.dtype,
+                bias=self.to_out.bias,
+            ).view(*output_shape)
+        else:
+            hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+            hidden_states, _ = self.to_out(hidden_states)
 
         return hidden_states
 
