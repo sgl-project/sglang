@@ -35,6 +35,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_flags,
     get_parallel,
     get_spec,
@@ -202,7 +203,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
             sampling_seed = (
                 torch.zeros((self.max_bs,), dtype=torch.int64)
-                if self.model_runner.server_args.enable_deterministic_inference
+                if get_exec().deterministic.enable_deterministic_inference
                 and self.model_runner.server_args.speculative_use_rejection_sampling
                 else None
             )

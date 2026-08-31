@@ -60,6 +60,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_flags,
     get_parallel,
     get_spec,
@@ -681,7 +682,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
                 )
                 sampling_seed = (
                     torch.zeros((max_bs,), dtype=torch.int64)
-                    if model_runner.server_args.enable_deterministic_inference
+                    if get_exec().deterministic.enable_deterministic_inference
                     else None
                 )
             else:
