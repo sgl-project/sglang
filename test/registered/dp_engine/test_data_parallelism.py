@@ -8,9 +8,11 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_rust_server_built,
     popen_launch_server,
 )
 
@@ -65,6 +67,33 @@ class TestDataParallelism(CustomTestCase, GSM8KMixin):
 
         response = requests.get(self.base_url + "/server_info")
         assert response.status_code == 200
+
+
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built",
+)
+class TestRustDataParallelism(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env={"SGLANG_RUST_SERVER": "1"},
+            other_args=["--dp", 2],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_nonzero_dp_rank_has_http_listener(self):
+        # popen_launch_server already waits for rank 0's listener.
+        host, port = self.base_url.rsplit(":", 1)
+        response = requests.get(f"{host}:{int(port) + 1}/health", timeout=30)
+        self.assertEqual(response.status_code, 200, response.text)
 
 
 if __name__ == "__main__":
