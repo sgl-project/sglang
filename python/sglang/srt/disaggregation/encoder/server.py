@@ -113,17 +113,32 @@ ENCODER_MAX_BATCH_SIZE_EXPLICIT = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.is_set()
 ENCODER_REQ_TIMEOUT = envs.SGLANG_ENCODER_REQ_TIMEOUT.get()
 
 
-async def _await_transfer_completion(awaitable, operation: str):
-    """Do not let cancellation outlive a zero-copy transfer using its buffer."""
-    task = asyncio.ensure_future(awaitable)
+async def await_task_completion_on_cancel(task: asyncio.Task, operation: str):
+    """Keep task-owned resources live until cancellation reaches a safe point."""
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        try:
-            await asyncio.shield(task)
-        except Exception:
-            logger.exception("%s failed while draining cancellation", operation)
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not task.cancelled() and task.exception() is not None:
+            logger.error(
+                "%s failed while draining cancellation",
+                operation,
+                exc_info=task.exception(),
+            )
         raise
+
+
+async def _await_transfer_completion(awaitable, operation: str):
+    """Do not let cancellation outlive a zero-copy transfer using its buffer."""
+    return await await_task_completion_on_cancel(
+        asyncio.ensure_future(awaitable), operation
+    )
 
 
 class EncoderMetaRegistry:
@@ -824,21 +839,27 @@ class MMEncoder:
         expected_destination_count: int,
         destination_urls: Iterable[str],
     ) -> None:
-        async with rid_lock:
-            if req_id not in rid_to_receive_endpoint:
-                rid_to_receive_endpoint[req_id] = set()
-                rid_to_receive_count[req_id] = expected_destination_count
-            registered_count = rid_to_receive_count[req_id]
-            if registered_count != expected_destination_count:
-                raise BadRequestError(
-                    f"Inconsistent receive_count for req_id={req_id}: "
-                    f"registered {registered_count}, got {expected_destination_count}"
-                )
-            rid_to_receive_endpoint[req_id].update(destination_urls)
+        state = self.req_states.get(req_id)
+        if state is None:
+            raise BadRequestError(f"Encoder request is not active: {req_id}")
 
-        cond = await _get_receive_condition(req_id)
-        async with cond:
-            cond.notify_all()
+        async with state.lifecycle_condition:
+            if self.req_states.get(req_id) is not state or state.release_requested:
+                raise BadRequestError(f"Encoder request is not active: {req_id}")
+            async with rid_lock:
+                if req_id not in rid_to_receive_endpoint:
+                    rid_to_receive_endpoint[req_id] = set()
+                    rid_to_receive_count[req_id] = expected_destination_count
+                registered_count = rid_to_receive_count[req_id]
+                if registered_count != expected_destination_count:
+                    raise BadRequestError(
+                        f"Inconsistent receive_count for req_id={req_id}: "
+                        f"registered {registered_count}, got {expected_destination_count}"
+                    )
+                rid_to_receive_endpoint[req_id].update(destination_urls)
+            cond = await _get_receive_condition(req_id)
+            async with cond:
+                cond.notify_all()
 
     def _infer_embedding_dims(self) -> dict:
         """Infer per-modality embedding dimensions from hf_config at init time."""

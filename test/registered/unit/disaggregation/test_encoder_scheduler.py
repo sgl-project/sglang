@@ -1,5 +1,7 @@
 import asyncio
 import sys
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -131,26 +133,32 @@ def test_scheduler_isolates_bad_request_from_failed_fused_batch():
             max_batch_size=8,
             coalesce_same_turn=True,
         )
-        scheduler.start()
-        try:
-            requests = [
-                {
-                    "req_id": req_id,
-                    "modality": "image",
-                    "mm_items": [object()],
-                    "num_parts": 1,
-                    "part_idx": 0,
-                }
-                for req_id in ("bad", "good")
-            ]
-            results = await asyncio.gather(
-                *(scheduler.submit(request) for request in requests)
-            )
-        finally:
-            await scheduler.stop()
+        collector = SimpleNamespace(observe_queue_wait=Mock())
+        with patch(
+            "sglang.srt.disaggregation.encoder.runtime.server_module.encoder_metrics_collector",
+            collector,
+        ):
+            scheduler.start()
+            try:
+                requests = [
+                    {
+                        "req_id": req_id,
+                        "modality": "image",
+                        "mm_items": [object()],
+                        "num_parts": 1,
+                        "part_idx": 0,
+                    }
+                    for req_id in ("bad", "good")
+                ]
+                results = await asyncio.gather(
+                    *(scheduler.submit(request) for request in requests)
+                )
+            finally:
+                await scheduler.stop()
 
         assert encoder.batches == [["bad", "good"], ["bad"], ["good"]]
         assert results == [(0, 0, 0, "bad image", 400), (1, 2, 3, None, None)]
+        assert collector.observe_queue_wait.call_count == len(requests)
 
     asyncio.run(run_test())
 

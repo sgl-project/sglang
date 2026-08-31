@@ -23,7 +23,11 @@ from grpc_reflection.v1alpha import reflection
 from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
 from sglang.srt.disaggregation.encoder.runtime import validate_encode_request
-from sglang.srt.disaggregation.encoder.server import MMEncoder, launch_encoder
+from sglang.srt.disaggregation.encoder.server import (
+    MMEncoder,
+    await_task_completion_on_cancel,
+    launch_encoder,
+)
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.runtime_context import (
@@ -115,20 +119,9 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             # launch order identical when gRPC handlers run concurrently.
             async with self.encoder.encode_dispatch_lock:
                 encode_task = asyncio.create_task(self._dispatch_encode(request_dict))
-                try:
-                    result = await asyncio.shield(encode_task)
-                except asyncio.CancelledError:
-                    # Once TP dispatch starts, interrupting one rank can strand
-                    # its peers in a collective. Drain to a safe point before
-                    # releasing the lock and request state.
-                    try:
-                        await asyncio.shield(encode_task)
-                    except Exception:
-                        logger.exception(
-                            "Encoder request %s failed while draining cancellation",
-                            request.req_id,
-                        )
-                    raise
+                result = await await_task_completion_on_cancel(
+                    encode_task, f"Encoder request {request.req_id}"
+                )
                 (
                     nbytes,
                     embedding_len,

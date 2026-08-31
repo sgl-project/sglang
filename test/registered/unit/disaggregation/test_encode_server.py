@@ -376,6 +376,10 @@ class TestEncoderDelivery(CustomTestCase):
             await asyncio.sleep(0)
             self.assertFalse(task.done())
 
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+
             finish_transfer.set()
             with self.assertRaises(asyncio.CancelledError):
                 await task
@@ -535,6 +539,31 @@ class TestEncoderDelivery(CustomTestCase):
 
         asyncio.run(run())
 
+    def test_cleanup_failure_preserves_send_error_on_python_310(self):
+        async def run():
+            encoder = SimpleNamespace(
+                send=AsyncMock(side_effect=ValueError("transfer failed")),
+                release_request=AsyncMock(side_effect=RuntimeError("cleanup failed")),
+            )
+            request = {
+                "req_id": "req",
+                "prefill_host": "127.0.0.1",
+                "embedding_port": 1,
+                "session_id": "session",
+                "buffer_address": 2,
+            }
+
+            with (
+                patch.object(encoder_runtime.sys, "version_info", (3, 10)),
+                self.assertLogs(encoder_runtime.logger, level="ERROR"),
+                self.assertRaisesRegex(ValueError, "transfer failed"),
+            ):
+                await send_staged_embedding(
+                    encoder, request, release_without_count=False
+                )
+
+        asyncio.run(run())
+
     def test_cancelled_staged_send_releases_request(self):
         async def run():
             encoder = SimpleNamespace(
@@ -691,7 +720,10 @@ class TestEncoderDelivery(CustomTestCase):
     def _load_grpc_server():
         try:
             import grpc
+            from grpc_health.v1 import health_pb2
             from smg_grpc_proto import sglang_encoder_pb2
+
+            health_pb2.HealthCheckRequest()
         except ImportError as e:
             raise unittest.SkipTest(f"gRPC test dependencies unavailable: {e}") from e
         except Exception as e:
@@ -1052,6 +1084,11 @@ class TestEncoderDelivery(CustomTestCase):
                 await asyncio.sleep(0)
 
                 # Cancellation cannot interrupt an in-flight TP collective.
+                self.assertFalse(task.done())
+                encoder.release_request.assert_not_awaited()
+
+                task.cancel()
+                await asyncio.sleep(0)
                 self.assertFalse(task.done())
                 encoder.release_request.assert_not_awaited()
 
@@ -1647,6 +1684,52 @@ class TestEncoderDelivery(CustomTestCase):
 
         asyncio.run(run())
 
+    def test_destination_registration_respects_request_lifecycle(self):
+        async def run():
+            req_id = "registration-lifecycle"
+            await meta_registry.discard(req_id)
+
+            encoder = MMEncoder.__new__(MMEncoder)
+            state = ReqState(req_id)
+            state.active_encodes = 1
+            encoder.req_states = {req_id: state}
+            encoder.delivery = ZmqDelivery(encoder, cleanup_receive_state=True)
+
+            await encoder.register_embedding_destinations(
+                req_id, 1, ["tcp://127.0.0.1:1"]
+            )
+            self.assertIn(req_id, rid_to_receive_endpoint)
+
+            with patch.object(meta_registry, "discard", AsyncMock()):
+                await encoder.release_request(req_id)
+
+            self.assertTrue(state.release_requested)
+            self.assertIn(req_id, encoder.req_states)
+            with self.assertRaisesRegex(BadRequestError, "not active"):
+                await encoder.register_embedding_destinations(
+                    req_id, 1, ["tcp://127.0.0.1:2"]
+                )
+            self.assertEqual(rid_to_receive_endpoint[req_id], {"tcp://127.0.0.1:1"})
+
+            with patch.object(meta_registry, "discard", AsyncMock()):
+                await encoder._release_encode_ref(state)
+
+            self.assertNotIn(req_id, rid_to_receive_endpoint)
+            self.assertNotIn(req_id, rid_to_receive_count)
+            self.assertNotIn(req_id, rid_to_cond)
+
+            # a reused ID starts a new request lifecycle
+            encoder.req_states[req_id] = ReqState(req_id)
+            await encoder.register_embedding_destinations(
+                req_id, 1, ["tcp://127.0.0.1:3"]
+            )
+            self.assertEqual(rid_to_receive_endpoint[req_id], {"tcp://127.0.0.1:3"})
+
+            with patch.object(meta_registry, "discard", AsyncMock()):
+                await encoder.release_request(req_id)
+
+        asyncio.run(run())
+
 
 class TestEncoderDPAbandonedRequest(CustomTestCase):
     @staticmethod
@@ -1748,6 +1831,27 @@ class TestEncoderDPAbandonedRequest(CustomTestCase):
             encoder.release_request.assert_not_awaited()
             encode_task.cancel()
             await asyncio.gather(encode_task, return_exceptions=True)
+
+        asyncio.run(run())
+
+    def test_worker_preserves_release_before_encode_task_exists(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 0
+            encoder.req_states = {}
+            encoder.abandoned_req_ids = set()
+            encoder.delivery = SimpleNamespace(release=AsyncMock())
+
+            await _retire_abandoned_encode(encoder, None, "abandoned")
+            self.assertIn("abandoned", encoder.abandoned_req_ids)
+
+            state = encoder._acquire_encode_ref("abandoned")
+            self.assertTrue(state.release_requested)
+            with patch.object(meta_registry, "discard", AsyncMock()):
+                await encoder._release_encode_ref(state)
+
+            encoder.delivery.release.assert_awaited_once_with(state)
+            self.assertNotIn("abandoned", encoder.req_states)
 
         asyncio.run(run())
 

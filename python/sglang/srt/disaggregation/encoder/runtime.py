@@ -12,6 +12,7 @@ import contextlib
 import logging
 import multiprocessing as mp
 import os
+import sys
 import time
 import traceback
 import uuid
@@ -31,6 +32,7 @@ from sglang.srt.disaggregation.encoder.server import (
     EncoderProfiler,
     MMEncoder,
     MMError,
+    await_task_completion_on_cancel,
     launch_encoder,
 )
 from sglang.srt.environ import envs
@@ -244,7 +246,11 @@ class EncoderScheduler:
                         p.future.set_exception(e)
 
     async def _dispatch_group(
-        self, group: List[PendingRequest], modality: Modality
+        self,
+        group: List[PendingRequest],
+        modality: Modality,
+        *,
+        observe_queue_wait: bool = True,
     ) -> None:
         # A request may time out while queued. Never start work that no caller
         # can observe, or its eventual staged embedding would have no owner.
@@ -276,7 +282,7 @@ class EncoderScheduler:
         requests = [p.request for p in group]
         start = time.time()
         modality_str = modality.name.lower()
-        if server_module.encoder_metrics_collector is not None:
+        if observe_queue_wait and server_module.encoder_metrics_collector is not None:
             for p in group:
                 server_module.encoder_metrics_collector.observe_queue_wait(
                     max(0.0, start - p.submit_time), modality=modality_str
@@ -341,7 +347,9 @@ class EncoderScheduler:
                 "individual requests"
             )
             for pending in group:
-                await self._dispatch_group([pending], modality)
+                await self._dispatch_group(
+                    [pending], modality, observe_queue_wait=False
+                )
             return
 
         for p, result in zip(group, results):
@@ -1172,7 +1180,12 @@ async def send_staged_embedding(
         try:
             await enc.release_request(req_id)
         except Exception as cleanup_error:
-            error.add_note(f"Failed to release encoder request: {cleanup_error}")
+            if sys.version_info >= (3, 11):
+                error.add_note(f"Failed to release encoder request: {cleanup_error}")
+            else:
+                logger.exception(
+                    "Failed to release encoder request %s after send failure", req_id
+                )
         raise
 
 
@@ -1220,28 +1233,9 @@ async def _run_dispatched_encode(
             hashes=request.get("hashes"),
         )
     )
-    try:
-        return await asyncio.shield(encode_task)
-    except asyncio.CancelledError:
-        # The TP followers have already received the request. Let every rank
-        # finish the same collective sequence while the dispatch lock is held.
-        while not encode_task.done():
-            try:
-                await asyncio.shield(encode_task)
-            except asyncio.CancelledError:
-                continue
-            except Exception:
-                break
-        try:
-            encode_task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception(
-                "Encoder request %s failed while draining cancellation",
-                request["req_id"],
-            )
-        raise
+    return await await_task_completion_on_cancel(
+        encode_task, f"Encoder request {request['req_id']}"
+    )
 
 
 async def execute_encode_pipeline(
@@ -1564,7 +1558,7 @@ async def _retire_abandoned_encode(
 ) -> None:
     """Retire an abandoned request without interrupting its encode work."""
     try:
-        if encode_task is not None and not encode_task.done():
+        if encode_task is None or not encode_task.done():
             await enc.abandon_request(req_id)
         else:
             await enc.release_request(req_id)
