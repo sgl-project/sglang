@@ -111,9 +111,7 @@ def _package(name):
 
 
 def _load_target_module():
-    base_prefix_cache = types.ModuleType(
-        "sglang.srt.mem_cache.base_prefix_cache"
-    )
+    base_prefix_cache = types.ModuleType("sglang.srt.mem_cache.base_prefix_cache")
     for name in (
         "EvictParams",
         "EvictResult",
@@ -136,15 +134,11 @@ def _load_target_module():
     utils.create_device_stream = Mock()
     utils.device_stream_context = lambda stream: nullcontext()
 
-    mp_adapter = types.ModuleType(
-        "lmcache.integration.sglang.multi_process_adapter"
-    )
+    mp_adapter = types.ModuleType("lmcache.integration.sglang.multi_process_adapter")
     mp_adapter.LMCacheMPConnector = type("LMCacheMPConnector", (), {})
 
     sglang_adapter = types.ModuleType("lmcache.integration.sglang.sglang_adapter")
-    sglang_adapter.LMCacheLayerwiseConnector = type(
-        "LMCacheLayerwiseConnector", (), {}
-    )
+    sglang_adapter.LMCacheLayerwiseConnector = type("LMCacheLayerwiseConnector", (), {})
     sglang_adapter.LoadMetadata = _LoadMetadata
     sglang_adapter.StoreMetadata = _StoreMetadata
 
@@ -154,9 +148,7 @@ def _load_target_module():
     stubs = {
         "sglang.srt": _package("sglang.srt"),
         "sglang.srt.mem_cache": _package("sglang.srt.mem_cache"),
-        "sglang.srt.mem_cache.storage": _package(
-            "sglang.srt.mem_cache.storage"
-        ),
+        "sglang.srt.mem_cache.storage": _package("sglang.srt.mem_cache.storage"),
         "sglang.srt.mem_cache.storage.lmcache": _package(
             "sglang.srt.mem_cache.storage.lmcache"
         ),
@@ -282,29 +274,30 @@ class TestLMCacheMPCacheSalt(CustomTestCase):
 
         connector.lookup_kv.assert_called_once_with([11, 12, 13], "request-1")
 
-    def test_legacy_connector_rejects_salted_lookup_before_external_access(self):
+    def test_legacy_connector_skips_salted_lookup_before_external_access(self):
         connector = SimpleNamespace(
             lookup_kv=Mock(return_value=0),
             release_pending=Mock(),
         )
         tree = self._lookup_tree(connector)
+        base_res = self._base_match_result()
 
-        with self.assertRaisesRegex(RuntimeError, "cache_salt"):
-            tree._mp_match_prefix(
+        with self.assertLogs(self.module.logger, level="WARNING") as logs:
+            result = tree._mp_match_prefix(
                 _RadixKey([11, 12, 13], cache_salt="tenant-a"),
-                self._base_match_result(),
+                base_res,
                 torch.empty(0, dtype=torch.int64),
                 _TreeNode(),
                 self._req("tenant-a"),
             )
 
+        self.assertIs(result, base_res)
+        self.assertIn("Skipping LMCache MP lookup", logs.output[0])
         connector.lookup_kv.assert_not_called()
 
     def test_legacy_connector_keeps_unsalted_store_compatible(self):
         class LegacyStoreMetadata:
-            def __init__(
-                self, last_node, token_ids, kv_indices, offset, request_id=""
-            ):
+            def __init__(self, last_node, token_ids, kv_indices, offset, request_id=""):
                 self.last_node = last_node
                 self.token_ids = token_ids
                 self.kv_indices = kv_indices
@@ -318,26 +311,44 @@ class TestLMCacheMPCacheSalt(CustomTestCase):
         tree = self._store_tree(connector)
         self.module.StoreMetadata = LegacyStoreMetadata
 
-        tree.cache_finished_req(
-            self._req(None), is_insert=True, kv_len_to_handle=3
-        )
+        tree.cache_finished_req(self._req(None), is_insert=True, kv_len_to_handle=3)
 
         connector.store_kv.assert_called_once()
 
-    def test_legacy_connector_rejects_salted_store_before_mutating_cache(self):
+    def test_legacy_connector_skips_salted_store_after_local_cleanup(self):
         connector = SimpleNamespace(
             store_kv=Mock(),
             end_session=Mock(),
         )
         tree = self._store_tree(connector)
 
-        with self.assertRaisesRegex(RuntimeError, "cache_salt"):
+        with self.assertLogs(self.module.logger, level="WARNING") as logs:
             tree.cache_finished_req(
                 self._req("tenant-a"), is_insert=True, kv_len_to_handle=3
             )
 
-        self.assertEqual(tree._base_finished_calls, [])
+        self.assertEqual(len(tree._base_finished_calls), 1)
+        self.assertIn("Skipping LMCache MP store", logs.output[0])
         connector.store_kv.assert_not_called()
+        connector.end_session.assert_called_once_with("request-1")
+
+    def test_mp_store_failure_always_releases_local_and_external_state(self):
+        connector = SimpleNamespace(
+            supports_cache_salt=True,
+            store_kv=Mock(side_effect=ValueError("invalid cache_salt")),
+            end_session=Mock(),
+        )
+        tree = self._store_tree(connector)
+        tree._mp_load_back_markers["request-1"] = object()
+
+        with self.assertRaisesRegex(ValueError, "invalid cache_salt"):
+            tree.cache_finished_req(
+                self._req("tenant-a"), is_insert=True, kv_len_to_handle=3
+            )
+
+        self.assertNotIn("request-1", tree._mp_load_back_markers)
+        tree.dec_lock_ref.assert_called_once()
+        connector.end_session.assert_called_once_with("request-1")
 
 
 if __name__ == "__main__":
