@@ -102,7 +102,7 @@ class TestDisaggregationWire(unittest.TestCase):
 
     def test_prebuilt_skips_unused_prompt_tensor(self):
         req = SimpleNamespace(
-            req_pool_idx=0,
+            kv=SimpleNamespace(req_pool_idx=0),
             prefix_indices=[0, 1],
             extend_range=SimpleNamespace(length=3),
             origin_input_ids=[0, 1, 2, 3, 4],

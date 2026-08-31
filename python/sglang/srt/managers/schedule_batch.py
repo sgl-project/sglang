@@ -848,7 +848,8 @@ class ReqLogprob:
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqKvInfo:
     # Device KV a request holds outside the prefix cache. Always present on the Req;
-    # whether any KV is held is `req.req_pool_idx is not None` (Req.is_holding_kv).
+    # whether any KV is held is `is_held` (a row is registered).
+    req_pool_idx: Optional[int] = None  # req_to_token row, the register for the slots
 
     # The request's own KV is [cache_protected_len, kv_allocated_len).
     cache_protected_len: int = 0  # tree cache owns [0, here) (matched or inserted)
@@ -866,6 +867,10 @@ class ReqKvInfo:
         if page_size > 1 and lo > self.cache_protected_len:
             lo = ceil_align(lo, page_size)
         return lo
+
+    @property
+    def is_held(self) -> bool:
+        return self.req_pool_idx is not None
 
     @property
     def is_released(self) -> bool:
@@ -1002,7 +1007,6 @@ class Req(ReqDllmMixin):
         self.routing_key = routing_key
 
         # Memory pool info
-        self.req_pool_idx: Optional[int] = None
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
         self.mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
         self.mamba_next_track_idx: Optional[int] = None  # 0 or 1
@@ -1310,9 +1314,10 @@ class Req(ReqDllmMixin):
             or self.mamba_host_hit_length > 0
         )
 
-    @property
-    def is_holding_kv(self) -> bool:
-        return self.req_pool_idx is not None
+    def detach_kv(self) -> ReqKvInfo:
+        # Hand the KV record to a new holder; the req keeps a fresh empty one.
+        kv, self.kv = self.kv, ReqKvInfo()
+        return kv
 
     def effective_kv_committed_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
@@ -1780,7 +1785,7 @@ class Req(ReqDllmMixin):
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
         self.already_computed = 0
-        assert not self.is_holding_kv, "expect it is already released"
+        assert not self.kv.is_held, "expect it is already released"
         self.kv.kv_committed_len = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -1805,7 +1810,7 @@ class Req(ReqDllmMixin):
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
-            self.req_pool_idx, : self.seqlen - 1
+            self.kv.req_pool_idx, : self.seqlen - 1
         ]
         # Copies over both the kv cache and mamba state if available
         mamba_pool = self._mamba_pool_needing_backup(
@@ -1825,7 +1830,7 @@ class Req(ReqDllmMixin):
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         assert self.retraction_backup is not None
         token_indices = req_to_token_pool.req_to_token[
-            self.req_pool_idx, : self.seqlen - 1
+            self.kv.req_pool_idx, : self.seqlen - 1
         ]
         # Loads both the kv cache and mamba state if exists
         mamba_cpu = self.retraction_backup.mamba_cpu
@@ -3531,7 +3536,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # seqlen progress is monotonic per KV handle.
                     if (
                         req.decode_batch_idx >= 1
-                        and req.is_holding_kv
+                        and req.kv.is_held
                         and req.seqlen - 1 - sliding_window_size
                         >= req.kv.swa_evicted_seqlen + eviction_interval
                     ):

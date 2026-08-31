@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 import torch.nn as nn
+from safetensors.torch import save_file as safetensors_save_file
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
@@ -20,7 +21,9 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     ComponentCheckpointUnsupportedError,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
+    _assign_direct_gpu_vae_state,
     _backfill_ltx2_audio_vae_latent_stats,
+    _direct_gpu_vae_state_slots,
     _match_checkpoint_dtypes,
     _require_native_loader_for_quantized_vae,
     _should_use_channels_last_3d,
@@ -44,6 +47,7 @@ class _FakeServerArgs:
         self.trust_remote_code = True
         self.layerwise_components = set()
         self.component_quantizations = {}
+        self.component_direct_gpu_weight_loading = {}
 
     def resolve_component_attention_backend(self, _component_name):
         return None, None
@@ -51,8 +55,14 @@ class _FakeServerArgs:
     def should_start_component_on_cpu(self, _component_name):
         return False
 
+    def should_use_fsdp_for_component(self, _component_name):
+        return False
+
     def should_configure_layerwise_offload_for_lazy_component(self, component_name):
         return component_name in self.layerwise_components
+
+    def should_direct_gpu_weight_load_component(self, component_name):
+        return self.component_direct_gpu_weight_loading.get(component_name, False)
 
     def should_use_fsdp_for_component(self, _component_name):
         return False
@@ -124,6 +134,131 @@ class TestMatchCheckpointDtypes(unittest.TestCase):
         before = loaded["extra"]
         _match_checkpoint_dtypes(loaded, {})
         self.assertIs(loaded["extra"], before)
+
+
+class TestDirectGPUVAEState(unittest.TestCase):
+    class _StandardVAE(nn.Module):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+            self.proj = nn.Linear(2, 2, bias=False)
+            self.register_buffer("scale", torch.ones(1))
+
+    def test_assigns_one_complete_state_without_a_cpu_state_dict(self):
+        expected_weight = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+        expected_scale = torch.tensor([3.0])
+        with TemporaryDirectory() as root:
+            checkpoint = pathlib.Path(root) / "model.safetensors"
+            safetensors_save_file(
+                {"proj.weight": expected_weight, "scale": expected_scale}, checkpoint
+            )
+            with torch.device("meta"):
+                vae = self._StandardVAE()
+            _assign_direct_gpu_vae_state(
+                vae,
+                [str(checkpoint)],
+                component_name="vae",
+                device=torch.device("cpu"),
+            )
+
+        self.assertTrue(torch.equal(vae.proj.weight, expected_weight))
+        self.assertTrue(torch.equal(vae.scale, expected_scale))
+        self.assertFalse(any(tensor.is_meta for tensor in vae.state_dict().values()))
+
+    def test_rejects_nonstandard_state_lifecycle(self):
+        class _CustomVAE(self._StandardVAE):
+            def state_dict(self, *args, **kwargs):
+                return super().state_dict(*args, **kwargs)
+
+        with torch.device("meta"):
+            vae = _CustomVAE()
+
+        with self.assertRaisesRegex(ComponentCheckpointUnsupportedError, "ABI"):
+            _direct_gpu_vae_state_slots(vae, "vae")
+
+    def test_ignores_nonpersistent_runtime_buffers(self):
+        class _VAEWithRuntimeBuffer(self._StandardVAE):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("runtime_cache", torch.zeros(1), persistent=False)
+
+        with torch.device("meta"):
+            vae = _VAEWithRuntimeBuffer()
+
+        state, slots = _direct_gpu_vae_state_slots(vae, "vae")
+
+        self.assertNotIn("runtime_cache", state)
+        self.assertNotIn("runtime_cache", slots)
+
+    def test_loader_streams_native_vae_without_the_legacy_cpu_state_dict(self):
+        loader = vae_loader.VAELoader()
+        server_args = _FakeServerArgs(QwenImagePipelineConfig())
+        server_args.component_weights_paths = {}
+        server_args.component_direct_gpu_weight_loading = {"vae": True}
+        expected_weight = torch.arange(4, dtype=torch.bfloat16).reshape(2, 2)
+        expected_scale = torch.tensor([3.0], dtype=torch.bfloat16)
+
+        with (
+            TemporaryDirectory() as root,
+            patch.object(
+                vae_loader,
+                "get_diffusers_component_config",
+                return_value={"_class_name": "TestVAE"},
+            ),
+            patch.object(
+                vae_loader.ModelRegistry,
+                "resolve_model_cls",
+                return_value=(self._StandardVAE, None),
+            ),
+            patch.object(
+                vae_loader,
+                "_list_safetensors_files",
+                return_value=[str(pathlib.Path(root) / "model.safetensors")],
+            ),
+            patch.object(loader, "target_device", return_value=torch.device("cpu")),
+            patch.object(
+                vae_loader.current_platform,
+                "optimize_vae",
+                side_effect=lambda vae: vae,
+            ),
+            patch.object(vae_loader, "safetensors_load_file") as legacy_load,
+        ):
+            safetensors_save_file(
+                {"proj.weight": expected_weight, "scale": expected_scale},
+                pathlib.Path(root) / "model.safetensors",
+            )
+            loaded = loader.load_customized(root, server_args, "vae")
+
+        legacy_load.assert_not_called()
+        self.assertTrue(torch.equal(loaded.proj.weight, expected_weight))
+        self.assertTrue(torch.equal(loaded.scale, expected_scale))
+
+    def test_quantized_checkpoint_does_not_fall_back_from_direct_loading(self):
+        loader = vae_loader.VAELoader()
+        server_args = _FakeServerArgs(QwenImagePipelineConfig())
+        server_args.component_direct_gpu_weight_loading = {"vae": True}
+
+        with (
+            patch.object(
+                vae_loader,
+                "get_diffusers_component_config",
+                return_value={
+                    "_class_name": "AutoencoderKL",
+                    "quantization_config": {"quant_method": "bitsandbytes"},
+                },
+            ),
+            patch("diffusers.AutoModel.from_pretrained") as native_load,
+            patch.object(
+                vae_loader.current_platform,
+                "get_available_gpu_memory",
+                return_value=10.0,
+            ),
+            self.assertRaisesRegex(
+                ComponentCheckpointUnsupportedError, "Direct GPU loading"
+            ),
+        ):
+            loader.load("/quantized/vae", server_args, "vae", "diffusers")
+
+        native_load.assert_not_called()
 
 
 class TestVAELoader(unittest.TestCase):
@@ -279,6 +414,12 @@ class TestVAELoader(unittest.TestCase):
                 loader.load("/quantized/vae", server_args, "vae", "diffusers")
 
         native_load.assert_not_called()
+
+    def test_pipeline_config_declares_an_empty_native_only_default(self):
+        loader = vae_loader.VAELoader()
+        server_args = _FakeServerArgs(QwenImagePipelineConfig())
+
+        self.assertFalse(loader.should_raise_customized_load_error(server_args, "vae"))
 
     def test_backfill_ltx2_audio_vae_latent_stats_maps_official_keys(self):
         loaded = {
