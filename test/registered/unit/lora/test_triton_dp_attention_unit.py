@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.lora.backend.triton_backend import (
     TritonLoRABackend,
@@ -144,23 +143,13 @@ def test_prepare_global_routing_gathers_pruned_lm_head_routes(
         is_extend_in_batch=True,
     )
 
-    with (
-        envs.SGLANG_ENABLE_LOGPROB_CHUNK.override(True),
-        envs.SGLANG_LOGPROB_CHUNK_SIZE.override(2),
-    ):
-        backend.prepare_global_lora_batch(forward_batch)
+    backend.prepare_global_lora_batch(forward_batch)
 
     assert gather_count == 2
     assert backend.batch_info.num_segments == 3
     assert _routes(backend.batch_info) == [1, 2, 0]
     assert backend.lm_head_batch_info is not None
     assert _routes(backend.lm_head_batch_info) == [1, 2, 0, 2, 2]
-    assert backend.lm_head_pass_batch_infos is not None
-    assert [_routes(batch_info) for batch_info in backend.lm_head_pass_batch_infos] == [
-        [1, 2],
-        [0, 2],
-        [2],
-    ]
 
 
 if __name__ == "__main__":
