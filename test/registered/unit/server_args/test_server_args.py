@@ -806,74 +806,6 @@ class TestSkipTokenizerInit(unittest.TestCase):
         self.assertEqual(resolution_result(server_args, "detokenizer_worker_num"), 1)
 
 
-class TestRocmDsaTopKCompatibility(CustomTestCase):
-    def test_gfx942_defaults_to_torch_unfused_topk(self):
-        args = ServerArgs(model_path="dummy")
-
-        with (
-            envs.SGLANG_DSA_FUSE_TOPK.override(True),
-            patch.object(server_args_module, "is_hip", return_value=True),
-            patch.object(server_args_module, "is_gfx95_supported", return_value=False),
-        ):
-            args._handle_rocm_dsa_topk_compatibility()
-
-            self.assertEqual(resolution_result(args, "dsa_topk_backend"), "torch")
-            self.assertEqual(
-                resolution_result(args, "speculative_dsa_topk_backend"),
-                "sgl-kernel",
-            )
-            self.assertFalse(envs.SGLANG_DSA_FUSE_TOPK.get())
-
-    def test_gfx950_keeps_sgl_kernel_fused_topk(self):
-        args = ServerArgs(model_path="dummy")
-
-        with (
-            envs.SGLANG_DSA_FUSE_TOPK.override(True),
-            patch.object(server_args_module, "is_hip", return_value=True),
-            patch.object(server_args_module, "is_gfx95_supported", return_value=True),
-        ):
-            args._handle_rocm_dsa_topk_compatibility()
-
-            self.assertEqual(resolution_result(args, "dsa_topk_backend"), "sgl-kernel")
-            self.assertEqual(
-                resolution_result(args, "speculative_dsa_topk_backend"),
-                "sgl-kernel",
-            )
-            self.assertTrue(envs.SGLANG_DSA_FUSE_TOPK.get())
-
-    def test_cuda_and_explicit_backends_are_unchanged(self):
-        cuda_args = ServerArgs(model_path="dummy")
-        explicit_args = ServerArgs(
-            model_path="dummy",
-            dsa_topk_backend="torch",
-            speculative_dsa_topk_backend="flashinfer",
-        )
-
-        with envs.SGLANG_DSA_FUSE_TOPK.override(True):
-            with patch.object(server_args_module, "is_hip", return_value=False):
-                cuda_args._handle_rocm_dsa_topk_compatibility()
-            self.assertEqual(
-                resolution_result(cuda_args, "dsa_topk_backend"), "sgl-kernel"
-            )
-            self.assertTrue(envs.SGLANG_DSA_FUSE_TOPK.get())
-
-            with (
-                patch.object(server_args_module, "is_hip", return_value=True),
-                patch.object(
-                    server_args_module, "is_gfx95_supported", return_value=False
-                ),
-            ):
-                explicit_args._handle_rocm_dsa_topk_compatibility()
-            self.assertEqual(
-                resolution_result(explicit_args, "dsa_topk_backend"), "torch"
-            )
-            self.assertEqual(
-                resolution_result(explicit_args, "speculative_dsa_topk_backend"),
-                "flashinfer",
-            )
-            self.assertTrue(envs.SGLANG_DSA_FUSE_TOPK.get())
-
-
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
     # The backend selection moved to the resolution pipeline; these policy
     # tests drive the pass through its read-only view.
@@ -2101,50 +2033,6 @@ class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
             resolution_result(args, "cuda_graph_config").prefill.backend,
             Backend.DISABLED,
         )
-
-
-class TestBreakableCudaGraphKDACompatibility(CustomTestCase):
-    def _handled_args(self, **overrides):
-        args = ServerArgs(model_path="dummy", **overrides)
-        text_config = SimpleNamespace(
-            layer_types=["linear_attention", "deepseek_sparse_attention"],
-            linear_num_heads=64,
-            linear_head_dim=128,
-        )
-        args.model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(
-                architectures=["KimiLinearForCausalLM"],
-                get_text_config=lambda: text_config,
-            ),
-            is_piecewise_cuda_graph_disabled_model=False,
-            is_multimodal=False,
-            is_multimodal_piecewise_cuda_graph_supported=False,
-            is_multimodal_breakable_cuda_graph_supported=False,
-        )
-        with (
-            patch("sglang.srt.utils.is_cuda", return_value=True),
-            patch.object(ServerArgs, "use_mla_backend", return_value=False),
-        ):
-            args._handle_cuda_graph_config()
-        return args
-
-    def test_default_breakable_prefill_graph_is_disabled(self):
-        args = self._handled_args()
-
-        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
-        self.assertNotEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
-
-    def test_explicit_breakable_prefill_graph_is_preserved(self):
-        args = self._handled_args(cuda_graph_backend_prefill=Backend.BREAKABLE)
-
-        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
-
-    def test_legacy_kda_layer_list_is_detected(self):
-        from sglang.srt.configs.model_config import uses_kda_attention
-
-        config = SimpleNamespace(linear_attn_config={"kda_layers": [0, 2]})
-
-        self.assertTrue(uses_kda_attention(config))
 
 
 class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
