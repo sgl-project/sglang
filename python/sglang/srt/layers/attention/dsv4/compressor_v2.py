@@ -207,6 +207,13 @@ class CompressorBackendMixin:
             bf16_store=bf16_store,
             kvcache_scale=kv_scale_cache,
             rope_cache=rope_cache,
+            # Derived once per forward by the backend; every C4 layer writes the
+            # same rows to the same slots.
+            fp4_k_write_metadata=(
+                getattr(self.forward_metadata, "fp4_k_write_metadata", None)
+                if _is_hip and use_fp4_indexer
+                else None
+            ),
         )
 
     def forward_unified(

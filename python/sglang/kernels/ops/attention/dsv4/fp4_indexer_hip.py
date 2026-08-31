@@ -48,6 +48,11 @@ class FP4PrefillWorkspace(NamedTuple):
     max_seq_len: int
 
 
+class FP4KWriteMetadata(NamedTuple):
+    positions: torch.Tensor
+    slots: torch.Tensor
+
+
 def aiter_q_indexer_fp4(
     q: torch.Tensor,
     cos: torch.Tensor,
@@ -301,6 +306,35 @@ def aiter_fp4_paged_mqa_logits(
     return logits
 
 
+def prepare_fp4_k_write_metadata(
+    plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+    out_loc: torch.Tensor,
+    rope_table_len: int,
+) -> FP4KWriteMetadata:
+    """
+    Build RoPE positions and cache slots from a compressor plan.
+    """
+    plan_words = plan[1].view(torch.int32)
+    seq_lens = plan_words[:, 0].to(torch.int64)
+    positions = seq_lens - plan.compress_ratio
+    valid = (positions >= 0) & (positions < rope_table_len)
+    positions = torch.where(valid, positions, torch.zeros_like(positions))
+    valid &= seq_lens % plan.compress_ratio == 0
+
+    out_loc = out_loc.to(dtype=torch.int64)
+    if plan.is_decode:
+        slots = out_loc
+    elif out_loc.shape[0] == 0:
+        slots = torch.full_like(seq_lens, -1)
+        valid.zero_()
+    else:
+        ragged_ids = plan_words[:, 1].bitwise_and(0xFFFF).to(torch.int64)
+        valid &= ragged_ids < out_loc.shape[0]
+        slots = out_loc[ragged_ids.clamp(max=out_loc.shape[0] - 1)]
+    slots = torch.where(valid, slots, torch.full_like(slots, -1))
+    return FP4KWriteMetadata(positions.contiguous(), slots.contiguous())
+
+
 def aiter_k_indexer_fp4_cache_write(
     *,
     k: torch.Tensor,
@@ -312,30 +346,18 @@ def aiter_k_indexer_fp4_cache_write(
     out_loc: torch.Tensor,
     k_payload: torch.Tensor,
     k_scale: torch.Tensor,
+    write_metadata: Optional[FP4KWriteMetadata] = None,
 ) -> None:
-    """Map compressed K rows to cache slots and run the fused AITER FP4 writer."""
+    """
+    Map compressed K rows to cache slots and run the fused AITER FP4 writer.
+    """
     num_rows = k.shape[0]
     if num_rows == 0:
         return
 
-    plan_words = plan[1].view(torch.int32)
-    seq_lens = plan_words[:, 0].to(torch.int64)
-    positions = seq_lens - plan.compress_ratio
-    valid = (positions >= 0) & (positions < cos.shape[0])
-    positions = torch.where(valid, positions, torch.zeros_like(positions))
-    valid &= seq_lens % plan.compress_ratio == 0
+    assert write_metadata is not None, "FP4 K-write metadata is missing."
 
-    out_loc = out_loc.to(device=k.device, dtype=torch.int64)
-    if plan.is_decode:
-        slots = out_loc
-    elif out_loc.shape[0] == 0:
-        slots = torch.full_like(seq_lens, -1)
-        valid.zero_()
-    else:
-        ragged_ids = plan_words[:, 1].bitwise_and(0xFFFF).to(torch.int64)
-        valid &= ragged_ids < out_loc.shape[0]
-        slots = out_loc[ragged_ids.clamp(max=out_loc.shape[0] - 1)]
-    slots = torch.where(valid, slots, torch.full_like(slots, -1)).contiguous()
+    positions, slots = write_metadata
 
     import aiter
 
@@ -346,7 +368,7 @@ def aiter_k_indexer_fp4_cache_write(
         norm_weight.to(device=k.device, dtype=torch.bfloat16).contiguous(),
         cos,
         sin,
-        positions.contiguous(),
+        positions,
         slots,
         norm_epsilon,
         rope_dim=_ROPE_DIM,

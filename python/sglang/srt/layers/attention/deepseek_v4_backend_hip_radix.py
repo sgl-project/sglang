@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
         FP4DecodeWorkspace,
+        FP4KWriteMetadata,
         FP4PrefillWorkspace,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -362,6 +363,10 @@ class DSV4Metadata:
     # workspace builders refresh their contents instead.
     fp4_decode_workspace: Optional[FP4DecodeWorkspace] = field(default=None, repr=False)
     fp4_prefill_workspace: Optional[FP4PrefillWorkspace] = field(
+        default=None, repr=False
+    )
+    # Derived by the first C4 layer of a forward and reused by the rest.
+    fp4_k_write_metadata: Optional[FP4KWriteMetadata] = field(
         default=None, repr=False
     )
 
@@ -874,6 +879,17 @@ class DeepseekV4HipRadixBackend(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
                     torch.int32
                 )
+            )
+
+        if self._fp4_workspaces_enabled(metadata):
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                prepare_fp4_k_write_metadata,
+            )
+
+            metadata.fp4_k_write_metadata = prepare_fp4_k_write_metadata(
+                metadata.c4_compress_metadata,
+                metadata.core_attn_metadata.c4_out_loc,
+                self.MAX_SEQ_LEN_FOR_CAPTURE,
             )
 
         # Decode's schedule builder is capture-safe because the workspace pins

@@ -433,6 +433,7 @@ def compress_norm_rope_store(
     # HIP FP4 uses split scale storage and precomputed BF16 RoPE tables.
     kvcache_scale: Optional[torch.Tensor] = None,
     rope_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    fp4_k_write_metadata=None,
 ) -> None:
     if use_fp4:
         assert kv.shape[-1] == 128
@@ -452,6 +453,7 @@ def compress_norm_rope_store(
             out_loc=out_loc,
             k_payload=kvcache,
             k_scale=cast(torch.Tensor, kvcache_scale),
+            write_metadata=fp4_k_write_metadata,
         )
         return
 
