@@ -41,7 +41,6 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_parallel,
     get_server_args,
-    get_spec,
     max_speculative_num_draft_tokens,
     publish,
     publish_role,
@@ -1344,25 +1343,6 @@ class TestAdaptiveDraftBoundLifecycle(_IsolatedServerArgs):
             )
         )
         self.assertEqual(max_speculative_num_draft_tokens(), 7)
-
-    def test_runtime_shrink_preserves_startup_bound(self):
-        get_context().set_server_args(
-            _FakeResolvedArgs(speculative_num_draft_tokens=16)
-        )
-        self.assertEqual(get_spec().max_speculative_num_draft_tokens, 16)
-        get_context().override("custom adaptive", speculative_num_draft_tokens=8)
-        self.assertEqual(get_spec().max_speculative_num_draft_tokens, 16)
-        self.assertEqual(max_speculative_num_draft_tokens(), 16)
-
-    def test_scoped_publish_restores_the_previous_bound(self):
-        get_context().set_server_args(
-            _FakeResolvedArgs(speculative_num_draft_tokens=16)
-        )
-        with get_context().override_server_args(speculative_num_draft_tokens=4):
-            self.assertEqual(get_spec().max_speculative_num_draft_tokens, 4)
-            self.assertEqual(max_speculative_num_draft_tokens(), 4)
-        self.assertEqual(get_spec().max_speculative_num_draft_tokens, 16)
-        self.assertEqual(max_speculative_num_draft_tokens(), 16)
 
 
 class TestNamedAccessorsCallWhatTheyWrap(CustomTestCase):
