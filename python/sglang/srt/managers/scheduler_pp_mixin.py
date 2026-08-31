@@ -17,6 +17,10 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
@@ -1039,6 +1043,22 @@ class SchedulerPPMixin:
                 **tensor_dict,
                 **logprob_dict,
             }
+
+        if (
+            not batch.spec_algorithm.is_none()
+            and result.next_draft_input is not None
+            and _is_npu
+        ):
+            draft_input = result.next_draft_input
+            if draft_input.topk_p is not None:
+                tensor_dict["draft_topk_p"] = draft_input.topk_p
+            if draft_input.topk_index is not None:
+                tensor_dict["draft_topk_index"] = draft_input.topk_index
+            if draft_input.hidden_states is not None:
+                tensor_dict["draft_hidden_states"] = draft_input.hidden_states
+            if draft_input.dsa_topk_indices is not None:
+                tensor_dict["draft_dsa_topk_indices"] = draft_input.dsa_topk_indices
+
         auxiliary_output = (
             result.logits_output.auxiliary_device_output
             if result.logits_output is not None
@@ -1158,6 +1178,7 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
 
         logits_output = None
         extend_input_len_per_req = None
@@ -1214,6 +1235,21 @@ class SchedulerPPMixin:
             ),
         )
         batch.input_ids = None
+
+        next_draft_input = None
+        if (
+            not batch.spec_algorithm.is_none()
+            and _is_npu
+            and pp_outputs.tensors.get("draft_topk_p") is not None
+        ):
+            next_draft_input = EagleDraftInput(
+                topk_p=pp_outputs.tensors.get("draft_topk_p"),
+                topk_index=pp_outputs.tensors.get("draft_topk_index"),
+                hidden_states=pp_outputs.tensors.get("draft_hidden_states"),
+                dsa_topk_indices=pp_outputs.tensors.get("draft_dsa_topk_indices"),
+            )
+            batch.spec_info = next_draft_input
+
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1222,6 +1258,7 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            next_draft_input=next_draft_input,
         )
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
