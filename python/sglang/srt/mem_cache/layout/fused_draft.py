@@ -154,15 +154,22 @@ class DraftKVProfile(msgspec.Struct, frozen=True, kw_only=True):
     num_depths: int = 1
 
 
+def draft_swa_layer_ids(draft_model_config) -> Tuple[int, ...]:
+    """The draft layer ids a hybrid-SWA pool routes to its swa side. This is
+    the pool-routing convention (`SWAKVPool.layers_mapping`), not a per-layer
+    kernel window: an attention-only draft window stays full-kind."""
+    mc = draft_model_config
+    if mc.is_hybrid_swa and not mc.is_deepseek_v4_arch:
+        return tuple(int(i) for i in mc.swa_attention_layer_ids)
+    return ()
+
+
 def draft_kv_profile(
     draft_model_config, *, num_layers: int, attn_tp_size: int
 ) -> DraftKVProfile:
     """The profile of a draft `ModelConfig`, heads divided by attn_tp the way
     the target divides its own (drafts never join the DCP group)."""
     mc = draft_model_config
-    swa_layer_ids: Tuple[int, ...] = ()
-    if mc.is_hybrid_swa and not mc.is_deepseek_v4_arch:
-        swa_layer_ids = tuple(int(i) for i in mc.swa_attention_layer_ids)
     num_depths = mc.num_nextn_predict_layers
     return DraftKVProfile(
         num_layers=int(num_layers),
@@ -171,7 +178,7 @@ def draft_kv_profile(
             head_dim=int(mc.head_dim),
             v_head_dim=int(mc.v_head_dim),
         ),
-        swa_layer_ids=swa_layer_ids,
+        swa_layer_ids=draft_swa_layer_ids(mc),
         num_depths=1 if num_depths is None else int(num_depths),
     )
 
