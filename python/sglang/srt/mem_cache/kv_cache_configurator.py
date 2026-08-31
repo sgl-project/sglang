@@ -746,8 +746,9 @@ class KVCacheConfigurator:
             # Draft workers keep the token-count byte sum (spec is asserted
             # off under unified; belt only).
             unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
-            # bs=1 feasibility floor inputs: one worst-case request running
-            # alone must fit, or under-sizing is a retract LIVELOCK at runtime.
+            # bs=1 feasibility floor inputs. `model_context_len` bounds the
+            # sliding window term only -- the full-attention side is not
+            # charged, see `_check_bs1_feasibility_floor`.
             model_context_len=self.model_config.context_len,
             sliding_window_size=self.model_config.sliding_window_size,
         )
