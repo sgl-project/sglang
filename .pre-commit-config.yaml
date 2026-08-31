@@ -126,6 +126,12 @@ repos:
         language: system
         files: ^test/registered/.*\.py$
         pass_filenames: false
+      - id: check-test-admission
+        name: enforce incremental registered-test admission policy
+        entry: python3 scripts/lint/check_test_admission.py
+        language: system
+        files: ^(test/registered/.*\.py|scripts/lint/(check_test_admission|test_check_test_admission)\.py)$
+        pass_filenames: false
       - id: check-no-registered-tests-in-package
         name: reject CI-registered tests inside the sglang package
         entry: python3 scripts/lint/check_no_registered_tests_in_package.py
