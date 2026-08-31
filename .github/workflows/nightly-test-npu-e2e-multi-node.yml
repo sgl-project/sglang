@@ -80,6 +80,7 @@ jobs:
         KUBECTL: /root/.cache/.cache/kubectl
         NAMESPACE: sgl-project
         KUBE_JOB_NAME: ascend-sglang-${{ inputs.test_type }}-${{ github.run_id }}-${{ github.run_attempt }}-test
+        SGLANG_SOURCE_RELATIVE_PATH: tests/sglang-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.test_config_name }}
         SGLANG_IS_IN_CI: true
         ASCEND_E2E_TEST_CONFIG_PATH: python/sglang/test/ascend/e2e
         SGLANG_USE_MODELSCOPE: true
@@ -100,10 +101,9 @@ jobs:
 
       - name: Prepare code for testing
         run: |
-          # copy source code to shared-disk
-          # Append run_id to isolate concurrent runs sharing the same PVC.
+          # copy source code to shared-disk; unique per run+attempt+test config so parallel jobs don't overwrite each other
           current_path=$(pwd)
-          target_path=/root/.cache/tests/sglang-${{ github.run_id }}
+          target_path=/root/.cache/${SGLANG_SOURCE_RELATIVE_PATH}
           rm -rf ${target_path}
           mkdir -p ${target_path}
           cp -r ${current_path}/* ${target_path}/
@@ -145,9 +145,8 @@ jobs:
       - name: Run test
         timeout-minutes: 300
         run: |
-          # sglang_source_relative_path is shared-disk path
-          # Append run_id so concurrent runs do not overwrite each other on the shared PVC.
-          sglang_source_relative_path=tests/sglang-${{ github.run_id }}
+          # sglang_source_relative_path is shared-disk path; unique per run+attempt+test config
+          sglang_source_relative_path=${SGLANG_SOURCE_RELATIVE_PATH}
           sglang_source_path=/root/.cache/${sglang_source_relative_path}
           echo "Source code path: ${sglang_source_path}"
 
@@ -285,4 +284,4 @@ jobs:
           fi
 
           # Cleanup the run-scoped source code directory on the shared PVC.
-          rm -rf /root/.cache/tests/sglang-${{ github.run_id }} || true
+          rm -rf /root/.cache/${SGLANG_SOURCE_RELATIVE_PATH} || true
