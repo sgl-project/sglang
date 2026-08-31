@@ -57,10 +57,7 @@ from sglang.kernels.ops.attention.flash_attention import (
 
 
 def _should_disable_scheduler_metadata_precompute() -> bool:
-    return bool(
-        get_parallel().config.enable_prefill_cp
-        or get_parallel().config.enable_dp_attention
-    )
+    return bool(get_parallel().enable_prefill_cp or get_parallel().enable_dp_attention)
 
 
 @dataclass
@@ -196,7 +193,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.needs_cpu_seq_lens = False
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         # Unified pool: req_to_token holds VIRTUAL ids but the MLA per-layer views
-        # are DENSE, so every page_table needs remapping. MLA-only -- the MHA/SWA
+        # are kernel-facing, so every page_table needs remapping. MLA-only -- the MHA/SWA
         # sub-pools keep the strided envelope layout FA3 cannot read at all.
         self._unified_hooks = unified_mla_hooks(model_runner.token_to_kv_pool_allocator)
         self._unified_dense = self._unified_hooks.enabled and self.use_mla
@@ -1104,16 +1101,16 @@ class FlashAttentionBackend(AttentionBackend):
         # the remap into normal_decode_set_metadata, which must write in place.
         #
         # Placed BEFORE the `// page_size` reduction, in token space: since
-        # dense(t) = phys_page * (ps * L) + t % ps, dense(page_start) // ps is
+        # kernel_id(t) = phys_page * (ps * L) + t % ps, dense(page_start) // ps is
         # phys_page * L, the dense page id the kernel wants. One site then serves
-        # both page sizes, and it inherits translate_kv_loc_dense's tombstone
+        # both page sizes, and it inherits translate_kv_loc_for_kernel's tombstone
         # clamp so an unwritten req_to_token slot lands in the page-0 sink.
         if self._unified_dense and metadata.page_table is not None:
             # Flattened: the page_size == 1 translate path uses index_select,
             # which rejects a 2-D index.
             pt = metadata.page_table
             metadata.page_table = (
-                self._unified_hooks.translate_kv_loc_dense(pt.reshape(-1))
+                self._unified_hooks.translate_kv_loc_for_kernel(pt.reshape(-1))
                 .to(torch.int32)
                 .view(pt.shape)
             )

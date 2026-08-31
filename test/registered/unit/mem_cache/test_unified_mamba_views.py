@@ -313,10 +313,10 @@ def _k3_kda_mamba_geometry(heads_per_rank: int) -> dict:
 class TestKDAFlashInferEnvelopeStateContract(unittest.TestCase):
     """Derived property: the envelope-strided KDA temporal view (unified memory
     / page-major layout) must satisfy the state contract of FlashInfer
-    ``recurrent_kda`` (pinned ``flashinfer_python==0.6.17``), because the KDA
-    flashinfer decode wrapper (``linear/kernels/kda_flashinfer.py``) passes the
-    committed per-layer pool view straight into the kernel (in-place state
-    update on the cu_seqlens path — no gather/scatter copy around the call).
+    ``recurrent_kda``, because the KDA flashinfer decode wrapper
+    (``linear/kernels/kda_flashinfer.py``) passes the committed per-layer pool
+    view straight into the kernel (in-place state update on the cu_seqlens path
+    — no gather/scatter copy around the call).
 
     The kernel compiles its state argument as a CuTe fake tensor of shape
     ``[N, HV, V, K]`` with stride ``(sym_int64(divisibility=16), V*K, K, 1)``

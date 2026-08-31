@@ -14,6 +14,7 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
@@ -22,6 +23,9 @@ from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
+)
+from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
+    validate_replay_state_indices_cpu,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -40,6 +44,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
 
 logger = logging.getLogger(__name__)
+_validate_mamba_replay_state_indices = (
+    envs.SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES.get()
+)
 
 
 class MambaAttnBackendBase(AttentionBackend):
@@ -598,6 +605,17 @@ class MambaAttnBackendBase(AttentionBackend):
             mamba_indices = self._translate_mamba_indices(mamba_indices)
             mamba_indices[bs - num_padding :] = -1
             self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        if _validate_mamba_replay_state_indices and not in_capture:
+            # This pre-replay diagnostic intentionally syncs to reject malformed
+            # live or padded indices before a captured state update uses them.
+            valid_bs = bs - int(num_padding)
+            validate_replay_state_indices_cpu(
+                mamba_indices.detach().cpu(),
+                valid_bs=valid_bs,
+                total_bs=bs,
+                num_state_slots=self.req_to_token_pool.mamba_pool.size + 1,
+                pad_slot_id=self.pad_slot_id,
+            )
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
         # Hand out only the refreshed [:bs] prefix — Mamba2's track-save slices
