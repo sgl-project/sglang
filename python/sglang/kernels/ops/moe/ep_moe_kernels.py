@@ -1267,6 +1267,7 @@ def ep_scatter_from_psum(
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
+    expert_start: int = 0,
 ):
     BLOCK_E = 128
     BLOCK_D = 128
@@ -1315,6 +1316,8 @@ def ep_scatter_from_psum(
         output_index,
         output_index.stride(0),
         output_index.stride(1),
+        expert_start,
+        num_experts,
         topk_num=recv_topk.shape[1],
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,
