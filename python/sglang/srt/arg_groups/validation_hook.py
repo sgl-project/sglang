@@ -61,11 +61,18 @@ def check_server_args(server_args: Any):
     assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
     assert cfg.gpu_id_step >= 1, "gpu_id_step must be positive"
 
+    attn_dp_size = cfg.dp_size if cfg.enable_dp_attention else 1
+    effective_attn_tp_size = cfg.tp_size // attn_dp_size // cfg.attn_cp_size
     assert cfg.moe_dense_tp_size in (
         None,
         1,
         cfg.tp_size,
-    ), "moe_dense_tp_size only supports None, 1, or tp_size currently"
+        effective_attn_tp_size,
+    ), (
+        "moe_dense_tp_size only supports None, 1, tp_size, or attn_tp_size "
+        f"(got {cfg.moe_dense_tp_size}; tp_size={cfg.tp_size}, "
+        f"attn_tp_size={effective_attn_tp_size})"
+    )
 
     # Check served model name to not have colon as it is reserved for LoRA adapter syntax
     if not is_runai_obj_uri(cfg.served_model_name):

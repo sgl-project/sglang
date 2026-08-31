@@ -1130,11 +1130,6 @@ class ServerArgs:
         "Shard shared expert weights across the attention TP group when using an expert-parallel all-to-all backend.",
         NS("parallel"),
     ] = False
-    enable_dense_mlp_attn_tp: A[
-        bool,
-        "Shard dense MLP weights across the attention TP group under DP attention.",
-        NS("parallel"),
-    ] = False
     disable_attn_tp_gather: A[
         bool,
         "Disable scheduler-side attn_tp_gather (the upstream SP path "
@@ -2486,7 +2481,7 @@ class ServerArgs:
     moe_dense_tp_size: A[
         Optional[int],
         Arg(
-            help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
+            help="TP size for MoE dense MLP layers. Accepts None (shard over the full TP group, default), 1 (replicate), tp_size (explicit full-TP sharding), or the attention-TP size (shard the dense MLP over the attention-TP group under DP attention).",
             resolvable=True,
         ),
         NS("parallel"),

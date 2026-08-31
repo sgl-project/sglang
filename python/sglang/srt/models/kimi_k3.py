@@ -305,8 +305,15 @@ class KimiK3MLP(nn.Module):
         parallel = get_parallel()
         self._dp_attention = is_dp_attention_enabled()
         use_default_tp = tp_rank is None and tp_size is None
+        # --moe-dense-tp-size selects how this dense MLP is sharded:
+        #   None          -> full-TP sharding (default)
+        #   1             -> replicate (tp_size=1)
+        #   tp_size       -> full-TP sharding (explicit)
+        #   attn_tp_size  -> shard over the attention-TP group under DP attention
         self.use_dp_attention_reduce = (
-            parallel.enable_dense_mlp_attn_tp and self._dp_attention and use_default_tp
+            parallel.moe_dense_tp_size == parallel.attn_tp_size
+            and self._dp_attention
+            and use_default_tp
         )
         if self.use_dp_attention_reduce:
             tp_rank, tp_size = parallel.attn_tp_rank, parallel.attn_tp_size
