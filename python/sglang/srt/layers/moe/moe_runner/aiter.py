@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 
-from sglang.kernels.ops.moe.moe_sorting_small import apply_aiter_small_moe_sort_patch
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -245,6 +244,10 @@ def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
 class AiterRunnerCore(MoeRunnerCore):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        from sglang.kernels.ops.moe.moe_sorting_small import (
+            apply_aiter_small_moe_sort_patch,
+        )
+
         apply_aiter_small_moe_sort_patch()
 
     def run(

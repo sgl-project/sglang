@@ -33,6 +33,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_gfx95_supported
+
 logger = logging.getLogger(__name__)
 
 
@@ -309,9 +311,7 @@ def _moe_sorting_small_kernel_distributed(
         offs_q = tl.arange(0, QCHUNK)
         offs_g = tl.arange(0, QCHUNK // 32)
         base_sw = (
-            (dest_p // 32) * (SCALEN_PAD * 32)
-            + (dest_p % 16) * 4
-            + (dest_p % 32) // 16
+            (dest_p // 32) * (SCALEN_PAD * 32) + (dest_p % 16) * 4 + (dest_p % 32) // 16
         )
         for cc in tl.static_range(N_COLS // QCHUNK):
             c0 = cc * QCHUNK
@@ -462,14 +462,22 @@ def apply_aiter_small_moe_sort_patch() -> None:
     global _patched
     if _patched:
         return
+    if not is_gfx95_supported():
+        _patched = True
+        return
 
-    import aiter.fused_moe as fm
-    from aiter import dtypes
-    from aiter.jit.utils.chip_info import get_gfx  # noqa: F401  (import check)
+    try:
+        import aiter.fused_moe as fm
+        from aiter import dtypes
+        from aiter.jit.utils.chip_info import get_gfx  # noqa: F401  (import check)
 
-    orig_fused_moe = fm.fused_moe
-    orig_sorting_impl = fm._moe_sorting_impl
-    orig_mx_quant = fm.fused_dynamic_mxfp8_quant_moe_sort
+        orig_fused_moe = fm.fused_moe
+        orig_sorting_impl = fm._moe_sorting_impl
+        orig_mx_quant = fm.fused_dynamic_mxfp8_quant_moe_sort
+    except (ImportError, AttributeError) as exc:
+        logger.info("aiter small-batch MoE sorting patch not applied: %s", exc)
+        _patched = True
+        return
 
     @functools.wraps(orig_fused_moe)
     def fused_moe_wrapper(
