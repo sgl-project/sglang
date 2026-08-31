@@ -110,7 +110,10 @@ def _reference(
 @pytest.mark.skipif(
     not is_sm90_supported(), reason="native Q8KV8 sparse GQA requires SM90 CUDA"
 )
-@pytest.mark.parametrize("num_q_heads,num_kv_heads", [(4, 1), (8, 2)])
+@pytest.mark.parametrize(
+    "num_q_heads,num_kv_heads",
+    [(16, 16), (16, 8), (16, 4), (16, 2), (16, 1)],
+)
 @pytest.mark.parametrize(
     "q_scale,k_scale,v_scale", [(1.0, 1.0, 1.0), (0.75, 1.25, 0.625)]
 )
@@ -174,6 +177,18 @@ def test_native_q8kv8_accepts_strided_q_with_contiguous_last_dim():
     native_module = importlib.import_module(MODULE_NAME)
     args = list(_make_case(4, 1))
     q = args[0]
+    expected = native_module.sgl_native_q8kv8_sparse_prefill(
+        q=q,
+        k_cache=args[1],
+        v_cache=args[2],
+        req_to_token=args[3],
+        slot_ids=args[4],
+        topk_idx=args[5],
+        cu_seqlens=args[6],
+        seq_lens=args[7],
+        prefix_lens=args[8],
+        block_size_k=args[9],
+    )
     storage = torch.empty(
         q.shape[0], q.shape[1], q.shape[2] + 1, device=q.device, dtype=q.dtype
     )
@@ -183,7 +198,7 @@ def test_native_q8kv8_accepts_strided_q_with_contiguous_last_dim():
     assert q_strided.stride(-1) == 1
     args[0] = q_strided
 
-    output = native_module.sgl_native_q8kv8_sparse_prefill(
+    actual = native_module.sgl_native_q8kv8_sparse_prefill(
         q=args[0],
         k_cache=args[1],
         v_cache=args[2],
@@ -195,5 +210,5 @@ def test_native_q8kv8_accepts_strided_q_with_contiguous_last_dim():
         prefix_lens=args[8],
         block_size_k=args[9],
     )
-    assert output.shape == q.shape
-    assert torch.isfinite(output).all()
+    assert actual.shape == q.shape
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
