@@ -640,8 +640,8 @@ export const benchmarks = [
   {
     match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "dev-dsv4-flash-vision",
-    accuracy: { mmmu_pro_pct: 74.96 },
-    notes: "MMMU-Pro (standard, 10-option) measured with sgl-eval on 4×B200 (TP=4) at temperature 1.0, top-p 0.95, --reasoning-effort max.",
+    accuracy: { mmmu_pro_pct: 75.14 },
+    notes: "MMMU-Pro (standard, 10-option) measured with sgl-eval on 4×B200 (TP=4) at temperature 1.0, top-p 0.95, --reasoning-effort max, with the bundled DSpark head enabled (--speculative-algorithm DSPARK).",
   },
   { match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
   { match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" } },

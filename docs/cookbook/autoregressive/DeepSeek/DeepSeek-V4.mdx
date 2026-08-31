@@ -225,7 +225,7 @@ For the original Flash and Pro checkpoints:
 - **Verified matrix** — MMMU-Pro via sgl-eval at `temperature 1.0`, `top-p 0.95`, `--reasoning-effort max`.
 - **Engine auto-configuration** — the engine picks the `flashinfer_mxfp4` MoE runner and auto-disables shared-experts fusion for this checkpoint (its HashTopK routing rejects fused shared experts); don't pass `--enforce-shared-experts-fusion`.
 - **Chunked prefill & radix cache stay enabled** — the scheduler keeps image spans consistent automatically: chunked-prefill truncation points are span-aligned (an image span always prefills within a single extend, overshooting the chunk budget by at most one span), and a radix-cache prefix match ending deep inside an image span is re-issued from the span start.
-- **Speculative decoding** — the checkpoint bundles a DSpark head, but MTP/DSpark with image batches is not yet verified, so all Flash Vision recipes run target-only. As on the 0731/0813 checkpoints, do not pass the EAGLE flags.
+- **Speculative decoding** — the checkpoint bundles a DSpark head, and the low-latency recipes enable it with `--speculative-algorithm DSPARK` (verified with image batches on B200 via the MMMU-Pro round; the other hardware rows are pending verification). The balanced and high-throughput recipes run target-only: they use DP Attention, which DSpark is incompatible with on current releases. As on the 0731/0813 checkpoints, do not pass the EAGLE flags.
 
 **Shared experts fusion (Blackwell, flashinfer_mxfp4)**
 
@@ -625,7 +625,7 @@ For more details, see the [HiCache documentation](../../../docs/advanced_feature
 
 Flash Official (0731) and Pro Official (0813) bundle a DSpark draft head in `deepseek-ai/DeepSeek-V4-Flash-0731` and `deepseek-ai/DeepSeek-V4-Pro-0813`. The target and draft weights therefore come from the same checkpoint: enable DSpark with `--speculative-algorithm DSPARK` and do not set a separate `--speculative-draft-model-path`.
 
-The experimental [Flash Vision checkpoint](#vision-note) also bundles a DSpark head, but speculative decoding with image batches is not yet verified on it — the Flash Vision recipes run target-only for now, and the Playground greys the DSpark chip out on that variant.
+The experimental [Flash Vision checkpoint](#vision-note) also bundles a DSpark head, enabled the same way: the Flash Vision low-latency recipes ship with `--speculative-algorithm DSPARK` (verified with image batches on B200 via the MMMU-Pro round; other hardware rows pending). The balanced and high-throughput Flash Vision recipes stay target-only because they run DP Attention.
 
 Unlike the EAGLE recipes for the original Flash and Pro checkpoints, this recipe omits `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`. SGLang reads the DSpark shape from the checkpoint.
 

@@ -313,8 +313,6 @@ sgl-eval run mmmu_pro \\
           flags: ["--speculative-algorithm DSPARK"],
           hide: { variant: ["flash", "pro"] },
           disable: [
-            { when: { variant: ["flash-vision"] },
-              reason: "The Flash Vision checkpoint bundles a DSpark head, but speculative decoding is not yet verified with image inputs — the cookbook recipes run target-only for now." },
             { when: { dpAttnOn: [true] },
               reason: "DSpark is not compatible with DP Attention on the current release." },
             { when: { hw: ["mi300x", "mi355x"] },
@@ -2849,11 +2847,12 @@ sgl-eval run mmmu_pro \\
     //
     // DeepSeek-V4-Flash-Vision-Exp (sgl-project/sglang#37253): the 0731
     // Flash base plus a vision encoder + aligner. The checkpoint bundles a
-    // DSpark head, but speculative decoding is not yet verified with image
-    // batches, so every recipe runs target-only. Low-latency is the serving
-    // shape the MMMU-Pro round ran on (4×B200); balanced / high-throughput
-    // mirror the Flash Official recipes on the same 4-GPU topology — final
-    // verification in progress.
+    // DSpark head; low-latency recipes enable it (--speculative-algorithm
+    // DSPARK, no other spec flags — the draft ships in the main checkpoint),
+    // verified on B200 via the MMMU-Pro round (4×B200, image batches).
+    // Balanced / high-throughput stay target-only: those recipes run DP
+    // attention, which DSpark is incompatible with on the current release.
+    // Non-B200 hardware — final verification in progress.
     // ====================================================================
     {
       match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
@@ -2863,6 +2862,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
+        "--speculative-algorithm DSPARK",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -2918,6 +2918,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
+        "--speculative-algorithm DSPARK",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -2969,6 +2970,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
+        "--speculative-algorithm DSPARK",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -3020,6 +3022,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
+        "--speculative-algorithm DSPARK",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -3076,6 +3079,7 @@ sgl-eval run mmmu_pro \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--moe-runner-backend marlin",
+        "--speculative-algorithm DSPARK",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
