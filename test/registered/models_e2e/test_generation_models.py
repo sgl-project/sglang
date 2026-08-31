@@ -83,6 +83,14 @@ ALL_MODELS = [
     ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
     ModelCase("ibm-granite/granite-3.0-2b-instruct", skip_long_prompt=True),
     ModelCase(
+        "tiiuae/falcon7b",
+        attention_backend="triton",
+    ),
+    ModelCase(
+        "tiiuae/falcon1b",
+        attention_backend="triton",
+    ),
+    ModelCase(
         "microsoft/Phi-3.5-MoE-instruct",
         tp_size=2,
         trust_remote_code=True,
