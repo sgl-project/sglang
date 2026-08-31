@@ -409,13 +409,13 @@ class TestKVPressureSmallPool(ScriptedTestCase):
             if (
                 r_chunk.kv_pages == 0
                 and r_chunk.lock_refs == 0
-                and (r_chunk.req is None or r_chunk.req.req_pool_idx is None)
+                and (r_chunk.req is None or r_chunk.req.kv.req_pool_idx is None)
             ):
                 break
             yield
         assert r_chunk.kv_pages == 0, f"kv_pages={r_chunk.kv_pages}"
         assert r_chunk.lock_refs == 0, f"lock_refs={r_chunk.lock_refs}"
-        assert r_chunk.req is None or r_chunk.req.req_pool_idx is None
+        assert r_chunk.req is None or r_chunk.req.kv.req_pool_idx is None
 
         t.abort(ballast)
         for _ in range(200):
