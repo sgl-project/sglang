@@ -105,6 +105,29 @@ class TestMlxRunnerPoolContract(unittest.TestCase):
         MlxModelRunnerStub.init_attention_backends(runner)
         self.assertIsNone(runner.attn_backend)
 
+    def test_stub_overrides_preloaded_weights_bytes(self):
+        """``preloaded_weights_bytes`` must not touch the base ``loader``."""
+        self.assertIn(
+            "preloaded_weights_bytes",
+            vars(MlxModelRunnerStub),
+            msg=(
+                "MlxModelRunnerStub lost its preloaded_weights_bytes override. "
+                "The base implementation reads self.loader, which the MLX stub "
+                "never creates (PyTorch weights are not loaded). Without it "
+                "every MLX startup crashes in Scheduler.init_target_memory_pool."
+            ),
+        )
+        self.assertIsNot(
+            MlxModelRunnerStub.preloaded_weights_bytes,
+            ModelRunner.preloaded_weights_bytes,
+            msg="preloaded_weights_bytes must be overridden on the MLX stub, "
+            "not inherited from ModelRunner.",
+        )
+
+    def test_stub_preloaded_weights_bytes_is_zero(self):
+        runner = object.__new__(MlxModelRunnerStub)
+        self.assertEqual(runner.preloaded_weights_bytes, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

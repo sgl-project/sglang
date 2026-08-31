@@ -107,6 +107,11 @@ class MlxModelRunnerStub(ModelRunner):
     # that path working instead of raising AttributeError.
     prefill_aware_swa = False
 
+    @property
+    def preloaded_weights_bytes(self) -> int:
+        """No PyTorch weights are loaded; MLX manages weights separately."""
+        return 0
+
     @staticmethod
     def validate_startup_weight_load_mode(server_args) -> None:
         if server_args.is_startup_weight_load_overlap:
