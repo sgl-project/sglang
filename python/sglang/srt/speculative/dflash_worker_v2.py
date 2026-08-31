@@ -1769,7 +1769,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch_output.next_token_ids,
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, next_token_ids)
-            # Mixed decode tails already carry the +1 from mix_with_running.
             new_seq_lens = batch.seq_lens
             batch_output.new_seq_lens = new_seq_lens
             if on_publish is not None:

@@ -1182,7 +1182,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
-            # Mixed decode tails already carry the +1 from mix_with_running.
             batch_output.new_seq_lens = batch.seq_lens
             # Publish before draft_extend so the fence is at target-end.
             if on_publish is not None:

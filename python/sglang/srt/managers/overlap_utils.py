@@ -469,13 +469,9 @@ class FutureMap:
         self.output_tokens_buf[indices] = bonus_tokens.to(self.output_tokens_buf.dtype)
 
     def resolve_mixed_spec_tails(self, batch: ScheduleBatch) -> None:
-        """Late-bind a spec mixed batch's decode tails (overlap): schedule
-        time pinned them at a base that lags the in-flight step by its accept
-        count. Gather the settled committed lengths behind the publish fence
-        and rebuild the tail rows: seq_lens (base + 1 for the bonus token),
-        out_cache_loc (the reserved slot at base), and the CPU mirrors the
-        extend metadata reads (prefix_lens, seq_lens_cpu, seq_lens_sum).
-        The bonus-token input ids gather stays with the caller."""
+        """Late-bind a spec mixed batch's decode tails (overlap): schedule-time
+        lengths lag the in-flight step's accept count, so rebuild the tail rows
+        from the published committed lengths behind the publish fence."""
         idx = batch.mix_running_indices
         n = int(idx.shape[0])
         if n == 0:

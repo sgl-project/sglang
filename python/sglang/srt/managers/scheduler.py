@@ -3691,8 +3691,6 @@ class Scheduler(
                     self.future_map.stash_bonus_tokens(
                         running_batch.req_pool_indices, last_tokens
                     )
-                # The mixed batch now owns the tails; they re-enter via the
-                # last_batch extend-merge next iteration.
                 running_batch = ScheduleBatch(
                     reqs=[], batch_is_full=running_batch.batch_is_full
                 )
