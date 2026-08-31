@@ -72,6 +72,7 @@ pub struct Limits {
     pub allow_auto_truncate: bool,
     /// Whether the server can produce hidden states at all.
     pub enable_return_hidden_states: bool,
+    pub enable_custom_logit_processor: bool,
 }
 
 impl From<&ServerArgs> for Limits {
@@ -83,6 +84,7 @@ impl From<&ServerArgs> for Limits {
             num_reserved_tokens: sa.num_reserved_tokens,
             allow_auto_truncate: sa.allow_auto_truncate,
             enable_return_hidden_states: sa.enable_return_hidden_states,
+            enable_custom_logit_processor: sa.enable_custom_logit_processor,
         }
     }
 }
@@ -622,6 +624,23 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
         ));
     }
 
+    // Match Python's feature gate; Rust does not deserialize the processor.
+    if !limits.enable_custom_logit_processor
+        && matches!(
+            &req.kind,
+            RequestKind::Generate(g)
+                if g.custom_logit_processor
+                    .as_deref()
+                    .is_some_and(|s| !s.is_empty())
+        )
+    {
+        return Err(Error::Validation(
+            "The server is not configured to enable custom logit processor. \
+             Please set `--enable-custom-logit-processor` to enable this feature."
+                .into(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -692,6 +711,7 @@ fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::config::ServerArgs;
     use crate::message::request::GenerateRequest;
     use crate::message::response::ResponseSink;
     use crate::message::sampling::SamplingParams;
@@ -851,7 +871,18 @@ mod tests {
             num_reserved_tokens: 0,
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
+            enable_custom_logit_processor: false,
         }
+    }
+
+    #[test]
+    fn custom_logit_processor_server_arg_reaches_limits() {
+        let server_args = ServerArgs {
+            enable_custom_logit_processor: true,
+            ..Default::default()
+        };
+        let limits = Limits::from(&server_args);
+        assert!(limits.enable_custom_logit_processor);
     }
 
     fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
@@ -1062,6 +1093,33 @@ mod tests {
             ..test_limits()
         };
         assert!(validate(&mut req(true), &enabled).is_ok());
+    }
+
+    #[test]
+    fn custom_logit_processor_gated_on_server_support() {
+        let req = |processor: Option<&str>| {
+            let mut r = generate_req(32, SamplingParams::default());
+            if let RequestKind::Generate(g) = &mut r.kind {
+                g.custom_logit_processor = processor.map(str::to_owned);
+            }
+            r
+        };
+        let disabled = test_limits();
+        assert!(validate(&mut req(None), &disabled).is_ok());
+        assert!(validate(&mut req(Some("")), &disabled).is_ok());
+        for processor in ["opaque", " "] {
+            let err = validate(&mut req(Some(processor)), &disabled).unwrap_err();
+            assert_eq!(err.http_status(), 400);
+            assert!(
+                err.to_string().contains("--enable-custom-logit-processor"),
+                "{err}"
+            );
+        }
+        let enabled = Limits {
+            enable_custom_logit_processor: true,
+            ..test_limits()
+        };
+        assert!(validate(&mut req(Some("not valid serialized")), &enabled).is_ok());
     }
 
     /// End-to-end through `drive`: an over-context request is rejected on the way

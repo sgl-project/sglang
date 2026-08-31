@@ -47,7 +47,7 @@ const JSON_TO_HEAP_FACTOR: usize = 8;
 /// as a pydantic dataclass, which drops extras. `deny_unknown_fields` here turned
 /// every `GenerateReqInput` field this server has not ported — `priority`,
 /// `extra_key`, `session_id`, `session_params`, `return_sampling_mask`,
-/// `custom_logit_processor`, and ~40 more — into a 400, so a client that worked
+/// and ~40 more — into a 400, so a client that worked
 /// against the Python server broke against this one. The cost of dropping it is
 /// that a typo (`temperature`) is silently ignored rather than reported; that is
 /// the same trade Python already makes.
@@ -85,6 +85,9 @@ pub struct GenerateBody {
     /// Scalar-only in Python too (`return_text_in_logprobs: bool`).
     #[serde(default)]
     pub return_text_in_logprobs: Option<bool>,
+    /// Scalars broadcast; nullable lists map per batch item.
+    #[serde(default)]
+    pub custom_logit_processor: Option<OneOrMany<Option<String>>>,
     // PD-disaggregation routing, injected per request by the PD router
     // (mini_lb / sgl-model-gateway): a scalar for a single prompt, one-per-item
     // lists for a batch. Elements are nullable (`List[Optional[...]]` in
@@ -145,6 +148,7 @@ impl GenerateBody {
             token_ids_logprob,
             return_hidden_states,
             return_text_in_logprobs,
+            custom_logit_processor,
             bootstrap_host,
             bootstrap_port,
             bootstrap_room,
@@ -319,6 +323,14 @@ impl GenerateBody {
         let logprob_start_lens = fan_out(logprob_start_len, n, "logprob_start_len")?;
         let top_logprobs_nums = fan_out(top_logprobs_num, n, "top_logprobs_num")?;
         let return_hidden = fan_out(return_hidden_states, n, "return_hidden_states")?;
+        let custom_logit_processors = match custom_logit_processor {
+            Some(OneOrMany::Many(_)) if !is_batch => {
+                return Err(Error::Validation(
+                    "custom_logit_processor list requires a batch request".into(),
+                ));
+            }
+            other => flatten_column(fan_out(other, n, "custom_logit_processor")?),
+        };
 
         // PD fields fan out like Python `_normalize_bootstrap_params`: scalars
         // broadcast — except a scalar `bootstrap_room`, which becomes `room + i`
@@ -370,6 +382,7 @@ impl GenerateBody {
             top_logprobs_nums,
             tid_logprobs,
             return_hidden,
+            custom_logit_processors,
             bootstrap_hosts,
             bootstrap_ports,
             bootstrap_rooms,
@@ -390,6 +403,7 @@ impl GenerateBody {
                 top_logprobs_num,
                 token_ids_logprob,
                 return_hidden_states,
+                custom_logit_processor,
                 bootstrap_host,
                 bootstrap_port,
                 bootstrap_room,
@@ -417,6 +431,7 @@ impl GenerateBody {
                 return_sampling_mask: false, // TODO: port Python's `return_sampling_mask`
                 return_hidden_states: return_hidden_states.unwrap_or(false),
                 return_text_in_logprobs,
+                custom_logit_processor,
                 bootstrap_host,
                 bootstrap_port,
                 bootstrap_room,
@@ -642,6 +657,8 @@ pub struct GenerateRequest {
     /// it is consumed on the way out, by `register_detok` → `DetokMsg::Register`
     /// → the shard's `decode_logprob_texts`.
     pub return_text_in_logprobs: Option<bool>,
+    /// Opaque serialized processor forwarded to the Python scheduler.
+    pub custom_logit_processor: Option<String>,
     /// PD-disaggregation routing, forwarded verbatim to the scheduler (which
     /// fills a `None` port from `--disaggregation-bootstrap-port` and 400-aborts
     /// a room-less request in PD mode).
@@ -889,6 +906,46 @@ mod tests {
         assert!(err.to_string().contains("length"), "{err}");
     }
 
+    #[test]
+    fn custom_logit_processor_normalizes_scalar_and_nullable_batch_values() {
+        let (ps, _) = requests(r#"{"text": "a"}"#).unwrap();
+        assert_eq!(ps[0].custom_logit_processor, None);
+
+        let (ps, _) = requests(r#"{"text": "a", "custom_logit_processor": null}"#).unwrap();
+        assert_eq!(ps[0].custom_logit_processor, None);
+
+        let (ps, _) =
+            requests(r#"{"text": "a", "custom_logit_processor": "not parsed by Rust"}"#).unwrap();
+        assert_eq!(
+            ps[0].custom_logit_processor.as_deref(),
+            Some("not parsed by Rust")
+        );
+
+        let (ps, _) =
+            requests(r#"{"text": ["a", "b"], "custom_logit_processor": "opaque"}"#).unwrap();
+        assert_eq!(
+            ps.iter()
+                .map(|p| p.custom_logit_processor.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("opaque"), Some("opaque")]
+        );
+
+        let (ps, _) =
+            requests(r#"{"text": ["a", "b"], "custom_logit_processor": ["A", null]}"#).unwrap();
+        assert_eq!(
+            ps.iter()
+                .map(|p| p.custom_logit_processor.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("A"), None]
+        );
+
+        let err = requests(r#"{"text": ["a", "b"], "custom_logit_processor": ["A"]}"#).unwrap_err();
+        assert!(err.to_string().contains("custom_logit_processor"), "{err}");
+
+        let err = requests(r#"{"text": "a", "custom_logit_processor": ["A"]}"#).unwrap_err();
+        assert!(err.to_string().contains("custom_logit_processor"), "{err}");
+    }
+
     /// `input_ids` batch (list of lists) fans out; scalar (list of ints) is single.
     #[test]
     fn input_ids_scalar_vs_batch() {
@@ -930,7 +987,6 @@ mod tests {
             r#""session_id": "s""#,
             r#""session_params": {"a": 1}"#,
             r#""return_sampling_mask": true"#,
-            r#""custom_logit_processor": "cls""#,
             r#""lora_path": "adapter""#,
             r#""image_data": "base64""#,
             r#""return_routed_experts": true"#,
