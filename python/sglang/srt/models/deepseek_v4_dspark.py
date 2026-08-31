@@ -50,15 +50,19 @@ from sglang.srt.models.dspark import (
     project_through_lm_head,
     run_markov_block,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils import add_prefix, is_blackwell_supported, is_npu
+from sglang.srt.utils import add_prefix, is_npu
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
@@ -131,7 +135,7 @@ class DSparkAttention(MqaAttentionBase):
 
         self._use_fast_kernel = envs.SGLANG_DSPARK_FAST_KERNEL.get()
         self.alt_streams = alt_streams
-        self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
+        self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
         if _is_npu:
             self.register_buffer(
                 "_q_post_norm_weight",
@@ -487,13 +491,15 @@ class DSparkV4MarkovHead(nn.Module):
         first_prev_tokens: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        collect_corrected: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         return run_markov_block(
             self,
             base_logits,
             first_prev_tokens=first_prev_tokens,
             hidden_states=hidden_states,
             sampler=sampler,
+            collect_corrected=collect_corrected,
         )
 
 
@@ -691,6 +697,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.gamma = int(
             dspark_config.resolve_gamma(default=int(config.num_hidden_layers))
         )
+        self.sample_from_anchor = get_dspark_sample_from_anchor(config)
         self.block_size = self.gamma
         if dspark_config.target_layer_ids is not None:
             self.num_stages = len(dspark_config.target_layer_ids)

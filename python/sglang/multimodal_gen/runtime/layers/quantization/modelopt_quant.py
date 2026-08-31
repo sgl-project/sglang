@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -254,11 +255,12 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         self.checkpoint_weight_scale_layout = checkpoint_weight_scale_layout
         self.checkpoint_uses_comfy_quantization = checkpoint_uses_comfy_quantization
         self._comfy_int8_config: KitchenInt8Config | None = None
+        self._comfy_fp8_config: ComfyFp8Config | None = None
 
     def set_comfy_layer_markers(self, layer_markers: dict[str, dict[str, Any]]) -> None:
         unsupported = {
             str(marker.get("format")) for marker in layer_markers.values()
-        } - {"nvfp4", "int8_tensorwise"}
+        } - {"nvfp4", "int8_tensorwise", "float8_e4m3fn"}
         if unsupported:
             raise ValueError(
                 "NVFP4 checkpoints cannot dispatch companion Comfy formats: "
@@ -272,6 +274,12 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         self._comfy_int8_config = (
             KitchenInt8Config(layer_markers=int8_markers) if int8_markers else None
         )
+        fp8_markers = {
+            prefix: marker
+            for prefix, marker in layer_markers.items()
+            if marker.get("format") == "float8_e4m3fn"
+        }
+        self._comfy_fp8_config = ComfyFp8Config(fp8_markers) if fp8_markers else None
 
     @classmethod
     def get_name(cls) -> str:
@@ -383,6 +391,11 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             and prefix in self._comfy_int8_config.layer_markers
         ):
             return self._comfy_int8_config.get_quant_method(layer, prefix)
+        if (
+            self._comfy_fp8_config is not None
+            and prefix in self._comfy_fp8_config.layer_markers
+        ):
+            return self._comfy_fp8_config.get_quant_method(layer, prefix)
         return self._get_quant_method(layer, prefix, Linear=ModelOptFp4LinearMethod)
 
 
@@ -665,18 +678,12 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
 
-        _, flashinfer_backend = _get_fp4_gemm_op()
-        uses_flux1_scale_layout = not getattr(
-            self.quant_config, "checkpoint_uses_packed_qkv", False
-        ) and getattr(layer, "prefix", "").startswith(
-            ("transformer_blocks.", "single_transformer_blocks.")
+        # Every FP4 GEMM reachable here reads block scales in the 128x4 TMA layout;
+        # trtllm, the one backend wanting its own shuffled layout, returned above.
+        padded_scales = padded_scales.reshape(
+            B, M_padded // 128, 4, 32, K_padded // 4, 4
         )
-        if flashinfer_backend is None or uses_flux1_scale_layout:
-            # CUTLASS and FLUX.1 CUDNN paths need the TMA scale layout.
-            padded_scales = padded_scales.reshape(
-                B, M_padded // 128, 4, 32, K_padded // 4, 4
-            )
-            padded_scales = padded_scales.permute(0, 1, 4, 3, 2, 5)
+        padded_scales = padded_scales.permute(0, 1, 4, 3, 2, 5)
 
         padded_scales = padded_scales.contiguous().cuda()
         padded_scales = (

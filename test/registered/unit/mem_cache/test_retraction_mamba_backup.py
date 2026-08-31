@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -39,10 +39,10 @@ class _Allocator:
 
 def _req_and_pool():
     req = object.__new__(Req)
-    req.req_pool_idx = 0
+    req.kv = ReqKvInfo(req_pool_idx=0)
     req.origin_input_ids = [1, 2]
     req.output_ids = [3]
-    req.mamba_pool_idx = torch.tensor(1)
+    req.kv.mamba_pool_idx = torch.tensor(1)
 
     pool = object.__new__(HybridReqToTokenPool)
     pool.req_to_token = torch.zeros(1, 8, dtype=torch.int64)
@@ -59,7 +59,7 @@ class TestRetractionMambaBackup(unittest.TestCase):
         allocator = _Allocator(carries_mamba=False)
 
         req.offload_kv_cache(pool, allocator)
-        self.assertIs(req.retraction_backup.mamba_cpu, MAMBA_STATE)
+        self.assertIs(req.kv.retraction_backup.mamba_cpu, MAMBA_STATE)
 
         req.load_kv_cache(pool, allocator)
         self.assertIs(pool.mamba_pool.loaded, MAMBA_STATE)
@@ -69,7 +69,7 @@ class TestRetractionMambaBackup(unittest.TestCase):
         allocator = _Allocator(carries_mamba=True)
 
         req.offload_kv_cache(pool, allocator)
-        self.assertIsNone(req.retraction_backup.mamba_cpu)
+        self.assertIsNone(req.kv.retraction_backup.mamba_cpu)
 
         req.load_kv_cache(pool, allocator)
         self.assertIsNone(pool.mamba_pool.loaded)
