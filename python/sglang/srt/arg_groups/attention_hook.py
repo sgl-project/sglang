@@ -221,7 +221,7 @@ def handle_linear_attn_backend(server_args: Any):
     # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
     if (
         cfg.linear_attn_decode_backend is None
-        and cfg.linear_attn_backend != "helion"
+        and cfg.linear_attn_backend not in {"cake", "helion"}
         and get_platform().is_sm100
         and cfg.mamba_ssm_dtype == "bfloat16"
         # Stage 4: flashinfer's recurrent_kda compiles the state slot stride
@@ -266,13 +266,13 @@ def handle_linear_attn_backend(server_args: Any):
         )
 
     if (
-        decode == "flashinfer"
+        decode in {"cake", "flashinfer"}
         and cfg.mamba_ssm_dtype != "bfloat16"
         and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
     ):
         raise ValueError(
-            "--linear-attn-decode-backend flashinfer on SM100+ requires "
+            f"--linear-attn-decode-backend {decode} on SM100+ requires "
             "--mamba-ssm-dtype bfloat16, "
             f"got {cfg.mamba_ssm_dtype!r}"
         )
@@ -295,6 +295,17 @@ def handle_linear_attn_backend(server_args: Any):
     # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
     # for correctness and best performance.
     prefill = cfg.linear_attn_prefill_backend or cfg.linear_attn_backend
+    if (
+        prefill == "cake"
+        and cfg.mamba_ssm_dtype != "bfloat16"
+        and get_platform().is_cuda
+        and torch.cuda.get_device_capability()[0] >= 10
+    ):
+        raise ValueError(
+            "--linear-attn-prefill-backend cake on SM100+ requires "
+            "--mamba-ssm-dtype bfloat16, "
+            f"got {cfg.mamba_ssm_dtype!r}"
+        )
     cuda_version = torch.version.cuda
     cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
     if (

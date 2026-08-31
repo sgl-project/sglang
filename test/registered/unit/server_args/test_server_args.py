@@ -13,6 +13,7 @@ from sglang.srt.arg_groups import parallel_hook, pd_disaggregation_hook, serving
 from sglang.srt.arg_groups.attention_hook import (
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
+    handle_linear_attn_backend,
 )
 from sglang.srt.arg_groups.cuda_graph_hook import (
     disable_tc_piecewise_cudagraph_if_incompatible,
@@ -25,6 +26,9 @@ from sglang.srt.arg_groups.hicache_hook import (
 from sglang.srt.arg_groups.hisparse_hook import (
     validate_hisparse_dsa_backend,
     validate_hisparse_kv_cache_dtype,
+)
+from sglang.srt.arg_groups.kimi_k3_hook import (
+    apply_kimi_k3_linear_attn_defaults,
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
@@ -652,6 +656,178 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires SM100"):
             handle_mamba_backend(server_args)
+
+
+class TestCakeLinearAttnBackend(unittest.TestCase):
+    @override_platform(is_cuda=False)
+    def test_shared_backend_selects_cake_for_prefill_and_decode(self):
+        server_args = ServerArgs(model_path="dummy", linear_attn_backend="cake")
+
+        handle_linear_attn_backend(server_args)
+
+        self.assertEqual(resolution_result(server_args, "linear_attn_backend"), "cake")
+        self.assertIsNone(resolution_result(server_args, "linear_attn_decode_backend"))
+        self.assertIsNone(resolution_result(server_args, "linear_attn_prefill_backend"))
+
+    @override_platform(is_cuda=False)
+    def test_per_phase_override_wins_over_shared_cake_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            linear_attn_backend="cake",
+            linear_attn_decode_backend="triton",
+        )
+
+        handle_linear_attn_backend(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "linear_attn_decode_backend"), "triton"
+        )
+        self.assertIsNone(resolution_result(server_args, "linear_attn_prefill_backend"))
+
+    @override_platform(is_sm100=True)
+    def test_kimi_k3_default_respects_shared_cake_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            linear_attn_backend="cake",
+            mamba_ssm_dtype="bfloat16",
+        )
+
+        apply_kimi_k3_linear_attn_defaults(server_args)
+
+        self.assertIsNone(resolution_result(server_args, "linear_attn_decode_backend"))
+
+    @override_platform(is_sm100=True)
+    def test_kimi_k3_default_keeps_default_triton_decode(self):
+        server_args = ServerArgs(model_path="dummy", mamba_ssm_dtype="bfloat16")
+
+        apply_kimi_k3_linear_attn_defaults(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "linear_attn_decode_backend"), "triton"
+        )
+
+    @override_platform(is_sm100=True)
+    def test_kimi_linear_equal_head_d128_defaults_prefill_and_decode_to_cake(
+        self,
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="bfloat16",
+            tp_size=1,
+        )
+        hf_config = SimpleNamespace(
+            linear_attn_config={"num_heads": 32, "head_dim": 128}
+        )
+
+        apply_kimi_k3_linear_attn_defaults(
+            server_args,
+            model_arch="KimiLinearForCausalLM",
+            hf_config=hf_config,
+        )
+
+        self.assertEqual(
+            resolution_result(server_args, "linear_attn_decode_backend"), "cake"
+        )
+        self.assertEqual(
+            resolution_result(server_args, "linear_attn_prefill_backend"), "cake"
+        )
+
+    @override_platform(is_sm100=True)
+    def test_kimi_linear_tp_shapes_default_ssm_state_to_bfloat16(self):
+        hf_config = SimpleNamespace(
+            linear_attn_config={"num_heads": 32, "head_dim": 128}
+        )
+        for tp_size, local_heads in ((1, 32), (2, 16), (4, 8), (8, 4)):
+            with self.subTest(tp_size=tp_size, local_heads=local_heads):
+                server_args = ServerArgs(model_path="dummy", tp_size=tp_size)
+                apply_kimi_k3_linear_attn_defaults(
+                    server_args,
+                    model_arch="KimiLinearForCausalLM",
+                    hf_config=hf_config,
+                )
+
+                self.assertEqual(
+                    resolution_result(server_args, "mamba_ssm_dtype"), "bfloat16"
+                )
+                self.assertEqual(
+                    resolution_result(server_args, "linear_attn_decode_backend"),
+                    "cake",
+                )
+                self.assertEqual(
+                    resolution_result(server_args, "linear_attn_prefill_backend"),
+                    "cake",
+                )
+
+    @override_platform(is_sm100=True)
+    def test_kimi_linear_equal_head_d128_respects_explicit_fp32_ssm_state(
+        self,
+    ):
+        server_args = ServerArgs(
+            model_path="dummy", mamba_ssm_dtype="float32", tp_size=2
+        )
+        hf_config = SimpleNamespace(
+            linear_attn_config={"num_heads": 32, "head_dim": 128}
+        )
+
+        apply_kimi_k3_linear_attn_defaults(
+            server_args,
+            model_arch="KimiLinearForCausalLM",
+            hf_config=hf_config,
+        )
+
+        self.assertEqual(resolution_result(server_args, "mamba_ssm_dtype"), "float32")
+        self.assertIsNone(resolution_result(server_args, "linear_attn_decode_backend"))
+        self.assertIsNone(resolution_result(server_args, "linear_attn_prefill_backend"))
+
+    @override_platform(is_sm100=True)
+    def test_kimi_linear_rejects_nondivisible_empty_or_non_d128_contract(
+        self,
+    ):
+        for tp_size, num_heads, head_dim in (
+            (3, 32, 128),
+            (1, 0, 128),
+            (1, 32, 64),
+        ):
+            with self.subTest(tp_size=tp_size, num_heads=num_heads, head_dim=head_dim):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    mamba_ssm_dtype="bfloat16",
+                    tp_size=tp_size,
+                )
+                apply_kimi_k3_linear_attn_defaults(
+                    server_args,
+                    model_arch="KimiLinearForCausalLM",
+                    hf_config=SimpleNamespace(
+                        linear_attn_config={
+                            "num_heads": num_heads,
+                            "head_dim": head_dim,
+                        }
+                    ),
+                )
+
+                self.assertEqual(
+                    resolution_result(server_args, "linear_attn_decode_backend"),
+                    "triton",
+                )
+                self.assertIsNone(
+                    resolution_result(server_args, "linear_attn_prefill_backend")
+                )
+
+    @override_platform(is_sm100=True)
+    def test_kimi_k3_default_keeps_triton_decode_for_other_shared_backend(
+        self,
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            linear_attn_backend="cutedsl",
+            mamba_ssm_dtype="bfloat16",
+        )
+
+        apply_kimi_k3_linear_attn_defaults(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "linear_attn_decode_backend"), "triton"
+        )
 
 
 class TestLoadBalanceMethod(unittest.TestCase):

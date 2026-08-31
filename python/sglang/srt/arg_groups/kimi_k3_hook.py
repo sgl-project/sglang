@@ -55,15 +55,77 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
         )
 
 
-def apply_kimi_k3_linear_attn_defaults(server_args: ServerArgs) -> None:
-    """KDA decode-fallback default for Kimi hybrid models (spec-independent)."""
+def _uses_native_kimi_linear_unbounded_kda(
+    server_args: ServerArgs, *, model_arch=None, hf_config=None
+) -> bool:
+    """Return whether every TP rank has the native equal-head/D128 contract."""
+    if model_arch != "KimiLinearForCausalLM" or hf_config is None:
+        return False
+    linear_attn_config = getattr(hf_config, "linear_attn_config", None)
+    if not isinstance(linear_attn_config, dict):
+        return False
+    num_heads = linear_attn_config.get("num_heads")
+    head_dim = linear_attn_config.get("head_dim")
+    tp_size = resolving_view(server_args).tp_size
+    return (
+        isinstance(num_heads, int)
+        and isinstance(head_dim, int)
+        and isinstance(tp_size, int)
+        and tp_size > 0
+        and num_heads > 0
+        and num_heads % tp_size == 0
+        and head_dim == 128
+    )
+
+
+def apply_kimi_k3_linear_attn_defaults(
+    server_args: ServerArgs, *, model_arch=None, hf_config=None
+) -> None:
+    """Apply architecture-specific KDA defaults for Kimi hybrid models."""
     cfg = resolving_view(server_args)
+
+    native_kimi_linear = _uses_native_kimi_linear_unbounded_kda(
+        server_args, model_arch=model_arch, hf_config=hf_config
+    )
+    if native_kimi_linear and get_platform().is_sm100:
+        changes = {}
+        ssm_dtype = cfg.mamba_ssm_dtype
+        if ssm_dtype is None:
+            changes["mamba_ssm_dtype"] = "bfloat16"
+            ssm_dtype = "bfloat16"
+        if ssm_dtype != "bfloat16":
+            return
+        if cfg.linear_attn_decode_backend is None:
+            changes["linear_attn_decode_backend"] = "cake"
+        if cfg.linear_attn_prefill_backend is None:
+            changes["linear_attn_prefill_backend"] = "cake"
+        if changes:
+            declare_resolution(
+                server_args,
+                "apply_kimi_k3_linear_attn_defaults",
+                **changes,
+            )
+        if "mamba_ssm_dtype" in changes:
+            logger.info(
+                "Kimi-Linear equal-head/D128: defaulting --mamba-ssm-dtype "
+                "to bfloat16 for Cake's native KDA route."
+            )
+        if {
+            "linear_attn_decode_backend",
+            "linear_attn_prefill_backend",
+        } & changes.keys():
+            logger.info(
+                "Kimi-Linear equal-head/D128 with bf16 SSM state: defaulting KDA "
+                "prefill and decode to Cake's native unbounded-softplus route."
+            )
+        return
 
     # Preempts the generic SM100+bf16 flashinfer switch (a GDN default): on
     # KDA shapes the triton packed decode measures ~35% faster than
     # recurrent_kda across bs 1-256, and ReplaySSM requires triton.
     if (
         cfg.linear_attn_decode_backend is None
+        and cfg.linear_attn_backend != "cake"
         and cfg.mamba_ssm_dtype == "bfloat16"
         and get_platform().is_sm100
     ):

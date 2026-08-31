@@ -51,6 +51,12 @@ class TestLinearAttnBackends(CustomTestCase):
         self.assertEqual(backends.prefill, LinearAttnKernelBackend.TRITON)
         self.assertEqual(backends.decode, LinearAttnKernelBackend.TRITON)
 
+    def test_cake_base_selects_both_kernel_phases(self):
+        self._publish(linear_attn_backend="cake")
+        backends = resolve_linear_attn_backends()
+        self.assertEqual(backends.prefill, LinearAttnKernelBackend.CAKE)
+        self.assertEqual(backends.decode, LinearAttnKernelBackend.CAKE)
+
     def test_the_default_does_not_reach_the_decode_backend(self):
         self._publish(linear_attn_backend="triton")
         backends = resolve_linear_attn_backends(prefill_default="flashinfer")

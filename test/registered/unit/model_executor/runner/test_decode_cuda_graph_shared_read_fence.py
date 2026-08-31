@@ -11,11 +11,21 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph_capture,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph_capture as implementation_capture_probe,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 DECODE = ForwardMode.DECODE
+
+
+def test_breakable_capture_probe_is_public():
+    assert is_in_breakable_cuda_graph_capture is implementation_capture_probe
 
 
 def _runner(*, has_marker: bool = False):
