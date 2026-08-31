@@ -18,7 +18,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 def _make_req(req_pool_idx, origin_input_ids, output_ids):
     return types.SimpleNamespace(
-        req_pool_idx=req_pool_idx,
+        kv=types.SimpleNamespace(req_pool_idx=req_pool_idx),
         origin_input_ids=origin_input_ids,
         output_ids=output_ids,
         return_logprob=False,
