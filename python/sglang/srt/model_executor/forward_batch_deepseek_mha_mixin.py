@@ -91,9 +91,7 @@ class ForwardBatchDeepSeekMHAMixin:
                 self.prefix_chunk_starts_cpu[idx],
                 self.prefix_chunk_seq_lens_cpu[idx],
             )
-            # Unified pool: req_to_token holds VIRTUAL ids — translate at
-            # production so the pool door receives kernel-facing ids.
-            # Identity on non-unified pools; None on unmigrated backends.
+            # None on a backend that never bound a translator.
             src = get_attn_backend().kv_index_translator
             if src is not None:
                 chunk_kv_indices = src.translate_full_attn_ids(chunk_kv_indices)
@@ -242,9 +240,7 @@ class ForwardBatchDeepSeekMHAMixin:
             kv_indices,
             req_to_token.shape[1],
         )
-        # Unified pool: translate at production (once; the memo above holds
-        # the translated result). Identity on non-unified pools; None on
-        # unmigrated backends.
+        # None on a backend that never bound a translator.
         src = get_attn_backend().kv_index_translator
         if src is not None:
             kv_indices = src.translate_full_attn_ids(kv_indices)

@@ -557,7 +557,7 @@ def test_metadata_correctness(bs, seqlen_offset, q_mode, with_swa, static_width)
 @pytest.mark.parametrize("pass_tables", [False, True])
 def test_skip_page_table_updates_seqlens_only(pass_tables):
     """The unified-memory arm: skip_page_table=True must still rebuild the
-    seqlen metadata in-graph but leave every page-table byte alone — the bound
+    seqlen metadata in-graph but leave every page-table byte alone -- the bound
     tables are capture-stable read tables the translator refreshes
     out-of-graph, and an in-graph write would clobber them with virtual-derived
     pages. Covers both call shapes: page_table=None (what the backend passes)

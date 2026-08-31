@@ -199,9 +199,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
         # Raw full->swa index mapping tensor for the fused cuda-graph
         # metadata kernel (gather + // page_size happen on device). The unified
-        # pool maintains no token-level mapping — its swa table and write loc
-        # come from the translator, out-of-graph — so the mapping (and the
-        # in-graph swa work it feeds) is a static-pool mechanism only.
+        # pool has no token-level mapping, so this is a static-pool mechanism.
         if (
             self._swa_kv_pool is not None
             and not self.kv_index_translator.is_translating
@@ -775,9 +773,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # bounds real KV reads by cache_seqlens, so this is a fixed loop
         # bound only — never a host max / seq_lens_cpu D2H sync.
         max_seq_pages = self.max_num_pages
-        # Unified pool: the page tables and the swa write loc are refreshed
-        # out-of-graph, so the recorded kernel must neither rebuild them from
-        # virtual ids nor run the (nonexistent) token-level swa mapping.
         unified = self.kv_index_translator.is_translating
         update_trtllm_mha_graph_metadata(
             req_pool_indices=req_pool_indices,
@@ -914,16 +909,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
             metadata = self.forward_metadata
             if in_capture:
-                # Bind the read tables ONCE; the attention kernels bake
-                # these pointers, and the stored metadata carries them into
-                # every replay.
+                # Bind ONCE: the attention kernels bake these pointers at capture.
                 metadata.page_table = kv_view.ids[:bs]
                 if kv_view.sliding_window_ids is not None:
                     metadata.swa_page_table = kv_view.sliding_window_ids[:bs]
-            # SWA write loc: the in-graph kernel skips it under unified (the
-            # static token-level mapping does not exist); refill the captured
-            # buffer through the translator. Capture dummy batches carry no
-            # prepared write loc; zeros are the page-0 sink.
+            # A capture batch carries no prepared write loc; zeros are the
+            # page-0 sink.
             if (
                 self.use_sliding_window_kv_pool
                 and forward_batch.out_cache_loc is not None
@@ -1088,10 +1079,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
         if kv_view.is_translated:
-            # Unified pool: the canonical page tables ARE the trtllm block
-            # tables (entries already kernel-facing, page-granular; the
-            # attention kernels take the tensor's own width/stride, and reads
-            # are bounded by cache_seqlens). No fill kernel, no translate.
+            # No fill kernel: the kernels take the tensor's own width/stride
+            # and bound their reads by cache_seqlens.
             metadata.page_table = kv_view.ids
             metadata.swa_page_table = kv_view.sliding_window_ids
         else:
@@ -1122,9 +1111,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # int64 scatter index (unlike the int32 read page table above).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            # Unified: the write loc the translator resolved for this batch's
-            # (already kernel-facing) loc; static SWA: the legacy full->swa
-            # translate — one resolver for both.
             metadata.swa_out_cache_loc = (
                 self.kv_index_translator.sliding_window_write_loc_for(
                     forward_batch.out_cache_loc

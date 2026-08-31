@@ -150,7 +150,7 @@ class TestDenseBlockTable(unittest.TestCase):
 
     def test_static_kernel_matches_reference(self):
         """The stripped (id-space-free) flashmla kernel is byte-identical to the
-        plain token//ps reference — guards the v2p-arg removal itself."""
+        plain token//ps reference -- guards the v2p-arg removal itself."""
         for page_size in (1, 32, 64):
             rt, rpi, sl, _ = self._make_batch(page_size)
             got = _fill_block_table_static(rt, rpi, sl, page_size)

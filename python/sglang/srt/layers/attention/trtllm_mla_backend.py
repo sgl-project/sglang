@@ -284,9 +284,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
-        # Per-forward write loc ([:n] view of a capture-stable buffer), refilled
-        # by the cuda-graph out-graph hook; None on the eager path, which passes
-        # forward_batch.out_cache_loc (already kernel-facing) straight through.
+        # [:n] view of a capture-stable buffer on the cuda-graph path; None on
+        # the eager path, which passes forward_batch.out_cache_loc through.
         self._decode_kernel_loc: Optional[torch.Tensor] = None
         self.cuda_graph_out_cache_loc_kernel: Optional[torch.Tensor] = None
         # Fused KV-scatter + q-concat on the decode dense-loc path (one launch
@@ -360,8 +359,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         if self.kv_index_translator.is_translating:
-            # Unified pool: the read-table entries ARE the dense block-table
-            # rows; prefix-only build keeps the -1 tail sentinel.
             self.kv_index_translator.fill_read_table(
                 out=block_kv_indices,
                 req_pool_indices=req_pool_indices,
@@ -544,10 +541,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Update block indices for new sequences.
         if self.kv_index_translator.is_translating:
-            # Unified pool: prefix-only refresh of the capture-stable table
-            # (spec is asserted off, so `seq_lens` here is always the plain
-            # decode length; the builder takes seq_lens as a tensor, so the
-            # verify/draft-widened lengths plug in when the spec seam opens).
             self.kv_index_translator.fill_read_table(
                 out=metadata.block_kv_indices,
                 req_pool_indices=req_pool_indices[:bs],
@@ -630,10 +623,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_mode=forward_mode,
             )
 
-        # Unified pool: precompute the DENSE KV write loc into the capture-stable
-        # buffer (both capture and each replay-prep run this out of the graph),
-        # so the in-graph set_mla_kv_buffer writes a dense loc without capturing
-        # a translate. Decode AND target-verify write KV under unified memory.
+        # Out-of-graph on capture AND every replay-prep, so the in-graph
+        # set_mla_kv_buffer captures no translate.
         if self.kv_index_translator.is_translating and (
             forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
         ):

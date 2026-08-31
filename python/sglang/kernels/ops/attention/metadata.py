@@ -193,9 +193,8 @@ def _fused_metadata_kernel_general(
     use_swa: tl.constexpr,
     SHIFT: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
-    # Unified pool: `req_to_token` and `full_to_swa_mapping` instead carry the
-    # translator's PAGE-granular read tables, entries already kernel-facing.
-    # Emitted verbatim: no >>SHIFT, no v2p, no mapping gather.
+    # 1: the two table pointers carry PAGE-granular, already kernel-facing
+    # read tables; emit verbatim -- no >>SHIFT, no v2p, no mapping gather.
     SRC_IS_KERNEL_PAGE_TABLE: tl.constexpr = 0,
 ):
     pid_b = tl.program_id(0)  # batch index
@@ -356,9 +355,6 @@ def _fused_metadata_kernel_ps1_no_swa(
         req_to_token + rt_offsets, mask=mask, other=0, cache_modifier=".cg"
     )
 
-    # page_table = page_index // 1 = page_index. Under the unified pool the
-    # source IS the canonical kernel page table (token-granular at ps=1), so
-    # its entries pass through verbatim — no translate variant needed here.
     pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
     tl.store(page_table + pt_offsets, page_index, mask=mask, cache_modifier=".cg")
 
@@ -632,10 +628,6 @@ def normal_decode_set_metadata(
     page_table_stride_0 = page_table.stride(0)
     page_table_stride_1 = page_table.stride(1)
 
-    # Check if we should use the specialized fast path for page_size=1, no SWA.
-    # Check if we should use the specialized fast path for page_size=1, no SWA.
-    # At ps=1 the read table is token-granular and passes through verbatim, so
-    # only the general kernel branches on src_is_read_table.
     use_swa = swa_page_table is not None and (
         token_to_kv_pool is not None or swa_src_table is not None
     )

@@ -239,8 +239,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.kv_index_translator = model_runner.kv_index_translator
-        # Set unconditionally: the read site evaluates it before the call,
-        # and a non-translating pool never looks at its value.
         self.kv_read_tables = None
         self.enable_chunk_kv = (
             not skip_prefill
@@ -346,10 +344,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
-        # One build serves both the capture-time plan and
-        # _apply_cuda_graph_metadata. All flashinfer gathers run OUT-of-graph
-        # (plan time), so the capture-stable table is for buffer reuse here,
-        # not pointer stability.
+        # All flashinfer gathers run OUT-of-graph (plan time), so the
+        # capture-stable table is buffer reuse, not pointer stability.
         kv_view = self.kv_index_translator.build_index_table(
             req_pool_indices=req_pool_indices[:bs],
             seq_lens=seq_lens[:bs],
@@ -1079,9 +1075,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
-            # Under the unified pool the view is the translator's read table,
-            # so the emitted ids are already kernel-facing int32 — one pass, no
-            # post-hoc translate.
             create_flashinfer_kv_indices_triton[(bs,)](
                 kv_view.ids,
                 kv_view.row_ids,

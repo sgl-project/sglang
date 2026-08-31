@@ -61,7 +61,7 @@ class _RecordingPool:
 class TestUnifiedSWARouting(unittest.TestCase):
     """`UnifiedSWAKVPool.set_kv_buffer` routing: full layers write `full_loc`
     when present (triton's capture-stable buffer), else the rebound generic
-    `loc` — the same id space once the loc is rebound; SWA layers write the swa-physical
+    `loc` -- the same id space once the loc is rebound; SWA layers write the swa-physical
     `swa_loc`, which has no fallback (a different id space). The pool never
     translates."""
 
@@ -104,7 +104,7 @@ class TestUnifiedSWARouting(unittest.TestCase):
         2-arg KVWriteLoc(loc, swa) and the full-layer door demanded an explicit
         full_loc. Once the loc is rebound the generic `loc` IS the full-side kernel-facing id
         (rebind_write_loc runs at ForwardBatch construction),
-        so the door must fall back to it — the pool still never translates."""
+        so the door must fall back to it -- the pool still never translates."""
         pool = self._make_bare_pool()
         rebound_loc = torch.tensor([10, 11, 12], dtype=torch.int64)
         swa_phys = torch.tensor([1, 2, 0], dtype=torch.int64)
@@ -340,7 +340,7 @@ class TestHybridLinearMLARouting(unittest.TestCase):
         """Kernel-facing contract, read side: `loc` is a read-index tensor
         already translated at its production site
         (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices); the
-        door forwards it UNTOUCHED — a re-added door translate would
+        door forwards it UNTOUCHED -- a re-added door translate would
         double-translate every unified MLA prefix read."""
         pool = self._make_bare_pool()
         loc = torch.tensor([104, 105], dtype=torch.int64)

@@ -163,9 +163,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             max_seqlen_pad = triton.cdiv(eager_max_k, PAGE_SIZE)
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
             if self.kv_index_translator.is_translating:
-                # Unified pool: the read-table entries ARE the dense block-table
-                # rows (pool page size is snapped to PAGE_SIZE for flashmla);
-                # prefix-only build, stale tail unread (bounded by seq_lens_k).
                 assert self.page_size == PAGE_SIZE
                 self.kv_index_translator.fill_read_table(
                     out=block_kv_indices,
@@ -340,9 +337,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
 
             if self.kv_index_translator.is_translating:
-                # Prefix-only refresh of the capture-stable table; the stale tail is
-                # unread, bounded by seq_lens_k. Only decode/idle reaches this (spec is
-                # asserted off under the unified pool).
                 assert self.page_size == PAGE_SIZE
                 self.kv_index_translator.fill_read_table(
                     out=self.cuda_graph_kv_indices,

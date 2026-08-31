@@ -62,10 +62,8 @@ def update_trtllm_mha_graph_metadata_kernel(
     Q_MODE: tl.constexpr,
     PAGE_BLOCK: tl.constexpr,
     BS_BLOCK: tl.constexpr,
-    # Unified memory pool: the page table(s) are capture-stable canonical
-    # buffers refreshed OUT-of-graph by the translator (req_to_token holds
-    # VIRTUAL ids the graph could not translate); the recorded kernel then
-    # only rebuilds the seqlen metadata. 0 = static pool, full rebuild.
+    # 1: the page tables are refreshed out-of-graph, so rebuild only the
+    # seqlen metadata. 0 = static pool, full rebuild.
     SKIP_PAGE_TABLE: tl.constexpr = 0,
 ):
     pid = tl.program_id(axis=0)
@@ -162,7 +160,7 @@ def update_trtllm_mha_graph_metadata(
     across replays, so consumers must bound reads by cache_seqlens.
 
     ``skip_page_table=True`` (the unified memory pool): the seqlen metadata is
-    still rebuilt in one launch, but the page-table writes are compiled out —
+    still rebuilt in one launch, but the page-table writes are compiled out --
     the bound tables are capture-stable read tables the translator
     refreshes out-of-graph. ``page_table`` may then be None.
     """

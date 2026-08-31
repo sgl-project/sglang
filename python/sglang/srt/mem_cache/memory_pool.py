@@ -1607,7 +1607,7 @@ class KVWriteLoc:
       same rebound loc (``sliding_window_write_loc_for``).
     - ``full_loc``: OPTIONAL full-attention-sub-pool location. Since the
       construction-time rebind it is the SAME id space as ``loc``, so pools
-      fall back to ``loc`` when it is ``None`` — only triton's captured path
+      fall back to ``loc`` when it is ``None`` -- only triton's captured path
       still passes its capture-stable
       ``ForwardMetadata.out_cache_loc_full_physical`` buffer here (a
       same-space alias slated for collapse).
@@ -3964,7 +3964,7 @@ class HybridLinearKVPool(KVCache):
         dst_dtype: Optional[torch.dtype] = None,
     ):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
-        # Read door — same kernel-facing contract as the write door: `loc` is
+        # Read door -- same kernel-facing contract as the write door: `loc` is
         # a read-index tensor already translated at its production site
         # (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices); the
         # pool never translates.

@@ -312,8 +312,6 @@ class FlashInferAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.kv_index_translator = model_runner.kv_index_translator
-        # Set unconditionally: the read site evaluates it before the call,
-        # and a non-translating pool never looks at its value.
         self.kv_read_tables = None
         self._swa_kv_pool: Optional[BaseSWAKVPool] = self._resolve_swa_kv_pool(
             model_runner
@@ -726,9 +724,8 @@ class FlashInferAttnBackend(AttentionBackend):
             num_tokens = forward_batch.positions.numel()
             self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
 
-        # Canonical id source for the index builders below. All flashinfer
-        # gathers run OUT-of-graph (plan time), so only buffer reuse — not
-        # pointer stability — motivates the capture-stable read table here.
+        # All flashinfer gathers run OUT-of-graph (plan time), so the
+        # capture-stable read table is buffer reuse, not pointer stability.
         kv_view = self.kv_index_translator.build_index_table(
             req_pool_indices=req_pool_indices[:bs],
             seq_lens=seq_lens[:bs],
@@ -862,13 +859,10 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
             if in_capture and self.kv_index_translator.is_translating:
                 # A runner-built capture batch never went through `init_new`,
-                # so there is no prepared write loc to resolve — and zeros are the
+                # so there is no prepared write loc to resolve -- and zeros are the
                 # page-0 sink in every id space. Replay refills below.
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
-                # Unified: the write loc the translator resolved for this batch's
-                # (already kernel-facing) loc; static SWA: the legacy
-                # full->swa translate — one resolver for both.
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
                     self.kv_index_translator.sliding_window_write_loc_for(
                         forward_batch.out_cache_loc
@@ -963,9 +957,6 @@ class FlashInferAttnBackend(AttentionBackend):
         kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            # Unified: the write loc the translator resolved for this batch's
-            # (already kernel-facing) loc; static SWA: the legacy full->swa
-            # translate — one resolver for both.
             swa_out_cache_loc = self.kv_index_translator.sliding_window_write_loc_for(
                 forward_batch.out_cache_loc
             )
@@ -1735,7 +1726,7 @@ class FlashInferIndicesUpdaterDecode:
         *,
         kv_view: KVIndexTable,
     ):
-        # Unified SWA wrapper-0: gather from the swa canonical directly — its
+        # Unified SWA wrapper-0: gather from the swa canonical directly -- its
         # entries are already swa-side kernel-facing ids, so the in-place
         # full->swa translate below must not run on top of them.
         use_swa_source = use_sliding_window_kv_pool and kv_view.is_translated
@@ -2166,7 +2157,7 @@ class FlashInferIndicesUpdaterPrefill:
         kv_view: KVIndexTable,
     ):
         bs = len(seq_lens)
-        # Unified SWA wrapper-0: gather from the swa canonical directly — its
+        # Unified SWA wrapper-0: gather from the swa canonical directly -- its
         # entries are already swa-side kernel-facing ids, so the in-place
         # full->swa translate below must not run on top of them.
         use_swa_source = use_sliding_window_kv_pool and kv_view.is_translated

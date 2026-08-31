@@ -45,7 +45,7 @@ def _iter_sources():
 class TestUnifiedTranslateBanned(CustomTestCase):
     def test_no_unified_translate_calls(self):
         """No backend calls the unified translate surfaces. A hit here means
-        a backend re-grew its own id-space transition — the design whose two
+        a backend re-grew its own id-space transition -- the design whose two
         failure modes (forgotten translate, duplicated translate) this scan
         exists to prevent. Route reads through KVIndexTranslator views and
         writes through the ForwardBatch rebind instead."""
@@ -58,7 +58,7 @@ class TestUnifiedTranslateBanned(CustomTestCase):
         self.assertEqual(hits, [])
 
     def test_no_translate_capability_probing(self):
-        """No backend probes an allocator for translate capability — the
+        """No backend probes an allocator for translate capability -- the
         getattr-hook pattern is how per-backend translation grew the first
         time."""
         probing = re.compile(r"""getattr\([^)]*['"]translate_kv_loc""")

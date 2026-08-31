@@ -180,7 +180,7 @@ class TestPadComposesWithDerivation(CustomTestCase):
 
 class TestReadRailTranslatesAtProduction(CustomTestCase):
     """The model-door READ indices (req_to_token-derived, VIRTUAL under the
-    unified pool) are translated at their PRODUCTION site — the cache then
+    unified pool) are translated at their PRODUCTION site -- the cache then
     holds the kernel-facing result and the pool door never translates."""
 
     def _fb_for_one_shot(self):
