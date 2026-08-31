@@ -193,13 +193,9 @@ def _fused_metadata_kernel_general(
     use_swa: tl.constexpr,
     SHIFT: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
-    # Unified-memory per-layer-view path (page-major envelope shared with the mamba
-    # sub-pool). Both default to the identity for the statically-partitioned
-    # pool, where req_to_token already holds physical ids.
-    v2p_ptr=None,
-    PAGE_MULT: tl.constexpr = 1,
-    # Unified SWA puts its independent v2p table in the legacy mapping slot.
-    SWA_MAPPING_IS_V2P: tl.constexpr = False,
+    # 1: the two table pointers carry PAGE-granular, already kernel-facing
+    # read tables; emit verbatim -- no >>SHIFT, no v2p, no mapping gather.
+    SRC_IS_KERNEL_PAGE_TABLE: tl.constexpr = 0,
 ):
     pid_b = tl.program_id(0)  # batch index
     pid_c = tl.program_id(1)  # column chunk index
@@ -240,8 +236,11 @@ def _fused_metadata_kernel_general(
     col_offsets = col_start + tl.arange(0, BLOCK_COLS)
     mask = col_offsets < num_live_pages
 
-    # Compute column indices in the source tensor (token offset)
-    if page_size == 1:
+    # Compute column indices in the source tensor (token offset; page offset
+    # when the source is already the page-granular canonical)
+    if SRC_IS_KERNEL_PAGE_TABLE:
+        col_idx = col_offsets
+    elif page_size == 1:
         col_idx = col_offsets
     else:
         col_idx = col_offsets << SHIFT  # faster than multiplication for power-of-two
@@ -253,40 +252,38 @@ def _fused_metadata_kernel_general(
     )
 
     # Compute page_table
-    if page_size == 1:
+    if SRC_IS_KERNEL_PAGE_TABLE:
+        page_table_val = page_index  # read-table entries are the page ids
+    elif page_size == 1:
         page_table_val = page_index
     else:
         page_table_val = page_index >> SHIFT
-
-    # Unified memory: virtual page -> physical page -> that layer's dense block.
-    # Derived from page_table_val, NOT page_index, which the SWA branch below
-    # still needs in virtual space. Masked so padded lanes never index the table.
-    if v2p_ptr is not None:
-        page_table_val = tl.load(v2p_ptr + page_table_val, mask=mask, other=0)
-    page_table_val = page_table_val * PAGE_MULT
 
     # Store to page_table
     pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
     tl.store(page_table + pt_offsets, page_table_val, mask=mask, cache_modifier=".cg")
 
     if use_swa:
-        if SWA_MAPPING_IS_V2P:
+        if SRC_IS_KERNEL_PAGE_TABLE:
+            # The swa canonical shares the full canonical's shape and strides,
+            # so the SAME rt_offsets address the matching swa entry.
+            swa_val = tl.load(
+                full_to_swa_mapping + rt_offsets,
+                mask=mask,
+                other=0,
+                cache_modifier=".cg",
+            )
+        else:
+            swa_slot = tl.load(
+                full_to_swa_mapping + page_index * full_to_swa_mapping_stride_0,
+                mask=mask,
+                other=0,
+                cache_modifier=".cg",
+            )
             if page_size == 1:
-                swa_mapping_index = page_index
+                swa_val = swa_slot
             else:
-                swa_mapping_index = page_index >> SHIFT
-        else:
-            swa_mapping_index = page_index * full_to_swa_mapping_stride_0
-        swa_slot = tl.load(
-            full_to_swa_mapping + swa_mapping_index,
-            mask=mask,
-            other=0,
-            cache_modifier=".cg",
-        )
-        if page_size == 1 or SWA_MAPPING_IS_V2P:
-            swa_val = swa_slot
-        else:
-            swa_val = swa_slot >> SHIFT
+                swa_val = swa_slot >> SHIFT
         swa_offsets = (
             i * swa_page_table_stride_0 + col_offsets * swa_page_table_stride_1
         )
@@ -316,9 +313,6 @@ def _fused_metadata_kernel_ps1_no_swa(
     max_seq_pages,
     seq_len_delta: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
-    # Unified-memory per-layer-view path; identity defaults for the static pool.
-    v2p_ptr=None,
-    PAGE_MULT: tl.constexpr = 1,
 ):
     pid_b = tl.program_id(0)  # batch index
     pid_c = tl.program_id(1)  # column chunk index
@@ -361,11 +355,6 @@ def _fused_metadata_kernel_ps1_no_swa(
         req_to_token + rt_offsets, mask=mask, other=0, cache_modifier=".cg"
     )
 
-    # page_table = page_index // 1 = page_index
-    # Unified memory: at page_size 1 the virtual token id IS the virtual page id.
-    if v2p_ptr is not None:
-        page_index = tl.load(v2p_ptr + page_index, mask=mask, other=0)
-    page_index = page_index * PAGE_MULT
     pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
     tl.store(page_table + pt_offsets, page_index, mask=mask, cache_modifier=".cg")
 
@@ -586,15 +575,14 @@ def normal_decode_set_metadata(
     page_table: torch.Tensor,
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
-    strided_indices: torch.Tensor,
     max_seq_pages: torch.Tensor,
     seq_lens: torch.Tensor,
     seq_len_delta: int,
     page_size: int,
     swa_page_table: Optional[torch.Tensor] = None,
     token_to_kv_pool: Optional["SWAKVPool"] = None,
-    v2p_page_table: Optional[torch.Tensor] = None,
-    kernel_page_multiplier: int = 1,
+    src_is_read_table: bool = False,
+    swa_src_table: Optional[torch.Tensor] = None,
 ):
     """
     Fused Triton implementation that replaces 4-5 sequential CUDA kernels with 1-2 kernels:
@@ -602,14 +590,15 @@ def normal_decode_set_metadata(
       2. cu_seqlens_k = cumsum(cache_seqlens) (prefix-sum)
       3. page_indices = req_to_token[pool_idx, stride_idx] (2-D gather)
       4. page_table = page_indices // page_size (floor-divide)
-      4b. (unified memory) page_table = v2p_page_table[page] * kernel_page_multiplier
-      5. (optional) swa_page_table via the legacy full->SWA map or the unified
-         SWA pool's independent page map
+      5. (optional) swa_page_table for sliding window attention
 
-    Step 4b is folded in rather than applied afterwards so the capture-stable
-    page_table is written already translated: no separate pass a caller could
-    forget, and no temporary to keep pointer-stable across cuda-graph replays.
-    Identity (None / 1) for the statically-partitioned pool.
+    Unified pool (``src_is_read_table=True``): ``req_to_token`` /
+    ``req_pool_indices`` carry the translator's PAGE-granular read table and its
+    row indices instead (entries already kernel-facing; ``swa_src_table`` is
+    the swa canonical, same shape and strides); steps 3-5 become verbatim
+    copies of the read table's rows' live prefixes, folded into the same launch
+    so the capture-stable page_table is written translated with no separate
+    pass a caller could forget.
 
     Achieves ~5.2x speedup on H200 hardware for typical decode workloads.
 
@@ -639,7 +628,9 @@ def normal_decode_set_metadata(
     page_table_stride_0 = page_table.stride(0)
     page_table_stride_1 = page_table.stride(1)
 
-    use_swa = swa_page_table is not None and token_to_kv_pool is not None
+    use_swa = swa_page_table is not None and (
+        token_to_kv_pool is not None or swa_src_table is not None
+    )
 
     # Unified SWA uses an independent SWA v2p table.
     swa_v2p_page_table = None
@@ -681,15 +672,26 @@ def normal_decode_set_metadata(
             max_seq_pages,
             seq_len_delta,
             BLOCK_COLS=BLOCK_COLS,
-            v2p_ptr=v2p_page_table,
-            PAGE_MULT=kernel_page_multiplier,
             num_warps=8,
             num_stages=3,
         )
     else:
         # General kernel for page_size > 1 or SWA cases
         # SWA parameters
-        if use_swa:
+        if use_swa and src_is_read_table:
+            # Unified pool: the swa canonical rides in the mapping slot; the
+            # kernel addresses it with the SAME row/col offsets as the full
+            # canonical, so their layouts must match exactly.
+            assert swa_src_table is not None
+            assert (
+                swa_src_table.stride() == req_to_token.stride()
+            ), "swa canonical must share the full canonical's strides"
+            swa_page_table = swa_page_table.contiguous()
+            swa_page_table_stride_0 = swa_page_table.stride(0)
+            swa_page_table_stride_1 = swa_page_table.stride(1)
+            full_to_swa_mapping = swa_src_table
+            full_to_swa_mapping_stride_0 = 0  # unused under the canonical source
+        elif use_swa:
             from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
             swa_page_table = swa_page_table.contiguous()
@@ -749,9 +751,7 @@ def normal_decode_set_metadata(
             use_swa,
             shift,
             BLOCK_COLS=BLOCK_COLS,
-            v2p_ptr=v2p_page_table,
-            PAGE_MULT=kernel_page_multiplier,
-            SWA_MAPPING_IS_V2P=swa_uses_v2p,
+            SRC_IS_KERNEL_PAGE_TABLE=1 if src_is_read_table else 0,
             num_warps=4,
             num_stages=3,
         )
