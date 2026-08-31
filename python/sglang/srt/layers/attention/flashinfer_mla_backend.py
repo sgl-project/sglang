@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from sglang.srt.runtime_context import (
+    get_buffer,
     get_disagg,
     get_exec,
     get_parallel,
+    get_platform,
     get_schedule,
 )
 
@@ -41,7 +43,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_buffer
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -50,7 +51,6 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils import (
     is_flashinfer_available,
-    is_sm100_supported,
     next_power_of_2,
 )
 
@@ -277,7 +277,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
-        if is_sm100_supported():
+        if get_platform().is_sm100:
             self.fmha_backend = "cutlass"
         else:
             self.fmha_backend = "auto"
@@ -850,7 +850,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         # Unified dense MLA pool: VIRTUAL -> DENSE kv_indices (see prefill updater).
         self._translate_kv_loc_dense = unified_mla_hooks(
             model_runner.token_to_kv_pool_allocator
-        ).translate_kv_loc_dense
+        ).translate_kv_loc_for_kernel
 
     def update(
         self,
@@ -918,7 +918,7 @@ class FlashInferMLAIndicesUpdaterDecode:
             # [:paged_kernel_lens_sum] prefix the index kernel just filled is
             # translated; the stale tail is left alone so it can never index the
             # v2p table out of bounds. The int64 translate result narrows back to
-            # the buffer's int32 on copy_ (flashinfer requires int32; dense ids
+            # the buffer's int32 on copy_ (flashinfer requires int32; kernel-facing ids
             # fit comfortably).
             if self._translate_kv_loc_dense is not None:
                 valid = kv_indices[:paged_kernel_lens_sum]
@@ -989,11 +989,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
         # Unified dense MLA pool: kv_indices built from req_to_token are VIRTUAL;
-        # the paged wrapper reads the dense per-layer view, so remap them to DENSE
+        # the paged wrapper reads the per-layer view, so remap them to kernel-facing
         # token ids. None (identity) unless the unified MLA pool is active.
         self._translate_kv_loc_dense = unified_mla_hooks(
             model_runner.token_to_kv_pool_allocator
-        ).translate_kv_loc_dense
+        ).translate_kv_loc_for_kernel
 
     def update(
         self,

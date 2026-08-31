@@ -334,7 +334,7 @@ def _insert_seq(env, seq):
     mamba_val = None
     if env.has_mamba:
         req = env.make_req()
-        mamba_val = req.mamba_pool_idx.unsqueeze(0)
+        mamba_val = req.kv.mamba_pool_idx.unsqueeze(0)
     key = RadixKey(array("q", seq))
     env.tree.insert(InsertParams(key=key, value=v[: len(key)], mamba_value=mamba_val))
     return True
@@ -356,7 +356,7 @@ def _fill_no_evict(env):
         mamba_val = None
         if env.has_mamba:
             req = env.make_req()
-            mamba_val = req.mamba_pool_idx.unsqueeze(0)
+            mamba_val = req.kv.mamba_pool_idx.unsqueeze(0)
         key = RadixKey(array("q", seq))
         env.tree.insert(
             InsertParams(key=key, value=v[: len(key)], mamba_value=mamba_val)
@@ -642,11 +642,11 @@ def bench_cache_finished(
             len(req.prefix_indices), len(req.full_untruncated_fill_ids)
         )
         req.last_node = node
-        req.cache_protected_len = matched_len
-        req.kv_committed_len = len(seq)
+        req.kv.cache_protected_len = matched_len
+        req.kv.kv_committed_len = len(seq)
         if hasattr(lr, "swa_uuid_for_lock"):
             req.swa_uuid_for_lock = lr.swa_uuid_for_lock
-        env.rtp.req_to_token[req.req_pool_idx, : len(kv_indices)] = kv_indices
+        env.rtp.req_to_token[req.kv.req_pool_idx, : len(kv_indices)] = kv_indices
         req_items.append(req)
 
     if not req_items:
@@ -657,7 +657,7 @@ def bench_cache_finished(
         "cache_finished",
         lambda: req_items,
         lambda req: env.tree.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req.kv_committed_len
+            req, is_insert=True, kv_len_to_handle=req.kv.kv_committed_len
         ),
         len(req_items) - warmup,
         env.avg_tokens,

@@ -17,8 +17,12 @@ from sglang.srt.layers.attention.minicpm.attention_adapter import (
 )
 from sglang.srt.layers.attention.minicpm.cache import attach_compressed_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel, get_schedule
-from sglang.srt.utils import is_blackwell_supported, next_power_of_2
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_platform,
+    get_schedule,
+)
+from sglang.srt.utils import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -127,7 +131,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         use_flashinfer: bool,
     ):
         super().__init__()
-        use_blackwell = is_blackwell_supported()
+        use_blackwell = get_platform().is_blackwell
         if use_blackwell:
             fa_impl_ver = 4
         self.flash_attn_backend = FlashAttentionBackend(

@@ -243,8 +243,12 @@ class StagingAllocator:
                 self.alloc_order.pop(0)
 
             if not self.allocations:
+                # An empty ring makes the entire prior round reusable. Start a
+                # fresh round at offset zero so the watermark cannot stay stale.
+                self.round += 1
+                self.head = 0
                 self.watermark_round = self.round
-                self.watermark_tail = self.head
+                self.watermark_tail = 0
             elif self.alloc_order:
                 off, _, rnd = self.allocations[self.alloc_order[0]]
                 self.watermark_round = rnd
