@@ -66,6 +66,7 @@ fn insert_params_mamba<'k>(
         swa_evicted_seqlen: 0,
         chunked: false,
         priority: 0,
+        track_adopted_ranges: false,
     }
 }
 

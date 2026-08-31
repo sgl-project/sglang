@@ -215,6 +215,14 @@ def _insert_step_from_binding(step) -> InsertStepResult:
             last_device_node=step.result.last_device_node,
             mamba_exist=step.result.mamba_exist,
             host_insert_dropped=step.result.host_insert_dropped,
+            adopted_ranges=(
+                {
+                    ComponentType(component_type): list(ranges)
+                    for component_type, ranges in step.result.adopted_ranges.items()
+                }
+                if step.result.adopted_ranges is not None
+                else None
+            ),
         )
     return InsertStepResult(
         actions=_cache_actions_from_tagged(step.actions), result=result
@@ -609,6 +617,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 swa_evicted_seqlen=params.swa_evicted_seqlen,
                 chunked=params.chunked,
                 priority=0 if params.priority is None else params.priority,
+                track_adopted_ranges=params.track_adopted_ranges,
             )
         )
         return _insert_step_from_binding(step)

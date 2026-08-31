@@ -547,6 +547,7 @@ fn insert_params_swa<'k>(
         swa_evicted_seqlen,
         chunked: false,
         priority: 0,
+        track_adopted_ranges: false,
     }
 }
 
@@ -730,7 +731,10 @@ fn insert_overlap_recovers_a_tombstone_inside_the_window() {
     tc.insert(&insert_params_swa(&vec![1, 2, 3], &[10, 11, 12], 0, 0));
     let root = tc.arena.root();
     let leaf = child_of(&tc, root, &[1]);
-    let result = tc.insert(&insert_params_swa(&vec![1, 2, 3], &[20, 21, 22], 0, 0));
+    let result = tc.insert(&InsertParams {
+        track_adopted_ranges: true,
+        ..insert_params_swa(&vec![1, 2, 3], &[20, 21, 22], 0, 0)
+    });
     // SWA consumed the whole slice: the node adopts the fresh Full KV and
     // the old Full is freed instead of the duplicates.
     assert!(
@@ -751,6 +755,9 @@ fn insert_overlap_recovers_a_tombstone_inside_the_window() {
     assert!(freed[0].equal(&Tensor::from_slice(&[10i64, 11, 12])));
     assert_eq!(*node_id, tc.arena.node(leaf).id);
     assert!(source_value.equal(&Tensor::from_slice(&[20i64, 21, 22])));
+    let adopted = result.adopted_ranges.as_ref().unwrap();
+    assert_eq!(adopted[&FULL], [(0, 3)]);
+    assert_eq!(adopted[&SWA], [(0, 3)]);
 }
 
 #[test]
@@ -777,7 +784,10 @@ fn insert_overlap_with_a_locked_full_emits_the_recover_action() {
     tc.arena
         .node_mut(leaf)
         .set_lock_ref_(ValueSlotIdx::device(FULL), 1);
-    let result = tc.insert(&insert_params_swa(&vec![1, 2, 3], &[20, 21, 22], 0, 0));
+    let result = tc.insert(&InsertParams {
+        track_adopted_ranges: true,
+        ..insert_params_swa(&vec![1, 2, 3], &[20, 21, 22], 0, 0)
+    });
     // The locked Full stays on the node; the cache resolves the recover action.
     assert!(
         tc.arena
@@ -797,6 +807,9 @@ fn insert_overlap_with_a_locked_full_emits_the_recover_action() {
     assert_eq!(*node_id, tc.arena.node(leaf).id);
     assert!(kept_full.equal(&Tensor::from_slice(&[10i64, 11, 12])));
     assert!(incoming_full.equal(&Tensor::from_slice(&[20i64, 21, 22])));
+    let adopted = result.adopted_ranges.as_ref().unwrap();
+    assert!(!adopted.contains_key(&FULL));
+    assert_eq!(adopted[&SWA], [(0, 3)]);
 }
 
 #[test]

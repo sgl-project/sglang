@@ -504,12 +504,13 @@ pub struct InsertParamsBinding {
     pub swa_evicted_seqlen: usize,
     pub chunked: bool,
     pub priority: i64,
+    pub track_adopted_ranges: bool,
 }
 
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, chunked = false, priority = 0, mamba_value = None))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -521,6 +522,7 @@ impl InsertParamsBinding {
         chunked: bool,
         priority: i64,
         mamba_value: Option<Py<PyAny>>,
+        track_adopted_ranges: bool,
     ) -> PyResult<Self> {
         Ok(InsertParamsBinding {
             key: py_array_to_vec_i64(py, key)?,
@@ -532,6 +534,7 @@ impl InsertParamsBinding {
             swa_evicted_seqlen,
             chunked,
             priority,
+            track_adopted_ranges,
         })
     }
 }
@@ -578,6 +581,7 @@ pub struct InsertResultBinding {
     inserted_host_node: Option<NodeId>,
     host_insert_dropped: bool,
     mamba_exist: bool,
+    adopted_ranges: Option<HashMap<u8, Vec<(usize, usize)>>>,
     cache_actions: Py<PyList>,
 }
 
@@ -616,6 +620,12 @@ impl InsertResultBinding {
             inserted_host_node: result.inserted_host_node,
             host_insert_dropped: result.host_insert_dropped,
             mamba_exist: result.mamba_exist,
+            adopted_ranges: result.adopted_ranges.map(|ranges| {
+                ranges
+                    .into_iter()
+                    .map(|(component_type, ranges)| (component_type_to_u8(component_type), ranges))
+                    .collect()
+            }),
             cache_actions: cache_actions_to_py(py, result.cache_actions)?,
         })
     }
@@ -989,6 +999,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             chunked: params.chunked,
             priority: params.priority,
+            track_adopted_ranges: params.track_adopted_ranges,
         };
         let result = py
             .allow_threads(move || self.core().try_insert(&params))
@@ -1023,6 +1034,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             chunked: params.chunked,
             priority: params.priority,
+            track_adopted_ranges: params.track_adopted_ranges,
         };
         let step = py
             .allow_threads(move || self.core().try_begin_insert(&params))

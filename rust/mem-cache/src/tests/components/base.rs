@@ -97,7 +97,9 @@ fn insert_overlap_default_consumes_nothing() {
             swa_evicted_seqlen: 0,
             chunked: false,
             priority: 0,
+            track_adopted_ranges: false,
         },
+        &mut InsertResult::default(),
         &mut Vec::new(),
     );
     // Nothing consumed: the whole overlap stays freeable as duplicates.

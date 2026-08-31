@@ -1824,7 +1824,55 @@ fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i
         swa_evicted_seqlen: 0,
         chunked: false,
         priority: 0,
+        track_adopted_ranges: false,
     }
+}
+
+fn tracked_insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i64>> {
+    InsertParams {
+        track_adopted_ranges: true,
+        ..insert_params(key, value)
+    }
+}
+
+#[test]
+fn adopted_ranges_are_opt_in_and_coalesce() {
+    let mut untracked = InsertResult::default();
+    untracked.record_adopted_range(FULL, 0, 2);
+    assert_eq!(untracked.adopted_ranges, None);
+
+    let mut tracked = InsertResult {
+        adopted_ranges: Some(HashMap::new()),
+        ..InsertResult::default()
+    };
+    tracked.record_adopted_range(FULL, 2, 4);
+    tracked.record_adopted_range(FULL, 4, 6);
+    tracked.record_adopted_range(FULL, 8, 10);
+    tracked.record_adopted_range(FULL, 7, 9);
+    tracked.record_adopted_range(SWA, 3, 3);
+    assert_eq!(
+        tracked.adopted_ranges.as_ref().unwrap()[&FULL],
+        [(2, 6), (7, 10)]
+    );
+    assert!(!tracked.adopted_ranges.as_ref().unwrap().contains_key(&SWA));
+}
+
+#[test]
+fn insert_reports_new_and_unevicted_full_ranges() {
+    let mut tc = core();
+    let first = tc.insert(&tracked_insert_params(&vec![1, 2, 3], &[10, 11, 12]));
+    assert_eq!(first.adopted_ranges.as_ref().unwrap()[&FULL], [(0, 3)]);
+
+    let leaf = tc
+        .match_prefix(&match_params(&vec![1, 2, 3]))
+        .best_match_node_id;
+    let leaf = tc.arena.resolve(leaf);
+    let _ = tc.arena.take_device_value(leaf, FULL);
+    tc.component_state_mut(FULL).evictable_size = 0;
+    tc.evictable_device_leaves.discard(leaf);
+
+    let restored = tc.insert(&tracked_insert_params(&vec![1, 2, 3, 4], &[20, 21, 22, 23]));
+    assert_eq!(restored.adopted_ranges.as_ref().unwrap()[&FULL], [(0, 4)]);
 }
 
 fn insert_params_in_namespace<'a>(
@@ -2536,6 +2584,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
         swa_evicted_seqlen: 0,
         chunked: false,
         priority: 0,
+        track_adopted_ranges: false,
     });
     let hashes = crate::node::get_hash_str::<Vec<(i64, i64)>>(&key, None, 1);
     assert_eq!(
@@ -7438,6 +7487,7 @@ fn sequence_insert_params<'k>(
         swa_evicted_seqlen: 0,
         chunked: false,
         priority: 0,
+        track_adopted_ranges: false,
     }
 }
 

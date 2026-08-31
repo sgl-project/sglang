@@ -7999,6 +7999,43 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=8
     )
 
+    def _recover_swa_tombstone_with_tracking(self, *, lock_full: bool):
+        cache, allocator, _ = build_fixture(self.cfg)
+        seq = list(range(1, self.cfg.sliding_window_size + 1))
+        key = RadixKey(array("q", seq))
+        cache.insert(
+            InsertParams(
+                key=key,
+                value=self._alloc(allocator, len(seq)),
+                swa_evicted_seqlen=len(seq),
+            )
+        )
+        (leaf,) = _node_children(cache, cache.root_node_handle())
+        lock_result = cache.inc_lock_ref(leaf) if lock_full else None
+        try:
+            result = cache.insert(
+                InsertParams(
+                    key=key,
+                    value=self._alloc(allocator, len(seq)),
+                    swa_evicted_seqlen=0,
+                    track_adopted_ranges=True,
+                )
+            )
+        finally:
+            if lock_result is not None:
+                cache.dec_lock_ref(leaf, lock_result.to_dec_params())
+        return result, len(seq)
+
+    def test_swa_tombstone_recovery_reports_unlocked_full_adoption(self):
+        result, seq_len = self._recover_swa_tombstone_with_tracking(lock_full=False)
+        self.assertEqual(result.adopted_ranges[ComponentType.FULL], [(0, seq_len)])
+        self.assertEqual(result.adopted_ranges[ComponentType.SWA], [(0, seq_len)])
+
+    def test_swa_tombstone_recovery_keeps_locked_full_out_of_adoption(self):
+        result, seq_len = self._recover_swa_tombstone_with_tracking(lock_full=True)
+        self.assertNotIn(ComponentType.FULL, result.adopted_ranges)
+        self.assertEqual(result.adopted_ranges[ComponentType.SWA], [(0, seq_len)])
+
     def test_swa_tombstone_recovery_frees_full_only(self):
         sw = self.cfg.sliding_window_size
         cache, allocator, _ = build_fixture(self.cfg)

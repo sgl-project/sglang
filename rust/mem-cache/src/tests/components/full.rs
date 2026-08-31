@@ -73,6 +73,7 @@ fn insert(tc: &mut UnifiedTreeCore<Vec<i64>>, key: &Vec<i64>, value: &[i64]) {
         swa_evicted_seqlen: 0,
         chunked: false,
         priority: 0,
+        track_adopted_ranges: false,
     });
 }
 
@@ -460,6 +461,7 @@ fn host_drive_is_a_noop_without_host_leaves() {
         swa_evicted_seqlen: 0,
         chunked: false,
         priority: 0,
+        track_adopted_ranges: false,
     });
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
     accumulate_step(

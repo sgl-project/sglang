@@ -151,6 +151,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         total_prefix_len: usize,
         value_slice: Tensor,
         params: &InsertParams<'_, K>,
+        result: &mut InsertResult,
         cache_actions: &mut Vec<CacheAction>,
     ) -> usize {
         prefix_len
@@ -167,6 +168,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         prefix_len: usize,
         total_prefix_len: usize,
         params: &InsertParams<'_, K>,
+        result: &mut InsertResult,
         cache_actions: &mut Vec<CacheAction>,
     ) {
     }

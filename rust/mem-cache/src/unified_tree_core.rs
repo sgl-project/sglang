@@ -113,6 +113,8 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     pub chunked: bool,
     /// Eviction priority floor applied along the walked path.
     pub priority: i64,
+    /// Whether the result should report which incoming ranges the tree retained.
+    pub track_adopted_ranges: bool,
 }
 
 /// Result of an insert.
@@ -131,8 +133,35 @@ pub struct InsertResult {
     pub inserted_host_node: Option<NodeId>,
     /// Whether write-through rejected a host suffix below an unbacked parent.
     pub host_insert_dropped: bool,
+    /// Incoming ranges retained by each component, in key-relative atom offsets.
+    pub adopted_ranges: Option<HashMap<ComponentType, Vec<(usize, usize)>>>,
     /// Actions for the controller to apply.
     pub cache_actions: Vec<CacheAction>,
+}
+
+impl InsertResult {
+    pub fn record_adopted_range(
+        &mut self,
+        component_type: ComponentType,
+        start: usize,
+        end: usize,
+    ) {
+        let Some(adopted_ranges) = self.adopted_ranges.as_mut() else {
+            return;
+        };
+        if start >= end {
+            return;
+        }
+        let ranges = adopted_ranges.entry(component_type).or_default();
+        if let Some((previous_start, previous_end)) = ranges.last_mut()
+            && start <= *previous_end
+        {
+            *previous_start = (*previous_start).min(start);
+            *previous_end = (*previous_end).max(end);
+        } else {
+            ranges.push((start, end));
+        }
+    }
 }
 
 /// One step of a resumable insert: the Controller executes `actions`, then
@@ -164,6 +193,7 @@ pub struct InsertWalkState<K: ChildKeyType> {
     mamba_value: Option<Tensor>,
     chunked: bool,
     priority: i64,
+    track_adopted_ranges: bool,
     total_prefix_length: usize,
     is_new_leaf: bool,
     target_node_id: Option<NodeIdx_>,
@@ -1303,6 +1333,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     inserted_host_node: None,
                     host_insert_dropped: false,
                     mamba_exist: true,
+                    adopted_ranges: None,
                     cache_actions: Vec::new(),
                 }),
             });
@@ -1326,10 +1357,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             mamba_value: params.mamba_value.as_ref().map(Tensor::shallow_clone),
             chunked: params.chunked,
             priority: params.priority,
+            track_adopted_ranges: params.track_adopted_ranges,
             total_prefix_length: 0,
             is_new_leaf: false,
             target_node_id: None,
-            result: None,
+            result: Some(InsertResult {
+                adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
+                ..InsertResult::default()
+            }),
             pending_actions: Vec::new(),
         });
         Ok(self.advance_insert_())
@@ -1447,12 +1482,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
             chunked: state.chunked,
             priority: state.priority,
+            track_adopted_ranges: state.track_adopted_ranges,
         };
         if self.arena.node(node_id).evicted() {
             self.unevict_node_on_insert_(
                 node_id,
                 &state.value.narrow(0, cursor as i64, prefix_len as i64),
             );
+            state
+                .result
+                .as_mut()
+                .expect("insert result exists during the walk")
+                .record_adopted_range(BASE_COMPONENT_TYPE, cursor, cursor + prefix_len);
             // FULL was restored from the request's fresh KV. Aux
             // components (e.g. SWA) may still hold tombstones and need
             // to rebuild their value from the same slice.
@@ -1467,6 +1508,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     prefix_len,
                     cursor,
                     &params,
+                    state
+                        .result
+                        .as_mut()
+                        .expect("insert result exists during the walk"),
                     &mut state.pending_actions,
                 );
             }
@@ -1483,6 +1528,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     cursor,
                     value_slice.shallow_clone(),
                     &params,
+                    state
+                        .result
+                        .as_mut()
+                        .expect("insert result exists during the walk"),
                     &mut state.pending_actions,
                 );
                 consumed_from = consumed_from.min(comp_consumed_from);
@@ -1517,6 +1566,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // window). Materialize it anyway so the Full KV stays cacheable.
         let target_node_id = if state.total_prefix_length < state.aligned_key_len {
             state.is_new_leaf = true;
+            state
+                .result
+                .as_mut()
+                .expect("insert result exists during commit")
+                .record_adopted_range(
+                    BASE_COMPONENT_TYPE,
+                    state.total_prefix_length,
+                    state.aligned_key_len,
+                );
             // The walk's only owned key: the unmatched suffix backing the new leaf.
             let leaf_value = state.value.narrow(
                 0,
@@ -1541,15 +1599,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // e.g. Mamba attaches mamba_value to the leaf node
         // All hooks run before their emitted actions execute; an action failure
         // fail-stops the process, so partial-commit state is never observed.
-        let mut result = InsertResult {
-            prefix_len: state.total_prefix_length,
-            total_len: 0,
-            last_device_node_id: Some(self.arena.node(target_node_id).id),
-            inserted_host_node: None,
-            host_insert_dropped: false,
-            mamba_exist: false,
-            cache_actions: Vec::new(),
-        };
+        let result = state
+            .result
+            .as_mut()
+            .expect("insert result exists during commit");
+        result.prefix_len = state.total_prefix_length;
+        result.last_device_node_id = Some(self.arena.node(target_node_id).id);
         let params = InsertParams {
             key: &state.key,
             namespace: state.namespace.as_ref(),
@@ -1559,6 +1614,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
             chunked: state.chunked,
             priority: state.priority,
+            track_adopted_ranges: state.track_adopted_ranges,
         };
         for i in 0..self.components.len() {
             let component = Arc::clone(&self.components[i]);
@@ -1567,11 +1623,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 target_node_id,
                 state.is_new_leaf,
                 &params,
-                &mut result,
+                result,
                 &mut state.pending_actions,
             );
         }
-        state.result = Some(result);
         state.phase = InsertPhase::Tail;
     }
 
@@ -2869,6 +2924,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 inserted_host_node: None,
                 host_insert_dropped: false,
                 mamba_exist: true,
+                adopted_ranges: None,
                 cache_actions: Vec::new(),
             });
         }
@@ -2907,6 +2963,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             inserted_host_node: None,
             host_insert_dropped: false,
             mamba_exist: false,
+            adopted_ranges: None,
             cache_actions,
         };
         if matched_length == total_len {

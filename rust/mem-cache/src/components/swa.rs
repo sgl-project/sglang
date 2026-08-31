@@ -380,6 +380,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         total_prefix_len: usize,
         value_slice: Tensor,
         params: &InsertParams<'_, K>,
+        result: &mut InsertResult,
         cache_actions: &mut Vec<CacheAction>,
     ) -> usize {
         if params.prev_prefix_len >= total_prefix_len + prefix_len {
@@ -406,6 +407,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
 
         if swa_evicted_seqlen <= total_prefix_len {
             // Branch 1: entire value_slice is within SWA window — recover
+            result.record_adopted_range(SWA, total_prefix_len, total_prefix_len + prefix_len);
             if node.device_lock_ref(FULL) > 0 {
                 cache_actions.push(CacheAction::RecoverSwaWithLockedFull {
                     node_id: node.id,
@@ -414,6 +416,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 });
                 return 0;
             }
+            result.record_adopted_range(FULL, total_prefix_len, total_prefix_len + prefix_len);
             let old_full = node.take_device_value(FULL);
             node.set_device_value(FULL, value_slice.copy());
             cache_actions.push(CacheAction::FreeDeviceKVFullOnly(vec![old_full]));
@@ -425,6 +428,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         } else if swa_evicted_seqlen < total_prefix_len + prefix_len {
             // Branch 2: value_slice[start_idx:] is within SWA window — partial recover
             let start_idx = swa_evicted_seqlen - total_prefix_len;
+            result.record_adopted_range(SWA, swa_evicted_seqlen, total_prefix_len + prefix_len);
             let node_ext_id = node.id;
             let is_locked = node.device_lock_ref(FULL) > 0;
             let full_len = node.device_value_len(FULL);
@@ -444,6 +448,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 });
                 return start_idx;
             }
+            result.record_adopted_range(FULL, swa_evicted_seqlen, total_prefix_len + prefix_len);
             let node = tree_core.arena.node_mut(node_id);
             let _ = node.take_device_value(FULL);
             node.set_device_value(FULL, new_full.copy());
@@ -466,6 +471,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         prefix_len: usize,
         total_prefix_len: usize,
         params: &InsertParams<'_, K>,
+        result: &mut InsertResult,
         cache_actions: &mut Vec<CacheAction>,
     ) {
         // _unevict_node_on_insert already wrote the request's fresh KV slice
@@ -498,6 +504,11 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         } else {
             return;
         }
+        result.record_adopted_range(
+            SWA,
+            total_prefix_len.max(swa_evicted_seqlen),
+            total_prefix_len + prefix_len,
+        );
         cache_actions.push(CacheAction::SwaRebuild {
             node_id: tree_core.arena.node(node_id).id,
             source_value: tree_core.arena.device_value(node_id, FULL).shallow_clone(),
@@ -518,6 +529,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         }
 
         let node_start = result.prefix_len;
+        let node_end = node_start + tree_core.arena.node(node_id).key.atom_len();
         // A boundary above the leaf skips the split (Python's negative split_pos).
         if params.swa_evicted_seqlen >= node_start {
             let split_pos = params.swa_evicted_seqlen - node_start;
@@ -532,6 +544,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 assert!(action.is_none(), "new leaf cannot be write-through-pending");
             }
         }
+        result.record_adopted_range(SWA, node_start.max(params.swa_evicted_seqlen), node_end);
         // Cap the in-window leaf at one window for lock granularity, then rebuild SWA
         // onto the in-window node(s) at apply time; rebuild the older prefix first so
         // the in-window tail lands more-MRU.
