@@ -95,6 +95,10 @@ from sglang.multimodal_gen.runtime.models.dits.longcat_image import (
     _apply_longcat_qknorm_rope,
 )
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import _ltx2_rms_norm_modulate
+from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+    QwenImageTransformerBlock,
+    _qwen_modulation_cache_key,
+)
 from sglang.multimodal_gen.runtime.models.dits.sana import (
     _eager_ln_modulate as _sana_eager_ln_modulate,
 )
@@ -289,6 +293,117 @@ class TestFlux2EagerFusions(CustomTestCase):
         expected = F.silu(second[..., :384]) * second[..., 384:]
         self.assertTrue(torch.equal(actual, expected))
         self.assertEqual(len(flux2._FLUX2_SWIGLU_SIGS), 1)
+
+
+# -------------------------------------------------------------------------
+# Qwen-Image -- reuse timestep-only modulation across serial CFG branches
+# -------------------------------------------------------------------------
+
+
+class _CountingProjection(nn.Module):
+    def __init__(self, offset: float):
+        super().__init__()
+        self.offset = offset
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        return x + self.offset, None
+
+
+class TestQwenImageModulationCache(CustomTestCase):
+    def _block(self):
+        block = QwenImageTransformerBlock.__new__(QwenImageTransformerBlock)
+        nn.Module.__init__(block)
+        block.img_mod = nn.ModuleList([nn.Identity(), _CountingProjection(1.0)])
+        block.txt_mod = nn.ModuleList([nn.Identity(), _CountingProjection(2.0)])
+        block._modulation_cache = None
+        return block
+
+    def _key(self, timestep, hidden, additional_t_cond=None):
+        with torch.no_grad():
+            return _qwen_modulation_cache_key(
+                timestep,
+                additional_t_cond,
+                hidden,
+            )
+
+    def test_matching_cfg_key_reuses_both_modulation_projections(self):
+        block = self._block()
+        timestep = torch.tensor([500.0], device="cuda")
+        hidden = torch.empty(1, 17, 32, device="cuda", dtype=torch.bfloat16)
+        img_temb = torch.randn(1, 32, device="cuda", dtype=torch.bfloat16)
+        txt_temb = torch.randn_like(img_temb)
+        key = self._key(timestep, hidden)
+
+        first = block._get_modulation_params(img_temb, txt_temb, key)
+        second = block._get_modulation_params(img_temb, txt_temb, key)
+
+        self.assertIs(first[0], second[0])
+        self.assertIs(first[1], second[1])
+        self.assertIsNone(block._modulation_cache)
+        self.assertEqual(block.img_mod[1].calls, 1)
+        self.assertEqual(block.txt_mod[1].calls, 1)
+
+    def test_tensor_identity_version_and_condition_invalidate_cache(self):
+        block = self._block()
+        timestep = torch.tensor([500.0], device="cuda")
+        hidden = torch.empty(1, 17, 32, device="cuda", dtype=torch.bfloat16)
+        temb = torch.randn(1, 32, device="cuda", dtype=torch.bfloat16)
+        key = self._key(timestep, hidden)
+        block._get_modulation_params(temb, temb, key)
+
+        with torch.no_grad():
+            timestep.add_(1)
+        mutated = self._key(timestep, hidden)
+        block._get_modulation_params(temb, temb, mutated)
+        self.assertEqual(block.img_mod[1].calls, 2)
+
+        same_value_new_tensor = self._key(timestep.clone(), hidden)
+        block._get_modulation_params(temb, temb, same_value_new_tensor)
+        self.assertEqual(block.img_mod[1].calls, 3)
+
+        condition = torch.tensor([1], device="cuda")
+        conditioned = self._key(timestep, hidden, condition)
+        block._get_modulation_params(temb, temb, conditioned)
+        self.assertEqual(block.img_mod[1].calls, 4)
+
+    def test_grad_enabled_path_disables_and_clears_cache(self):
+        block = self._block()
+        timestep = torch.tensor([500.0], device="cuda")
+        hidden = torch.empty(1, 17, 32, device="cuda", dtype=torch.bfloat16)
+        temb = torch.randn(1, 32, device="cuda", dtype=torch.bfloat16)
+        key = self._key(timestep, hidden)
+        block._get_modulation_params(temb, temb, key)
+
+        self.assertIsNone(_qwen_modulation_cache_key(timestep, None, hidden))
+        block._get_modulation_params(temb, temb, None)
+
+        self.assertIsNone(block._modulation_cache)
+        self.assertEqual(block.img_mod[1].calls, 2)
+
+    def test_inference_tensors_cache_and_graph_path_falls_back(self):
+        block = self._block()
+        with torch.inference_mode():
+            timestep = torch.tensor([500.0], device="cuda")
+            hidden = torch.empty(1, 17, 32, device="cuda", dtype=torch.bfloat16)
+            temb = torch.randn(1, 32, device="cuda", dtype=torch.bfloat16)
+            key = _qwen_modulation_cache_key(timestep, None, hidden)
+
+            first = block._get_modulation_params(temb, temb, key)
+            second = block._get_modulation_params(temb, temb, key)
+
+        self.assertIs(first[0], second[0])
+        self.assertEqual(block.img_mod[1].calls, 1)
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.qwen_image.is_in_breakable_cuda_graph",
+                return_value=True,
+            ),
+            torch.no_grad(),
+        ):
+            self.assertIsNone(_qwen_modulation_cache_key(timestep, None, hidden))
 
 
 # -------------------------------------------------------------------------

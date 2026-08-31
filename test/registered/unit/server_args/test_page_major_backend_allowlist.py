@@ -15,9 +15,9 @@
 
 The page-major envelope K/V views are strided, which only the Triton attention
 kernels read. The one exception is the unified-memory MLA pool: it exposes each
-layer as a DENSE contiguous view (`build_dense_mla_views`), so the paged MLA
+layer as a contiguous view (`build_mla_views`), so the paged MLA
 backends can read it directly once their kv_indices / block tables are remapped
-to dense ids -- `fa3`, `flashinfer`'s MLA backend, and `trtllm_mla` with its
+to kernel-facing ids -- `fa3`, `flashinfer`'s MLA backend, and `trtllm_mla` with its
 `cutedsl_mla` / `tokenspeed_mla` subclasses.
 
 Pinned here so the exception cannot silently widen to a backend that has no
@@ -30,7 +30,10 @@ under its own default configuration.
 """
 
 import unittest
+from types import SimpleNamespace
 
+from sglang.srt.arg_groups.kv_cache_hook import handle_page_major_kv_layout
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -44,6 +47,7 @@ def _accepts(
     unified: bool = True,
     linear_decode: str | None = None,
     linear_prefill: str | None = None,
+    has_asymmetric_kv: bool = False,
 ) -> bool:
     """Run just `_handle_page_major_kv_layout` against a minimal stand-in.
 
@@ -65,10 +69,20 @@ def _accepts(
         "mamba_backend": "triton",
     }.items():
         object.__setattr__(sa, name, value)
-    sa.use_mla_backend = lambda: use_mla
-    sa._resolved_attention_backends = lambda: [backend]
+    object.__setattr__(
+        sa,
+        "_model_config",
+        SimpleNamespace(
+            attention_arch=AttentionArch.MLA if use_mla else AttentionArch.MHA,
+            has_asymmetric_kv=has_asymmetric_kv,
+            head_dim=192 if has_asymmetric_kv else 128,
+            v_head_dim=128,
+            swa_head_dim=128,
+            swa_v_head_dim=128,
+        ),
+    )
     try:
-        ServerArgs._handle_page_major_kv_layout(sa)
+        handle_page_major_kv_layout(sa)
         return True
     except AssertionError:
         return False
@@ -98,7 +112,7 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
             )
 
     def test_dense_mla_backends_rejected_for_mha(self):
-        """The dense-view exception is MLA-only -- MHA sub-pools stay strided."""
+        """The per-layer-view exception is MLA-only -- MHA sub-pools stay strided."""
         for backend in self.DENSE_MLA_BACKENDS:
             self.assertFalse(
                 _accepts(backend, use_mla=False),
@@ -114,6 +128,40 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 f"{backend} must stay rejected without --enable-unified-memory",
             )
 
+    def test_plain_page_major_arm_is_gated_at_boot(self):
+        """The strided views were removed: --enable-page-major-kv-layout
+        without --enable-unified-memory must be rejected up front for EVERY
+        backend, Triton included, until the per-layer-view reimplementation."""
+        for backend in ("triton",) + self.DENSE_MLA_BACKENDS:
+            for use_mla in (True, False):
+                self.assertFalse(
+                    _accepts(backend, use_mla=use_mla, unified=False),
+                    f"{backend} must be rejected on the static page-major arm",
+                )
+
+    def test_asymmetric_kv_mha_model_cannot_use_unified_memory(self):
+        """head_dim != v_head_dim (MiMoV2): no uniform rows, so no per-layer views
+        and no unified pool. The rejection is the POOL's, not a backend's, so
+        it must fire on every backend -- Triton included."""
+        for backend in ("triton",) + self.DENSE_MLA_BACKENDS:
+            self.assertFalse(
+                _accepts(backend, use_mla=False, has_asymmetric_kv=True),
+                f"--enable-unified-memory + {backend} must be rejected for an "
+                "asymmetric-K/V model",
+            )
+
+    def test_asymmetric_dims_do_not_screen_out_mla(self):
+        """MLA stores one latent row per layer, so its K/V head dims never have
+        to agree -- and real MLA configs report them as unequal (Kimi-Linear:
+        head_dim 72, v_head_dim 128). Screening on `has_asymmetric_kv` alone
+        would lock every one of them out of the unified pool."""
+        for backend in ("triton",) + self.DENSE_MLA_BACKENDS:
+            self.assertTrue(
+                _accepts(backend, use_mla=True, has_asymmetric_kv=True),
+                f"{backend} must stay allowed for an MLA model with asymmetric "
+                "K/V head dims",
+            )
+
     def test_unwired_backends_always_rejected(self):
         for backend in self.UNWIRED_BACKENDS:
             for use_mla in (True, False):
@@ -123,15 +171,10 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 )
 
     def test_helion_linear_attention_is_kda_only(self):
-        for unified in (True, False):
-            for phase in ("decode", "prefill"):
-                kwargs = {f"linear_{phase}": "helion"}
-                self.assertTrue(
-                    _accepts("triton", use_mla=True, unified=unified, **kwargs)
-                )
-                self.assertFalse(
-                    _accepts("triton", use_mla=False, unified=unified, **kwargs)
-                )
+        for phase in ("decode", "prefill"):
+            kwargs = {f"linear_{phase}": "helion"}
+            self.assertTrue(_accepts("triton", use_mla=True, **kwargs))
+            self.assertFalse(_accepts("triton", use_mla=False, **kwargs))
 
 
 if __name__ == "__main__":

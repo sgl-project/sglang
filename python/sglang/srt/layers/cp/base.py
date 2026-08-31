@@ -33,7 +33,6 @@ from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.server_args import ServerArgs
 
 
 class ContextParallelStrategyKind(IntEnum):
@@ -237,20 +236,27 @@ def _is_dsa_active() -> bool:
 _STRATEGY: Optional[ContextParallelStrategy] = None
 
 
-def init_cp_strategy(server_args: ServerArgs) -> None:
-    """Bind the configured CP strategy for this process."""
+def init_cp_strategy(
+    *, enable_prefill_cp: bool, cp_size: int, cp_strategy: str
+) -> None:
+    """Bind the CP strategy for this process.
+
+    Takes the three values: resolution calls this from inside `__post_init__`,
+    where the bags do not exist yet, and `get_cp_strategy` calls it lazily in a
+    worker, which reads them off the published bags. Each caller reads from the
+    source it has.
+    """
     global _STRATEGY
 
-    if not getattr(server_args, "enable_prefill_cp", False):
+    if not enable_prefill_cp:
         _STRATEGY = None
         return
 
-    cp_size = getattr(server_args, "attn_cp_size", 1)
     if cp_size <= 1:
         _STRATEGY = None
         return
 
-    kind = ContextParallelStrategyKind.from_string(server_args.cp_strategy)
+    kind = ContextParallelStrategyKind.from_string(cp_strategy)
     if kind == ContextParallelStrategyKind.ZIGZAG:
         from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 
@@ -261,8 +267,7 @@ def init_cp_strategy(server_args: ServerArgs) -> None:
         _STRATEGY = InterleaveCPStrategy(cp_size=cp_size)
     else:
         raise ValueError(
-            f"Unsupported cp_strategy kind {kind} for "
-            f"cp_strategy={server_args.cp_strategy!r}"
+            f"Unsupported cp_strategy kind {kind} for cp_strategy={cp_strategy!r}"
         )
 
 
@@ -277,14 +282,20 @@ def get_cp_strategy() -> Optional[ContextParallelStrategy]:
     global _STRATEGY
 
     if _STRATEGY is None:
-        from sglang.srt.runtime_context import get_server_args
-
+        # The reads are what raise, so they sit inside the guard.
         try:
-            server_args = get_server_args()
-        except ValueError:
+            parallel = get_parallel()
+            enable_prefill_cp = parallel.enable_prefill_cp
+            cp_size = parallel.attn_cp_size
+            cp_strategy = parallel.cp_strategy
+        except (AssertionError, AttributeError, RuntimeError, ValueError):
             return None
-        if server_args is not None and get_parallel().enable_prefill_cp:
-            init_cp_strategy(server_args)
+        if enable_prefill_cp:
+            init_cp_strategy(
+                enable_prefill_cp=True,
+                cp_size=cp_size,
+                cp_strategy=cp_strategy,
+            )
     return _STRATEGY
 
 

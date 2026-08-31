@@ -48,6 +48,11 @@ import torch
 import uvloop
 import zmq
 
+from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.engine_info_bootstrap_server import (
     EngineInfoBootstrapServer,
@@ -98,9 +103,7 @@ from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
-    configured_attn_cp_size,
-    configured_moe_dp_size,
-    configured_pp_size,
+    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -252,7 +255,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 kwargs["log_level"] = "error"
             server_args = self.server_args_class(**kwargs)
         self.server_args = server_args
-        logger.info(f"{server_args=}")
+        logger.info(f"server_args={server_args.resolved_dict()}")
 
         # Rust Server is not supported with the offline Engine API
         if envs.SGLANG_RUST_SERVER.get():
@@ -312,9 +315,9 @@ class Engine(EngineScoreMixin, EngineBase):
                 trace_modules=server_args.trace_modules,
             )
             thread_label = "Tokenizer"
-            if server_args.disaggregation_mode == "prefill":
+            if get_disagg().disaggregation_mode == "prefill":
                 thread_label = "Prefill Tokenizer"
-            elif server_args.disaggregation_mode == "decode":
+            elif get_disagg().disaggregation_mode == "decode":
                 thread_label = "Decode Tokenizer"
             trace_set_thread_info(thread_label)
 
@@ -684,7 +687,7 @@ class Engine(EngineScoreMixin, EngineBase):
         pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
             _calculate_rank_ranges(
                 server_args.nnodes,
-                configured_pp_size(),
+                get_parallel().pp_size,
                 tp_size,
                 server_args.node_rank,
             )
@@ -845,7 +848,7 @@ class Engine(EngineScoreMixin, EngineBase):
             pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
                 _calculate_rank_ranges(
                     server_args.nnodes,
-                    configured_pp_size(),
+                    get_parallel().pp_size,
                     server_args.tp_size,
                     server_args.node_rank,
                 )
@@ -1059,10 +1062,8 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Needs a tokenizer and a chat template, so it cannot live in the
         # pipeline; after the plugins, which may register the parser detected.
-        if (
-            server_args.reasoning_parser == "auto"
-            or server_args.tool_call_parser == "auto"
-        ):
+        parsers = resolving_view(server_args)
+        if parsers.reasoning_parser == "auto" or parsers.tool_call_parser == "auto":
             resolve_auto_parsers(server_args)
 
         # This publish replaces whatever was published before it, so the
@@ -1079,7 +1080,7 @@ class Engine(EngineScoreMixin, EngineBase):
             # Allocate ports for inter-process communications
             if port_args is None:
                 port_args = PortArgs.init_new(server_args)
-            logger.info(f"{server_args=}")
+            logger.info(f"server_args={server_args.resolved_dict()}")
 
             # Start the engine info bootstrap server if per-rank info is needed.
             engine_info_bootstrap_server = None
@@ -1345,7 +1346,7 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         return msgspec_to_builtins(
             {
-                **dataclasses.asdict(self.tokenizer_manager.server_args),
+                **self.tokenizer_manager.server_args.resolved_dict(),
                 **self._scheduler_init_result.scheduler_infos[0],
                 "startup_time": self.tokenizer_manager.startup_time,
                 "internal_states": internal_states,
@@ -1630,27 +1631,29 @@ class Engine(EngineScoreMixin, EngineBase):
 
 
 def _set_envs_and_config(server_args: ServerArgs):
+
+    cfg = resolving_view(server_args)
     # Set global environments
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
     # cuMem-based buffers and MNNVL transport. Default them on (user-set
     # values win; the symm-mem override below only fires when unset).
-    if server_args.nnodes > 1 and is_mnnvl_fabric_device():
+    if cfg.nnodes > 1 and is_mnnvl_fabric_device():
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         os.environ.setdefault("NCCL_MNNVL_ENABLE", "1")
-    if "NCCL_CUMEM_ENABLE" not in os.environ or server_args.enable_symm_mem:
-        os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
+    if "NCCL_CUMEM_ENABLE" not in os.environ or cfg.enable_symm_mem:
+        os.environ["NCCL_CUMEM_ENABLE"] = str(int(cfg.enable_symm_mem))
     if (
         "NCCL_NVLS_ENABLE" not in os.environ
-        or server_args.enable_nccl_nvls
-        or server_args.enable_symm_mem
+        or cfg.enable_nccl_nvls
+        or cfg.enable_symm_mem
     ):
         os.environ["NCCL_NVLS_ENABLE"] = str(
-            int(server_args.enable_nccl_nvls or server_args.enable_symm_mem)
+            int(cfg.enable_nccl_nvls or cfg.enable_symm_mem)
         )
-    if "NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or server_args.enable_symm_mem:
+    if "NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or cfg.enable_symm_mem:
         # Note(wh): NCCL_GRAPH_MIXING_SUPPORT=0 can help improve performance for symmetric kernels.
         # details in https://github.com/NVIDIA/nccl-tests/issues/333#issuecomment-3103636985
-        if server_args.dcp_size > 1:
+        if cfg.dcp_size > 1:
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
 
@@ -1672,7 +1675,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     )
 
     # Set prometheus env vars
-    if server_args.enable_metrics:
+    if cfg.enable_metrics:
         set_prometheus_multiproc_dir()
 
     # Set ulimit
@@ -1680,10 +1683,10 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Check flashinfer version
     if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
-        if "flashinfer" in server_args.get_attention_backends():
+        if "flashinfer" in attention_backends_of(resolved_view(cfg)):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.17",
+                "0.6.18",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -1697,7 +1700,7 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Signal handlers can only be registered from the main thread.
     if threading.current_thread() is threading.main_thread():
-        if server_args.custom_sigquit_handler is None:
+        if cfg.custom_sigquit_handler is None:
             # Register the signal handler.
             # The child processes will send SIGQUIT to this process when any error happens
             # This process then clean up the whole process tree
@@ -1712,10 +1715,8 @@ def _set_envs_and_config(server_args: ServerArgs):
             signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
         else:
             # Allow users to register a custom SIGQUIT handler for things like crash dump
-            logger.error(
-                f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
-            )
-            signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
+            logger.error(f"Using custom SIGQUIT handler: {cfg.custom_sigquit_handler}")
+            signal.signal(signal.SIGQUIT, cfg.custom_sigquit_handler)
     else:
         logger.warning(
             "Signal handler is not added because the engine is not in the "
@@ -1727,7 +1728,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
     # Set gc threshold
-    if gc_threshold := server_args.gc_threshold:
+    if gc_threshold := cfg.gc_threshold:
         gc.set_threshold(*gc_threshold)
 
     _log_legacy_kernel_cache_dirs()
@@ -1847,8 +1848,8 @@ def _compute_parallelism_ranks(
     """
     attn_dp_size = get_parallel().dp_size if get_parallel().enable_dp_attention else 1
     tp_size = server_args.tp_size
-    attn_cp_size = configured_attn_cp_size()
-    moe_dp_size = configured_moe_dp_size()
+    attn_cp_size = get_parallel().attn_cp_size
+    moe_dp_size = get_parallel().moe_dp_size
 
     # Parallelism hierarchy (outermost to innermost):
     # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)

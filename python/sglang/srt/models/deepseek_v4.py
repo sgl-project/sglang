@@ -156,7 +156,13 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_platform,
+)
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -530,6 +536,10 @@ def deepseek_v4_attention_with_output(
     attention_layer = attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
 
+    if real_num_tokens == 0:
+        output.zero_()
+        return
+
     query = query[:real_num_tokens]
     key_value = key_value[:real_num_tokens]
 
@@ -848,9 +858,7 @@ class MQALayer(MqaAttentionBase):
             self.alt_streams = None
             self.alt_streams_indexer = None
 
-        from sglang.srt.utils import is_blackwell_supported
-
-        self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
+        self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
 
         self.compressor = None
         self.indexer = None
@@ -1055,8 +1063,6 @@ class MQALayer(MqaAttentionBase):
                 x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
             )
 
-        del qkv_a
-
         if self.compressor is not None:
             with torch.cuda.stream(stream_compressor):
                 attn_backend.forward_core_compressor(
@@ -1067,6 +1073,7 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
+        del qkv_a
 
         return q
 
@@ -1149,8 +1156,6 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
             q.record_stream(stream_q)
 
-        del qkv_a
-
         # Indexer + compressor: serial on current.
         if self.indexer is not None:
             self.indexer(
@@ -1170,6 +1175,7 @@ class MQALayer(MqaAttentionBase):
         # Join stream_kv + stream_q before downstream attention.
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_q)
+        del qkv_a
         return q
 
     def _forward_prepare_multi_stream_hip(
@@ -2300,10 +2306,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             if moe_a2a_backend.is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
-                assert moe_a2a_backend.is_deepep() or moe_a2a_backend.is_megamoe(), (
-                    "CP requires DeepEP or megaMoE "
-                    "(moe_a2a_backend == deepep or megamoe). "
-                    f"Got {moe_a2a_backend.value}."
+                assert (
+                    moe_a2a_backend.is_deepep()
+                    or moe_a2a_backend.is_megamoe()
+                    or moe_a2a_backend.is_mori()
+                ), (
+                    "CP requires moe_a2a_backend in ('deepep', 'megamoe', 'mori'), "
+                    f"got {moe_a2a_backend.value!r}."
                 )
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = (

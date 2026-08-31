@@ -22,6 +22,7 @@ from sglang.srt.model_loader.loader import (
     BaseModelLoader,
     _initialize_model,
 )
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 from .protocol import (
     CacheConfig,
@@ -76,6 +77,7 @@ class IpcModelLoader(BaseModelLoader):
         self.weight_cache_mode = weight_cache_mode
         self._fallback_loader_cls = fallback_loader_cls
         self._fallback_load_format = fallback_load_format
+        self.preloaded_weights_bytes = 0
         self._transport_backend = get_client_transport_backend(TORCH_IPC_BACKEND)
 
     def load_model(
@@ -90,6 +92,7 @@ class IpcModelLoader(BaseModelLoader):
         (fallback to disk loading would cause OOM on shared GPUs).
         In client mode, falls back to DefaultModelLoader.
         """
+        self.preloaded_weights_bytes = 0
         tic = time.perf_counter()
 
         # Hard-gate unsupported quant methods before touching the daemon, so an
@@ -119,6 +122,19 @@ class IpcModelLoader(BaseModelLoader):
             return self._fallback_load(model_config, device_config)
 
         entries = cache_data["entries"]
+        # Older daemons omit this field; missing metadata means no correction.
+        preloaded_weights_bytes = cache_data.get("preloaded_weights_bytes", 0)
+        if preloaded_weights_bytes is None:
+            preloaded_weights_bytes = 0
+        if (
+            isinstance(preloaded_weights_bytes, bool)
+            or not isinstance(preloaded_weights_bytes, int)
+            or preloaded_weights_bytes < 0
+        ):
+            raise RuntimeError(
+                "[IpcModelLoader] Daemon returned invalid weight-memory metadata: "
+                f"{preloaded_weights_bytes=}"
+            )
         logger.info(
             f"[IpcModelLoader] Fetched {len(entries)} tensors from daemon "
             f"(transport={self._transport_backend.name}) "
@@ -137,6 +153,7 @@ class IpcModelLoader(BaseModelLoader):
             entries,
             quant_config,
         )
+        self.preloaded_weights_bytes = preloaded_weights_bytes
 
         # Skip _post_load_weights: the daemon already ran
         # process_weights_after_loading on the weights before exporting
@@ -478,7 +495,7 @@ class IpcModelLoader(BaseModelLoader):
 
         try:
             # Build engine's config fingerprint
-            from sglang.srt.runtime_context import get_exec, get_parallel
+            from sglang.srt.layers.dp_attention import get_moe_cp_size
 
             ps = get_parallel()
             tp_size = ps.tp_size
@@ -488,11 +505,11 @@ class IpcModelLoader(BaseModelLoader):
             pp_rank = ps.pp_rank
 
             ep_size = ps.moe_ep_size
-            moe_dp_size = ps.moe_dp_size
+            moe_dp_size = get_moe_cp_size()
             moe_dp_rank = ps.moe_dp_rank
             moe_ep_rank = ps.moe_ep_rank
 
-            dp_size = ps.dp_size
+            dp_size = get_parallel().dp_size
 
             quant_method, quant_config = self._resolve_engine_quant(model_config)
 
