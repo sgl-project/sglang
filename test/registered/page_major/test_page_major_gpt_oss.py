@@ -1,10 +1,10 @@
 """
-End-to-end accuracy test for the page-major KV layout on a hybrid-SWA MoE model.
+End-to-end accuracy test for the unified memory pool on a hybrid-SWA MoE model.
 
-Launches gpt-oss-20b with ``--enable-page-major-kv-layout`` on the Triton
-attention backend and checks that GSM8K accuracy holds. This exercises the
-SWA + full-attention KV pools under the page-granularity envelope layout
-(SWAKVPool routes both sub-pools through PageMajorMHATokenToKVPool).
+Launches gpt-oss-20b with ``--enable-unified-memory`` on the Triton attention
+backend and checks that GSM8K accuracy holds. This exercises the SWA +
+full-attention KV sub-pools stored as per-layer views in the unified
+page-major envelope.
 
 Registered to the label-gated ``run-ci-extra`` suite (opt-in, not per-commit).
 
@@ -22,9 +22,17 @@ from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
 
 register_cuda_ci(est_time=420, stage="extra-a", runner_config="1-gpu-large")
 
+_UNIFIED_COMMON_ARGS = [
+    "--enable-unified-memory",
+    "--mem-fraction-static",
+    "0.70",
+    "--cuda-graph-backend-prefill=disabled",
+]
 
-class TestPageMajorGptOss(DefaultServerBase):
-    """Page-major KV layout on gpt-oss-20b (hybrid-SWA MoE), Triton backend."""
+
+class TestUnifiedGptOssTriton(DefaultServerBase):
+    """Unified pool on gpt-oss-20b (hybrid-SWA MoE), Triton pinned: dense
+    MHA/SWA views through the reference backend."""
 
     model = DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
 
@@ -33,16 +41,7 @@ class TestPageMajorGptOss(DefaultServerBase):
     num_shots = 5
     parallel = 32
 
-    other_args = [
-        "--enable-page-major-kv-layout",
-        # The envelope's strided 4-D K/V views are only read by the Triton
-        # attention kernels (the layout's validator enforces this).
-        "--attention-backend",
-        "triton",
-        "--mem-fraction-static",
-        "0.70",
-        "--cuda-graph-backend-prefill=disabled",
-    ]
+    other_args = _UNIFIED_COMMON_ARGS + ["--attention-backend", "triton"]
 
     def test_gsm8k(self):
         from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k
