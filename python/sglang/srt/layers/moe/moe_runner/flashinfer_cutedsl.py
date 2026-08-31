@@ -337,7 +337,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     else:
         # Standard allgather path: the MoE sees up to dp_size local forwards
         # gathered together, so scale the per-rank forward bound by dp_size.
-        max_num_tokens = get_parallel().config.dp_size * cutedsl_moe_max_num_tokens()
+        max_num_tokens = get_parallel().dp_size * cutedsl_moe_max_num_tokens()
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside
@@ -496,10 +496,10 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 
 @register_fused_func("flashinfer", "flashinfer_cutedsl")
 def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
-    dispatch_output: FlashinferDispatchOutput,
+    dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: CuteDslFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> FlashinferCombineInput:
+) -> FlashinferCombineInput | StandardCombineInput:
     """CuteDSL fused func for flashinfer alltoall dispatcher.
 
     Two cases depending on whether the dispatcher did FP4 quantization:
@@ -508,6 +508,10 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     """
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardCombineInput,
+        StandardDispatchOutput,
     )
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
@@ -579,6 +583,9 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     )
 
     # Note: output contains routed expert results; shared_expert is handled separately
+
+    if isinstance(dispatch_output, StandardDispatchOutput):
+        return StandardCombineInput(hidden_states=output)
 
     # Write into pre-allocated workspace buffer if available
     if dispatch_output.moe_output is not None:
