@@ -1270,7 +1270,7 @@
             "expected_avg_denoise_ms": 118.58,
             "expected_median_denoise_ms": 109.14,
             "load_peak_vram_mb": 43920.0,
-            "runtime_peak_vram_mb": 57528.0,
+            "runtime_peak_vram_mb": 72438.0,
             "estimated_full_test_time_s": 345.4
         },
         "wan2_2_ti2v_5b": {
@@ -1516,7 +1516,7 @@
             "stages_ms": {
                 "InputValidationStage": 15.59,
                 "ImageVAEEncodingStage": 1484.2,
-                "DecodingStage": 1114.63,
+                "DecodingStage": 2450.0,
                 "LatentPreparationStage": 0.21,
                 "TextEncodingStage": 327.94,
                 "TimestepPreparationStage": 2.47,
@@ -1568,7 +1568,7 @@
             "expected_avg_denoise_ms": 1689.73,
             "expected_median_denoise_ms": 1714.58,
             "load_peak_vram_mb": 6440.0,
-            "runtime_peak_vram_mb": 26322.0,
+            "runtime_peak_vram_mb": 75468.0,
             "estimated_full_test_time_s": 264.1
         },
         "wan2_1_i2v_14b_480P_2gpu": {
@@ -1892,7 +1892,7 @@
             "expected_avg_denoise_ms": 1437.82,
             "expected_median_denoise_ms": 1416.85,
             "load_peak_vram_mb": 6784.0,
-            "runtime_peak_vram_mb": 21450.0,
+            "runtime_peak_vram_mb": 72396.0,
             "estimated_full_test_time_s": 181.8
         },
         "wan2_1_t2v_1_3b_lora_1gpu": {
@@ -2030,7 +2030,7 @@
             "expected_avg_denoise_ms": 1913.15,
             "expected_median_denoise_ms": 1922.21,
             "load_peak_vram_mb": 36266.0,
-            "runtime_peak_vram_mb": 51132.0,
+            "runtime_peak_vram_mb": 58868.0,
             "estimated_full_test_time_s": 248.2
         },
         "flux_2_image_t2i_2_gpus": {
@@ -2185,7 +2185,7 @@
             "expected_avg_denoise_ms": 82.26,
             "expected_median_denoise_ms": 81.75,
             "load_peak_vram_mb": 7176.0,
-            "runtime_peak_vram_mb": 12634.0,
+            "runtime_peak_vram_mb": 24338.0,
             "estimated_full_test_time_s": 122.7
         },
         "hunyuan3d_shape_gen": {

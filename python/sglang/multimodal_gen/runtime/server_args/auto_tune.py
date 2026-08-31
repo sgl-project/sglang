@@ -71,6 +71,8 @@ def auto_residency_static_skip_reason(server_args: ServerArgs) -> str | None:
         return "disabled via SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY"
     if server_args.performance_mode != "auto":
         return f"performance_mode={server_args.performance_mode}"
+    if server_args.ltx2_two_stage_device_mode == "original":
+        return "LTX-2 original two-stage placement"
     if server_args.disagg_role != RoleType.MONOLITHIC:
         return "disaggregated role"
     task_type = server_args.pipeline_config.task_type
