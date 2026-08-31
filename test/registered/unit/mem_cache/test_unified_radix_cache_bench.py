@@ -240,7 +240,7 @@ def create_bench_cache(
     _rid = [0]
 
     def make_req():
-        from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+        from sglang.srt.managers.schedule_batch import Req
         from sglang.srt.sampling.sampling_params import SamplingParams
 
         req = Req(
@@ -251,8 +251,6 @@ def create_bench_cache(
         )
         _rid[0] += 1
         req_to_token_pool.alloc([req])
-        # fabricated reqs bypass alloc_for_extend, the normal creator of req.kv
-        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
         return req
 
     return tree, allocator, req_to_token_pool, make_req
@@ -644,11 +642,11 @@ def bench_cache_finished(
             len(req.prefix_indices), len(req.full_untruncated_fill_ids)
         )
         req.last_node = node
-        req.cache_protected_len = matched_len
-        req.kv_committed_len = len(seq)
+        req.kv.cache_protected_len = matched_len
+        req.kv.kv_committed_len = len(seq)
         if hasattr(lr, "swa_uuid_for_lock"):
             req.swa_uuid_for_lock = lr.swa_uuid_for_lock
-        env.rtp.req_to_token[req.req_pool_idx, : len(kv_indices)] = kv_indices
+        env.rtp.req_to_token[req.kv.req_pool_idx, : len(kv_indices)] = kv_indices
         req_items.append(req)
 
     if not req_items:
@@ -659,7 +657,7 @@ def bench_cache_finished(
         "cache_finished",
         lambda: req_items,
         lambda req: env.tree.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req.kv_committed_len
+            req, is_insert=True, kv_len_to_handle=req.kv.kv_committed_len
         ),
         len(req_items) - warmup,
         env.avg_tokens,
