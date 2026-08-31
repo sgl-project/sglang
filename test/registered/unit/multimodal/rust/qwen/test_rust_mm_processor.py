@@ -22,7 +22,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.mm_utils import hash_feature  # noqa: E402
-from sglang.srt.managers.rust_server import NativeMmHost  # noqa: E402
+from sglang.srt.rust_server.multimodal import RustMmProcessor  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -32,7 +32,7 @@ from _mm_rust_utils import PROCESSOR_CONFIGS, image_bytes, load_core  # noqa: E4
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 CORE = load_core()
-DRIVER = getattr(getattr(CORE, "qwen_vl", None), "process_native_mm", None)
+DRIVER = getattr(getattr(CORE, "qwen_vl", None), "process_mm", None)
 
 
 def raw_bytes(source):
@@ -45,7 +45,7 @@ def raw_bytes(source):
 
 
 @unittest.skipUnless(DRIVER, "sglang-mm native Qwen driver not built")
-class TestQwenNativeMmHashes(CustomTestCase):
+class TestQwenRustMmHashes(CustomTestCase):
     def setUp(self):
         from sglang.srt.managers.multimodal_processor import import_processors
 
@@ -58,11 +58,11 @@ class TestQwenNativeMmHashes(CustomTestCase):
 
     def native_hashes(self, sources):
         """Per-item hashes the Rust driver returns, via the production gate."""
-        host = NativeMmHost.__new__(NativeMmHost)
+        host = RustMmProcessor.__new__(RustMmProcessor)
         host.model_config = SimpleNamespace(hf_config=self.processor.hf_config)
         host._processor = self.processor._processor
         host.server_args = self.processor.server_args
-        spec = host.resolve_native_spec()
+        spec = host.resolve_spec()
         self.assertIsNotNone(spec, "gate rejected the fixture processor")
         input_ids = [t for _ in sources for t in (1, 2, 3, 4)]
         return DRIVER(input_ids, sources, spec.rust_json())[3]

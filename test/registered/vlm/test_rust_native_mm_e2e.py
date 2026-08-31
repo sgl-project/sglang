@@ -2,7 +2,7 @@
 
 Covers what the CPU parity units structurally cannot: the sidecar handoff, the
 drain ordering, Rust-side tokenization of multimodal prompts, and the rejection
-of inputs outside the native pipeline's scope (there is no Python fallback).
+of inputs outside the Rust pipeline's scope (there is no Python fallback).
 """
 
 import base64
@@ -51,7 +51,7 @@ def solid_image_data_url(fmt):
     importlib.util.find_spec("sglang.srt.rust_extensions._server") is None,
     "sglang-server rust extension not installed (e.g. AMD suite)",
 )
-class TestRustServerNativeMm(CustomTestCase):
+class TestRustServerMm(CustomTestCase):
     env = {"SGLANG_RUST_SERVER": "1"}
 
     @classmethod
