@@ -4888,9 +4888,8 @@ class Scheduler(
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
                     if get_memory().hicache_host_memory_mode == "buffer_only":
-                        # Queued writes, staged prefetches, and in-flight
-                        # storage writes still hold host staging
-                        # (buffer-mode unified tree only).
+                        # Buffer-mode transfers have additional pending and
+                        # in-flight state owned by the unified tree pipeline.
                         idle &= tc.buffer_pipeline.is_idle()
 
         return idle
