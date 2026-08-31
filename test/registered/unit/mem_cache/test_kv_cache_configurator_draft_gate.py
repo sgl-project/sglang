@@ -1,0 +1,209 @@
+# Copyright 2023-2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""How a draft-shaped KVCacheConfigurator binds its KV under the unified pool.
+
+DERIVED PROPERTY (binding dispatch). The fused-vs-private draft binding
+dispatches on the spec algorithm, not the allocator kind: a non-EAGLE draft on
+a unified SWA target takes the private arm, sized by the full sub-allocator's
+VIRTUAL id space (`max_slots - 1`). The SWA allocator's `size_full` reports
+the static token budget — smaller than the id space — so sizing by it would
+put verify-window writes at high virtual ids out of bounds.
+
+    python -m pytest test/registered/unit/mem_cache/test_kv_cache_configurator_draft_gate.py -v
+"""
+
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
+
+from sglang.srt.mem_cache import kv_cache_configurator as kcc
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedSWATokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.unified_memory_pool import (
+    DenseDraftRegion,
+    MHASubPoolSpec,
+    UnifiedDraftKVPool,
+    UnifiedKVPool,
+)
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class _FakeKVCache:
+    def __init__(self, max_slots):
+        self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
+        self.allocator = None
+
+    def attach_allocator(self, allocator):
+        self.allocator = allocator
+
+
+class _FakeUnifiedSWAKVPool:
+    def __init__(self, shared_pool):
+        self.full_kv_pool = _FakeKVCache(shared_pool.max_slots("full"))
+        self.swa_kv_pool = _FakeKVCache(shared_pool.max_slots("swa"))
+        self.full_to_swa_index_mapping = None
+
+    def attach_allocators(self, *, full_allocator, swa_allocator):
+        self._full_allocator = full_allocator
+        self._swa_allocator = swa_allocator
+
+
+class _CapturedSizes(Exception):
+    """Sentinel carrying the sizes handed to the token-pool build."""
+
+    def __init__(self, sizes):
+        self.sizes = sizes
+
+
+_PS = 2
+
+
+class TestDraftBindingDispatch(CustomTestCase):
+    def _swa_allocator(self, *, with_draft_region: bool, n_full=32, n_swa=16):
+        full_spec = MHASubPoolSpec(
+            name="full",
+            layer_num=2,
+            head_num=2,
+            head_dim=4,
+            store_dtype=torch.bfloat16,
+            grow_direction="down",
+            draft_region=(
+                DenseDraftRegion(
+                    layer_num=1, head_num=1, head_dim=3, store_dtype=torch.bfloat16
+                )
+                if with_draft_region
+                else None
+            ),
+        )
+        swa_spec = MHASubPoolSpec(
+            name="swa",
+            layer_num=1,
+            head_num=2,
+            head_dim=4,
+            store_dtype=torch.bfloat16,
+            grow_direction="up",
+        )
+        total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full_spec, swa_spec],
+            device="cpu",
+            enable_memory_saver=False,
+            page_size=_PS,
+        )
+        return UnifiedSWATokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=_FakeUnifiedSWAKVPool(pool),
+            device="cpu",
+            full_max_total_num_tokens=n_full,
+            swa_max_total_num_tokens=n_swa,
+            page_size=_PS,
+            need_sort=False,
+            forward_stream=None,
+        )
+
+    def _run(self, *, algorithm, alloc, max_total_num_tokens):
+        cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        cfg.is_draft_worker = True
+        cfg.spec_algorithm = algorithm
+        cfg.page_size = _PS
+        cfg.is_hybrid_swa_mtp_draft = False
+        cfg.model_config = SimpleNamespace(hf_config=None)
+        sizes = kcc._PoolSizes(
+            max_total_num_tokens=max_total_num_tokens,
+            max_running_requests=8,
+            full_max_total_num_tokens=max_total_num_tokens,
+            swa_max_total_num_tokens=16,
+            c4_max_total_num_tokens=0,
+            c128_max_total_num_tokens=0,
+            c4_state_pool_size=0,
+            c128_state_pool_size=0,
+            c4_state_dtype=None,
+            c128_state_dtype=None,
+        )
+
+        def _capture(self, *, sizes, **kw):
+            raise _CapturedSizes(sizes)
+
+        with (
+            patch.object(
+                kcc,
+                "get_memory",
+                return_value=SimpleNamespace(enable_unified_memory=True),
+            ),
+            patch.object(
+                kcc,
+                "get_schedule",
+                return_value=SimpleNamespace(page_size=_PS),
+            ),
+            patch.object(kcc, "is_deepseek_dsa", return_value=False),
+            patch.object(kcc, "is_deepseek_v4", return_value=False),
+            patch.object(
+                kcc.KVCacheConfigurator,
+                "_validate_prefill_only_disable_kv_cache_pool_family",
+                lambda self, *a, **kw: None,
+            ),
+            patch.object(kcc.KVCacheConfigurator, "_build_token_to_kv_pool", _capture),
+        ):
+            return cfg._init_pools(
+                sizes=sizes,
+                req_to_token_pool=object(),
+                token_to_kv_pool_allocator=alloc,
+            )
+
+    def test_non_eagle_draft_takes_the_private_arm_sized_by_the_id_space(self):
+        alloc = self._swa_allocator(with_draft_region=False)
+        id_space = alloc.full_attn_allocator.max_slots - 1
+        # The distinction under test only exists while budget < id space.
+        self.assertLess(alloc.size_full, id_space)
+        with self.assertRaises(_CapturedSizes) as caught:
+            self._run(
+                algorithm=SpeculativeAlgorithm.DSPARK,
+                alloc=alloc,
+                max_total_num_tokens=alloc.size_full,
+            )
+        sized = caught.exception.sizes.max_total_num_tokens
+        self.assertEqual(sized, (id_space + _PS - 1) // _PS * _PS)
+
+    def test_eagle_draft_still_binds_the_fused_pool(self):
+        alloc = self._swa_allocator(with_draft_region=True)
+        pools = self._run(
+            algorithm=SpeculativeAlgorithm.EAGLE3,
+            alloc=alloc,
+            max_total_num_tokens=alloc.size_full,
+        )
+        self.assertIsInstance(pools.token_to_kv_pool, UnifiedDraftKVPool)
+        self.assertIs(pools.token_to_kv_pool_allocator, alloc)
+
+    def test_eagle_draft_without_a_region_fails_loud(self):
+        """A gate-admitted EAGLE draft with no resolved region is a boot-order
+        bug; falling back to the private arm would hide it."""
+        alloc = self._swa_allocator(with_draft_region=False)
+        with self.assertRaisesRegex(ValueError, "fused draft-KV region"):
+            self._run(
+                algorithm=SpeculativeAlgorithm.EAGLE3,
+                alloc=alloc,
+                max_total_num_tokens=alloc.size_full,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
