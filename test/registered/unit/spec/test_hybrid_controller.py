@@ -15,8 +15,8 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.runtime_context import (
     get_context,
     max_speculative_num_draft_tokens,
@@ -113,9 +113,7 @@ class TestHybridServerArgs(CustomTestCase):
                 )
         for name in ("min_continuation_ratio", "min_matching_ratio"):
             with self.assertRaisesRegex(ValueError, rf"{name} must be in \\(0, 1\\]"):
-                HybridController._load_config(
-                    json.dumps({**full, name: 1.5})
-                )
+                HybridController._load_config(json.dumps({**full, name: 1.5}))
 
 
 class TestHybridRuntimeSwitch(CustomTestCase):
