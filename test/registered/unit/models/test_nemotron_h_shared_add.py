@@ -73,7 +73,15 @@ def test_latent_projection_accumulates_into_shared_output_and_replays_graph(
 
 @pytest.mark.parametrize(
     "fallback",
-    ["noncontiguous", "compiled", "aiter", "cutedsl", "splitk", "rocm"],
+    [
+        "noncontiguous",
+        "compiled",
+        "aiter",
+        "cutedsl",
+        "hopper_gemv",
+        "splitk",
+        "rocm",
+    ],
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @torch.inference_mode()
@@ -81,6 +89,7 @@ def test_latent_projection_preserves_unfused_fallbacks(monkeypatch, fallback):
     """Unsupported platforms and custom kernels must retain separate-add semantics."""
     backend = {
         "cutedsl": Bf16GemmBackend.CUTEDSL,
+        "hopper_gemv": Bf16GemmBackend.CUTEDSL,
         "splitk": Bf16GemmBackend.FLASHINFER_PR4266,
     }.get(fallback, Bf16GemmBackend.TORCH)
     monkeypatch.setattr(unquant, "_BF16_GEMM_BACKEND", backend)
@@ -106,6 +115,10 @@ def test_latent_projection_preserves_unfused_fallbacks(monkeypatch, fallback):
             "_cutedsl_bf16_gemm",
             lambda x, weight, bias: F.linear(x, weight, bias),
         )
+    elif fallback == "hopper_gemv":
+        monkeypatch.setattr(unquant, "_use_hopper_bf16_gemv", lambda *args: True)
+        linear_output = F.linear(routed, projection.weight)
+        monkeypatch.setattr(method, "apply", lambda layer, x, bias: linear_output)
     elif fallback == "splitk":
         monkeypatch.setattr(unquant, "_enable_bf16_splitk_gemm", True)
         monkeypatch.setattr(

@@ -439,6 +439,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         # when the optimized backend would fall through to F.linear/cuBLAS.
         if _enable_bf16_splitk_gemm and use_flashinfer_pr4266_bf16_gemm(m, n, k):
             return False
+        if _use_hopper_bf16_gemv is not None and _use_hopper_bf16_gemv(m, n, k):
+            return False
         return not _use_cutedsl_bf16_gemm(m, n, k)
 
     def apply_with_addend(
