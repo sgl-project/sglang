@@ -45,11 +45,11 @@ _BLOCK_COLS = 256
 
 @triton.jit
 def build_kv_read_table_kernel(
-    req_to_token_ptr,  # in: [max_reqs, max_context] — VIRTUAL token ids
-    req_pool_indices_ptr,  # in: [bs] — row per batch lane
+    req_to_token_ptr,  # in: [max_reqs, max_context] -- VIRTUAL token ids
+    req_pool_indices_ptr,  # in: [bs] -- row per batch lane
     seq_lens_ptr,  # in: [bs]
-    v2p_ptr,  # in: [num_pages + 1] int64 — virtual->physical page table
-    out_ptr,  # out: [>=bs, >=max_pages] int32 — the read table
+    v2p_ptr,  # in: [num_pages + 1] int64 -- virtual->physical page table
+    out_ptr,  # out: [>=bs, >=max_pages] int32 -- the read table
     req_stride,  # runtime: req_to_token row stride (elements)
     out_stride,  # runtime: out row stride (elements)
     mult,  # runtime: kernel_page_multiplier of the target sub-pool
@@ -92,7 +92,7 @@ def build_kv_read_table(
 
     ``out`` is caller-owned (fresh zeros for the eager path, the module's
     capture-stable buffer for replay) and only its ``[:bs, :max_pages]``
-    region's live prefix is written — never rebound, never tail-cleared.
+    region's live prefix is written -- never rebound, never tail-cleared.
     """
     bs = int(req_pool_indices.numel())
     assert (

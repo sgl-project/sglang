@@ -265,7 +265,7 @@ class KVIndexTranslator:
         """Eager per-batch view, memoized in one slot keyed by batch identity
         so multi-consumer metadata builds share a build. The next batch
         replaces the slot; consumers only read during their own build. The
-        captured path does not memoize — it refreshes its buffers per
+        captured path does not memoize -- it refreshes its buffers per
         replay."""
         memo = self._index_table_memo
         if memo is not None and memo[0]() is forward_batch:

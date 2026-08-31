@@ -2234,7 +2234,7 @@ def update_sliding_window_buffer(
     ``index_table`` is the batch's read-index source view. Unified pool: the
     gather reads the parallel SWA array (built directly from virtual ids
     through the swa side's own v2p), so the window indices come out
-    already swa-side ids — no translate here, eager or captured. Static SWA
+    already swa-side ids -- no translate here, eager or captured. Static SWA
     pools gather full-token ids from req_to_token and keep the legacy
     full->swa translate below.
     """

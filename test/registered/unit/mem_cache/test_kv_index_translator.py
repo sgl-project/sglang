@@ -11,12 +11,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""KVIndexTranslator — the read-path id translator.
+"""KVIndexTranslator -- the read-path id translator.
 
 Covers, CPU-only (the builder's pure-torch reference path; GPU parity of the
 Triton kernel is a later CUDA CI pin):
   - strict passthrough: a non-unified source returns the SAME req_to_token /
-    req_pool_indices objects — zero tensor ops, no copies (the property that
+    req_pool_indices objects -- zero tensor ops, no copies (the property that
     makes backend re-pointing byte-identical for every non-unified server);
   - static SWA pools keep their legacy full->swa mapping on the view;
   - the read table matches the hand formula
@@ -106,7 +106,7 @@ def _build_composite(ps, collapse=False, n_full_pages=16, n_swa_pages=8):
 
 def _make_source(allocator, req_to_token, ps):
     """The owning runner's source: its token_to_kv_pool IS the allocator's own
-    kvcache. (A runner can share the allocator while owning a different pool —
+    kvcache. (A runner can share the allocator while owning a different pool --
     see TestPoolOwnership.)"""
     return KVIndexTranslator(
         req_to_token=req_to_token,
@@ -233,7 +233,7 @@ class TestReadTableBuild(unittest.TestCase):
 
     def test_sink_routing(self):
         """Dead lanes (seq_len 0), -1 slots inside the live prefix, and
-        tombstoned v2p pages must ALL read entry 0 — one wild entry is a
+        tombstoned v2p pages must ALL read entry 0 -- one wild entry is a
         captured-graph OOB read at replay."""
         ps = 4
         allocator = _build_composite(ps)
@@ -259,13 +259,13 @@ class TestReadTableBuild(unittest.TestCase):
 
 class TestBuildInto(unittest.TestCase):
     """fill_read_table fills a backend-owned padded block table's live prefix with
-    FULL-side read-table entries — the trtllm_mla / flashmla consumption route
+    FULL-side read-table entries -- the trtllm_mla / flashmla consumption route
     (their rows ARE the read table's rows)."""
 
     def test_prefix_filled_tail_sentinel_preserved_width_capped(self):
         """Three contracts in one batch: entries equal the read-table formula,
         lanes past each row's live pages keep the backend's -1 sentinel
-        (prefix-only — a tail write scatters the trtllm sentinel contract),
+        (prefix-only -- a tail write scatters the trtllm sentinel contract),
         and a table padded WIDER than the req_to_token page span (trtllm's
         LCM alignment) is capped instead of tripping the builder's width
         assert."""
@@ -328,7 +328,7 @@ class TestPoolOwnership(unittest.TestCase):
     allocator's SLOT count. Probing the allocator alone reports "unified" for
     that runner, so its indices would be mapped into the composite's
     kernel-facing space (kernel-facing ids up to num_pages * multiplier) and then used
-    to address a buffer with only num_slots rows — out of bounds on both the
+    to address a buffer with only num_slots rows -- out of bounds on both the
     read gather and the KV store.
     """
 
@@ -336,7 +336,7 @@ class TestPoolOwnership(unittest.TestCase):
         """The guard rests on `allocator.get_kvcache() is token_to_kv_pool`
         holding for a REAL target bundle. If a factory ever returned a pool
         the allocator does not hold, the guard would silently disable the
-        unified path for EVERY model — so pin it against the real factory
+        unified path for EVERY model -- so pin it against the real factory
         rather than against this file's own construction."""
         from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 
@@ -388,7 +388,7 @@ class TestPoolOwnership(unittest.TestCase):
 
     def test_disabled_source_is_strict_passthrough(self):
         """Consequence of the guard: such a runner must see RAW virtual ids on
-        the read table — they index its own pool directly. A translate here is
+        the read table -- they index its own pool directly. A translate here is
         the out-of-bounds bug the ownership identity exists to prevent."""
         alloc = _build_composite(ps=1)
         req_to_token = torch.arange(16, dtype=torch.int32, device=_DEV).view(2, 8)
@@ -428,7 +428,7 @@ class TestCaptureContract(unittest.TestCase):
         self.assertIsNotNone(cap_swa, "the SWA composite has a second id space")
 
         # Poison everything, then refresh a 1-row batch: ONLY its live prefix
-        # may change — stale tails and other rows are the fa3 contract.
+        # may change -- stale tails and other rows are the fa3 contract.
         cap.fill_(7)
         cap_swa.fill_(7)
         view = src.build_index_table(
@@ -481,7 +481,7 @@ class _FakeForwardBatch:
 
 class TestViewMemo(unittest.TestCase):
     """The eager view is memoized ON THE SOURCE in a single slot keyed by
-    batch identity — per-batch state stays out of the ForwardBatch (it does
+    batch identity -- per-batch state stays out of the ForwardBatch (it does
     not scale with the number of id spaces), and one metadata build's many
     consumers still share one table build."""
 
