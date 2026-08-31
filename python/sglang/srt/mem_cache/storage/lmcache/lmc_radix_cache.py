@@ -170,6 +170,23 @@ class LMCRadixCache(RadixCache):
         self._node_lock = threading.Lock()
         self._mp_load_back_markers: dict[str, _LMCacheLoadBackMarker] = {}
 
+    def _mp_supports_cache_salt(self) -> bool:
+        return (
+            getattr(self.lmcache_connector, "supports_cache_salt", False) is True
+        )
+
+    def _require_mp_cache_salt_support(
+        self, cache_salt: Optional[str]
+    ) -> bool:
+        supports_cache_salt = self._mp_supports_cache_salt()
+        if cache_salt and not supports_cache_salt:
+            raise RuntimeError(
+                "This request uses cache_salt, but the installed LMCache MP "
+                "connector does not support cache-salt namespacing. Upgrade "
+                "LMCache before serving salted requests."
+            )
+        return supports_cache_salt
+
     def reset(self):
         super().reset()
         if hasattr(self, "_in_flight_nodes"):
@@ -220,7 +237,13 @@ class LMCRadixCache(RadixCache):
         the held read locks and returns the radix-only result.
         """
         token_ids = key.raw_token_ids()
-        matched = self.lmcache_connector.lookup_kv(token_ids, req.rid)
+        supports_cache_salt = self._require_mp_cache_salt_support(key.cache_salt)
+        if supports_cache_salt:
+            matched = self.lmcache_connector.lookup_kv(
+                token_ids, req.rid, cache_salt=key.cache_salt or ""
+            )
+        else:
+            matched = self.lmcache_connector.lookup_kv(token_ids, req.rid)
         if matched <= value.numel():
             # Release the read locks; keep the pending session for end_session.
             self.lmcache_connector.release_pending(req.rid)
@@ -443,6 +466,10 @@ class LMCRadixCache(RadixCache):
     ) -> None:
         """On request completion, insert device KV into radix and store to LMCache."""
 
+        supports_cache_salt = False
+        if is_insert and self._mode is LMCacheMode.MP:
+            supports_cache_salt = self._require_mp_cache_salt_support(req.cache_salt)
+
         super().cache_finished_req(
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
         )
@@ -480,13 +507,16 @@ class LMCRadixCache(RadixCache):
         assert new_last_node is not None
 
         self.inc_lock_ref(new_last_node)
-        store_md = StoreMetadata(
+        store_metadata_kwargs = dict(
             last_node=new_last_node,
             token_ids=token_ids,
             kv_indices=kv_indices,
             offset=0,
             request_id=req.rid,
         )
+        if self._mode is LMCacheMode.MP and supports_cache_salt:
+            store_metadata_kwargs["cache_salt"] = req.cache_salt or ""
+        store_md = StoreMetadata(**store_metadata_kwargs)
         if self._mode is LMCacheMode.MP:
             self.lmcache_connector.store_kv(store_md)
             # MP store_kv blocks until the daemon's signal event fires, so the slots are safe to evict immediately.
