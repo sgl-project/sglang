@@ -58,10 +58,13 @@ RUN apt-get update && apt-get install -y software-properties-common curl && \
 RUN apt-get update && apt-get install -y \
     python3-dev \
     build-essential \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:$PATH"
+ENV PATH="/root/.local/bin:/root/.cargo/bin:$PATH"
+RUN curl --proto '=https' --retry 3 --retry-delay 2 --tlsv1.2 -sSf https://sh.rustup.rs \
+| sh -s -- -y --no-modify-path --profile minimal && rustc --version && cargo --version
 ENV VIRTUAL_ENV="/opt/venv"
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 RUN uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV}

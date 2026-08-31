@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from enum import Enum
 
-from sglang.srt.utils import is_hip, is_sm100_supported
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_hip
 
 
 class DSAPagedMQALogitsBackend(Enum):
@@ -34,7 +35,7 @@ class DSAPagedMQALogitsBackend(Enum):
         if value == "aiter":
             raise ValueError("dsa_paged_mqa_logits_backend='aiter' requires ROCm.")
         if value == "cutedsl":
-            if not is_sm100_supported():
+            if not get_platform().is_sm100:
                 raise ValueError(
                     "dsa_paged_mqa_logits_backend='cutedsl' requires SM100 (Blackwell)."
                 )

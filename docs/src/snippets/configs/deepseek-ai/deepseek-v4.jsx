@@ -183,8 +183,8 @@ sgl-eval run aime25 \\
     gb300: "lmsysorg/sglang:latest",
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
-    mi300x: "lmsysorg/sglang-rocm:v0.5.18-rocm720-mi30x-20260828",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.18-rocm720-mi35x-20260828",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.18-rocm720-mi30x-20260829",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.18-rocm720-mi35x-20260829",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
@@ -1643,7 +1643,7 @@ sgl-eval run aime25 \\
       // DSpark requires CUDA; EAGLE binds a head that accepts nothing on 0813 -> target-only.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1654,7 +1654,7 @@ sgl-eval run aime25 \\
         "--swa-full-tokens-ratio 0.15",
         "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1663,7 +1663,7 @@ sgl-eval run aime25 \\
       // DSpark requires CUDA; EAGLE binds a head that accepts nothing on 0813 -> target-only.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1686,7 +1686,7 @@ sgl-eval run aime25 \\
       // DSpark requires CUDA; EAGLE binds a head that accepts nothing on 0813 -> target-only.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2236,6 +2236,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -2249,7 +2250,7 @@ sgl-eval run aime25 \\
         "--swa-full-tokens-ratio 0.1",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2263,6 +2264,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
@@ -2295,6 +2297,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
@@ -2329,6 +2332,7 @@ sgl-eval run aime25 \\
       verified: false,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
@@ -2343,7 +2347,7 @@ sgl-eval run aime25 \\
         "--swa-full-tokens-ratio 0.15",
         "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -2353,6 +2357,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
@@ -2367,7 +2372,7 @@ sgl-eval run aime25 \\
         "--swa-full-tokens-ratio 0.15",
         "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2381,6 +2386,7 @@ sgl-eval run aime25 \\
       verified: false,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
@@ -2412,6 +2418,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
@@ -2447,6 +2454,7 @@ sgl-eval run aime25 \\
       verified: false,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
@@ -2478,6 +2486,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
@@ -2515,6 +2524,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
@@ -2529,7 +2539,7 @@ sgl-eval run aime25 \\
         "--swa-full-tokens-ratio 0.15",
         "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2543,6 +2553,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
@@ -2578,6 +2589,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
@@ -2615,6 +2627,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
@@ -2629,7 +2642,7 @@ sgl-eval run aime25 \\
         "--swa-full-tokens-ratio 0.15",
         "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2643,6 +2656,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
@@ -2678,6 +2692,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
@@ -2715,6 +2730,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
@@ -2729,7 +2745,7 @@ sgl-eval run aime25 \\
         "--swa-full-tokens-ratio 0.15",
         "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2743,6 +2759,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
@@ -2778,6 +2795,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",

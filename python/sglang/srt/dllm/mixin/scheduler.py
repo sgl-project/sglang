@@ -319,7 +319,7 @@ class SchedulerDllmMixin:
             if running_batch.batch_is_full:
                 if (
                     not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                    or not adder.preempt_to_schedule(req)
                 ):
                     break
 

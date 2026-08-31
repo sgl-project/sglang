@@ -333,6 +333,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         _CUDA,
         "Wan causal VAE main + DupUp3D(src).",
     ),
+    (
+        "diffusion.flux2_token_cat_nvfp4",
+        KernelBackend.JIT,
+        "layout.flux2_token_cat_nvfp4_jit:try_flux2_token_cat_nvfp4",
+        _CUDA,
+        "FLUX.2 single-block token concatenation + NVFP4 quantization.",
+    ),
 )
 
 for _op, _backend, _target, _caps, _description in _SPECS:
@@ -373,6 +380,8 @@ _EXPORTS: dict[str, str] = {
     "rmsnorm_tanh_residual": "norm.native_bf16_rmsnorm_triton",
     "norm_infer": "norm.norm_triton",
     "rms_norm_fn": "norm.norm_triton",
+    "try_fused_bias_mul_add": "norm.norm_scale_shift_jit",
+    "try_fused_bias_scale_residual_norm_scale_shift": "norm.norm_scale_shift_jit",
     "triton_one_pass_rms_norm": "norm.rmsnorm_onepass_triton",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "can_use_fused_scale_residual_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
@@ -380,6 +389,10 @@ _EXPORTS: dict[str, str] = {
     "fused_scale_residual_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",
     "fused_norm_scale_shift": "norm.scale_residual_norm_cutedsl",
     "fused_scale_residual_norm_scale_shift": "norm.scale_residual_norm_cutedsl",
+    "fused_norm_scale_shift_fp8": "norm.norm_scale_shift_jit",
+    "fused_scale_residual_norm_scale_shift_fp8": "norm.norm_scale_shift_jit",
+    "try_fused_norm_scale_shift_fp8": "norm.norm_scale_shift_jit",
+    "try_fused_scale_residual_norm_scale_shift_fp8": "norm.norm_scale_shift_jit",
     "validate_scale_shift": "norm.scale_residual_norm_cutedsl",
     "can_use_wan_rmsnorm_silu": "norm.wan_rmsnorm_silu_triton",
     "wan_rmsnorm_silu": "norm.wan_rmsnorm_silu_triton",
@@ -447,6 +460,7 @@ _EXPORTS: dict[str, str] = {
     "fused_scatter_to_padded": "layout.varlen_pack_pad_triton",
     "cat_pad_channels_last_3d": "layout.wan_causal_cache_triton",
     "dup_up3d_add": "layout.wan_causal_cache_triton",
+    "try_flux2_token_cat_nvfp4": "layout.flux2_token_cat_nvfp4_jit",
     # Fusion-site policy: quality gate, first-sight verification, mount
     "BitExactFusionGate": "sites.bitexact_gate",
     "flashinfer_rmsnorm_diagnostic_hint": "sites.bitexact_gate",
@@ -463,6 +477,10 @@ _EXPORTS: dict[str, str] = {
     "mark_fused_gelu_site": "sites.fused_linear_gelu_site",
     "mount_fused_linear_gelu": "sites.fused_linear_gelu_site",
     "unmount_fused_linear_gelu": "sites.fused_linear_gelu_site",
+    "mark_nvfp4_bias_gelu_site": "sites.nvfp4_bias_gelu_site",
+    "mount_nvfp4_bias_gelu": "sites.nvfp4_bias_gelu_site",
+    "nvfp4_bias_gelu_active": "sites.nvfp4_bias_gelu_site",
+    "unmount_nvfp4_bias_gelu": "sites.nvfp4_bias_gelu_site",
     "can_use_ln_modulate": "sites.fused_ln_modulate_site",
     "fused_ln_modulate": "sites.fused_ln_modulate_site",
     "fused_ln_modulate_active": "sites.fused_ln_modulate_site",
