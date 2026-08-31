@@ -138,9 +138,12 @@ class HiCacheFileLRUTestBase(CustomTestCase):
         self.tmpdir = tempfile.mkdtemp(prefix="hicache_lru_unit_")
         self.make_backend = _BackendBuilder(self.tmpdir)
         # Neutralise env vars so user shell can't leak settings into tests.
+        # The storage dir takes precedence over HiCacheFile's file_path arg, so
+        # leaving it set would point every backend below at one shared dir.
         self._env_overrides = [
             envs.SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE.override("0"),
             envs.SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE.override("0"),
+            envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(None),
         ]
         for cm in self._env_overrides:
             cm.__enter__()

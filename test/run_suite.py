@@ -13,7 +13,11 @@ from sglang.test.ci.ci_register import (
     auto_partition,
     collect_tests,
 )
-from sglang.test.ci.ci_utils import run_unittest_files
+from sglang.test.ci.ci_utils import (
+    cleanup_hicache_scratch_dir,
+    run_unittest_files,
+    setup_hicache_scratch_dir,
+)
 
 HW_MAPPING = {
     "cpu": HWBackend.CPU,
@@ -524,7 +528,11 @@ def main():
                 f"but got {args.auto_partition_id}"
             )
 
-    exit_code = run_a_suite(args)
+    hicache_scratch_dir = setup_hicache_scratch_dir()
+    try:
+        exit_code = run_a_suite(args)
+    finally:
+        cleanup_hicache_scratch_dir(hicache_scratch_dir)
     sys.exit(exit_code)
 
 
