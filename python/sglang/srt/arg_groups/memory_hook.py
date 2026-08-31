@@ -16,9 +16,11 @@ from sglang.srt.arg_groups.overrides import (
     use_mla_backend,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
 
 
 def handle_gpu_memory_settings(server_args: Any, gpu_mem):
@@ -188,6 +190,18 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
             prefill_cuda_graph_config.max_bs = cfg.chunked_prefill_size
         else:
             prefill_cuda_graph_config.max_bs = 2048
+
+        # For opt-in PP breakable graphs, capture small aggregate-token
+        # buckets by default and leave larger forwards on the eager path.
+        # Explicit max_bs or bs settings retain their existing semantics.
+        if (
+            cfg.pp_size > 1
+            and prefill_cuda_graph_config.backend == Backend.BREAKABLE
+            and (Phase.PREFILL, "bs") not in server_args._cuda_graph_config_locked
+            and prefill_cuda_graph_config.max_bs
+            > _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS
+        ):
+            prefill_cuda_graph_config.max_bs = _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS
 
         # If max_total_tokens is set, cap prefill max_bs to not exceed max_total_tokens.
         if cfg.max_total_tokens is not None:
