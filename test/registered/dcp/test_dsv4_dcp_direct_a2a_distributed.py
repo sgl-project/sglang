@@ -184,9 +184,7 @@ def _worker_test(
     assert torch.equal(old_result.view(torch.int16), direct_result.view(torch.int16))
 
     push_workspace = None
-    if hasattr(
-        coordinator.ca_comm, "prepare_dsv4_destination_push_workspace"
-    ):
+    if hasattr(coordinator.ca_comm, "prepare_dsv4_destination_push_workspace"):
         registered_push = coordinator.prepare_dsv4_dcp_destination_push_workspace()
         assert registered_push is not None
         push_workspace = DCPDestinationPushWorkspace(
@@ -223,12 +221,8 @@ def _worker_test(
             destination_push_workspace=push_workspace,
         )
         assert isinstance(pushed, DCPDestinationPushOutput)
-        push_result = dcp_registered_destination_push_lse_reduce(
-            pushed, coordinator
-        )
-        assert torch.equal(
-            old_result.view(torch.int16), push_result.view(torch.int16)
-        )
+        push_result = dcp_registered_destination_push_lse_reduce(pushed, coordinator)
+        assert torch.equal(old_result.view(torch.int16), push_result.view(torch.int16))
 
     graph_q = q.clone()
     graph_kv = kv.clone()

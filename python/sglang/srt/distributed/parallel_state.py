@@ -1178,9 +1178,7 @@ class GroupCoordinator:
             ca_comm is not None
             and not getattr(ca_comm, "disabled", True)
             and hasattr(ca_comm, "should_dsv4_destination_push")
-            and ca_comm.should_dsv4_destination_push(
-                recv_planes, peer_recv_ptrs, epoch
-            )
+            and ca_comm.should_dsv4_destination_push(recv_planes, peer_recv_ptrs, epoch)
         )
 
     def dsv4_dcp_destination_push_ready(
