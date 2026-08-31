@@ -129,7 +129,9 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
             patch("sglang.srt.layers.quantization.fp8._use_aiter", True),
             patch("sglang.srt.layers.quantization.fp8._is_fp8_fnuz", False),
             patch.object(method, "_convert_mxfp8_moe_to_block_fp8"),
-            patch("sglang.srt.layers.quantization.fp8.shuffle_weight") as shuffle,
+            patch(
+                "sglang.srt.layers.quantization.fp8.shuffle_weight", create=True
+            ) as shuffle,
         ):
             method.process_weights_after_loading_block_quant(layer)
 
@@ -150,7 +152,9 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
             patch("sglang.srt.layers.quantization.fp8._use_aiter", True),
             patch("sglang.srt.layers.quantization.fp8._is_fp8_fnuz", False),
             patch.object(method, "_convert_mxfp8_moe_to_block_fp8"),
-            patch("sglang.srt.layers.quantization.fp8.shuffle_weight") as shuffle,
+            patch(
+                "sglang.srt.layers.quantization.fp8.shuffle_weight", create=True
+            ) as shuffle,
         ):
             method.process_weights_after_loading_block_quant(layer)
 
@@ -179,6 +183,7 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
             patch(
                 "sglang.srt.layers.quantization.fp8.shuffle_weight",
                 side_effect=add_one,
+                create=True,
             ) as shuffle,
         ):
             method.process_weights_after_loading_block_quant(layer)

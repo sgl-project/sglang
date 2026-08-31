@@ -19,11 +19,6 @@ import torch
 from transformers import AutoProcessor
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state import (
-    get_attn_tensor_model_parallel_rank,
-    get_attn_tensor_model_parallel_world_size,
-    get_attn_tp_group,
-)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
@@ -485,7 +480,7 @@ class EncoderPreprocessor:
             torch.distributed.all_reduce(
                 ok,
                 op=torch.distributed.ReduceOp.MIN,
-                group=get_attn_tp_group().cpu_group,
+                group=get_parallel().attn_tp_group.cpu_group,
             )
         if not int(ok.item()):
             if local_error is not None:
@@ -579,7 +574,8 @@ class EncoderPreprocessor:
                     ]
                 )
             else:
-                tp_size = get_attn_tensor_model_parallel_world_size()
+                parallel = get_parallel()
+                tp_size = parallel.attn_tp_size
                 sampled = None
                 if len(video_items) == 1:
                     vr = video_items[0]
@@ -600,7 +596,7 @@ class EncoderPreprocessor:
                     result = await self._dp_sharded_decode_single_video(
                         video_items[0],
                         video_configs[0],
-                        tp_rank=get_attn_tensor_model_parallel_rank(),
+                        tp_rank=parallel.attn_tp_rank,
                         tp_size=tp_size,
                         video_processor_kwargs=video_processor_kwargs,
                         precomputed_indices=sampled,
