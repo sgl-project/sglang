@@ -75,7 +75,7 @@ struct GatherScatterSconvKernel {
     W1s.set_value(W1);
 
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(hidden);
-    TensorMatcher({-1, W1s, D}).with_dtype<DType>().with_device(dev).verify(cache);
+    TensorMatcher({-1, W1s, D}).with_strides({-1, -1, 1}).with_dtype<DType>().with_device(dev).verify(cache);
     TensorMatcher({B, W1s}).with_dtype<int32_t>().with_device(dev).verify(track_idx);
     TensorMatcher({B}).with_device(dev).verify(mask);
     TensorMatcher({B}).with_dtype<int64_t>().with_device(dev).verify(dst);
