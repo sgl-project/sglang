@@ -452,6 +452,7 @@ class TokenizerManagerScoreMixin:
         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
         request: Optional[Any] = None,
         return_pooled_hidden_states: bool = False,
+        rid: Optional[str] = None,
     ) -> ScoreResult:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair.
@@ -473,6 +474,11 @@ class TokenizerManagerScoreMixin:
 
         return_pooled_hidden_states is only supported for non-generation models
         (SequenceClassification, RewardModel); raises ValueError for CausalLM.
+
+        rid is an optional caller-supplied base request id. A scoring call fans out
+        into one sub-request per item, so the base id is expanded to ``<rid>_<i>``
+        and used as the cross-process correlation key that appears in
+        TokenizerManager / scheduler / detokenizer logs. Auto-generated when None.
         """
         is_generation = self.is_generation
 
@@ -611,6 +617,7 @@ class TokenizerManagerScoreMixin:
                 sampling_params={"max_new_tokens": 0},
                 positional_embed_overrides=positional_embed_overrides,
                 multi_item_delimiter_indices=mis_delimiter_indices,
+                rid=rid,
             )
         else:
             batch_request = EmbeddingReqInput(
@@ -619,6 +626,7 @@ class TokenizerManagerScoreMixin:
                 positional_embed_overrides=positional_embed_overrides,
                 return_pooled_hidden_states=return_pooled_hidden_states,
                 multi_item_delimiter_indices=mis_delimiter_indices,
+                rid=rid,
             )
 
         results = await self.generate_request(batch_request, request).__anext__()
