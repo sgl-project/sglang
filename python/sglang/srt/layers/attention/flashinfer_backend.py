@@ -737,7 +737,6 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
-                req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
@@ -973,7 +972,6 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
-                forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
@@ -1588,7 +1586,6 @@ class FlashInferIndicesUpdaterDecode:
 
     def update(
         self,
-        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
@@ -1605,7 +1602,6 @@ class FlashInferIndicesUpdaterDecode:
 
     def update_single_wrapper(
         self,
-        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
@@ -1620,7 +1616,6 @@ class FlashInferIndicesUpdaterDecode:
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
             decode_wrappers[0],
-            req_pool_indices,
             seq_lens,
             seq_lens_sum,
             self.kv_indptr[0],
@@ -1634,7 +1629,6 @@ class FlashInferIndicesUpdaterDecode:
 
     def update_sliding_window(
         self,
-        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
@@ -1674,7 +1668,6 @@ class FlashInferIndicesUpdaterDecode:
 
             self.call_begin_forward(
                 decode_wrappers[wrapper_id],
-                req_pool_indices,
                 paged_kernel_lens_tmp,
                 paged_kernel_lens_sum_tmp,
                 self.kv_indptr[wrapper_id],
@@ -1689,7 +1682,6 @@ class FlashInferIndicesUpdaterDecode:
 
     def update_cross_attention(
         self,
-        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
@@ -1717,7 +1709,6 @@ class FlashInferIndicesUpdaterDecode:
 
             self.call_begin_forward(
                 decode_wrappers[wrapper_id],
-                req_pool_indices,
                 paged_kernel_lens,
                 seq_lens_sum,
                 self.kv_indptr[wrapper_id],
@@ -1732,7 +1723,6 @@ class FlashInferIndicesUpdaterDecode:
     def call_begin_forward(
         self,
         wrapper: BatchDecodeWithPagedKVCacheWrapper,
-        req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         kv_indptr: torch.Tensor,
@@ -1750,7 +1740,7 @@ class FlashInferIndicesUpdaterDecode:
         # full->swa translate below must not run on top of them.
         use_swa_source = use_sliding_window_kv_pool and kv_view.is_translated
         if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
-            bs = len(req_pool_indices)
+            bs = len(paged_kernel_lens)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
 

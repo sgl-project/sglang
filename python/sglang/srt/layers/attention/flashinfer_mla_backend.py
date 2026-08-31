@@ -372,7 +372,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     backend="auto",
                 )
                 self.indices_updater_decode.update(
-                    req_pool_indices,
                     seq_lens,
                     seq_lens_sum,
                     decode_wrapper=decode_wrapper,
@@ -435,7 +434,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
-                forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
                 decode_wrapper=self.decode_wrapper,
@@ -582,7 +580,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
 
             self.indices_updater_decode.update(
-                req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_sum,
                 decode_wrapper=self.decode_cuda_graph_metadata[bs],
@@ -876,7 +873,6 @@ class FlashInferMLAIndicesUpdaterDecode:
 
     def update(
         self,
-        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         decode_wrapper: BatchMLAPagedAttentionWrapper,
@@ -889,7 +885,6 @@ class FlashInferMLAIndicesUpdaterDecode:
         decode_wrapper = decode_wrapper or self.decode_wrapper
         self.call_begin_forward(
             decode_wrapper,
-            req_pool_indices,
             seq_lens,
             seq_lens_sum,
             self.q_indptr,
@@ -903,7 +898,6 @@ class FlashInferMLAIndicesUpdaterDecode:
     def call_begin_forward(
         self,
         wrapper: BatchMLAPagedAttentionWrapper,
-        req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         q_indptr: torch.Tensor,
@@ -914,7 +908,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         kv_view: KVIndexTable,
         **fast_decode_kwargs,
     ):
-        bs = len(req_pool_indices)
+        bs = len(paged_kernel_lens)
         q_indptr = q_indptr[: bs + 1]
         kv_lens = paged_kernel_lens.to(torch.int32)
         sm_scale = self.scaling
