@@ -284,13 +284,13 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
     `translate_kv_loc*` already collapsed by a DCP index kernel. Only the
     pieces below have been converted to that two-stage contract.
     """
-    assert server_args.use_mla_backend(), (
+    assert use_mla_backend(server_args), (
         "--enable-unified-memory with decode context parallelism "
         "(--dcp-size > 1) supports MLA models only (e.g. kimi-linear): the "
         "MHA unified pool has no DCP-aware masked write path "
         "(UnifiedMHATokenToKVPool.set_kv_buffer asserts dcp_kv_mask is None)."
     )
-    assert not server_args.get_model_config().is_hybrid_swa, (
+    assert not model_config_of(server_args).is_hybrid_swa, (
         "--enable-unified-memory with decode context parallelism "
         "(--dcp-size > 1) does not support hybrid sliding-window models: "
         "UnifiedSWATokenToKVPoolAllocator does not widen its virtual id "
@@ -311,7 +311,7 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
     # page ids; the DCP variant (create_mla_kv_page_table_for_dcp) has no v2p
     # gather at all. Wire one of them through the other to add those here.
     dcp_allowed = {"flashinfer"}
-    backends = set(server_args._resolved_attention_backends())
+    backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= dcp_allowed, (
         "--enable-unified-memory with decode context parallelism "
