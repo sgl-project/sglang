@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Tuple, Union
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -19,6 +19,33 @@ _ROPE_DIM = 64
 _GROUP_SIZE = 32
 _KV_BLOCK_SIZE = 64
 _Q_SCALE_SHAPE = (1, 4, 16, 4)
+# gfx950 has 256 CUs; target four persistent CTAs per CU.
+_DECODE_BASE_CTA_TARGET = 1024
+# Preserve per-query parallelism when the batch itself exceeds one CTA per CU.
+_DECODE_CTAS_PER_QUERY = 4
+_PREFILL_BASE_CTA_TARGET = 1024
+# AITER varctx cta_info row: [batch_packed, chunk_start, chunk_count, ctx_len].
+_DECODE_CTA_INFO_WIDTH = 4
+
+
+class FP4DecodeWorkspace(NamedTuple):
+    guarded_page_table: torch.Tensor
+    c4_seq_lens: torch.Tensor
+    cta_info: torch.Tensor
+    cta_count: int
+    logits: torch.Tensor
+    # Held only so AITER's schedule scratch never returns to the graph memory
+    # pool: the captured builder writes it again on every replay.
+    schedule_scratch: torch.Tensor
+
+
+class FP4PrefillWorkspace(NamedTuple):
+    guarded_page_table: torch.Tensor
+    row_to_batch: torch.Tensor
+    local_starts: torch.Tensor
+    cta_info: torch.Tensor
+    cta_count: int
+    logits: torch.Tensor
 
 
 def aiter_q_indexer_fp4(
@@ -55,14 +82,125 @@ def aiter_q_indexer_fp4(
     return q_fp4, q_scale
 
 
-def _guard_page_table(page_table: torch.Tensor):
+def _decode_cta_count(num_queries: int, max_seq_len: int) -> int:
+    """Choose a bounded persistent grid without exceeding available KV chunks."""
+    chunks_per_seq = max(1, (max_seq_len + 255) // 256)
+    available_ctas = num_queries * chunks_per_seq
+    target_ctas = max(_DECODE_BASE_CTA_TARGET, num_queries * _DECODE_CTAS_PER_QUERY)
+    return min(available_ctas, target_ctas)
+
+
+def _guard_page_table(page_table: torch.Tensor, out: Optional[torch.Tensor] = None):
     """Pad page tables for 256-token scheduling and one-chunk lookahead."""
     page_table = page_table.to(dtype=torch.int32).contiguous()
     rows, logical_width = page_table.shape
     padded_width = max(4, (logical_width + 3) // 4 * 4)
-    guarded = page_table.new_zeros((rows, padded_width + 4))
-    guarded[:, :logical_width].copy_(page_table)
-    return guarded, padded_width * _KV_BLOCK_SIZE
+    if out is None:
+        out = page_table.new_zeros((rows, padded_width + 4))
+    else:
+        assert out.shape == (rows, padded_width + 4), f"{out.shape=} {rows=}"
+    out[:, :logical_width].copy_(page_table)
+    return out, padded_width * _KV_BLOCK_SIZE
+
+
+def prepare_fp4_decode_workspace(
+    page_table: torch.Tensor,
+    c4_seq_lens: torch.Tensor,
+) -> FP4DecodeWorkspace:
+    """Build the decode page-table, schedule, and logits buffers.
+
+    Safe to run under CUDA-graph capture: every tensor the captured schedule
+    kernel touches is reachable from the returned workspace, so none of it can
+    be handed out again by a later capture sharing the graph memory pool.
+    """
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+        compute_varctx_schedule,
+    )
+
+    guarded, max_seq_len = _guard_page_table(page_table)
+    c4_seq_lens = c4_seq_lens.reshape(-1).to(torch.int32).contiguous()
+    num_queries = guarded.shape[0]
+    cta_count = _decode_cta_count(num_queries, max_seq_len)
+    cta_info = torch.empty(
+        (cta_count, _DECODE_CTA_INFO_WIDTH),
+        dtype=torch.int32,
+        device=guarded.device,
+    )
+    schedule_scratch, _, _ = compute_varctx_schedule(
+        c4_seq_lens,
+        block_k=256,
+        parallel_unit_num=cta_count,
+        max_seq_len=max_seq_len,
+        next_n=1,
+        cta_info_out=cta_info,
+    )
+    # AITER writes every score below c4_seq_lens and length-aware top-k reads
+    # exactly that window, so the tail never has to be initialized.
+    logits = torch.empty(
+        (num_queries, max_seq_len), dtype=torch.float32, device=guarded.device
+    )
+    return FP4DecodeWorkspace(
+        guarded, c4_seq_lens, cta_info, cta_count, logits, schedule_scratch
+    )
+
+
+def prepare_fp4_prefill_workspace(
+    page_table: torch.Tensor,
+    c4_seq_lens: torch.Tensor,
+    workspace: Optional[FP4PrefillWorkspace] = None,
+) -> FP4PrefillWorkspace:
+    """Build or refresh the prefill page-table, schedule, and logits buffers.
+
+    Must run OUTSIDE CUDA-graph capture. AITER's prefill scheduler frees its own
+    scratch when it returns, and its schedule kernel reads that scratch, so a
+    captured build would replay against recycled graph-pool memory. Callers
+    instead refresh this workspace per step and let the graph read only the
+    pinned ``cta_info`` / ``logits`` / page-table buffers.
+    """
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        CTA_INFO_WIDTH,
+        compute_prefill_schedule,
+    )
+
+    c4_seq_lens = c4_seq_lens.reshape(-1).to(torch.int32).contiguous()
+    if workspace is None:
+        guarded, max_seq_len = _guard_page_table(page_table)
+        num_queries = guarded.shape[0]
+        cta_count = max(_PREFILL_BASE_CTA_TARGET, num_queries)
+        workspace = FP4PrefillWorkspace(
+            guarded_page_table=guarded,
+            row_to_batch=torch.arange(
+                num_queries, device=guarded.device, dtype=torch.int32
+            ),
+            local_starts=torch.zeros(
+                num_queries, device=guarded.device, dtype=torch.int32
+            ),
+            cta_info=torch.empty(
+                (cta_count, CTA_INFO_WIDTH), dtype=torch.int32, device=guarded.device
+            ),
+            cta_count=cta_count,
+            # See prepare_fp4_decode_workspace on why the tail stays uninitialized.
+            logits=torch.empty(
+                (num_queries, max_seq_len), dtype=torch.float32, device=guarded.device
+            ),
+        )
+    else:
+        _, max_seq_len = _guard_page_table(page_table, out=workspace.guarded_page_table)
+
+    assert c4_seq_lens.shape[0] == workspace.row_to_batch.shape[0], (
+        f"c4_seq_lens rows {c4_seq_lens.shape[0]} do not match the workspace's "
+        f"{workspace.row_to_batch.shape[0]}; the schedule kernel indexes both by row"
+    )
+    compute_prefill_schedule(
+        workspace.row_to_batch,
+        workspace.local_starts,
+        c4_seq_lens,
+        block_k=256,
+        parallel_unit_num=workspace.cta_count,
+        max_seq_len=max_seq_len,
+        cta_info_out=workspace.cta_info,
+    )
+    return workspace
 
 
 def aiter_fp4_paged_mqa_logits(
@@ -76,6 +214,8 @@ def aiter_fp4_paged_mqa_logits(
     c4_seq_lens: torch.Tensor,
     weight_scale: float,
     is_decode: bool,
+    decode_workspace: Optional[FP4DecodeWorkspace] = None,
+    prefill_workspace: Optional[FP4PrefillWorkspace] = None,
 ) -> torch.Tensor:
     """Compute FP4 Q/K indexer logits with the decode or prefill FlyDSL kernel."""
     from aiter.ops.flydsl import (
@@ -84,8 +224,17 @@ def aiter_fp4_paged_mqa_logits(
     )
 
     num_tokens = q_fp4.shape[0]
-    page_table, max_seq_len = _guard_page_table(page_table)
     c4_seq_lens = c4_seq_lens.reshape(-1).to(torch.int32).contiguous()
+    workspace = decode_workspace if is_decode else prefill_workspace
+    # A workspace is bound to one row count. DP padding or truncated activations
+    # can leave it stale, in which case fall back to building the schedule here.
+    if workspace is not None and workspace.logits.shape[0] != num_tokens:
+        workspace = None
+    if workspace is not None:
+        page_table = workspace.guarded_page_table
+        max_seq_len = workspace.logits.shape[1]
+    else:
+        page_table, max_seq_len = _guard_page_table(page_table)
     q_payload = q_fp4.view(torch.uint8)
     k_payload = k_payload.view(torch.uint8)
     common = {
@@ -96,6 +245,15 @@ def aiter_fp4_paged_mqa_logits(
     }
 
     if is_decode:
+        pinned = (
+            {}
+            if workspace is None
+            else {
+                "out": workspace.logits,
+                "cta_info": workspace.cta_info,
+                "total_ctas": workspace.cta_count,
+            }
+        )
         logits = flydsl_pa_mqa_logits_fp4(
             q_payload.reshape(num_tokens, 1, _HEADS, _HEAD_DIM // 2),
             q_scale.reshape(num_tokens, 1, *_Q_SCALE_SHAPE),
@@ -107,11 +265,26 @@ def aiter_fp4_paged_mqa_logits(
             max_seq_len,
             next_n=1,
             parallel_unit_num=None,
+            **pinned,
             **common,
         )
     else:
-        row_to_batch = torch.arange(num_tokens, device=q_fp4.device, dtype=torch.int32)
-        local_starts = torch.zeros(num_tokens, device=q_fp4.device, dtype=torch.int32)
+        if workspace is None:
+            pinned = {}
+            row_to_batch = torch.arange(
+                num_tokens, device=q_fp4.device, dtype=torch.int32
+            )
+            local_starts = torch.zeros(
+                num_tokens, device=q_fp4.device, dtype=torch.int32
+            )
+        else:
+            pinned = {
+                "out": workspace.logits,
+                "cta_info": workspace.cta_info,
+                "n_ctas": workspace.cta_count,
+            }
+            row_to_batch = workspace.row_to_batch
+            local_starts = workspace.local_starts
         logits = flydsl_pa_mqa_logits_fp4_prefill(
             q_payload,
             q_scale,
@@ -123,7 +296,8 @@ def aiter_fp4_paged_mqa_logits(
             local_starts,
             c4_seq_lens,
             max_seq_len,
-            parallel_unit_num=max(512, num_tokens),
+            parallel_unit_num=max(_PREFILL_BASE_CTA_TARGET, num_tokens),
+            **pinned,
             **common,
         )
 
