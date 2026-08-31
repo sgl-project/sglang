@@ -87,16 +87,12 @@ def _init_state() -> Optional[_State]:
 
     from sglang.kernels.ops.kimi_k3 import attn_res, sp_collective
 
-    # Refuse to enable without a checked-in table for this exact device.
-    if (
-        sp_collective.get_dispatch(
-            "reduce_scatter",
-            group.world_size,
-            _HIDDEN_SIZE,
-            1,
-            torch.device("cuda"),
-        )
-        is None
+    # Refuse to enable without a checked-in table for this exact device. The
+    # probe is table existence, not a non-NCCL dispatch: a measured table may
+    # legitimately keep one collective on NCCL for every bucket (B300 does,
+    # for reduce-scatter) while the other collective uses the fused kernels.
+    if not sp_collective.has_table(
+        group.world_size, _HIDDEN_SIZE, torch.device("cuda")
     ):
         (logger.warning if explicit else logger.info)(
             "K3 SP collective has no tuning table for %s; using NCCL.",

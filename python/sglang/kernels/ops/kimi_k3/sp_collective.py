@@ -65,6 +65,17 @@ def _table(world_size: int, hidden_size: int, device: torch.device) -> Optional[
     return _TABLES[path]
 
 
+def has_table(world_size: int, hidden_size: int, device: torch.device) -> bool:
+    """True when a tuning table is checked in for this exact device.
+
+    Distinct from probing get_dispatch(): a valid table may select NCCL for
+    every bucket of one collective (measured on B300, where NCCL wins every
+    reduce-scatter bucket while the push/direct all-gather kernels win) and
+    per-call dispatch already falls back to NCCL for those entries.
+    """
+    return _table(world_size, hidden_size, device) is not None
+
+
 def get_dispatch(
     kind: str,
     world_size: int,
