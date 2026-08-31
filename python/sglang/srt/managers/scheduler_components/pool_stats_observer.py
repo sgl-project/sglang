@@ -172,8 +172,8 @@ class SchedulerPoolStatsObserver:
             if batch is None or batch.is_empty():
                 continue
             for req in batch.reqs:
-                if req.req_pool_idx is not None:
-                    idxs.add(req.req_pool_idx)
+                if req.kv.req_pool_idx is not None:
+                    idxs.add(req.kv.req_pool_idx)
         return idxs
 
     def session_held_tokens(self) -> int:

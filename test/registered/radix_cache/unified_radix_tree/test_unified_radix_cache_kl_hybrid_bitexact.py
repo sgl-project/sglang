@@ -40,7 +40,10 @@ as tests.
 
 import os
 import random
+import re
 import unittest
+
+import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_multiturn_utils import (
@@ -97,7 +100,9 @@ def _random_suffixes(n: int, length: int, seed: int) -> list[list[int]]:
     return [[rng.randint(1, 30000) for _ in range(length)] for _ in range(n)]
 
 
-def _base_args(mamba_strategy: str = "extra_buffer") -> list[str]:
+def _base_args(
+    mamba_strategy: str = "extra_buffer", *, mem_fraction_static: float = 0.6
+) -> list[str]:
     return [
         "--trust-remote-code",
         "--attention-backend",
@@ -114,11 +119,22 @@ def _base_args(mamba_strategy: str = "extra_buffer") -> list[str]:
         # the static pool leaves ~19 GB for the prefill graphs, the fa4 workspace
         # and the chunked-prefill activations, which is what this config needs.
         "--mem-fraction-static",
-        "0.6",
+        str(mem_fraction_static),
         "--mamba-track-interval",
         str(TRACK_INTERVAL),
         "--enable-deterministic-inference",
     ]
+
+
+def _prefill_graph_count(base_url: str) -> float:
+    metrics = requests.get(base_url + "/metrics", timeout=30).text
+    matches = re.findall(
+        r'^sglang:cuda_graph_passes_total\{[^}]*mode="prefill_cuda_graph"[^}]*\}'
+        r"\s+([0-9.eE+-]+)$",
+        metrics,
+        re.MULTILINE,
+    )
+    return sum(map(float, matches), 0.0)
 
 
 class TestUnifiedHybridBitExact(CustomTestCase):
@@ -321,7 +337,9 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
     def setUpClass(cls):
         cls.model = _MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = _base_args() + [
+        # Target FullCG and both MTP draft workers retain graph pools, so this
+        # class needs more dynamic-memory headroom than the non-spec tests.
+        other_args = _base_args(mem_fraction_static=0.58) + [
             "--speculative-algorithm",
             "EAGLE",
             "--enable-multi-layer-eagle",
@@ -333,6 +351,7 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
             "3",
             "--chunked-prefill-size",
             "16384",
+            "--enable-metrics",
         ]
         if _MODEL_REVISION:
             other_args += ["--revision", _MODEL_REVISION]
@@ -353,6 +372,9 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
             terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def _run(self, helper):
+        server_info = requests.get(self.base_url + "/server_info", timeout=30).json()
+        self.assertEqual(server_info["cuda_graph_config"]["prefill"]["backend"], "full")
+        graph_count = _prefill_graph_count(self.base_url)
         helper(
             self.base_url,
             {self.model: {"kl_div": KL_DIV_THRESHOLD}},
@@ -360,6 +382,11 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
             max_samples=32,
             max_new_tokens=MAX_NEW_TOKENS,
             trust_remote_code=True,
+        )
+        self.assertGreater(
+            _prefill_graph_count(self.base_url),
+            graph_count,
+            "MTP target prefill did not replay the configured Full CUDA graph.",
         )
 
     def test_logprobs_match(self):
