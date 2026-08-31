@@ -944,12 +944,19 @@ class SchedulerBatchResultProcessor:
             next_token_id = next_token_ids[i]
             is_spec = not batch.spec_algorithm.is_none()
 
+            new_output_start = len(req.output_ids)
             req.output_ids.extend(next_token_id)
             new_accept_len = len(next_token_id)
 
-            self._maybe_update_reasoning_tokens(req, next_token_id)
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
+
+            # A speculative verify step can accept tokens past max_new_tokens or
+            # a stop condition. Only the emitted prefix belongs to usage; letting
+            # the over-accepted suffix advance reasoning state can otherwise make
+            # reasoning_tokens exceed completion_tokens.
+            emitted_token_ids = list(req.output_ids_through_stop[new_output_start:])
+            self._maybe_update_reasoning_tokens(req, emitted_token_ids)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 

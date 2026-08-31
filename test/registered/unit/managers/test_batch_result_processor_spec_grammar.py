@@ -6,6 +6,7 @@ token, so the over-drafted suffix is never committed to KV nor emitted.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -60,30 +61,33 @@ class _FakeBatch:
 
 
 def _make_processor() -> SchedulerBatchResultProcessor:
+    metrics_reporter = Mock()
+    metrics_reporter.num_generated_tokens = 0
+    metrics_reporter.forward_ct_decode = 0
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
         enable_overlap=False,
         enable_overlap_mlx=False,
         model_config=SimpleNamespace(think_end_ids=None),
-        token_to_kv_pool_allocator=None,
+        token_to_kv_pool_allocator=Mock(),
         tree_cache=None,
         hisparse_coordinator=None,
         req_to_token_pool=None,
         decode_offload_manager=None,
         metrics_collector=None,
-        metrics_reporter=SimpleNamespace(),
+        metrics_reporter=metrics_reporter,
         draft_worker=None,
         model_worker=SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
         logprob_result_processor=None,
-        output_streamer=SimpleNamespace(),
+        output_streamer=Mock(),
         beam_coordinator=SimpleNamespace(),
         abort_request=lambda *a, **k: None,
     )
 
 
-def _make_req(terminate_after: int) -> Req:
-    sp = SamplingParams(max_new_tokens=256, temperature=0)
+def _make_req(terminate_after: int, max_new_tokens: int = 256) -> Req:
+    sp = SamplingParams(max_new_tokens=max_new_tokens, temperature=0)
     sp.normalize(None)
     req = Req(
         rid="r0",
@@ -135,6 +139,47 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
 
 
 class TestReasoningTokenAccounting(CustomTestCase):
+    def _process_spec_decode(self, req: Req, tokens):
+        processor = _make_processor()
+        processor.model_config.think_end_ids = [7, 8]
+        batch = SimpleNamespace(
+            reqs=[req],
+            return_logprob=False,
+            spec_algorithm=_FakeSpecAlgorithm(),
+            batch_size=lambda: 1,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=SimpleNamespace(hidden_states=None),
+            next_token_ids=None,
+            can_run_cuda_graph=False,
+            num_correct_drafts=0,
+            num_block_accept_tokens=0,
+            num_cap_tokens=0,
+            speculative_num_draft_tokens=len(tokens),
+        )
+
+        with (
+            patch.object(
+                SchedulerBatchResultProcessor,
+                "_normalize_decode_outputs",
+                return_value=([tokens], None),
+            ),
+            patch.object(
+                SchedulerBatchResultProcessor,
+                "_handle_finish_state_updated_req",
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.get_observability",
+                return_value=SimpleNamespace(enable_metrics=False),
+            ),
+        ):
+            processor.process_batch_result_decode(batch, result)
+
     def test_multi_token_end_can_span_decode_steps(self):
         req = _make_req(terminate_after=99)
         req.require_reasoning = True
@@ -146,6 +191,31 @@ class TestReasoningTokenAccounting(CustomTestCase):
 
         self.assertEqual(req.reasoning_tokens, 3)
         self.assertTrue(req._is_reasoning_over)
+
+    def test_spec_decode_excludes_tokens_past_length_limit(self):
+        req = _make_req(terminate_after=99, max_new_tokens=3)
+        req.grammar = None
+        req.require_reasoning = True
+
+        self._process_spec_decode(req, [10, 11, 12, 13])
+
+        self.assertEqual(list(req.output_ids_through_stop), [10, 11, 12])
+        self.assertEqual(req.reasoning_tokens, 3)
+        self.assertLessEqual(req.reasoning_tokens, len(req.output_ids_through_stop))
+
+    def test_spec_decode_excludes_tokens_past_eos(self):
+        req = _make_req(terminate_after=99)
+        req.grammar = None
+        req.require_reasoning = True
+        req.eos_token_ids = {99}
+
+        # The reasoning delimiter is present only in the over-accepted suffix.
+        self._process_spec_decode(req, [10, 11, 99, 7, 8])
+
+        self.assertEqual(list(req.output_ids_through_stop), [10, 11, 99])
+        self.assertEqual(req.reasoning_tokens, 3)
+        self.assertFalse(req._is_reasoning_over)
+        self.assertLessEqual(req.reasoning_tokens, len(req.output_ids_through_stop))
 
 
 if __name__ == "__main__":
