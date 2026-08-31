@@ -516,6 +516,8 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) enable_hicache: bool,
     /// Whether the storage tier (L3) is wired; gates page-hash computation.
     pub(crate) enable_storage: bool,
+    /// Whether a direct device-to-external-cache linker is wired.
+    pub(crate) enable_external_cache_linker: bool,
     /// Whether the cache wired a host SWA pool (HiCache).
     pub(crate) has_swa_host_pool: bool,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
@@ -699,6 +701,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             is_write_back: params.is_write_back,
             enable_hicache: params.enable_hicache,
             enable_storage: false,
+            enable_external_cache_linker: false,
             has_swa_host_pool: params.has_swa_host_pool,
             enable_kv_cache_events: params.enable_kv_cache_events,
             kv_event_queue: Vec::new(),
@@ -1271,6 +1274,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             return false;
         }
         node.hit_count += 1;
+
+        if self.enable_external_cache_linker {
+            return !node.external_cache_stored && node.hit_count >= self.write_through_threshold;
+        }
+
         self.enable_hicache && !node.backuped() && node.hit_count >= self.write_through_threshold
     }
 
@@ -1697,6 +1705,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let child = self.arena.node(child_id);
         let parent_id = child.parent();
         let child_namespace = child.namespace.clone();
+        let child_external_cache_stored = child.external_cache_stored;
         let (key_head, key_tail) = child.key.split_at(split_len);
         // key_head keeps the original key's first page, which keys the parent's child map.
         let parent_map_key = key_head.child_key(page_size);
@@ -1712,6 +1721,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             (child_namespace.clone(), key_tail.child_key(page_size)),
             child_id,
         );
+        self.arena.node_mut(new_node_id).external_cache_stored = child_external_cache_stored;
 
         // The child's aux LRU cells detach while it is re-linked.
         self.for_each_component_lru_(
@@ -1831,7 +1841,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             "add_new_node_: parent {parent_id} already has a child on the new node's page"
         );
         self.inc_evictable_size(FULL, value.size()[0] as usize);
-        if self.enable_storage {
+        if self.enable_storage || self.enable_external_cache_linker {
             let hash_values = self.arena.compute_node_hash_values(new_node_id, page_size);
             self.arena.node_mut(new_node_id).hash_value = Some(hash_values);
         }
@@ -2645,6 +2655,22 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Whether the storage tier (L3) is wired; storage attaches after tree construction.
     pub fn set_enable_storage(&mut self, value: bool) {
         self.enable_storage = value;
+    }
+
+    /// Enable or disable the direct external-cache linker.
+    pub fn set_enable_external_cache_linker(
+        &mut self,
+        value: bool,
+    ) -> Result<(), TreeCoreRuntimeError> {
+        if value && self.components_by_type[MAMBA.idx()].is_some() {
+            return Err(
+                TreeCoreRuntimeError::ExternalCacheLinkerUnsupportedComponent {
+                    component_type: MAMBA,
+                },
+            );
+        }
+        self.enable_external_cache_linker = value;
+        Ok(())
     }
 
     // ==== KV cache placement events ====
@@ -3478,14 +3504,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(order)
     }
 
-    /// Build the backup action for a node and its unbacked ancestors.
+    /// Build the backup action for a node and its not-yet-persisted ancestors.
     pub fn build_backup_kv_action_(&self, node: &Node<K>, write_back: bool) -> BackupKV {
         let mut chain = vec![node.id];
         if !write_back {
             let mut ancestor = node.try_parent();
             while let Some(ancestor_idx) = ancestor {
                 let ancestor_node = self.arena.node(ancestor_idx);
-                if ancestor_node.is_root() || ancestor_node.backuped() {
+                if ancestor_node.is_root()
+                    || ancestor_node.backuped()
+                    || ancestor_node.external_cache_stored
+                {
                     break;
                 }
                 chain.push(ancestor_node.id);
@@ -3647,6 +3676,85 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.update_full_coexisting_host_tracking_(idx);
             node_id = self.arena.node(idx).try_parent();
         }
+    }
+
+    /// Build direct device-to-external-store transfers for an unstored node.
+    pub fn build_external_linker_offload_transfers(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
+        let node_id = self.try_resolve_node_handle_(node_id)?;
+        if self.arena.node(node_id).external_cache_stored {
+            return Ok(None);
+        }
+
+        let transfers = self
+            .components
+            .iter()
+            .filter_map(|component| component.build_external_linker_offload_transfer(self, node_id))
+            .collect();
+        Ok(Some(transfers))
+    }
+
+    /// Mark the path from `from_node_id` to, but excluding, `until_node_id` as
+    /// available in the external cache.
+    pub fn mark_external_cache_stored_path(
+        &mut self,
+        from_node_id: NodeId,
+        until_node_id: NodeId,
+    ) -> Result<(), TreeCoreRuntimeError> {
+        let from = self.try_resolve_node_handle_(from_node_id)?;
+        let until = self.try_resolve_node_handle_(until_node_id)?;
+        let mut path = Vec::new();
+        let mut current = from;
+        while current != until {
+            let node = self.arena.node(current);
+            let Some(parent) = node.try_parent() else {
+                return Err(TreeCoreRuntimeError::ExternalCachePathNotAncestor {
+                    from_node_id,
+                    until_node_id,
+                });
+            };
+            path.push(current);
+            current = parent;
+        }
+        for node_id in path {
+            self.arena.node_mut(node_id).external_cache_stored = true;
+        }
+        Ok(())
+    }
+
+    /// Publish an accepted external offload as pending and externally stored.
+    pub fn mark_external_linker_offload_pending(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<(), TreeCoreRuntimeError> {
+        let node_idx = self.try_resolve_node_handle_(node_id)?;
+        let node = self.arena.node_mut(node_idx);
+        node.write_through_pending_id = Some(node_id);
+        node.external_cache_stored = true;
+        Ok(())
+    }
+
+    /// Finalize external-store state for an offload and its split fragments.
+    pub fn finish_external_linker_offload(
+        &mut self,
+        node_ids: &[NodeId],
+        ack_id: NodeId,
+        success: bool,
+    ) -> Result<(), TreeCoreRuntimeError> {
+        let node_indices = node_ids
+            .iter()
+            .map(|&node_id| self.try_resolve_node_handle_(node_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        for node_id in node_indices {
+            let node = self.arena.node_mut(node_id);
+            if node.write_through_pending_id == Some(ack_id) {
+                node.write_through_pending_id = None;
+            }
+            node.external_cache_stored = success;
+        }
+        Ok(())
     }
 
     /// Mark a node as having an in-flight write-through backup.
