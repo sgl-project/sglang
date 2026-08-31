@@ -10,6 +10,7 @@ from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    fused_conv_window_scatter_with_mask,
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
@@ -50,6 +51,11 @@ _validate_mamba_replay_state_indices = (
 
 
 class MambaAttnBackendBase(AttentionBackend):
+    # Per-slot accept lengths for the KDA fused-accept spec path; allocated only
+    # by KDAAttnBackend where `_can_fuse_accept_state` holds. None everywhere
+    # else — update_mamba_state_after_mtp_verify keys the fused branch on it.
+    accept_lens_pool: Optional[torch.Tensor] = None
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
@@ -1279,6 +1285,31 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices=mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 null_block_id=-1,
+            )
+            return
+
+        # KDA fused-accept: the next verify seeds itself in-kernel from the
+        # accepted checkpoint slot (recurrent_kda's num_accepted_tokens), so the
+        # SSM state never round-trips through `temporal` and only the conv
+        # windows still need the accept rollback. Recording this round's accept
+        # length is what selects that seed next round; chain layout only (see
+        # above), so accept_lens == last_correct_step_indices + 1. The pool
+        # exists only where KDAAttnBackend found the contract satisfied, which
+        # includes mamba radix tracking being off.
+        accept_lens_pool = self.linear_attn_backend.accept_lens_pool
+        if accept_lens_pool is not None:
+            assert mamba_track_indices is None, "fused-accept runs with radix off"
+            for conv_states, intermediate_conv_window in zip(
+                mamba_caches.conv, mamba_caches.intermediate_conv_window
+            ):
+                fused_conv_window_scatter_with_mask(
+                    conv_states,
+                    intermediate_conv_window,
+                    state_indices_tensor,
+                    last_correct_step_indices,
+                )
+            accept_lens_pool[state_indices_tensor.to(torch.int64)] = (
+                last_correct_step_indices.to(torch.int32) + 1
             )
             return
 

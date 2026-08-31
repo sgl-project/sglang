@@ -741,3 +741,37 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)
+
+
+def apply_nvfp4_gemm_prequantized(
+    layer: torch.nn.Module,
+    x_fp4: torch.Tensor,
+    x_scale_interleaved: torch.Tensor,
+    output_dtype: torch.dtype,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run a ModelOpt NVFP4 GEMM from already packed activations and scales."""
+    weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
+    x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
+
+    w = layer.weight
+    w_scale_interleaved = layer.weight_scale_interleaved
+    if x_scale_interleaved.dtype == torch.uint8:
+        x_scale_interleaved = x_scale_interleaved.view(torch.float8_e4m3fn)
+    if w_scale_interleaved.dtype == torch.uint8:
+        w_scale_interleaved = w_scale_interleaved.view(torch.float8_e4m3fn)
+
+    fp4_gemm, flashinfer_backend = _get_fp4_gemm_op()
+    if fp4_gemm is None:
+        raise RuntimeError("No FP4 GEMM kernel available. Install flashinfer.")
+    out = fp4_gemm(
+        x_fp4,
+        w.T,
+        x_scale_interleaved,
+        w_scale_interleaved.T,
+        layer.alpha,
+        output_dtype,
+        backend=flashinfer_backend,
+    )
+    out = slice_nvfp4_output(out, layer.output_size_per_partition)
+    return out + bias if bias is not None else out

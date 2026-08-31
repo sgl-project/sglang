@@ -9,10 +9,11 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
     terminate_and_kill_process_tree,
+    unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=250, stage="base-b", runner_config="2-gpu-large")
-register_amd_ci(est_time=400, suite="stage-b-test-2-gpu-large-amd")
+register_cuda_ci(est_time=500, stage="base-b", runner_config="2-gpu-large")
+register_amd_ci(est_time=800, suite="stage-b-test-2-gpu-large-amd")
 
 FULL_MODEL = "Qwen/Qwen3-32B"
 
@@ -20,6 +21,7 @@ FULL_MODEL = "Qwen/Qwen3-32B"
 class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Full attention."""
 
+    tree_core_backend = "python"
     kl_threshold = 0.0025
 
     @classmethod
@@ -38,13 +40,17 @@ class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--page-size",
                 "64",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
     @classmethod
     def tearDownClass(cls):
         terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+
+
+class TestRustUnifiedFullRadixCache(TestUnifiedFullRadixCache):
+    tree_core_backend = "rust"
 
 
 if __name__ == "__main__":
