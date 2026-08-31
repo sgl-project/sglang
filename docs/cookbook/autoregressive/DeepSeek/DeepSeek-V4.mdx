@@ -222,11 +222,10 @@ For the original Flash and Pro checkpoints:
 [`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) is DeepSeek's first experimental multimodal V4 checkpoint: the 0731 Flash base plus a vision encoder and aligner, served through the same `sglang serve` flow with OpenAI-style `image_url` inputs (see [Vision](#3-5-vision-image-inputs) below). Select the **Flash Vision** variant in the Deploy panel for its recipes.
 
 - **Preview build required** — support lands via [sgl-project/sglang#37253](https://github.com/sgl-project/sglang/pull/37253) and has not shipped in a release. Docker mode on the Flash Vision cells already emits the preview image `lmsysorg/sglang:dev-dsv4-flash-vision`; for a Python environment, install SGLang from that PR's branch.
-- **Verified matrix** — the low-latency TP=4 recipe is verified end-to-end on 4×B200 (MMMU-Pro standard 10-option: **74.96%** via sgl-eval at `temperature 1.0`, `top-p 0.95`, `--reasoning-effort max`). The balanced / high-throughput recipes are still in their verification round and carry the **Final Verification In Progress** badge.
+- **Verified matrix** — MMMU-Pro via sgl-eval at `temperature 1.0`, `top-p 0.95`, `--reasoning-effort max`.
 - **Engine auto-configuration** — the engine picks the `flashinfer_mxfp4` MoE runner and auto-disables shared-experts fusion for this checkpoint (its HashTopK routing rejects fused shared experts); don't pass `--enforce-shared-experts-fusion`.
 - **Chunked prefill & radix cache stay enabled** — the scheduler keeps image spans consistent automatically: chunked-prefill truncation points are span-aligned (an image span always prefills within a single extend, overshooting the chunk budget by at most one span), and a radix-cache prefix match ending deep inside an image span is re-issued from the span start.
 - **Speculative decoding** — the checkpoint bundles a DSpark head, but MTP/DSpark with image batches is not yet verified, so all Flash Vision recipes run target-only. As on the 0731/0813 checkpoints, do not pass the EAGLE flags.
-- **Cap `max_tokens` when evaluating** — with unbounded generation an occasional sample can enter a very long reasoning loop (a 400K+-token chain was observed during the MMMU-Pro round; excluding it moves the score by at most ±0.06%).
 
 **Shared experts fusion (Blackwell, flashinfer_mxfp4)**
 

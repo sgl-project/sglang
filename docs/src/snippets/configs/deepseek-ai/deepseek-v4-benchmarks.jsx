@@ -645,4 +645,17 @@ export const benchmarks = [
   },
   { match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
   { match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" } },
+  // B300 / GB200 / GB300 / H200 / H100 — Flash Vision (Exp), all pending
+  { match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" } },
+  { match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" } },
+  { match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" } },
+  { match: { hw: "h200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "h200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "h100", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
 ];
