@@ -271,9 +271,10 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             self.buffers.seq_lens_cpu[self.raw_bs : self.bs].fill_(
                 self.seq_len_fill_value
             )
-            self.buffers.req_pool_indices[: self.bs].copy_(
+            self.buffers.req_pool_indices[: self.raw_bs].copy_(
                 forward_batch.req_pool_indices[: self.raw_bs]
             )
+            self.buffers.req_pool_indices[self.raw_bs : self.bs].fill_(0)
             fb_view = build_replay_fb_view(
                 forward_batch=forward_batch,
                 buffers=self.buffers,
