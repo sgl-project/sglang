@@ -99,6 +99,44 @@ SGL_DEVICE uint32_t dcp_block_inclusive_sum(uint32_t value, int32_t* scratch, ui
   return static_cast<uint32_t>(scratch[warp_id]) + value;
 }
 
+SGL_DEVICE uint32_t dcp_block_reduce_min(uint32_t value, int32_t* scratch) {
+  constexpr uint32_t kLogicalWarpSize = 32;
+  constexpr uint32_t kLogicalWarps = kTopKBlockSize / kLogicalWarpSize;
+  const uint32_t tx = threadIdx.x;
+  const uint32_t warp_id = tx / kLogicalWarpSize;
+  const uint32_t lane_id = tx % kLogicalWarpSize;
+
+#pragma unroll
+  for (uint32_t offset = kLogicalWarpSize / 2; offset > 0; offset >>= 1) {
+#ifdef USE_ROCM
+    value = min(value, __shfl_down(value, offset, kLogicalWarpSize));
+#else
+    value = min(value, __shfl_down_sync(0xffffffffu, value, offset, kLogicalWarpSize));
+#endif
+  }
+  if (lane_id == 0) {
+    scratch[warp_id] = static_cast<int32_t>(value);
+  }
+  __syncthreads();
+
+  if (warp_id == 0) {
+    value = lane_id < kLogicalWarps ? static_cast<uint32_t>(scratch[lane_id]) : 0xffffffffu;
+#pragma unroll
+    for (uint32_t offset = kLogicalWarpSize / 2; offset > 0; offset >>= 1) {
+#ifdef USE_ROCM
+      value = min(value, __shfl_down(value, offset, kLogicalWarpSize));
+#else
+      value = min(value, __shfl_down_sync(0xffffffffu, value, offset, kLogicalWarpSize));
+#endif
+    }
+    if (lane_id == 0) {
+      scratch[0] = static_cast<int32_t>(value);
+    }
+  }
+  __syncthreads();
+  return static_cast<uint32_t>(scratch[0]);
+}
+
 template <bool kUsePDL>
 __global__ void dcp_topk_candidates_kernel(const __grid_constant__ DCPTopKCandidateParams params) {
   const uint32_t batch_idx = blockIdx.x;
@@ -111,7 +149,7 @@ __global__ void dcp_topk_candidates_kernel(const __grid_constant__ DCPTopKCandid
   device::PDLWaitPrimary<kUsePDL>();
 
   __shared__ int32_t selected[kMaxTopK];
-  __shared__ uint32_t threshold_key;
+  __shared__ int32_t reduce_scratch[kTopKBlockSize / 32];
   __shared__ uint32_t output_count;
   __shared__ uint32_t tile_count;
   __shared__ uint32_t radix_prefix;
@@ -133,17 +171,13 @@ __global__ void dcp_topk_candidates_kernel(const __grid_constant__ DCPTopKCandid
   }
 
   const bool radix_scratch_overflow = radix_topk(score_ptr, selected, local_len, params.topk, true);
+  uint32_t threshold_key;
   if (!radix_scratch_overflow) {
     if (tx == 0) {
-      threshold_key = 0xffffffffu;
       output_count = 0;
     }
-    __syncthreads();
-
-    if (tx < params.topk) {
-      atomicMin(&threshold_key, ordered_dcp_score(score_ptr[selected[tx]]));
-    }
-    __syncthreads();
+    threshold_key = dcp_block_reduce_min(
+        tx < params.topk ? ordered_dcp_score(score_ptr[selected[tx]]) : 0xffffffffu, reduce_scratch);
   } else {
     // topk_v1 reports when its fixed index scratch clipped a dense coarse
     // bucket. Select the exact 32-bit threshold with four bounded histogram
@@ -230,10 +264,10 @@ __global__ void dcp_topk_candidates_kernel(const __grid_constant__ DCPTopKCandid
     }
 
     if (tx == 0) {
-      threshold_key = radix_prefix;
       output_count = 0;
     }
     __syncthreads();
+    threshold_key = radix_prefix;
   }
 
   for (uint32_t tile_start = 0; tile_start < local_len; tile_start += kTopKBlockSize) {
@@ -280,7 +314,6 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
 
   const uint32_t batch_idx = blockIdx.x;
   const uint32_t tx = threadIdx.x;
-  const uint32_t candidate_count = kDCPSize * params.topk;
   const auto page_table = params.local_page_table + batch_idx * params.page_table_stride;
   const auto page_indices = params.page_indices + batch_idx * params.topk;
   const auto local_raw_indices =
@@ -289,9 +322,9 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
   __shared__ float candidate_scores[kMaxCandidateCount];
   __shared__ int32_t candidate_indices[kMaxCandidateCount];
   __shared__ int32_t selected[kMaxTopK];
+  __shared__ int32_t reduce_scratch[kTopKBlockSize / 32];
+  __shared__ uint32_t candidate_offsets[kDCPSize + 1];
   __shared__ uint32_t output_count;
-  __shared__ uint32_t threshold_key;
-  __shared__ uint32_t greater_count;
   __shared__ uint32_t threshold_valid_count;
   __shared__ uint32_t tie_count;
   __shared__ uint32_t tie_min_index;
@@ -302,8 +335,6 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
 
   if (tx == 0) {
     output_count = 0;
-    threshold_key = 0xffffffffu;
-    greater_count = 0;
     threshold_valid_count = 0;
     tie_count = 0;
     tie_min_index = 0xffffffffu;
@@ -316,9 +347,89 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
     }
   }
 
+  if (tx < kDCPSize) {
+    const auto candidate_row = params.candidates + (tx * params.batch_size + batch_idx) * params.candidate_stride;
+    candidate_offsets[tx + 1] = unpack_dcp_candidate_index(candidate_row[params.topk - 1]) >= 0 ? params.topk : 0;
+  }
+  if (tx == 0) {
+    candidate_offsets[0] = 0;
+  }
+  __syncthreads();
+
+  bool all_candidate_rows_full = true;
+#pragma unroll
+  for (uint32_t rank = 0; rank < kDCPSize; ++rank) {
+    all_candidate_rows_full &= candidate_offsets[rank + 1] == params.topk;
+  }
+  if (!all_candidate_rows_full) {
+    if (tx < kDCPSize && candidate_offsets[tx + 1] == 0) {
+      const auto candidate_row = params.candidates + (tx * params.batch_size + batch_idx) * params.candidate_stride;
+      uint32_t low = 0;
+      uint32_t high = params.topk;
+      while (low < high) {
+        const uint32_t mid = low + (high - low) / 2;
+        if (unpack_dcp_candidate_index(candidate_row[mid]) >= 0) {
+          low = mid + 1;
+        } else {
+          high = mid;
+        }
+      }
+      candidate_offsets[tx + 1] = low;
+    }
+    __syncthreads();
+    if (tx == 0) {
+      uint32_t offset = 0;
+#pragma unroll
+      for (uint32_t rank = 0; rank < kDCPSize; ++rank) {
+        const uint32_t count = candidate_offsets[rank + 1];
+        candidate_offsets[rank] = offset;
+        offset += count;
+      }
+      candidate_offsets[kDCPSize] = offset;
+    }
+    __syncthreads();
+  }
+  const uint32_t valid_candidate_count = candidate_offsets[kDCPSize];
+  // candidate_offsets[kDCPSize] is only a per-row marker when every row is
+  // full, not a global count. In the partial-row case, every valid candidate
+  // is selected when the exact global count fits in top-k.
+  if (!all_candidate_rows_full && valid_candidate_count <= params.topk) {
+    const uint32_t owner_candidate_count = candidate_offsets[params.dcp_rank + 1] - candidate_offsets[params.dcp_rank];
+    const auto owner_candidate_row =
+        params.candidates + (params.dcp_rank * params.batch_size + batch_idx) * params.candidate_stride;
+    if (tx < owner_candidate_count) {
+      // The packed index is the low 32-bit word. Load it directly so this path
+      // never touches the candidate score.
+      const int32_t owner_global_index = reinterpret_cast<const int32_t*>(owner_candidate_row)[2 * tx];
+      const uint32_t local_raw = static_cast<uint32_t>(owner_global_index) / kDCPSize;
+      page_indices[tx] = page_to_indices(page_table, local_raw, params.page_bits);
+      if (local_raw_indices != nullptr) {
+        local_raw_indices[tx] = static_cast<int32_t>(local_raw);
+      }
+    }
+    if (tx == 0) {
+      params.local_lens[batch_idx] = static_cast<int32_t>(owner_candidate_count);
+    }
+    __syncthreads();
+    device::PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
+
+  const bool use_compact_candidates = !all_candidate_rows_full && valid_candidate_count > params.topk &&
+                                      valid_candidate_count * 4 <= kDCPSize * params.topk * 3;
+  const uint32_t candidate_count = use_compact_candidates ? candidate_offsets[kDCPSize] : kDCPSize * params.topk;
   for (uint32_t candidate_id = tx; candidate_id < candidate_count; candidate_id += kTopKBlockSize) {
-    const uint32_t source_rank = candidate_id / params.topk;
-    const uint32_t local_id = candidate_id - source_rank * params.topk;
+    uint32_t source_rank = candidate_id / params.topk;
+    uint32_t local_id = candidate_id - source_rank * params.topk;
+    if (use_compact_candidates) {
+#pragma unroll
+      for (uint32_t rank = 0; rank < kDCPSize; ++rank) {
+        if (candidate_id >= candidate_offsets[rank] && candidate_id < candidate_offsets[rank + 1]) {
+          source_rank = rank;
+          local_id = candidate_id - candidate_offsets[rank];
+        }
+      }
+    }
     const auto candidate_row =
         params.candidates + (source_rank * params.batch_size + batch_idx) * params.candidate_stride;
     const int64_t candidate = candidate_row[local_id];
@@ -331,26 +442,22 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
   radix_topk(candidate_scores, selected, candidate_count, params.topk);
   __syncthreads();
 
-  if (tx < params.topk) {
-    atomicMin(&threshold_key, ordered_dcp_score(candidate_scores[selected[tx]]));
-  }
-  __syncthreads();
+  const uint32_t threshold_key = dcp_block_reduce_min(
+      tx < params.topk ? ordered_dcp_score(candidate_scores[selected[tx]]) : 0xffffffffu, reduce_scratch);
 
-  uint32_t thread_greater_count = 0;
+  const int32_t selected_global_index = tx < params.topk ? candidate_indices[selected[tx]] : -1;
+  const uint32_t selected_score_key = tx < params.topk ? ordered_dcp_score(candidate_scores[selected[tx]]) : 0u;
+  dcp_block_inclusive_sum(
+      selected_global_index >= 0 && selected_score_key > threshold_key ? 1u : 0u, reduce_scratch, &compact_count);
+  const uint32_t greater_count = compact_count;
+
   uint32_t thread_threshold_valid_count = 0;
   for (uint32_t candidate_id = tx; candidate_id < candidate_count; candidate_id += kTopKBlockSize) {
     const int32_t global_index = candidate_indices[candidate_id];
     const uint32_t score_key = ordered_dcp_score(candidate_scores[candidate_id]);
-    if (global_index >= 0) {
-      if (score_key > threshold_key) {
-        ++thread_greater_count;
-      } else if (score_key == threshold_key) {
-        ++thread_threshold_valid_count;
-      }
+    if (global_index >= 0 && score_key == threshold_key) {
+      ++thread_threshold_valid_count;
     }
-  }
-  if (thread_greater_count != 0) {
-    atomicAdd(&greater_count, thread_greater_count);
   }
   if (thread_threshold_valid_count != 0) {
     atomicAdd(&threshold_valid_count, thread_threshold_valid_count);
@@ -364,9 +471,21 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
   __syncthreads();
 
   const uint32_t owner_candidate_id = params.dcp_rank * params.topk + min(tx, params.topk - 1);
-  const int32_t owner_global_index = tx < params.topk ? candidate_indices[owner_candidate_id] : -1;
-  const bool owner_is_strict =
-      owner_global_index >= 0 && ordered_dcp_score(candidate_scores[owner_candidate_id]) > threshold_key;
+  int32_t owner_global_index = -1;
+  uint32_t owner_score_key = 0;
+  if (tx < params.topk) {
+    if (use_compact_candidates) {
+      const auto owner_candidate_row =
+          params.candidates + (params.dcp_rank * params.batch_size + batch_idx) * params.candidate_stride;
+      const int64_t owner_candidate = owner_candidate_row[tx];
+      owner_global_index = unpack_dcp_candidate_index(owner_candidate);
+      owner_score_key = ordered_dcp_score(unpack_dcp_candidate_score(owner_candidate));
+    } else {
+      owner_global_index = candidate_indices[owner_candidate_id];
+      owner_score_key = ordered_dcp_score(candidate_scores[owner_candidate_id]);
+    }
+  }
+  const bool owner_is_strict = owner_global_index >= 0 && owner_score_key > threshold_key;
   const uint32_t owner_position = dcp_block_inclusive_sum(owner_is_strict ? 1u : 0u, selected, &compact_count);
   if (owner_is_strict) {
     const uint32_t local_raw = static_cast<uint32_t>(owner_global_index) / kDCPSize;
@@ -413,8 +532,7 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
     }
     __syncthreads();
 
-    const bool owner_is_selected_tie = owner_global_index >= 0 &&
-                                       candidate_scores[owner_candidate_id] != __uint_as_float(0xff800000u) &&
+    const bool owner_is_selected_tie = owner_global_index >= 0 && owner_score_key == threshold_key &&
                                        static_cast<uint32_t>(owner_global_index) <= tie_max_index;
     const uint32_t tie_position = dcp_block_inclusive_sum(owner_is_selected_tie ? 1u : 0u, selected, &compact_count);
     const uint32_t tie_base = output_count;

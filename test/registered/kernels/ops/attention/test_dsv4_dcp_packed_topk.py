@@ -26,6 +26,22 @@ def _local_lens(global_lens: torch.Tensor, dcp_size: int, rank: int) -> torch.Te
     return (global_lens // dcp_size + (rank < global_lens % dcp_size)).to(torch.int32)
 
 
+def _uneven_candidate_counts(
+    total: int, dcp_size: int, rotate: bool = False
+) -> list[int]:
+    counts = [0] * dcp_size
+    assigned = 0
+    for rank in range(1, dcp_size - 1):
+        counts[rank] = 1 << (rank - 1)
+        assigned += counts[rank]
+    counts[-1] = total - assigned
+    if rotate:
+        counts = counts[1:] + counts[:1]
+    assert min(counts) >= 0
+    assert sum(counts) == total
+    return counts
+
+
 def test_candidate_mapping_uses_compressed_row_owner_order() -> None:
     candidates = torch.empty((1, 2), dtype=torch.int64, device="cuda")
     dcp_topk_candidates(
@@ -311,9 +327,248 @@ def test_combined_q_candidate_layout_is_zero_copy_and_bitwise(
 
 @pytest.mark.parametrize("topk", [512, 1024])
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
-@pytest.mark.parametrize("tied", [False, True])
+def test_merge_selects_exact_short_candidate_prefix(topk: int, dcp_size: int) -> None:
+    device = torch.device("cuda")
+    batch_size = 3
+    counts = [
+        [0] * dcp_size,
+        _uneven_candidate_counts(topk - 1, dcp_size),
+        _uneven_candidate_counts(topk, dcp_size, rotate=True),
+    ]
+
+    packed = torch.empty(
+        (dcp_size * batch_size, topk), dtype=torch.int64, device=device
+    )
+    packed_words = packed.view(torch.int32).reshape(dcp_size * batch_size, topk, 2)
+    packed_words[..., 0] = -1
+    packed_words[..., 1] = torch.tensor(
+        -float("inf"), dtype=torch.float32, device=device
+    ).view(torch.int32)
+    expected_raw = [[None] * dcp_size for _ in range(batch_size)]
+    for batch_idx in range(batch_size):
+        for rank in range(dcp_size):
+            count = counts[batch_idx][rank]
+            raw = torch.arange(count - 1, -1, -1, dtype=torch.int32, device=device)
+            row = rank * batch_size + batch_idx
+            packed_words[row, :count, 0] = raw * dcp_size + rank
+            scores = torch.full(
+                (count,),
+                float("nan") if batch_idx == 1 else 3.0,
+                dtype=torch.float32,
+                device=device,
+            )
+            packed_words[row, :count, 1] = scores.view(torch.int32)
+            expected_raw[batch_idx][rank] = raw
+
+    head_dim, local_heads = 512, 16
+    combined_storage = torch.full(
+        (
+            dcp_size * batch_size + 2,
+            local_heads + topk * 4 // head_dim,
+            head_dim,
+        ),
+        11.0,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    strided_candidates = combined_q_topk_candidate_view(
+        combined_storage[1:-1],
+        local_heads=local_heads,
+        topk=topk,
+    )
+    assert strided_candidates.stride(0) > topk
+    strided_candidates.copy_(packed)
+    combined_before = combined_storage.clone()
+
+    num_pages = (topk + C4_PAGE_SIZE - 1) // C4_PAGE_SIZE
+    sentinel = 0x1234567
+
+    def guarded_outputs() -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        page_storage = torch.full(
+            (batch_size + 2, topk), sentinel, dtype=torch.int32, device=device
+        )
+        raw_storage = torch.full_like(page_storage, sentinel)
+        lens_storage = torch.full(
+            (batch_size + 2,), sentinel, dtype=torch.int32, device=device
+        )
+        return (
+            page_storage,
+            page_storage[1:-1],
+            raw_storage,
+            raw_storage[1:-1],
+            lens_storage,
+            lens_storage[1:-1],
+        )
+
+    for rank in range(dcp_size):
+        page_table = (
+            torch.arange(num_pages, dtype=torch.int32, device=device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+            .clone()
+        )
+        page_table += (
+            rank * 10000
+            + torch.arange(batch_size, dtype=torch.int32, device=device).unsqueeze(1)
+            * 100
+        )
+
+        (
+            page_storage,
+            page_indices,
+            raw_storage,
+            local_raw,
+            lens_storage,
+            local_lens,
+        ) = guarded_outputs()
+        dcp_topk_merge(
+            strided_candidates,
+            page_table,
+            page_indices,
+            local_lens,
+            C4_PAGE_SIZE,
+            dcp_size,
+            rank,
+            local_raw,
+        )
+
+        (
+            repeated_page_storage,
+            repeated_page_indices,
+            repeated_raw_storage,
+            repeated_local_raw,
+            repeated_lens_storage,
+            repeated_local_lens,
+        ) = guarded_outputs()
+        dcp_topk_merge(
+            strided_candidates,
+            page_table,
+            repeated_page_indices,
+            repeated_local_lens,
+            C4_PAGE_SIZE,
+            dcp_size,
+            rank,
+            repeated_local_raw,
+        )
+
+        (
+            optional_page_storage,
+            optional_page_indices,
+            _,
+            _,
+            optional_lens_storage,
+            optional_local_lens,
+        ) = guarded_outputs()
+        dcp_topk_merge(
+            strided_candidates,
+            page_table,
+            optional_page_indices,
+            optional_local_lens,
+            C4_PAGE_SIZE,
+            dcp_size,
+            rank,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(repeated_local_lens, local_lens, rtol=0, atol=0)
+        torch.testing.assert_close(repeated_page_indices, page_indices, rtol=0, atol=0)
+        torch.testing.assert_close(repeated_local_raw, local_raw, rtol=0, atol=0)
+        torch.testing.assert_close(optional_local_lens, local_lens, rtol=0, atol=0)
+        torch.testing.assert_close(optional_page_indices, page_indices, rtol=0, atol=0)
+
+        for batch_idx in range(batch_size):
+            count = counts[batch_idx][rank]
+            raw = expected_raw[batch_idx][rank]
+            assert int(local_lens[batch_idx]) == count
+            torch.testing.assert_close(
+                local_raw[batch_idx, :count], raw, rtol=0, atol=0
+            )
+            expected_pages = (
+                page_table[batch_idx, raw // C4_PAGE_SIZE] * C4_PAGE_SIZE
+                + raw % C4_PAGE_SIZE
+            )
+            torch.testing.assert_close(
+                page_indices[batch_idx, :count], expected_pages, rtol=0, atol=0
+            )
+            assert torch.all(page_indices[batch_idx, count:] == -1)
+            assert torch.all(local_raw[batch_idx, count:] == -1)
+
+        for storage in (
+            page_storage,
+            raw_storage,
+            lens_storage,
+            repeated_page_storage,
+            repeated_raw_storage,
+            repeated_lens_storage,
+            optional_page_storage,
+            optional_lens_storage,
+        ):
+            assert torch.all(storage[0] == sentinel)
+            assert torch.all(storage[-1] == sentinel)
+
+    torch.testing.assert_close(
+        combined_storage, combined_before, rtol=0, atol=0, equal_nan=True
+    )
+
+
+def test_merge_all_full_marker_uses_score_selection() -> None:
+    device = torch.device("cuda")
+    topk, dcp_size, selected_rank = 1024, 8, 7
+    candidates = torch.empty((dcp_size, topk), dtype=torch.int64, device=device)
+    words = candidates.view(torch.int32).reshape(dcp_size, topk, 2)
+    raw = torch.arange(topk, dtype=torch.int32, device=device)
+    for rank in range(dcp_size):
+        words[rank, :, 0] = raw * dcp_size + rank
+        scores = torch.full(
+            (topk,),
+            1.0 if rank == selected_rank else 0.0,
+            dtype=torch.float32,
+            device=device,
+        )
+        words[rank, :, 1] = scores.view(torch.int32)
+
+    page_table = torch.arange(
+        (topk + C4_PAGE_SIZE - 1) // C4_PAGE_SIZE,
+        dtype=torch.int32,
+        device=device,
+    ).unsqueeze(0)
+    for rank in range(dcp_size):
+        page_indices = torch.empty((1, topk), dtype=torch.int32, device=device)
+        local_raw = torch.empty_like(page_indices)
+        local_lens = torch.empty((1,), dtype=torch.int32, device=device)
+        dcp_topk_merge(
+            candidates,
+            page_table,
+            page_indices,
+            local_lens,
+            C4_PAGE_SIZE,
+            dcp_size,
+            rank,
+            local_raw,
+        )
+        torch.cuda.synchronize()
+
+        expected_count = topk if rank == selected_rank else 0
+        assert int(local_lens[0]) == expected_count
+        torch.testing.assert_close(
+            local_raw[0, :expected_count], raw[:expected_count], rtol=0, atol=0
+        )
+        assert torch.all(page_indices[0, expected_count:] == -1)
+        assert torch.all(local_raw[0, expected_count:] == -1)
+
+
+@pytest.mark.parametrize("topk", [512, 1024])
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("score_mode", ["random", "all_tied", "boundary_tied"])
 def test_packed_dcp_topk_matches_global_score_set(
-    topk: int, dcp_size: int, tied: bool
+    topk: int, dcp_size: int, score_mode: str
 ) -> None:
     device = torch.device("cuda")
     global_lens = torch.tensor(
@@ -324,10 +579,16 @@ def test_packed_dcp_topk_matches_global_score_set(
     batch_size = global_lens.numel()
     global_width = int(global_lens.max())
     generator = torch.Generator(device=device).manual_seed(20260828 + topk + dcp_size)
-    if tied:
+    if score_mode == "all_tied":
         global_scores = torch.zeros(
             (batch_size, global_width), dtype=torch.float32, device=device
         )
+    elif score_mode == "boundary_tied":
+        global_scores = torch.zeros(
+            (batch_size, global_width), dtype=torch.float32, device=device
+        )
+        global_scores[:, : topk - 17] = 2.0
+        global_scores[:, topk - 17 : topk + 47] = 1.0
     else:
         global_scores = torch.randn(
             (batch_size, global_width),
@@ -440,7 +701,7 @@ def test_packed_dcp_topk_matches_global_score_set(
         assert len(selected) == expected_count
         assert len(set(selected)) == expected_count
         assert all(0 <= index < length for index in selected)
-        if tied:
+        if score_mode != "random":
             assert set(selected) == set(range(expected_count))
         elif length <= topk:
             assert set(selected) == set(range(length))
