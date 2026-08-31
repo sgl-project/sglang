@@ -33,9 +33,10 @@ def _make_mock_req(
     """Create a mock Req with the KV cache state needed for testing."""
     req = MagicMock()
     req.rid = rid
-    req.req_pool_idx = req_pool_idx
     req.kv = ReqKvInfo(
-        kv_committed_len=kv_committed_len, kv_allocated_len=kv_allocated_len
+        req_pool_idx=req_pool_idx,
+        kv_committed_len=kv_committed_len,
+        kv_allocated_len=kv_allocated_len,
     )
     req.prefix_indices = list(range(prefix_indices_len))
     req.effective_kv_committed_len = lambda: req.kv.kv_committed_len

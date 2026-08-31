@@ -82,13 +82,13 @@ class ChunkCache(BasePrefixCache):
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         # The protected prefix is not this req's to free.
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, req.kv.cache_protected_len : kv_len_to_handle
+            req.kv.req_pool_idx, req.kv.cache_protected_len : kv_len_to_handle
         ]
         self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.extend_range.end
+            req.kv.req_pool_idx, : req.extend_range.end
         ]
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
@@ -158,7 +158,7 @@ class PureSWAChunkCache(SWAChunkCache):
     ):
         kv_committed_len = kv_len_to_handle
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.kv.req_pool_idx, :kv_committed_len
         ]
         # The cache_protected_len prefix is not this req's to free.
         protected_len = req.kv.cache_protected_len

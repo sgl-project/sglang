@@ -88,7 +88,11 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.runtime_context import get_parallel, get_stream
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel as _gp
+from sglang.srt.runtime_context import (
+    get_stream,
+)
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -141,7 +145,6 @@ def _scmoe_align_rows(t, target):
     if t is None or t.shape[0] == target:
         return t
     from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor as _ag
-    from sglang.srt.runtime_context import get_parallel as _gp
 
     cur = t.shape[0]
     if target > cur:
