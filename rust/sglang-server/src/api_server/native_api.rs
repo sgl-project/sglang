@@ -99,8 +99,9 @@ pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Res
 /// Python) decides whether `/health` shares it or is a plain 200 (routing the
 /// request already proves the frontend is up).
 fn health_routes() -> Router<Arc<AppState>> {
-    let timeout =
-        std::time::Duration::from_secs(environ::env_u64("SGLANG_HEALTH_CHECK_TIMEOUT", 20));
+    let timeout = std::time::Duration::from_secs(
+        environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
+    );
     let probe = get(move |state: State<Arc<AppState>>| health_generate(state, timeout));
     let health = if environ::env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
         probe.clone()

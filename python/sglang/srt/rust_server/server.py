@@ -89,13 +89,11 @@ class RustServer:
                 "ingress has no equivalent). Launch without SGLANG_RUST_SERVER, or "
                 "drop --preferred-sampling-params and send those values per request."
             )
-        http_addr = f"{get_serving().host}:{get_serving().port}"
-
         # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
         # so the rank is not conflated with rank 0 of a one-rank group.
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
-        if dp_rank is not None:
-            http_addr = f"{get_serving().host}:{get_serving().port + dp_rank}"
+        listen_port = get_serving().port + (dp_rank or 0)
+        listen_addr = f"{get_serving().host}:{listen_port}"
 
         launch_cores, server_cores = _partition_cores(
             mm_workers=(
@@ -109,7 +107,7 @@ class RustServer:
             _build_server_args(scheduler),
             # None -> run unpinned; the list carries the pinning decision.
             cores=server_cores,
-            http_addr=http_addr,
+            port_offset=dp_rank,
         )
 
         # Multimodal models must have a Rust pipeline — there is no Python
@@ -161,7 +159,7 @@ class RustServer:
         )
         logger.info(
             "SGLANG_RUST_SERVER enabled, Rust server listen on %s%s",
-            http_addr,
+            listen_addr,
             dp_note,
         )
 
