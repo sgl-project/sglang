@@ -172,7 +172,7 @@ class SchedulerPoolStatsObserver:
             if batch is None or batch.is_empty():
                 continue
             for req in batch.reqs:
-                if req.kv.req_pool_idx is not None:
+                if req.kv.holds_kv:
                     idxs.add(req.kv.req_pool_idx)
         return idxs
 

@@ -185,7 +185,7 @@ class RadixCacheCpp(BasePrefixCache):
     ):
         """Cache request when it finishes."""
         self._reject_cache_salt(req.cache_salt)
-        assert req.kv.req_pool_idx is not None
+        assert req.kv.holds_kv
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :kv_len_to_handle
@@ -223,7 +223,7 @@ class RadixCacheCpp(BasePrefixCache):
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         self._reject_cache_salt(req.cache_salt)
-        assert req.kv.req_pool_idx is not None
+        assert req.kv.holds_kv
         token_ids = req.get_fill_ids()
         prefill_len = len(token_ids)  # prefill only (maybe chunked)
         kv_indices = self.req_to_token_pool.req_to_token[

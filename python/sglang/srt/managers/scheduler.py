@@ -3124,7 +3124,7 @@ class Scheduler(
         if self.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
             # it. Drop the marker once the request is actually gone.
-            if req.finished() or req.kv.req_pool_idx is None:
+            if req.finished() or not req.kv.holds_kv:
                 self._pending_chunked_abort_req = None
             return
 

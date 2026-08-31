@@ -289,7 +289,7 @@ class ReqToTokenPool:
     def alloc(self, reqs: list[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
-        reusing = [i for i, r in enumerate(reqs) if r.kv.req_pool_idx is not None]
+        reusing = [i for i, r in enumerate(reqs) if r.kv.holds_kv]
         assert all(
             reqs[i].kv.kv_allocated_len > 0 for i in reusing
         ), "a reused row must carry allocated KV"
@@ -299,7 +299,7 @@ class ReqToTokenPool:
             return None
         offset = 0
         for r in reqs:
-            if r.kv.req_pool_idx is None:
+            if not r.kv.holds_kv:
                 r.kv.req_pool_idx = select_index[offset]
                 offset += 1
         return [r.kv.req_pool_idx for r in reqs]
@@ -328,7 +328,7 @@ class ReqToTokenPool:
         self.free_slots.extend(indices)
 
     def free(self, req: Req):
-        assert req.kv.req_pool_idx is not None, "request must have req_pool_idx"
+        assert req.kv.holds_kv, "request must have req_pool_idx"
         self.free_rows([req.kv.req_pool_idx])
         req.kv.req_pool_idx = None
 
