@@ -3,20 +3,12 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.multimodal_gen.runtime.loader.component_loaders.bridge_loader import (
-    BridgeLoader,
-)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    ComponentLoader,
     NativeComponentLoaderRequired,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    RESIDENT,
-)
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
@@ -145,26 +137,6 @@ class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
                 self._server_args(), "transformer_2"
             )
         )
-
-    def test_only_fsdp_materializers_keep_the_component_request(self):
-        server_args = ServerArgs.__new__(ServerArgs)
-        server_args.use_fsdp_inference = True
-        server_args._fsdp_disabled_components = set()
-        server_args.residency_mode = lambda _component: RESIDENT
-
-        ComponentLoader().disable_unsupported_component_fsdp(
-            server_args, "text_encoder"
-        )
-        self.assertFalse(server_args.should_use_fsdp_for_component("text_encoder"))
-
-        TransformerLoader().disable_unsupported_component_fsdp(
-            server_args, "transformer"
-        )
-        BridgeLoader().disable_unsupported_component_fsdp(
-            server_args, "dual_tower_bridge"
-        )
-        self.assertTrue(server_args.should_use_fsdp_for_component("transformer"))
-        self.assertTrue(server_args.should_use_fsdp_for_component("dual_tower_bridge"))
 
 
 if __name__ == "__main__":

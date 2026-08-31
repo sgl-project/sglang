@@ -398,12 +398,21 @@ class VAELoader(ComponentLoader):
 
     component_names = ["vae", "audio_vae", "video_vae"]
     expected_library = "diffusers"
-    supports_direct_gpu_weight_loading = True
 
-    def supports_direct_gpu_weight_loading_for_component(
-        self, component_name: str
+    def resolve_component_weight_override(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return server_args.component_weights_paths.get(component_name)
+
+    def resolve_component_direct_gpu_loading(
+        self, server_args: ServerArgs, component_name: str
     ) -> bool:
-        return component_name in ("vae", "video_vae")
+        requested = server_args.should_direct_gpu_weight_load_component(component_name)
+        if requested and component_name not in ("vae", "video_vae"):
+            raise ComponentCheckpointUnsupportedError(
+                f"Direct GPU loading is not implemented for {component_name!r}"
+            )
+        return requested
 
     def select_weight_files(
         self,
@@ -425,14 +434,14 @@ class VAELoader(ComponentLoader):
     ) -> str | None:
         return server_args.component_precisions.get(component_name)
 
-    @staticmethod
     def resolve_model_weights_path(
+        self,
         component_model_path: str,
         server_args: ServerArgs,
         component_name: str,
     ) -> str:
-        weights_override = getattr(server_args, "component_weights_paths", {}).get(
-            component_name
+        weights_override = self.resolve_component_weight_override(
+            server_args, component_name
         )
         if weights_override is None:
             return component_model_path
@@ -467,13 +476,9 @@ class VAELoader(ComponentLoader):
         cpu_offload_flag: bool = False,
     ):
         """Load the VAE based on the model path, and inference args."""
-        direct_gpu_weight_loading = server_args.should_direct_gpu_weight_load_component(
-            component_name
+        direct_gpu_weight_loading = self.resolve_component_direct_gpu_loading(
+            server_args, component_name
         )
-        if direct_gpu_weight_loading and component_name not in ("vae", "video_vae"):
-            raise ComponentCheckpointUnsupportedError(
-                f"Direct GPU loading is not implemented for {component_name!r}"
-            )
         component_weights_path = self.resolve_model_weights_path(
             component_model_path,
             server_args,

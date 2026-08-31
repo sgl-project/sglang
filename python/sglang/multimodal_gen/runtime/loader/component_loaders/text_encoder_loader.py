@@ -498,7 +498,16 @@ class TextEncoderLoader(ComponentLoader):
 
     component_names = ["text_encoder"]
     expected_library = "transformers"
-    supports_online_quantization_override = True
+
+    def resolve_component_weight_override(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return server_args.component_weights_paths.get(component_name)
+
+    def resolve_component_quantization_override(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return server_args.component_quantizations.get(component_name)
 
     def component_load_precision(
         self, server_args: ServerArgs, component_name: str
@@ -518,13 +527,15 @@ class TextEncoderLoader(ComponentLoader):
             or component_name in server_args.component_quantizations
         )
 
-    @staticmethod
     def resolve_model_weights_path(
+        self,
         component_model_path: str,
         server_args: ServerArgs,
         component_name: str,
     ) -> str:
-        weights_override = server_args.component_weights_paths.get(component_name)
+        weights_override = self.resolve_component_weight_override(
+            server_args, component_name
+        )
         if weights_override is None:
             return component_model_path
         if names_gguf_checkpoint(weights_override):
@@ -532,11 +543,6 @@ class TextEncoderLoader(ComponentLoader):
                 raise ValueError(
                     "GGUF encoder checkpoints require CUDA; the GGML kernels have "
                     f"no {current_platform.device_type} implementation"
-                )
-            if server_args.should_use_fsdp_for_component(component_name):
-                raise ValueError(
-                    f"GGUF encoder checkpoint {component_name!r} is incompatible "
-                    "with FSDP; select resident or layerwise placement"
                 )
         model_weights_path = materialize_weight(resolve_weight(weights_override))
         logger.info(

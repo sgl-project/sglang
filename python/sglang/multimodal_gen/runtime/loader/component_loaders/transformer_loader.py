@@ -155,10 +155,6 @@ def _server_args_for_transformer_component(
 class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
-    allow_global_attention_backend_fallback = False
-    supports_online_quantization_override = True
-    supports_fsdp_inference = True
-
     component_names = [
         "transformer",
         "unconditional_transformer",
@@ -166,6 +162,29 @@ class TransformerLoader(ComponentLoader):
         "video_dit",
     ]
     expected_library = "diffusers"
+
+    def resolve_component_weight_override(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return server_args.component_weights_paths.get(component_name)
+
+    def resolve_component_quantization_override(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return server_args.component_quantizations.get(component_name)
+
+    def component_attention_backend_context(
+        self,
+        attn_backend,
+        component_attn_name: str | None,
+        require_backend_selection: bool,
+    ):
+        return component_attn_backend_context_manager(
+            attn_backend,
+            component_name=component_attn_name,
+            allow_global_backend_fallback=False,
+            require_backend_selection=require_backend_selection,
+        )
 
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str

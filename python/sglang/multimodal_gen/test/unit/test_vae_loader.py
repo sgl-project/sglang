@@ -49,6 +49,7 @@ class _FakeServerArgs:
         self.revision = "test-revision"
         self.trust_remote_code = True
         self.layerwise_components = set()
+        self.component_weights_paths = {}
         self.component_quantizations = {}
         self.component_precisions = {}
         self.component_direct_gpu_weight_loading = {}
