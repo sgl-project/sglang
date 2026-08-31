@@ -82,13 +82,7 @@ def should_send_aux_metadata(
     decode_attn_tp_size: int,
     decode_attn_tp_rank: int,
 ) -> bool:
-    """Select the sole prefill writer of request-global AUX metadata.
-
-    KV and side-state payloads may be partitioned across CP ranks, but AUX
-    metadata is replicated and every sender targets the same decode-side slot.
-    Select CP rank zero and one prefill TP rank for each decode TP destination.
-    Non-writers must still send their normal completion notifications.
-    """
+    """Choose the sole PP/CP/TP writer for replicated AUX; non-writers must still notify completion."""
     primary_prefill_tp_rank = (
         decode_attn_tp_rank * prefill_attn_tp_size // decode_attn_tp_size
     )
@@ -862,10 +856,7 @@ def resolve_linear_state_shards(
     decode_attn_tp_size: int,
     decode_tp_rank: int,
 ) -> Optional[Tuple[int, int, int, int]]:
-    """Select the linear-state source shard for one destination rank. Prefill
-    shards by attention CP (DSA Prefill CP) or attention TP; decode by
-    attention TP only. Returns ``None`` when the two ranks own disjoint head
-    ranges."""
+    """Map a prefill TP/CP head shard to decode TP; return None for disjoint ranges."""
     values = {
         "prefill_attn_tp_size": prefill_attn_tp_size,
         "prefill_attn_cp_size": prefill_attn_cp_size,
@@ -1082,7 +1073,6 @@ def slice_dsa_tail_dst_ptrs_for_pp(
     start_layer: int,
     end_layer: Optional[int],
 ) -> List[int]:
-    """Align ``[key layers..., score layers...]`` tail pointers across PP."""
     if len(src_ptrs) == len(dst_ptrs):
         return list(dst_ptrs)
     if len(src_ptrs) % 2 != 0 or len(dst_ptrs) % 2 != 0:
@@ -1116,12 +1106,7 @@ def build_dsa_tail_transfer_blocks(
     dst_indices: List[int],
     dst_item_lens: Optional[List[int]] = None,
 ) -> List[Tuple[int, int, int]]:
-    """Build byte ranges for a request-scoped DSA tail ring transfer.
-
-    The Prefill and Decode pools may reserve different numbers of speculative
-    tail slots. Preserve the logical token order while remapping between their
-    physical rings.
-    """
+    """Remap live DSA tail tokens between rings with different speculative-slot counts."""
     if not src_indices and not dst_indices:
         return []
     if not src_indices or not dst_indices:

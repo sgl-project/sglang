@@ -115,7 +115,6 @@ class TemplateManager:
 
     @property
     def jinja_template_may_reorder_tool_results(self) -> bool:
-        """Whether the active Jinja template associates results by call ID."""
         return self._jinja_template_may_reorder_tool_results
 
     def _run_template_detection(self, template, tokenizer) -> None:

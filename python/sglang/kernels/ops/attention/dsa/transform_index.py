@@ -233,9 +233,7 @@ def transform_index_page_table_decode_fast(
         result = torch.empty_like(topk_indices, dtype=torch.int32)
     topk = topk_indices.shape[1]
     if topk == 2048:
-        # Preserve the existing single-program fast path for the standard DSA
-        # width. KPool can append a live partial-pool tail, which is handled by
-        # the generic tiled path below without changing this common path.
+        # Keep the 2048-wide fast path; KPool tail widths use the tiled kernel.
         transform_index_page_table_decode_kernel[(qo_len,)](
             page_table,
             topk_indices,

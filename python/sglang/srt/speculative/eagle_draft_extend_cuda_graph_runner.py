@@ -58,9 +58,7 @@ if TYPE_CHECKING:
 def resolve_draft_extend_seq_len_fill_value(
     attn_backend, captured_req_width: int
 ) -> int:
-    """DRAFT_EXTEND_V2 subtracts the fixed draft width when building the KPool
-    write plan; padding rows need enough synthetic history for that subtraction
-    plus the KPool offset."""
+    """Pad synthetic history past the fixed draft-width subtraction and KPool offset."""
     fill_value = attn_backend.get_cuda_graph_seq_len_fill_value()
     full_attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
     dsa_index_kpool = getattr(full_attn_backend, "dsa_index_kpool", 1)

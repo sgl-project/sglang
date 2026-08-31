@@ -1315,10 +1315,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             )
                             handles.append(aux_xfer_handle)
                         else:
-                            # The payload is request-global and another source
-                            # rank writes it. Keep this source rank's no-KV
-                            # accounting/completion notification without
-                            # racing that shared destination slot.
+                            # AUX is replicated; non-writers still notify so
+                            # per-source completion accounting advances.
                             self.agent.send_notif(
                                 req.agent_name, aux_notif.encode("ascii")
                             )
@@ -2508,9 +2506,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if h is not None:
                 handles.append(h)
         if skipped_replicated_state and not handles:
-            # Decode waits for one state notification from every connected
-            # Prefill source rank. A non-owner CP rank has no bytes to write,
-            # but it must still satisfy that completion barrier.
+            # Non-owner CP ranks have no state bytes, but decode still expects
+            # one completion per source rank.
             self.agent.send_notif(peer_name, f"{notif}_marker".encode("ascii"))
         return handles
 

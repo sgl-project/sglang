@@ -446,7 +446,6 @@ class EncoderPreprocessor:
         video_processor_kwargs: dict,
         precomputed_indices: Optional[List[int]] = None,
     ):
-        """Decode and preprocess only this encoder rank's temporal units."""
         video_config = video_config or {}
         video_fps = vr.avg_fps
         duration = len(vr) / video_fps if video_fps else 0
@@ -592,8 +591,6 @@ class EncoderPreprocessor:
                         target_fps=config.get("fps"),
                         max_frame_count=config.get("max_frames"),
                     )
-                # The static threshold intentionally keeps small videos on the
-                # simpler path; only large single videos need decode sharding.
                 if (
                     self.server_args.mm_enable_dp_encoder
                     and tp_size > 1

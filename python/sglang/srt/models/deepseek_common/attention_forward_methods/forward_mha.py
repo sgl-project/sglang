@@ -431,9 +431,8 @@ class DeepseekMHAForwardMixin:
             dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
             or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
         ) and not is_cp_v2_active(forward_batch):
-            # CP-v1 keeps Q rank-local, but every rank owns a complete KV pool.
-            # Rebuild the zigzag-split latent KV in global token order before
-            # writing it with the (unsplit) out_cache_loc indices.
+            # CP-v1 keeps Q rank-local but gives every rank a complete KV pool, so
+            # rebuild KV in global token order against the unsplit out_cache_loc.
             kv_a, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache.squeeze(1),
                 forward_batch,

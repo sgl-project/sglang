@@ -194,9 +194,8 @@ class MambaAttnBackendBase(AttentionBackend):
                 and forward_batch.extend_seq_lens is not None
             )
             if forward_batch.forward_mode.is_draft_extend_v2() and not has_extend_meta:
-                # HybridLinearAttnBackend.init_forward_metadata calls all sub-backends
-                # unconditionally, but DRAFT_EXTEND_V2 only runs full-attn layers in
-                # the draft model, so mamba metadata can be skipped.
+                # Draft-extend-v2 may omit linear metadata when the draft runs only
+                # full-attention layers.
                 query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
                 ragged_layout = forward_batch.spec_info.ragged_verify_layout
@@ -1014,9 +1013,8 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     @property
     def kv_cache_dtype(self):
-        # DSA/NSA fused-rope path (forward_mla._fuse_rope_for_trtllm_mla) reads
-        # this off get_attn_backend(), which returns this wrapper; delegate to
-        # the wrapped full-attn (DSA) backend that actually owns it.
+        # Expose the full-attention backend's cache dtype because fused DSA/NSA RoPE
+        # reads it from this wrapper.
         return getattr(self.full_attn_backend, "kv_cache_dtype", None)
 
     def _is_full_attn(

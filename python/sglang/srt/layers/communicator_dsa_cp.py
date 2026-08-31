@@ -53,12 +53,7 @@ def maybe_prefetch_next_full_attention_kv(
     forward_batch: ForwardBatch,
     next_full_attention_layer_id: Optional[int],
 ) -> None:
-    """Prefetch (owner-broadcast) the next layer's DSA KV under layer split.
-
-    Hybrid pools expose ``prefetch_full_attention_kv_buffer`` to translate the
-    model layer id to the compact full-attention pool id. Non-hybrid
-    layer-sharded pools expose ``prefetch_kv_buffer`` directly.
-    """
+    """Hybrid pools map model layer IDs to compact full-attention pool IDs."""
     if next_full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
         return
 

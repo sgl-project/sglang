@@ -729,17 +729,7 @@ class OpenAIServingChat(OpenAIServingBase):
         video_data: List[Any],
         audio_data: List[Any],
     ) -> tuple[List[Any], List[Any], List[Any]]:
-        """Align media data with the order emitted by the chat template.
-
-        Media extraction walks request messages, but templates that associate
-        tool results by ``tool_call_id`` may emit those results in tool-call
-        order. Render a media-free copy containing indexed text sentinels and
-        use their rendered order as the permutation for each modality.
-
-        A permutation is applied only when every collected item appears exactly
-        once. Templates that drop, duplicate, or transform a sentinel safely
-        retain the original order.
-        """
+        """Tool-result templates can reorder positional media independently of request extraction."""
         counters = {media_type: 0 for media_type in self._MM_ORDER_TAGS}
         sentinel_messages = []
         for message in messages:
@@ -1514,10 +1504,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     # should be treated as client errors (400 BadRequest)
                     raise ValueError(str(template_error)) from template_error
 
-            # Templates that associate results with assistant tool calls can
-            # emit result messages in call order rather than request order. An
-            # extra render is needed only when that can change a positional
-            # media binding: at least two tool-result items of one modality.
             if getattr(
                 self.template_manager,
                 "jinja_template_may_reorder_tool_results",

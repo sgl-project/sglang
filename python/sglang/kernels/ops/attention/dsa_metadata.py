@@ -4,25 +4,12 @@ import torch
 import triton
 import triton.language as tl
 
-# Target page-table tile-program count per launch for the bounded column scan
-# below. Enough programs to saturate a datacenter GPU for this copy kernel,
-# while the dispatch cost of a full grid of idle programs stays at a few
-# microseconds.
+# Bound the replay grid while retaining enough copy programs to saturate the GPU.
 _TILE_PROGRAM_TARGET = 8192
 
 
 def _bounded_scan_num_splits(rows: int, num_col_blocks: int) -> int:
-    """Column-split factor for the bounded page-table scan.
-
-    Each of ``rows`` output rows gets this many tile programs; program ``s``
-    of a row covers column blocks ``s, s + splits, s + 2*splits, ...`` up to
-    the row's own kv length, which the kernel reads at run time. The grid is
-    therefore data-independent (CUDA-graph-safe by construction) while the
-    traversal is bounded by the live data: dispatch scales with
-    ``rows * splits`` instead of ``rows * table_width / BLOCK_N``. The factor
-    never exceeds the full-width column-block count, so the grid is never
-    larger than the full-width scan's.
-    """
+    """Keep the grid capture-safe while bounding traversal by replay-time data."""
     assert rows > 0
     return max(1, min(num_col_blocks, _TILE_PROGRAM_TARGET // rows))
 
@@ -74,10 +61,7 @@ def _fused_dsa_decode_metadata_kernel(
         if index_kpool <= 1:
             dsa_seq = tl.minimum(seq_i32, dsa_index_topk)
         else:
-            # Match compute_dsa_seqlens exactly (same formula as the
-            # target-verify kernel below): select complete history pools up
-            # to top-k, then retain the partial trailing pool.  In
-            # particular, topk+pool-1 -> topk+pool-1 while topk+pool -> topk.
+            # Preserve the live partial pool after selecting pool-aligned history.
             full_pool_tokens = (seq_i32 // index_kpool) * index_kpool
             selected_history_tokens = tl.minimum(full_pool_tokens, dsa_index_topk)
             tail_tokens = seq_i32 - full_pool_tokens
@@ -108,23 +92,10 @@ def _fused_dsa_decode_metadata_kernel(
         mask=row < bs,
         other=0,
     ).to(tl.int32)
-    # Same int64 row-term promotion as the target-verify and draft-extend
-    # kernels below: the wide table's row stride is ~max_context_len (2^20 +
-    # headroom on 1M-context models), so the int32 product row * stride wraps
-    # negative once row reaches 2^31 / stride (~2048). Decode rows equal the
-    # batch size, so today's graph buckets stay below the wrap, but the store
-    # math should not depend on that.
+    # Page-table row offsets can overflow int32 at 1M context.
     row_i64 = row.to(tl.int64)
-    # Bounded traversal: scan only up to this row's kv length, read here at
-    # run (replay) time. Column blocks past kv_len hold no consumer-visible
-    # data (attention and the indexer both stay within cache_seqlens), so the
-    # write set is identical to a full-width scan that early-exits dead
-    # blocks; what changes is that those blocks are never dispatched.
     num_live_blocks = tl.minimum(tl.cdiv(kv_len, BLOCK_N), tl.cdiv(max_len, BLOCK_N))
-    # num_stages: this dot-free copy loop is not software-pipelined by
-    # default, which would leave one load in flight per warp and make
-    # multi-iteration rows (long contexts at high row counts) latency-bound;
-    # explicit staging turns the loads into multi-buffered async copies.
+    # Three stages hide latency across strided copy iterations.
     for col_block in tl.range(split_id, num_live_blocks, num_splits, num_stages=3):
         offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
         mask = (row < bs) & (offs_n < max_len)
@@ -135,9 +106,6 @@ def _fused_dsa_decode_metadata_kernel(
             mask=mask,
             other=0,
         ).to(tl.int32)
-        # Write the wide page_size=1 table only when the caller provides it;
-        # the fused decode CUDA graph drops it and consumes real_page_table
-        # alone.
         if HAS_PAGE_TABLE_1:
             tl.store(
                 page_table_1
@@ -334,9 +302,7 @@ def _fused_dsa_target_verify_metadata_kernel(
         if index_kpool <= 1:
             dsa_seq = tl.minimum(expanded_seq, dsa_index_topk)
         else:
-            # Match compute_dsa_seqlens exactly: select complete history pools
-            # up to top-k, then retain the partial trailing pool.  In
-            # particular, topk+pool-1 -> topk+pool-1 while topk+pool -> topk.
+            # Preserve the live partial pool after selecting pool-aligned history.
             full_pool_tokens = (expanded_seq // index_kpool) * index_kpool
             selected_history_tokens = tl.minimum(full_pool_tokens, dsa_index_topk)
             tail_tokens = expanded_seq - full_pool_tokens
@@ -376,23 +342,11 @@ def _fused_dsa_target_verify_metadata_kernel(
         ).to(tl.int32)
         + next_n
     )
-    # Promote the row term to int64 before the pointer add: the wide table's
-    # row stride is ~max_context_len (2^20 + headroom for 1M-context models),
-    # so the int32 product out_row * stride wraps negative from
-    # out_row == 2048 (expanded rows = bs * next_n > 2048), sending the
-    # stores below wild. The column term stays int32 (bounded by the row
-    # stride itself).
+    # Output-row offsets can overflow int32 at 1M context.
     out_row_i64 = out_row.to(tl.int64)
-    # Bounded traversal: scan only up to this row's kv length
-    # (seq_len + next_n), read here at run (replay) time. Column blocks past
-    # kv_len hold no consumer-visible data (attention and the indexer stay
-    # within cache_seqlens), so the write set is identical to a full-width
-    # scan that early-exits dead blocks; what changes is that those blocks
-    # are never dispatched.
     num_live_blocks = tl.minimum(
         tl.cdiv(kv_len, BLOCK_N), tl.cdiv(max_seqlen_k, BLOCK_N)
     )
-    # num_stages: see the decode kernel above.
     for col_block in tl.range(split_id, num_live_blocks, num_splits, num_stages=3):
         offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
         mask = (out_row < expanded_size) & (offs_n < max_seqlen_k)
@@ -403,9 +357,6 @@ def _fused_dsa_target_verify_metadata_kernel(
             mask=mask,
             other=0,
         ).to(tl.int32)
-        # Write the wide page_size=1 table only when the caller provides it
-        # (see fused_dsa_decode_metadata for the optional-page_table_1
-        # contract).
         if HAS_PAGE_TABLE_1:
             tl.store(
                 page_table_1
@@ -446,9 +397,6 @@ def _prep_fused_dsa_target_verify_metadata_launch(
     paged_mqa_ctx_lens_2d: torch.Tensor = None,
     index_kpool: int = 1,
 ):
-    """Validate and build the (grid, args, constexpr kwargs) launch spec for
-    the target-verify metadata kernel (bs > 0). Shared between the per-call
-    wrapper below and the prebound cuda-graph replay launcher."""
     assert seq_lens.is_cuda
     assert req_pool_indices.is_cuda
     assert req_to_token.is_cuda
@@ -684,10 +632,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
         if index_kpool <= 1:
             dsa_seq = tl.minimum(expanded_seq, dsa_index_topk)
         else:
-            # Match compute_dsa_seqlens exactly (same formula as the
-            # target-verify kernel above): select complete history pools up
-            # to top-k, then retain the partial trailing pool.  In
-            # particular, topk+pool-1 -> topk+pool-1 while topk+pool -> topk.
+            # Preserve the live partial pool after selecting pool-aligned history.
             full_pool_tokens = (expanded_seq // index_kpool) * index_kpool
             selected_history_tokens = tl.minimum(full_pool_tokens, dsa_index_topk)
             tail_tokens = expanded_seq - full_pool_tokens
@@ -714,13 +659,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
         mask=req_row < bs,
         other=0,
     ).to(tl.int32)
-    # Bounded traversal: scan only up to this request's kv length, read here
-    # at run (replay) time. Column blocks past kv_len hold no
-    # consumer-visible data (attention and the indexer both stay within
-    # cache_seqlens), so the write set is identical to a full-width scan that
-    # early-exits dead blocks; what changes is that those blocks are never
-    # dispatched. The early return below also keeps idle programs from paying
-    # the dynamic-extend prefix loop.
+    # Bound the scan by the live replay-time kv length.
     num_live_blocks = tl.minimum(
         tl.cdiv(kv_len, BLOCK_N), tl.cdiv(max_seqlen_k, BLOCK_N)
     )
@@ -745,12 +684,8 @@ def _fused_dsa_draft_extend_metadata_kernel(
         mask=has_rows,
         other=0,
     )
-    # Same int64 row-term promotion as the target-verify kernel above:
-    # out_rows spans bs * max_extend_len rows and the wide table's row stride
-    # is ~max_context_len, so the int32 product wraps negative once
-    # row * stride reaches 2^31.
+    # Output-row offsets can overflow int32 at 1M context.
     out_rows_i64 = out_rows.to(tl.int64)
-    # num_stages: see the decode kernel above.
     for col_block in tl.range(split_id, num_live_blocks, num_splits, num_stages=3):
         offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
         col_mask = offs_n < max_seqlen_k
@@ -763,9 +698,6 @@ def _fused_dsa_draft_extend_metadata_kernel(
             mask=col_mask & has_rows,
             other=0,
         ).to(tl.int32)
-        # Write the wide page_size=1 table only when the caller provides it
-        # (see fused_dsa_decode_metadata for the optional-page_table_1
-        # contract).
         if HAS_PAGE_TABLE_1:
             tl.store(
                 page_table_1

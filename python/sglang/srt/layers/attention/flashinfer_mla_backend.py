@@ -81,15 +81,8 @@ _MLA_BF16_DEQUANT_SCRATCH = {}
 
 
 def _referenced_kv_to_bf16(k_fp8, kv_indices):
-    """Dequantize only the KV rows referenced by ``kv_indices`` (this batch's tokens)
-    into a persistent bf16 buffer mirroring the fp8 pool layout, so the paged wrapper
-    reads it with the same (unmodified) ``kv_indices``. Avoids converting the whole
-    pool every layer (the decode-latency bottleneck); since fa2 has no fp8 tensor
-    cores, feeding bf16 to the proven bf16 MLA kernel also keeps EAGLE draft acceptance
-    intact (the native in-kernel fp8 repack subtly degrades draft proposals).
-
-    Keyed by shape (one buffer reused across layers, overwritten before each read) and
-    allocated outside inference mode so the in-place scatter is legal under cuda graph.
+    """Dequantize only referenced KV rows instead of the entire pool.
+    Allocate the persistent CUDA graph buffer outside inference mode.
     """
     key = (k_fp8.device, tuple(k_fp8.shape))
     scratch = _MLA_BF16_DEQUANT_SCRATCH.get(key)
@@ -105,12 +98,7 @@ def _referenced_kv_to_bf16(k_fp8, kv_indices):
 
 
 def _verify_plan_indptr_cpu(bs, draft_token_num, seq_lens_cpu):
-    """Build target-verify plan indptr on the host so the flashinfer plan skips its
-    blocking ``qo_indptr/kv_indptr/kv_len_arr.to("cpu")`` device sync (the decode
-    per-token bottleneck). Verify's layout is structural — ``q_len == draft_token_num``
-    and ``kv_len == seq_len + draft_token_num`` — so these match
-    ``generate_attn_arg_prefill`` exactly while the GPU ``kv_indices`` stay unchanged.
-    """
+    """Build verify indptr on CPU to avoid FlashInfer plan's blocking GPU-to-host synchronization."""
     n = draft_token_num
     qo_indptr = torch.arange(0, (bs + 1) * n, step=n, dtype=torch.int32)
     kv_len_arr = seq_lens_cpu[:bs].to(torch.int32) + n
@@ -120,11 +108,7 @@ def _verify_plan_indptr_cpu(bs, draft_token_num, seq_lens_cpu):
 
 
 def _extend_plan_indptr_cpu(bs, seq_lens_cpu, extend_seq_lens_cpu):
-    """Host-side plan indptr for non-spec paged extend / draft-extend, skipping the
-    plan's blocking ``.to("cpu")`` sync. ``kv_len == seq_len`` and
-    ``q_len == extend_len`` match the GPU cumsum in ``call_begin_forward`` exactly
-    while the GPU ``kv_indices`` stay unchanged.
-    """
+    """Build extend indptr on CPU to avoid FlashInfer plan's blocking GPU-to-host synchronization."""
     kv_len_arr = seq_lens_cpu[:bs].to(torch.int32)
     kv_indptr = torch.zeros(bs + 1, dtype=torch.int32)
     kv_indptr[1:] = torch.cumsum(kv_len_arr, dim=0)
@@ -817,11 +801,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         return _referenced_kv_to_bf16(k_fp8, idx)
 
     def _scaled_fp8_kv_kwargs(self, k_fp8, kv_indices, kv_indptr=None, kv_indptr_idx=0):
-        """Split a scaled-fp8 KV row (``[ckv fp8 | per-128-group fp32 scales]``) into the
-        fp8 ckv view and the ``run()`` kwargs carrying the contiguous per-group scales.
-        Only the referenced rows are gathered into the persistent scale buffer, which
-        mirrors the pool layout so the kernel reads it with the same physical indices.
-        """
+        """Gather referenced per-group FP8 scales into an index-compatible persistent buffer."""
         assert self.use_dsa_scaled_kv
         assert self._dsa_ckv_scale_buf is not None
         scale_src = k_fp8[

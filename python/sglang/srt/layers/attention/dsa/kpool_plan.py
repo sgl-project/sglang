@@ -103,12 +103,8 @@ class KPoolExtendPlan:
 
 @dataclass(frozen=True)
 class KPoolWritePlan:
-    """Layer-invariant plan for kpool tail writes and closed-pool compression.
-
-    ``write_loc[b, p]`` is the compression destination for logical pool
-    ``base_pool[b] + p``. The compression kernel determines how many of these
-    candidate pools were actually closed by each batch.
-    """
+    """``write_loc[b, p]`` is the compression destination for candidate closed
+    pool ``base_pool[b] + p``; the kernel decides which candidates closed."""
 
     req: torch.Tensor
     write_start: torch.Tensor
@@ -540,9 +536,8 @@ _DEEP_GEMM_IMPORT_FAILED = False
 
 
 def _get_deep_gemm():
-    """Cached deep_gemm import, hoisted out of the per-replay schedule
-    refresh (the old per-call try-import re-ran the import machinery on
-    every cuda-graph replay cycle)."""
+    # Cache import failure too, because this helper runs on every graph-replay
+    # metadata refresh.
     global _DEEP_GEMM_MODULE, _DEEP_GEMM_IMPORT_FAILED
     if _DEEP_GEMM_MODULE is None and not _DEEP_GEMM_IMPORT_FAILED:
         try:
@@ -772,13 +767,8 @@ def update_kpool_write_plan(
             effective_n_per_batch.to(torch.int32)
         )
 
-    # include_deep_gemm_schedule=False: the caller records the write-plan
-    # kernel inside a cuda graph but keeps the DeepGEMM schedule build
-    # out-of-graph (SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA_DG_OUT_OF_
-    # GRAPH); it refreshes the schedule per replay via
-    # refresh_kpool_pool_schedule_from with a source rebuilt from raw
-    # seq_lens, since plan.pool_seqlens_per_q is only written when the
-    # captured kernel replays.
+    # In-graph replay updates plan lengths too late for host schedule construction;
+    # the caller rebuilds the schedule from raw seq_lens out of graph.
     if include_deep_gemm_schedule and plan.pool_schedule_metadata is not None:
         new_schedule = _compute_pool_schedule_metadata(
             plan.pool_seqlens_per_q,
@@ -794,17 +784,8 @@ def refresh_kpool_pool_schedule_from(
     *,
     slots_per_page: int,
 ) -> None:
-    """Refresh ONLY the pooled DeepGEMM schedule of the verify write plan from
-    an EXPLICIT per-q pooled-seqlens source.
-
-    Out-of-graph residual of the in-graph verify metadata capture (see
-    update_kpool_write_plan's include_deep_gemm_schedule): the caller derives
-    ``pool_seqlens_per_q`` from the raw seq_lens buffer using the same closed
-    form the captured write-plan kernel stores
-    (``(write_start + k + 1) // pool_size``), because the plan's own
-    ``pool_seqlens_per_q`` buffer is not refreshed until the captured graph
-    replays. No-op when the plan or its schedule buffer is absent.
-    """
+    """Use an explicit source because the captured plan buffer remains stale
+    until replay."""
     plan = metadata.kpool_write_plan
     if plan is None or plan.pool_schedule_metadata is None:
         return

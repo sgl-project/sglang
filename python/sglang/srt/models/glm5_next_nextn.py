@@ -12,8 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only GLM5-Next Speculative Decoding."""
-
 import logging
 
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
@@ -34,15 +32,8 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
         )
 
     def _resolve_nextn_quant_config(self, config, quant_config):
-        """Keep a checkpoint-declared BF16 NextN block unquantized.
-
-        The Hybrid FP8+NVFP4 checkpoint advertises a global FP8 quantization
-        method, but its full ``model.layers.<num_hidden_layers>.*`` NextN block
-        is listed in ``quantization_config.ignore`` and stored as BF16. Passing
-        the target quant config into that block allocates FP8 parameters and
-        loads the BF16 payload without matching scales, corrupting the first
-        QKV projection.
-        """
+        """Mixed checkpoints list the BF16 NextN block in ``quantization_config.ignore``;
+        inheriting global FP8 quantization would corrupt its QKV weights."""
         raw_quant_config = getattr(config, "quantization_config", None) or {}
         if hasattr(raw_quant_config, "to_dict"):
             raw_quant_config = raw_quant_config.to_dict()

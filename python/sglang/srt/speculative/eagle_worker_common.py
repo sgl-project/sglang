@@ -485,10 +485,7 @@ def run_eagle_verify(
     - ``finalize_tree_path``: single-layer compacts the accepted tree path to
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
-    - ``verify_handoff_event``: forward-stream event recorded at the
-      draft/tree frontier; when set, the plan stream waits on it (letting host
-      planning run ahead) instead of the full ``wait_stream(fwd_stream)``,
-      which remains the fallback when None.
+    - ``verify_handoff_event`` gates plan-stream GPU work at the completed draft/tree frontier.
     """
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info

@@ -11,11 +11,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MHC + DSA prefill-CP hybrid communicator.
-
-hc_mult-width local DP buffer is routed through ``get_local_dp_buffer_mhc``.
-"""
-
 from functools import partial
 from typing import Optional
 
@@ -55,18 +50,22 @@ class MHCHybridDSACPLayerCommunicator(MHCLayerCommunicator):
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
         )
-        self._communicate_with_all_reduce_and_layer_norm_fn = MHCHybridDSACPCommunicateWithAllReduceAndLayerNormFn.get_fn(
-            hidden_states_input_mode=ScatterMode.SCATTERED,
-            residual_input_mode=ScatterMode.SCATTERED,
-            hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
-            residual_output_mode=ScatterMode.SCATTERED,
-            context=self._context,
+        self._communicate_with_all_reduce_and_layer_norm_fn = (
+            MHCHybridDSACPCommunicateWithAllReduceAndLayerNormFn.get_fn(
+                hidden_states_input_mode=ScatterMode.SCATTERED,
+                residual_input_mode=ScatterMode.SCATTERED,
+                hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
+                residual_output_mode=ScatterMode.SCATTERED,
+                context=self._context,
+            )
         )
-        self._communicate_summable_tensor_pair_fn = MHCHybridDSACPCommunicateSummableTensorPairFn.get_fn(
-            hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
-            residual_input_mode=ScatterMode.SCATTERED,
-            output_mode=ScatterMode.SCATTERED,
-            context=self._context,
+        self._communicate_summable_tensor_pair_fn = (
+            MHCHybridDSACPCommunicateSummableTensorPairFn.get_fn(
+                hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
+                residual_input_mode=ScatterMode.SCATTERED,
+                output_mode=ScatterMode.SCATTERED,
+                context=self._context,
+            )
         )
 
     def maybe_prefetch_next_full_attention_kv(

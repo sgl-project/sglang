@@ -4875,7 +4875,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         device: str,
         max_running_requests: Optional[int],
     ) -> None:
-        """In-flight per-request bf16 key/score tail buffers; kept on the pool, not the Indexer, because they are part of the index cache state."""
+        """Keep request tails on the pool so they follow the index-cache lifecycle."""
         self.kpool_use_compress = index_kpool > 1 and index_kpool_compress
 
         if not self.kpool_use_compress:
@@ -4930,7 +4930,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
 
     def get_compress_tail_buf_infos(self):
-        """Buffer infos for per-request DSA kpool compress-tail rows."""
         if not self.kpool_use_compress:
             return [], [], []
         if self.layer_shard_enabled:
@@ -4998,8 +4997,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         n_remain: int,
         dst_logical_start: int,
     ) -> None:
-        """Overwrite per-request tail ring rows after a chunk. ``n_remain == 0``
-        means the chunk landed on a pool boundary, no tail carries over."""
+        """Leave the ring untouched at a pool boundary; no tail carries over."""
         assert (
             self.kpool_use_compress
         ), "set_compress_tail_for_request called when kpool compress is disabled"
@@ -5106,11 +5104,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             )
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        # DSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
-        # Retract frees the slots/pages and they get reused by other reqs'
-        # set_index_k_scale_buffer, so we must offload it here too -- otherwise
-        # resume restores kv_buffer but leaves foreign index/scale in place and
-        # DSA attention reads garbage at those token positions.
+        # Retraction reuses index-cache pages; offload index/scale with KV so resume cannot read another request's entries.
         kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
         cpu_copy = {
             "kv": kv_cache_cpu,

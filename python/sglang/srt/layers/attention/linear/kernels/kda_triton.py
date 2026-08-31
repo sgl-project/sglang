@@ -231,10 +231,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        # CP/DP padding marks zero-length requests with -1, which
-        # chunk_gated_delta_rule_fwd_h skips (`valid_state = index >= 0` gates
-        # both the initial-state load and the in-place final-state store), so
-        # the sentinel is passed through unmodified as on the non-GLM path.
+        # Preserve -1 padding sentinels: chunk_gated_delta_rule_fwd_h masks both
+        # state loads and stores for them.
         return chunk_kda(
             q=q,
             k=k,

@@ -721,9 +721,7 @@ class BaseMultimodalProcessor(ABC):
             if processor_device is not None:
                 kwargs["device"] = processor_device
 
-        # Model families may keep video preprocessing off the GPU: the
-        # tokenizer process otherwise competes with the scheduler's pools for
-        # device memory on long videos.
+        # Long-video preprocessing stays on CPU to avoid competing with scheduler GPU pools.
         if videos:
             video_device = getattr(self, "video_preprocessing_device", None)
             if video_device is not None:

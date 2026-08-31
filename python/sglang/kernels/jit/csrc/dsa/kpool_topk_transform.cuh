@@ -1,17 +1,9 @@
-/**
- * @NOTE: The radix top-k core (fast_topk_cuda_tl_impl) is adapted from
- * https://github.com/tile-ai/tilelang/blob/main/examples/deepseek_v32/topk_selector.py
- * and was previously shipped as an AOT sgl-kernel op (fast_kpool_topk_transform_fused).
- * It is re-implemented here as a lightweight JIT kernel for the NSA kpool indexer:
- * select pool groups at pool granularity, expand each group to `pool_size` token
- * indices, and optionally transform those indices through a page table or ragged offset.
- *
- * The pool-level top-k value is a compile-time constant injected via -DSGL_GROUP_TOPK.
- */
-#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice, is_type
-#include <sgl_kernel/utils.h>   // For RuntimeCheck, RuntimeDeviceCheck
+// Radix top-k core adapted from https://github.com/tile-ai/tilelang/blob/main/examples/deepseek_v32/topk_selector.py.
+// This JIT variant adds pool expansion and page-table/ragged-offset transforms.
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/utils.cuh>  // For LaunchKernel, type aliases
+#include <sgl_kernel/utils.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -36,13 +28,9 @@ namespace {
 #define SGL_GROUP_TOPK 256
 #endif
 
-// Compile-time pool-level top-k (number of groups selected per row).
 inline constexpr int kGroupTopK = SGL_GROUP_TOPK;
 inline constexpr int kThreadsPerBlock = 1024;
 
-// Reduced from 128KB to 32KB to improve occupancy.
-// Each radix pass needs at most ~K candidates in the threshold bin,
-// so 4K entries per round (2 rounds = 8K entries = 32KB) is sufficient.
 inline constexpr std::size_t kSmem = 8 * 1024 * sizeof(uint32_t);  // 32KB (bytes)
 
 struct FastTopKParams {
@@ -68,7 +56,6 @@ __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
 template <int K>
 __device__ void
 fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
-  // An optimized topk kernel copied from tilelang kernel
   // We assume length > K here, or it will crash
   int topk = K;
   constexpr auto BLOCK_SIZE = 1024;
@@ -81,12 +68,10 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
   alignas(128) __shared__ int s_num_input[2];
 
   auto& s_histogram = s_histogram_buf[0];
-  // allocate for two rounds
   extern __shared__ int s_input_idx[][SMEM_INPUT_SIZE];
 
   const int tx = threadIdx.x;
 
-  // stage 1: 8bit coarse histogram
   if (tx < RADIX + 1) s_histogram[tx] = 0;
   __syncthreads();
 
@@ -149,7 +134,6 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
         index[pos] = idx;
       } else if (bin == threshold_bin) {
         const auto pos = ::atomicAdd(&s_num_input[0], 1);
-        /// NOTE: (dark) fuse the histogram computation here
         if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
           s_input_idx[0][pos] = idx;
           const auto bin = convert_to_uint32(raw_input);
@@ -161,13 +145,11 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
     __syncthreads();
   }
 
-  // stage 2: refine with 8bit radix passes
 #pragma unroll 4
   for (int round = 0; round < 4; ++round) {
     __shared__ int s_last_remain;
     const auto r_idx = round % 2;
 
-    // clip here to prevent overflow
     const auto _raw_num_input = s_num_input[r_idx];
     const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE)) ? _raw_num_input : int(SMEM_INPUT_SIZE);
 
@@ -217,7 +199,6 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
           } else {
             const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
             if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
-              /// NOTE: (dark) fuse the histogram computation here
               s_input_idx[r_idx ^ 1][pos] = idx;
               const auto bin = convert_to_uint32(raw_input);
               const auto sub_bin = (bin >> (offset - 8)) & 0xFF;
@@ -333,15 +314,6 @@ const T* optional_data_ptr(const tvm::ffi::Optional<tvm::ffi::TensorView>& opt) 
 struct KpoolTopKTransformKernel {
   static constexpr auto kernel = kpool_topk_transform_kernel<kGroupTopK>;
 
-  // Pool-level radix top-k for the NSA kpool indexer.
-  //   score                : [B, S] strided float32 scores (one score per pool group)
-  //   lengths              : [B] int32 valid group count per row
-  //   dst_token_indices    : [B, out_cols] int32 output token indices (contiguous)
-  //   pool_size            : tokens per pool group
-  //   page_table  (opt)    : [B, P] strided int32 raw-token -> real-token map
-  //   topk_indices_offset  : [B] int32 per-row offset added to raw tokens (ragged)
-  //   row_starts  (opt)    : [B] int32 score row start offsets
-  //   seq_lens    (opt)    : [B] int32 sequence lengths; enables tail append
   static void transform(
       const tvm::ffi::TensorView score,
       const tvm::ffi::TensorView lengths,
@@ -360,19 +332,9 @@ struct KpoolTopKTransformKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({B, -1})  // strided scores
-        .with_strides({S, 1})
-        .with_dtype<float>()
-        .with_device(device)
-        .verify(score);
-    TensorMatcher({B})  // lengths, contiguous int32
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(lengths);
-    TensorMatcher({B, out_cols_sym})  // output, contiguous int32
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(dst_token_indices);
+    TensorMatcher({B, -1}).with_strides({S, 1}).with_dtype<float>().with_device(device).verify(score);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(lengths);
+    TensorMatcher({B, out_cols_sym}).with_dtype<int32_t>().with_device(device).verify(dst_token_indices);
 
     RuntimeCheck(pool_size > 1, "pool_size must be > 1, got ", pool_size);
     RuntimeCheck(
@@ -402,45 +364,30 @@ struct KpoolTopKTransformKernel {
       auto P = SymbolicSize{"page_table_stride"};
       if (page_table_row_index_opt.has_value()) {
         auto page_table_rows = SymbolicSize{"page_table_rows"};
-        TensorMatcher({page_table_rows, -1})  // compact shared page table
+        TensorMatcher({page_table_rows, -1})
             .with_strides({P, 1})
             .with_dtype<int32_t>()
             .with_device(device)
             .verify(page_table_opt.value());
       } else {
-        TensorMatcher({B, -1})  // one page-table row per score row
-            .with_strides({P, 1})
-            .with_dtype<int32_t>()
-            .with_device(device)
-            .verify(page_table_opt.value());
+        TensorMatcher({B, -1}).with_strides({P, 1}).with_dtype<int32_t>().with_device(device).verify(
+            page_table_opt.value());
       }
       page_table_ptr = static_cast<const int32_t*>(page_table_opt.value().data_ptr());
       page_table_stride = static_cast<int64_t>(P.unwrap());
     }
 
     if (topk_indices_offset_opt.has_value()) {
-      TensorMatcher({B})  //
-          .with_dtype<int32_t>()
-          .with_device(device)
-          .verify(topk_indices_offset_opt.value());
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(topk_indices_offset_opt.value());
     }
     if (row_starts_opt.has_value()) {
-      TensorMatcher({B})  //
-          .with_dtype<int32_t>()
-          .with_device(device)
-          .verify(row_starts_opt.value());
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(row_starts_opt.value());
     }
     if (seq_lens_opt.has_value()) {
-      TensorMatcher({B})  //
-          .with_dtype<int32_t>()
-          .with_device(device)
-          .verify(seq_lens_opt.value());
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(seq_lens_opt.value());
     }
     if (page_table_row_index_opt.has_value()) {
-      TensorMatcher({B})  //
-          .with_dtype<int32_t>()
-          .with_device(device)
-          .verify(page_table_row_index_opt.value());
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(page_table_row_index_opt.value());
     }
 
     const auto params = FastTopKParams{

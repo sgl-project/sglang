@@ -352,34 +352,8 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
 
 
 class _DSAInGraphVerifyMetadataState:
-    """Marker + replay-side residual for a TARGET_VERIFY metadata refresh that
-    was recorded INSIDE the captured cuda graph
-    (SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA).
-
-    Published on the frozen ``decode_cuda_graph_metadata[bs]`` entry by
-    :py:meth:`DeepseekSparseAttnBackend.init_forward_metadata_in_graph` once
-    the refresh nodes were recorded, as an UNDECLARED attribute
-    (``object.__setattr__``), so both a graph recapture (fresh DSAMetadata)
-    and ``dataclasses.replace()`` drop it automatically.
-
-    Its presence tells :py:meth:`_apply_cuda_graph_metadata` that
-    ``graph.replay()`` re-executes the whole refresh sequence reading the
-    LIVE contents of the static seq_lens / req_pool_indices buffers, so the
-    out-of-graph replay body must skip the corresponding device work: values
-    it wrote would be recomputed by the captured nodes anyway and -- if
-    derived from any other buffers -- clobbered by them. Only host-side
-    state survives out-of-graph: the memoized
-    ``set_dsa_prefill_impl(None)`` result and the optional DG_OUT_OF_GRAPH
-    residual (DeepGEMM schedule builds rebuilt from raw seq_lens).
-
-    :py:meth:`matches` revalidates on every replay that the incoming
-    seq_lens / req_pool_indices alias the storage the captured nodes read
-    (data_ptr/stride identity). A mismatch
-    is a HARD ERROR rather than a fallback: running the generic out-of-graph
-    body against foreign buffers cannot help, because the captured refresh
-    still re-executes at replay and overwrites the metadata from the static
-    buffers the caller never filled.
-    """
+    """Captured refreshes require fixed input-buffer identities at replay.
+    Mismatches must fail because captured nodes would overwrite fallback metadata."""
 
     __slots__ = (
         "prefill_impl_state",
@@ -466,12 +440,7 @@ class DeepseekSparseAttnBackend(
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
-        # The fused metadata kernels are already the standard path for
-        # kpool<=1 backends; this flag extends them to page-aligned KPool
-        # geometries with pool-aligned topk.
-        # Any other geometry keeps the eager path: the env var is global and
-        # may be set fleet-wide across heterogeneous DSA backends, so an
-        # unsupported backend must degrade gracefully, not fail startup.
+        # The env is global, so unsupported KPool geometry or platforms must fall back.
         _kpool_fusion_requested = (
             envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION.get()
         )
@@ -480,10 +449,6 @@ class DeepseekSparseAttnBackend(
             self.real_page_size,
             self.dsa_index_topk,
         )
-        # The fused kernels and the multi-step sibling-copy dedup are
-        # CUDA-only (every replay call site guards on is_cuda() and not
-        # _is_hip); fold the platform into the effective enable so every
-        # consumer of this attribute inherits it.
         _kpool_fusion_platform_ok = is_cuda() and not _is_hip
         self.experimental_kpool_metadata_fusion = (
             _kpool_fusion_requested
@@ -505,11 +470,8 @@ class DeepseekSparseAttnBackend(
                 self.real_page_size,
                 self.dsa_index_topk,
             )
-        # Experimental, default-off: record the whole TARGET_VERIFY metadata
-        # refresh inside the captured verify graph at capture time so replay
-        # gets it for free (see init_forward_metadata_in_graph /
-        # _DSAInGraphVerifyMetadataState). The DG_OUT_OF_GRAPH sub-mode keeps
-        # only the two DeepGEMM schedule builds out-of-graph.
+        # Replay may refresh target-verify metadata in-graph; DG_OUT_OF_GRAPH
+        # leaves only the DeepGEMM schedule builds outside.
         self.ingraph_verify_metadata_enabled = (
             envs.SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA.get()
         )
@@ -2164,18 +2126,8 @@ class DeepseekSparseAttnBackend(
 
         metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
 
-        # Experimental in-graph verify metadata
-        # (SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA): the whole
-        # TARGET_VERIFY refresh sequence for this entry was recorded INSIDE
-        # the captured graph at capture time (init_forward_metadata_in_graph),
-        # so graph.replay() re-executes it -- ahead of the attention kernels,
-        # reading the CURRENT contents of the static seq_lens /
-        # req_pool_indices buffers that fill_from refreshed this cycle. Skip
-        # the corresponding out-of-graph device work here; keep only host
-        # state (the memoized set_dsa_prefill_impl(None) result) and the
-        # optional DG_OUT_OF_GRAPH residual. Runs during recapture too
-        # (in_capture out_graph replays this body): the residual is harmless
-        # there and the in-graph hook re-publishes a fresh state afterwards.
+        # Captured graphs recompute device metadata, so this path retains only
+        # host state and any out-of-graph DeepGEMM residual.
         if forward_mode.is_target_verify():
             ingraph_state = getattr(metadata, "_ingraph_verify_metadata", None)
             if ingraph_state is not None:
@@ -2523,47 +2475,8 @@ class DeepseekSparseAttnBackend(
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        """Graph-recordable TARGET_VERIFY metadata refresh (experimental,
-        SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA; default no-op).
-
-        Runs inside ``with graph.capture():`` (the decode runner's run_once,
-        after init_forward_metadata_out_graph(in_capture=True) built the
-        metadata entry and BEFORE the model forward), so every launch below
-        is recorded as graph nodes that precede the attention kernels in the
-        SAME captured graph. At replay they re-execute reading the CURRENT
-        contents of the runner's static seq_lens / req_pool_indices buffers
-        -- buffer contents are read at replay execution time, not capture
-        time, and fill_from refreshes them on the fwd/plan stream before
-        graph.replay() in stream order.
-
-        Capture-legality per recorded op (base-hook lint contract):
-          - fused_dsa_target_verify_metadata: plain triton launch; the
-            JITFunction host planning happens once here at capture.
-          - ctx-lens publication: captured copy_ between static buffers.
-          - deep_gemm.get_paged_mqa_logits_metadata: static-shape device
-            build; the fresh output tensor is allocated in the graph-private
-            pool (address stable across replays) and the captured copy_ into
-            the static schedule buffer pins the dataflow. If a deep_gemm
-            build is ever not stream-capture-safe, set
-            SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA_DG_OUT_OF_GRAPH=1
-            to keep both DeepGEMM builds out-of-graph (rebuilt per replay
-            from raw seq_lens by the residual).
-          - plan_topk_v2(out=...): single tvm-ffi kernel launch into the
-            preallocated plan buffer (LaunchKernel resolves the capture
-            stream; no sync, no alloc).
-          - KPool write plan: triton launch (+ pooled DeepGEMM schedule when
-            DG stays in-graph).
-
-        No-op -- leaving the generic out-of-graph replay body in charge --
-        for non-TARGET_VERIFY captures (e.g. the multi-step draft DECODE
-        backends reach this via DeepseekSparseAttnMultiStepBackend),
-        ineligible configs, and any structural surprise in
-        _record_ingraph_verify_metadata. The hybrid linear (KDA/mamba)
-        sibling stays out-of-graph: its query_start_loc clamp and
-        state-index poisoning depend on the host-side per-replay num_padding
-        and the live v2p mamba translate, so they are not trivially
-        graph-recordable.
-        """
+        """Record target-verify refreshes only for capture-safe configurations.
+        Replay reads the same static input buffers with updated contents."""
         if not forward_batch.forward_mode.is_target_verify():
             return
         if not self._ingraph_verify_metadata_eligible():
@@ -2586,18 +2499,8 @@ class DeepseekSparseAttnBackend(
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
     ) -> None:
-        """Record the fused TARGET_VERIFY refresh into the graph being
-        captured and publish _DSAInGraphVerifyMetadataState on success.
-
-        Mirrors, node for node and in the same stream order, the fused
-        TARGET_VERIFY body of _apply_cuda_graph_metadata (fused metadata
-        kernel -> DeepGEMM schedule -> ctx-lens publication -> top-k v2 plan
-        -> KPool write plan + pooled schedule). Bails WITHOUT publishing on
-        any structural surprise, leaving the graph without refresh nodes and
-        the generic out-of-graph replay in charge. Also runs eagerly during
-        the pre-capture warmup invocations of run_once, which is idempotent:
-        it rewrites the same buffers with the same capture-time values.
-        """
+        """Publish replay state only after every structural check passes.
+        Otherwise the generic out-of-graph path remains responsible."""
         if metadata.paged_mqa_schedule_metadata is None:
             return
         next_n = self.speculative_num_draft_tokens
@@ -2606,7 +2509,6 @@ class DeepseekSparseAttnBackend(
         expanded_size = bs * next_n
         max_seqlen_k = self._graph_page_table_width(metadata)
 
-        # Same DG-native eligibility checks as the fused replay body.
         paged_mqa_ctx_lens_2d = None
         if (
             next_n >= 2
@@ -2640,10 +2542,6 @@ class DeepseekSparseAttnBackend(
                 return
             ctx_lens_copy_src = schedule_src_2d
 
-        # ---- Recorded nodes; identical device-work order to the fused
-        # out-of-graph replay body. ------------------------------------
-        # 1. Fused verify metadata (triton): cache/dsa seqlens, cu_seqlens,
-        #    page tables, expanded seqlens, optional DG-native ctx lens.
         fused_dsa_target_verify_metadata(
             seq_lens=seq_lens,
             req_pool_indices=req_pool_indices,
@@ -2664,23 +2562,22 @@ class DeepseekSparseAttnBackend(
             index_kpool=self.dsa_index_kpool,
         )
 
-        # 2. DeepGEMM paged-MQA schedule refresh + ctx-lens publication.
         dg_in_graph = not self.ingraph_verify_metadata_dg_out_of_graph
         num_sms = deep_gemm.get_num_sms()
         if dg_in_graph:
+            # Copy into the static buffer to keep the captured destination stable.
             metadata.paged_mqa_schedule_metadata.copy_(
                 deep_gemm.get_paged_mqa_logits_metadata(schedule_src_2d, 64, num_sms)
             )
         if ctx_lens_copy_src is not None:
             metadata.paged_mqa_ctx_lens_2d.copy_(ctx_lens_copy_src)
 
-        # 3. Top-k v2 plan refresh (tvm-ffi kernel into the captured plan).
         if metadata.topk_v2_plan is not None:
+            # A preallocated output avoids allocation during capture.
             _get_plan_topk_v2()(
                 metadata.dsa_seqlens_expanded, out=metadata.topk_v2_plan
             )
 
-        # 4. KPool write plan (+ pooled schedule iff DG stays in-graph).
         self._update_kpool_metadata_replay(
             metadata,
             seq_lens,
@@ -2699,8 +2596,6 @@ class DeepseekSparseAttnBackend(
                 ctx_lens_written,
             )
 
-        # set_dsa_prefill_impl(forward_batch=None) is a pure function of
-        # init-time config; capture its result for the in-graph replay state.
         self.set_dsa_prefill_impl(forward_batch=None)
         state = _DSAInGraphVerifyMetadataState(
             prefill_impl_state=(self.use_mha, self.dsa_prefill_impl),
@@ -2728,22 +2623,8 @@ class DeepseekSparseAttnBackend(
         num_sms: int,
         ctx_lens_written: bool,
     ) -> Callable[[], None]:
-        """Out-of-graph per-replay residual for the DG_OUT_OF_GRAPH fallback.
-
-        Only the two DeepGEMM schedule builds stay out-of-graph. They must
-        NOT read the kernel-written metadata buffers here: at residual time
-        (the out-of-graph replay body, before graph.replay()) the captured
-        triton refresh has not run yet for this cycle, so those buffers
-        still hold LAST replay's values. Both schedule sources are instead
-        rebuilt from the raw seq_lens buffer using the exact closed forms
-        the captured kernels write:
-          - main schedule ctx lens: cache_seqlens = seq_lens + next_n
-            ((bs, next_n) DG-native expand), or the per-token expanded
-            lens seq_lens + [1..next_n] as (bs*next_n, 1) otherwise;
-          - pooled KPool per-q lens: (seq_lens + k + 1) // pool_size for
-            k in [0, next_n) (verify write_start == seq_lens; see
-            _update_kpool_write_plan_kernel).
-        """
+        """Rebuild residual schedules from raw seq_lens before graph replay.
+        Captured metadata still contains the previous replay's values then."""
         schedule_dst = metadata.paged_mqa_schedule_metadata
         dg_get = deep_gemm.get_paged_mqa_logits_metadata
         pool_size = self.dsa_index_kpool
@@ -2809,10 +2690,8 @@ class DeepseekSparseAttnBackend(
 
         self._copy_base_replay_buffers(bs, metadata, precomputed, forward_mode)
 
-        # Refresh DeepGEMM paged MQA schedule metadata for the actual seqlens of
-        # this replay (the captured graph holds stale data otherwise, which can
-        # deadlock the kernel when the runtime work decomposition diverges from
-        # the captured one).
+        # Refresh the schedule because stale shape decomposition can deadlock
+        # DeepGEMM paged MQA.
         if is_cuda():
             if forward_mode.is_decode_or_idle():
                 seqlens_32_2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
@@ -2968,11 +2847,7 @@ class DeepseekSparseAttnBackend(
 
     @staticmethod
     def _sibling_replay_metadata_compatible(dst: DSAMetadata, src: DSAMetadata) -> bool:
-        """Structural check that every derived buffer the sibling-copy path
-        writes exists on both sides.  Step backends of a multi-step group are
-        constructed and captured identically, so this always holds in
-        practice; a mismatch routes the caller back to the full recompute
-        path instead of risking stale derived metadata."""
+        """Check that both sides expose the same optional derived buffers."""
 
         def _match(a, b) -> bool:
             return (a is None) == (b is None)
@@ -3002,10 +2877,7 @@ class DeepseekSparseAttnBackend(
     def _copy_kpool_metadata_from_sibling(
         self, metadata: DSAMetadata, src_metadata: DSAMetadata
     ) -> None:
-        """D2D mirror of `_update_kpool_metadata_from_precomputed`: copy every
-        buffer that function writes (pooled seqlens div, pooled page table,
-        DeepGEMM pool schedule, and the kpool write plan) from a sibling
-        backend that just ran the real update on identical inputs."""
+        """Copy KPool metadata derived from identical inputs from a sibling."""
         if self.dsa_index_kpool <= 1 or not is_cuda():
             return
 
@@ -3044,21 +2916,7 @@ class DeepseekSparseAttnBackend(
         precomputed: PrecomputedMetadata,
         forward_mode: ForwardMode,
     ) -> None:
-        """Replay fast path for step backends past the first in the multi-step
-        draft loop (engaged when SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION
-        is on; internal behavior, no standalone flag).
-
-        The base captured buffers are still copied from `precomputed` (one
-        fused kernel launch), but the DERIVED metadata that
-        `init_forward_metadata_replay_cuda_graph_from_precomputed` recomputes
-        per backend -- the deep_gemm.get_paged_mqa_logits_metadata schedule,
-        the top-k v2 plan, and everything
-        `_update_kpool_metadata_from_precomputed` derives (pooled seqlens div,
-        build_pooled_page_table_64, the DeepGEMM pool schedule and the kpool
-        write plan) -- is copied device-to-device from `src_backend`, which
-        just ran the full path on the SAME `precomputed`.  Every derived
-        quantity is a pure function of `precomputed`, so the copy is bit-exact
-        with the recompute."""
+        """Copy replay metadata from a sibling using the same precomputed input."""
         metadata = self.decode_cuda_graph_metadata.get(bs)
         src_metadata = src_backend.decode_cuda_graph_metadata.get(bs)
         if (
@@ -4814,14 +4672,7 @@ class DeepseekSparseAttnMultiStepBackend:
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
     def _multistep_dedup_enabled(self) -> bool:
-        """Whether later step backends may sibling-copy derived replay
-        metadata from step 0 instead of recomputing it.
-
-        Internal behavior of the fused metadata path (no standalone flag):
-        follows the step backends' effective fusion enable, which already
-        folds in the geometry and platform gates -- on unsupported backends
-        every step recomputes independently, the pre-fusion contract.
-        """
+        """The effective fusion gate includes geometry and platform support."""
         return getattr(
             self.attn_backends[0], "experimental_kpool_metadata_fusion", False
         )
@@ -4997,12 +4848,7 @@ class DeepseekSparseAttnMultiStepBackend:
                         forward_mode=ForwardMode.DECODE,
                     )
         else:
-            # Less than 3 backends: copy to each backend individually.
-            # Backend 0 always runs the full path (base copy + derived
-            # recompute).  When the fused metadata path is enabled, later step
-            # backends D2D-copy the derived metadata from backend 0 instead of
-            # recomputing it -- the inputs (`precomputed`) are identical across
-            # the step backends, so the derived quantities are too.
+            # Backend 0 fully refreshes; later backends may copy its derived metadata.
             dedup = self._multistep_dedup_enabled()
             self.attn_backends[
                 0

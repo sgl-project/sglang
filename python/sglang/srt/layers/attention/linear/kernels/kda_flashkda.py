@@ -226,9 +226,8 @@ class FlashKDAKernel(LinearAttnKernelBase):
         v = v.contiguous()
         g = g.contiguous()
 
-        # GLM-5 passes raw beta logits. Kimi Linear currently passes an already
-        # activated beta, which must be inverted because FlashKDA applies
-        # sigmoid internally.
+        # FlashKDA applies sigmoid internally; invert only the already-activated
+        # Kimi beta path.
         if not beta_is_raw:
             beta = torch.logit(beta.float().clamp_(1e-7, 1.0 - 1e-7))
         beta = beta.to(torch.bfloat16).contiguous()

@@ -378,15 +378,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # to its dense layout, so ragged verify graphs are supported.
     supports_ragged_verify_graph: bool = True
 
-    # Target graph loading snapshots request-to-state indices and fixed replay
-    # metadata only.  Candidate conv/SSM states stay isolated until acceptance
-    # commits them on the main forward stream, so metadata loading is safe on
-    # the MTP plan stream after the draft/tree handoff event.
+    # Candidate states remain isolated until acceptance, so target metadata may load
+    # on the MTP plan stream.
     supports_overlap_plan_stream_graph_load: bool = True
 
-    # KDA graph replay receives padding explicitly and does not use the generic
-    # ReplaySSM host-seqlen force-flush path.  Keep the speculative length relay
-    # on device instead of synchronizing a D2H mirror every MTP cycle.
+    # KDA gets graph padding explicitly and never uses ReplaySSM's host-seqlen
+    # force-flush path.
     needs_cpu_seq_lens: bool = False
 
     def __init__(self, model_runner: ModelRunner):
@@ -552,8 +549,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             conv_state_indices=cache_indices,
         )
 
-        # The packed kernel assumes one token per request. It does not support
-        # the GLM-5 lower-bound gate variant, which stays on the unfused path.
+        # The packed kernel assumes one token per request.
         if (
             self.kernel_dispatcher.supports_packed_decode
             and getattr(layer, "lower_bound", None) is None
@@ -677,7 +673,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         gate_was_flat = a.ndim == 3
         if gate_was_flat:
-            # Kernel backends use the explicit [B, T, H, D] gate layout.
             a = a.unflatten(-1, (-1, layer.head_k_dim))
 
         track_ssm = self.forward_metadata.has_mamba_track_mask
