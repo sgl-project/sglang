@@ -908,12 +908,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return int(seq_lens.max().item())
 
     def _select_context_bucket(self, max_context_len: int) -> Optional[int]:
-        capture_context_sizes = getattr(self, "capture_context_sizes", ())
-        if not capture_context_sizes:
+        if not self.capture_context_sizes:
             return None
-        if max_context_len > capture_context_sizes[-1]:
+        if max_context_len > self.capture_context_sizes[-1]:
             return None
-        return self._pad_to_bucket(max_context_len, capture_context_sizes)
+        return self._pad_to_bucket(max_context_len, self.capture_context_sizes)
 
     @staticmethod
     def _resolve_prefix_chunk_shape(
@@ -970,7 +969,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
             assert captured_n is not None, "prefix batch has no captured FullCG variant"
             variant = _chunked_prefix_variant(captured_n)
-        if getattr(self, "capture_context_sizes", ()) and context_size is None:
+        if self.capture_context_sizes and context_size is None:
             max_context_len = self._max_context_len(forward_batch)
             assert max_context_len is not None, "batch has no final context length"
             context_size = self._select_context_bucket(max_context_len)
@@ -1240,7 +1239,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if return_logprob and not self._uses_eager_prefill_tail():
             return False
-        if getattr(self, "capture_context_sizes", ()):
+        if self.capture_context_sizes:
             if max_context_len is None:
                 return False
             context_bucket = self._select_context_bucket(max_context_len)

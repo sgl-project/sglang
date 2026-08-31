@@ -97,11 +97,9 @@ class PhaseConfig:
     bs: Optional[List[int]] = None
     # Only meaningful when backend == tc_piecewise; ignored otherwise.
     tc_compiler: str = "eager"
-    # Only meaningful for prefill body-capture backends (breakable/full):
-    # captured maximum final-context lengths. Replay rounds the largest
-    # seq_len in the batch up to one of these buckets, making context-shaped
-    # metadata and intermediates part of the graph shape rather than padding
-    # every graph to the model's maximum context.
+    # Effective for both full and breakable backend: maximum captured context length.
+    # Replay rounds the largest seq_len in the batch up to one of these buckets, using to
+    # avoid padding every graph to the model's maximum context.
     context_buckets: Optional[List[int]] = None
     # Only meaningful for the prefill phase with backend == full: max number of
     # request slots baked into each captured graph. Real bs <= full_prefill_max_req
