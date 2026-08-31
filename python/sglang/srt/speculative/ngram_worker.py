@@ -29,6 +29,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
+    get_simulated_accept_token_id,
     move_accept_tokens_to_target_kvcache,
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
@@ -483,7 +484,13 @@ class NGRAMWorker(BaseSpecWorker):
                 predict,
                 accept_lens,
                 accept_index,
-            ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+            ) = eagle_sample(
+                verify_input,
+                batch,
+                logits_output,
+                grammar_mask,
+                simulate_acc_token_id=get_simulated_accept_token_id(self.target_worker),
+            )
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,

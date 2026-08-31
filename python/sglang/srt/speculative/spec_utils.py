@@ -66,6 +66,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -182,6 +183,9 @@ def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.T
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
+
+_SIMULATED_ACCEPT_TOKEN_ID_ATTR = "_sglang_simulated_accept_token_id"
+_SIMULATED_ACCEPT_TOKEN_PROBES = ("a", "A", "0", ".")
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
@@ -395,6 +399,88 @@ def sample_simulated_acc_len(
     return int(simulate_acc_len)
 
 
+def _decode_complete_token(tokenizer, token_id: int) -> Optional[str]:
+    try:
+        text = decode_without_hf_kwargs(
+            tokenizer, [int(token_id)], skip_special_tokens=True
+        )
+    except Exception:
+        return None
+    return text if text and "\ufffd" not in text else None
+
+
+def resolve_simulated_accept_token_id(
+    tokenizer,
+    *,
+    vocab_size: Optional[int] = None,
+) -> int:
+    """Resolve a fixed benchmark token that decodes to complete text."""
+    if tokenizer is None:
+        raise ValueError(
+            "Fixed simulated acceptance needs a tokenizer to derive a safe token. "
+            "Use SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token when "
+            "--skip-tokenizer-init is enabled."
+        )
+
+    candidates = []
+    for probe in _SIMULATED_ACCEPT_TOKEN_PROBES:
+        candidates.extend(tokenizer.encode(probe, add_special_tokens=False))
+
+    seen = set()
+    for token_id in candidates:
+        token_id = int(token_id)
+        if token_id in seen:
+            continue
+        seen.add(token_id)
+        if token_id < 0 or (vocab_size is not None and token_id >= vocab_size):
+            continue
+        if _decode_complete_token(tokenizer, token_id) is not None:
+            return token_id
+
+    try:
+        tokenizer_size = len(tokenizer)
+    except TypeError:
+        tokenizer_size = getattr(tokenizer, "vocab_size", None)
+    if tokenizer_size is None:
+        tokenizer_size = vocab_size
+    if tokenizer_size is None:
+        raise ValueError(
+            "The tokenizer does not expose a vocabulary size, so a complete "
+            "simulated-acceptance token could not be derived."
+        )
+    scan_size = (
+        tokenizer_size if vocab_size is None else min(tokenizer_size, vocab_size)
+    )
+    for token_id in range(scan_size):
+        if token_id not in seen and _decode_complete_token(tokenizer, token_id):
+            return token_id
+
+    raise ValueError(
+        "Could not derive a token that decodes to complete text for fixed "
+        "simulated acceptance. Use "
+        "SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token instead."
+    )
+
+
+def get_simulated_accept_token_id(target_worker) -> Optional[int]:
+    """Resolve and cache the fixed benchmark token once per target worker."""
+    if SIMULATE_ACC_LEN <= 0 or SIMULATE_ACC_TOKEN_MODE != "fixed":
+        return None
+
+    cached = getattr(target_worker, _SIMULATED_ACCEPT_TOKEN_ID_ATTR, None)
+    if cached is not None:
+        return cached
+
+    model_config = getattr(target_worker, "model_config", None)
+    token_id = resolve_simulated_accept_token_id(
+        getattr(target_worker, "tokenizer", None),
+        vocab_size=getattr(model_config, "vocab_size", None),
+    )
+    setattr(target_worker, _SIMULATED_ACCEPT_TOKEN_ID_ATTR, token_id)
+    logger.info("Using token id %d for fixed simulated acceptance.", token_id)
+    return token_id
+
+
 def generate_simulated_accept_index(
     accept_index,
     predict,
@@ -406,6 +492,7 @@ def generate_simulated_accept_index(
     simulate_acc_len: float = SIMULATE_ACC_LEN,
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
     simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
+    simulate_acc_token_id: Optional[int] = None,
 ):
     use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
 
@@ -424,7 +511,11 @@ def generate_simulated_accept_index(
     num_correct_drafts.fill_(simulate_acc_len - 1)
 
     if not use_real_draft_tokens:
-        predict.fill_(100)  # some legit token id
+        if simulate_acc_token_id is None:
+            raise ValueError(
+                "simulate_acc_token_id is required for fixed simulated acceptance."
+            )
+        predict.fill_(simulate_acc_token_id)
         return sim_accept_index
 
     # Use the topk=1 draft chain for forced acceptance, then a target-derived bonus.

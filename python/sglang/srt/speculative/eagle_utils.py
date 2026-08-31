@@ -669,6 +669,7 @@ def eagle_sample(
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
+    simulate_acc_token_id: Optional[int] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -915,6 +916,7 @@ def eagle_sample(
             target_predict=target_predict,
             simulate_acc_len=SIMULATE_ACC_LEN,
             simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+            simulate_acc_token_id=simulate_acc_token_id,
             bs=bs,
             spec_steps=verify_input.max_tree_depth - 1,
         )
