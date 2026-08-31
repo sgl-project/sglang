@@ -210,7 +210,11 @@ def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
 def _set_shm_master_env(dist_init_method: Optional[str]) -> None:
     # setdefault so an explicit user-provided MASTER_ADDR/MASTER_PORT wins.
     prefix = "tcp://"
-    if dist_init_method and dist_init_method.startswith(prefix) and ":" in dist_init_method[len(prefix) :]:
+    if (
+        dist_init_method
+        and dist_init_method.startswith(prefix)
+        and ":" in dist_init_method[len(prefix) :]
+    ):
         host, port = dist_init_method[len(prefix) :].rsplit(":", 1)
         os.environ.setdefault("MASTER_ADDR", host)
         os.environ.setdefault("MASTER_PORT", port)
