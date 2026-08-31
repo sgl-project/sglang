@@ -22,9 +22,11 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 
 register_cuda_ci(est_time=750, stage="base-c", runner_config="8-gpu-b300")
 
+MODEL_LOADER_EXTRA_CONFIG = '{"enable_multithread_load": true, "num_threads": 6}'
+
 
 class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
-    model = "/data/radixark/model-cache/hub/models--nvidia--GLM-5.2-NVFP4/snapshots/aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa"
+    model = "nvidia/GLM-5.2-NVFP4"
 
     # Full GSM8K test set (1319 questions) with a tight accuracy floor.
     gsm8k_accuracy_thres = 0.935
