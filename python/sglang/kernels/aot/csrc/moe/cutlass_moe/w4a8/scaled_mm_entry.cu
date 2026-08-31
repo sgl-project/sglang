@@ -293,23 +293,10 @@ void cutlass_mxfp4a8_fused_moe_core(
           intermediate_size,
           hidden_size);
       fused_per_token_quant_fp8_shuffled(
-          input,
-          a_map,
-          gateup_input,
-          a1_scale,
-          w1_residual,
-          expert_offsets,
-          num_experts);
+          input, a_map, gateup_input, a1_scale, w1_residual, expert_offsets, num_experts);
     }
   } else {
-    fused_per_token_quant_fp8_shuffled(
-        input,
-        a_map,
-        gateup_input,
-        a1_scale,
-        w1_residual,
-        expert_offsets,
-        num_experts);
+    fused_per_token_quant_fp8_shuffled(input, a_map, gateup_input, a1_scale, w1_residual, expert_offsets, num_experts);
   }
   cutlass_mxfp4a8_fused_moe_mm(
       c1,
@@ -327,14 +314,7 @@ void cutlass_mxfp4a8_fused_moe_core(
       gemm1_config,
       expert_ids);
   fused_swiglu_quant_fp8(
-      c1,
-      intermediate_q,
-      a2_scale,
-      w2_residual,
-      expert_offsets,
-      num_experts,
-      swiglu_limit,
-      has_swiglu_limit);
+      c1, intermediate_q, a2_scale, w2_residual, expert_offsets, num_experts, swiglu_limit, has_swiglu_limit);
   cutlass_mxfp4a8_fused_moe_mm(
       c2,
       intermediate_q,

@@ -243,10 +243,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "                        Tensor! input_permutation, "
       "                        Tensor! output_permutation, int num_experts, "
       "                        int n, int k) -> ()");
-  m.impl(
-      "get_cutlass_w4a8_moe_mm_data_with_permutation",
-      torch::kCUDA,
-      &get_cutlass_w4a8_moe_mm_data_with_permutation);
+  m.impl("get_cutlass_w4a8_moe_mm_data_with_permutation", torch::kCUDA, &get_cutlass_w4a8_moe_mm_data_with_permutation);
 
   m.def(
       "cutlass_w4a8_moe_mm(Tensor! d, Tensor a, Tensor b, "
@@ -280,10 +277,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int topk, int gemm1_config, int gemm2_config, int num_experts, "
       "int intermediate_size, int hidden_size, float swiglu_limit, "
       "bool has_swiglu_limit, bool prepare_inputs, Tensor? expert_ids=None) -> ()");
-  m.impl(
-      "cutlass_mxfp4a8_fused_moe_core",
-      torch::kCUDA,
-      &cutlass_mxfp4a8_fused_moe_core);
+  m.impl("cutlass_mxfp4a8_fused_moe_core", torch::kCUDA, &cutlass_mxfp4a8_fused_moe_core);
 
   /*
    * From csrc/speculative

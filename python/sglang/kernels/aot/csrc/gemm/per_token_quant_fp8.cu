@@ -8,8 +8,8 @@
 static constexpr int kWarpSize = 32;
 static constexpr int DEFAULT_SHARED_MEM_THRESHOLD_KB = 48;  // Default shared memory quota in KB
 
-__device__ __forceinline__ int find_expert_for_token(
-    int64_t token, const int32_t* __restrict__ expert_offsets, int64_t num_experts) {
+__device__ __forceinline__ int
+find_expert_for_token(int64_t token, const int32_t* __restrict__ expert_offsets, int64_t num_experts) {
   // upper_bound(expert_offsets, token) - 1. Repeated offsets from empty
   // experts are handled by moving to the rightmost matching interval.
   int lo = 0;
@@ -389,23 +389,23 @@ bool fused_prepare_moe_input_and_quant_fp8_shuffled(
   constexpr int kThreads = 256;
   const bool use_vec16 = hidden_dim % 16 == 0;
   const bool use_vec8 = hidden_dim % 8 == 0;
-#define LAUNCH_TINY_FUSED_QUANT(VEC_SIZE)                                                        \
-  prepare_moe_input_and_quant_fp8_shuffled_kernel<scalar_t, __nv_fp8_e4m3, VEC_SIZE>            \
-      <<<num_routes, kThreads, 0, stream>>>(                                                      \
-          static_cast<const scalar_t*>(input.data_ptr()),                                        \
-          static_cast<const int32_t*>(topk_ids.data_ptr()),                                       \
-          static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),                                       \
-          static_cast<float*>(output_s.data_ptr()),                                               \
-          static_cast<const float*>(residual.data_ptr()),                                         \
-          static_cast<int32_t*>(expert_offsets.data_ptr()),                                       \
-          static_cast<int32_t*>(problem_sizes1.data_ptr()),                                       \
-          static_cast<int32_t*>(problem_sizes2.data_ptr()),                                       \
-          static_cast<int32_t*>(input_permutation.data_ptr()),                                    \
-          static_cast<int32_t*>(output_permutation.data_ptr()),                                   \
-          hidden_dim,                                                                             \
-          num_routes,                                                                             \
-          topk_ids.size(1),                                                                        \
-          num_experts,                                                                            \
+#define LAUNCH_TINY_FUSED_QUANT(VEC_SIZE)                                            \
+  prepare_moe_input_and_quant_fp8_shuffled_kernel<scalar_t, __nv_fp8_e4m3, VEC_SIZE> \
+      <<<num_routes, kThreads, 0, stream>>>(                                         \
+          static_cast<const scalar_t*>(input.data_ptr()),                            \
+          static_cast<const int32_t*>(topk_ids.data_ptr()),                          \
+          static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),                          \
+          static_cast<float*>(output_s.data_ptr()),                                  \
+          static_cast<const float*>(residual.data_ptr()),                            \
+          static_cast<int32_t*>(expert_offsets.data_ptr()),                          \
+          static_cast<int32_t*>(problem_sizes1.data_ptr()),                          \
+          static_cast<int32_t*>(problem_sizes2.data_ptr()),                          \
+          static_cast<int32_t*>(input_permutation.data_ptr()),                       \
+          static_cast<int32_t*>(output_permutation.data_ptr()),                      \
+          hidden_dim,                                                                \
+          num_routes,                                                                \
+          topk_ids.size(1),                                                          \
+          num_experts,                                                               \
           intermediate_size)
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
     if (use_vec16) {
@@ -441,13 +441,7 @@ static inline void launch_per_token_quant_fp8_warp_kernel(
   const size_t smem_size = USE_SMEM ? dynamicSmemSz : 0;
 
   if (use_vec16) {
-    per_token_quant_fp8_kernel<
-        scalar_t,
-        __nv_fp8_e4m3,
-        TOKENS_PER_CTA,
-        16,
-        USE_SMEM,
-        APPLY_EXPERT_RESIDUAL>
+    per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 16, USE_SMEM, APPLY_EXPERT_RESIDUAL>
         <<<grid, block, smem_size, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
@@ -459,13 +453,7 @@ static inline void launch_per_token_quant_fp8_warp_kernel(
             num_tokens,
             num_experts);
   } else if (use_vec8) {
-    per_token_quant_fp8_kernel<
-        scalar_t,
-        __nv_fp8_e4m3,
-        TOKENS_PER_CTA,
-        8,
-        USE_SMEM,
-        APPLY_EXPERT_RESIDUAL>
+    per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 8, USE_SMEM, APPLY_EXPERT_RESIDUAL>
         <<<grid, block, smem_size, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
@@ -477,13 +465,7 @@ static inline void launch_per_token_quant_fp8_warp_kernel(
             num_tokens,
             num_experts);
   } else {
-    per_token_quant_fp8_kernel<
-        scalar_t,
-        __nv_fp8_e4m3,
-        TOKENS_PER_CTA,
-        4,
-        USE_SMEM,
-        APPLY_EXPERT_RESIDUAL>
+    per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 4, USE_SMEM, APPLY_EXPERT_RESIDUAL>
         <<<grid, block, smem_size, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
@@ -589,39 +571,39 @@ void per_token_quant_fp8_impl(
       if (use_vec16) {
         per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 16, APPLY_EXPERT_RESIDUAL>
             <<<grid, block, 0, stream>>>(
-            static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-            static_cast<float*>(output_s.data_ptr()),
-            residual,
-            expert_offsets,
-            permutation,
-            hidden_dim,
-            num_tokens,
-            num_experts);
+                static_cast<const scalar_t*>(input.data_ptr()),
+                static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+                static_cast<float*>(output_s.data_ptr()),
+                residual,
+                expert_offsets,
+                permutation,
+                hidden_dim,
+                num_tokens,
+                num_experts);
       } else if (use_vec8) {
         per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 8, APPLY_EXPERT_RESIDUAL>
             <<<grid, block, 0, stream>>>(
-            static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-            static_cast<float*>(output_s.data_ptr()),
-            residual,
-            expert_offsets,
-            permutation,
-            hidden_dim,
-            num_tokens,
-            num_experts);
+                static_cast<const scalar_t*>(input.data_ptr()),
+                static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+                static_cast<float*>(output_s.data_ptr()),
+                residual,
+                expert_offsets,
+                permutation,
+                hidden_dim,
+                num_tokens,
+                num_experts);
       } else {
         per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 4, APPLY_EXPERT_RESIDUAL>
             <<<grid, block, 0, stream>>>(
-            static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-            static_cast<float*>(output_s.data_ptr()),
-            residual,
-            expert_offsets,
-            permutation,
-            hidden_dim,
-            num_tokens,
-            num_experts);
+                static_cast<const scalar_t*>(input.data_ptr()),
+                static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+                static_cast<float*>(output_s.data_ptr()),
+                residual,
+                expert_offsets,
+                permutation,
+                hidden_dim,
+                num_tokens,
+                num_experts);
       }
     }
     return true;
@@ -633,8 +615,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   CHECK_INPUT(output_q);
   CHECK_INPUT(output_s);
   TORCH_CHECK(input.dim() == 2, "input must have shape [M, K]");
-  per_token_quant_fp8_impl</*APPLY_EXPERT_RESIDUAL=*/false>(
-      input, output_q, output_s, nullptr, nullptr, nullptr, 0);
+  per_token_quant_fp8_impl</*APPLY_EXPERT_RESIDUAL=*/false>(input, output_q, output_s, nullptr, nullptr, nullptr, 0);
 }
 
 #ifndef USE_ROCM
@@ -656,9 +637,7 @@ void fused_per_token_quant_fp8(
   TORCH_CHECK(
       output_s.numel() == input.size(0) && output_s.scalar_type() == at::kFloat,
       "output_s must be float32 with M elements");
-  TORCH_CHECK(
-      residual.numel() == num_experts && residual.scalar_type() == at::kFloat,
-      "residual must be float32 [E]");
+  TORCH_CHECK(residual.numel() == num_experts && residual.scalar_type() == at::kFloat, "residual must be float32 [E]");
   TORCH_CHECK(
       expert_offsets.numel() == num_experts + 1 && expert_offsets.scalar_type() == at::kInt,
       "expert_offsets must be int32 [E + 1]");
@@ -701,9 +680,7 @@ void fused_per_token_quant_fp8_shuffled(
   TORCH_CHECK(
       output_s.numel() == permutation.numel() && output_s.scalar_type() == at::kFloat,
       "output_s must be float32 with N elements");
-  TORCH_CHECK(
-      residual.numel() == num_experts && residual.scalar_type() == at::kFloat,
-      "residual must be float32 [E]");
+  TORCH_CHECK(residual.numel() == num_experts && residual.scalar_type() == at::kFloat, "residual must be float32 [E]");
   TORCH_CHECK(
       expert_offsets.numel() == num_experts + 1 && expert_offsets.scalar_type() == at::kInt,
       "expert_offsets must be int32 [E + 1]");

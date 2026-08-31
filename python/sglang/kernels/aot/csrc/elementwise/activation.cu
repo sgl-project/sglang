@@ -21,6 +21,7 @@
 #ifndef USE_ROCM
 
 #include <cuda_fp8.h>
+
 #include <flashinfer/activation.cuh>
 
 #include "utils.h"
@@ -107,18 +108,13 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input) {
 
 #ifndef USE_ROCM
 template <typename T>
-__device__ __forceinline__ T fused_swiglu_value(
-    T gate_value,
-    T up_value,
-    const float swiglu_limit,
-    const bool has_swiglu_limit) {
+__device__ __forceinline__ T
+fused_swiglu_value(T gate_value, T up_value, const float swiglu_limit, const bool has_swiglu_limit) {
   if (has_swiglu_limit) {
     gate_value = static_cast<T>(fminf(static_cast<float>(gate_value), swiglu_limit));
-    up_value =
-        static_cast<T>(fmaxf(fminf(static_cast<float>(up_value), swiglu_limit), -swiglu_limit));
+    up_value = static_cast<T>(fmaxf(fminf(static_cast<float>(up_value), swiglu_limit), -swiglu_limit));
   }
-  return static_cast<T>(
-      silu(static_cast<float>(gate_value)) * static_cast<float>(up_value));
+  return static_cast<T>(silu(static_cast<float>(gate_value)) * static_cast<float>(up_value));
 }
 
 template <typename T>
@@ -158,8 +154,7 @@ __global__ void fused_swiglu_quant_fp8_kernel(
     const T* up_values = reinterpret_cast<const T*>(&up_pack);
 #pragma unroll
     for (int j = 0; j < kVecSize; ++j) {
-      const T value =
-          fused_swiglu_value(gate_values[j], up_values[j], swiglu_limit, has_swiglu_limit);
+      const T value = fused_swiglu_value(gate_values[j], up_values[j], swiglu_limit, has_swiglu_limit);
       max_value = fmaxf(max_value, fabsf(static_cast<float>(value)));
     }
   }
@@ -200,8 +195,7 @@ __global__ void fused_swiglu_quant_fp8_kernel(
 #pragma unroll
     for (int j = 0; j < kVecSize; ++j) {
       const int64_t i = vec * kVecSize + j;
-      const T value =
-          fused_swiglu_value(gate_values[j], up_values[j], swiglu_limit, has_swiglu_limit);
+      const T value = fused_swiglu_value(gate_values[j], up_values[j], swiglu_limit, has_swiglu_limit);
       float quant_value = static_cast<float>(value) * scale_inv;
       quant_value = fmaxf(fminf(quant_value, FP8_E4M3_MAX), -FP8_E4M3_MAX);
       output_q[token * hidden_dim + i] = static_cast<__nv_fp8_e4m3>(quant_value);
@@ -232,13 +226,10 @@ void fused_swiglu_quant_fp8(
   TORCH_CHECK(input.dim() == 2 && input.size(1) % 2 == 0, "input must have shape [M, 2N]");
   const int64_t num_tokens = input.size(0);
   const int64_t hidden_dim = input.size(1) / 2;
-  TORCH_CHECK(
-      output_q.sizes() == at::IntArrayRef({num_tokens, hidden_dim}), "output_q must have shape [M, N]");
+  TORCH_CHECK(output_q.sizes() == at::IntArrayRef({num_tokens, hidden_dim}), "output_q must have shape [M, N]");
   TORCH_CHECK(output_q.scalar_type() == at::kFloat8_e4m3fn, "output_q must be float8_e4m3fn");
-  TORCH_CHECK(
-      output_s.numel() == num_tokens && output_s.scalar_type() == at::kFloat, "output_s must be float32 [M]");
-  TORCH_CHECK(
-      residual.numel() == num_experts && residual.scalar_type() == at::kFloat, "residual must be float32 [E]");
+  TORCH_CHECK(output_s.numel() == num_tokens && output_s.scalar_type() == at::kFloat, "output_s must be float32 [M]");
+  TORCH_CHECK(residual.numel() == num_experts && residual.scalar_type() == at::kFloat, "residual must be float32 [E]");
   TORCH_CHECK(
       expert_offsets.numel() == num_experts + 1 && expert_offsets.scalar_type() == at::kInt,
       "expert_offsets must be int32 [E + 1]");

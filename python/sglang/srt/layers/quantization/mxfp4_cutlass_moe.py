@@ -182,6 +182,7 @@ class Mxfp4CutlassMoEMethod:
         from flashinfer.fused_moe import (
             preprocess_moe_weights_for_sm90_mixed_gemm_humming,
         )
+
         from sglang.srt.layers.mxfp4a8_utils import repack_hf_mxfp4_to_kernel
         from sglang.srt.layers.quantization.marlin_utils_fp4 import (
             _normalize_scale_tensor,

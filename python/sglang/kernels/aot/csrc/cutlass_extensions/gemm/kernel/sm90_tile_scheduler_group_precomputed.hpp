@@ -66,15 +66,18 @@ struct PrecomputedGroupWorkTile {
       asm volatile("trap;");
     }
 
-    return uint64_t(channel_idx) | (uint64_t(token_idx) << TokenShift) |
-           (uint64_t(expert_idx) << ExpertShift);
+    return uint64_t(channel_idx) | (uint64_t(token_idx) << TokenShift) | (uint64_t(expert_idx) << ExpertShift);
   }
 
   CUTLASS_DEVICE
-  static bool is_invalid(uint64_t packed) { return packed == Invalid; }
+  static bool is_invalid(uint64_t packed) {
+    return packed == Invalid;
+  }
 
   CUTLASS_DEVICE
-  static int32_t channel_idx(uint64_t packed) { return static_cast<int32_t>(packed & ChannelMask); }
+  static int32_t channel_idx(uint64_t packed) {
+    return static_cast<int32_t>(packed & ChannelMask);
+  }
 
   CUTLASS_DEVICE
   static int32_t token_idx(uint64_t packed) {
@@ -115,16 +118,24 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
     int32_t is_valid_tile = 0;
 
     CUTLASS_HOST_DEVICE
-    bool is_valid() const { return is_valid_tile != 0; }
+    bool is_valid() const {
+      return is_valid_tile != 0;
+    }
 
     CUTLASS_HOST_DEVICE
-    static WorkTileInfo invalid_work_tile() { return {-1, -1, -1, 0}; }
+    static WorkTileInfo invalid_work_tile() {
+      return {-1, -1, -1, 0};
+    }
 
     CUTLASS_HOST_DEVICE
-    bool is_final_split(uint32_t k_tiles_per_output_tile) const { return true; }
+    bool is_final_split(uint32_t k_tiles_per_output_tile) const {
+      return true;
+    }
 
     CUTLASS_HOST_DEVICE
-    int32_t reduction_subtile_idx() const { return -1; }
+    int32_t reduction_subtile_idx() const {
+      return -1;
+    }
   };
 
   using ProblemShape = typename GroupProblemShape::UnderlyingProblemShape;
@@ -132,9 +143,12 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
   struct Params : ParamsBase, PrecomputedWorkMapStride<ChunkMajorWorkMap> {
     uint64_t const* precomputed_work_tiles_ = nullptr;
 
-    void initialize_precomputed(dim3 problem_blocks, GemmCoord cluster_shape,
-                                KernelHardwareInfo const& hw_info, int max_swizzle_size,
-                                typename ParamsBase::RasterOrderOptions raster_order_option) {
+    void initialize_precomputed(
+        dim3 problem_blocks,
+        GemmCoord cluster_shape,
+        KernelHardwareInfo const& hw_info,
+        int max_swizzle_size,
+        typename ParamsBase::RasterOrderOptions raster_order_option) {
       CUTLASS_UNUSED(hw_info);
 
       auto problem_blocks_m = round_up(problem_blocks.x, cluster_shape.m());
@@ -143,8 +157,8 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
       this->blocks_across_problem_ = problem_blocks.x * problem_blocks.y * problem_blocks.z;
       this->pre_processed_problem_shapes = true;
       CUTLASS_UNUSED(max_swizzle_size);
-      this->raster_order_ = ParamsBase::get_rasterization_order(problem_blocks_m, problem_blocks_n,
-                                                                raster_order_option);
+      this->raster_order_ =
+          ParamsBase::get_rasterization_order(problem_blocks_m, problem_blocks_n, raster_order_option);
 
       this->cluster_shape_ = cluster_shape;
     }
@@ -162,10 +176,8 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
 
   // using PipelineStorage = typename Pipeline::SharedStorage;
   // using PipelineState = typename Pipeline::PipelineState;
-  using PipelineStorage =
-      cutlass::PipelineDetail::PipelineAsyncSharedStorage<SchedulerPipelineStageCount>;
-  using PipelineState =
-      cutlass::PipelineDetail::PipelineAsyncPipelineState<SchedulerPipelineStageCount>;
+  using PipelineStorage = cutlass::PipelineDetail::PipelineAsyncSharedStorage<SchedulerPipelineStageCount>;
+  using PipelineState = cutlass::PipelineDetail::PipelineAsyncPipelineState<SchedulerPipelineStageCount>;
 
   using ThrottlePipeline = PipelineEmpty;
   using ThrottlePipelineStorage = typename PipelineEmpty::SharedStorage;
@@ -173,10 +185,16 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
 
   class SharedStorage {
    public:
-    CUTLASS_DEVICE PipelineStorage pipeline() { return pipeline_; }
+    CUTLASS_DEVICE PipelineStorage pipeline() {
+      return pipeline_;
+    }
     // Pipeline throttle is not needed here as the scheduling is not dynamic.
-    CUTLASS_DEVICE ThrottlePipelineStorage throttle_pipeline() { return ThrottlePipelineStorage{}; }
-    CUTLASS_DEVICE SchedulerResponse* data() { return data_; }
+    CUTLASS_DEVICE ThrottlePipelineStorage throttle_pipeline() {
+      return ThrottlePipelineStorage{};
+    }
+    CUTLASS_DEVICE SchedulerResponse* data() {
+      return data_;
+    }
 
    private:
     alignas(16) PipelineStorage pipeline_;
@@ -200,8 +218,11 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
 
   template <class TileShape, class ClusterShape>
   static Params to_underlying_arguments(
-      GroupProblemShape problem_shapes, TileShape tile_shape, ClusterShape cluster_shape,
-      KernelHardwareInfo const& hw_info, Arguments const& arguments,
+      GroupProblemShape problem_shapes,
+      TileShape tile_shape,
+      ClusterShape cluster_shape,
+      KernelHardwareInfo const& hw_info,
+      Arguments const& arguments,
       [[maybe_unused]] void* workspace = nullptr,
       [[maybe_unused]] const uint32_t epilogue_subtile = 1,
       [[maybe_unused]] uint32_t ktile_start_alignment_count = 1u) {
@@ -209,13 +230,12 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
     static_assert(cute::is_static<TileShape>::value);
     static_assert(cute::is_static<ClusterShape>::value);
 
-    dim3 problem_blocks =
-        get_tiled_cta_shape_mnl(problem_shapes, hw_info, tile_shape, cluster_shape);
+    dim3 problem_blocks = get_tiled_cta_shape_mnl(problem_shapes, hw_info, tile_shape, cluster_shape);
 
     CUTLASS_ASSERT(arguments.precomputed_work_tiles != nullptr);
     Params params;
-    params.initialize_precomputed(problem_blocks, to_gemm_coord(cluster_shape), hw_info,
-                                  arguments.max_swizzle_size, RasterOrderOptions::AlongM);
+    params.initialize_precomputed(
+        problem_blocks, to_gemm_coord(cluster_shape), hw_info, arguments.max_swizzle_size, RasterOrderOptions::AlongM);
     params.precomputed_work_tiles_ = arguments.precomputed_work_tiles;
     if constexpr (ChunkMajorWorkMap) {
       params.precomputed_work_tiles_per_worker = arguments.precomputed_work_tiles_per_worker;
@@ -226,27 +246,34 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
 
   // Given the inputs, computes the physical grid we should launch.
   template <class TileShape, class ClusterShape>
-  CUTLASS_HOST_DEVICE static dim3 get_grid_shape([[maybe_unused]] Params const& params,
-                                                 GroupProblemShape const& problem_shapes,
-                                                 TileShape tile_shape, ClusterShape cluster_shape,
-                                                 KernelHardwareInfo hw_info, Arguments arguments,
-                                                 bool truncate_by_problem_size = true) {
-    dim3 problem_blocks =
-        get_tiled_cta_shape_mnl(problem_shapes, hw_info, tile_shape, cluster_shape);
+  CUTLASS_HOST_DEVICE static dim3 get_grid_shape(
+      [[maybe_unused]] Params const& params,
+      GroupProblemShape const& problem_shapes,
+      TileShape tile_shape,
+      ClusterShape cluster_shape,
+      KernelHardwareInfo hw_info,
+      Arguments arguments,
+      bool truncate_by_problem_size = true) {
+    dim3 problem_blocks = get_tiled_cta_shape_mnl(problem_shapes, hw_info, tile_shape, cluster_shape);
 
-    return Params::get_grid_shape(problem_blocks, to_gemm_coord(cluster_shape), hw_info,
-                                  arguments.max_swizzle_size, RasterOrderOptions::AlongM,
-                                  /* truncate_by_problem_size = */ true);
+    return Params::get_grid_shape(
+        problem_blocks,
+        to_gemm_coord(cluster_shape),
+        hw_info,
+        arguments.max_swizzle_size,
+        RasterOrderOptions::AlongM,
+        /* truncate_by_problem_size = */ true);
   }
 
   // Given the inputs, computes the total number of output blocks this problem will compute over
   // Note that this is only the logical size of our grid, not the physical grid we will actually
   // launch.
   template <class BlockShape, class ClusterShape>
-  CUTLASS_HOST_DEVICE static dim3 get_tiled_cta_shape_mnl(GroupProblemShape const& problem_shapes,
-                                                          KernelHardwareInfo hw_info,
-                                                          BlockShape cta_shape,
-                                                          ClusterShape cluster_shape) {
+  CUTLASS_HOST_DEVICE static dim3 get_tiled_cta_shape_mnl(
+      GroupProblemShape const& problem_shapes,
+      KernelHardwareInfo hw_info,
+      BlockShape cta_shape,
+      ClusterShape cluster_shape) {
     int groups = problem_shapes.groups();
     uint32_t total_ctas = 0;
     uint32_t cta_in_N_dim = 1;  // We linearize the blocks across all the problems here
@@ -259,12 +286,10 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
     // smaller grid.
     else {
       for (int group = 0; group < groups; group++) {
-        auto ctas_along_m =
-            cute::size(cute::ceil_div(cute::shape<0>(problem_shapes.get_host_problem_shape(group)),
-                                      cute::shape<0>(cta_shape)));
-        auto ctas_along_n =
-            cute::size(cute::ceil_div(cute::shape<1>(problem_shapes.get_host_problem_shape(group)),
-                                      cute::shape<1>(cta_shape)));
+        auto ctas_along_m = cute::size(
+            cute::ceil_div(cute::shape<0>(problem_shapes.get_host_problem_shape(group)), cute::shape<0>(cta_shape)));
+        auto ctas_along_n = cute::size(
+            cute::ceil_div(cute::shape<1>(problem_shapes.get_host_problem_shape(group)), cute::shape<1>(cta_shape)));
         if (ctas_along_m <= 0) ctas_along_m = 1;
         if (ctas_along_n <= 0) ctas_along_n = 1;
         auto problem_blocks_m = round_up(ctas_along_m, cute::get<0>(cluster_shape));
@@ -294,16 +319,14 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
     // like blockIdx and gridDim, with __CUDA_ARCH__.
 #if defined(__CUDA_ARCH__)
     CUTLASS_ASSERT(scheduler_params.precomputed_work_tiles_ != nullptr);
-    WorkLinearIdx const worker_idx =
-        WorkLinearIdx(blockIdx.x) * WorkLinearIdx(gridDim.y) + WorkLinearIdx(blockIdx.y) +
-        WorkLinearIdx(blockIdx.z) * WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y);
+    WorkLinearIdx const worker_idx = WorkLinearIdx(blockIdx.x) * WorkLinearIdx(gridDim.y) + WorkLinearIdx(blockIdx.y) +
+                                     WorkLinearIdx(blockIdx.z) * WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y);
     if constexpr (ChunkMajorWorkMap) {
       current_work_linear_idx_ = worker_idx * scheduler_params.precomputed_work_tiles_per_worker;
       total_grid_size_ = 1;
     } else {
       current_work_linear_idx_ = worker_idx;
-      total_grid_size_ =
-          WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y) * WorkLinearIdx(gridDim.z);
+      total_grid_size_ = WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y) * WorkLinearIdx(gridDim.z);
     }
 
 #else
@@ -318,16 +341,14 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
     // like blockIdx and gridDim, with __CUDA_ARCH__.
 #if defined(__CUDA_ARCH__)
     CUTLASS_ASSERT(scheduler_params.precomputed_work_tiles_ != nullptr);
-    WorkLinearIdx const worker_idx =
-        WorkLinearIdx(blockIdx.x) * WorkLinearIdx(gridDim.y) + WorkLinearIdx(blockIdx.y) +
-        WorkLinearIdx(blockIdx.z) * WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y);
+    WorkLinearIdx const worker_idx = WorkLinearIdx(blockIdx.x) * WorkLinearIdx(gridDim.y) + WorkLinearIdx(blockIdx.y) +
+                                     WorkLinearIdx(blockIdx.z) * WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y);
     if constexpr (ChunkMajorWorkMap) {
       current_work_linear_idx_ = worker_idx * scheduler_params.precomputed_work_tiles_per_worker;
       total_grid_size_ = 1;
     } else {
       current_work_linear_idx_ = worker_idx;
-      total_grid_size_ =
-          WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y) * WorkLinearIdx(gridDim.z);
+      total_grid_size_ = WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y) * WorkLinearIdx(gridDim.z);
     }
 
 #else
@@ -346,23 +367,27 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
   }
 
   CUTLASS_DEVICE
-  static WorkTileInfo get_precomputed_work_tile(uint64_t linear_idx,
-                                                uint64_t const* precomputed_work_tiles) {
+  static WorkTileInfo get_precomputed_work_tile(uint64_t linear_idx, uint64_t const* precomputed_work_tiles) {
     uint64_t const packed = __ldg(precomputed_work_tiles + linear_idx);
     if (PrecomputedGroupWorkTile::is_invalid(packed)) {
       return WorkTileInfo::invalid_work_tile();
     }
 
-    return {PrecomputedGroupWorkTile::channel_idx(packed),
-            PrecomputedGroupWorkTile::token_idx(packed),
-            PrecomputedGroupWorkTile::expert_idx(packed), 1};
+    return {
+        PrecomputedGroupWorkTile::channel_idx(packed),
+        PrecomputedGroupWorkTile::token_idx(packed),
+        PrecomputedGroupWorkTile::expert_idx(packed),
+        1};
   }
 
-  template <typename TileSchedulerPipeline, typename TileSchedulerPipelineState,
-            typename CallbackBeforeCommit = WorkTileInfo (*)(WorkTileInfo)>
+  template <
+      typename TileSchedulerPipeline,
+      typename TileSchedulerPipelineState,
+      typename CallbackBeforeCommit = WorkTileInfo (*)(WorkTileInfo)>
   CUTLASS_DEVICE auto advance_to_next_work(
       TileSchedulerPipeline& scheduler_pipeline,
-      TileSchedulerPipelineState scheduler_pipe_producer_state, uint32_t advance_count = 1,
+      TileSchedulerPipelineState scheduler_pipe_producer_state,
+      uint32_t advance_count = 1,
       CallbackBeforeCommit callback_before_commit = [](WorkTileInfo info) { return info; }) {
     current_work_linear_idx_ += total_grid_size_ * WorkLinearIdx(advance_count);
     auto work_tile = get_current_work_for_linear_idx(current_work_linear_idx_);
@@ -374,8 +399,8 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
     }
 
     if (cute::elect_one_sync()) {
-      reinterpret_cast<WorkTileWithCallbackInfo*>(
-          response_ptr_)[scheduler_pipe_producer_state.index()] = work_tile_with_callback_info;
+      reinterpret_cast<WorkTileWithCallbackInfo*>(response_ptr_)[scheduler_pipe_producer_state.index()] =
+          work_tile_with_callback_info;
       cutlass::arch::fence_view_async_shared();
       scheduler_pipeline.producer_commit(scheduler_pipe_producer_state);
     }
@@ -383,7 +408,9 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
   }
 
   CUTLASS_DEVICE
-  void advance_to_next_work() { current_work_linear_idx_ += total_grid_size_; }
+  void advance_to_next_work() {
+    current_work_linear_idx_ += total_grid_size_;
+  }
 
   CUTLASS_DEVICE
   void advance_to_next_work(uint32_t advance_count) {
@@ -393,39 +420,47 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
   // Returns whether the block assigned this work should compute the epilogue for the corresponding
   // output tile. For the basic tile scheduler, this is always true.
   CUTLASS_HOST_DEVICE
-  static bool compute_epilogue(WorkTileInfo const&, Params const&) { return true; }
+  static bool compute_epilogue(WorkTileInfo const&, Params const&) {
+    return true;
+  }
 
   // Performs the reduction across splits for a given output tile. Since this scheduler does
   // not split output tiles, no reduction is needed.
   template <class FrgTensorC>
-  CUTLASS_DEVICE static void fixup(Params const&, WorkTileInfo const&, FrgTensorC&, uint32_t,
-                                   uint32_t) {}
+  CUTLASS_DEVICE static void fixup(Params const&, WorkTileInfo const&, FrgTensorC&, uint32_t, uint32_t) {}
 
   // Returns whether the current WorkTileInfo passed in should continue to be used. Since
   // this scheduler only schedules work in units of single, full output tiles, the WorkTileInfo
   // passed in should not be used after having been processed.
   CUTLASS_DEVICE
-  static bool continue_current_work(WorkTileInfo&) { return false; }
+  static bool continue_current_work(WorkTileInfo&) {
+    return false;
+  }
 
   // The basic tile scheduler does not require any additional workspace
   template <class ProblemShape, class ElementAccumulator>
-  static size_t get_workspace_size(Arguments const&, ProblemShape, KernelHardwareInfo const&,
-                                   uint32_t, const uint32_t = 1, uint32_t = 1) {
+  static size_t get_workspace_size(
+      Arguments const&, ProblemShape, KernelHardwareInfo const&, uint32_t, const uint32_t = 1, uint32_t = 1) {
     return 0;
   }
 
   template <class ProblemShape, class ElementAccumulator>
-  static cutlass::Status initialize_workspace(Arguments const&, void*, cudaStream_t, ProblemShape,
-                                              KernelHardwareInfo const&, uint32_t,
-                                              const uint32_t = 1, uint32_t = 1,
-                                              CudaHostAdapter* cuda_adapter = nullptr) {
+  static cutlass::Status initialize_workspace(
+      Arguments const&,
+      void*,
+      cudaStream_t,
+      ProblemShape,
+      KernelHardwareInfo const&,
+      uint32_t,
+      const uint32_t = 1,
+      uint32_t = 1,
+      CudaHostAdapter* cuda_adapter = nullptr) {
     return Status::kSuccess;
   }
 
   template <class ProblemShape_MNKL, class TileShape>
-  CUTLASS_HOST_DEVICE static int get_work_k_tile_count(WorkTileInfo const& work_tile_info,
-                                                       ProblemShape_MNKL problem_shape,
-                                                       TileShape tile_shape) {
+  CUTLASS_HOST_DEVICE static int
+  get_work_k_tile_count(WorkTileInfo const& work_tile_info, ProblemShape_MNKL problem_shape, TileShape tile_shape) {
     // All work units returned by this scheduler cover the entire K iteration
     // space of the output tile assigned to the work unit.
     return cute::size(cute::ceil_div(cute::get<2>(problem_shape), cute::get<2>(tile_shape)));
@@ -438,7 +473,9 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
   }
 
   CUTLASS_DEVICE
-  static bool need_separate_reduction(Params const& params) { return false; }
+  static bool need_separate_reduction(Params const& params) {
+    return false;
+  }
 
   CUTLASS_DEVICE
   bool is_work_tile_for_reduction(WorkTileInfo const& work_tile_info, Params const& params) {
@@ -451,34 +488,44 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
   }
 
   template <class FrgTensorC>
-  CUTLASS_DEVICE void separate_reduction(Params const& params, WorkTileInfo const& work_tile_info,
-                                         FrgTensorC& accumulators, uint32_t num_barriers,
-                                         uint32_t barrier_idx) {}
+  CUTLASS_DEVICE void separate_reduction(
+      Params const& params,
+      WorkTileInfo const& work_tile_info,
+      FrgTensorC& accumulators,
+      uint32_t num_barriers,
+      uint32_t barrier_idx) {}
 
   // Shares the accumulator set with peers in the global workspace
   template <class FrgTensorC>
-  CUTLASS_DEVICE static void share(Params const& params, WorkTileInfo const& work_tile_info,
-                                   FrgTensorC& accumulators, uint32_t num_barriers,
-                                   uint32_t barrier_idx) {}
+  CUTLASS_DEVICE static void share(
+      Params const& params,
+      WorkTileInfo const& work_tile_info,
+      FrgTensorC& accumulators,
+      uint32_t num_barriers,
+      uint32_t barrier_idx) {}
 
   CUTLASS_DEVICE
-  static bool valid_warpgroup_in_work_tile(WorkTileInfo const& work_tile_info) { return true; }
+  static bool valid_warpgroup_in_work_tile(WorkTileInfo const& work_tile_info) {
+    return true;
+  }
 
   CUTLASS_DEVICE
-  static bool requires_separate_reduction(Params const& params) { return false; }
+  static bool requires_separate_reduction(Params const& params) {
+    return false;
+  }
 
   // Kernel helper function to get next work tile
-  template <typename WorkTileWithCallbackInfo, typename TileSchedulerPipeline,
-            typename TileSchedulerPipelineState>
-  CUTLASS_DEVICE auto fetch_next_work(WorkTileWithCallbackInfo work_tile_with_callback_info,
-                                      TileSchedulerPipeline& scheduler_pipeline,
-                                      TileSchedulerPipelineState scheduler_pipe_consumer_state) {
+  template <typename WorkTileWithCallbackInfo, typename TileSchedulerPipeline, typename TileSchedulerPipelineState>
+  CUTLASS_DEVICE auto fetch_next_work(
+      WorkTileWithCallbackInfo work_tile_with_callback_info,
+      TileSchedulerPipeline& scheduler_pipeline,
+      TileSchedulerPipelineState scheduler_pipe_consumer_state) {
     if (continue_current_work(work_tile_with_callback_info)) {
       return cute::make_tuple(work_tile_with_callback_info, true);
     }
     scheduler_pipeline.consumer_wait(scheduler_pipe_consumer_state);
-    work_tile_with_callback_info = reinterpret_cast<WorkTileWithCallbackInfo*>(
-        response_ptr_)[scheduler_pipe_consumer_state.index()];
+    work_tile_with_callback_info =
+        reinterpret_cast<WorkTileWithCallbackInfo*>(response_ptr_)[scheduler_pipe_consumer_state.index()];
     cutlass::arch::fence_view_async_shared();
     scheduler_pipeline.consumer_release(scheduler_pipe_consumer_state);
 
@@ -498,9 +545,7 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
   // Returns the initial work tile info that will be computed over
   template <class ClusterShape, typename CallbackBeforeCommit = WorkTileInfo (*)(WorkTileInfo)>
   CUTLASS_DEVICE auto initial_work_tile_info(
-      ClusterShape, CallbackBeforeCommit callback_before_commit = [](WorkTileInfo response) {
-        return response;
-      }) {
+      ClusterShape, CallbackBeforeCommit callback_before_commit = [](WorkTileInfo response) { return response; }) {
     auto work_tile = get_current_work_for_linear_idx(current_work_linear_idx_);
     using WorkTileWithCallbackInfo = decltype(callback_before_commit(work_tile));
     WorkTileWithCallbackInfo work_tile_with_callback_info = work_tile;

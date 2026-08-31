@@ -842,9 +842,14 @@ def _build_grouped_act_block_scale_capture_safe(
         .contiguous()
     )
     as_packed = packed.reshape(-1).contiguous()
-    expert_prefix = torch.arange(num_experts, dtype=torch.int64, device=device) * m_stride
+    expert_prefix = (
+        torch.arange(num_experts, dtype=torch.int64, device=device) * m_stride
+    )
     as_strides = torch.stack(
-        [torch.full((num_experts,), m_stride, dtype=torch.int64, device=device), expert_prefix],
+        [
+            torch.full((num_experts,), m_stride, dtype=torch.int64, device=device),
+            expert_prefix,
+        ],
         dim=1,
     ).contiguous()
     return as_packed, as_strides

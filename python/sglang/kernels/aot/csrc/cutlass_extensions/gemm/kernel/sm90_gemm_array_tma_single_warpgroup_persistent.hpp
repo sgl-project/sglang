@@ -38,20 +38,24 @@ enum class SingleWarpgroupPipelineMode { PrefillAll, RollingRefill };
 
 template <class ProblemShape, class CollectiveMainloop, class CollectiveEpilogue>
 using SingleWarpgroupPersistentBase = GemmUniversalPrecomputedScheduler<
-    ProblemShape, CollectiveMainloop, CollectiveEpilogue,
+    ProblemShape,
+    CollectiveMainloop,
+    CollectiveEpilogue,
     detail::PersistentTileSchedulerSm90GroupPrecomputed<ProblemShape, 8, true>>;
 
 // Small-K persistent kernel that keeps the existing mixed-input collectives
 // intact while one warpgroup overlaps the next output tile with current MMA.
-template <class ProblemShape_, class CollectiveMainloop_, class CollectiveEpilogue_,
-          int MinCtasPerMultiprocessor_, int PrefetchNextTileStages_,
-          SingleWarpgroupPipelineMode PipelineMode_ = SingleWarpgroupPipelineMode::PrefillAll>
+template <
+    class ProblemShape_,
+    class CollectiveMainloop_,
+    class CollectiveEpilogue_,
+    int MinCtasPerMultiprocessor_,
+    int PrefetchNextTileStages_,
+    SingleWarpgroupPipelineMode PipelineMode_ = SingleWarpgroupPipelineMode::PrefillAll>
 class SingleWarpgroupPersistentGemm
-    : public SingleWarpgroupPersistentBase<ProblemShape_, CollectiveMainloop_,
-                                           CollectiveEpilogue_> {
+    : public SingleWarpgroupPersistentBase<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_> {
  private:
-  using Base =
-      SingleWarpgroupPersistentBase<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_>;
+  using Base = SingleWarpgroupPersistentBase<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_>;
 
  public:
   using ProblemShape = typename Base::ProblemShape;
@@ -76,18 +80,18 @@ class SingleWarpgroupPersistentGemm
   static constexpr SingleWarpgroupPipelineMode PipelineMode = PipelineMode_;
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
-  static_assert(MinCtasPerMultiprocessor_ > 0,
-                "Single-warpgroup persistent GEMM requires a positive CTA/SM target.");
+  static_assert(MinCtasPerMultiprocessor_ > 0, "Single-warpgroup persistent GEMM requires a positive CTA/SM target.");
 
-  static dim3 get_block_shape() { return dim3(MaxThreadsPerBlock, 1, 1); }
+  static dim3 get_block_shape() {
+    return dim3(MaxThreadsPerBlock, 1, 1);
+  }
 
   static bool can_implement(Arguments const& args) {
     bool implementable = Base::can_implement(args);
     if constexpr (PipelineMode == SingleWarpgroupPipelineMode::PrefillAll) {
       auto problem_shape = args.problem_shape;
       if (problem_shape.is_host_problem_shape_available()) {
-        constexpr int MaxPrefillK =
-            CollectiveMainloop::DispatchPolicy::Stages * cute::size<2>(TileShape{});
+        constexpr int MaxPrefillK = CollectiveMainloop::DispatchPolicy::Stages * cute::size<2>(TileShape{});
         for (int group = 0; group < problem_shape.groups(); ++group) {
           implementable &= cute::get<2>(problem_shape.get_host_problem_shape(group)) <= MaxPrefillK;
         }
@@ -106,20 +110,15 @@ class SingleWarpgroupPersistentGemm
         "ERROR : Arch conditional MMA instruction used without targeting sm90a compute capability. "
         "Aborting.\n");
 #else
-    static_assert(size(TiledMma{}) == NumThreadsPerWarpGroup,
-                  "Single-warpgroup persistent GEMM requires a 128-thread TiledMma.");
-    static_assert(size(ClusterShape{}) == 1,
-                  "The single-warpgroup kernel supports only a 1x1x1 cluster.");
-    static_assert(Base::IsGroupedGemmKernel,
-                  "The single-warpgroup kernel supports grouped GEMM only.");
     static_assert(
-        PrefetchNextTileStages > 0 &&
-            PrefetchNextTileStages <= CollectiveMainloop::DispatchPolicy::Stages,
+        size(TiledMma{}) == NumThreadsPerWarpGroup, "Single-warpgroup persistent GEMM requires a 128-thread TiledMma.");
+    static_assert(size(ClusterShape{}) == 1, "The single-warpgroup kernel supports only a 1x1x1 cluster.");
+    static_assert(Base::IsGroupedGemmKernel, "The single-warpgroup kernel supports grouped GEMM only.");
+    static_assert(
+        PrefetchNextTileStages > 0 && PrefetchNextTileStages <= CollectiveMainloop::DispatchPolicy::Stages,
         "Cross-tile prefetch depth must be positive and fit inside the mainloop stage ring.");
-    static_assert(rank(InternalStrideA{}) == 3 && rank(InternalStrideB{}) == 3,
-                  "Mainloop strides must be rank-3.");
-    static_assert(rank(InternalStrideC{}) == 3 && rank(InternalStrideD{}) == 3,
-                  "Epilogue strides must be rank-3.");
+    static_assert(rank(InternalStrideA{}) == 3 && rank(InternalStrideB{}) == 3, "Mainloop strides must be rank-3.");
+    static_assert(rank(InternalStrideC{}) == 3 && rank(InternalStrideD{}) == 3, "Epilogue strides must be rank-3.");
 
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
     int const thread_idx = int(threadIdx.x);
@@ -135,8 +134,7 @@ class SingleWarpgroupPersistentGemm
     mainloop_pipeline_params.num_consumers = NumThreadsPerWarpGroup;
     mainloop_pipeline_params.num_producers = CollectiveMainloop::NumProducerThreadEvents;
     mainloop_pipeline_params.transaction_bytes = params.mainloop.tma_transaction_bytes;
-    MainloopPipeline mainloop_pipeline(shared_storage.pipelines.mainloop, mainloop_pipeline_params,
-                                       ClusterShape{});
+    MainloopPipeline mainloop_pipeline(shared_storage.pipelines.mainloop, mainloop_pipeline_params, ClusterShape{});
 
     using EpiLoadPipeline = typename CollectiveEpilogue::LoadPipeline;
     typename EpiLoadPipeline::Params epi_load_pipeline_params;
@@ -156,10 +154,8 @@ class SingleWarpgroupPersistentGemm
 
     typename CollectiveMainloop::PipelineState mainloop_pipe_consumer_state;
     typename CollectiveEpilogue::LoadPipelineState epi_load_pipe_consumer_state;
-    PipelineState mainloop_pipe_producer_state =
-        cutlass::make_producer_start_state<MainloopPipeline>();
-    PipelineState epi_store_pipe_producer_state =
-        cutlass::make_producer_start_state<EpiStorePipeline>();
+    PipelineState mainloop_pipe_producer_state = cutlass::make_producer_start_state<MainloopPipeline>();
+    PipelineState epi_store_pipe_producer_state = cutlass::make_producer_start_state<EpiStorePipeline>();
 
     __syncthreads();
 
@@ -180,11 +176,9 @@ class SingleWarpgroupPersistentGemm
       return;
     }
 
-    auto problem_shape_MNKL =
-        append<4>(params.problem_shape.get_problem_shape(work_tile_info.L_idx), 1);
+    auto problem_shape_MNKL = append<4>(params.problem_shape.get_problem_shape(work_tile_info.L_idx), 1);
     auto load_inputs = collective_mainloop.load_init(problem_shape_MNKL, params.mainloop);
-    static_assert(tuple_size_v<decltype(load_inputs)> >= 2,
-                  "load_init must return at least A and B tensors.");
+    static_assert(tuple_size_v<decltype(load_inputs)> >= 2, "load_init must return at least A and B tensors.");
     Tensor gA_mkl = get<0>(load_inputs);
     Tensor gB_nkl = get<1>(load_inputs);
 
@@ -194,9 +188,8 @@ class SingleWarpgroupPersistentGemm
         params.mainloop, shared_storage.tensormaps.mainloop, logical_sm_count, logical_sm_idx);
 
     constexpr int EpilogueDescriptorSlot = 0;
-    auto epi_store_tensormap = get<0>(
-        collective_epilogue.store_init(params.epilogue, shared_storage.tensormaps.epilogue,
-                                       logical_sm_count, logical_sm_idx, EpilogueDescriptorSlot));
+    auto epi_store_tensormap = get<0>(collective_epilogue.store_init(
+        params.epilogue, shared_storage.tensormaps.epilogue, logical_sm_count, logical_sm_idx, EpilogueDescriptorSlot));
 
     int32_t current_group = -1;
     constexpr bool IsEpiLoad = false;
@@ -209,13 +202,17 @@ class SingleWarpgroupPersistentGemm
         problem_shape_MNKL = append<4>(params.problem_shape.get_problem_shape(next_group), 1);
       }
       if (did_group_change && warp_idx == 0) {
-        load_inputs = collective_mainloop.tensors_perform_update(load_inputs, params.mainloop,
-                                                                 problem_shape_MNKL, next_group);
+        load_inputs =
+            collective_mainloop.tensors_perform_update(load_inputs, params.mainloop, problem_shape_MNKL, next_group);
         collective_mainloop.tensormaps_fence_acquire(input_tensormaps);
 
         collective_epilogue.template tensormaps_perform_update<IsEpiLoad>(
-            shared_storage.tensormaps.epilogue, params.epilogue, epi_store_tensormap,
-            problem_shape_MNKL, next_group, EpilogueDescriptorSlot);
+            shared_storage.tensormaps.epilogue,
+            params.epilogue,
+            epi_store_tensormap,
+            problem_shape_MNKL,
+            next_group,
+            EpilogueDescriptorSlot);
         __syncwarp();
         collective_epilogue.template tensormaps_cp_fence_release<IsEpiLoad>(
             shared_storage.tensormaps.epilogue, epi_store_tensormap, EpilogueDescriptorSlot);
@@ -225,14 +222,11 @@ class SingleWarpgroupPersistentGemm
       auto m_coord = idx2crd(work_tile_info.M_idx, shape<2>(gA_mkl));
       auto n_coord = idx2crd(work_tile_info.N_idx, shape<2>(gB_nkl));
       auto producer_blk_coord = make_coord(m_coord, n_coord, _, Int<0>{});
-      auto epilogue_blk_coord =
-          make_coord(m_coord, n_coord, _, idx2crd(next_group, shape<4>(gB_nkl)));
+      auto epilogue_blk_coord = make_coord(m_coord, n_coord, _, idx2crd(next_group, shape<4>(gB_nkl)));
 
-      int const work_k_tile_count =
-          TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, blk_shape);
+      int const work_k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, blk_shape);
       auto work_k_tile_start = TileScheduler::get_work_k_tile_start(work_tile_info);
-      auto k_tile_iter =
-          make_coord_iterator(idx2crd(work_k_tile_start, shape<3>(gA_mkl)), shape<3>(gA_mkl));
+      auto k_tile_iter = make_coord_iterator(idx2crd(work_k_tile_start, shape<3>(gA_mkl)), shape<3>(gA_mkl));
 
       auto accumulators = partition_fragment_C(tiled_mma, take<0, 2>(blk_shape));
       auto next_work_tile_info = work_tile_info;
@@ -253,14 +247,21 @@ class SingleWarpgroupPersistentGemm
                                           : CollectiveMainloop::DispatchPolicy::Stages;
         current_k_tiles_to_refill = work_k_tile_count - current_prefill_stage_count;
       }
-      int const current_k_tiles_to_produce =
-          current_prefill_stage_count - current_prefetched_stages;
+      int const current_k_tiles_to_produce = current_prefill_stage_count - current_prefetched_stages;
       CUTLASS_ASSERT(current_k_tiles_to_produce >= 0);
       if (current_k_tiles_to_produce > 0 && warp_idx == 0) {
-        collective_mainloop.load(params.mainloop, mainloop_pipeline, mainloop_pipe_producer_state,
-                                 load_inputs, input_tensormaps, producer_blk_coord, k_tile_iter,
-                                 current_k_tiles_to_produce, lane_idx, block_rank_in_cluster,
-                                 shared_storage.tensors.mainloop);
+        collective_mainloop.load(
+            params.mainloop,
+            mainloop_pipeline,
+            mainloop_pipe_producer_state,
+            load_inputs,
+            input_tensormaps,
+            producer_blk_coord,
+            k_tile_iter,
+            current_k_tiles_to_produce,
+            lane_idx,
+            block_rank_in_cluster,
+            shared_storage.tensors.mainloop);
         mainloop_pipe_producer_state.advance(current_k_tiles_to_produce);
       }
       auto current_refill_k_tile_iter = k_tile_iter;
@@ -282,15 +283,14 @@ class SingleWarpgroupPersistentGemm
         next_group_change = next_work_tile_info.L_idx != current_group;
         next_group_mainloop_state_ready = !next_group_change;
         if (next_group_change) {
-          next_problem_shape_MNKL =
-              append<4>(params.problem_shape.get_problem_shape(next_work_tile_info.L_idx), 1);
+          next_problem_shape_MNKL = append<4>(params.problem_shape.get_problem_shape(next_work_tile_info.L_idx), 1);
         }
         auto next_m_coord = idx2crd(next_work_tile_info.M_idx, shape<2>(gA_mkl));
         auto next_n_coord = idx2crd(next_work_tile_info.N_idx, shape<2>(gB_nkl));
         next_producer_blk_coord = make_coord(next_m_coord, next_n_coord, _, Int<0>{});
         if (next_group_change) {
-          next_work_k_tile_count = TileScheduler::get_work_k_tile_count(
-              next_work_tile_info, next_problem_shape_MNKL, blk_shape);
+          next_work_k_tile_count =
+              TileScheduler::get_work_k_tile_count(next_work_tile_info, next_problem_shape_MNKL, blk_shape);
           next_work_k_tile_start = TileScheduler::get_work_k_tile_start(next_work_tile_info);
         } else {
           next_work_k_tile_count = work_k_tile_count;
@@ -300,16 +300,14 @@ class SingleWarpgroupPersistentGemm
         if constexpr (PipelineMode == SingleWarpgroupPipelineMode::PrefillAll) {
           if (next_group_change && warp_idx == 0) {
             next_load_inputs = collective_mainloop.tensors_perform_update(
-                next_load_inputs, params.mainloop, next_problem_shape_MNKL,
-                next_work_tile_info.L_idx);
+                next_load_inputs, params.mainloop, next_problem_shape_MNKL, next_work_tile_info.L_idx);
             collective_mainloop.tensormaps_fence_acquire(input_tensormaps);
           }
           next_group_mainloop_state_ready = true;
         }
       }
 
-      auto next_k_tile_iter =
-          make_coord_iterator(idx2crd(next_work_k_tile_start, shape<3>(gA_mkl)), shape<3>(gA_mkl));
+      auto next_k_tile_iter = make_coord_iterator(idx2crd(next_work_k_tile_start, shape<3>(gA_mkl)), shape<3>(gA_mkl));
 
       int const available_prefetch_stages =
           next_work_k_tile_count < work_k_tile_count ? next_work_k_tile_count : work_k_tile_count;
@@ -323,10 +321,18 @@ class SingleWarpgroupPersistentGemm
         if constexpr (PipelineMode == SingleWarpgroupPipelineMode::RollingRefill) {
           if (current_k_tiles_to_refill > 0) {
             if (warp_idx == 0) {
-              collective_mainloop.load(params.mainloop, mainloop_pipeline,
-                                       mainloop_pipe_producer_state, load_inputs, input_tensormaps,
-                                       producer_blk_coord, current_refill_k_tile_iter, 1, lane_idx,
-                                       block_rank_in_cluster, shared_storage.tensors.mainloop);
+              collective_mainloop.load(
+                  params.mainloop,
+                  mainloop_pipeline,
+                  mainloop_pipe_producer_state,
+                  load_inputs,
+                  input_tensormaps,
+                  producer_blk_coord,
+                  current_refill_k_tile_iter,
+                  1,
+                  lane_idx,
+                  block_rank_in_cluster,
+                  shared_storage.tensors.mainloop);
               ++current_refill_k_tile_iter;
               ++mainloop_pipe_producer_state;
             }
@@ -340,8 +346,7 @@ class SingleWarpgroupPersistentGemm
             if (!next_group_mainloop_state_ready) {
               if (warp_idx == 0) {
                 next_load_inputs = collective_mainloop.tensors_perform_update(
-                    next_load_inputs, params.mainloop, next_problem_shape_MNKL,
-                    next_work_tile_info.L_idx);
+                    next_load_inputs, params.mainloop, next_problem_shape_MNKL, next_work_tile_info.L_idx);
                 collective_mainloop.tensormaps_fence_acquire(input_tensormaps);
               }
               next_group_mainloop_state_ready = true;
@@ -349,9 +354,17 @@ class SingleWarpgroupPersistentGemm
           }
           if (warp_idx == 0) {
             collective_mainloop.load(
-                params.mainloop, mainloop_pipeline, mainloop_pipe_producer_state, next_load_inputs,
-                input_tensormaps, next_producer_blk_coord, next_k_tile_iter, 1, lane_idx,
-                block_rank_in_cluster, shared_storage.tensors.mainloop);
+                params.mainloop,
+                mainloop_pipeline,
+                mainloop_pipe_producer_state,
+                next_load_inputs,
+                input_tensormaps,
+                next_producer_blk_coord,
+                next_k_tile_iter,
+                1,
+                lane_idx,
+                block_rank_in_cluster,
+                shared_storage.tensors.mainloop);
             ++next_k_tile_iter;
             ++mainloop_pipe_producer_state;
           }
@@ -360,10 +373,15 @@ class SingleWarpgroupPersistentGemm
       };
 
       collective_mainloop.mma_with_released_stage_producer(
-          mainloop_pipeline, mainloop_pipe_consumer_state, accumulators, work_k_tile_count,
-          mma_thread_idx, shared_storage.tensors.mainloop, params.mainloop, produce_released_stage);
-      collective_mainloop.mma_tail(mainloop_pipeline, mainloop_pipe_consumer_state,
-                                   work_k_tile_count);
+          mainloop_pipeline,
+          mainloop_pipe_consumer_state,
+          accumulators,
+          work_k_tile_count,
+          mma_thread_idx,
+          shared_storage.tensors.mainloop,
+          params.mainloop,
+          produce_released_stage);
+      collective_mainloop.mma_tail(mainloop_pipeline, mainloop_pipe_consumer_state, work_k_tile_count);
       CUTLASS_ASSERT(current_k_tiles_to_refill == 0);
       produce_released_stage();
 
@@ -371,8 +389,7 @@ class SingleWarpgroupPersistentGemm
         if (next_work_tile_info.is_valid() && !next_group_mainloop_state_ready) {
           if (warp_idx == 0) {
             next_load_inputs = collective_mainloop.tensors_perform_update(
-                next_load_inputs, params.mainloop, next_problem_shape_MNKL,
-                next_work_tile_info.L_idx);
+                next_load_inputs, params.mainloop, next_problem_shape_MNKL, next_work_tile_info.L_idx);
             collective_mainloop.tensormaps_fence_acquire(input_tensormaps);
           }
           next_group_mainloop_state_ready = true;
@@ -387,18 +404,25 @@ class SingleWarpgroupPersistentGemm
         collective_epilogue.template tensormaps_fence_acquire<IsEpiLoad>(epi_store_tensormap);
       }
 
-      auto [epi_load_pipe_consumer_state_next, epi_store_pipe_producer_state_next] =
-          collective_epilogue.store(epi_load_pipeline, epi_load_pipe_consumer_state,
-                                    epi_store_pipeline, epi_store_pipe_producer_state,
-                                    problem_shape_MNKL, blk_shape, epilogue_blk_coord, accumulators,
-                                    tiled_mma, mma_thread_idx, shared_storage.tensors.epilogue,
-                                    epi_store_tensormap, work_tile_info.reduction_subtile_idx());
+      auto [epi_load_pipe_consumer_state_next, epi_store_pipe_producer_state_next] = collective_epilogue.store(
+          epi_load_pipeline,
+          epi_load_pipe_consumer_state,
+          epi_store_pipeline,
+          epi_store_pipe_producer_state,
+          problem_shape_MNKL,
+          blk_shape,
+          epilogue_blk_coord,
+          accumulators,
+          tiled_mma,
+          mma_thread_idx,
+          shared_storage.tensors.epilogue,
+          epi_store_tensormap,
+          work_tile_info.reduction_subtile_idx());
       epi_load_pipe_consumer_state = epi_load_pipe_consumer_state_next;
       epi_store_pipe_producer_state = epi_store_pipe_producer_state_next;
 
-      auto store_tail_states =
-          collective_epilogue.store_tail(epi_load_pipeline, epi_load_pipe_consumer_state,
-                                         epi_store_pipeline, epi_store_pipe_producer_state);
+      auto store_tail_states = collective_epilogue.store_tail(
+          epi_load_pipeline, epi_load_pipe_consumer_state, epi_store_pipeline, epi_store_pipe_producer_state);
       epi_load_pipe_consumer_state = get<0>(store_tail_states);
       epi_store_pipe_producer_state = get<1>(store_tail_states);
 

@@ -9,12 +9,7 @@
 #include "cutlass/bfloat16.h"
 #include "cutlass/float8.h"
 
-template <
-    typename ElementA,
-    typename ElementB,
-    typename ElementC,
-    typename ElementAccumulator,
-    typename ElementBScale>
+template <typename ElementA, typename ElementB, typename ElementC, typename ElementAccumulator, typename ElementBScale>
 __global__ void int4_fp8_get_group_gemm_starts(
     int32_t* expert_offsets,
     ElementA** a_offsets,
@@ -61,8 +56,7 @@ __global__ void int4_fp8_get_group_gemm_starts(
   b_offsets[group_id] = b_base_as_int + expert_id * k * n / 2;
   out_offsets[group_id] = out_base_as_int + expert_offset * n;
   a_scales_offsets[group_id] = a_scales_base_as_int + (per_act_token ? expert_offset : 0);
-  b_scales_offsets[group_id] =
-      b_scales_base_as_int + (per_out_ch ? expert_id * n * k / weight_scale_group : expert_id);
+  b_scales_offsets[group_id] = b_scales_base_as_int + (per_out_ch ? expert_id * n * k / weight_scale_group : expert_id);
   if (as_offsets != nullptr && as_base_as_int != nullptr) {
     // as_strides is laid out as [E,2]. Column 0 is the per-expert padded token
     // stride consumed by the TMA descriptor. Column 1 is the exclusive
@@ -76,12 +70,7 @@ __global__ void int4_fp8_get_group_gemm_starts(
   }
 }
 
-template <
-    typename ElementA,
-    typename ElementB,
-    typename ElementC,
-    typename ElementAccumulator,
-    typename ElementBScale>
+template <typename ElementA, typename ElementB, typename ElementC, typename ElementAccumulator, typename ElementBScale>
 __global__ void int4_fp8_get_group_gemm_starts_3d(
     ElementA** a_offsets,
     ElementB** b_offsets,
@@ -117,53 +106,51 @@ __global__ void int4_fp8_get_group_gemm_starts_3d(
 
 #define __CALL_W4A8_GET_STARTS_KERNEL(TENSOR_C_TYPE, C_TYPE)                                             \
   else if (out_tensors.dtype() == TENSOR_C_TYPE) {                                                       \
-    int4_fp8_get_group_gemm_starts<                                                                     \
-        cutlass::float_e4m3_t, cutlass::int8_t, C_TYPE, float, ElementBScale>                           \
+    int4_fp8_get_group_gemm_starts<cutlass::float_e4m3_t, cutlass::int8_t, C_TYPE, float, ElementBScale> \
         <<<1, num_experts, 0, stream>>>(                                                                 \
-            static_cast<int32_t*>(expert_offsets.data_ptr()),                             \
-            static_cast<cutlass::float_e4m3_t**>(a_ptrs.data_ptr()),                      \
-            static_cast<cutlass::int8_t**>(b_ptrs.data_ptr()),                            \
-            static_cast<C_TYPE**>(out_ptrs.data_ptr()),                                   \
-            static_cast<float**>(a_scales_ptrs.data_ptr()),                               \
+            static_cast<int32_t*>(expert_offsets.data_ptr()),                                            \
+            static_cast<cutlass::float_e4m3_t**>(a_ptrs.data_ptr()),                                     \
+            static_cast<cutlass::int8_t**>(b_ptrs.data_ptr()),                                           \
+            static_cast<C_TYPE**>(out_ptrs.data_ptr()),                                                  \
+            static_cast<float**>(a_scales_ptrs.data_ptr()),                                              \
             static_cast<ElementBScale**>(b_scales_ptrs.data_ptr()),                                      \
-            static_cast<cutlass::float_e4m3_t*>(a_tensors.data_ptr()),                    \
-            static_cast<cutlass::int8_t*>(b_tensors.data_ptr()),                          \
-            static_cast<C_TYPE*>(out_tensors.data_ptr()),                                 \
-            static_cast<float*>(a_scales.data_ptr()),                                     \
+            static_cast<cutlass::float_e4m3_t*>(a_tensors.data_ptr()),                                   \
+            static_cast<cutlass::int8_t*>(b_tensors.data_ptr()),                                         \
+            static_cast<C_TYPE*>(out_tensors.data_ptr()),                                                \
+            static_cast<float*>(a_scales.data_ptr()),                                                    \
             static_cast<ElementBScale*>(b_scales.data_ptr()),                                            \
-            out_tensors.size(1),                                                          \
-            a_tensors.size(1),                                                            \
-            per_act_token,                                                                \
-            per_out_ch,                                                                   \
-            as_ptrs_raw,                                                                  \
-            as_base_raw,                                                                  \
-            act_scale_group,                                                              \
-            weight_scale_group,                                                           \
-            as_strides_raw,                                                               \
-            expert_ids_raw);                                                              \
+            out_tensors.size(1),                                                                         \
+            a_tensors.size(1),                                                                           \
+            per_act_token,                                                                               \
+            per_out_ch,                                                                                  \
+            as_ptrs_raw,                                                                                 \
+            as_base_raw,                                                                                 \
+            act_scale_group,                                                                             \
+            weight_scale_group,                                                                          \
+            as_strides_raw,                                                                              \
+            expert_ids_raw);                                                                             \
   }
 
-#define __CALL_W4A8_GET_STARTS_KERNEL_3D(TENSOR_C_TYPE, C_TYPE)                                       \
-  else if (out_tensors.dtype() == TENSOR_C_TYPE) {                                                     \
-    int4_fp8_get_group_gemm_starts_3d<                                                               \
-        cutlass::float_e4m3_t, cutlass::int8_t, C_TYPE, float, ElementBScale>                         \
-        <<<1, num_experts, 0, stream>>>(                                                               \
-            static_cast<cutlass::float_e4m3_t**>(a_ptrs.data_ptr()),                         \
-            static_cast<cutlass::int8_t**>(b_ptrs.data_ptr()),                               \
-            static_cast<C_TYPE**>(out_ptrs.data_ptr()),                                      \
-            static_cast<float**>(a_scales_ptrs.data_ptr()),                                  \
-            static_cast<ElementBScale**>(b_scales_ptrs.data_ptr()),                                    \
-            static_cast<cutlass::float_e4m3_t*>(a_tensors.data_ptr()),                       \
-            static_cast<cutlass::int8_t*>(b_tensors.data_ptr()),                             \
-            static_cast<C_TYPE*>(out_tensors.data_ptr()),                                    \
-            static_cast<float*>(a_scales.data_ptr()),                                        \
-            static_cast<ElementBScale*>(b_scales.data_ptr()),                                          \
-            out_tensors.size(2),                                                             \
-            a_tensors.size(1),                                                               \
-            a_tensors.size(2),                                                               \
-            per_act_token,                                                                   \
-            per_out_ch,                                                                      \
-            num_experts);                                                                    \
+#define __CALL_W4A8_GET_STARTS_KERNEL_3D(TENSOR_C_TYPE, C_TYPE)                                             \
+  else if (out_tensors.dtype() == TENSOR_C_TYPE) {                                                          \
+    int4_fp8_get_group_gemm_starts_3d<cutlass::float_e4m3_t, cutlass::int8_t, C_TYPE, float, ElementBScale> \
+        <<<1, num_experts, 0, stream>>>(                                                                    \
+            static_cast<cutlass::float_e4m3_t**>(a_ptrs.data_ptr()),                                        \
+            static_cast<cutlass::int8_t**>(b_ptrs.data_ptr()),                                              \
+            static_cast<C_TYPE**>(out_ptrs.data_ptr()),                                                     \
+            static_cast<float**>(a_scales_ptrs.data_ptr()),                                                 \
+            static_cast<ElementBScale**>(b_scales_ptrs.data_ptr()),                                         \
+            static_cast<cutlass::float_e4m3_t*>(a_tensors.data_ptr()),                                      \
+            static_cast<cutlass::int8_t*>(b_tensors.data_ptr()),                                            \
+            static_cast<C_TYPE*>(out_tensors.data_ptr()),                                                   \
+            static_cast<float*>(a_scales.data_ptr()),                                                       \
+            static_cast<ElementBScale*>(b_scales.data_ptr()),                                               \
+            out_tensors.size(2),                                                                            \
+            a_tensors.size(1),                                                                              \
+            a_tensors.size(2),                                                                              \
+            per_act_token,                                                                                  \
+            per_out_ch,                                                                                     \
+            num_experts);                                                                                   \
   }
 
 namespace {

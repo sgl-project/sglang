@@ -32,8 +32,12 @@
 
 namespace cutlass::gemm::kernel {
 
-template <class ProblemShape_, class CollectiveMainloop_, class CollectiveEpilogue_,
-          class TileScheduler_ = void, class Enable = void>
+template <
+    class ProblemShape_,
+    class CollectiveMainloop_,
+    class CollectiveEpilogue_,
+    class TileScheduler_ = void,
+    class Enable = void>
 class GemmUniversalPrecomputedScheduler;
 
 }  // namespace cutlass::gemm::kernel

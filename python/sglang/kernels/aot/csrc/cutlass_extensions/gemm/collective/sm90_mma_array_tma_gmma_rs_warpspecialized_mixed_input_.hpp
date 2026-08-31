@@ -1027,8 +1027,8 @@ struct CollectiveMmaArrayMixedInput<
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Consumer Perspective
   template <class FrgTensorC>
-  CUTLASS_DEVICE void mma(
-      MainloopPipeline pipeline,
+  CUTLASS_DEVICE void
+  mma(MainloopPipeline pipeline,
       PipelineState smem_pipe_read,
       FrgTensorC& accum,
       int k_tile_count,

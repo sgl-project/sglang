@@ -62,10 +62,8 @@ template <
     class TileShapeMNK,
     int Alignment = 128,
     int CarveoutBytes>
-constexpr int compute_stage_count_or_override_folded_weight_scale(
-    StageCountAutoCarveout<CarveoutBytes>) {
-  constexpr auto mainloop_pipeline_bytes =
-      sizeof(typename cutlass::PipelineTmaAsync<1>::SharedStorage);
+constexpr int compute_stage_count_or_override_folded_weight_scale(StageCountAutoCarveout<CarveoutBytes>) {
+  constexpr auto mainloop_pipeline_bytes = sizeof(typename cutlass::PipelineTmaAsync<1>::SharedStorage);
   constexpr auto a_bits = cute::sizeof_bits_v<ElementA>;
   constexpr auto b_bits = cute::sizeof_bits_v<ElementB>;
   constexpr auto s_bits = cute::sizeof_bits_v<ElementScale>;
@@ -76,20 +74,16 @@ constexpr int compute_stage_count_or_override_folded_weight_scale(
       (size<2>(TileShapeMNK{}) % scale_group_size) == 0,
       "Folded weight-scale storage requires TileK to cover complete scale groups.");
 
-  constexpr auto scale_bytes = cutlass::bits_to_bytes(
-      s_bits * size<0>(TileShapeMNK{}) * size<2>(TileShapeMNK{}) / scale_group_size);
+  constexpr auto scale_bytes =
+      cutlass::bits_to_bytes(s_bits * size<0>(TileShapeMNK{}) * size<2>(TileShapeMNK{}) / scale_group_size);
   constexpr auto zero_bytes = cutlass::bits_to_bytes(z_bits * size<0>(TileShapeMNK{}));
-  static_assert(
-      scale_bytes % 16 == 0,
-      "Folded weight-scale bulk copy must be at least 16B aligned.");
+  static_assert(scale_bytes % 16 == 0, "Folded weight-scale bulk copy must be at least 16B aligned.");
   static_assert(zero_bytes % 128 == 0, "Zero bytes must be a multiple of 128");
 
-  constexpr int stage_bytes_ =
-      cutlass::bits_to_bytes(a_bits * size<0>(TileShapeMNK{}) * size<2>(TileShapeMNK{})) +
-      cutlass::bits_to_bytes(b_bits * size<1>(TileShapeMNK{}) * size<2>(TileShapeMNK{})) +
-      scale_bytes + zero_bytes;
-  constexpr int stage_bytes =
-      cutlass::round_up(stage_bytes_, Alignment) + static_cast<int>(mainloop_pipeline_bytes);
+  constexpr int stage_bytes_ = cutlass::bits_to_bytes(a_bits * size<0>(TileShapeMNK{}) * size<2>(TileShapeMNK{})) +
+                               cutlass::bits_to_bytes(b_bits * size<1>(TileShapeMNK{}) * size<2>(TileShapeMNK{})) +
+                               scale_bytes + zero_bytes;
+  constexpr int stage_bytes = cutlass::round_up(stage_bytes_, Alignment) + static_cast<int>(mainloop_pipeline_bytes);
   constexpr int carveout_bytes = cutlass::round_up(CarveoutBytes, Alignment);
   constexpr int capacity_bytes = CapacityBytes / Alignment * Alignment;
   constexpr int computed_stage_count = (capacity_bytes - carveout_bytes) / stage_bytes;
@@ -318,17 +312,15 @@ struct CollectiveBuilderMixedInput<
   }();
 
   static_assert(
-      !UseFusedE8M0PreMmaScale || (IsArrayOfPointersGemm && IsATransformed &&
-                                   cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
-                                   cute::is_same_v<ElementB, cutlass::float_e4m3_t>),
+      !UseFusedE8M0PreMmaScale ||
+          (IsArrayOfPointersGemm && IsATransformed && cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
+           cute::is_same_v<ElementB, cutlass::float_e4m3_t>),
       "Pre-MMA E8M0 scale mode is only implemented for grouped MXFP4 weight x FP8 activation.");
 
   using ArrayMixedInputDispatchPolicy = cute::conditional_t<
       UseFusedE8M0PreMmaScale,
-      MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInputPreScale<
-          PipelineStages, ClusterShape_MNK, KernelScheduleType>,
-      MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput<
-          PipelineStages, ClusterShape_MNK, KernelScheduleType>>;
+      MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInputPreScale<PipelineStages, ClusterShape_MNK, KernelScheduleType>,
+      MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput<PipelineStages, ClusterShape_MNK, KernelScheduleType>>;
 
   using DispatchPolicy = cute::conditional_t<
       IsMixedInput,

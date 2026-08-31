@@ -29,7 +29,6 @@ _is_cuda_alike = is_cuda_alike()
 
 if _is_cuda_alike:
     from sgl_kernel import (
-        cutlass_mxfp4a8_moe_mm,
         get_cutlass_w4a8_moe_mm_data,
         prepare_moe_input,
         sgl_per_token_quant_fp8,
@@ -44,6 +43,7 @@ if _is_cuda_alike:
         from sgl_kernel import get_cutlass_w4a8_moe_mm_data_with_permutation
     except ImportError:
         get_cutlass_w4a8_moe_mm_data_with_permutation = None
+
 
 @triton.jit
 def _apply_shuffle_mul_sum_fp32_factors_kernel(
@@ -100,7 +100,9 @@ class CutlassMxfp4A8FusedMoeRunner:
     """Stateful MXFP4A8 MoE runner with reusable per-layer workspaces."""
 
     def __init__(self):
-        self._workspace: Dict[Tuple[str, Tuple[int, ...], torch.dtype, int], torch.Tensor] = {}
+        self._workspace: Dict[
+            Tuple[str, Tuple[int, ...], torch.dtype, int], torch.Tensor
+        ] = {}
 
     def _empty(
         self,
@@ -131,10 +133,16 @@ class CutlassMxfp4A8FusedMoeRunner:
             "compact_expert_offsets", (max_groups,), torch.int32, expert_offsets.device
         )
         compact_problem_sizes1 = self._empty(
-            "compact_problem_sizes1", (max_groups, 3), torch.int32, expert_offsets.device
+            "compact_problem_sizes1",
+            (max_groups, 3),
+            torch.int32,
+            expert_offsets.device,
         )
         compact_problem_sizes2 = self._empty(
-            "compact_problem_sizes2", (max_groups, 3), torch.int32, expert_offsets.device
+            "compact_problem_sizes2",
+            (max_groups, 3),
+            torch.int32,
+            expert_offsets.device,
         )
         compact_expert_ids = self._empty(
             "compact_expert_ids", (max_groups,), torch.int32, expert_offsets.device
@@ -211,9 +219,7 @@ class CutlassMxfp4A8FusedMoeRunner:
             return
         m, row_stride = output.shape
         block = 256
-        _apply_shuffle_mul_sum_fp32_factors_kernel[
-            (m, triton.cdiv(row_stride, block))
-        ](
+        _apply_shuffle_mul_sum_fp32_factors_kernel[(m, triton.cdiv(row_stride, block))](
             c2,
             output,
             c_map,
@@ -274,7 +280,9 @@ class CutlassMxfp4A8FusedMoeRunner:
         device = a.device
 
         if apply_router_weight_on_input:
-            assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
+            assert (
+                topk == 1
+            ), "apply_router_weight_on_input is only implemented for topk=1"
 
         # The AOT prepare/apply path does not materialize valid c_map entries for
         # the EP sentinel (-1 -> num_local_experts). Keep the legacy Triton path

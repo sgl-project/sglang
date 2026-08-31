@@ -209,8 +209,7 @@ __global__ void compute_tiny_moe_data_w4a8(
   }
   __syncthreads();
 
-  int32_t const count =
-      threadIdx.x < num_experts ? write_offsets[threadIdx.x] : 0;
+  int32_t const count = threadIdx.x < num_experts ? write_offsets[threadIdx.x] : 0;
   int32_t offset = 0;
   BlockScan(scan_storage).ExclusiveSum(count, offset);
 
@@ -256,19 +255,18 @@ void get_cutlass_w4a8_moe_mm_data_with_permutation(
   constexpr int TINY_MAX_EXPERTS = 256;
   constexpr int TINY_MAX_ROUTES = 384;
   if (num_experts <= TINY_MAX_EXPERTS && topk_ids.numel() <= TINY_MAX_ROUTES) {
-    compute_tiny_moe_data_w4a8<TINY_BLOCK_SIZE, TINY_MAX_EXPERTS>
-        <<<1, TINY_BLOCK_SIZE, 0, stream>>>(
-            static_cast<const int32_t*>(topk_ids.data_ptr()),
-            static_cast<int32_t*>(expert_offsets.data_ptr()),
-            static_cast<int32_t*>(problem_sizes1.data_ptr()),
-            static_cast<int32_t*>(problem_sizes2.data_ptr()),
-            static_cast<int32_t*>(input_permutation.data_ptr()),
-            static_cast<int32_t*>(output_permutation.data_ptr()),
-            topk_ids.numel(),
-            topk_ids.size(1),
-            num_experts,
-            n,
-            k);
+    compute_tiny_moe_data_w4a8<TINY_BLOCK_SIZE, TINY_MAX_EXPERTS><<<1, TINY_BLOCK_SIZE, 0, stream>>>(
+        static_cast<const int32_t*>(topk_ids.data_ptr()),
+        static_cast<int32_t*>(expert_offsets.data_ptr()),
+        static_cast<int32_t*>(problem_sizes1.data_ptr()),
+        static_cast<int32_t*>(problem_sizes2.data_ptr()),
+        static_cast<int32_t*>(input_permutation.data_ptr()),
+        static_cast<int32_t*>(output_permutation.data_ptr()),
+        topk_ids.numel(),
+        topk_ids.size(1),
+        num_experts,
+        n,
+        k);
     return;
   }
 

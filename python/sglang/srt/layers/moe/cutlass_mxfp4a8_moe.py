@@ -18,9 +18,9 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_cuda_alike
-from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
 _is_cuda = is_cuda()
 _is_cuda_alike = is_cuda_alike()
@@ -30,7 +30,6 @@ if _is_cuda_alike:
         cutlass_mxfp4a8_moe_mm,
         get_cutlass_w4a8_moe_mm_data,
     )
-
 
 from sglang.kernels.ops.moe.ep_moe_kernels import (
     cutlass_w4_run_moe_ep_preproess,
@@ -174,7 +173,9 @@ def cutlass_mxfp4a8_moe(
     active_expert_ids = None
     if not get_is_capture_mode():
         expert_counts = expert_offsets[1:] - expert_offsets[:-1]
-        active_expert_ids = torch.nonzero(expert_counts > 0, as_tuple=False).flatten().to(torch.int32)
+        active_expert_ids = (
+            torch.nonzero(expert_counts > 0, as_tuple=False).flatten().to(torch.int32)
+        )
         if active_expert_ids.numel() == num_local_experts:
             active_expert_ids = None
 

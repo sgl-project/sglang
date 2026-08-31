@@ -92,12 +92,10 @@ template <
     int ClusterM = 1,
     int ClusterN = 1,
     bool ChunkMajorWorkMap = true,
-    sgl_kernel::swg_detail::ExpertRowPolicy RowPolicy =
-        sgl_kernel::swg_detail::ExpertRowPolicy::All>
+    sgl_kernel::swg_detail::ExpertRowPolicy RowPolicy = sgl_kernel::swg_detail::ExpertRowPolicy::All>
 struct SM90_PRECOMPUTED_MXFP4 {
   using TileShape = cute::Shape<cute::Int<M>, cute::Int<N>, cute::Int<K>>;
-  using ClusterShape =
-      cute::Shape<cute::Int<ClusterM>, cute::Int<ClusterN>, cute::Int<1>>;
+  using ClusterShape = cute::Shape<cute::Int<ClusterM>, cute::Int<ClusterN>, cute::Int<1>>;
   using Cutlass3xW4A8Gemm = cutlass_3x_w4a8_group_gemm<
       TileShape,
       ClusterShape,

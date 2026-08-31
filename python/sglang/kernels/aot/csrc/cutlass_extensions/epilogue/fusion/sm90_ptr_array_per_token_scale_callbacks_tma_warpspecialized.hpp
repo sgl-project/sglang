@@ -43,40 +43,67 @@ namespace cutlass::epilogue::fusion {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <class ElementOutput_, class ElementCompute_, class ElementScalar_ = ElementCompute_,
-          int AlignmentScalar_ = 128 / cute::sizeof_bits_v<ElementScalar_>,
-          FloatRoundStyle RoundStyle_ = FloatRoundStyle::round_to_nearest>
-struct PtrArrayPerTokenScaledAcc
-    : ScaledAcc<ElementOutput_, ElementCompute_, ElementScalar_, RoundStyle_> {
+template <
+    class ElementOutput_,
+    class ElementCompute_,
+    class ElementScalar_ = ElementCompute_,
+    int AlignmentScalar_ = 128 / cute::sizeof_bits_v<ElementScalar_>,
+    FloatRoundStyle RoundStyle_ = FloatRoundStyle::round_to_nearest>
+struct PtrArrayPerTokenScaledAcc : ScaledAcc<ElementOutput_, ElementCompute_, ElementScalar_, RoundStyle_> {
   static constexpr int AlignmentScalar = AlignmentScalar_;
 };
 
-template <class CtaTileShapeMNK, class ElementOutput, class ElementCompute,
-          class ElementScalar = ElementCompute,
-          int AlignmentScalar = 128 / sizeof_bits_v<ElementScalar>,
-          FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest>
-using Sm90PtrArrayPerTokenScaledAcc =
-    Sm90EVT<Sm90Compute<multiplies, ElementOutput, ElementCompute, RoundStyle>,
-            Sm90RowBroadcast<0, CtaTileShapeMNK, ElementScalar*, ElementCompute, Stride<_0, _1, _0>,
-                             AlignmentScalar>,
-            Sm90AccFetch>;
+template <
+    class CtaTileShapeMNK,
+    class ElementOutput,
+    class ElementCompute,
+    class ElementScalar = ElementCompute,
+    int AlignmentScalar = 128 / sizeof_bits_v<ElementScalar>,
+    FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest>
+using Sm90PtrArrayPerTokenScaledAcc = Sm90EVT<
+    Sm90Compute<multiplies, ElementOutput, ElementCompute, RoundStyle>,
+    Sm90RowBroadcast<0, CtaTileShapeMNK, ElementScalar*, ElementCompute, Stride<_0, _1, _0>, AlignmentScalar>,
+    Sm90AccFetch>;
 
-template <int StagesC, int StagesD, int FragmentSize, bool ReuseSmemC, bool DelayTmaStore,
-          int NumEpilogueWarpGroups, class ElementOutput, class ElementCompute, class ElementScalar,
-          int AlignmentScalar, FloatRoundStyle RoundStyle, class CtaTileShapeMNK,
-          class EpilogueTile>
+template <
+    int StagesC,
+    int StagesD,
+    int FragmentSize,
+    bool ReuseSmemC,
+    bool DelayTmaStore,
+    int NumEpilogueWarpGroups,
+    class ElementOutput,
+    class ElementCompute,
+    class ElementScalar,
+    int AlignmentScalar,
+    FloatRoundStyle RoundStyle,
+    class CtaTileShapeMNK,
+    class EpilogueTile>
 struct FusionCallbacks<
-    epilogue::Sm90PtrArrayTmaWarpSpecialized<StagesC, StagesD, FragmentSize, ReuseSmemC,
-                                             DelayTmaStore, NumEpilogueWarpGroups>,
-    fusion::PtrArrayPerTokenScaledAcc<ElementOutput, ElementCompute, ElementScalar, AlignmentScalar,
-                                      RoundStyle>,
-    CtaTileShapeMNK, EpilogueTile>
+    epilogue::Sm90PtrArrayTmaWarpSpecialized<
+        StagesC,
+        StagesD,
+        FragmentSize,
+        ReuseSmemC,
+        DelayTmaStore,
+        NumEpilogueWarpGroups>,
+    fusion::PtrArrayPerTokenScaledAcc<ElementOutput, ElementCompute, ElementScalar, AlignmentScalar, RoundStyle>,
+    CtaTileShapeMNK,
+    EpilogueTile>
     : Sm90PtrArrayPerTokenScaledAcc<
-          CtaTileShapeMNK, typename cutlass::detail::get_unpacked_element_type<ElementOutput>::type,
-          ElementCompute, ElementScalar, AlignmentScalar, RoundStyle> {
+          CtaTileShapeMNK,
+          typename cutlass::detail::get_unpacked_element_type<ElementOutput>::type,
+          ElementCompute,
+          ElementScalar,
+          AlignmentScalar,
+          RoundStyle> {
   using Impl = Sm90PtrArrayPerTokenScaledAcc<
-      CtaTileShapeMNK, typename cutlass::detail::get_unpacked_element_type<ElementOutput>::type,
-      ElementCompute, ElementScalar, AlignmentScalar, RoundStyle>;
+      CtaTileShapeMNK,
+      typename cutlass::detail::get_unpacked_element_type<ElementOutput>::type,
+      ElementCompute,
+      ElementScalar,
+      AlignmentScalar,
+      RoundStyle>;
 
   struct Arguments {
     ElementScalar token_scale_default = ElementScalar(1);
