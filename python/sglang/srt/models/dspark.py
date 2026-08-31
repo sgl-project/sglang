@@ -25,6 +25,7 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
+from sglang.srt.utils import use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,15 @@ def gather_and_crop_vocab(
 
 def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
     """Project draft hidden states through the target head; a quantized head
-    stores `weight` packed, so it needs its own kernel instead of a matmul."""
+    stores `weight` packed, so it needs its own kernel instead of a matmul.
+    CPU AMX prepacking packs the weight the same way."""
+    if use_intel_amx_backend(lm_head):
+        return torch.ops.sgl_kernel.weight_packed_linear(
+            hidden.to(lm_head.weight.dtype),
+            lm_head.weight,
+            None,  # bias
+            True,  # is_vnni
+        )
     quant_method = lm_head.quant_method
     if should_apply_lm_head_quant_method(lm_head, quant_method):
         return quant_method.apply(lm_head, hidden, None)
