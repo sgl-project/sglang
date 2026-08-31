@@ -382,6 +382,15 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             (target_backend, decode_backend, fallback_backend),
         )
 
+    def test_non_last_pp_uses_target_runner_and_backend(self):
+        target_runner = SimpleNamespace(attn_backend=object())
+        worker = object.__new__(EAGLEWorkerV2)
+        worker._target_worker = SimpleNamespace(model_runner=target_runner)
+        worker._draft_worker = None
+
+        self.assertIs(worker.last_shared_read_runner, target_runner)
+        self.assertEqual(worker.spec_v2_attn_backends, (target_runner.attn_backend,))
+
 
 if __name__ == "__main__":
     unittest.main()

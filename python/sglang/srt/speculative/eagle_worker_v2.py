@@ -1182,13 +1182,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
     @property
     def last_shared_read_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
-        # draft_extend, which runs on the draft runner.
+        # draft_extend, which runs on the draft runner when this rank hosts it.
+        # Non-last PP ranks only own the target worker, so their target runner
+        # is the final shared-buffer reader on this rank.
+        if self._draft_worker is None:
+            return self._target_worker.model_runner
         return self._draft_worker.draft_runner
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
-        # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
+        # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H. Non-last PP
+        # ranks execute only the target forward and must expose only its backend.
+        if self._draft_worker is None:
+            return (self._target_worker.model_runner.attn_backend,)
         return (
             self._target_worker.model_runner.attn_backend,
             self._draft_worker.draft_attn_backend,
