@@ -24,9 +24,16 @@ import torch
 from sglang.jit_kernel.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.moe.mega_moe_sm90 import (
+    is_sm90_fp4_mega_moe_available,
+    is_sm90_fp8_mega_moe_available,
+    run_sm90_mega_routed,
+)
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.models.deepseek_common.utils import _device_sm
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -37,6 +44,12 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Read a recently added SGLang env option across image revisions."""
+    option = getattr(envs, name, None)
+    return default if option is None else bool(option.get())
 
 
 def _apply_mega_moe_dg_env() -> None:
@@ -51,9 +64,9 @@ def _apply_mega_moe_dg_env() -> None:
     global _MEGA_MOE_DG_ENV_APPLIED
     if _MEGA_MOE_DG_ENV_APPLIED:
         return
-    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get():
+    if _env_bool("SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS"):
         os.environ.setdefault("DG_USE_FP4_ACTS", "1")
-    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND.get():
+    if _env_bool("SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND"):
         os.environ.setdefault("DG_USE_MXF4_KIND", "1")
     _MEGA_MOE_DG_ENV_APPLIED = True
 
@@ -99,16 +112,33 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
-    if get_is_capture_mode():
-        return True
-
+    if _device_sm == 90:
+        if not (
+            is_sm90_fp8_mega_moe_available(moe.experts)
+            or is_sm90_fp4_mega_moe_available(moe.experts)
+        ):
+            return False
     global_num_tokens = get_dp_global_num_tokens()
-    if global_num_tokens:
+    if global_num_tokens and not is_dsa_enable_prefill_cp():
         max_tokens_per_rank = max(global_num_tokens)
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank > cap:
+        if getattr(moe.experts, "_mega_moe_sm90_fp4_weights", False):
+            raise RuntimeError(
+                "SM90 FP4 MegaMoE has no compatible grouped-GEMM fallback. "
+                f"max_tokens_per_rank={max_tokens_per_rank} exceeds "
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+                f"{cap}; raise the cap or reduce the active batch."
+            )
+        return False
+    # CUDA graph capture must obey the same cap as eager execution. Returning
+    # true here without checking it would defer the failure to the graph body
+    # and can leave a partially captured graph behind.
+    if get_is_capture_mode():
+        return True
+    return True
 
 
 def forward_mega_moe(
@@ -190,12 +220,13 @@ def _run_mega_routed(
     num_max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
-    assert num_tokens <= num_max_tokens_per_rank, (
-        f"mega MoE: num_tokens={num_tokens} exceeds cap "
-        f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
-        f"{num_max_tokens_per_rank}; raise the env var or shrink "
-        f"cuda_graph_max_bs / chunked_prefill_size accordingly"
-    )
+    if num_tokens > num_max_tokens_per_rank:
+        raise RuntimeError(
+            f"mega MoE: num_tokens={num_tokens} exceeds cap "
+            f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+            f"{num_max_tokens_per_rank}; raise the env var or shrink "
+            f"cuda_graph_max_bs / chunked_prefill_size accordingly"
+        )
 
     buf = _get_mega_moe_symm_buffer(
         ep_group,
@@ -213,7 +244,17 @@ def _run_mega_routed(
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
 
-    use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
+    if _device_sm == 90:
+        return run_sm90_mega_routed(
+            moe,
+            hidden_states,
+            topk_ids_in,
+            topk_weights_in,
+            buf,
+            num_tokens,
+        )
+
+    use_fp4_acts = _env_bool("SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS")
     if use_fp4_acts:
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
@@ -267,12 +308,42 @@ def _run_mega_routed(
     return y
 
 
+def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
+    # Match DeepGEMM's L1 gate/up layout:
+    # [gate: 0..7, up: 0..7, gate: 8..15, up: 8..15, ...].
+    num_groups, n, *rest = t.shape
+    half = n // 2
+    gate = t[:, :half].reshape(num_groups, half // gran, gran, *rest)
+    up = t[:, half:].reshape(num_groups, half // gran, gran, *rest)
+    result = torch.stack([gate, up], dim=2).reshape(num_groups, n, *rest)
+    return torch.empty_like(t).copy_(result)
+
+
+def _interleave_mega_moe_l1_weights(
+    l1_weights: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        _interleave_mega_moe_gate_up(l1_weights[0]),
+        _interleave_mega_moe_gate_up(l1_weights[1]),
+    )
+
+
+def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
+    num_groups, mn, packed_sf_k = sf.shape
+    assert sf.dtype == torch.int and mn % 128 == 0
+    result = (
+        sf.reshape(num_groups, -1, 4, 32, packed_sf_k)
+        .transpose(2, 3)
+        .reshape(num_groups, mn, packed_sf_k)
+    )
+    return torch.empty_like(sf).copy_(result)
+
+
 def build_mega_moe_experts_weights(experts) -> None:
     from deep_gemm import (
         transform_sf_into_required_layout,
         transform_weights_for_mega_moe,
     )
-    from deep_gemm.mega import _interleave_l1_weights, _transpose_sf_for_utccp
 
     if getattr(experts, "_mega_moe_weights_built", False):
         return
@@ -304,16 +375,18 @@ def build_mega_moe_experts_weights(experts) -> None:
         disable_ue8m0_cast=False,
     )
 
-    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+    if _env_bool("SGLANG_OPT_FIX_MEGA_MOE_MEMORY"):
         # Build the interleaved L1 weight + scale once; share the weight buffer
         # between `w13_weight.data` (normal deep-ep path) and `mega_l1_weights[0]`
         # (mega moe path). Mega moe additionally needs a UTCCP-transposed scale;
         # the deep-ep path consumes the non-transposed interleaved scale and a
         # swizzle-aware activation kernel. L2 weight is untouched by the mega
         # transform, so the existing `w2_weight.data` is shared directly.
-        w13_interleaved, w13_sf_interleaved = _interleave_l1_weights((w13, w13_sf))
-        w13_sf_utccp = _transpose_sf_for_utccp(w13_sf_interleaved)
-        w2_sf_utccp = _transpose_sf_for_utccp(w2_sf)
+        w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
+            (w13, w13_sf)
+        )
+        w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
+        w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
 
         experts.w13_weight.data = w13_interleaved
         experts.w13_weight_scale_inv.data = w13_sf_interleaved
