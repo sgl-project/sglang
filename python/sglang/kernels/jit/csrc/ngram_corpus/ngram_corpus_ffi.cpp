@@ -59,7 +59,8 @@ struct NgramCorpusObj : public tvm::ffi::Object {
       const tvm::ffi::TensorView offsets,
       const tvm::ffi::TensorView total_lens_tv,
       const tvm::ffi::TensorView out_tokens,
-      const tvm::ffi::TensorView out_mask) {
+      const tvm::ffi::TensorView out_mask,
+      const tvm::ffi::TensorView out_match_len) {
     auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
     auto* data = static_cast<const int32_t*>(tokens_flat.data_ptr());
     auto* offs = static_cast<const int64_t*>(offsets.data_ptr());
@@ -74,8 +75,8 @@ struct NgramCorpusObj : public tvm::ffi::Object {
       total_lens[i] = static_cast<size_t>(tlens[i]);
     }
 
-    auto result = ngram_->batchMatch(state_ids, tokens, total_lens);
-    write_result_(result, out_tokens, out_mask);
+    auto [result, match_lens] = ngram_->batchMatch(state_ids, tokens, total_lens);
+    write_result_(result, out_tokens, out_mask, match_lens, out_match_len);
   }
 
   void erase_match_state(const tvm::ffi::TensorView state_ids_tv) {
@@ -132,9 +133,14 @@ struct NgramCorpusObj : public tvm::ffi::Object {
 
  private:
   void write_result_(
-      const ngram::Result& result, const tvm::ffi::TensorView& out_tokens, const tvm::ffi::TensorView& out_mask) {
+      const ngram::Result& result,
+      const tvm::ffi::TensorView& out_tokens,
+      const tvm::ffi::TensorView& out_mask,
+      const std::vector<int32_t>& match_lens,
+      const tvm::ffi::TensorView& out_match_len) {
     auto* out_tok = static_cast<int32_t*>(out_tokens.data_ptr());
     auto* out_msk = static_cast<uint8_t*>(out_mask.data_ptr());
+    auto* out_ml = static_cast<int32_t*>(out_match_len.data_ptr());
     if (result.token.size() > static_cast<size_t>(out_tokens.size(0))) {
       throw std::runtime_error(
           "out_tokens buffer too small: " + std::to_string(out_tokens.size(0)) + " < " +
@@ -145,8 +151,14 @@ struct NgramCorpusObj : public tvm::ffi::Object {
           "out_mask buffer too small: " + std::to_string(out_mask.size(0)) + " < " +
           std::to_string(result.mask.size()));
     }
+    if (match_lens.size() > static_cast<size_t>(out_match_len.size(0))) {
+      throw std::runtime_error(
+          "out_match_len buffer too small: " + std::to_string(out_match_len.size(0)) + " < " +
+          std::to_string(match_lens.size()));
+    }
     std::memcpy(out_tok, result.token.data(), result.token.size() * sizeof(int32_t));
     std::memcpy(out_msk, result.mask.data(), result.mask.size() * sizeof(uint8_t));
+    std::memcpy(out_ml, match_lens.data(), match_lens.size() * sizeof(int32_t));
   }
 
   std::unique_ptr<ngram::Ngram> ngram_;

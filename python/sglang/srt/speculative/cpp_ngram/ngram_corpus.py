@@ -102,7 +102,7 @@ class NgramCorpus:
         req_ids: List[str],
         batch_tokens: List[List[int]],
         total_lens: List[int],
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         state_ids = [self._get_state_id(rid) for rid in req_ids]
         return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
 
@@ -191,10 +191,11 @@ if __name__ == "__main__":
 
     corpus.synchronize()
     queries = [[1, 2, 3], [3, 44], [3, 6, 999]]
-    decoding_ids, decoding_masks = corpus.batch_get(
+    decoding_ids, decoding_masks, decoding_match_lens = corpus.batch_get(
         req_ids=[f"query-{i}" for i in range(len(queries))],
         batch_tokens=queries,
         total_lens=[len(q) for q in queries],
     )
 
     corpus.debug_result(decoding_ids, decoding_masks)
+    logger.info(f"match_lens: {decoding_match_lens.tolist()}")

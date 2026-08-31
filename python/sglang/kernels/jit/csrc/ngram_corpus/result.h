@@ -12,6 +12,8 @@ namespace ngram {
 struct Result {
   std::vector<int32_t> token;
   std::vector<uint8_t> mask;
+  // Per-request max suffix-match depth (longest expandable context suffix).
+  int32_t match_len = 0;
 
   void truncate(size_t n);
 };

@@ -181,6 +181,10 @@ std::vector<SamAnchor> SuffixAutomaton::match(const int32_t* context, size_t len
 Result SuffixAutomaton::buildRecency(
     const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
   auto anchors = match(context, len, param.max_trie_depth);
+  int32_t max_d = 0;
+  for (const auto& anchor : anchors) {
+    max_d = std::max(max_d, anchor.matched_len);
+  }
   const auto max_match_depth = std::max<int32_t>(1, static_cast<int32_t>(param.max_trie_depth - 1));
   const double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) / max_match_depth;
   std::vector<Node> tree(draft_token_num + 1);
@@ -211,12 +215,18 @@ Result SuffixAutomaton::buildRecency(
       }
     }
   }
-  return fillResult(last_token, draft_token_num + 1, tree, root);
+  auto info = fillResult(last_token, draft_token_num + 1, tree, root);
+  info.match_len = max_d;
+  return info;
 }
 
 Result SuffixAutomaton::buildFrequency(
     const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
   auto anchors = match(context, len, param.max_trie_depth);
+  int32_t max_d = 0;
+  for (const auto& anchor : anchors) {
+    max_d = std::max(max_d, anchor.matched_len);
+  }
   struct CompareByProb {
     bool operator()(
         const std::tuple<int, int32_t, int, double>& lhs, const std::tuple<int, int32_t, int, double>& rhs) const {
@@ -279,7 +289,9 @@ Result SuffixAutomaton::buildFrequency(
       addToHeap(pos, child_state, prob);
     }
   }
-  return fillResult(last_token, draft_token_num + 1, tree, root);
+  auto info = fillResult(last_token, draft_token_num + 1, tree, root);
+  info.match_len = max_d;
+  return info;
 }
 
 }  // namespace ngram

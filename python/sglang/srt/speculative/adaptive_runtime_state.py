@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Mapping, Protocol
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -91,6 +91,11 @@ class AdaptiveController:
     @property
     def candidate_steps(self) -> list[int]:
         return self.params.candidate_steps
+
+    @property
+    def states(self) -> Mapping[int, SpecRuntimeState]:
+        """All initialized states, exposed read-only to an outer controller."""
+        return self._states
 
     def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
         """Register a pre-built runtime state.

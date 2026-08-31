@@ -21,6 +21,7 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
     eagle_sample,
+    get_target_verify_attn_backend,
 )
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
@@ -345,7 +346,9 @@ def build_eagle_verify_input(
     # Write straight into the backend's buffer when it owns one and this batch
     # fits; an eager batch past the captured max_bs falls back to allocating.
     bs = batch.seq_lens.shape[0]
-    target_attn_backend = target_worker.model_runner.attn_backend
+    target_attn_backend = get_target_verify_attn_backend(
+        target_worker, num_draft_tokens
+    )
     verify_mask = target_attn_backend.verify_mask
     if verify_mask is None:
         tree_mask_buf, mask_mode, fill_mask = None, tree_mask_mode, True
@@ -524,13 +527,17 @@ def run_eagle_verify(
         # Some values such as custom_mask and position depend on the output of draft,
         # so the previous plan step used the wrong values. Here, we need to run the related
         # computation again to update them to the correct values.
-        target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
+        target_attn_backend = get_target_verify_attn_backend(
+            target_worker, verify_input.draft_token_num
+        )
+        cuda_graph_runner = getattr(
+            verify_forward_batch,
+            "cuda_graph_runner",
+            target_worker.model_runner.decode_cuda_graph_runner,
+        )
+        target_attn_backend.update_verify_buffers_to_fill_after_draft(
             verify_input,
-            (
-                target_worker.model_runner.decode_cuda_graph_runner.bs
-                if can_run_cuda_graph
-                else None
-            ),
+            (cuda_graph_runner.bs if can_run_cuda_graph else None),
         )
 
     # Must stay ahead of the target verify launch below.

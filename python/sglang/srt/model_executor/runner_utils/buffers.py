@@ -378,6 +378,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         hidden_size: int,
         dtype: torch.dtype,
         enable_mamba_track: bool,
+        enable_input_embeds: Optional[bool] = None,
         pp_size: int = 1,
         is_first_pp_rank: bool = False,
         hc_hidden_size: Optional[int] = None,
@@ -403,11 +404,17 @@ class PrefillInputBuffers(ForwardInputBuffers):
             )
             positions = torch.zeros((max_num_tokens,), dtype=torch.int64)
 
-            if is_multimodal:
+            if enable_input_embeds is None:
+                enable_input_embeds = is_multimodal
+
+            if enable_input_embeds:
                 input_embeds = torch.zeros((max_num_tokens, hidden_size), dtype=dtype)
-                mrope_positions = torch.zeros((3, max_num_tokens), dtype=torch.int64)
             else:
                 input_embeds = None
+
+            if is_multimodal:
+                mrope_positions = torch.zeros((3, max_num_tokens), dtype=torch.int64)
+            else:
                 mrope_positions = None
 
             pp_proxy_tensors = (

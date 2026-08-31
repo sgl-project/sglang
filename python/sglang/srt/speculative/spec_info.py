@@ -44,6 +44,7 @@ class SpeculativeAlgorithm(Enum):
     FROZEN_KV_MTP = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    HYBRID = auto()
     NONE = auto()
 
     @classmethod
@@ -104,6 +105,7 @@ class SpeculativeAlgorithm(Enum):
             SpeculativeAlgorithm.EAGLE,
             SpeculativeAlgorithm.EAGLE3,
             SpeculativeAlgorithm.FROZEN_KV_MTP,
+            SpeculativeAlgorithm.HYBRID,
         )
 
     def is_eagle3(self) -> bool:
@@ -129,6 +131,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
+
+    def is_hybrid(self) -> bool:
+        return self == SpeculativeAlgorithm.HYBRID
 
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
@@ -169,7 +174,7 @@ class SpeculativeAlgorithm(Enum):
     def carries_draft_hidden_states(self) -> bool:
         """Whether the disagg prefill->decode transfer carries draft hidden
         states (EAGLE-family only; STANDALONE's vanilla draft ignores them)."""
-        return self.is_eagle()
+        return self.is_eagle() or self.is_hybrid()
 
     def create_future_map(
         self,
@@ -211,7 +216,7 @@ class SpeculativeAlgorithm(Enum):
         return None
 
     def need_topk(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_hybrid()
 
     def handle_server_args(self, server_args: ServerArgs) -> None:
         """Hook for per-algorithm server args mutation.
@@ -223,6 +228,7 @@ class SpeculativeAlgorithm(Enum):
             _handle_dspark,
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
+            _handle_hybrid,
             _handle_ngram,
             _handle_uno,
         )
@@ -241,6 +247,8 @@ class SpeculativeAlgorithm(Enum):
             _handle_dspark(server_args)
         elif self.is_frozen_kv_mtp():
             _handle_frozen_kv_mtp(server_args)
+        elif self.is_hybrid():
+            _handle_hybrid(server_args)
         elif self.is_eagle() or self.is_standalone():
             _handle_eagle_family(server_args)
         elif self.is_ngram():
@@ -250,9 +258,37 @@ class SpeculativeAlgorithm(Enum):
         self, server_args: ServerArgs
     ) -> Optional[int]:
         """Return the largest draft-token width this algorithm may use."""
+        import json
+
         from sglang.srt.arg_groups.overrides import resolving_view
 
         cfg = resolving_view(server_args)
+        if self.is_hybrid():
+            # Each role carries its own width in the hybrid JSON config, so
+            # the capacity must cover the widest route.
+            widths = []
+            if cfg.speculative_num_draft_tokens is not None:
+                widths.append(cfg.speculative_num_draft_tokens)
+            try:
+                hybrid_config = json.loads(cfg.speculative_hybrid_config)
+            except (TypeError, json.JSONDecodeError):
+                hybrid_config = {}
+            for role in ("retrieval", "neural"):
+                role_config = hybrid_config.get(role, {})
+                if isinstance(role_config, dict):
+                    width = role_config.get("speculative_num_draft_tokens")
+                    if isinstance(width, int):
+                        widths.append(width)
+            if cfg.speculative_adaptive:
+                from sglang.srt.speculative.adaptive_spec_params import (
+                    resolve_candidate_steps_from_config,
+                )
+
+                candidate_steps = resolve_candidate_steps_from_config(
+                    cfg_path=cfg.speculative_adaptive_config,
+                )
+                widths.append(max(candidate_steps) + 1)
+            return max(widths) if widths else None
         if cfg.speculative_num_draft_tokens is None:
             return None
         if not cfg.speculative_adaptive:
@@ -334,7 +370,11 @@ class SpeculativeAlgorithm(Enum):
 
         # EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER always use the V2 worker,
         # even with overlap disabled (scheduler drives it synchronously).
-        if self.is_eagle() and cfg.enable_multi_layer_eagle:
+        if self.is_hybrid():
+            from sglang.srt.speculative.hybrid_controller import HybridController
+
+            return HybridController
+        elif self.is_eagle() and cfg.enable_multi_layer_eagle:
             from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
                 MultiLayerEagleWorkerV2,
             )
@@ -371,6 +411,7 @@ class SpecInputType(IntEnum):
     UNO_STATE = auto()
     UNO_DRAFT = auto()
     UNO_VERIFY = auto()
+    HYBRID_VERIFY = auto()
 
 
 class SpecInput(ABC):
@@ -418,6 +459,7 @@ class SpecInput(ABC):
             SpecInputType.DFLASH_VERIFY,
             SpecInputType.NGRAM_VERIFY,
             SpecInputType.UNO_VERIFY,
+            SpecInputType.HYBRID_VERIFY,
         }
 
 

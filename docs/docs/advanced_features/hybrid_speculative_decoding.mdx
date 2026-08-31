@@ -1,0 +1,88 @@
+---
+title: "Hybrid Speculative Decoding"
+metatags:
+    description: "Run retrieval-based and neural draft workers side by side and let SGLang route each decode batch to the better one with hybrid speculative decoding."
+---
+
+Hybrid speculative decoding keeps a retrieval-based draft worker (NGRAM) and a neural draft worker (EAGLE3) ready at the same time, then selects one worker per pure-decode batch.
+It is designed for workloads where acceptance varies between repetition-heavy and open-ended output. Retrieval-based methods shine on repetition but degrade badly without it, while draft-model-based methods are stable across workloads but leave speedup on the table when local repetition is high.
+Statically picking one method is never optimal, so the hybrid controller routes per decode batch and stays close to the better of the two.
+
+## Current support
+
+- Retrieval role: `NGRAM`
+- Neural role: `EAGLE3`, which requires a draft checkpoint
+- Each role has independent speculative parameters, including its own draft width
+- Routing happens at the decode-batch level; prefill and mixed extend/decode batches use the neural route
+
+## Usage
+
+Set `--speculative-algorithm HYBRID` and pass a JSON object to `--speculative-hybrid-config`.
+The `retrieval` and `neural` objects contain an `algorithm` plus normal `ServerArgs` field names written with underscores.
+The two routing thresholds `min_continuation_ratio` and `min_matching_ratio` sit next to the role objects and are both **required**.
+
+```bash Example
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3.5-35B-A3B \
+    --speculative-algorithm HYBRID \
+    --speculative-hybrid-config '{
+      "retrieval": {
+        "algorithm": "NGRAM",
+        "speculative_num_draft_tokens": 6,
+        "speculative_ngram_min_bfs_breadth": 1,
+        "speculative_ngram_max_bfs_breadth": 1,
+        "speculative_ngram_match_type": "PROB"
+      },
+      "neural": {
+        "algorithm": "EAGLE3",
+        "speculative_draft_model_path": "/path/to/eagle3-draft-model",
+        "speculative_num_draft_tokens": 4,
+        "speculative_eagle_topk": 1,
+        "speculative_num_steps": 3
+      },
+      "min_continuation_ratio": 1.0,
+      "min_matching_ratio": 0.5
+    }' \
+    --mem-fraction-static 0.8 \
+    --max-running-requests 8 \
+    --cuda-graph-max-bs 8
+```
+
+## Routing policy
+
+The controller evaluates a two-level threshold heuristic before drafting.
+
+### Request level: `min_continuation_ratio`
+
+A request **qualifies** for retrieval when its retrieval draft quality score reaches the `min_continuation_ratio` fraction of the retrieval draft.
+The score weights the actual draft length by the suffix-match length and normalizes it by the draft width:
+
+```text
+score = continuation_length * suffix_match_length / speculative_num_draft_tokens
+qualifies when score >= min_continuation_ratio * (speculative_num_draft_tokens - 1)
+```
+
+The longer the suffix match, the more likely the retrieved draft is accepted.
+
+- Required; must be in `(0, 1]`.
+
+### Batch level: `min_matching_ratio`
+
+Retrieval is selected for the whole decode batch only when the number of qualifying requests is at least `batch_size * min_matching_ratio`.
+
+- Required; must be in `(0, 1]`.
+
+## State handling
+
+Both workers stay live across route switches, so routing can change on the next decode step without rebuilding state:
+
+- The CUDA graph runners and attention backends of both workers are captured at init and switched when the route changes.
+- The suffix tree and the EAGLE draft KV are updated with accepted tokens every step, so either worker can be picked on the next step.
+- The prompt is inserted into the NGRAM trie, so drafts can also match against the input.
+
+## Observability
+
+Set the environment variable `SGLANG_LOG_HYBRID_SPEC` to a positive batch interval to log route decisions and per-route acceptance statistics. The log covers average continuation length, average suffix-match length, qualifying request count, and the accept length and accept rate of each route.
+
+- Breakable prefill CUDA graphs are incompatible with EAGLE3 aux hidden-state capture; run with `--cuda-graph-backend-prefill tc_piecewise` or `disabled` instead. The incompatibility is not hybrid specific and also affects plain EAGLE3.
+- Routing is decided per decode batch; routing individual requests inside a mixed batch is future work.

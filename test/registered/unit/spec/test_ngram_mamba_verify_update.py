@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -8,6 +9,38 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestNgramExtendCorpusSync(CustomTestCase):
+    def test_uses_extend_range_after_req_accessor_removal(self):
+        from sglang.srt.speculative.ngram_worker import NGRAMWorker
+        from sglang.srt.utils.common import Range
+
+        worker = object.__new__(NGRAMWorker)
+        worker.max_trie_depth = 4
+        worker.ngram_corpus = MagicMock()
+        batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(
+                    origin_input_ids=list(range(6)),
+                    prefix_indices=[10, 11],
+                    extend_range=Range(2, 4),
+                    extend_batch_idx=1,
+                ),
+                SimpleNamespace(
+                    origin_input_ids=list(range(10)),
+                    prefix_indices=[10, 11, 12, 13, 14],
+                    extend_range=Range(5, 8),
+                    extend_batch_idx=2,
+                ),
+            ]
+        )
+
+        worker._insert_extend_into_ngram_corpus(batch)
+
+        worker.ngram_corpus.batch_put.assert_called_once_with(
+            [[0, 1, 2, 3], [2, 3, 4, 5, 6, 7]]
+        )
 
 
 class TestNgramLastCorrectStepIndices(CustomTestCase):
@@ -47,7 +80,7 @@ class TestNgramLastCorrectStepIndices(CustomTestCase):
         self.assertTrue(torch.equal(result, expected))
 
     def test_linear_chain_partial_accept(self):
-        bs, draft_token_num = 3, 5
+        draft_token_num = 5
         accept_indices = torch.tensor(
             [
                 [0, 1, 2, -1, -1],
@@ -65,7 +98,7 @@ class TestNgramLastCorrectStepIndices(CustomTestCase):
         self.assertTrue(torch.equal(result, expected))
 
     def test_tree_structure_non_sequential(self):
-        bs, draft_token_num = 2, 6
+        draft_token_num = 6
         accept_indices = torch.tensor(
             [
                 [0, 2, 5, -1, -1, -1],
@@ -82,7 +115,7 @@ class TestNgramLastCorrectStepIndices(CustomTestCase):
         self.assertTrue(torch.equal(result, expected))
 
     def test_single_request_zero_drafts(self):
-        bs, draft_token_num = 1, 4
+        draft_token_num = 4
         accept_indices = torch.tensor([[0, -1, -1, -1]], dtype=torch.int32)
         num_correct_drafts = torch.tensor([0], dtype=torch.int32)
 

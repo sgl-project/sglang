@@ -50,11 +50,12 @@ def _batch_get(
     corpus: NgramCorpus,
     batch_tokens: list[list[int]],
 ):
-    return corpus.batch_get(
+    ids, masks, _match_lens = corpus.batch_get(
         req_ids=[uuid.uuid4().hex for _ in range(len(batch_tokens))],
         batch_tokens=batch_tokens,
         total_lens=[len(tokens) for tokens in batch_tokens],
     )
+    return ids, masks
 
 
 def _batch_get_with_state(
@@ -63,7 +64,8 @@ def _batch_get_with_state(
     current_tokens: list[int],
     total_len: int,
 ):
-    return corpus.batch_get([req_id], [current_tokens], [total_len])
+    ids, masks, _match_lens = corpus.batch_get([req_id], [current_tokens], [total_len])
+    return ids, masks
 
 
 class _IntTokenizer:
@@ -176,6 +178,14 @@ class TestNgramCorpusBFS(CustomTestCase):
 
     def test_masks(self):
         np.testing.assert_array_equal(self.masks.tolist(), EXPECTED_BFS_MASKS)
+
+    def test_match_lengths(self):
+        _, _, match_lens = self.corpus.batch_get(
+            req_ids=[uuid.uuid4().hex for _ in QUERY_SEQUENCES],
+            batch_tokens=QUERY_SEQUENCES,
+            total_lens=[len(tokens) for tokens in QUERY_SEQUENCES],
+        )
+        self.assertEqual(match_lens.tolist(), [3, 2, 0])
 
 
 class TestNgramCorpusProb(CustomTestCase):

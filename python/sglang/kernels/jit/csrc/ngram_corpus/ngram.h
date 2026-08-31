@@ -63,7 +63,10 @@ class Ngram {
 
   std::vector<std::pair<std::string, int64_t>> listExternalCorpora() const;
 
-  Result batchMatch(
+  // Returns (merged draft Result, per-request match_len array). match_len is a
+  // scalar on each per-request Result but the batch needs one value per
+  // request, so it travels as a separate vector alongside the merged Result.
+  std::pair<Result, std::vector<int32_t>> batchMatch(
       const std::vector<int64_t>& state_ids,
       const std::vector<std::vector<int32_t>>& tokens,
       const std::vector<size_t>& total_lens);

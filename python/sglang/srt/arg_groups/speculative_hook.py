@@ -169,10 +169,8 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             f"speculative_algorithm == EAGLE, got {cfg.speculative_algorithm}."
         )
 
-    if cfg.speculative_adaptive:
-        _maybe_disable_adaptive(server_args)
-        if cfg.speculative_adaptive:
-            _init_adaptive_speculative_params(server_args)
+    if cfg.speculative_adaptive and (algo is None or not algo.is_hybrid()):
+        configure_adaptive_speculative_decoding(server_args)
 
     if algo is not None:
         # A registered algorithm's callback lives outside this tree and sets
@@ -982,6 +980,80 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_hybrid(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.speculative_hybrid_config is None:
+        raise ValueError(
+            "HYBRID speculative decoding requires --speculative-hybrid-config."
+        )
+    try:
+        config = json.loads(cfg.speculative_hybrid_config)
+    except json.JSONDecodeError as exc:
+        raise ValueError("--speculative-hybrid-config must be a JSON object.") from exc
+    if not isinstance(config, dict):
+        raise ValueError("--speculative-hybrid-config must be a JSON object.")
+
+    neural = config.get("neural")
+    if not isinstance(neural, dict):
+        return
+
+    # TokenizerManager and target memory-pool initialization run before the
+    # controller creates role-specific ServerArgs copies. Bootstrap EAGLE-only
+    # settings from the neural role, but size target verify buffers for the
+    # widest configured route. The controller captures a width-specific graph
+    # for every route over those shared buffers after worker initialization.
+    neural_overrides = {}
+    for field in (
+        "speculative_num_steps",
+        "speculative_eagle_topk",
+        "speculative_num_draft_tokens",
+        "speculative_draft_model_path",
+        "speculative_draft_model_revision",
+    ):
+        value = neural.get(field)
+        if value is not None:
+            neural_overrides[field] = value
+    declare_resolution(server_args, "_handle_hybrid.neural", **neural_overrides)
+
+    # HYBRID needs the neural overrides installed before adaptive validation
+    # and initial-step selection. The generic hook cannot do this earlier
+    # because it deliberately knows nothing about role-specific JSON fields.
+    if resolving_view(server_args).speculative_adaptive:
+        configure_adaptive_speculative_decoding(server_args)
+
+    # The initial target verify graph supplies the largest shared static
+    # buffers. Route-specific graphs and attention metadata are created later
+    # by HybridController, but this bootstrap width must cover NGRAM too.
+    role_widths = [
+        config.get(role, {}).get("speculative_num_draft_tokens")
+        for role in ("retrieval", "neural")
+        if isinstance(config.get(role), dict)
+        and config[role].get("speculative_num_draft_tokens") is not None
+    ]
+    if role_widths and all(isinstance(width, int) for width in role_widths):
+        from sglang.srt.arg_groups.overrides import (
+            max_speculative_num_draft_tokens,
+        )
+
+        max_width = max_speculative_num_draft_tokens(server_args)
+        declare_resolution(
+            server_args,
+            "_handle_hybrid.max_width",
+            speculative_num_draft_tokens=max(max(role_widths), max_width or 0),
+        )
+
+    if resolving_view(server_args).max_running_requests is None:
+        declare_resolution(
+            server_args,
+            "_handle_hybrid",
+            max_running_requests=48,
+        )
+        logger.warning(
+            "Max running requests is reset to 48 for HYBRID speculative decoding. "
+            "You can override this by explicitly setting --max-running-requests."
+        )
+
+
 def _handle_ngram(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if cfg.device not in ("cuda", "cpu"):
@@ -1087,6 +1159,13 @@ def _maybe_disable_adaptive(server_args: ServerArgs) -> None:
             "_maybe_disable_adaptive",
             speculative_adaptive=False,
         )
+
+
+def configure_adaptive_speculative_decoding(server_args: ServerArgs) -> None:
+    """Validate and initialize adaptive parameters for one worker config."""
+    _maybe_disable_adaptive(server_args)
+    if resolving_view(server_args).speculative_adaptive:
+        _init_adaptive_speculative_params(server_args)
 
 
 def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:

@@ -97,6 +97,9 @@ class CustomSpecAlgo:
     def is_ngram(self) -> bool:
         return False
 
+    def is_hybrid(self) -> bool:
+        return False
+
     def supports_target_verify_for_draft(self) -> bool:
         return False
 

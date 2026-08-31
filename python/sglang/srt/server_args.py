@@ -2067,12 +2067,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
-        NS("spec"),
-    ] = None
-    uno_lora_path: A[
-        Optional[str],
-        "Path to the UNO draft LoRA checkpoint.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, HYBRID, DFLASH, DSPARK, UNO. HYBRID routes each batch between EAGLE and NGRAM. Or any name registered via `SpeculativeAlgorithm.register`.",
         NS("spec"),
     ] = None
     speculative_draft_model_path: A[
@@ -2278,6 +2273,11 @@ class ServerArgs:
     speculative_adaptive_config: A[
         Optional[str],
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
+        NS("spec"),
+    ] = None
+    speculative_hybrid_config: A[
+        Optional[str],
+        "HYBRID only. JSON object declaring retrieval and neural workers. Each role contains algorithm plus ServerArgs overrides directly; required min_continuation_ratio gates retrieval quality per request and min_matching_ratio sets the fraction of qualifying requests needed to route a batch to retrieval.",
         NS("spec"),
     ] = None
 

@@ -53,19 +53,25 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
-
     cfg = resolving_view(server_args)
+    algorithm = cfg.speculative_algorithm
+    topk = cfg.speculative_eagle_topk
+    if algorithm == "HYBRID":
+        try:
+            hybrid_config = json.loads(cfg.speculative_hybrid_config)
+        except (TypeError, json.JSONDecodeError):
+            return "the HYBRID config is not a valid JSON object"
+        neural_config = hybrid_config.get("neural", {})
+        algorithm = str(neural_config.get("algorithm", "")).upper()
+        topk = neural_config.get("speculative_eagle_topk", topk)
 
-    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+    if algorithm not in ("EAGLE", "EAGLE3"):
         return (
-            f"speculative_algorithm={cfg.speculative_algorithm} "
+            f"neural speculative_algorithm={algorithm} "
             "(only EAGLE/EAGLE3 are supported)"
         )
-    if cfg.speculative_eagle_topk is not None and cfg.speculative_eagle_topk != 1:
-        return (
-            f"speculative_eagle_topk={cfg.speculative_eagle_topk} "
-            "(only topk=1 is supported)"
-        )
+    if topk is not None and topk != 1:
+        return f"speculative_eagle_topk={topk} (only topk=1 is supported)"
     if resolved_view(server_args).enable_dp_attention:
         return (
             "enable_dp_attention=True is not supported "
