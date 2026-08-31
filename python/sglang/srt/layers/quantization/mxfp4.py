@@ -49,7 +49,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_platform,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_device_capability,
@@ -57,9 +60,6 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
-    is_sm90_supported,
-    is_sm100_supported,
-    is_sm120_supported,
     is_triton_kernels_available,
     next_power_of_2,
     round_up,
@@ -236,13 +236,13 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         mx_axis=-2, num_warps=num_warps
     )
     scale_layout_opts = {}
-    if is_sm100_supported():
+    if get_platform().is_sm100:
         constraints = {
             "is_persistent": True,
             "epilogue_subtile": 1,
         }
         opt_flags.update_opt_flags_constraints(constraints)
-    elif is_sm90_supported():
+    elif get_platform().is_sm90:
         constraints = {
             "split_k": 1,
         }
@@ -413,11 +413,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         #                           (FlashInfer PR #3084, post-0.6.10)
         self._fi_kernel: Optional[str] = None
         if self.use_flashinfer:
-            if is_sm100_supported():
+            if get_platform().is_sm100:
                 self._fi_kernel = "trtllm_sm100"
-            elif is_sm120_supported():
+            elif get_platform().is_sm120:
                 self._fi_kernel = "cutlass_sm120"
-            elif is_sm90_supported():
+            elif get_platform().is_sm90:
                 if not _FI_HAS_SM90_CUTLASS_MXFP4:
                     raise RuntimeError(
                         "moe_runner_backend=flashinfer_mxfp4 on SM90 requires the "
@@ -466,7 +466,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # DeepGEMM fp8_fp4 grouped GEMM consumes the checkpoint layout
             # directly (packed e2m1 K-major + ue8m0 g32 scales); no padding.
             pass
-        elif is_sm100_supported():
+        elif get_platform().is_sm100:
             if self.use_flashinfer:
                 # FlashInfer trtllm-gen FP4 kernel actual alignment:
                 # intermediate: scale shuffle needs M%128==0 → intermediate%64==0
@@ -614,9 +614,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             if (
-                not is_sm90_supported()
-                and not is_sm100_supported()
-                and not is_sm120_supported()
+                not get_platform().is_sm90
+                and not get_platform().is_sm100
+                and not get_platform().is_sm120
             ):
                 raise RuntimeError("MXFP4 Marlin requires SM90+.")
             if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
