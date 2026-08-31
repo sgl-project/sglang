@@ -133,6 +133,8 @@ class SchedulerStats:
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
+    num_demotion_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    demotion_queue_cache_usage: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -553,6 +555,21 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.pending_prealloc_token_usage = Gauge(
             name="sglang:pending_prealloc_token_usage",
             documentation="The token usage for pending preallocated tokens (not preallocated yet).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.num_demotion_queue_reqs = Gauge(
+            name="sglang:num_demotion_queue_reqs",
+            documentation="The number of requests currently in the demotion queue.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.demotion_queue_cache_usage = Gauge(
+            name="sglang:demotion_queue_cache_usage",
+            documentation=(
+                "KV tokens of demoted requests as a fraction of the GPU KV pool,"
+                " bounded by proactive_safe_cpu_demote_cache_usage."
+            ),
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1417,6 +1434,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
+        )
+        self._log_gauge_queue_count(
+            self.num_demotion_queue_reqs, stats.num_demotion_queue_reqs
+        )
+        self._log_gauge(
+            self.demotion_queue_cache_usage, stats.demotion_queue_cache_usage
         )
 
         # Utilization
