@@ -404,6 +404,9 @@ class DPDispatcher:
         self._pending_send_at: Dict[str, float] = {}
         # Set when _result_listener gives up; makes alive_ranks report empty.
         self._listener_failed = False
+        # The event loop only keeps weak references to tasks, so the long-lived
+        # loops started in `start()` need a strong reference to survive GC.
+        self.background_tasks: Set[asyncio.Task] = set()
 
         # Prometheus gauge: pending requests per DP rank. Lives in the main
         # process (the dispatcher), unlike the per-worker EncoderMetricsCollector.
@@ -443,9 +446,14 @@ class DPDispatcher:
 
     def start(self) -> None:
         logger.info(f"DP dispatcher started: {self.dp_size} ranks (all remote)")
-        asyncio.create_task(self._result_listener())
-        asyncio.create_task(self._worker_watchdog())
-        asyncio.create_task(self._cleanup_stale_mappings())
+        for coro in (
+            self._result_listener(),
+            self._worker_watchdog(),
+            self._cleanup_stale_mappings(),
+        ):
+            task = asyncio.create_task(coro)
+            self.background_tasks.add(task)
+            task.add_done_callback(self.background_tasks.discard)
 
     def _drop_pending_and_mapping(self, rank: int, req_id: str) -> None:
         # dispatch / broadcast failure: no follow-up /send expected.
