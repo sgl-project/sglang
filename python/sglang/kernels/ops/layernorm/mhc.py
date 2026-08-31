@@ -18,9 +18,98 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils.common import get_bool_env_var, is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
+
+_AITER_MHC_RUNTIME_DISABLED = False
+_AITER_MHC_IMPORT_WARNED = False
+_AITER_MHC_ACTIVE_LOGGED = False
+
+
+def _use_aiter_mhc() -> bool:
+    return (
+        not _AITER_MHC_RUNTIME_DISABLED
+        and is_hip()
+        and is_gfx95_supported()
+        and get_bool_env_var("SGLANG_USE_AITER")
+    )
+
+
+def _try_aiter_mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    global _AITER_MHC_RUNTIME_DISABLED, _AITER_MHC_IMPORT_WARNED
+    global _AITER_MHC_ACTIVE_LOGGED
+
+    try:
+        from aiter.ops.mhc import mhc_pre as aiter_mhc_pre
+    except Exception as err:
+        if not _AITER_MHC_IMPORT_WARNED:
+            logger.warning("AITER mHC pre is unavailable, falling back: %s", err)
+            _AITER_MHC_IMPORT_WARNED = True
+        _AITER_MHC_RUNTIME_DISABLED = True
+        return None
+
+    kwargs = {}
+    if norm_weight is not None:
+        kwargs["norm_weight"] = norm_weight
+        kwargs["norm_eps"] = norm_eps if norm_eps is not None else rms_eps
+
+    try:
+        result = aiter_mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            **kwargs,
+        )
+    except Exception as err:
+        logger.warning("AITER mHC pre failed, disabling fast path: %s", err)
+        _AITER_MHC_RUNTIME_DISABLED = True
+        return None
+
+    if not _AITER_MHC_ACTIVE_LOGGED:
+        logger.info("Using AITER gfx950 mHC pre/post kernels")
+        _AITER_MHC_ACTIVE_LOGGED = True
+    return result
+
+
+def _try_aiter_mhc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor | None:
+    global _AITER_MHC_RUNTIME_DISABLED
+
+    try:
+        from aiter.ops.mhc import mhc_post as aiter_mhc_post
+
+        out = torch.empty_like(residual)
+        aiter_mhc_post(out, x, residual, post_layer_mix, comb_res_mix)
+        return out
+    except Exception as err:
+        logger.warning("AITER mHC post failed, disabling fast path: %s", err)
+        _AITER_MHC_RUNTIME_DISABLED = True
+        return None
+
 
 # This module is imported during model-registry discovery. Do not import the real
 # TileLang package here: it loads native CUDA stubs. The proxy below lets
@@ -118,6 +207,24 @@ pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
 }
+
+
+def _use_deep_gemm_hc_prenorm() -> bool:
+    if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        return False
+
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+
+    return ENABLE_JIT_DEEPGEMM
+
+
+def _use_tilelang_mhc_pre() -> bool:
+    return envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() and not is_hip()
+
+
+def _use_tilelang_mhc_post() -> bool:
+    return envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get() and not is_hip()
+
 
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"
@@ -1006,7 +1113,7 @@ def mhc_pre(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
         )
 
-    if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+    if _use_deep_gemm_hc_prenorm():
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
@@ -1618,7 +1725,7 @@ def mhc_fused_post_pre(
             hidden_size,
         )
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        if _use_deep_gemm_hc_prenorm():
             import deep_gemm
 
             deep_gemm.tf32_hc_prenorm_gemm(
@@ -1732,6 +1839,218 @@ def mhc_fused_post_pre(
         comb_mix_cur.view(*outer_shape, hc_mult, hc_mult),
         layer_input_cur.view(*outer_shape, hidden_size),
     )
+
+
+def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
+    return x.repeat(1, n)
+
+
+def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
+    return x.unflatten(-1, (n, -1)).mean(dim=-2)
+
+
+def _mhc_pre_torch(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    import torch.nn.functional as F
+
+    s, n, h = residual.shape
+    dtype = residual.dtype
+
+    x_flat = residual.view(s, n * h).float()
+    rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + rms_eps)
+    mixes = F.linear(x_flat, fn) * rsqrt
+
+    pre_raw = mixes[:, :n]
+    post_raw = mixes[:, n : 2 * n]
+    comb_raw = mixes[:, 2 * n :].view(s, n, n)
+    pre_base = hc_base[:n]
+    post_base = hc_base[n : 2 * n]
+    comb_base = hc_base[2 * n :].view(n, n)
+
+    pre = torch.sigmoid(pre_raw * hc_scale[0] + pre_base) + hc_pre_eps
+    post = hc_post_mult_value * torch.sigmoid(post_raw * hc_scale[1] + post_base)
+    comb = comb_raw * hc_scale[2] + comb_base
+
+    comb = comb.softmax(-1) + hc_sinkhorn_eps
+    comb = comb / (comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
+    for _ in range(sinkhorn_repeat - 1):
+        comb = comb / (comb.sum(-1, keepdim=True) + hc_sinkhorn_eps)
+        comb = comb / (comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
+
+    layer_input = (pre.unsqueeze(-1) * residual.float()).sum(dim=1).to(dtype)
+    return post.unsqueeze(-1), comb, layer_input
+
+
+def _mhc_post_torch(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    out = post_layer_mix * x.unsqueeze(1) + (
+        comb_res_mix.unsqueeze(-1) * residual.unsqueeze(2)
+    ).sum(dim=1)
+    return out.type_as(x)
+
+
+@torch._dynamo.disable
+def _mhc_pre_dispatch(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
+    if _use_aiter_mhc():
+        result = _try_aiter_mhc_pre(
+            residual=residual,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+        if result is not None:
+            post_mix, comb_mix, layer_input = result
+            return post_mix, comb_mix, layer_input, norm_weight is not None
+
+    if not _use_tilelang_mhc_pre():
+        post_mix, comb_mix, layer_input = _mhc_pre_torch(
+            residual=residual,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+        )
+        return post_mix, comb_mix, layer_input, False
+
+    post_mix, comb_mix, layer_input = mhc_pre(
+        residual=residual,
+        fn=fn,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+    return post_mix, comb_mix, layer_input, norm_weight is not None
+
+
+@torch._dynamo.disable
+def _mhc_post_dispatch(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    assert x.dim() == 2 and residual.dim() == 3
+    assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
+    if _use_aiter_mhc():
+        result = _try_aiter_mhc_post(
+            x=x,
+            residual=residual,
+            post_layer_mix=post_layer_mix,
+            comb_res_mix=comb_res_mix,
+        )
+        if result is not None:
+            return result
+
+    if not _use_tilelang_mhc_post():
+        return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
+    return mhc_post(x, residual, post_layer_mix, comb_res_mix)
+
+
+def hc_pre(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    post_mult_value: float = 2.0,
+    hc_norm_weight: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_norm_eps: float | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    s, total = x.shape
+    hidden_size = total // hc_mult
+    if x.numel() == 0:
+        empty_layer_input = x.new_zeros((s, hidden_size))
+        empty_h_res = torch.zeros(
+            (s, hc_mult * hc_mult), device=x.device, dtype=torch.float32
+        )
+        empty_h_post = torch.zeros((s, hc_mult), device=x.device, dtype=torch.float32)
+        return empty_layer_input, empty_h_res, empty_h_post, False
+
+    fn = hc_fn if hc_norm_weight is None else hc_fn * hc_norm_weight
+    residual_3d = x.view(s, hc_mult, hidden_size)
+    post_mix, comb_mix, layer_input, norm_fused = _mhc_pre_dispatch(
+        residual=residual_3d,
+        fn=fn,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_eps,
+        hc_sinkhorn_eps=hc_eps,
+        hc_post_mult_value=post_mult_value,
+        sinkhorn_repeat=sinkhorn_iters,
+        norm_weight=out_norm_weight,
+        norm_eps=out_norm_eps,
+    )
+    return (
+        layer_input,
+        comb_mix.reshape(s, hc_mult * hc_mult),
+        post_mix.reshape(s, hc_mult),
+        norm_fused,
+    )
+
+
+def hc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    h_post: torch.Tensor,
+    h_res: torch.Tensor,
+    hc_mult: int,
+) -> torch.Tensor:
+    s, hidden_size = x.shape
+    if s == 0:
+        return x.new_zeros((s, hc_mult * hidden_size))
+    residual = residual.view(s, hc_mult, hidden_size)
+    h_post = h_post.view(s, hc_mult, 1)
+    h_res = h_res.view(s, hc_mult, hc_mult)
+    out = _mhc_post_dispatch(x, residual, h_post, h_res)
+    return out.view(s, -1)
 
 
 def npu_hc_pre(

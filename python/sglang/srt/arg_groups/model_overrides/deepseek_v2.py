@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
     "MistralLarge3ForCausalLM",
     "PixtralForConditionalGeneration",
     "GlmMoeDsaForCausalLM",
+    "Glm5NextForConditionalGeneration",
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
     "Dots3NoteForCausalLM",

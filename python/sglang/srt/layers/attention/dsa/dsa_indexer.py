@@ -481,7 +481,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     dim=-1,
                 )
             with torch.cuda.stream(self.alt_stream):
-                # TODO we should also put DeepGEMM half SM here?
                 if self.use_dsa_indexer_fusion:
                     key, weights_raw = self._fused_k_weights(x)
                 else:
@@ -871,10 +870,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if use_dg_native:
             seqlens_32_2d = ctx_2d
+        elif ctx_2d is not None:
+            if ctx_2d.size(1) == 1:
+                seqlens_32_2d = ctx_2d
+            else:
+                seqlens_32_2d = ctx_2d.reshape(-1).contiguous().view(-1, 1)
         elif seqlens_32.dim() == 2:
-            seqlens_32_2d = seqlens_32
+            if seqlens_32.size(1) == 1:
+                seqlens_32_2d = seqlens_32.contiguous()
+            else:
+                seqlens_32_2d = seqlens_32.reshape(-1).contiguous().view(-1, 1)
         else:
-            seqlens_32_2d = seqlens_32.unsqueeze(-1)
+            seqlens_32_2d = seqlens_32.contiguous().view(-1, 1)
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
@@ -890,6 +897,52 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
+
+        # SM100 DeepGEMM paged MQA requires batch_size <= num_sms; chunk larger batches.
+        def _chunked_fp8_paged_mqa_logits(
+            q: torch.Tensor,
+            kv_cache: torch.Tensor,
+            w: torch.Tensor,
+            context_lens: torch.Tensor,
+            block_table: torch.Tensor,
+            mqa_schedule_metadata: torch.Tensor,
+            max_len: int,
+            clean_logits: bool = False,
+        ) -> torch.Tensor:
+            batch_size, chunk_next_n = q.shape[:2]
+            if batch_size == 0:
+                return torch.empty((0, max_len), dtype=torch.float32, device=q.device)
+            if batch_size <= self.sm_count:
+                return deep_gemm.fp8_paged_mqa_logits(
+                    q,
+                    kv_cache,
+                    w,
+                    context_lens,
+                    block_table,
+                    mqa_schedule_metadata,
+                    max_len,
+                    clean_logits=clean_logits,
+                )
+            logits_chunks = []
+            for start in range(0, batch_size, self.sm_count):
+                end = min(start + self.sm_count, batch_size)
+                chunk_context_lens = context_lens[start:end]
+                chunk_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    chunk_context_lens, blocksize, self.sm_count
+                )
+                logits_chunks.append(
+                    deep_gemm.fp8_paged_mqa_logits(
+                        q[start:end],
+                        kv_cache,
+                        w[start * chunk_next_n : end * chunk_next_n],
+                        chunk_context_lens,
+                        block_table[start:end],
+                        chunk_schedule_metadata,
+                        max_len,
+                        clean_logits=clean_logits,
+                    )
+                )
+            return torch.cat(logits_chunks, dim=0)
 
         if self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
@@ -923,7 +976,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         elif use_dg_native:
             logits = deepgemm_paged_mqa_logits_native(
-                deep_gemm.fp8_paged_mqa_logits,
+                _chunked_fp8_paged_mqa_logits,
                 q_fp8,
                 kv_cache_fp8,
                 weights,
@@ -937,7 +990,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         else:
             logits = deepgemm_paged_mqa_logits_split(
-                deep_gemm.fp8_paged_mqa_logits,
+                _chunked_fp8_paged_mqa_logits,
                 q_fp8,
                 kv_cache_fp8,
                 weights,

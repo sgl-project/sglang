@@ -10,6 +10,7 @@ Covers:
   - _handle_batch_output cleans up rid_to_state on finished requests
   - _init_req_state rejects duplicate rids
   - Resubmission succeeds after cleanup
+  - Handler failures clean up pending and dispatched requests
 """
 
 import asyncio
@@ -454,40 +455,87 @@ def _make_generate_obj(rid, is_single):
     return obj
 
 
-class TestDiscardPendingReqStates(CustomTestCase):
-    """Direct tests for _discard_pending_req_states."""
+class TestReleaseReqStatesOnFailure(CustomTestCase):
+    """Direct tests for _release_req_states_on_failure."""
 
-    def test_discard_single(self):
+    def test_undelivered_single_is_dropped(self):
         tm = _make_tokenizer_manager(self)
         rid = "d_single"
         tm.rid_to_state[rid] = _make_req_state(rid)
-        obj = Mock(spec=GenerateReqInput)
-        obj.is_single = True
-        obj.rid = rid
-        tm._discard_pending_req_states(obj)
+        tm._release_req_states_on_failure([rid])
         self.assertNotIn(rid, tm.rid_to_state)
 
-    def test_discard_batch_removes_all(self):
+    def test_undelivered_batch_removes_all(self):
         tm = _make_tokenizer_manager(self)
         rids = ["d0", "d1", "d2"]
         for r in rids:
             tm.rid_to_state[r] = _make_req_state(r)
-        obj = Mock(spec=GenerateReqInput)
-        obj.is_single = False
-        obj.rid = list(rids)
-        tm._discard_pending_req_states(obj)
+        tm._release_req_states_on_failure(rids)
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
 
-    def test_discard_ignores_already_removed(self):
-        """Popping a rid that is no longer present must not raise."""
+    def test_ignores_already_removed(self):
+        """A rid that is no longer present must not raise."""
         tm = _make_tokenizer_manager(self)
         tm.rid_to_state["p1"] = _make_req_state("p1")
-        obj = Mock(spec=GenerateReqInput)
-        obj.is_single = False
-        obj.rid = ["p1", "already_gone"]
-        tm._discard_pending_req_states(obj)  # must not raise
+        tm._release_req_states_on_failure(["p1", "already_gone"])
         self.assertNotIn("p1", tm.rid_to_state)
+
+    def test_dispatched_single_is_aborted_and_state_kept(self):
+        tm = _make_tokenizer_manager(self)
+        tm.server_args.tokenizer_worker_num = 1
+        tm._dispatch_to_scheduler = Mock()
+        tm.enable_metrics = True
+        tm.metrics_collector = MagicMock()
+        rid = "d_live"
+        state = _make_req_state(rid)
+        state.dispatched = True
+        tm.rid_to_state[rid] = state
+        tm._release_req_states_on_failure([rid])
+        tm._release_req_states_on_failure([rid])
+
+        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+        self.assertEqual(
+            [type(m) for m in sent], [AbortReq], "expected exactly one AbortReq"
+        )
+        self.assertEqual(sent[0].rid, rid)
+        self.assertIn(rid, tm.rid_to_state)
+        self.assertTrue(state.abort_sent)
+        tm.metrics_collector.observe_one_aborted_request.assert_called_once()
+
+    def test_dispatched_batch_aborts_delivered_and_drops_rest(self):
+        tm = _make_tokenizer_manager(self)
+        tm.server_args.tokenizer_worker_num = 1
+        tm._dispatch_to_scheduler = Mock()
+        delivered, undelivered = "d_delivered", "d_undelivered"
+        live = _make_req_state(delivered)
+        live.dispatched = True
+        tm.rid_to_state[delivered] = live
+        tm.rid_to_state[undelivered] = _make_req_state(undelivered)
+        tm._release_req_states_on_failure([delivered, undelivered])
+
+        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+        self.assertEqual([type(m) for m in sent], [AbortReq])
+        self.assertEqual(sent[0].rid, delivered)
+        self.assertIn(delivered, tm.rid_to_state)
+        self.assertNotIn(undelivered, tm.rid_to_state)
+
+    def test_abort_failure_does_not_stop_cleanup(self):
+        tm = _make_tokenizer_manager(self)
+        tm.server_args.tokenizer_worker_num = 1
+        tm._dispatch_to_scheduler = Mock(side_effect=RuntimeError("send failed"))
+        delivered, undelivered = "live", "pending"
+        live = _make_req_state(delivered)
+        live.dispatched = True
+        tm.rid_to_state[delivered] = live
+        tm.rid_to_state[undelivered] = _make_req_state(undelivered)
+
+        with self.assertLogs(level="ERROR"):
+            tm._release_req_states_on_failure([delivered, undelivered])
+
+        self.assertIn(delivered, tm.rid_to_state)
+        self.assertFalse(live.abort_sent)
+        self.assertNotIn(undelivered, tm.rid_to_state)
 
 
 class TestParallelStreamTaskCleanup(CustomTestCase):

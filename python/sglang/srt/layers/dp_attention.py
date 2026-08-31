@@ -215,6 +215,21 @@ class _DpGatheredBufferWrapper:
         return buffer
 
     @classmethod
+    def get_local_dp_buffer_mhc(
+        cls, group: GroupCoordinator, n: int = 1
+    ) -> torch.Tensor:
+        from sglang.srt.runtime_context import get_flags
+
+        dp = get_flags().dp
+        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
+            buffer = torch.empty(
+                (cls._local_dp_buffer_len, dp.buffer_hidden_size * n),
+                dtype=dp.buffer_dtype,
+                device=dp.buffer_device,
+            )
+        return buffer
+
+    @classmethod
     def get_global_dp_buffer_len(cls) -> int:
         return cls._global_dp_buffer_len
 
@@ -276,6 +291,10 @@ def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
 
 def get_local_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
     return _DpGatheredBufferWrapper.get_local_dp_buffer(group=group)
+
+
+def get_local_dp_buffer_mhc(group: GroupCoordinator, n: int = 1) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_local_dp_buffer_mhc(group=group, n=n)
 
 
 def get_global_dp_buffer_len() -> int:

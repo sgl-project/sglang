@@ -53,6 +53,7 @@ from sglang.srt.disaggregation.utils import (
     _is_fake_transfer,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_dsv4_c128_online_enabled,
@@ -1103,6 +1104,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         preallocated_reqs = []
         indices_to_remove = set()
 
+        # The all-waiting shortcut stops receiver polling, so enforce its timeout here.
+        prealloc_timeout = float(
+            getattr(getattr(self, "kv_manager", None), "waiting_timeout", 0.0)
+        )
+        prealloc_now = time.perf_counter()
+
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
         retractable_tokens = sum(
@@ -1138,16 +1145,47 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             self.queue.sort(key=lambda r: r.req.priority * priority_sign)
 
-        # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
+
+            bootstrap_done_time = getattr(
+                getattr(decode_req.req, "time_stats", None),
+                "bootstrap_done_time",
+                0.0,
+            )
+            prealloc_timed_out = (
+                not isinstance(decode_req.req.finished_reason, FINISH_ABORT)
+                and prealloc_timeout > 0
+                and getattr(decode_req, "waiting_for_input", False)
+                and bootstrap_done_time > 0
+                and prealloc_now - bootstrap_done_time > prealloc_timeout
+            )
+            if prealloc_timed_out:
+                elapsed = prealloc_now - bootstrap_done_time
+                error_message = (
+                    f"Decode preallocation timed out after {elapsed:.1f}s "
+                    f"(timeout={prealloc_timeout:.1f}s) for request "
+                    f"rank={self.tp_rank} {decode_req.req.rid=} "
+                    f"{decode_req.req.bootstrap_room=}"
+                )
+                logger.error(error_message)
+                prepare_abort(
+                    decode_req.req,
+                    error_message,
+                    status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                )
+                if self.scheduler.metrics_reporter.enable_metrics:
+                    self.scheduler.metrics_collector.increment_prealloc_failed_reqs()
+
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                 if not getattr(decode_req.req, "finished_output", False):
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
                         decode_req.req.return_logprob,
                     )
+                if prealloc_timed_out:
+                    decode_req.kv_receiver.abort()
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)
@@ -1419,6 +1457,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 device_page_size = self.token_to_kv_pool.page_size
                 return kv_to_page_indices(kv_indices_full, device_page_size)
 
+            def _dsa_tail_payload():
+                return get_dsa_tail_state_indices(
+                    self.token_to_kv_pool,
+                    decode_req.req.req_pool_idx,
+                    seq_len,
+                )
+
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
                 # Same window positions and order -> positional match with prefill.
@@ -1451,6 +1496,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,

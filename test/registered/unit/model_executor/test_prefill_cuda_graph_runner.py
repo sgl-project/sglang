@@ -15,6 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_prefill_graph,
 )
@@ -22,6 +23,9 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    _weak_ref_if_tensor,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -37,6 +41,16 @@ class _FakeAttentionBackend:
 
     def prepare_full_cuda_graph_chunked_prefix(self, forward_batch, *, in_capture):
         self.calls.append((forward_batch, in_capture))
+
+
+class _ContextReadingAttentionBackend:
+    def __init__(self):
+        self.req_to_token_pool = object()
+        self.observed_req_to_token_pool = None
+
+    def init_forward_metadata(self, forward_batch):
+        del forward_batch
+        self.observed_req_to_token_pool = get_req_to_token_pool()
 
 
 class _FakeKVIndexKernel:
@@ -151,6 +165,26 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             )
 
         self.assertIs(capture.runner, prefill_runner)
+
+    def test_breakable_graph_keeps_cpu_tensor_reference(self):
+        tensor = torch.zeros(1)
+
+        self.assertIs(_weak_ref_if_tensor(tensor), tensor)
+
+    def test_breakable_graph_keeps_empty_tensor_reference(self):
+        tensor = torch.empty(0, device="meta")
+
+        self.assertIs(_weak_ref_if_tensor(tensor), tensor)
+
+    def test_capture_metadata_initialization_has_forward_context(self):
+        backend = _ContextReadingAttentionBackend()
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(attn_backend=backend)
+        runner.use_captured_attn_metadata = False
+
+        runner._init_forward_metadata_for_capture(SimpleNamespace(), 4)
+
+        self.assertIs(backend.observed_req_to_token_pool, backend.req_to_token_pool)
 
     def test_eagle_target_tc_piecewise_skips_last_mode_capture(self):
         eager_runner = object()

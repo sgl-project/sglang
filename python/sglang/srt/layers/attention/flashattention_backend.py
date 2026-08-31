@@ -23,6 +23,7 @@ from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_kv_cache,
     cp_allgather_and_save_kv_cache,
     cp_attn_forward_extend,
 )
@@ -1259,7 +1260,9 @@ class FlashAttentionBackend(AttentionBackend):
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
         is_cp_mode = (
-            forward_batch.forward_mode.is_context_parallel_extend()
+            forward_batch.forward_mode.is_context_parallel_extend(
+                include_draft_extend_v2=True
+            )
             and forward_batch.attn_cp_metadata is not None
             and self.attn_cp_size > 1
         )
@@ -1452,7 +1455,9 @@ class FlashAttentionBackend(AttentionBackend):
                 window_size = (-1, -1)
 
             if (
-                forward_batch.forward_mode.is_context_parallel_extend()
+                forward_batch.forward_mode.is_context_parallel_extend(
+                    include_draft_extend_v2=True
+                )
                 and forward_batch.attn_cp_metadata is not None
                 and self.attn_cp_size > 1
             ):
@@ -1466,7 +1471,7 @@ class FlashAttentionBackend(AttentionBackend):
                         v_cache=value_cache,
                         page_table=page_table,
                         cache_seqlens=cache_seqlens_cp,
-                        cu_seqlens_q=cu_seqlens_q_cp,
+                        cu_seqlens_q=cu_seqlens_q_cp.to(torch.int32),
                         cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                         max_seqlen_q=max_seqlen_q_cp,
                         softmax_scale=layer.scaling,
@@ -1608,6 +1613,76 @@ class FlashAttentionBackend(AttentionBackend):
                 o = result
         else:
             if (
+                is_cp_mode
+                and self.fa_impl_ver == 4
+                and not any(forward_batch.extend_prefix_lens_cpu or [])
+            ):
+                # FA4 lacks absorbed MLA under CP, so projected K/V must be gathered
+                # globally before each zigzag Q half runs.
+                k_full = cp_all_gather_rerange_kv_cache(
+                    k.contiguous(),
+                    self.attn_cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+                v_full = cp_all_gather_rerange_kv_cache(
+                    v.contiguous(),
+                    self.attn_cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+                cp_meta = forward_batch.attn_cp_metadata
+                full_k_lens = cp_meta.kv_len_next_tensor.to(torch.int32)
+                full_k_lens_cpu = full_k_lens.cpu().tolist()
+
+                def _fa4_mla_mha_cp_attn(
+                    q_chunk,
+                    cu_seqlens_q_cp,
+                    cache_seqlens_cp,
+                    max_seqlen_q_cp,
+                ):
+                    cache_seqlens_cp = cache_seqlens_cp.to(torch.int32)
+                    cache_seqlens_cpu = cache_seqlens_cp.cpu().tolist()
+                    k_parts = []
+                    v_parts = []
+                    offset = 0
+                    for full_len, cache_len in zip(full_k_lens_cpu, cache_seqlens_cpu):
+                        k_parts.append(k_full[offset : offset + cache_len])
+                        v_parts.append(v_full[offset : offset + cache_len])
+                        offset += full_len
+                    k_chunk = torch.cat(k_parts, dim=0)
+                    v_chunk = torch.cat(v_parts, dim=0)
+                    cu_seqlens_k_cp = torch.nn.functional.pad(
+                        torch.cumsum(cache_seqlens_cp, dim=0, dtype=torch.int32),
+                        (1, 0),
+                    )
+                    return flash_attn_varlen_func(
+                        q=q_chunk.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k=k_chunk.view(-1, layer.tp_k_head_num, layer.head_dim).to(
+                            q.dtype
+                        ),
+                        v=v_chunk.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(
+                            q.dtype
+                        ),
+                        cu_seqlens_q=cu_seqlens_q_cp.to(torch.int32),
+                        cu_seqlens_k=cu_seqlens_k_cp,
+                        max_seqlen_q=max_seqlen_q_cp,
+                        max_seqlen_k=int(cache_seqlens_cp.max().item()),
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                        return_softmax_lse=False,
+                        ver=self.fa_impl_ver,
+                        **kwargs,
+                    )
+
+                return cp_attn_forward_extend(
+                    forward_batch,
+                    q.contiguous(),
+                    self.device,
+                    _fa4_mla_mha_cp_attn,
+                )
+
+            if (
                 forward_batch.attn_attend_prefix_cache is not None
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -1682,20 +1757,24 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 k_rope = kv_cache[:, :, layer.v_head_dim :]
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
-                k_rope_cache = k_rope.view(
-                    -1,
-                    self.page_size,
-                    layer.tp_k_head_num,
-                    layer.head_dim - layer.v_head_dim,
-                )
+                if k_rope.numel() == 0:
+                    k_rope_cache = None
+                else:
+                    k_rope_cache = k_rope.view(
+                        -1,
+                        self.page_size,
+                        layer.tp_k_head_num,
+                        layer.head_dim - layer.v_head_dim,
+                    )
                 c_kv_cache = c_kv.view(
                     -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                 )
                 if q_rope is not None:
                     q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                    q_rope = q_rope.view(
-                        -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
-                    )
+                    if q_rope.numel() > 0:
+                        q_rope = q_rope.view(
+                            -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                        )
                 else:
                     q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                     q_nope = q_all[:, :, : layer.v_head_dim]
@@ -1722,6 +1801,8 @@ class FlashAttentionBackend(AttentionBackend):
                     ):
                         q_nope_chunk = q_chunk[..., : layer.v_head_dim]
                         q_rope_chunk = q_chunk[..., layer.v_head_dim :]
+                        if q_rope_chunk.numel() == 0:
+                            q_rope_chunk = None
                         return flash_attn_with_kvcache(
                             q=q_rope_chunk,
                             qv=q_nope_chunk,
@@ -1741,6 +1822,7 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=fa_v_descale,
                             num_splits=self.num_splits,
                             ver=self.fa_impl_ver,
+                            only_qv=q_rope_chunk is None,
                         )
 
                     if is_cp_v2_active(forward_batch):
@@ -1758,6 +1840,8 @@ class FlashAttentionBackend(AttentionBackend):
                             forward_batch, q_fused, self.device, _mla_cp_attn
                         )
                 else:
+                    if q_rope is not None and q_rope.numel() == 0:
+                        q_rope = None
                     result = flash_attn_with_kvcache(
                         q=q_rope,
                         k_cache=k_rope_cache,
@@ -1776,6 +1860,7 @@ class FlashAttentionBackend(AttentionBackend):
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
                         ver=self.fa_impl_ver,
+                        only_qv=q_rope is None,
                     )
                     if use_cascade_attn:
                         o, softmax_lse, *rest = result
@@ -1799,6 +1884,7 @@ class FlashAttentionBackend(AttentionBackend):
                                 return_softmax_lse=True,
                                 num_splits=self.num_splits,
                                 ver=self.fa_impl_ver,
+                                only_qv=q_rope is None,
                             )
                         )
                         o, _ = merge_state_v2_wrapper(
@@ -2084,25 +2170,31 @@ class FlashAttentionBackend(AttentionBackend):
             kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
             k_rope = kv_cache[:, :, layer.v_head_dim :]
             c_kv = kv_cache[:, :, : layer.v_head_dim]
-            k_rope_cache = k_rope.view(
-                -1,
-                self.page_size,
-                layer.tp_k_head_num,
-                layer.head_dim - layer.v_head_dim,
-            )
+            if k_rope.numel() == 0:
+                k_rope_cache = None
+            else:
+                k_rope_cache = k_rope.view(
+                    -1,
+                    self.page_size,
+                    layer.tp_k_head_num,
+                    layer.head_dim - layer.v_head_dim,
+                )
             c_kv_cache = c_kv.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
             )
 
             if q_rope is not None:
                 q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                q_rope = q_rope.view(
-                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
-                )
+                if q_rope.numel() > 0:
+                    q_rope = q_rope.view(
+                        -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                    )
             else:
                 q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 q_nope = q_all[:, :, : layer.v_head_dim]
                 q_rope = q_all[:, :, layer.v_head_dim :]
+            if q_rope is not None and q_rope.numel() == 0:
+                q_rope = None
             max_seqlen_q = metadata.max_seq_len_q
 
             result = flash_attn_with_kvcache(
@@ -2123,6 +2215,7 @@ class FlashAttentionBackend(AttentionBackend):
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
                 num_splits=self.num_splits,
                 ver=self.fa_impl_ver,
+                only_qv=q_rope is None,
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -2145,6 +2238,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
+                    only_qv=q_rope is None,
                 )
                 o, _ = merge_state_v2(
                     o,

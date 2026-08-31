@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -872,6 +873,7 @@ class SchedulerDisaggregationPrefillMixin:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+        self.maybe_send_health_check_signal()
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
@@ -1242,6 +1244,13 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
 
+            def _dsa_tail_payload():
+                return get_dsa_tail_state_indices(
+                    self.token_to_kv_pool_allocator.get_kvcache(),
+                    req.req_pool_idx,
+                    seq_len,
+                )
+
             def _swa_ring_payload():
                 # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
                 # for the last `window` positions, in ascending position order so
@@ -1278,6 +1287,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,

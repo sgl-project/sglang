@@ -126,6 +126,12 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         with patch(
             "sglang.srt.speculative.spec_utils.mambaish_config",
             return_value={"some": "config"},
+        ), patch(
+            "sglang.srt.speculative.spec_utils.get_spec",
+            return_value=MagicMock(speculative_eagle_topk=2),
+        ), patch(
+            "sglang.srt.speculative.spec_utils.mamba_track_grid",
+            return_value=256,
         ):
             commit_mamba_states_after_verify(
                 target_worker,
@@ -200,6 +206,9 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         ), patch(
             "sglang.srt.speculative.spec_utils.mamba_track_grid",
             return_value=256,
+        ), patch(
+            "sglang.srt.speculative.spec_utils.get_spec",
+            return_value=MagicMock(speculative_eagle_topk=2),
         ):
             commit_mamba_states_after_verify(
                 target_worker,
@@ -420,6 +429,92 @@ class TestMtpVerifyHookSignature(CustomTestCase):
                 f"{rel}:{lineno} {self.HOOK} is missing {sorted(missing)}; "
                 "the spec workers call this hook by keyword.",
             )
+
+
+class TestMambaTrackSkipAdaptiveBound(CustomTestCase):
+    """The interval-crossing skip must bound its reach by the CONFIGURED
+    maximum draft size: adaptive gear switches overwrite
+    server_args.speculative_num_draft_tokens with the current gear, while the
+    in-flight verify the host counter lags behind may still be from a larger
+    gear. Regression for the downshift-near-boundary case.
+    """
+
+    def _run_commit(self, kv_committed_len, current_draft=2, max_draft=8, interval=256):
+        from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
+
+        target_worker = MagicMock()
+        target_worker.model_runner.model = MagicMock()
+        # This test isolates the generic Mamba commit path.  A bare MagicMock
+        # would make the upstream ReplaySSM feature flags truthy and divert the
+        # call into the unrelated KDA fold path.
+        target_worker.model_runner.req_to_token_pool.mamba_pool = None
+
+        batch = MagicMock()
+        batch.forward_mode.is_idle.return_value = False
+        batch.mamba_track_indices = torch.tensor([100], dtype=torch.int64)
+        batch.seq_lens = torch.tensor([kv_committed_len + 4], dtype=torch.int32)
+        # GPU-only backend (no CPU mirror): force the host-counter bound.
+        batch.seq_lens_cpu = None
+        req = MagicMock()
+        req.kv_committed_len = kv_committed_len
+        batch.reqs = [req]
+        accept_lens = torch.tensor([current_draft], dtype=torch.int32)
+        accept_index = torch.tensor([[0, 1, -1, -1]], dtype=torch.int32)
+
+        prologue = MagicMock(
+            return_value=(
+                torch.tensor([1], dtype=torch.int32),
+                torch.tensor([-1], dtype=torch.int32),
+            )
+        )
+        with patch(
+            "sglang.srt.speculative.spec_utils.mambaish_config",
+            return_value={"some": "config"},
+        ), patch(
+            "sglang.srt.speculative.spec_utils.get_spec",
+            return_value=MagicMock(speculative_eagle_topk=1),
+        ), patch(
+            "sglang.srt.speculative.spec_utils.mamba_track_grid",
+            return_value=interval,
+        ), patch(
+            "sglang.srt.speculative.spec_utils.max_speculative_num_draft_tokens",
+            return_value=max_draft,
+        ), patch(
+            "sglang.srt.speculative.spec_utils._is_cuda", True
+        ), patch(
+            "sglang.srt.speculative.spec_utils._is_hip", False
+        ), patch(
+            "sglang.kernels.ops.speculative.eagle.nextn_mamba_commit_prologue_func",
+            prologue,
+        ):
+            commit_mamba_states_after_verify(
+                target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                draft_token_num=current_draft,
+            )
+        return prologue
+
+    def test_downshift_near_boundary_keeps_track_commit(self):
+        # lb=249, interval=256: a current-gear reach (3*2=6) would stay in
+        # bucket 0 (249 -> 255) and wrongly skip, but the in-flight verify may
+        # have used the configured gear; the configured-max reach (3*8=24)
+        # crosses (249 -> 273), so the exact tracked path must be kept.
+        prologue = self._run_commit(kv_committed_len=249)
+        prologue.assert_called_once()
+        args = prologue.call_args[0]
+        self.assertEqual(args[2], 256, "track interval must be passed through")
+        self.assertTrue(args[3], "has_track must stay True near the boundary")
+
+    def test_far_from_boundary_skips_track_commit(self):
+        # lb=10: even the configured-max reach (3*8=24) stays inside bucket 0,
+        # so skipping the track commit is provably safe.
+        prologue = self._run_commit(kv_committed_len=10)
+        prologue.assert_called_once()
+        args = prologue.call_args[0]
+        self.assertEqual(args[2], 0, "skip must disable interval tracking")
+        self.assertFalse(args[3])
 
 
 if __name__ == "__main__":

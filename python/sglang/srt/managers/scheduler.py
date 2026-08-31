@@ -16,6 +16,7 @@
 import dataclasses
 import faulthandler
 import logging
+import math
 import os
 import signal
 import sys
@@ -651,6 +652,7 @@ class Scheduler(
 
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
+        self.init_dsa_kpool_truncation_align()
 
         self.init_weight_updater()
 
@@ -1600,6 +1602,28 @@ class Scheduler(
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
         )
+
+    def init_dsa_kpool_truncation_align(self):
+        """Kpool compress-write asserts chunked extends start on pool boundaries.
+        Use the LCM to preserve any existing deterministic-inference alignment."""
+        from sglang.srt.configs.model_config import (
+            get_dsa_index_kpool,
+            is_deepseek_dsa,
+        )
+
+        if not is_deepseek_dsa(self.model_config.hf_config):
+            return
+
+        dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
+        if dsa_index_kpool <= 1:
+            return
+
+        if self.truncation_align_size is None:
+            self.truncation_align_size = dsa_index_kpool
+        else:
+            self.truncation_align_size = math.lcm(
+                self.truncation_align_size, dsa_index_kpool
+            )
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -3126,6 +3150,11 @@ class Scheduler(
             # it. Drop the marker once the request is actually gone.
             if req.finished() or req.kv.req_pool_idx is None:
                 self._pending_chunked_abort_req = None
+                return
+            # The request moved to another scheduler queue after abort_request
+            # deferred it, so retry against its current location.
+            self._pending_chunked_abort_req = None
+            self.abort_request(AbortReq(rid=req.rid))
             return
 
         prepare_abort(req, "Aborted")
@@ -3279,6 +3308,7 @@ class Scheduler(
             running_batch.filter_batch()
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
+                running_batch.is_prefill_only = False
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -3505,6 +3535,9 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if adder.chunk_budget_exhausted():
+                break
+
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -4278,7 +4311,7 @@ class Scheduler(
             )
 
     def maybe_send_health_check_signal(self):
-        if self.return_health_check_ipcs:
+        while self.return_health_check_ipcs:
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.

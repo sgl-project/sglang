@@ -83,7 +83,9 @@ def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
     return (
         forward_batch.attn_cp_metadata is not None
         and mla_enable_prefill_cp
-        and forward_batch.forward_mode.is_context_parallel_extend()
+        and forward_batch.forward_mode.is_context_parallel_extend(
+            include_draft_extend_v2=True
+        )
     )
 
 

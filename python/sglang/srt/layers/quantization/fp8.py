@@ -1609,8 +1609,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_input_scale = None
                 layer.w2_input_scale = None
             runner_is_aiter = (
-                getattr(self, "runner", None) is not None
-                and self.runner.runner_backend.is_aiter()
+                self._owns_moe_runner and self.runner.runner_backend.is_aiter()
             )
             if _use_aiter and runner_is_aiter:
                 layer.w13_weight.data = shuffle_weight(
@@ -1650,14 +1649,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale, requires_grad=False
             )
             layer.w2_input_scale = None
-            if _use_aiter:
+            runner_is_aiter = (
+                self._owns_moe_runner and self.runner.runner_backend.is_aiter()
+            )
+            if _use_aiter and runner_is_aiter:
                 layer.w13_weight.data = shuffle_weight(
                     layer.w13_weight.contiguous(), (16, 16)
                 )
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
-        elif _use_aiter:
+        elif (
+            _use_aiter
+            and self._owns_moe_runner
+            and self.runner.runner_backend.is_aiter()
+        ):
             # Pre-shuffle weights
             t = shuffle_weight(layer.w13_weight, (16, 16))
             layer.w13_weight.copy_(t)

@@ -511,6 +511,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "Lfm2ForCausalLM",
         "Lfm2MoeForCausalLM",
         "ZayaForCausalLM",
+        "Glm5NextForConditionalGeneration",
     }
 )
 
@@ -532,6 +533,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "BailingMoeV3ForCausalLM",
         "FalconH1ForCausalLM",
         "GraniteMoeHybridForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
@@ -762,6 +764,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
         "Dots3NoteForCausalLM",

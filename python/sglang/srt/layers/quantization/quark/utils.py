@@ -55,6 +55,11 @@ def should_ignore_layer(
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]
 
+    # A serialized fused module may appear directly in ``exclude``, so match it
+    # before expanding the packed mapping.
+    if check_equal_or_regex_match(layer_name=layer_name, targets=ignore):
+        return True
+
     # Fused layers like gate_up_proj or qkv_proj will not be fused
     # in the safetensors checkpoint. So, we convert the name
     # from the fused version to unfused + check to make sure that

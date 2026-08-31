@@ -102,6 +102,55 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     return int(cell_size) * get_parallel().attn_dcp_size
 
 
+def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
+    """Global layer ids represented by the local DSA pool's dense layer slots."""
+    if kvc.mambaish_config and not kvc.is_draft_worker:
+        layer_ids = [
+            layer_id
+            for layer_id in kvc.mambaish_config.full_attention_layer_ids
+            if kvc.layer_info.start_layer <= layer_id < kvc.layer_info.end_layer
+        ]
+    else:
+        layer_ids = list(range(kvc.layer_info.start_layer, kvc.layer_info.end_layer))
+    # Draft pools and a few platform-specific pools may expose a synthetic layer
+    # count. They do not use indexShare, so only the length matters for sizing.
+    if len(layer_ids) != num_layers:
+        return list(range(num_layers))
+    return layer_ids
+
+
+def _get_dsa_indexer_effective_num_layers(
+    kvc: KVCacheConfigurator, cache_layer_ids: list[int]
+) -> int:
+    """Indexer buffers materialized per rank, including split remote scratch."""
+    enable_hisparse = kvc.server_args.enable_hisparse
+    if enable_hisparse or kvc.is_draft_worker:
+        included_layers = [True] * len(cache_layer_ids)
+    else:
+        included_layers = [
+            not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+            for layer_id in cache_layer_ids
+        ]
+
+    from sglang.srt.layers.cp.utils import (
+        get_glm_dsa_cp_layer_shard_info,
+        get_layer_shard_range,
+    )
+
+    layer_shard_rank, shard_size = get_glm_dsa_cp_layer_shard_info(kvc)
+    if enable_hisparse or layer_shard_rank is None:
+        return sum(included_layers)
+
+    # All ranks must derive the same token capacity. Use the maximum number of
+    # non-skipped owned layers across shards, then account for the one full-size
+    # remote indexer scratch buffer allocated by LayerSplitDSATokenToKVPool.
+    max_owned_layers = 0
+    for rank in range(shard_size):
+        start, end = get_layer_shard_range(rank, shard_size, len(cache_layer_ids))
+        max_owned_layers = max(max_owned_layers, sum(included_layers[start:end]))
+    return max(1, max_owned_layers + 1)
+
+
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
     if dtype_name in ("float32", "fp32"):
@@ -200,16 +249,23 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
-                    draft_kv_size = int(
-                        target_kv_size * draft_num_layers / target_kv_num_layers
+                    # Draft pools are DCP-replicated, not sharded: budget all copies.
+                    dcp_size = kvc.ps.attn_dcp_size
+                    draft_kv_size = (
+                        int(target_kv_size * draft_num_layers / target_kv_num_layers)
+                        * dcp_size
                     )
-                    draft_indexer_size = self._compute_dsa_indexer_cell_size(
-                        kvc=kvc,
-                        num_layers=draft_num_layers,
-                        allocate_all_layers=True,
+                    draft_indexer_size = (
+                        self._compute_dsa_indexer_cell_size(
+                            kvc=kvc,
+                            num_layers=draft_num_layers,
+                            allocate_all_layers=True,
+                        )
+                        * dcp_size
                     )
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
+                    draft_num_layers *= kvc.ps.attn_dcp_size
                     self._cell_size = int(
                         self._cell_size * (1 + draft_num_layers / int(num_layers))
                     )
@@ -247,8 +303,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             get_glm_dsa_layer_split_effective_num_layers,
         )
 
-        effective_num_layers = get_glm_dsa_layer_split_effective_num_layers(
-            kvc, num_layers
+        effective_num_layers = (
+            num_layers
+            if kvc.server_args.enable_hisparse
+            else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
+        )
+
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
         )
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
@@ -384,34 +446,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         ):
             num_indexer_layers = num_layers
         else:
-            active_indexer_layers = [
-                layer_id
-                for layer_id in range(
-                    kvc.layer_info.start_layer, kvc.layer_info.end_layer
-                )
-                if not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
-            ]
-            from sglang.srt.layers.cp.utils import (
-                get_glm_dsa_cp_layer_shard_info,
-                get_layer_shard_range,
+            num_indexer_layers = _get_dsa_indexer_effective_num_layers(
+                kvc, _get_dsa_cache_layer_ids(kvc, num_layers)
             )
-
-            _, shard_size = get_glm_dsa_cp_layer_shard_info(kvc)
-            if shard_size > 1:
-                active_set = set(active_indexer_layers)
-                max_owned = 0
-                for rank in range(shard_size):
-                    start, end = get_layer_shard_range(rank, shard_size, num_layers)
-                    max_owned = max(
-                        max_owned,
-                        sum(
-                            kvc.layer_info.start_layer + i in active_set
-                            for i in range(start, end)
-                        ),
-                    )
-                num_indexer_layers = max_owned + 1
-            else:
-                num_indexer_layers = len(active_indexer_layers)
 
         return int(
             indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
@@ -541,6 +578,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     - self._draft_swa_layers_num
                     - self._draft_swa_full_layers_num
                 )
+                dcp_size = kvc.ps.attn_dcp_size
+                self._draft_swa_layers_num *= dcp_size
+                self._draft_swa_full_layers_num *= dcp_size
+                self._draft_full_layers_num *= dcp_size
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
 

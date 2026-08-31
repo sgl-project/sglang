@@ -4,6 +4,7 @@ import unittest
 
 from sglang.srt.parser.jinja_template_utils import (
     detect_jinja_template_content_format,
+    jinja_template_may_reorder_tool_results,
     process_content_for_template_format,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -15,6 +16,34 @@ register_cpu_ci(est_time=6, suite="base-c-test-cpu")
 
 class TestTemplateContentFormatDetection(CustomTestCase):
     """Test template content format detection functionality."""
+
+    def test_detect_tool_result_id_association(self):
+        attribute_template = """
+        {% for message in messages %}
+            {{ message.tool_call_id }}
+        {% endfor %}
+        """
+        item_template = "{{ messages[0]['tool_call_id'] }}"
+        get_template = "{{ messages[0].get('tool_call_id') }}"
+        select_template = (
+            "{{ messages | selectattr('tool_call_id', 'equalto', 'call-a') | list }}"
+        )
+        sort_template = "{{ messages | sort(attribute='tool_call_id') }}"
+
+        self.assertTrue(jinja_template_may_reorder_tool_results(attribute_template))
+        self.assertTrue(jinja_template_may_reorder_tool_results(item_template))
+        self.assertTrue(jinja_template_may_reorder_tool_results(get_template))
+        self.assertTrue(jinja_template_may_reorder_tool_results(select_template))
+        self.assertTrue(jinja_template_may_reorder_tool_results(sort_template))
+
+    def test_tool_call_id_text_does_not_enable_order_recovery(self):
+        self.assertFalse(
+            jinja_template_may_reorder_tool_results(
+                "{# tool_call_id is mentioned only in a comment #}{{ messages }}"
+            )
+        )
+        self.assertFalse(jinja_template_may_reorder_tool_results("{{{{ invalid"))
+        self.assertFalse(jinja_template_may_reorder_tool_results(None))
 
     def test_detect_llama4_openai_format(self):
         """Test detection of llama4-style template (should be 'openai' format)."""

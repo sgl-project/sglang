@@ -30,10 +30,12 @@ class _Allocator:
     def get_kvcache(self):
         return self._kv
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         return "kv"
 
-    def load_cpu_copy(self, cpu_tensors, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, cpu_tensors, indices, mamba_indices=None, req_pool_index=None
+    ):
         self.loaded_kv = cpu_tensors
 
 

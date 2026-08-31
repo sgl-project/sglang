@@ -1698,7 +1698,7 @@ class ModelRunner:
                 )
             else:
                 # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
-                pool.mamba_pool.copy_from(
+                pool.copy_mamba_state(
                     pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
                     pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
                 )

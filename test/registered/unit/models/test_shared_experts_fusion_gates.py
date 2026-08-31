@@ -215,6 +215,62 @@ class TestGlmMoeGate(_FusionGateCase):
         )
 
 
+class TestGlm5NextGate(_FusionGateCase):
+    def _config(self):
+        return SimpleNamespace(n_shared_experts=1)
+
+    def _reason_for_backend(
+        self,
+        *,
+        is_cuda=False,
+        use_aiter_gfx95=False,
+        device_sm=None,
+        moe_ep_size=1,
+        deepep=False,
+    ):
+        import sglang.srt.models.glm5_next as glm5_next
+
+        backend = SimpleNamespace(is_deepep=lambda: deepep)
+        with (
+            unittest.mock.patch.object(glm5_next, "_is_cuda", is_cuda),
+            unittest.mock.patch.object(glm5_next, "_use_aiter_gfx95", use_aiter_gfx95),
+            unittest.mock.patch.object(glm5_next, "_device_sm", device_sm),
+            unittest.mock.patch.object(
+                glm5_next, "get_moe_a2a_backend", return_value=backend
+            ),
+        ):
+            return self._reason(
+                glm5_next.Glm5NextForConditionalGeneration,
+                self._config(),
+                moe_ep_size=moe_ep_size,
+            )
+
+    def test_aiter_gfx95_enables_shared_expert_fusion(self):
+        self.assertIsNone(self._reason_for_backend(use_aiter_gfx95=True))
+
+    def test_unsupported_non_cuda_backend_disables_shared_expert_fusion(self):
+        self.assertIn("requires CUDA", self._reason_for_backend())
+
+    def test_cuda_sm80_path_is_unchanged(self):
+        self.assertIsNone(self._reason_for_backend(is_cuda=True, device_sm=80))
+        self.assertIn(
+            "SM80 or newer",
+            self._reason_for_backend(is_cuda=True, device_sm=75),
+        )
+
+    def test_expert_parallelism_still_disables_shared_expert_fusion(self):
+        self.assertIn(
+            "expert parallelism",
+            self._reason_for_backend(use_aiter_gfx95=True, moe_ep_size=2),
+        )
+
+    def test_deepep_still_disables_shared_expert_fusion(self):
+        self.assertIn(
+            "Deepep",
+            self._reason_for_backend(use_aiter_gfx95=True, deepep=True),
+        )
+
+
 class TestMiniMaxGates(_FusionGateCase):
     def test_a_config_without_shared_experts_cannot_fuse(self):
         from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM

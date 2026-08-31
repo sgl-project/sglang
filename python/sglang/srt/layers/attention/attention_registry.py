@@ -7,6 +7,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
 )
 from sglang.srt.configs.hybrid_arch import (
+    glm5_next_config,
     hybrid_gdn_config,
     hybrid_lightning_config,
     kimi_linear_config,
@@ -504,6 +505,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
             else:
                 linear_attn_backend = KDAAttnBackend(runner)
+        elif glm5_next_config(runner.model_config) is not None:
+            linear_attn_backend = KDAAttnBackend(runner)
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:

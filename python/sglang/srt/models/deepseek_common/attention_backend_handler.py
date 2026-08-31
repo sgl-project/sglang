@@ -113,9 +113,9 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
         return _dispatch_mla_subtype(attn, forward_batch)
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
-    disable_ragged = (
-        backend_name in ["flashinfer", "flashmla"]
-    ) and attn.flashinfer_mla_disable_ragged
+    disable_ragged = (backend_name in ["flashinfer", "flashmla"]) and (
+        attn.flashinfer_mla_disable_ragged or attn.qk_rope_head_dim == 0
+    )
 
     if (
         not disable_ragged

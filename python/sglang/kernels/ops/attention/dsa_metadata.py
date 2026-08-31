@@ -4,12 +4,22 @@ import torch
 import triton
 import triton.language as tl
 
+# Bound the replay grid while retaining enough copy programs to saturate the GPU.
+_TILE_PROGRAM_TARGET = 8192
+
+
+def _bounded_scan_num_splits(rows: int, num_col_blocks: int) -> int:
+    """Keep the grid capture-safe while bounding traversal by replay-time data."""
+    assert rows > 0
+    return max(1, min(num_col_blocks, _TILE_PROGRAM_TARGET // rows))
+
 
 @triton.jit(
     do_not_specialize=[
         "page_table_stride_0",
         "real_page_table_stride_0",
         "max_len",
+        "num_splits",
     ]
 )
 def _fused_dsa_decode_metadata_kernel(
@@ -32,7 +42,9 @@ def _fused_dsa_decode_metadata_kernel(
     real_page_table_stride_1: tl.constexpr,
     bs: tl.constexpr,
     max_len,
+    num_splits,
     dsa_index_topk: tl.constexpr,
+    index_kpool: tl.constexpr,
     real_page_size: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
     HAS_PAGE_TABLE_1: tl.constexpr,
@@ -46,7 +58,14 @@ def _fused_dsa_decode_metadata_kernel(
         mask_b = offs_b < bs
         seq = tl.load(seq_lens + offs_b * seq_lens_stride, mask=mask_b, other=0)
         seq_i32 = seq.to(tl.int32)
-        dsa_seq = tl.minimum(seq_i32, dsa_index_topk)
+        if index_kpool <= 1:
+            dsa_seq = tl.minimum(seq_i32, dsa_index_topk)
+        else:
+            # Preserve the live partial pool after selecting pool-aligned history.
+            full_pool_tokens = (seq_i32 // index_kpool) * index_kpool
+            selected_history_tokens = tl.minimum(full_pool_tokens, dsa_index_topk)
+            tail_tokens = seq_i32 - full_pool_tokens
+            dsa_seq = selected_history_tokens + tail_tokens
 
         cu = tl.cumsum(seq_i32, 0)
         dsa_cu = tl.cumsum(dsa_seq, 0)
@@ -59,52 +78,53 @@ def _fused_dsa_decode_metadata_kernel(
         tl.store(dsa_cu_seqlens_k + 1 + offs_b, dsa_cu, mask=mask_b)
         return
 
-    num_col_blocks = tl.cdiv(max_len, BLOCK_N)
     page_pid = pid - 1
-    row = page_pid // num_col_blocks
-    col_block = page_pid - row * num_col_blocks
-    offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = (row < bs) & (offs_n < max_len)
+    row = page_pid // num_splits
+    split_id = page_pid - row * num_splits
 
     req_idx = tl.load(
         req_pool_indices + row * req_pool_indices_stride,
         mask=row < bs,
         other=0,
     )
-    # Skip column blocks past the request's kv length: no consumer reads there
-    # (attention and the indexer both stay within cache_seqlens). Loaded after
-    # req_idx so the two scalar loads pipeline (no added latency when live).
     kv_len = tl.load(
         seq_lens + row * seq_lens_stride,
         mask=row < bs,
         other=0,
     ).to(tl.int32)
-    if col_block * BLOCK_N >= kv_len:
-        return
-    vals = tl.load(
-        req_to_token + req_idx * req_to_token_stride_0 + offs_n * req_to_token_stride_1,
-        mask=mask,
-        other=0,
-    ).to(tl.int32)
-    # Write the wide page_size=1 table only when the caller provides it; the
-    # fused decode CUDA graph drops it and consumes real_page_table alone.
-    if HAS_PAGE_TABLE_1:
-        tl.store(
-            page_table_1 + row * page_table_stride_0 + offs_n * page_table_stride_1,
-            vals,
+    # Page-table row offsets can overflow int32 at 1M context.
+    row_i64 = row.to(tl.int64)
+    num_live_blocks = tl.minimum(tl.cdiv(kv_len, BLOCK_N), tl.cdiv(max_len, BLOCK_N))
+    # Three stages hide latency across strided copy iterations.
+    for col_block in tl.range(split_id, num_live_blocks, num_splits, num_stages=3):
+        offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = (row < bs) & (offs_n < max_len)
+        vals = tl.load(
+            req_to_token
+            + req_idx * req_to_token_stride_0
+            + offs_n * req_to_token_stride_1,
             mask=mask,
-        )
+            other=0,
+        ).to(tl.int32)
+        if HAS_PAGE_TABLE_1:
+            tl.store(
+                page_table_1
+                + row_i64 * page_table_stride_0
+                + offs_n * page_table_stride_1,
+                vals,
+                mask=mask,
+            )
 
-    if HAS_REAL_PAGE_TABLE:
-        real_mask = mask & ((offs_n % real_page_size) == 0)
-        real_cols = offs_n // real_page_size
-        tl.store(
-            real_page_table
-            + row * real_page_table_stride_0
-            + real_cols * real_page_table_stride_1,
-            vals // real_page_size,
-            mask=real_mask,
-        )
+        if HAS_REAL_PAGE_TABLE:
+            real_mask = mask & ((offs_n % real_page_size) == 0)
+            real_cols = offs_n // real_page_size
+            tl.store(
+                real_page_table
+                + row_i64 * real_page_table_stride_0
+                + real_cols * real_page_table_stride_1,
+                vals // real_page_size,
+                mask=real_mask,
+            )
 
 
 def fused_dsa_decode_metadata(
@@ -121,6 +141,7 @@ def fused_dsa_decode_metadata(
     max_len: int,
     dsa_index_topk: int,
     real_page_size: int,
+    index_kpool: int = 1,
 ) -> None:
     """Fill decode-graph DSA metadata (seqlens + page tables) from req_to_token.
 
@@ -134,6 +155,11 @@ def fused_dsa_decode_metadata(
     Contract: each page-table row is written only over its live prefix
     ([:cache_seqlens]); the tail keeps stale values across CUDA-graph replays, so
     consumers must bound reads by cache_seqlens.
+
+    The column scan is bounded inside the kernel by each row's own kv length
+    (read at run time), so the cost scales with the live sequence lengths and
+    not with ``max_len`` (the table width); the grid itself stays
+    data-independent. See :func:`_bounded_scan_num_splits`.
     """
     assert seq_lens.is_cuda
     assert req_pool_indices.is_cuda
@@ -147,6 +173,7 @@ def fused_dsa_decode_metadata(
         cu_seqlens_k[:1].zero_()
         dsa_cu_seqlens_k[:1].zero_()
         return
+    assert index_kpool > 0
 
     has_real_page_table = real_page_size > 1
     if has_real_page_table:
@@ -169,7 +196,8 @@ def fused_dsa_decode_metadata(
     block_bs = triton.next_power_of_2(bs)
     block_n = 128
     num_col_blocks = triton.cdiv(max_len, block_n)
-    grid = (1 + bs * num_col_blocks,)
+    num_splits = _bounded_scan_num_splits(bs, num_col_blocks)
+    grid = (1 + bs * num_splits,)
 
     _fused_dsa_decode_metadata_kernel[grid](
         seq_lens,
@@ -191,7 +219,9 @@ def fused_dsa_decode_metadata(
         real_page_table.stride(1) if has_real_page_table else 0,
         bs,
         max_len,
+        num_splits,
         dsa_index_topk,
+        index_kpool,
         real_page_size,
         has_real_page_table,
         has_page_table_1,
@@ -205,6 +235,7 @@ def fused_dsa_decode_metadata(
         "page_table_stride_0",
         "real_page_table_stride_0",
         "max_seqlen_k",
+        "num_splits",
     ]
 )
 def _fused_dsa_target_verify_metadata_kernel(
@@ -231,7 +262,9 @@ def _fused_dsa_target_verify_metadata_kernel(
     paged_mqa_ctx_lens_stride_1: tl.constexpr,
     bs: tl.constexpr,
     max_seqlen_k,
+    num_splits,
     dsa_index_topk: tl.constexpr,
+    index_kpool: tl.constexpr,
     real_page_size: tl.constexpr,
     next_n: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
@@ -266,7 +299,14 @@ def _fused_dsa_target_verify_metadata_kernel(
         ).to(tl.int32)
         expanded_seq = base_seq + draft_off + 1
         expanded_seq = tl.where(mask_e, expanded_seq, 0)
-        dsa_seq = tl.minimum(expanded_seq, dsa_index_topk)
+        if index_kpool <= 1:
+            dsa_seq = tl.minimum(expanded_seq, dsa_index_topk)
+        else:
+            # Preserve the live partial pool after selecting pool-aligned history.
+            full_pool_tokens = (expanded_seq // index_kpool) * index_kpool
+            selected_history_tokens = tl.minimum(full_pool_tokens, dsa_index_topk)
+            tail_tokens = expanded_seq - full_pool_tokens
+            dsa_seq = selected_history_tokens + tail_tokens
         dsa_cu = tl.cumsum(dsa_seq, 0)
 
         tl.store(seqlens_expanded + offs_e, expanded_seq, mask=mask_e)
@@ -284,12 +324,9 @@ def _fused_dsa_target_verify_metadata_kernel(
             )
         return
 
-    num_col_blocks = tl.cdiv(max_seqlen_k, BLOCK_N)
     page_pid = pid - 1
-    out_row = page_pid // num_col_blocks
-    col_block = page_pid - out_row * num_col_blocks
-    offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = (out_row < expanded_size) & (offs_n < max_seqlen_k)
+    out_row = page_pid // num_splits
+    split_id = page_pid - out_row * num_splits
 
     req_row = out_row // next_n
     req_idx = tl.load(
@@ -297,10 +334,6 @@ def _fused_dsa_target_verify_metadata_kernel(
         mask=out_row < expanded_size,
         other=0,
     )
-    # Skip column blocks past the request's kv length (seq_len + next_n): no
-    # consumer reads there (attention and the indexer stay within cache_seqlens).
-    # Loaded after req_idx so the two scalar loads pipeline (no added latency
-    # when live).
     kv_len = (
         tl.load(
             seq_lens + req_row * seq_lens_stride,
@@ -309,35 +342,43 @@ def _fused_dsa_target_verify_metadata_kernel(
         ).to(tl.int32)
         + next_n
     )
-    if col_block * BLOCK_N >= kv_len:
-        return
-    vals = tl.load(
-        req_to_token + req_idx * req_to_token_stride_0 + offs_n * req_to_token_stride_1,
-        mask=mask,
-        other=0,
-    ).to(tl.int32)
-    # Write the wide page_size=1 table only when the caller provides it (see
-    # fused_dsa_decode_metadata for the optional-page_table_1 contract).
-    if HAS_PAGE_TABLE_1:
-        tl.store(
-            page_table_1 + out_row * page_table_stride_0 + offs_n * page_table_stride_1,
-            vals,
+    # Output-row offsets can overflow int32 at 1M context.
+    out_row_i64 = out_row.to(tl.int64)
+    num_live_blocks = tl.minimum(
+        tl.cdiv(kv_len, BLOCK_N), tl.cdiv(max_seqlen_k, BLOCK_N)
+    )
+    for col_block in tl.range(split_id, num_live_blocks, num_splits, num_stages=3):
+        offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = (out_row < expanded_size) & (offs_n < max_seqlen_k)
+        vals = tl.load(
+            req_to_token
+            + req_idx * req_to_token_stride_0
+            + offs_n * req_to_token_stride_1,
             mask=mask,
-        )
+            other=0,
+        ).to(tl.int32)
+        if HAS_PAGE_TABLE_1:
+            tl.store(
+                page_table_1
+                + out_row_i64 * page_table_stride_0
+                + offs_n * page_table_stride_1,
+                vals,
+                mask=mask,
+            )
 
-    if HAS_REAL_PAGE_TABLE:
-        real_mask = mask & ((offs_n % real_page_size) == 0)
-        real_cols = offs_n // real_page_size
-        tl.store(
-            real_page_table
-            + out_row * real_page_table_stride_0
-            + real_cols * real_page_table_stride_1,
-            vals // real_page_size,
-            mask=real_mask,
-        )
+        if HAS_REAL_PAGE_TABLE:
+            real_mask = mask & ((offs_n % real_page_size) == 0)
+            real_cols = offs_n // real_page_size
+            tl.store(
+                real_page_table
+                + out_row_i64 * real_page_table_stride_0
+                + real_cols * real_page_table_stride_1,
+                vals // real_page_size,
+                mask=real_mask,
+            )
 
 
-def fused_dsa_target_verify_metadata(
+def _prep_fused_dsa_target_verify_metadata_launch(
     seq_lens: torch.Tensor,
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -354,7 +395,8 @@ def fused_dsa_target_verify_metadata(
     real_page_size: int,
     next_n: int,
     paged_mqa_ctx_lens_2d: torch.Tensor = None,
-) -> None:
+    index_kpool: int = 1,
+):
     assert seq_lens.is_cuda
     assert req_pool_indices.is_cuda
     assert req_to_token.is_cuda
@@ -364,11 +406,9 @@ def fused_dsa_target_verify_metadata(
     assert dsa_cache_seqlens.is_cuda
     assert dsa_cu_seqlens_k.is_cuda
 
-    if bs == 0:
-        cu_seqlens_k[:1].zero_()
-        dsa_cu_seqlens_k[:1].zero_()
-        return
+    assert bs > 0
     assert next_n > 0
+    assert index_kpool > 0
 
     has_real_page_table = real_page_size > 1
     if has_real_page_table:
@@ -402,9 +442,10 @@ def fused_dsa_target_verify_metadata(
     block_expanded = triton.next_power_of_2(expanded_size)
     block_n = 128
     num_col_blocks = triton.cdiv(max_seqlen_k, block_n)
-    grid = (1 + expanded_size * num_col_blocks,)
+    num_splits = _bounded_scan_num_splits(expanded_size, num_col_blocks)
+    grid = (1 + expanded_size * num_splits,)
 
-    _fused_dsa_target_verify_metadata_kernel[grid](
+    args = (
         seq_lens,
         req_pool_indices,
         req_to_token,
@@ -428,16 +469,69 @@ def fused_dsa_target_verify_metadata(
         paged_mqa_ctx_lens_2d.stride(1) if has_paged_mqa_ctx_lens else 0,
         bs,
         max_seqlen_k,
+        num_splits,
         dsa_index_topk,
+        index_kpool,
         real_page_size,
         next_n,
         has_real_page_table,
         has_paged_mqa_ctx_lens,
         has_page_table_1,
+    )
+    constexprs = dict(
         BLOCK_BS=block_bs,
         BLOCK_EXPANDED=block_expanded,
         BLOCK_N=block_n,
     )
+    return grid, args, constexprs
+
+
+def fused_dsa_target_verify_metadata(
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    page_table_1: Optional[torch.Tensor],
+    seqlens_expanded: torch.Tensor,
+    dsa_cache_seqlens: torch.Tensor,
+    dsa_cu_seqlens_k: torch.Tensor,
+    real_page_table: torch.Tensor,
+    bs: int,
+    max_seqlen_k: int,
+    dsa_index_topk: int,
+    real_page_size: int,
+    next_n: int,
+    paged_mqa_ctx_lens_2d: torch.Tensor = None,
+    index_kpool: int = 1,
+) -> None:
+    if bs == 0:
+        assert cu_seqlens_k.is_cuda
+        assert dsa_cu_seqlens_k.is_cuda
+        cu_seqlens_k[:1].zero_()
+        dsa_cu_seqlens_k[:1].zero_()
+        return
+
+    grid, args, constexprs = _prep_fused_dsa_target_verify_metadata_launch(
+        seq_lens,
+        req_pool_indices,
+        req_to_token,
+        cache_seqlens,
+        cu_seqlens_k,
+        page_table_1,
+        seqlens_expanded,
+        dsa_cache_seqlens,
+        dsa_cu_seqlens_k,
+        real_page_table,
+        bs,
+        max_seqlen_k,
+        dsa_index_topk,
+        real_page_size,
+        next_n,
+        paged_mqa_ctx_lens_2d,
+        index_kpool,
+    )
+    _fused_dsa_target_verify_metadata_kernel[grid](*args, **constexprs)
 
 
 @triton.jit(
@@ -446,6 +540,7 @@ def fused_dsa_target_verify_metadata(
         "real_page_table_stride_0",
         "total_len",
         "max_seqlen_k",
+        "num_splits",
     ]
 )
 def _fused_dsa_draft_extend_metadata_kernel(
@@ -472,7 +567,9 @@ def _fused_dsa_draft_extend_metadata_kernel(
     bs: tl.constexpr,
     total_len,
     max_seqlen_k,
+    num_splits,
     dsa_index_topk: tl.constexpr,
+    index_kpool: tl.constexpr,
     real_page_size: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
     HAS_PAGE_TABLE_1: tl.constexpr,
@@ -532,7 +629,14 @@ def _fused_dsa_draft_extend_metadata_kernel(
         expanded_seq = base_seq - qo_len_for_row + local_off + 1
         expanded_seq = tl.maximum(expanded_seq, 0)
         expanded_seq = tl.where(mask_e, expanded_seq, 0)
-        dsa_seq = tl.minimum(expanded_seq, dsa_index_topk)
+        if index_kpool <= 1:
+            dsa_seq = tl.minimum(expanded_seq, dsa_index_topk)
+        else:
+            # Preserve the live partial pool after selecting pool-aligned history.
+            full_pool_tokens = (expanded_seq // index_kpool) * index_kpool
+            selected_history_tokens = tl.minimum(full_pool_tokens, dsa_index_topk)
+            tail_tokens = expanded_seq - full_pool_tokens
+            dsa_seq = selected_history_tokens + tail_tokens
         dsa_cu = tl.cumsum(dsa_seq, 0)
 
         tl.store(seqlens_expanded + offs_e, expanded_seq, mask=mask_e)
@@ -541,25 +645,25 @@ def _fused_dsa_draft_extend_metadata_kernel(
         tl.store(dsa_cu_seqlens_k + 1 + offs_e, dsa_cu, mask=mask_e)
         return
 
-    num_col_blocks = tl.cdiv(max_seqlen_k, BLOCK_N)
     page_pid = pid - 1
-    req_row = page_pid // num_col_blocks
-    col_block = page_pid - req_row * num_col_blocks
-    offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    req_row = page_pid // num_splits
+    split_id = page_pid - req_row * num_splits
 
     qo_len = tl.load(
         extend_seq_lens + req_row * extend_seq_lens_stride,
         mask=req_row < bs,
         other=0,
     ).to(tl.int32)
-    # Skip column blocks past the request's kv length: no consumer reads there
-    # (attention and the indexer both stay within cache_seqlens).
     kv_len = tl.load(
         seq_lens + req_row * seq_lens_stride,
         mask=req_row < bs,
         other=0,
     ).to(tl.int32)
-    if col_block * BLOCK_N >= kv_len:
+    # Bound the scan by the live replay-time kv length.
+    num_live_blocks = tl.minimum(
+        tl.cdiv(kv_len, BLOCK_N), tl.cdiv(max_seqlen_k, BLOCK_N)
+    )
+    if split_id >= num_live_blocks:
         return
     if STATIC_EXTEND_LEN:
         prefix = req_row * qo_len
@@ -573,41 +677,46 @@ def _fused_dsa_draft_extend_metadata_kernel(
     offs_r = tl.arange(0, BLOCK_ROWS)
     out_rows = prefix + offs_r
     row_mask = (req_row < bs) & (offs_r < qo_len) & (out_rows < total_len)
-    col_mask = offs_n < max_seqlen_k
     has_rows = (req_row < bs) & (qo_len > 0)
-    mask = row_mask[:, None] & col_mask[None, :]
 
     req_idx = tl.load(
         req_pool_indices + req_row * req_pool_indices_stride,
         mask=has_rows,
         other=0,
     )
-    vals = tl.load(
-        req_to_token + req_idx * req_to_token_stride_0 + offs_n * req_to_token_stride_1,
-        mask=col_mask & has_rows,
-        other=0,
-    ).to(tl.int32)
-    # Write the wide page_size=1 table only when the caller provides it (see
-    # fused_dsa_decode_metadata for the optional-page_table_1 contract).
-    if HAS_PAGE_TABLE_1:
-        tl.store(
-            page_table_1
-            + out_rows[:, None] * page_table_stride_0
-            + offs_n[None, :] * page_table_stride_1,
-            vals[None, :],
-            mask=mask,
-        )
+    # Output-row offsets can overflow int32 at 1M context.
+    out_rows_i64 = out_rows.to(tl.int64)
+    for col_block in tl.range(split_id, num_live_blocks, num_splits, num_stages=3):
+        offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+        col_mask = offs_n < max_seqlen_k
+        mask = row_mask[:, None] & col_mask[None, :]
 
-    if HAS_REAL_PAGE_TABLE:
-        real_mask = mask & ((offs_n[None, :] % real_page_size) == 0)
-        real_cols = offs_n // real_page_size
-        tl.store(
-            real_page_table
-            + out_rows[:, None] * real_page_table_stride_0
-            + real_cols[None, :] * real_page_table_stride_1,
-            (vals // real_page_size)[None, :],
-            mask=real_mask,
-        )
+        vals = tl.load(
+            req_to_token
+            + req_idx * req_to_token_stride_0
+            + offs_n * req_to_token_stride_1,
+            mask=col_mask & has_rows,
+            other=0,
+        ).to(tl.int32)
+        if HAS_PAGE_TABLE_1:
+            tl.store(
+                page_table_1
+                + out_rows_i64[:, None] * page_table_stride_0
+                + offs_n[None, :] * page_table_stride_1,
+                vals[None, :],
+                mask=mask,
+            )
+
+        if HAS_REAL_PAGE_TABLE:
+            real_mask = mask & ((offs_n[None, :] % real_page_size) == 0)
+            real_cols = offs_n // real_page_size
+            tl.store(
+                real_page_table
+                + out_rows_i64[:, None] * real_page_table_stride_0
+                + real_cols[None, :] * real_page_table_stride_1,
+                (vals // real_page_size)[None, :],
+                mask=real_mask,
+            )
 
 
 def fused_dsa_draft_extend_metadata(
@@ -630,6 +739,7 @@ def fused_dsa_draft_extend_metadata(
     max_extend_len: int,
     max_total_len: int,
     static_extend_len: bool = False,
+    index_kpool: int = 1,
 ) -> None:
     assert seq_lens.is_cuda
     assert extend_seq_lens.is_cuda
@@ -658,6 +768,7 @@ def fused_dsa_draft_extend_metadata(
     # that would sync in the replay hot path.
     assert max_extend_len > 0
     assert total_len <= bs * max_extend_len
+    assert index_kpool > 0
 
     has_real_page_table = real_page_size > 1
     if has_real_page_table:
@@ -681,7 +792,8 @@ def fused_dsa_draft_extend_metadata(
     block_rows = triton.next_power_of_2(max_extend_len)
     block_n = 128
     num_col_blocks = triton.cdiv(max_seqlen_k, block_n)
-    grid = (1 + bs * num_col_blocks,)
+    num_splits = _bounded_scan_num_splits(bs, num_col_blocks)
+    grid = (1 + bs * num_splits,)
 
     _fused_dsa_draft_extend_metadata_kernel[grid](
         seq_lens,
@@ -707,7 +819,9 @@ def fused_dsa_draft_extend_metadata(
         bs,
         total_len,
         max_seqlen_k,
+        num_splits,
         dsa_index_topk,
+        index_kpool,
         real_page_size,
         has_real_page_table,
         has_page_table_1,

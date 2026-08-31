@@ -113,6 +113,13 @@ def kimi_linear_config(model_config: ModelConfig):
     return None
 
 
+def glm5_next_config(model_config: ModelConfig):
+    hf_config = model_config.hf_config
+    if hf_config.model_type == "glm5_next" and not model_config.is_draft_model:
+        return hf_config.get_text_config()
+    return None
+
+
 def linear_attn_model_spec(model_config: ModelConfig):
     result = _get_linear_attn_registry_result(model_config)
     return result[0] if result else None
@@ -123,6 +130,7 @@ def mambaish_config(model_config: ModelConfig):
         mamba2_config(model_config)
         or hybrid_gdn_config(model_config)
         or kimi_linear_config(model_config)
+        or glm5_next_config(model_config)
         or hybrid_lightning_config(model_config)
     )
     if existing:

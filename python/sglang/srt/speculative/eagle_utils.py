@@ -508,21 +508,44 @@ def get_draft_recurrent_hidden_state_spec(
     )
 
 
+_PREPARE_FOR_VERIFY_DEPS = None
+
+
 def eagle_prepare_for_verify(
     verify_input: EagleVerifyInput,
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
+    overlap_plan_stream: bool = False,
 ):
-    from sglang.kernels.ops.speculative.cache_locs import (
+    # Imports must stay lazy (import-cycle safety) but only need to resolve
+    # once, not on every decode cycle of this hot path.
+    global _PREPARE_FOR_VERIFY_DEPS
+    if _PREPARE_FOR_VERIFY_DEPS is None:
+        from sglang.kernels.ops.speculative.cache_locs import (
+            assign_extend_cache_locs_uniform_func,
+        )
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardBatch,
+            ForwardMode,
+        )
+        from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
+
+        _PREPARE_FOR_VERIFY_DEPS = (
+            assign_extend_cache_locs_uniform_func,
+            CaptureHiddenMode,
+            ForwardBatch,
+            ForwardMode,
+            prepare_mamba_track_for_verify,
+        )
+    (
         assign_extend_cache_locs_uniform_func,
-    )
-    from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
         ForwardBatch,
         ForwardMode,
-    )
-    from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
+        prepare_mamba_track_for_verify,
+    ) = _PREPARE_FOR_VERIFY_DEPS
 
     if not batch.forward_mode.is_idle():
         # Assign cache locations
@@ -582,7 +605,13 @@ def eagle_prepare_for_verify(
             verify_forward_batch
         )
     )
-    if can_run_cuda_graph:
+    # Recurrent backends may defer graph metadata loading because it can mutate state still consumed by the draft.
+    defer_graph_load = overlap_plan_stream and not getattr(
+        target_worker.model_runner.attn_backend,
+        "supports_overlap_plan_stream_graph_load",
+        True,
+    )
+    if can_run_cuda_graph and not defer_graph_load:
         target_worker.model_runner.decode_cuda_graph_runner.load_batch(
             verify_forward_batch
         )

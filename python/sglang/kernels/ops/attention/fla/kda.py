@@ -29,7 +29,6 @@ from sglang.kernels.ops.attention.fla.utils import (
     check_shared_mem,
     is_intel,
     is_nvidia,
-    is_tf32_supported,
 )
 
 if is_intel:
@@ -742,7 +741,7 @@ def recompute_w_u_fwd(
         BT=BT,
         STORE_KG=kg is not None,
         IS_VARLEN=cu_seqlens is not None,
-        DOT_PRECISION="tf32" if is_tf32_supported else "ieee",
+        DOT_PRECISION="ieee",
         **(static_config or {}),
     )
     return w, u, kg
@@ -751,8 +750,8 @@ def recompute_w_u_fwd(
 @triton.autotune(
     configs=[
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [64]
-        for BV in [64]
+        for BK in [32, 64]
+        for BV in [64, 128]
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
@@ -863,7 +862,7 @@ def chunk_gla_fwd_kernel_o(
     # [BT, BT]
     b_A = tl.load(p_A, boundary_check=(0, 1))
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
-    b_o += tl.dot(b_A, b_v)
+    b_o += tl.dot(b_A, b_v, allow_tf32=False)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -1155,6 +1154,7 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
+        safe_gate=lower_bound is not None,
         fuse_diagonal=_small_grid,
         fuse_recompute=_small_grid,
     )
@@ -1210,6 +1210,7 @@ def chunk_kda(
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
     output_intermediate_states: bool = False,
+    beta_is_raw: bool = False,
     **kwargs,
 ):
     if scale is None:
@@ -1218,6 +1219,9 @@ def chunk_kda(
     if use_qk_l2norm_in_kernel:
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
+
+    if beta_is_raw:
+        beta = beta.float().sigmoid()
 
     # Returns o [B, T, H, V] when output_intermediate_states=False, or (o, h [B, NT, H, V, K]) when output_intermediate_states=True.
     return chunk_kda_fwd(
