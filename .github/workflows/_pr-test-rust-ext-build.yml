@@ -187,24 +187,12 @@ jobs:
           export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
           # Per-interpreter subdirs (set in the loop): PyO3's fingerprint tracks
           # the interpreter, so a shared dir rebuilds on every ABI switch.
-          cargo_target_root="${HOME}/.cache/sglang-cargo-target"
-          # Base and Extra are separate workflow runs and may build concurrently
-          # on the same persistent host. Serialize every mutation of their shared
-          # target root; keep the lock outside it so disk-pressure cleanup cannot
-          # unlink the active lock file.
-          cargo_target_lock="${HOME}/.cache/sglang-cargo-target.lock"
-          mkdir -p "${HOME}/.cache"
-          exec 9>"${cargo_target_lock}"
-          echo "Waiting for exclusive cargo target lock: ${cargo_target_lock}"
-          flock --exclusive 9
-          echo "Acquired cargo target lock"
+          # ci_install_dependency.sh drops ${HOME}/.cache/sglang-cargo-target at 85%
+          # disk and unlocks before its own build, so a CUDA job sharing this host
+          # can delete the tree mid compile. Build in a per run dir nothing else
+          # touches. The .so cache above still carries results across runs.
+          cargo_target_root="${RUNNER_TEMP:-/tmp}/sglang-cargo-target-${GITHUB_RUN_ID:-norun}-$$"
           mkdir -p "${cargo_target_root}"
-          used="$(df --output=pcent "${cargo_target_root}" 2>/dev/null | tr -dc '0-9')"
-          if [ "${used:-0}" -ge 85 ]; then
-              echo "cargo target dir filesystem at ${used}%; dropping ${cargo_target_root}"
-              rm -rf "${cargo_target_root}"
-              mkdir -p "${cargo_target_root}"
-          fi
           python3 -m pip install --upgrade pip
           command -v uv >/dev/null 2>&1 || pip install uv
           # build_rust needs the build backend and torch, not sglang's ~294 other runtime deps.
@@ -213,7 +201,7 @@ jobs:
           venv_root="${RUNNER_TEMP:-/tmp}/sglang-ci-rust-ext-${GITHUB_RUN_ID:-norun}-$$"
           # Best-effort, like ci_cleanup_venv.sh: under set -e a failing EXIT trap
           # would fail the step, and nothing here is worth keeping for a postmortem.
-          trap 'rm -rf "${venv_root}" || true' EXIT
+          trap 'rm -rf "${venv_root}" "${cargo_target_root}" || true' EXIT
           for python_bin in "${{ steps.py310.outputs.python-path }}" "${{ steps.py312.outputs.python-path }}"; do
               minor="$("${python_bin}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
               export CARGO_TARGET_DIR="${cargo_target_root}/py${minor}"
