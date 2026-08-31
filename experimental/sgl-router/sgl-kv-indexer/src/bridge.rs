@@ -568,59 +568,120 @@ fn decode_event_batch_impl(
 }
 
 fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeError> {
+    match parse_event(event)? {
+        DecodedEvent::BlockStored {
+            hashes,
+            tier,
+            component_mask,
+            block_size,
+        } => {
+            actions.report(tier, hashes, component_mask, block_size);
+        }
+        DecodedEvent::BlockRemoved { hashes, tier } => {
+            actions.revoke(tier, hashes);
+        }
+        DecodedEvent::AllBlocksCleared => {
+            actions.clear_all();
+        }
+        DecodedEvent::Unsupported(other) => {
+            debug!(event_type = other, "ignoring unsupported SGLang KV event");
+        }
+    }
+    Ok(())
+}
+
+enum DecodedEvent {
+    BlockStored {
+        hashes: Vec<i64>,
+        tier: i32,
+        component_mask: Option<u32>,
+        block_size: Option<u32>,
+    },
+    BlockRemoved {
+        hashes: Vec<i64>,
+        tier: i32,
+    },
+    AllBlocksCleared,
+    Unsupported(String),
+}
+
+fn parse_event(event: &Value) -> Result<DecodedEvent, BridgeError> {
     let event = expect_map(event, "KV event")?;
+    let mut event_type = None;
+    let mut block_hashes = None;
+    let mut block_size = None;
+    let mut medium = None;
+    let mut component_types = None;
+
+    for (key, value) in event {
+        let name = expect_str(key, "KV event key")?;
+        let slot = match name {
+            "type" => &mut event_type,
+            "block_hashes" => &mut block_hashes,
+            "block_size" => &mut block_size,
+            "medium" => &mut medium,
+            "component_types" => &mut component_types,
+            _ => continue,
+        };
+        if slot.is_some() {
+            return Err(BridgeError::Decode(format!(
+                "KV event.{name} appears more than once"
+            )));
+        }
+        *slot = Some(value);
+    }
+
     let event_type = expect_str(
-        required_map_field(event, "type", "KV event")?,
+        event_type.ok_or_else(|| BridgeError::Decode("KV event.type is required".to_string()))?,
         "KV event.type",
     )?;
-
     match event_type {
         "BlockStored" => {
-            let tier = medium_to_tier(expect_optional_str(
-                optional_map_field(event, "medium", "BlockStored")?.unwrap_or(&Value::Nil),
-                "BlockStored.medium",
-            )?)?;
+            let hashes = decode_hashes(block_hashes.ok_or_else(|| {
+                BridgeError::Decode("BlockStored.block_hashes is required".to_string())
+            })?)?;
+            let medium = match medium {
+                Some(value) => expect_optional_str(value, "BlockStored.medium")?,
+                None => None,
+            };
+            let tier = medium_to_tier(medium)?;
             // Component labels are independent of other optional extensions,
             // notably salted-store metadata.
-            let mask = match optional_map_field(event, "component_types", "BlockStored")? {
+            let component_mask = match component_types {
                 Some(value) => decode_component_mask(value)?,
                 None => None,
             };
             // The token count is only carried alongside component-aware stores,
             // where the query path needs it to accumulate trailing windows.
-            let block_size = match mask {
-                Some(_) => Some(decode_block_size(required_map_field(
-                    event,
-                    "block_size",
-                    "BlockStored",
-                )?)?),
+            let block_size = match component_mask {
+                Some(_) => Some(decode_block_size(block_size.ok_or_else(|| {
+                    BridgeError::Decode("BlockStored.block_size is required".to_string())
+                })?)?),
                 None => None,
             };
-            actions.report(
+            Ok(DecodedEvent::BlockStored {
+                hashes,
                 tier,
-                decode_hashes(required_map_field(event, "block_hashes", "BlockStored")?)?,
-                mask,
+                component_mask,
                 block_size,
-            );
+            })
         }
         "BlockRemoved" => {
-            let tier = medium_to_tier(expect_optional_str(
-                optional_map_field(event, "medium", "BlockRemoved")?.unwrap_or(&Value::Nil),
-                "BlockRemoved.medium",
-            )?)?;
-            actions.revoke(
-                tier,
-                decode_hashes(required_map_field(event, "block_hashes", "BlockRemoved")?)?,
-            );
+            let hashes = decode_hashes(block_hashes.ok_or_else(|| {
+                BridgeError::Decode("BlockRemoved.block_hashes is required".to_string())
+            })?)?;
+            let medium = match medium {
+                Some(value) => expect_optional_str(value, "BlockRemoved.medium")?,
+                None => None,
+            };
+            Ok(DecodedEvent::BlockRemoved {
+                hashes,
+                tier: medium_to_tier(medium)?,
+            })
         }
-        "AllBlocksCleared" => {
-            actions.clear_all();
-        }
-        other => {
-            debug!(event_type = other, "ignoring unsupported SGLang KV event");
-        }
+        "AllBlocksCleared" => Ok(DecodedEvent::AllBlocksCleared),
+        other => Ok(DecodedEvent::Unsupported(other.to_string())),
     }
-    Ok(())
 }
 
 fn decode_hashes(value: &Value) -> Result<Vec<i64>, BridgeError> {
@@ -804,37 +865,6 @@ fn expect_map<'a>(value: &'a Value, field: &str) -> Result<&'a [(Value, Value)],
         .as_map()
         .map(Vec::as_slice)
         .ok_or_else(|| BridgeError::Decode(format!("{field} must be a map")))
-}
-
-fn optional_map_field<'a>(
-    map: &'a [(Value, Value)],
-    key: &str,
-    field: &str,
-) -> Result<Option<&'a Value>, BridgeError> {
-    let mut found = None;
-    for (candidate, value) in map {
-        let candidate = candidate
-            .as_str()
-            .ok_or_else(|| BridgeError::Decode(format!("{field} keys must be strings")))?;
-        if candidate == key {
-            if found.is_some() {
-                return Err(BridgeError::Decode(format!(
-                    "{field}.{key} appears more than once"
-                )));
-            }
-            found = Some(value);
-        }
-    }
-    Ok(found)
-}
-
-fn required_map_field<'a>(
-    map: &'a [(Value, Value)],
-    key: &str,
-    field: &str,
-) -> Result<&'a Value, BridgeError> {
-    optional_map_field(map, key, field)?
-        .ok_or_else(|| BridgeError::Decode(format!("{field}.{key} is required")))
 }
 
 fn expect_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, BridgeError> {
@@ -1248,6 +1278,34 @@ mod tests {
     fn unknown_event_tag_is_ignored() {
         let events = vec![event("BlockUpdated", vec![])];
         assert!(actions_of(events).is_empty());
+    }
+
+    #[test]
+    fn map_field_order_is_irrelevant() {
+        let store = Value::Map(vec![
+            field("medium", Value::String("GPU".into())),
+            field("block_hashes", ints(&[7])),
+            field("type", Value::String("BlockStored".into())),
+        ]);
+
+        assert_eq!(actions_of(vec![store]), vec![rep(hbm(), &["7"])]);
+    }
+
+    #[test]
+    fn duplicate_field_skips_only_that_event() {
+        let duplicate = event(
+            "BlockStored",
+            vec![
+                field("block_hashes", ints(&[1])),
+                field("medium", Value::String("GPU".into())),
+                field("medium", Value::String("DISK".into())),
+            ],
+        );
+
+        assert_eq!(
+            actions_of(vec![stored(&[2], "GPU"), duplicate, removed(&[3], "DISK")]),
+            vec![rep(hbm(), &["2"]), rev(ssd(), &["3"])]
+        );
     }
 
     #[test]
