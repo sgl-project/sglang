@@ -1903,7 +1903,7 @@ class UnifiedRadixCache(BasePrefixCache):
         expected_tokens = len(hash_value) * self.page_size
         if operation.prefetch_read_failed:
             stats["read_failed"] += 1
-            stats["l3_read_failed_tokens"] += max(0, expected_tokens - completed_tokens)
+        stats["l3_read_failed_tokens"] += max(0, expected_tokens - completed_tokens)
         stats["l3_actual_read_tokens"] += completed_tokens
         (
             last_host_node_id,
