@@ -396,7 +396,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.decode_cuda_graph_kv_indices = torch.full(
             (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
         )
-        # Unified pool: capture-stable buffer for the DENSE KV write loc, filled
+        # Unified pool: capture-stable buffer for the kernel-facing KV write loc, filled
         # out-of-graph in init_forward_metadata_out_graph so the in-graph
         # set_mla_kv_buffer captures no translate.
         if self.kv_index_translator.is_translating:
@@ -635,7 +635,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # Replay-prep receives the RAW (unpadded) out_cache_loc
             # (build_replay_fb_view), but the captured write kernel consumes the
             # full captured tier of this buffer. Zero the tail so pad rows write
-            # to the dense sink (row 0) instead of stale dense locs left by
+            # to the sink (row 0) instead of stale kernel-facing locs left by
             # earlier larger replays — a stale tail scatters pad-row garbage into
             # live KV pages. Mirrors the runner's PaddingPolicy.ZERO on its own
             # out_cache_loc slot.

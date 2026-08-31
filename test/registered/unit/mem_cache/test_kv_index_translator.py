@@ -183,10 +183,10 @@ def _alloc_and_fill(allocator, ps, lens):
 
 class TestReadTableBuild(unittest.TestCase):
 
-    def test_read_table_matches_reference_dense_and_strided(self):
+    def test_read_table_matches_reference_across_multipliers(self):
         """The load-bearing formula pin: full AND swa read tables equal
         the independent per-element derivation, across page sizes and both
-        multiplier regimes (strided=1, dense=2L). The swa table agreeing with
+        multiplier regimes (MLA=1, MHA=2L). The swa table agreeing with
         a formula over VIRTUAL ids is also the never-chained-through-
         full-physical proof."""
         for ps in (1, 4):
@@ -587,9 +587,9 @@ class TestWriteLoc(unittest.TestCase):
             self.assertTrue(torch.equal(fb.out_cache_loc, want_full))
             self.assertTrue(torch.equal(virt, keep))
 
-    def test_swa_write_loc_round_trips_from_dense(self):
+    def test_swa_write_loc_round_trips_from_full_side(self):
         """The derived property behind phase 2: for any virtual run t,
-        deriving from the dense full-side values must equal the direct
+        deriving from the kernel-facing full-side values must equal the direct
         virtual->swa translate — `field(full(t)) == swa(t)` across page sizes
         and multipliers."""
         for ps in (1, 4, 64):
@@ -600,7 +600,7 @@ class TestWriteLoc(unittest.TestCase):
             self.assertTrue(torch.equal(got, want_swa))
 
     def test_pad_lanes_derive_to_sink(self):
-        """The DP pad appends zeros; dense 0 is the reserved padding slot in
+        """The DP pad appends zeros; kernel-facing 0 is the reserved padding slot in
         every id space, so pad lanes must derive to swa slot 0 with no
         `num_live` bookkeeping."""
         src, _, rows, seq_lens, _, want_full, want_swa = self._built(n=3)

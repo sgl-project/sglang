@@ -59,7 +59,6 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         backend.is_prefill_aware_swa = False
         backend.has_swa = False
         backend.use_sliding_window_kv_pool = False
-        backend._unified_dense = False
         backend.page_size = 1
         backend._compute_scheduler_metadata = lambda *_: None
         backend._maybe_init_local_attn_metadata = lambda *_: None
