@@ -736,17 +736,44 @@ def _extract_runner_configs(content):
     return out
 
 
-def _extract_legacy_suites(content):
-    """Pull every legacy single-string `suite=` from `register_cuda_ci(...)`
-    calls. Used only to report why such a file is not dispatchable."""
+def _extract_suites(content, register_fn):
+    """Pull every single-string `suite=` from `<register_fn>(...)` calls."""
     out = []
     for args in re.finditer(
-        r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE
+        rf"^[^#\n]*{register_fn}\s*\(([^)]*)\)", content, re.MULTILINE
     ):
         m = re.search(r'suite\s*=\s*["\']([^"\']+)["\']', args.group(1))
         if m:
             out.append(m.group(1))
     return out
+
+
+def _extract_legacy_suites(content):
+    """Pull every legacy single-string `suite=` from `register_cuda_ci(...)`
+    calls. Used only to report why such a file is not dispatchable."""
+    return _extract_suites(content, "register_cuda_ci")
+
+
+# Backends with no job in rerun-test.yml (cuda / multimodal_gen / cpu only) and
+# no runner_config in runner_configs.yml, so no dispatch can be built for them.
+# Mirrors `REGISTER_MAPPING` in python/sglang/test/ci/ci_register.py.
+_OTHER_BACKEND_REGISTERS = {
+    "register_amd_ci": "AMD",
+    "register_npu_ci": "NPU",
+    "register_xpu_ci": "XPU",
+    "register_musa_ci": "MUSA",
+    "register_mlx_ci": "MLX",
+}
+
+
+def _extract_other_backends(content):
+    """Return (backend labels, suite names) for every non-CUDA/CPU registration."""
+    labels, suites = [], []
+    for register_fn, label in _OTHER_BACKEND_REGISTERS.items():
+        if re.search(rf"^[^#\n]*{register_fn}\s*\(", content, re.MULTILINE):
+            labels.append(label)
+            suites.extend(_extract_suites(content, register_fn))
+    return labels, sorted(set(suites))
 
 
 def _dispatch_err(suite, msg):
@@ -861,6 +888,20 @@ def detect_suite(file_path_from_test):
                 f"is not dispatchable via /rerun-test. Re-register it with "
                 f"`stage=`/`runner_config=` (CUDA), or dispatch its own "
                 f"workflow (npu/amd).",
+            )
+        ]
+
+    labels, suites = _extract_other_backends(content)
+    if labels:
+        backends = ", ".join(labels)
+        where = f" (suite `{suites[0]}`)" if suites else ""
+        return [
+            _dispatch_err(
+                suites[0] if suites else None,
+                f"`{full_path}` is registered for {backends}{where}, not for "
+                f"CUDA or CPU; rerun-test.yml has no {backends} job. Rerun it "
+                f"with /rerun-failed-ci, or dispatch the {backends} workflow "
+                f"manually.",
             )
         ]
 

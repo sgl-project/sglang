@@ -446,7 +446,7 @@ class ModelRunner:
 
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
+            deep_gemm_wrapper.update_deep_gemm_config(gpu_id)
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
@@ -506,7 +506,6 @@ class ModelRunner:
         )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=global_ep_rank,
             )
@@ -545,7 +544,7 @@ class ModelRunner:
         self._rearm_eplb_after_elastic_scale()
 
     def init_msprobe(self):
-        self.msprobe_debugger = misc_utils.create_msprobe_debugger(self.server_args)
+        self.msprobe_debugger = misc_utils.create_msprobe_debugger()
 
     def init_weight_updater(self):
         self.weight_updater = WeightUpdater(
@@ -711,7 +710,6 @@ class ModelRunner:
             )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=expert_rank,
             )
@@ -752,7 +750,6 @@ class ModelRunner:
     def maybe_init_expert_backup_client(self):
         self.expert_backup_client = (
             ExpertBackupClient(
-                server_args=self.server_args,
                 model_config=self.model_config,
                 moe_ep_size=self.ps.moe_ep_size,
                 moe_ep_rank=self.ps.moe_ep_rank,
@@ -920,7 +917,7 @@ class ModelRunner:
         )
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-        hisparse_cfg = parse_hisparse_config(self.server_args)
+        hisparse_cfg = parse_hisparse_config()
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
@@ -978,7 +975,6 @@ class ModelRunner:
         )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=global_ep_rank,
             )
@@ -2019,7 +2015,6 @@ class ModelRunner:
             return
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=self._elastic_global_rank(),
             )
@@ -2084,7 +2079,6 @@ class ModelRunner:
         ElasticEPStateManager.on_scale(effective_size, target_size)
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=self._elastic_global_rank(),
             )
