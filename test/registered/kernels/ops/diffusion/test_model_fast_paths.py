@@ -36,6 +36,7 @@ import sglang.multimodal_gen.runtime.models.dits.flux_2 as flux2
 import sglang.multimodal_gen.runtime.models.dits.glm_image as glm_image
 import sglang.multimodal_gen.runtime.models.dits.longcat_image as longcat_image
 import sglang.multimodal_gen.runtime.models.dits.ltx_2 as ltx2_module
+import sglang.multimodal_gen.runtime.models.dits.qwen_image as qwen_image
 import sglang.multimodal_gen.runtime.models.dits.sana as sana
 from sglang.kernels.ops.diffusion import (
     can_use_fused_layernorm_modulate,
@@ -98,6 +99,7 @@ from sglang.multimodal_gen.runtime.models.dits.ltx_2 import _ltx2_rms_norm_modul
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformerBlock,
     _qwen_modulation_cache_key,
+    _qwen_norm_out,
 )
 from sglang.multimodal_gen.runtime.models.dits.sana import (
     _eager_ln_modulate as _sana_eager_ln_modulate,
@@ -149,6 +151,81 @@ def test_bitexact_norm_guards_follow_platform():
     assert can_use_fused_layernorm_modulate(x, row, row) is is_cuda()
     assert can_use_fused_qk_head_layernorm(q, q) is is_cuda()
     assert can_use_fused_rmsnorm_scale_shift(x, weight, vec, vec) is is_cuda()
+
+
+# -------------------------------------------------------------------------
+# Qwen-Image -- final LayerNorm + adaLN scale/shift
+# -------------------------------------------------------------------------
+
+
+@requires_inline_ptx
+def test_qwen_norm_out_matches_adaln_reference():
+    qwen_image._QWEN_NORM_OUT.disabled = False
+    qwen_image._QWEN_NORM_OUT.verified = False
+    qwen_image._QWEN_NORM_OUT_SIGS.clear()
+    torch.manual_seed(0)
+    norm_out = (
+        qwen_image.AdaLayerNormContinuous(
+            3072, 3072, elementwise_affine=False, eps=1e-6
+        )
+        .cuda()
+        .bfloat16()
+    )
+    hidden_states = torch.randn(1, 257, 3072, device="cuda", dtype=torch.bfloat16)
+    conditioning = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)
+
+    expected = norm_out(hidden_states, conditioning)
+    actual = _qwen_norm_out(norm_out, hidden_states, conditioning)
+
+    assert torch.equal(actual, expected)
+    assert qwen_image._QWEN_NORM_OUT.verified
+    assert not qwen_image._QWEN_NORM_OUT.disabled
+
+
+def test_qwen_norm_out_preserves_compile_path(monkeypatch):
+    norm_out = (
+        qwen_image.AdaLayerNormContinuous(16, 16, elementwise_affine=False, eps=1e-6)
+        .cuda()
+        .bfloat16()
+    )
+    hidden_states = torch.randn(1, 3, 16, device="cuda", dtype=torch.bfloat16)
+    conditioning = torch.randn(1, 16, device="cuda", dtype=torch.bfloat16)
+    expected = norm_out(hidden_states, conditioning)
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(
+        qwen_image,
+        "fused_layernorm_modulate_raw",
+        lambda *args, **kwargs: pytest.fail("compile path must not dispatch kernel"),
+    )
+
+    assert torch.equal(_qwen_norm_out(norm_out, hidden_states, conditioning), expected)
+
+
+def test_qwen_norm_out_does_not_verify_during_graph_capture(monkeypatch):
+    qwen_image._QWEN_NORM_OUT.disabled = False
+    qwen_image._QWEN_NORM_OUT.verified = False
+    qwen_image._QWEN_NORM_OUT_SIGS.clear()
+    norm_out = (
+        qwen_image.AdaLayerNormContinuous(
+            3072, 3072, elementwise_affine=False, eps=1e-6
+        )
+        .cuda()
+        .bfloat16()
+    )
+    hidden_states = torch.randn(1, 17, 3072, device="cuda", dtype=torch.bfloat16)
+    conditioning = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)
+    expected = norm_out(hidden_states, conditioning)
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        qwen_image,
+        "fused_layernorm_modulate_raw",
+        lambda *args, **kwargs: pytest.fail("capture must not verify a new layout"),
+    )
+
+    assert torch.equal(_qwen_norm_out(norm_out, hidden_states, conditioning), expected)
+    assert not qwen_image._QWEN_NORM_OUT_SIGS
 
 
 # -------------------------------------------------------------------------

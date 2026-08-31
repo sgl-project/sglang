@@ -1192,7 +1192,7 @@ def init_unified_mamba_pools(
         pre_alloc_size=decode_pre_alloc_size,
     )
     if use_mla_backend:
-        # start_layer stays 0: HybridLinearKVPool patches layer ids to the dense
+        # start_layer stays 0: HybridLinearKVPool patches layer ids to the contiguous
         # 0..N-1 index via _transfer_id_context before every MLA pool call.
         unified_full_kv_pool = UnifiedMLATokenToKVPool(
             unified_buffer=shared_pool,
