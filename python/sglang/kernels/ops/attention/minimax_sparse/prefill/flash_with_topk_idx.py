@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_hip
+
 from ..common.utils import (
     _bitonic_merge,
     _sort_ids_ascending,
@@ -16,6 +18,7 @@ from ..common.utils import (
     unit_scale,
 )
 
+_is_hip = is_hip()
 _MAX_PER_PAGE_SLOT_UNROLL = 8
 
 
@@ -688,7 +691,8 @@ def flash_prefill_with_topk_index(
         return (triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]), batch_size * num_heads)
 
     if (
-        disable_index_value
+        _is_hip
+        and disable_index_value
         and score_type == "max"
         and sink is None
         and q_scale in (None, 1.0)

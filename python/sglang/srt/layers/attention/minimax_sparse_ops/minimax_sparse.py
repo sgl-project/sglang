@@ -20,6 +20,10 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_aiter_gfx95 = _use_aiter and is_gfx95_supported()
 
 logger = logging.getLogger(__name__)
 _msa_fallback_warned = False
@@ -149,7 +153,7 @@ def minimax_sparse_prefill(
     # MSA paths only replace this step; the indexer above is unchanged. MSA has
     # no attn-sink input, so keep the Triton path when sink is present.
     o = None
-    if envs.SGLANG_OPT_USE_GLUON_PREFILL.get():
+    if _use_aiter_gfx95 and envs.SGLANG_OPT_USE_GLUON_PREFILL.get():
         try:
             from .gluon_prefill import can_use_gluon_prefill, gluon_sparse_prefill
 

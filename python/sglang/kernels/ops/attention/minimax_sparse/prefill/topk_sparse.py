@@ -7,6 +7,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_gfx95_supported, is_gfx942_supported, is_hip
+
 from ..common.utils import (
     check_sparse_kv_fp8,
     get_cu_seqblocks,
@@ -15,20 +17,16 @@ from ..common.utils import (
     unit_scale,
 )
 
+_is_hip = is_hip()
+
 
 @functools.cache
 def _sparse_subk_divisor() -> int:
     """How many sub-tiles a CDNA KV tile is split into: 2 on gfx950, 4 on gfx942,
     0 (no sub-tiling) elsewhere."""
-    if not torch.version.hip:
-        return 0
-    try:
-        arch = torch.cuda.get_device_properties(0).gcnArchName
-    except Exception:
-        return 0
-    if "gfx950" in arch:
+    if is_gfx95_supported():
         return 2
-    if "gfx942" in arch:
+    if is_gfx942_supported():
         return 4
     return 0
 
@@ -63,12 +61,22 @@ def _sparse_subk(block_size_k: int) -> int:
     # Configs that fail to compile on the target arch are skipped, so widening
     # the num_warps x num_stages grid only adds candidates, never a bad kernel.
     configs=[
-        # CDNA sub-tiled MFMA configs; unsupported configs are skipped.
-        triton.Config(
-            {"matrix_instr_nonkdim": 16, "kpack": 2}, num_warps=1, num_stages=1
-        ),
-        triton.Config(
-            {"matrix_instr_nonkdim": 16, "kpack": 2}, num_warps=2, num_stages=1
+        # CDNA sub-tiled MFMA configs; NVIDIA's Triton rejects these launch kwargs.
+        *(
+            [
+                triton.Config(
+                    {"matrix_instr_nonkdim": 16, "kpack": 2},
+                    num_warps=1,
+                    num_stages=1,
+                ),
+                triton.Config(
+                    {"matrix_instr_nonkdim": 16, "kpack": 2},
+                    num_warps=2,
+                    num_stages=1,
+                ),
+            ]
+            if _is_hip
+            else []
         ),
         *[
             triton.Config({}, num_warps=nw, num_stages=ns)
