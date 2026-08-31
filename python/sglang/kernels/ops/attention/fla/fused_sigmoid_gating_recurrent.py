@@ -92,8 +92,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
-    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
 
     if IS_VARLEN:
