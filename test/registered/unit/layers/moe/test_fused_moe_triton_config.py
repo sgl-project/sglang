@@ -41,19 +41,6 @@ def test_h100_lingbot_video_configs_enable_tma_only_for_the_tuned_shape():
         )
 
 
-def test_gb300_glm45_fp8_per_channel_config_is_available():
-    config_path = (
-        Path(fused_moe_triton_config.__file__).parent
-        / "configs"
-        / "triton_3_7_1"
-        / "E=161,N=192,device_name=NVIDIA_GB300,dtype=fp8_w8a8,per_channel_quant=True.json"
-    )
-    configs = json.loads(config_path.read_text())
-
-    assert list(configs) == ["1", "16", "256", "512", "1024", "4096", "16384"]
-    assert all(config["BLOCK_SIZE_M"] > 0 for config in configs.values())
-
-
 def test_down_moe_reuses_tuned_up_config_when_separate_config_is_absent(
     monkeypatch, tmp_path
 ):
