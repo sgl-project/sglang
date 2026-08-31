@@ -362,6 +362,8 @@ def _detect_fused_ar_quant_format(linear) -> str:
     # return "" so the communicator does NOT emit a quantized tuple into a
     # plain GEMM (which would crash with 'tuple has no attribute dtype').
     return ""
+
+
 def _finish_mlp_output(hidden_states, *, expect_deferred: bool):
     if not expect_deferred:
         if not isinstance(hidden_states, torch.Tensor):
