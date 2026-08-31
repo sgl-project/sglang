@@ -221,6 +221,7 @@ class TargetVerifyExecutor:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        verify_forward_batch.is_speculative_idle_participation = True
         self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -456,8 +457,9 @@ class TargetVerifyExecutor:
     def _verify_backend_self_adds_seq_lens(self) -> bool:
         if self._verify_backend_self_adds_seq_lens_cache is None:
             backend = self.target_worker.model_runner.attn_backend
-            self._verify_backend_self_adds_seq_lens_cache = hasattr(
-                backend, "make_forward_metadata_from_raw_verify"
+            self._verify_backend_self_adds_seq_lens_cache = bool(
+                getattr(backend, "target_verify_self_adds_seq_lens", False)
+                or hasattr(backend, "make_forward_metadata_from_raw_verify")
             )
         return self._verify_backend_self_adds_seq_lens_cache
 

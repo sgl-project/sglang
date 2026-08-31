@@ -158,21 +158,7 @@ class SchedulerRequestReceiver:
                 work_reqs = None
                 control_reqs = None
 
-            if self.ps.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
-                )
-
-            if self.ps.attn_cp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_cp_group.rank,
-                    self.attn_cp_cpu_group,
-                    src=self.attn_cp_group.ranks[0],
-                )
+            work_reqs = self._broadcast_within_attention_dp_group(work_reqs)
 
             # When dp_attention_local_control_broadcast is enabled, each DP
             # group leader already receives control messages from the DP
@@ -184,20 +170,9 @@ class SchedulerRequestReceiver:
                 or is_ep_scale_joiner()
             )
             if _local_ctrl:
-                if self.ps.attn_tp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_tp_group.rank,
-                        self.attn_tp_cpu_group,
-                        src=self.attn_tp_group.ranks[0],
-                    )
-                if self.ps.attn_cp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_cp_group.rank,
-                        self.attn_cp_cpu_group,
-                        src=self.attn_cp_group.ranks[0],
-                    )
+                control_reqs = self._broadcast_within_attention_dp_group(
+                    control_reqs
+                )
             elif self.ps.tp_size != 1:
                 control_reqs = broadcast_pyobj(
                     control_reqs,
@@ -214,6 +189,33 @@ class SchedulerRequestReceiver:
                 src=self.tp_group.ranks[0],
             )
         return recv_reqs
+
+    def _broadcast_within_attention_dp_group(
+        self, reqs: Optional[List]
+    ) -> List:
+        """Broadcast from the (attention-CP0, attention-TP0) DP leader.
+
+        Only that leader receives requests. First seed its CP0 attention-TP
+        row, then let the populated row seed every attention-CP column. Other
+        CP rows must not start an attention-TP broadcast with ``None``.
+        """
+        if self.ps.attn_tp_size != 1 and self.ps.attn_cp_rank == 0:
+            reqs = broadcast_pyobj(
+                reqs,
+                self.attn_tp_group.rank,
+                self.attn_tp_cpu_group,
+                src=self.attn_tp_group.ranks[0],
+            )
+
+        if self.ps.attn_cp_size != 1:
+            reqs = broadcast_pyobj(
+                reqs,
+                self.attn_cp_group.rank,
+                self.attn_cp_cpu_group,
+                src=self.attn_cp_group.ranks[0],
+            )
+
+        return reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
         if not recv_reqs:

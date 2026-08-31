@@ -5,6 +5,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+    AscendAttnBackend,
+)
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     get_cp_strategy,
@@ -28,11 +31,26 @@ from sglang.srt.layers.cp.utils import (
     prepare_cp_forward,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+from sglang.srt.layers.utils.cp_utils import (
+    get_npu_mla_cp_ring_validation_error,
+    get_prefix_block_slices,
+    get_zigzag_cp_rank_block_lengths,
+    get_zigzag_cp_rank_chunk_indices,
+    get_zigzag_mla_cp_ring_visibility,
+    pack_paged_prefix_cache,
+    use_npu_mla_cp_ring,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
+)
+from sglang.srt.models.deepseek_common.attention_backend_handler import (
+    handle_attention_ascend,
+)
+from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
+    AttnForwardMethod,
 )
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
@@ -61,6 +79,260 @@ class _FakeCPGroup:
 class TestCPStrategyUnit(CustomTestCase):
     def tearDown(self):
         init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="zigzag")
+
+    def test_ascend_prefill_cp_for_other_models_keeps_mha(self):
+        forward_mode = SimpleNamespace(
+            is_extend=lambda: True,
+            is_target_verify=lambda: False,
+            is_draft_extend_v2=lambda: False,
+        )
+        forward_batch = SimpleNamespace(forward_mode=forward_mode)
+        attn = SimpleNamespace(use_dsa=False, mla_enable_prefill_cp=True)
+
+        with patch(
+            "sglang.srt.models.deepseek_common.attention_backend_handler."
+            "mla_use_prefill_cp",
+            return_value=True,
+        ) as use_prefill_cp:
+            method = handle_attention_ascend(attn, forward_batch)
+
+        self.assertEqual(method, AttnForwardMethod.MHA_NPU)
+        use_prefill_cp.assert_not_called()
+
+    def test_ascend_prefill_cp_ring_dispatches_to_mha(self):
+        forward_mode = SimpleNamespace(
+            is_extend=lambda: True,
+            is_target_verify=lambda: False,
+            is_draft_extend_v2=lambda: False,
+        )
+        forward_batch = SimpleNamespace(forward_mode=forward_mode)
+        attn = SimpleNamespace(
+            use_dsa=False,
+            mla_enable_prefill_cp=True,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            _use_npu_mla_cp_ring=True,
+        )
+
+        with (
+            patch(
+                "sglang.srt.models.deepseek_common.attention_backend_handler."
+                "mla_use_prefill_cp",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.models.deepseek_common.attention_backend_handler."
+                "get_npu_mla_cp_ring_validation_error",
+                return_value=None,
+            ),
+        ):
+            method = handle_attention_ascend(attn, forward_batch)
+
+        self.assertEqual(method, AttnForwardMethod.MHA_NPU)
+
+    def test_mla_cp_ring_batch_guard(self):
+        metadata = SimpleNamespace(bs=1, split_list=[64] * 8)
+        forward_batch = SimpleNamespace(
+            attn_cp_metadata=metadata,
+            extend_prefix_lens_cpu=[0],
+            _use_npu_mla_cp_ring=True,
+        )
+
+        def update_payload_metadata():
+            rank_tokens = []
+            for rank in range(4):
+                early_lens, late_lens = get_zigzag_cp_rank_block_lengths(
+                    metadata.split_list, metadata.bs, 4, rank
+                )
+                rank_tokens.append(sum(early_lens) + sum(late_lens))
+            metadata.per_rank_actual_token = rank_tokens
+            metadata.max_rank_len = [max(rank_tokens)] * 4
+
+        update_payload_metadata()
+        with patch(
+            "sglang.srt.layers.utils.cp_utils.get_parallel",
+            return_value=SimpleNamespace(attn_cp_size=4),
+        ):
+            self.assertIsNone(get_npu_mla_cp_ring_validation_error(forward_batch))
+            self.assertTrue(use_npu_mla_cp_ring(forward_batch))
+
+            metadata.bs = 2
+            metadata.split_list = [65] + [64] * 7 + [33] + [32] * 7
+            forward_batch.extend_prefix_lens_cpu = [0, 0]
+            update_payload_metadata()
+            self.assertIsNone(get_npu_mla_cp_ring_validation_error(forward_batch))
+            self.assertTrue(use_npu_mla_cp_ring(forward_batch))
+
+            forward_batch.extend_prefix_lens_cpu = [0, 65]
+            self.assertIsNone(get_npu_mla_cp_ring_validation_error(forward_batch))
+
+            forward_batch.extend_prefix_lens_cpu = [0, 1]
+            self.assertEqual(
+                get_npu_mla_cp_ring_validation_error(forward_batch),
+                "non-zero prefix length must be at least the largest zigzag "
+                "block for npu_ring_mla",
+            )
+
+            metadata.split_list[-1] = 0
+            self.assertEqual(
+                get_npu_mla_cp_ring_validation_error(forward_batch),
+                "each request's zigzag blocks must have non-zero lengths",
+            )
+            forward_batch.extend_prefix_lens_cpu = [0, 0]
+            metadata.split_list = [513] * 8 + [32] * 8
+            update_payload_metadata()
+            self.assertIsNone(get_npu_mla_cp_ring_validation_error(forward_batch))
+
+            metadata.split_list = [65] + [64] * 7 + [33] + [32] * 7
+            update_payload_metadata()
+            metadata.max_rank_len = [1] * 4
+            self.assertEqual(
+                get_npu_mla_cp_ring_validation_error(forward_batch),
+                "context-parallel ring payload metadata is invalid",
+            )
+
+    def test_mla_cp_ring_maps_rank_shards_to_natural_cache_locations(self):
+        cp_size = 4
+        blocks_per_request = 2 * cp_size
+        split_list = [2] * blocks_per_request + [1] * blocks_per_request
+        full_kv = torch.arange(sum(split_list)).unsqueeze(1)
+        natural_chunks = torch.split(full_kv, split_list, dim=0)
+        restored_cache = torch.full_like(full_kv, -1)
+
+        for rank in range(cp_size):
+            shard_indices = get_zigzag_cp_rank_chunk_indices(
+                bs=2, cp_size=cp_size, cp_rank=rank
+            )
+            shard = torch.cat([natural_chunks[index] for index in shard_indices], dim=0)
+            shard_cache_locs = torch.cat(
+                [natural_chunks[index].flatten() for index in shard_indices], dim=0
+            )
+            restored_cache[shard_cache_locs] = shard
+
+        self.assertEqual(
+            get_zigzag_cp_rank_chunk_indices(bs=2, cp_size=4, cp_rank=0),
+            [0, 8, 7, 15],
+        )
+        torch.testing.assert_close(restored_cache, full_kv)
+
+        with self.assertRaisesRegex(ValueError, "Invalid zigzag CP topology"):
+            get_zigzag_cp_rank_chunk_indices(bs=2, cp_size=4, cp_rank=4)
+
+    def test_mla_cp_ring_derives_uneven_source_block_lengths(self):
+        split_list = list(range(1, 17))
+        self.assertEqual(
+            get_zigzag_cp_rank_block_lengths(split_list, 2, 4, 0),
+            ([1, 9], [8, 16]),
+        )
+        self.assertEqual(
+            get_zigzag_cp_rank_block_lengths(split_list, 2, 4, 3),
+            ([4, 12], [5, 13]),
+        )
+
+        for total_tokens in range(8, 80):
+            base, remainder = divmod(total_tokens, 8)
+            blocks = [
+                base + (1 if block_id < remainder else 0) for block_id in range(8)
+            ]
+            for cp_rank in range(4):
+                local_early, local_late = get_zigzag_cp_rank_block_lengths(
+                    blocks, 1, 4, cp_rank
+                )
+                for source_rank in range(4):
+                    source_early, source_late = get_zigzag_cp_rank_block_lengths(
+                        blocks, 1, 4, source_rank
+                    )
+                    early_to_prev, _, late_to_next = get_zigzag_mla_cp_ring_visibility(
+                        cp_rank, source_rank
+                    )
+                    if early_to_prev:
+                        self.assertGreaterEqual(source_early[0], local_early[0])
+                    self.assertGreaterEqual(source_early[0], local_late[0])
+                    if late_to_next:
+                        self.assertGreaterEqual(source_late[0], local_late[0])
+
+    def test_mla_cp_ring_packs_prefix_pages_per_request(self):
+        selected_pages = torch.arange(12).view(3, 4, 1)
+        packed_prefix = pack_paged_prefix_cache(
+            selected_pages, prefix_lens=[3, 5], page_size=4
+        )
+        torch.testing.assert_close(
+            packed_prefix.flatten(), torch.tensor([0, 1, 2, 4, 5, 6, 7, 8])
+        )
+
+    def test_mla_cp_ring_prefix_blocks_fold_short_tails(self):
+        self.assertEqual(
+            get_prefix_block_slices(
+                prefix_lens=[0, 10, 25],
+                block_size=8,
+                minimum_block_lens=[0, 3, 6],
+            ),
+            [
+                [(0, 0), (0, 10), (0, 8)],
+                [(0, 0), (10, 0), (8, 8)],
+                [(0, 0), (10, 0), (16, 9)],
+            ],
+        )
+
+    def test_mla_cp_ring_direct_pack(self):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend._mla_cp_ring_send_buffer = None
+        latent = torch.arange(12, dtype=torch.float32).reshape(3, 1, 4)
+        rope = torch.arange(6, dtype=torch.float32).reshape(3, 1, 2)
+
+        direct = backend._pack_mla_cp_ring_local_kv(latent, rope, 5).clone()
+        expected = torch.zeros(5, 6)
+        expected[:3] = torch.cat((latent.flatten(1), rope.flatten(1)), dim=-1)
+
+        torch.testing.assert_close(direct, expected)
+
+    def test_mla_cp_ring_direct_prefix_gather(self):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.page_size = 4
+        backend.mla_cp_ring_prefix_block_size = 4
+        backend.forward_metadata = SimpleNamespace(
+            flatten_prefix_block_tables=torch.tensor([1, 3, 0], dtype=torch.int32)
+        )
+        forward_batch = SimpleNamespace()
+        k_buffer = torch.arange(16, dtype=torch.float32).reshape(4, 4, 1)
+        v_buffer = k_buffer + 100
+        args = (k_buffer, v_buffer, forward_batch, [5, 3], [0, 0])
+
+        direct = list(backend._iter_mla_cp_ring_compact_prefix_blocks(*args))
+
+        self.assertEqual([item[0] for item in direct], [[4, 3], [1, 0]])
+        torch.testing.assert_close(
+            direct[0][1].flatten(),
+            torch.tensor([4, 5, 6, 7, 0, 1, 2], dtype=torch.float32),
+        )
+        torch.testing.assert_close(
+            direct[1][1].flatten(), torch.tensor([12], dtype=torch.float32)
+        )
+        torch.testing.assert_close(direct[0][2], direct[0][1] + 100)
+        torch.testing.assert_close(direct[1][2], direct[1][1] + 100)
+
+    def test_mla_cp_ring_zigzag_visibility_is_causal(self):
+        cp_size = 4
+        for cp_rank in range(cp_size):
+            prev_visible_blocks = []
+            next_visible_blocks = []
+            for source_rank in range(cp_size):
+                early_to_prev, early_to_next, late_to_next = (
+                    get_zigzag_mla_cp_ring_visibility(cp_rank, source_rank)
+                )
+                if early_to_prev:
+                    prev_visible_blocks.append(source_rank)
+                if early_to_next:
+                    next_visible_blocks.append(source_rank)
+                if late_to_next:
+                    next_visible_blocks.append(2 * cp_size - 1 - source_rank)
+
+            self.assertEqual(prev_visible_blocks, list(range(cp_rank + 1)))
+            self.assertEqual(
+                sorted(next_visible_blocks),
+                list(range(2 * cp_size - cp_rank)),
+            )
 
     def test_strategy_kind_maps_cli_values(self):
         self.assertEqual(ContextParallelStrategyKind.NONE.value, 0)
@@ -304,6 +576,30 @@ class TestCPZigzagStrategy(CustomTestCase):
             self.assertTrue(enable_cp_v2())
             self.assertTrue(is_cp_v2_active(active_batch))
             self.assertFalse(is_cp_v2_active(inactive_batch))
+
+    def test_prefill_and_decode_dp_replicas_decide_cp_independently(self):
+        prefill_batch = SimpleNamespace(
+            input_ids=torch.arange(8),
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[8],
+        )
+        decode_batch = SimpleNamespace(
+            input_ids=torch.arange(8),
+            forward_mode=ForwardMode.DECODE,
+            extend_seq_lens_cpu=[8],
+        )
+        mixed_batch = SimpleNamespace(
+            input_ids=torch.arange(8),
+            forward_mode=ForwardMode.MIXED,
+            extend_seq_lens_cpu=[8],
+        )
+
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+        ):
+            self.assertTrue(is_cp_v2_active(prefill_batch))
+            self.assertFalse(is_cp_v2_active(decode_batch))
+            self.assertFalse(is_cp_v2_active(mixed_batch))
 
     def _expected_metadata(self, *, rank, cp_size, seq_lens, extend_seq_lens):
         bs = len(extend_seq_lens)
@@ -573,6 +869,38 @@ class TestCPZigzagStrategy(CustomTestCase):
                 )
 
             self.assertTrue(torch.equal(gathered, kv))
+
+    def test_zigzag_direct_layout_paths_restore_natural_order(self):
+        cp_size = 4
+        seq_lens = [17, 12, 9]
+        extend_seq_lens = [13, 10, 9]
+        x = torch.arange(sum(extend_seq_lens) * 3).view(sum(extend_seq_lens), 3)
+        metas, padded_rank_tensors = self._padded_rank_tensors(
+            x,
+            cp_size=cp_size,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+        )
+
+        for rank in range(cp_size):
+            metadata = metas[rank]
+            fb = self._forward_batch(metadata, extend_seq_lens)
+            strategy = ZigzagCPStrategy(cp_size=cp_size)
+            local_x = padded_rank_tensors[rank][: metadata.per_rank_actual_token[rank]]
+            with (
+                get_parallel().override(
+                    attn_cp_group=_FakeCPGroup(padded_rank_tensors)
+                ),
+                patch(
+                    "sglang.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
+                    return_value=torch.no_grad(),
+                ),
+            ):
+                direct_shard = strategy.shard_hidden_states(x, fb)
+                direct_gather = strategy.gather_hidden_states(local_x, fb)
+
+            self.assertTrue(torch.equal(direct_shard, local_x))
+            self.assertTrue(torch.equal(direct_gather, x))
 
     def test_zigzag_padding_aligns_local_tensors(self):
         cp_size = 2

@@ -218,6 +218,10 @@ class AscendMamba2AttnBackend(AscendMambaAttnBackendBase):
 
 
 class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
+    # Ascend full attention receives prefix lengths and adds the fixed target
+    # verify width while building metadata. DSpark must not pre-add it too.
+    target_verify_self_adds_seq_lens = True
+
     def __init__(
         self,
         full_attn_backend: AttentionBackend,

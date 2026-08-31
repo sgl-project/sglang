@@ -532,6 +532,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
     num_token_non_padded_cpu: int = None
+    # True for a shape-compatible target-verify pass that only lets an idle
+    # DP-attention rank participate in global collectives. Such a pass owns no
+    # real KV or recurrent-state rows and must not update dummy slot 0.
+    is_speculative_idle_participation: bool = False
 
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
     # Preallocated piecewise-graph attention output, set by RadixAttention.

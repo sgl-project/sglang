@@ -106,6 +106,126 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     name = "zigzag"
     kind = ContextParallelStrategyKind.ZIGZAG
 
+    def __init__(self, cp_size: int):
+        super().__init__(cp_size)
+        self._ragged_shard_indices: dict[
+            tuple[torch.device, tuple[int, ...], tuple[int, ...]], torch.Tensor
+        ] = {}
+        self._ragged_restore_indices: dict[
+            tuple[
+                torch.device,
+                tuple[int, ...],
+                tuple[int, ...],
+                tuple[int, ...],
+                int,
+                int,
+            ],
+            torch.Tensor,
+        ] = {}
+
+    @staticmethod
+    def _bounded_cache_insert(cache: dict, key, value, limit: int = 64) -> None:
+        if len(cache) >= limit:
+            cache.clear()
+        cache[key] = value
+
+    def _get_ragged_shard_indices(
+        self, device: torch.device, metadata: ZigzagContextParallelMetadata
+    ) -> torch.Tensor:
+        """Map natural tokens directly to this rank's two zigzag halves."""
+        split_lens = tuple(int(length) for length in metadata.split_list)
+        zigzag_index = tuple(int(index) for index in metadata.zigzag_index)
+        key = (device, split_lens, zigzag_index)
+        indices = self._ragged_shard_indices.get(key)
+        if indices is not None:
+            return indices
+
+        natural_starts = [0] + list(accumulate(split_lens))
+        index_chunks = [
+            torch.arange(
+                natural_starts[segment_id],
+                natural_starts[segment_id] + split_lens[segment_id],
+                dtype=torch.int64,
+                device=device,
+            )
+            for segment_id in zigzag_index
+            if split_lens[segment_id] > 0
+        ]
+        if not index_chunks:
+            indices = torch.empty(0, dtype=torch.int64, device=device)
+        elif len(index_chunks) == 1:
+            indices = index_chunks[0]
+        else:
+            indices = torch.cat(index_chunks)
+
+        expected_tokens = sum(split_lens[index] for index in zigzag_index)
+        if indices.numel() != expected_tokens:
+            raise RuntimeError(
+                "Zigzag CP ragged shard plan has the wrong token count: "
+                f"indices={indices.numel()}, expected={expected_tokens}."
+            )
+        self._bounded_cache_insert(self._ragged_shard_indices, key, indices)
+        return indices
+
+    def _get_ragged_restore_indices(
+        self,
+        device: torch.device,
+        metadata: ZigzagContextParallelMetadata,
+        per_rank_tokens: List[int],
+        max_rank_len: int,
+    ) -> torch.Tensor:
+        """Map fixed-shape rank-major gather output to natural token order."""
+        reverse_split_lens = tuple(int(length) for length in metadata.reverse_split_len)
+        reverse_order = tuple(int(index) for index in metadata.cp_reverse_index)
+        rank_tokens = tuple(int(length) for length in per_rank_tokens)
+        key = (
+            device,
+            reverse_split_lens,
+            reverse_order,
+            rank_tokens,
+            int(max_rank_len),
+            int(metadata.bs),
+        )
+        indices = self._ragged_restore_indices.get(key)
+        if indices is not None:
+            return indices
+
+        segments_per_rank = int(metadata.bs) * 2
+        compact_segment_starts = [0] + list(accumulate(reverse_split_lens))
+        compact_rank_starts = [0] + list(accumulate(rank_tokens))
+        index_chunks = []
+        for segment_id in reverse_order:
+            length = reverse_split_lens[segment_id]
+            if length == 0:
+                continue
+            owner_rank = segment_id // segments_per_rank
+            within_rank_start = (
+                compact_segment_starts[segment_id] - compact_rank_starts[owner_rank]
+            )
+            fixed_start = owner_rank * max_rank_len + within_rank_start
+            index_chunks.append(
+                torch.arange(
+                    fixed_start,
+                    fixed_start + length,
+                    dtype=torch.int64,
+                    device=device,
+                )
+            )
+        if not index_chunks:
+            indices = torch.empty(0, dtype=torch.int64, device=device)
+        elif len(index_chunks) == 1:
+            indices = index_chunks[0]
+        else:
+            indices = torch.cat(index_chunks)
+
+        if indices.numel() != metadata.total_seq_lens:
+            raise RuntimeError(
+                "Zigzag CP ragged restore plan has the wrong token count: "
+                f"indices={indices.numel()}, expected={metadata.total_seq_lens}."
+            )
+        self._bounded_cache_insert(self._ragged_restore_indices, key, indices)
+        return indices
+
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
             return False
@@ -115,8 +235,16 @@ class ZigzagCPStrategy(ContextParallelStrategy):
 
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is None:
+            # ScheduleBatch exposes the same unpadded request lengths under
+            # ``extend_lens``.  Accept both so DP-attention can decide PCP
+            # before it fabricates idle work or materializes padding.
+            extend_lens = getattr(forward_batch, "extend_lens", None)
+        if extend_lens is None:
             return True
-        return all(int(length) >= self.cp_size * 2 for length in extend_lens)
+        extend_lens = [int(length) for length in extend_lens]
+        return int(num_tokens) >= sum(extend_lens) and all(
+            length >= self.cp_size * 2 for length in extend_lens
+        )
 
     def build_metadata(
         self,
@@ -301,37 +429,42 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     def shard_hidden_states(self, x: Any, forward_batch) -> Any:
         metadata = forward_batch.attn_cp_metadata
         x = x[: metadata.total_seq_lens]
-        chunks = torch.split(x, metadata.split_list, dim=0)
-        local_x = torch.cat([chunks[i] for i in metadata.zigzag_index], dim=0)
+        local_x = torch.index_select(
+            x, 0, self._get_ragged_shard_indices(x.device, metadata)
+        )
         return pad_local_rows(local_x, metadata, dim=0)
 
     def shard_position_ids(self, positions: Any, forward_batch) -> Any:
         metadata = forward_batch.attn_cp_metadata
         positions = positions[..., : metadata.total_seq_lens]
-        chunks = torch.split(positions, metadata.split_list, dim=-1)
-        local_positions = torch.cat([chunks[i] for i in metadata.zigzag_index], dim=-1)
+        local_positions = torch.index_select(
+            positions,
+            -1,
+            self._get_ragged_shard_indices(positions.device, metadata),
+        )
         return pad_local_rows(local_positions, metadata, dim=-1)
 
     def gather_hidden_states(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
-        gathered = self._all_gather_reorganized(x, forward_batch)
-        chunks = torch.split(
-            gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
-        )
-        return torch.cat(
-            [chunks[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index], dim=0
-        )
+        return self._gather_and_restore(x, forward_batch)
 
     def gather_kv_cache(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
-        gathered = self._all_gather_reorganized(x, forward_batch)
-        chunks = torch.split(
-            gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
+        return self._gather_and_restore(x, forward_batch)
+
+    def _gather_and_restore(self, x: torch.Tensor, forward_batch) -> torch.Tensor:
+        metadata = forward_batch.attn_cp_metadata
+        gathered, per_rank_tokens, max_rank_len = self._all_gather_fixed_shape(
+            x, forward_batch
         )
-        return torch.cat(
-            [chunks[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index], dim=0
+        return torch.index_select(
+            gathered,
+            0,
+            self._get_ragged_restore_indices(
+                gathered.device, metadata, per_rank_tokens, max_rank_len
+            ),
         )
 
     def get_supported_attention_backend(self):
@@ -348,9 +481,9 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         attn_fn,
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
     ) -> Any:
-        assert (
-            attention_backend in self.get_supported_attention_backend()
-        ), f"{self.name} CP does not support {attention_backend=}"
+        assert attention_backend in self.get_supported_attention_backend(), (
+            f"{self.name} CP does not support {attention_backend=}"
+        )
 
         meta = forward_batch.attn_cp_metadata
         q_prev = q[: meta.total_q_prev_tokens]
@@ -438,7 +571,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             latent_full[..., kv_lora_rank:],
         )
 
-    def _all_gather_reorganized(self, x: torch.Tensor, forward_batch):
+    def _all_gather_fixed_shape(self, x: torch.Tensor, forward_batch):
         meta = forward_batch.attn_cp_metadata
         per_rank_token = meta.per_rank_logical_token or meta.per_rank_actual_token
         max_len = max(per_rank_token)
@@ -467,12 +600,4 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 dtype=x.dtype,
             )
         group.all_gather_into_tensor(gathered, x)
-
-        chunks = torch.split(gathered, [max_len] * self.cp_size, dim=0)
-        return torch.cat(
-            [
-                chunks[rank][:per_rank_len]
-                for rank, per_rank_len in enumerate(per_rank_token)
-            ],
-            dim=0,
-        )
+        return gathered, per_rank_token, max_len

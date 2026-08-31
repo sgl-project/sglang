@@ -36,8 +36,15 @@ def _fake_group() -> SimpleNamespace:
     return SimpleNamespace(rank=0, ranks=[0], cpu_group=object())
 
 
-def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
+def _make_receiver(
+    ps: ParallelState,
+    *,
+    attn_tp_group=None,
+    attn_cp_group=None,
+) -> SchedulerRequestReceiver:
     group = _fake_group()
+    attn_tp_group = attn_tp_group or group
+    attn_cp_group = attn_cp_group or group
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
         recv_from_rpc=None,
@@ -47,10 +54,10 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
         ps=ps,
         tp_group=group,
         tp_cpu_group=group,
-        attn_tp_group=group,
-        attn_tp_cpu_group=group,
-        attn_cp_group=group,
-        attn_cp_cpu_group=group,
+        attn_tp_group=attn_tp_group,
+        attn_tp_cpu_group=attn_tp_group.cpu_group,
+        attn_cp_group=attn_cp_group,
+        attn_cp_cpu_group=attn_cp_group.cpu_group,
         world_group=group,
         server_args=SimpleNamespace(
             enable_dp_attention=True,
@@ -64,6 +71,88 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
+    def test_request_broadcast_seeds_cp0_tp_row_before_cp_columns(self):
+        ps = _make_ps(
+            pp_rank=0,
+            pp_size=1,
+            attn_tp_rank=1,
+            attn_tp_size=4,
+            attn_cp_rank=0,
+            attn_cp_size=4,
+        )
+        attn_tp_group = SimpleNamespace(
+            rank=1, ranks=[0, 1, 2, 3], cpu_group="attn_tp"
+        )
+        attn_cp_group = SimpleNamespace(
+            rank=1, ranks=[1, 5, 9, 13], cpu_group="attn_cp"
+        )
+        receiver = _make_receiver(
+            ps,
+            attn_tp_group=attn_tp_group,
+            attn_cp_group=attn_cp_group,
+        )
+        calls = []
+
+        def fake_broadcast(data, rank, group, src):
+            calls.append((data, rank, group, src))
+            return ["request"]
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_receiver."
+            "broadcast_pyobj",
+            side_effect=fake_broadcast,
+        ):
+            self.assertEqual(
+                receiver._broadcast_within_attention_dp_group(None),
+                ["request"],
+            )
+
+        self.assertEqual(
+            calls,
+            [
+                (None, 1, "attn_tp", 0),
+                (["request"], 1, "attn_cp", 1),
+            ],
+        )
+
+    def test_request_broadcast_skips_unseeded_nonzero_cp_tp_row(self):
+        ps = _make_ps(
+            pp_rank=0,
+            pp_size=1,
+            attn_tp_rank=0,
+            attn_tp_size=4,
+            attn_cp_rank=1,
+            attn_cp_size=4,
+        )
+        attn_tp_group = SimpleNamespace(
+            rank=4, ranks=[4, 5, 6, 7], cpu_group="attn_tp"
+        )
+        attn_cp_group = SimpleNamespace(
+            rank=4, ranks=[0, 4, 8, 12], cpu_group="attn_cp"
+        )
+        receiver = _make_receiver(
+            ps,
+            attn_tp_group=attn_tp_group,
+            attn_cp_group=attn_cp_group,
+        )
+        calls = []
+
+        def fake_broadcast(data, rank, group, src):
+            calls.append((data, rank, group, src))
+            return ["request"]
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_receiver."
+            "broadcast_pyobj",
+            side_effect=fake_broadcast,
+        ):
+            self.assertEqual(
+                receiver._broadcast_within_attention_dp_group(None),
+                ["request"],
+            )
+
+        self.assertEqual(calls, [(None, 4, "attn_cp", 0)])
+
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         ps = _make_ps()
         calls = []
