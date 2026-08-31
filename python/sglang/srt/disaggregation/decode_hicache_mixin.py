@@ -306,7 +306,7 @@ class DecodeHiCacheTransferMixin:
 
         self.tree_cache.req_to_token_pool.write(
             (
-                decode_req.req.req_pool_idx,
+                decode_req.req.kv.req_pool_idx,
                 slice(prefix_match.l1_prefix_len, prefix_match.decode_prefix_len),
             ),
             decode_req.hicache_restored_kv_indices,
