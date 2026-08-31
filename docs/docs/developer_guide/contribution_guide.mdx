@@ -32,30 +32,36 @@ pre-commit run --all-files
 
 - **`pre-commit run --all-files`** manually runs all configured checks, applying fixes if possible. If it fails the first time, re-run it to ensure lint errors are fully resolved. Make sure your code passes all checks **before** creating a Pull Request.
 - **Do not commit** directly to the `main` branch. Always create a new branch (e.g., `feature/my-new-feature`), push your changes, and open a PR from that branch.
-- Link checking with lychee is **enforced in CI**. By default, it is not blocking local commits.
-- To run local link checks manually, use: `pre-commit run --hook-stage manual lychee --all-files`.
+- Documentation links and anchors are checked with Mintlify in CI. To run the same version locally, install it with `npm install -g mint@4.2.559`, then run `cd docs && mint broken-links --check-anchors --check-redirects`.
+- The manual `lychee` pre-commit hook checks links in the repository-level `README.md`: `pre-commit run --hook-stage manual lychee --all-files`.
 
 ## Run and add unit tests
 
-If you add a new feature or fix a bug, please add corresponding unit tests to ensure coverage and prevent regression.
+If you add a feature or fix a bug, add focused regression coverage when the test protects a concrete behavior, invariant, or bookkeeping contract.
 
 ### Unit tests (no server required)
 
 Unit tests live under [`test/registered/unit/`](https://github.com/sgl-project/sglang/tree/main/test/registered/unit), organized to mirror the `python/sglang/srt/` source tree. These tests validate component logic **without** launching a server or loading real model weights.
-SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework with [pytest](https://docs.pytest.org/) as the test runner.
+SGLang supports both Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework and [pytest](https://docs.pytest.org/). Registered CI tests must use `CustomTestCase` instead of raw `unittest.TestCase`, register themselves with `register_*_ci(...)`, and include a standard `__main__` entry point. CI discovers registrations with `test/run_suite.py` and executes each selected test file directly with fail-fast enabled.
 
 **When to add a unit test:** If you modify a file under `python/sglang/srt/`, check whether a corresponding test exists in `test/registered/unit/` and add coverage for your changes. For example:
 
-```
-srt/mem_cache/radix_cache.py   →  unit/mem_cache/test_radix_cache.py
+```text
+srt/mem_cache/radix_cache.py   →  unit/mem_cache/test_radix_cache_unit.py
 srt/sampling/sampling_params.py →  unit/sampling/test_sampling_params.py
 ```
 
-**Run unit tests locally:**
+**Run tests locally:**
 
-```bash Command
-pytest test/registered/unit/ -v                # all unit tests
-pytest test/registered/unit/mem_cache/ -v      # one module
+```bash
+# Closest to how CI executes an individual registered test file
+python3 test/registered/unit/mem_cache/test_radix_cache_unit.py
+
+# Run a registered CI suite
+python3 test/run_suite.py --hw cpu --suite base-a-test-cpu
+
+# Pytest remains useful for local directory-level discovery
+pytest test/registered/unit/mem_cache/ -v
 ```
 
 **Run with coverage:**
@@ -72,30 +78,29 @@ For tests that require launching a server, refer to [`test/registered/README.md`
 
 For detailed instructions on running tests and integrating them into CI, refer to [test/README.md](https://github.com/sgl-project/sglang/tree/main/test/README.md).
 
-## Write documentations
+## Write documentation
 
-We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase.
-For more details, please refer to [docs/README.md](https://github.com/sgl-project/sglang/tree/main/docs/README.md).
+Documentation is a good way for new contributors to learn the SGLang codebase. See [docs/README.md](https://github.com/sgl-project/sglang/tree/main/docs/README.md) for the current Mintlify setup and validation commands.
 
 ## Test the accuracy
-If your code changes the model output, please run the accuracy tests. A quick sanity check is the few-shot GSM8K.
+If your code changes model output, run an accuracy evaluation appropriate for the affected model and feature. For example, after launching a server, run the unified GSM8K evaluator:
 
-```text Output
+```bash
 # Launch a server
-python3 -m sglang.launch_server --model Qwen/Qwen2-7B-Instruct
+sglang serve --model-path Qwen/Qwen3-8B
 
 # Evaluate
-python3 -m sglang.test.few_shot_gsm8k --num-questions 200
+python3 -m sglang.test.run_eval \
+  --eval-name gsm8k \
+  --port 30000 \
+  --num-examples 200
 ```
 
 Please note that the above script is primarily a sanity check, not a rigorous accuracy or speed test.
 This test can have significant variance (1%–5%) in accuracy due to batching and the non-deterministic nature of the inference engine.
 Also, do not rely on the "Latency/Output throughput" from this script, as it is not a proper speed test.
 
-GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging accuracy tests.
-You can find additional accuracy eval examples in:
-- [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/manual/eval/test_eval_accuracy_large.py)
-- [test_gpt_oss_1gpu.py](https://github.com/sgl-project/sglang/blob/main/test/manual/core/test_gpt_oss_1gpu.py)
+GSM8K is too easy for many state-of-the-art models, so use a more challenging or feature-specific evaluation when appropriate. See [Evaluating New Models with SGLang](/docs/developer_guide/evaluating_new_models) for current MMLU, GSM8K, HellaSwag, GPQA, HumanEval, and MMMU commands. Additional examples are available in [test/manual/eval](https://github.com/sgl-project/sglang/tree/main/test/manual/eval).
 
 ## Benchmark the speed
 Refer to [Benchmark and Profiling](./benchmark_and_profiling).
@@ -110,21 +115,30 @@ Then your PR can be merged.
 We have a lot of open PRs but limited CI machines, so only top and trusted contributors have permission to trigger CI tests.
 Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json)
 
-**PR authors** can always use `/rerun-failed-ci` on their own PRs, even if they are not listed in `CI_PERMISSIONS.json`.
+**PR authors** can use `/rerun-failed-ci` on their own PRs even if they are not listed in `CI_PERMISSIONS.json`. Selective reruns have additional rules because they execute PR code on self-hosted runners; see the permission table below.
 
 For CI to run on a pull request, it must have the "run-ci" label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
 - `/tag-run-ci-label`: Adds the "run-ci" label. Only **future** commits trigger CI; the current commit is unaffected. Add the `extra` argument (`/tag-run-ci-label extra`) to additionally apply the "run-ci-extra" label, opting the PR into the extra test workflow (`pr-test-extra.yml`).
-- `/rerun-failed-ci`: Reruns workflows from the latest commit with conclusion **failed, flaky, or skipped**.
+- `/rerun-failed-ci`: Reruns workflows from the latest commit with conclusion **failed, skipped, cancelled, or timed out**.
 - `/tag-and-rerun-ci`: Runs both. Use this on a fresh PR to kick off CI on the current commit — `/tag-run-ci-label` alone won't. Accepts the same `extra` argument (`/tag-and-rerun-ci extra`).
-- `/rerun-stage <stage-name>`: Reruns a single test stage without waiting for its dependencies. Useful for quickly validating a specific test fix instead of waiting ~30 minutes for preceding stages.
-- `/rerun-test <test-spec> [<test-spec> ...]`: Reruns one or more specific tests directly, bypassing stage boundaries. Each `<test-spec>` is pytest-style `<file>::<TestClass>[.<test_method>]` (the `::TestClass` and `.<test_method>` parts are optional). The handler resolves each spec, groups specs by their registered runner-label, and dispatches one [Rerun Test workflow](https://github.com/sgl-project/sglang/actions/workflows/rerun-test.yml) per group. Examples: `/rerun-test test_srt_endpoint.py`, `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`, `/rerun-test test_a.py test_b.py` (multiple at once).
+- `/rerun-test <test-spec> [<test-spec> ...]`: Reruns one or more specific tests directly. A spec may select a file, class, or method using `<file>::<TestClass>[.<test_method>]`. Multiple specs and file globs are supported. Examples: `/rerun-test test_srt_endpoint.py`, `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`, `/rerun-test test_a.py test_b.py`, or `/rerun-test test_*backend*.py`.
+- `/rerun-group <group> [<group> ...]`: Expands one or more registered test groups (for example, `/rerun-group hicache`) and dispatches their tests through the same selective-rerun workflow.
+
+The rerun commands have the following permission rules:
+
+| Command | PR author | Other users | Additional rule for fork PRs |
+| --- | --- | --- | --- |
+| `/rerun-failed-ci` | Always allowed on their own PR | Must have `can_rerun_failed_ci` in `CI_PERMISSIONS.json` | None |
+| `/rerun-test`, `/rerun-group` | No special allowance; judged as any other commenter | Must have `cooldown_interval_minutes: 0` in `CI_PERMISSIONS.json`, or `write`/`admin` repository permission | None -- the same rule applies wherever the PR comes from |
+
+<Warning>
+Selective reruns do not build or install a PR-local `sglang-kernel` wheel. If a PR changes `python/sglang/kernels/aot/` or code that depends on that AOT change, use the normal/full PR CI workflow. A `/rerun-test` or `/rerun-group` result may use the pinned released kernel and does not validate the combined change.
+</Warning>
 
 If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash-command-handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/14253#issuecomment-3599509302).
 
 To avoid spamming a PR with too many `/rerun-failed-ci` comments, you can also trigger the command by editing an existing comment and adding any suffix (e.g., `/rerun-failed-ci try again`).
-
-Example of rerunning a single test stage: `/rerun-stage unit-test-backend-4-gpu`.
 
 If you don’t have permission and you’re not the PR author, please ask maintainers to trigger CI for you.
 
@@ -137,7 +151,7 @@ Each CI workflow has a default limit defined in its workflow configuration file.
 
 ```yaml Config
 cool-down-minutes:
-  description: "Default cooldown period in minutes; 0 disables rate limiting"
+  description: "Cooldown period in minutes for low-permission users; 0 disables rate limiting"
   type: number
   default: 120
 ```
@@ -150,31 +164,71 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
 - Prioritize extreme efficiency. SGLang is a runtime, and most of your code runs on the critical path for every request. Optimize all minor overheads as much as possible, especially in the model forward code.
   - A common pattern is some runtime checks in the model forward pass (e.g., [this](https://github.com/sgl-project/sglang/blob/f1b0eda55c2c4838e8ab90a0fac7fb1e3d7064ab/python/sglang/srt/models/deepseek_v2.py#L486-L491)). These are very likely the same for every layer. Please cache the result as a single boolean value in `__init__` whenever possible.
 - Make functions as pure as possible. Avoid in-place modification of arguments.
-- Keep files concise. If a file exceeds 2,000 lines of code, split it into multiple smaller files. (e.g., `scheduler.py`, `scheduler_output_processor_mixin.py`)
+- Prefer immutable data and compute configuration-derived values once during initialization when their inputs cannot change.
+- Keep functions under roughly 100 lines and make orchestration functions read like high-level pseudocode by extracting details into focused helpers.
+- Keep files concise. If a file exceeds 2,000 lines of code, split it into cohesive smaller modules.
+- Avoid adding mixins; prefer composition or plain functions. Use `msgspec.Struct` for new data containers instead of `dataclasses.dataclass` or `attrs`.
+- Prefer keyword arguments for calls with two or more arguments, and pass callees the specific values they need instead of a large state-holding object.
 - In a file, put core data structures at the top of the file. Put utility functions at the bottom of the file.
 - Keep tests run fast.
-  - If a single test file run longer than 500 seconds, split it into multiple smaller files (e.g., `test_eagle_infer_a.py`, `test_eagle_infer_b.py`).
-  - If a single job in a github workflow runs longer than 30 mins, split it into smaller jobs/steps.
-  - Reuse server launches in your unit tests to make tests run faster.
+  - If a single test file runs longer than 500 seconds, split it into multiple smaller files (e.g., `test_eagle_infer_a.py`, `test_eagle_infer_b.py`).
+  - If a single job in a GitHub Actions workflow runs longer than 30 minutes, split it into smaller jobs or steps.
+  - Reuse server launches across test methods in E2E test files.
 - Never use `pickle.loads()`, `pickle.load()`, or `recv_pyobj()` to deserialize untrusted or network-received data. Python's [pickle module is not secure](https://docs.python.org/3/library/pickle.html) — it can execute arbitrary code during deserialization. Use safe serialization formats such as [msgpack](https://github.com/jcrist/msgspec) or JSON instead.
 - When supporting new hardware or features, follow these guidelines:
   - Do not drastically change existing code.
   - Always prefer new files to introduce specific components for your new hardware (e.g., `allocator_ascend.py`).
   - If you write multiple if/else blocks for new features, ensure the common path (e.g., NVIDIA hardware or the existing code path) is the first branch.
 
-## How to update sgl-kernel
-Since sglang and the `sglang-kernel` (prior `sgl-kernel`) distribution are separate Python packages, our current GitHub CI infrastructure does not support updating a kernel and using it immediately within the same pull request (PR).
-To add a new kernel or modify an existing one in the `python/sglang/kernels/aot/` source tree, you must use multiple PRs.
+## How to update kernels in SGLang
 
-Follow these steps:
+Choose the implementation and release path based on the kernel's dependencies. For a lightweight kernel that does not depend on CUTLASS or another large C++ project, prefer the in-tree JIT kernel path. Use the AOT `sglang-kernel` path for heavyweight kernels, large C++ dependencies, or operations that need wheel packaging and Torch operator registration. FlashInfer-based kernels are an exception and may still use the JIT path. SGLang also consumes separately released custom builds of DeepGEMM and DeepEP; update those in their source repositories as described below.
 
-1. Submit a PR to update the sgl-kernel source code without using it in sglang python package (e.g., [#8884](https://github.com/sgl-project/sglang/pull/8884/files)).
-2. Bump the version of the kernel package (e.g., [#9220](https://github.com/sgl-project/sglang/pull/9220/files)).
-   - Once merged, this will trigger an automatic release of the `sglang-kernel` wheel to PyPI.
-   - If not urgent, you can wait for other people to release the wheel. A new version will typically be released within one week.
-3. Apply the changes:
-   - Update the `sglang-kernel` version in `sglang/python/pyproject.toml` to use the modified kernels.
-   - Update the related caller code in the sglang to use the new kernel.
+### Update sglang-kernel
+
+The `sglang-kernel` distribution (formerly `sgl-kernel`) is a separate Python package, but its source now lives in this repository under `python/sglang/kernels/aot/`. Normal PR CI builds and installs a PR-local `sglang-kernel` wheel, so it can test an AOT kernel and its caller together. This does not establish compatibility after merge: installed SGLang and scheduled CI use the released version pinned in `python/pyproject.toml`. If a caller unconditionally requires a new operator or a changed kernel contract, first merge and release the kernel, update the pinned `sglang-kernel` version, and then land the caller. A combined PR is acceptable only when every supported path remains correct with the pinned wheel—for example, when the caller checks operator availability and retains a semantically equivalent fallback until the released wheel includes the change. Selective `/rerun-test` and `/rerun-group` workflows do not install PR-local wheels and cannot validate the combined AOT path.
+
+For an AOT kernel change:
+
+1. Implement the kernel under `python/sglang/kernels/aot/csrc/` and update its declaration, Torch registration, and CMake source list.
+2. Expose the Python API under `python/sglang/kernels/aot/python/sgl_kernel/`.
+3. Add correctness tests under `python/sglang/kernels/aot/tests/` and a benchmark under `python/sglang/kernels/aot/benchmark/` when applicable.
+4. Build and test from `python/sglang/kernels/aot/` following its [README](https://github.com/sgl-project/sglang/tree/main/python/sglang/kernels/aot/README.md). Do not bump the pinned `sglang-kernel` version in `python/pyproject.toml` merely to test a PR-local kernel change.
+
+### Update sgl-deep-gemm
+
+Develop SGLang's customized DeepGEMM package on the [`dev` branch of `sgl-project/DeepGEMM`](https://github.com/sgl-project/DeepGEMM/tree/dev). Rebase incoming changes onto `dev`, place new or modified package tests under `sgl_deep_gemm/tests/`, and follow the [`sgl-deep-gemm` README](https://github.com/sgl-project/DeepGEMM/blob/dev/sgl_deep_gemm/README.md) to build and install a local wheel. After the implementation is merged, ask the SGLang team to run the [sgl-deep-gemm release workflow](https://github.com/sgl-project/sglang/actions/workflows/release-whl-deepgemm.yml) with the new version, CUDA target, and DeepGEMM branch. Once all required wheels are published and verified, update the `sgl-deep-gemm` pin in `python/pyproject.toml` before landing SGLang code that requires the new or changed behavior.
+
+### Update sgl-deep-ep
+
+Develop `sgl-deep-ep` in [`sgl-project/DeepEP`](https://github.com/sgl-project/DeepEP). Use the implementation branch for the target platform: `sgl-deepep` for CUDA 13 on x86_64 or aarch64, `sgl-deepep-cu12-x86` for CUDA 12.9 on x86_64, or `sgl-deepep-cu12-arm` for CUDA 12.9 on aarch64. Merge packaging changes into `sgl-deepep-packaging`. The [`sgl-deep-ep` README](https://github.com/sgl-project/DeepEP/blob/sgl-deepep-packaging/sgl_deep_ep/README.md) describes the platform prerequisites and release matrix.
+
+To validate locally, check out the selected implementation branch as `DeepEP-source` and the packaging branch as `DeepEP-packaging`. Install the required build dependencies first; CUDA 12.9 builds also require GDRCopy. The following CUDA 13 example builds a wheel for the host architecture, installs that exact wheel, and verifies that its guarded package import succeeds:
+
+```bash
+DEEPEP_OUTPUT_DIR="$(mktemp -d)"
+bash DeepEP-packaging/sgl_deep_ep/build_sgl_deep_ep.sh \
+  DeepEP-source \
+  DeepEP-packaging/sgl_deep_ep \
+  "${DEEPEP_OUTPUT_DIR}" \
+  13.0 \
+  "$(uname -m)"
+python3 -m pip install --force-reinstall --no-deps \
+  "${DEEPEP_OUTPUT_DIR}"/sgl_deep_ep-*.whl
+python3 -c "import deep_ep; print(deep_ep.__file__)"
+```
+
+Use `12.9` instead of `13.0` for a CUDA 12.9 build. The import check validates packaging and binary loading, but not communication correctness. On a configured multi-GPU host, also run the test appropriate for the implementation branch:
+
+```bash
+# CUDA 13 implementation branch
+python3 DeepEP-source/tests/elastic/test_ep.py --num-processes 8
+
+# CUDA 12.9 implementation branches
+python3 DeepEP-source/tests/test_intranode.py --num-processes 8
+```
+
+Adjust `--num-processes` to the available GPUs and run the internode or low-latency tests when those transports changed. After local validation, ask the SGLang team to run the [sgl-deep-ep release workflow](https://github.com/sgl-project/sglang/actions/workflows/release-whl-deepep.yml) with the new version, CUDA target, and packaging ref. After verifying the published wheels for the supported Python versions and architectures, update the `sgl-deep-ep` pin in `python/pyproject.toml` before landing dependent SGLang changes.
 
 ## Tips for newcomers
 

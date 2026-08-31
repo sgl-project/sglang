@@ -4,11 +4,17 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import (
+    get_spec,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
@@ -30,12 +36,8 @@ class HybridAttnBackend(AttentionBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
-        self.spec_attn_is_decode = (
-            model_runner.server_args.speculative_attention_mode == "decode"
-        )
-        self.spec_attn_is_prefill = (
-            model_runner.server_args.speculative_attention_mode == "prefill"
-        )
+        self.spec_attn_is_decode = get_spec().speculative_attention_mode == "decode"
+        self.spec_attn_is_prefill = get_spec().speculative_attention_mode == "prefill"
         # Gates the FutureMap's per-step seq_lens D2H (decide_needs_cpu_seq_lens
         # ORs it across backends). Count only what runs in the spec decode loop:
         # decode always, prefill only when mode=prefill routes verify to it --
@@ -83,6 +85,9 @@ class HybridAttnBackend(AttentionBackend):
         else:
             return self.prefill_backend
 
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        return self._select_backend(fm).shared_read_ends(fm)
+
     @property
     def supports_full_cuda_graph_chunked_prefix(self) -> bool:
         return self.prefill_backend.supports_full_cuda_graph_chunked_prefix
@@ -115,10 +120,7 @@ class HybridAttnBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.decode_backend.init_cuda_graph_state(max_bs, max_num_tokens)
-        if (
-            self.model_runner.server_args.speculative_algorithm is not None
-            and self.spec_attn_is_prefill
-        ):
+        if get_spec().speculative_algorithm is not None and self.spec_attn_is_prefill:
             # When speculative decoding is enabled, we need to initialize the backend
             # that will be used for target_verify.
             self.prefill_backend.init_cuda_graph_state(max_bs, max_num_tokens)

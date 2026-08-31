@@ -12,6 +12,11 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.step_span_utils import (
+    build_detailed_annotation_suffix,
+    detailed_annotations_enabled,
+    set_detailed_annotations_enabled,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import is_npu
@@ -76,6 +81,7 @@ class ProfileManager:
         self.first_rank_in_node = ps.gpu_id == get_device().base_gpu_id
         self.profiler_kwargs = None
         self.profiler = None
+        self.detailed_annotations = False
 
     def step(self, forward_mode: ForwardMode):
         stage = _get_stage_from_forward_mode(forward_mode)
@@ -98,7 +104,9 @@ class ProfileManager:
         merge_profiles: bool,
         profile_prefix: str,
         profile_stages: Optional[List[str]] = None,
+        detailed_annotations: bool = False,
     ):
+        self.detailed_annotations = detailed_annotations
         # not supported yet
         assert start_step is None
         assert (
@@ -141,6 +149,9 @@ class ProfileManager:
         )
 
         assert self.profiler is None
+        # Fold the per-phase c_/g_ aggregates into the step span while this
+        # stage's profile is active (v2 auto-start path; reset in _do_stop).
+        set_detailed_annotations_enabled(self.detailed_annotations)
         self.profiler = _ProfilerBase.create(
             **self.profiler_kwargs,
             ps=self.ps,
@@ -157,6 +168,10 @@ class ProfileManager:
             f"Profiling done. Traces are saved to: {self.profiler_kwargs['output_dir']}"
         )
         self.profiler = None
+        # Clear the detailed step-span toggle here too: the v2 trigger auto-stop
+        # goes through _do_stop (not SchedulerProfilerManager._stop_profile), so
+        # this guarantees the flag resets on every stop path.
+        set_detailed_annotations_enabled(False)
 
 
 def _get_stage_from_forward_mode(forward_mode: ForwardMode):
@@ -445,11 +460,29 @@ class _ProfilerRPD(_ProfilerConcreteBase):
             rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
 
 
-def build_step_span_name(forward_batch: ForwardBatch) -> str:
-    """Build a profile-trace span name for one forward step."""
+def build_step_span_name(
+    forward_batch: ForwardBatch, detailed_annotations: bool | None = None
+) -> str:
+    """Build the profile-trace span name for one forward step.
+
+    Detailed annotations are folded into the label (via
+    build_detailed_annotation_suffix) when enabled. detailed_annotations
+    defaults to the process-wide toggle (detailed_annotations_enabled, set
+    by the profiler manager); pass an explicit bool to override (e.g. in tests).
+    """
+    if detailed_annotations is None:
+        detailed_annotations = detailed_annotations_enabled()
+
     mode = forward_batch.forward_mode
     bs = forward_batch.batch_size
     if mode == ForwardMode.EXTEND:
         ext_toks = forward_batch.extend_num_tokens or 0
-        return f"step[EXTEND bs={bs} toks={ext_toks}]"
-    return f"step[{mode.name} bs={bs}]"
+        base = f"step[EXTEND bs={bs} toks={ext_toks}"
+    else:
+        base = f"step[{mode.name} bs={bs}"
+
+    if detailed_annotations:
+        suffix = build_detailed_annotation_suffix(forward_batch)
+        if suffix:
+            base = f"{base} {suffix}"
+    return f"{base}]"

@@ -13,13 +13,16 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_platform,
+    get_resources,
+)
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
     is_flashinfer_available,
-    is_sm90_supported,
-    is_sm100_supported,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -38,27 +41,27 @@ _flashinfer_allreduce_supports_trigger_completion = False
 
 def _mnnvl_supported(is_multi_node: bool) -> bool:
     """Whether the mnnvl backend is usable on the current system."""
-    if is_sm100_supported():
+    if get_platform().is_sm100:
         return True
-    return is_sm90_supported() and not is_multi_node
+    return get_platform().is_sm90 and not is_multi_node
 
 
 def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     """Resolve the requested FlashInfer allreduce fusion backend."""
-    if not (is_sm90_supported() or is_sm100_supported()):
+    if not (get_platform().is_sm90 or get_platform().is_sm100):
         raise ValueError(
             "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
         )
 
     if backend == "auto":
         if is_multi_node:
-            if is_sm100_supported():
+            if get_platform().is_sm100:
                 return "mnnvl"
             raise ValueError(
                 "FlashInfer allreduce fusion does not support multi-node on "
                 "non-Blackwell systems."
             )
-        if is_sm100_supported():
+        if get_platform().is_sm100:
             return "mnnvl"
         return "trtllm"
 
@@ -75,12 +78,16 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     return backend
 
 
-def resolve_flashinfer_allreduce_fusion_backend(server_args) -> Optional[str]:
-    backend = getattr(server_args, "flashinfer_allreduce_fusion_backend", None)
+def resolve_flashinfer_allreduce_fusion_backend() -> Optional[str]:
+    """The fusion backend for this process, or None when fusion is off.
+
+    Reads the published leaves (`exec.comm`, `parallel`): the backend is a
+    resolution decision, and the node count is launch topology.
+    """
+    backend = get_exec().comm.flashinfer_allreduce_fusion_backend
     if backend is None:
         return None
-    is_multi_node = getattr(server_args, "nnodes", 1) > 1
-    return _resolve_backend(backend, is_multi_node)
+    return _resolve_backend(backend, get_parallel().nnodes > 1)
 
 
 if is_flashinfer_available():
@@ -389,6 +396,8 @@ class FlashInferWorkspaceManager:
         self.max_token_num = None
         self.hidden_dim = None
         self.dtype = None
+        self.backend = None
+        self.use_fp32_lamport = None
         self.initialized = False
         # Track max sizes ever requested so the workspace only grows (fewer recreates)
         self._max_token_num_seen: Optional[int] = None
@@ -523,19 +532,24 @@ class FlashInferWorkspaceManager:
             self.max_token_num = alloc_token_num
             self.hidden_dim = alloc_hidden_dim
             self.dtype = dtype or torch.bfloat16
+            self.backend = self.workspace.backend
+            self.use_fp32_lamport = (
+                self.workspace.metadata["use_fp32_lamport"]
+                if self.backend == "trtllm"
+                else None
+            )
             self.initialized = True
 
-            backend_name = getattr(self.workspace, "backend", "unknown")
             if not self._logged_init:
                 logger.info(
                     f"FlashInfer AllReduce Fusion enabled and workspace initialized: "
-                    f"backend={backend_name}, rank={rank}, world_size={world_size}, "
+                    f"backend={self.backend}, rank={rank}, world_size={world_size}, "
                     f"max_token_num={self.max_token_num}, hidden_dim={self.hidden_dim}"
                 )
                 self._logged_init = True
             else:
                 logger.debug(
-                    f"FlashInfer workspace re-initialized: backend={backend_name}, "
+                    f"FlashInfer workspace re-initialized: backend={self.backend}, "
                     f"rank={rank}, world_size={world_size}"
                 )
         except Exception as e:
@@ -611,13 +625,14 @@ class FlashInferWorkspaceManager:
                 self.max_token_num = None
                 self.hidden_dim = None
                 self.dtype = None
+                self.backend = None
+                self.use_fp32_lamport = None
                 self._logged_init = False
 
 
 def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManager:
     """The per-group fusion workspace manager; the instances live on
     ``ctx.resources`` (one per comm group, created lazily)."""
-    from sglang.srt.runtime_context import get_resources
 
     buffers = get_resources().buffers
     name = (
@@ -707,8 +722,7 @@ def ensure_workspace_initialized(
     token_num = token_num or max_token_num
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
-    server_args = get_server_args()
-    backend = resolve_flashinfer_allreduce_fusion_backend(server_args)
+    backend = resolve_flashinfer_allreduce_fusion_backend()
     if backend is None:
         return False
 
@@ -923,6 +937,18 @@ def can_use_flashinfer_allreduce(
             and workspace_manager.dtype == input_.dtype
         )
 
+    # TRT-LLM logs a warning when its validator rejects an expected fallback.
+    # Mirror only the conditions that prove its workspace is insufficient:
+    # total element capacity and FP32-Lamport compatibility. MNNVL has a
+    # byte/strategy-based contract and does not emit that warning, so its
+    # authoritative validator remains the source of truth below.
+    if workspace_manager.backend == "trtllm" and (
+        token_num * hidden_dim
+        > workspace_manager.max_token_num * workspace_manager.hidden_dim
+        or workspace_manager.use_fp32_lamport != (input_.dtype == torch.float32)
+    ):
+        return False
+
     return workspace_manager.is_buffer_size_sufficient(
         token_num=token_num,
         hidden_dim=hidden_dim,
@@ -994,7 +1020,6 @@ def pre_initialize_workspaces(
 
 
 def cleanup_flashinfer_workspace():
-    from sglang.srt.runtime_context import get_resources
 
     buffers = get_resources().buffers
     for name in (

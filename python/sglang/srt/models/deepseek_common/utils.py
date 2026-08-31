@@ -29,6 +29,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -47,9 +48,13 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _device_sm = get_device_sm()
 _is_gfx95_supported = is_gfx95_supported()
+# gfx1250 reuses the gfx95 (CDNA4) code paths for MXFP4 q/k-norm kernels, but its
+# aiter rope kernels (ck_tile) do not build, so it runs sglang's native rope which
+# lacks the separate cos_cache/sin_cache buffers the gfx95 fused-rope decode path
+# expects. This flag lets gfx1250 carve out of that fused-rope path.
+_is_gfx1250_supported = is_gfx1250_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
-
 
 _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()
 
@@ -102,14 +107,14 @@ def awq_dequantize_func():
 
         return awq_dequantize
     elif _is_hip:
-        from sglang.kernel_api_logging import debug_kernel_api
+        from sglang.kernels.kernel_api_logging import debug_kernel_api
         from sglang.kernels.ops.quantization.awq_triton import (
             awq_dequantize_triton as awq_dequantize,
         )
 
         return debug_kernel_api(awq_dequantize, op_name="DeepseekCommon.awq_dequantize")
     elif _is_npu:
-        from sglang.kernel_api_logging import debug_kernel_api
+        from sglang.kernels.kernel_api_logging import debug_kernel_api
         from sglang.kernels.ops.quantization.awq_triton import (
             awq_dequantize_decomposition as awq_dequantize,
         )
@@ -150,6 +155,16 @@ def is_wint4afp8_or_wint4a16_config(
     return quant_config._is_wint4afp8(
         weight_quant, input_quant
     ) or quant_config._is_wint4abf16(weight_quant, input_quant)
+
+
+def quant_blocks_shared_experts_fusion(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Whether the quantization keeps shared experts at a higher precision than
+    the routed experts, which would require shared expert fusion to be disabled.
+    """
+    can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
+    return can_fuse_fn is not None and not can_fuse_fn()
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
