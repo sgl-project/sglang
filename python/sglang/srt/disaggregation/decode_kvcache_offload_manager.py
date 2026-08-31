@@ -94,9 +94,8 @@ class DecodeKVCacheOffloadManager:
 
         self.ongoing_offload = {}
         self.ongoing_backup = {}
-        # Keyed by Req identity (a caller-supplied rid can be reused while the
-        # previous request's D2H copy is in flight); weak keys so a request
-        # released outside _release_finished_req is not pinned here forever.
+        # Keyed by Req identity (rids can be reused while a D2H copy is still
+        # in flight); weak keys so a dropped Req is never pinned here.
         self.offloaded_state: weakref.WeakKeyDictionary[Req, OffloadedState] = (
             weakref.WeakKeyDictionary()
         )
@@ -252,11 +251,8 @@ class DecodeKVCacheOffloadManager:
 
         kv_committed_len = req.effective_kv_committed_len()
 
-        # Free the prefill-aligned slots. Previously this was done
-        # eagerly in offload_kv_cache (mid-decode), which raced with
-        # concurrent admission. Now consolidated here at request
-        # finish, where the request is guaranteed to no longer attend
-        # to those slots.
+        # Prefill-aligned slots are freed only here, at request finish; freeing
+        # them mid-decode races with concurrent admission over live slots.
         prefill_len = self._prefill_offloaded_len(req)
         if prefill_len > 0:
             prefill_indices = self.req_to_token_pool.req_to_token[

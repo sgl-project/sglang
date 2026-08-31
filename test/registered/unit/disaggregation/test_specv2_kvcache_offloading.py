@@ -180,9 +180,8 @@ class TestReleaseFinishedReq(unittest.TestCase):
     def test_release_finished_req_frees_prefill_and_pops_state(self):
         """
         _release_finished_req frees the prefill-aligned slots in addition to
-        the committed range. This is the consolidated free path that replaces
-        the eager free that previously happened in offload_kv_cache (which
-        raced with concurrent admission and produced cross-pollinated reads).
+        the committed range; freeing them mid-decode instead races with
+        concurrent admission and cross-pollinates KV reads.
         """
         manager, freed = _make_manager(pool_size=32)
         req = _make_mock_req(
