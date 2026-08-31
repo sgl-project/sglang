@@ -458,6 +458,10 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& retrieve_parent_token = std::nullopt);
 #endif
 
+// post-verify mamba state commit
+void mamba_state_scatter_with_mask_cpu(
+    at::Tensor& dst, const at::Tensor& src, const at::Tensor& dst_indices, const at::Tensor& step_indices);
+
 // conv3d fast path for patch embedding
 at::Tensor conv3d_embed_weight_pack(const at::Tensor& weight);
 
@@ -862,6 +866,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor(c!)? retrieve_parent_token=None) -> Tensor");
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
 #endif
+
+  // post-verify mamba state commit
+  m.def(
+      "mamba_state_scatter_with_mask_cpu(Tensor(a!) dst, Tensor src, Tensor dst_indices, "
+      "Tensor step_indices) -> ()");
+  m.impl("mamba_state_scatter_with_mask_cpu", torch::kCPU, &mamba_state_scatter_with_mask_cpu);
 
   // conv3d fast path for patch embedding
   m.def("conv3d_embed_weight_pack(Tensor weight) -> Tensor");

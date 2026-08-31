@@ -10,6 +10,13 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_cpu
+
+_is_cpu = is_cpu()
+
+if _is_cpu:
+    import sgl_kernel  # noqa: F401
+
 
 def _require_entry_contiguous_dst(
     dst: torch.Tensor, entry_start_dim: int, fn_name: str
@@ -150,11 +157,10 @@ def _state_scatter_with_mask_torch(
     dst_indices_raw: torch.Tensor,
     step_indices_raw: torch.Tensor,
 ):
-    """Non-CUDA fallback for the masked state scatters.
+    """Fallback for accelerators without a masked-scatter kernel of their own.
 
     Advanced indexing reads/writes through arbitrary strides, so it serves the
-    dense SSM/conv layouts used on CPU and NPU and the overlapping conv-window
-    view alike.
+    dense SSM/conv layouts and the overlapping conv-window view alike.
     """
     valid_mask = step_indices_raw >= 0
     if not valid_mask.any():
@@ -163,6 +169,25 @@ def _state_scatter_with_mask_torch(
     dst_indices = dst_indices_raw[valid_indices].long()
     step_indices = step_indices_raw[valid_indices].long()
     dst[:, dst_indices] = src[:, valid_indices, step_indices]
+
+
+def _state_scatter_with_mask(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    dst_indices_raw: torch.Tensor,
+    step_indices_raw: torch.Tensor,
+):
+    """Non-CUDA masked state scatter: the CPU kernel where it applies."""
+    if not _is_cpu:
+        _state_scatter_with_mask_torch(dst, src, dst_indices_raw, step_indices_raw)
+        return
+
+    torch.ops.sgl_kernel.mamba_state_scatter_with_mask_cpu(
+        dst,
+        src,
+        dst_indices_raw.to(torch.int32).contiguous(),
+        step_indices_raw.to(torch.int32).contiguous(),
+    )
 
 
 @triton.jit
@@ -270,7 +295,7 @@ def fused_mamba_state_scatter_with_mask(
             f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
     if not dst.is_cuda or not src.is_cuda:
-        _state_scatter_with_mask_torch(dst, src, dst_indices_raw, step_indices_raw)
+        _state_scatter_with_mask(dst, src, dst_indices_raw, step_indices_raw)
         return
     if dst.ndim < 2 or src.ndim < 3:
         raise ValueError(f"Unexpected tensor ranks: {dst.ndim=} {src.ndim=}")
@@ -433,7 +458,7 @@ def fused_conv_window_scatter_with_mask(
             f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
     if not dst.is_cuda or not src.is_cuda:
-        _state_scatter_with_mask_torch(dst, src, dst_indices_raw, step_indices_raw)
+        _state_scatter_with_mask(dst, src, dst_indices_raw, step_indices_raw)
         return
     if dst.ndim != 4 or src.ndim != 5:
         raise ValueError(f"Unexpected ranks: {dst.ndim=} (want 4) {src.ndim=} (want 5)")

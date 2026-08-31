@@ -5,6 +5,9 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
+from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    _state_scatter_with_mask_torch,
+)
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, organize_draft_results
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import precision
@@ -1826,6 +1829,176 @@ class TestCausalConv1dUpdateMultiToken(CustomTestCase):
                 torch.testing.assert_close(
                     intermediate_conv_window, window_ref, atol=atol, rtol=rtol
                 )
+
+
+class TestMambaStateScatterWithMask(CustomTestCase):
+    def setUp(self):
+        torch.manual_seed(1234)
+
+    def _run_and_check(self, dst, src, dst_indices, step_indices):
+        dst_ref = dst.clone()
+        _state_scatter_with_mask_torch(dst_ref, src, dst_indices, step_indices)
+
+        out = dst.clone()
+        torch.ops.sgl_kernel.mamba_state_scatter_with_mask_cpu(
+            out, src, dst_indices.to(torch.int32), step_indices.to(torch.int32)
+        )
+        torch.testing.assert_close(out, dst_ref, atol=0, rtol=0)
+
+    def test_ssm_state_scatter(self):
+        # dense per-step SSM states: [layers, cache, HV, K, V]
+        layers, cache_size, requests, steps = 2, 6, 3, 4
+        HV, K, V = 4, 8, 8
+        dst = torch.randn(layers, cache_size, HV, K, V, dtype=torch.float32)
+        src = torch.randn(layers, requests, steps, HV, K, V, dtype=torch.float32)
+        dst_indices = torch.tensor([4, 0, 2], dtype=torch.int32)
+        step_indices = torch.tensor([3, 0, 2], dtype=torch.int32)
+
+        self._run_and_check(dst, src, dst_indices, step_indices)
+
+    def test_skips_negative_steps_and_slots(self):
+        # padded requests carry -1 and must leave the cache untouched
+        layers, cache_size, requests, steps = 2, 5, 4, 3
+        dst = torch.randn(layers, cache_size, 4, 4, dtype=torch.bfloat16)
+        src = torch.randn(layers, requests, steps, 4, 4, dtype=torch.bfloat16)
+        dst_indices = torch.tensor([1, 3, -1, 0], dtype=torch.int32)
+        step_indices = torch.tensor([2, -1, 1, 0], dtype=torch.int32)
+
+        out = dst.clone()
+        torch.ops.sgl_kernel.mamba_state_scatter_with_mask_cpu(
+            out, src, dst_indices, step_indices
+        )
+        # rows 3 and -1 are skipped for their own reason; only 1 and 0 move
+        torch.testing.assert_close(out[:, 1], src[:, 0, 2], atol=0, rtol=0)
+        torch.testing.assert_close(out[:, 0], src[:, 3, 0], atol=0, rtol=0)
+        for untouched in (2, 3, 4):
+            torch.testing.assert_close(
+                out[:, untouched], dst[:, untouched], atol=0, rtol=0
+            )
+
+    def test_conv_window_scatter_strided_source(self):
+        # the deduplicated conv-window source overlaps its per-step windows, so
+        # its entries are non-contiguous
+        layers, cache_size, requests, steps = 2, 5, 3, 4
+        dim, win = 16, 3
+        dst = torch.randn(layers, cache_size, dim, win, dtype=torch.bfloat16)
+        shared = torch.randn(
+            layers, requests, dim, steps + win - 1, dtype=torch.bfloat16
+        )
+        src = shared.as_strided(
+            (layers, requests, steps, dim, win),
+            (
+                shared.stride(0),
+                shared.stride(1),
+                shared.stride(3),
+                shared.stride(2),
+                shared.stride(3),
+            ),
+        )
+        self.assertFalse(src[0, 0, 0].is_contiguous())
+        dst_indices = torch.tensor([2, 4, 0], dtype=torch.int32)
+        step_indices = torch.tensor([1, 3, -1], dtype=torch.int32)
+
+        self._run_and_check(dst, src, dst_indices, step_indices)
+
+    def test_dim_contiguous_conv_state_destination(self):
+        # causal_conv1d_update_cpu re-strides conv_states to be dim-contiguous,
+        # so the destination entry is transposed and the copy is a transpose
+        layers, cache_size, requests, steps = 2, 5, 3, 4
+        dim, win = 16, 3
+        dst = torch.randn(layers, cache_size, win, dim, dtype=torch.bfloat16).transpose(
+            2, 3
+        )
+        self.assertEqual(dst.shape[-2:], (dim, win))
+        self.assertFalse(dst[0, 0].is_contiguous())
+        src = torch.randn(layers, requests, steps, dim, win, dtype=torch.bfloat16)
+        dst_indices = torch.tensor([2, 4, 0], dtype=torch.int32)
+        step_indices = torch.tensor([1, 3, 2], dtype=torch.int32)
+
+        self._run_and_check(dst, src, dst_indices, step_indices)
+
+    def test_dense_conv_window_scatter(self):
+        layers, cache_size, requests, steps = 3, 4, 3, 5
+        dim, win = 32, 3
+        dst = torch.randn(layers, cache_size, dim, win, dtype=torch.bfloat16)
+        src = torch.randn(layers, requests, steps, dim, win, dtype=torch.bfloat16)
+        dst_indices = torch.tensor([3, 1, 2], dtype=torch.int32)
+        step_indices = torch.tensor([4, 0, -1], dtype=torch.int32)
+
+        self._run_and_check(dst, src, dst_indices, step_indices)
+
+    def test_both_sides_strided(self):
+        # the odometer path with two independent stride sets
+        layers, cache_size, requests, steps = 2, 5, 3, 4
+        dim, win = 16, 3
+        dst = torch.randn(layers, cache_size, win, dim, dtype=torch.bfloat16).transpose(
+            2, 3
+        )
+        shared = torch.randn(
+            layers, requests, dim, steps + win - 1, dtype=torch.bfloat16
+        )
+        src = shared.as_strided(
+            (layers, requests, steps, dim, win),
+            (
+                shared.stride(0),
+                shared.stride(1),
+                shared.stride(3),
+                shared.stride(2),
+                shared.stride(3),
+            ),
+        )
+        self.assertFalse(dst[0, 0].is_contiguous())
+        self.assertFalse(src[0, 0, 0].is_contiguous())
+        dst_indices = torch.tensor([2, 4, 0], dtype=torch.int32)
+        step_indices = torch.tensor([1, 3, 2], dtype=torch.int32)
+
+        self._run_and_check(dst, src, dst_indices, step_indices)
+
+    def test_envelope_strided_destination(self):
+        # a unified-pool view spaces its slots out, so the slot stride is wider
+        # than one entry
+        layers, cache_size, requests, steps = 2, 4, 2, 3
+        HV, K, V = 2, 4, 4
+        envelope = torch.zeros(layers, cache_size, 2, HV, K, V, dtype=torch.float32)
+        dst = envelope[:, :, 0]
+        self.assertGreater(dst.stride(1), HV * K * V)
+        src = torch.randn(layers, requests, steps, HV, K, V, dtype=torch.float32)
+        dst_indices = torch.tensor([3, 1], dtype=torch.int32)
+        step_indices = torch.tensor([2, 0], dtype=torch.int32)
+
+        self._run_and_check(dst, src, dst_indices, step_indices)
+        # the neighbouring half of each envelope slot must be untouched
+        torch.testing.assert_close(
+            envelope[:, :, 1], torch.zeros_like(envelope[:, :, 1]), atol=0, rtol=0
+        )
+
+    def test_out_of_range_indices_are_skipped(self):
+        # the torch reference raises on these, so the kernel is checked directly
+        layers, cache_size, requests, steps = 2, 3, 3, 2
+        dst = torch.randn(layers, cache_size, 4, dtype=torch.float32)
+        src = torch.randn(layers, requests, steps, 4, dtype=torch.float32)
+        dst_indices = torch.tensor([cache_size, 0, 1], dtype=torch.int32)
+        step_indices = torch.tensor([0, steps, 1], dtype=torch.int32)
+
+        out = dst.clone()
+        torch.ops.sgl_kernel.mamba_state_scatter_with_mask_cpu(
+            out, src, dst_indices, step_indices
+        )
+        # only request 2 is in range
+        torch.testing.assert_close(out[:, 1], src[:, 2, 1], atol=0, rtol=0)
+        for untouched in (0, 2):
+            torch.testing.assert_close(
+                out[:, untouched], dst[:, untouched], atol=0, rtol=0
+            )
+
+    def test_empty_request_list(self):
+        dst = torch.randn(2, 3, 4, dtype=torch.float32)
+        src = torch.randn(2, 0, 2, 4, dtype=torch.float32)
+        empty = torch.empty(0, dtype=torch.int32)
+
+        out = dst.clone()
+        torch.ops.sgl_kernel.mamba_state_scatter_with_mask_cpu(out, src, empty, empty)
+        torch.testing.assert_close(out, dst, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
