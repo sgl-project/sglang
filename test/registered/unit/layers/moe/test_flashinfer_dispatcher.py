@@ -24,7 +24,7 @@ def test_empty_mxfp8_dispatch_uses_same_payload_dtype_as_nonempty_rank():
     dispatcher.ep_size = 1
     dispatcher.invalid_token_expert_id = 8
     dispatcher.payload_in_workspace = False
-    dispatcher.quant_config = {}
+    dispatcher.quant_config = {"use_mxfp8": True}
     dispatcher.moe_a2a = FakeMoeAlltoAll()
 
     hidden_states = torch.empty((0, 128), dtype=torch.bfloat16)
