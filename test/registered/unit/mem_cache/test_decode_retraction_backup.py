@@ -116,8 +116,6 @@ class TestDecodeRetractionBackup(unittest.TestCase):
                 mode=HiCacheDraftMode.SIDECAR,
                 device_pools=(draft_pool,),
             ),
-            server_args=server_args,
-            page_size=1,
         )
         self.assertIn(PoolName.DRAFT, cache.host_pool_group.entry_map)
         cache.validate_retraction_host_capacity()
@@ -131,12 +129,14 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         )
 
     def _admit_req(self, env, num_tokens: int):
-        req = SimpleNamespace(rid="request", req_pool_idx=None, seqlen=num_tokens + 1)
+        req = SimpleNamespace(
+            rid="request", kv=SimpleNamespace(req_pool_idx=None), seqlen=num_tokens + 1
+        )
         self.assertIsNotNone(env.req_to_token_pool.alloc([req]))
         source_indices = env.allocator.alloc(num_tokens)
         self.assertIsNotNone(source_indices)
         env.req_to_token_pool.write(
-            (req.req_pool_idx, slice(0, num_tokens)), source_indices
+            (req.kv.req_pool_idx, slice(0, num_tokens)), source_indices
         )
         return req, source_indices
 
@@ -202,7 +202,7 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         self.assertIsNotNone(destination_indices)
         self.assertFalse(torch.equal(source_indices, destination_indices))
         req_to_token_pool.write(
-            (req.req_pool_idx, slice(0, self.num_tokens)), destination_indices
+            (req.kv.req_pool_idx, slice(0, self.num_tokens)), destination_indices
         )
 
         cache.retraction_restore(req, backup)

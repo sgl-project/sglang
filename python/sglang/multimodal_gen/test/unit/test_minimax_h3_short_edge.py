@@ -5,12 +5,29 @@ import pytest
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
     constants,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.request_validation import (
+    minimax_h3_validate_canonical_request,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
     MINIMAX_H3_BASE_SHORT_EDGE,
     MINIMAX_H3_CANVAS_MULTIPLE,
     MINIMAX_H3_MAX_PIXELS,
     minimax_h3_resolve_spatial_shape,
 )
+
+
+def _validate(short_edge):
+    return minimax_h3_validate_canonical_request(
+        task="t2va",
+        prompt="short edge warning",
+        conditions=[],
+        target={
+            "short_edge": short_edge,
+            "aspect_ratio": "16:9",
+            "duration_seconds": 5.0,
+        },
+        seed=0,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -70,3 +87,16 @@ class TestWarning:
                 )
         assert caplog.text.count("outside the verified configuration") == 1
         assert "768" in caplog.text
+
+    def test_request_validation_does_not_warn_about_the_recommended_edge(self, caplog):
+        # Request admission is the first thing every request hits, so an
+        # unconditional warning here fires on the released 768 configuration and
+        # names 768 as the verified one in the same sentence.
+        with caplog.at_level("WARNING"):
+            _validate(MINIMAX_H3_BASE_SHORT_EDGE)
+        assert "outside the verified configuration" not in caplog.text
+
+    def test_request_validation_warns_about_an_unverified_edge(self, caplog):
+        with caplog.at_level("WARNING"):
+            _validate(480)
+        assert "outside the verified configuration" in caplog.text
