@@ -371,6 +371,17 @@ def handle_linear_attn_backend(server_args: Any):
                 f"{cfg.linear_replayssm_cache_len}."
             )
 
+    if cfg.linear_replayssm_phase_policy != "natural":
+        if not cfg.enable_linear_replayssm:
+            raise ValueError(
+                "--linear-replayssm-phase-policy requires " "--enable-linear-replayssm."
+            )
+        if cfg.speculative_algorithm is not None:
+            raise ValueError(
+                "--linear-replayssm-phase-policy=staggered currently supports "
+                "non-speculative decode only."
+            )
+
     # ReplaySSM spec-verify (Part B of #28511): linear-chain target verify via
     # fold-every-commit -- the verify stores each draft step's raw inputs into
     # the per-slot (rawv, rawk, g, beta) window and the commit replays the

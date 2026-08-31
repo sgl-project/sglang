@@ -2699,6 +2699,15 @@ class ServerArgs:
         "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
         NS("exec.mamba"),
     ] = 16
+    linear_replayssm_phase_policy: A[
+        Literal["natural", "staggered"],
+        "Scheduler policy for ReplaySSM flush phases. 'natural' preserves the "
+        "existing per-request cursor behavior. 'staggered' assigns stable "
+        "request phases and uses correctness-preserving early flushes to spread "
+        "recurrent-state materialization across decode iterations. Experimental; "
+        "requires --enable-linear-replayssm and non-speculative decoding.",
+        NS("exec.mamba"),
+    ] = "natural"
     # ReplaySSM spec-verify (Part B of RFC #28511): linear-attn target-verify via
     # fold-every-commit instead of per-draft full-state snapshots -- the verify
     # stores each draft step's raw inputs into a per-slot window and the commit

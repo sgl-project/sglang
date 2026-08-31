@@ -170,8 +170,8 @@ class MambaAttnBackendBase(AttentionBackend):
                 safe_slots = slots.clamp(min=0)
                 replayssm_write_pos = write_pos_buf[safe_slots].clone()
                 L = mamba_pool.linear_replayssm_cache_len
-                # KDA has no radix coordination: flush only on the natural write_pos
-                # == L-1 wrap. GDN adds the radix-aligned force-flush below.
+                # KDA has no radix coordination; natural wraps apply unless the scheduler
+                # supplies an explicit phase flush. GDN also adds the radix-aligned flush below.
                 is_kda = getattr(mamba_pool, "replayssm_is_kda", False)
                 # Force-flush on the radix track's seq_lens % mamba_track_interval
                 # == 0 boundary so the ring folds into temporal[slot] when read.
@@ -181,6 +181,18 @@ class MambaAttnBackendBase(AttentionBackend):
                     )
                     replayssm_force_flush = force_flush_bool.to(
                         device=self.device, dtype=torch.int32
+                    )
+                scheduled_force_flush = forward_batch.replayssm_force_flush
+                if scheduled_force_flush is not None:
+                    scheduled_force_flush = scheduled_force_flush[:bs].to(
+                        device=self.device, dtype=torch.int32
+                    )
+                    replayssm_force_flush = (
+                        scheduled_force_flush
+                        if replayssm_force_flush is None
+                        else torch.logical_or(
+                            replayssm_force_flush != 0, scheduled_force_flush != 0
+                        ).to(torch.int32)
                     )
                 # Advance only valid slots, scattered over unique slots (dup-index
                 # race; padded rows clamp to 0); a forced flush -> next write_pos 0.
@@ -291,6 +303,7 @@ class MambaAttnBackendBase(AttentionBackend):
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            scheduled_force_flush=getattr(forward_batch, "replayssm_force_flush", None),
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -583,6 +596,7 @@ class MambaAttnBackendBase(AttentionBackend):
         num_padding: Optional[int] = None,
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
+        scheduled_force_flush: Optional[torch.Tensor] = None,
     ):
         if num_padding is None:
             if seq_lens_cpu is None:
@@ -656,18 +670,33 @@ class MambaAttnBackendBase(AttentionBackend):
                 # Refresh the force-flush buffer in-place from this step's seq_lens
                 # (same condition as the radix track). Zeroed during capture.
                 force_flush_dev = None
-                # KDA: no radix coordination -> leave zeroed so the advance is a pure wrap.
+                # Combine scheduler phase decisions with the mandatory GDN radix
+                # checkpoint flush. KDA has no radix coordination.
+                force_flush_dev = (
+                    scheduled_force_flush[:bs].to(device=self.device, dtype=torch.int32)
+                    if scheduled_force_flush is not None
+                    else None
+                )
                 is_kda = getattr(mamba_pool, "replayssm_is_kda", False)
                 if (
                     not is_kda
                     and forward_mode.is_decode_or_idle()
                     and seq_lens_cpu is not None
                 ):
-                    ff_mask = self._replayssm_track_flush_mask(seq_lens_cpu, bs)
-                    force_flush_dev = ff_mask.to(device=self.device, dtype=torch.int32)
-                    static_ff.copy_(force_flush_dev)
-                else:
+                    track_force_flush = self._replayssm_track_flush_mask(
+                        seq_lens_cpu, bs
+                    ).to(device=self.device, dtype=torch.int32)
+                    force_flush_dev = (
+                        track_force_flush
+                        if force_flush_dev is None
+                        else torch.logical_or(
+                            force_flush_dev != 0, track_force_flush != 0
+                        ).to(torch.int32)
+                    )
+                if force_flush_dev is None:
                     static_ff.zero_()
+                else:
+                    static_ff.copy_(force_flush_dev)
                 # Defense in depth: the decode-ring advance is only meaningful for
                 # decode/idle forwards (mirrors the eager path's gating). A
                 # TARGET_VERIFY replay must never advance the cursor.
@@ -900,6 +929,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            scheduled_force_flush=getattr(forward_batch, "replayssm_force_flush", None),
         )
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1

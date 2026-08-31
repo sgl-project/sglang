@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -10,6 +12,9 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.managers.schedule_batch import (
+    build_replayssm_staggered_force_flush_mask,
+)
 from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -82,6 +87,43 @@ class TestMtpPhaseBoundaryOverlap(unittest.TestCase):
             scheduler = self._scheduler(require_mlp_sync=require_mlp_sync)
             self.assertFalse(scheduler.is_disable_overlap_for_batch(decode, extend))
             self.assertFalse(scheduler.is_disable_overlap_for_batch(extend, decode))
+
+
+class TestReplaySSMPhasePolicy(unittest.TestCase):
+    def test_staggered_policy_balances_each_decode_iteration(self):
+        batch_size = 64
+        window = 16
+        req_pool_indices = torch.arange(batch_size, dtype=torch.int64)
+        initial_seq_lens = torch.full((batch_size,), 100, dtype=torch.int64)
+        masks = torch.stack(
+            [
+                build_replayssm_staggered_force_flush_mask(
+                    initial_seq_lens + step, req_pool_indices, window
+                )
+                for step in range(window)
+            ]
+        )
+        self.assertTrue(torch.equal(masks.sum(dim=1), torch.full((window,), 4)))
+        self.assertTrue(torch.equal(masks.sum(dim=0), torch.ones(batch_size)))
+
+    def test_staggered_policy_handles_noncontiguous_slots(self):
+        seq_lens = torch.tensor([7, 19, 33, 65], dtype=torch.int64)
+        req_pool_indices = torch.tensor([11, 3, 29, 40], dtype=torch.int64)
+        mask = build_replayssm_staggered_force_flush_mask(
+            seq_lens, req_pool_indices, window=8
+        )
+        expected = torch.remainder(seq_lens + req_pool_indices, 8) == 0
+        self.assertTrue(torch.equal(mask, expected))
+
+    def test_staggered_policy_validates_inputs(self):
+        with self.assertRaisesRegex(ValueError, "window must be >= 1"):
+            build_replayssm_staggered_force_flush_mask(
+                torch.zeros(1), torch.zeros(1), window=0
+            )
+        with self.assertRaisesRegex(ValueError, "must have the same shape"):
+            build_replayssm_staggered_force_flush_mask(
+                torch.zeros(2), torch.zeros(1), window=8
+            )
 
 
 if __name__ == "__main__":

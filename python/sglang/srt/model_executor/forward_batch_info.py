@@ -426,6 +426,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     # The seqlens to track mamba state if masked, prefill only.
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    # Scheduler-owned ReplaySSM early-flush decisions.
+    replayssm_force_flush: Optional[torch.Tensor] = None  # shape: [b], int32
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
@@ -791,6 +793,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
+            replayssm_force_flush=batch.replayssm_force_flush,
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,
@@ -1551,6 +1554,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.mamba_track_seqlens is not None:
             self.mamba_track_seqlens = self._pad_tensor_to_size(
                 self.mamba_track_seqlens, bs
+            )
+        if self.replayssm_force_flush is not None:
+            self.replayssm_force_flush = self._pad_tensor_to_size(
+                self.replayssm_force_flush, bs
             )
 
         if self.mrope_positions is not None:

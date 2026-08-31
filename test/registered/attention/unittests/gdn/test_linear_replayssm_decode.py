@@ -93,7 +93,15 @@ class TestLinearReplaySSMDecode(CustomTestCase):
     NUM_STEPS = 40  # > 16 -> multiple flush cycles for L in {4,8,16}
     L_SWEEP = (1, 4, 8, 16)
 
-    def _run_one(self, cfg, L, dtype, force_flush_steps=(), is_kda=False):
+    def _run_one(
+        self,
+        cfg,
+        L,
+        dtype,
+        force_flush_steps=(),
+        is_kda=False,
+        force_flush_phases=None,
+    ):
         from sglang.kernels.ops.attention.fla.fused_recurrent import (
             fused_recurrent_gated_delta_rule_packed_decode,
             fused_recurrent_kda_packed_decode,
@@ -183,12 +191,25 @@ class TestLinearReplaySSMDecode(CustomTestCase):
 
             # ---- ReplaySSM buffered decode for this L ----
             rep_out = mixed_qkv.new_empty(B, 1, HV, V)
-            # slice 2: force a flush at a radix track boundary even mid-buffer.
+            # Force either a whole batch (radix boundary) or independent request
+            # phases (scheduler policy). The latter exercises divergent rows.
             force_now = step in force_flush_steps
+            if force_flush_phases is not None:
+                phase_tensor = torch.as_tensor(
+                    force_flush_phases, device=device, dtype=torch.int32
+                )
+                force_flush_mask = phase_tensor == (step % L)
+            else:
+                force_flush_mask = torch.full(
+                    (B,), force_now, device=device, dtype=torch.bool
+                )
             ff_tensor = (
-                torch.ones(B, device=device, dtype=torch.int32) if force_now else None
+                force_flush_mask.to(torch.int32)
+                if bool(force_flush_mask.any().item())
+                else None
             )
-            is_flush = bool((write_pos[0].item()) == L - 1) or force_now
+            flush_mask = (write_pos == L - 1) | force_flush_mask
+            is_flush = bool(flush_mask.any().item())
             flush_step_seen = flush_step_seen or is_flush
             fused_recurrent_linear_replayssm_decode(
                 mixed_qkv=mixed_qkv,
@@ -239,8 +260,8 @@ class TestLinearReplaySSMDecode(CustomTestCase):
             if is_flush:
                 if dtype == torch.float32 and L == 1 and not is_kda:
                     torch.testing.assert_close(
-                        rep_state,
-                        ref_state,
+                        rep_state[flush_mask],
+                        ref_state[flush_mask],
                         atol=2e-6,
                         rtol=1e-5,
                         msg=f"GDN L=1 step={step} state",
@@ -261,8 +282,8 @@ class TestLinearReplaySSMDecode(CustomTestCase):
                         else dict(atol=3e-3, rtol=1e-2)
                     )
                     torch.testing.assert_close(
-                        rep_state,
-                        ref_state,
+                        rep_state[flush_mask],
+                        ref_state[flush_mask],
                         msg=f"is_kda={is_kda} L={L} step={step} state(flush)",
                         **state_tols,
                     )
@@ -270,15 +291,11 @@ class TestLinearReplaySSMDecode(CustomTestCase):
             # Advance the ring cursor (caller's responsibility in this phase):
             # wrap to 0 after a flush (natural L-1 OR a forced track-boundary
             # flush), otherwise increment.
-            if force_now:
-                write_pos = torch.zeros_like(write_pos)
-            else:
-                write_pos = torch.where(
-                    write_pos == L - 1,
-                    torch.zeros_like(write_pos),
-                    write_pos + 1,
-                )
-
+            write_pos = torch.where(
+                flush_mask,
+                torch.zeros_like(write_pos),
+                write_pos + 1,
+            )
         # Explicit wrap/flush boundary must have been exercised for L>1; for
         # L=1 every step is a flush.
         self.assertTrue(flush_step_seen, f"flush boundary never hit for L={L}")
@@ -327,6 +344,19 @@ class TestLinearReplaySSMDecode(CustomTestCase):
                         force_flush_steps=(3, 5, 11, 20),
                         is_kda=is_kda,
                     )
+
+    def test_per_request_phase_flush_matches_reference(self):
+        """Independent request phases preserve output and flushed checkpoints."""
+        cfg = dict(B=4, H=8, HV=16, K=128, V=128)
+        for is_kda in (False, True):
+            with self.subTest(is_kda=is_kda):
+                self._run_one(
+                    cfg,
+                    L=8,
+                    dtype=torch.bfloat16,
+                    is_kda=is_kda,
+                    force_flush_phases=(0, 2, 4, 6),
+                )
 
     def test_flush_boundary_state_exact_l1(self):
         """At L=1 (GDN) every step is a flush; the kernel is algebraically the
