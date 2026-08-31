@@ -14,8 +14,8 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
-from sglang.srt.utils.common import is_sm120_supported
 
 # Suppress TRT-LLM CUTLASS trace logs without overriding user configuration.
 os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
@@ -37,7 +37,7 @@ class Mxfp4FlashinferCutlassMoEMethod:
     def __init__(self, fp8_method, prefix: str):
         if not is_flashinfer_available():
             raise RuntimeError("Mxfp4FlashinferCutlassMoEMethod requires FlashInfer.")
-        self._use_mxfp8_act_scaling = is_sm120_supported()
+        self._use_mxfp8_act_scaling = get_platform().is_sm120
         self._fp8 = fp8_method
         self.prefix = prefix
         self._swiglu_limit_tensor: torch.Tensor | None = None
