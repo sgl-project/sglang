@@ -3124,7 +3124,7 @@ class Scheduler(
         if self.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
             # it. Drop the marker once the request is actually gone.
-            if req.finished() or req.req_pool_idx is None:
+            if req.finished() or req.kv.req_pool_idx is None:
                 self._pending_chunked_abort_req = None
             return
 
@@ -3161,7 +3161,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
         )
 
-        req_pool_indices = [r.req_pool_idx for r in reqs]
+        req_pool_indices = [r.kv.req_pool_idx for r in reqs]
         batch.req_pool_indices = torch.tensor(
             req_pool_indices, dtype=torch.int64, device=device
         )
@@ -4868,7 +4868,7 @@ class Scheduler(
                     _make_abort_req(req), req
                 )
                 if (
-                    req.req_pool_idx is not None
+                    req.kv.req_pool_idx is not None
                     or getattr(req, "mamba_pool_idx", None) is not None
                 ):
                     release_kv_cache(req, self.tree_cache, is_insert=False)
