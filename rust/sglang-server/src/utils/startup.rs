@@ -1,4 +1,4 @@
-//! Helpers for the Python-facing server boundary.
+//! Helpers for the Python-facing server startup boundary.
 
 use std::net::SocketAddr;
 
