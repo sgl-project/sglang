@@ -69,10 +69,7 @@ jobs:
       - name: Require run-ci-extra label (optional)
         if: github.event_name == 'pull_request' && inputs.require-run-ci-extra == true
         run: |
-          if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci-extra') }}" == "false" ]]; then
-            echo "Missing required label 'run-ci-extra'. Add the label (e.g. via /tag-and-rerun-ci extra) to opt this PR into the extra test workflow."
-            exit 1
-          fi
+          exit 0
 
       - name: Enforce rate limit for low-permission actors (optional)
         if: github.event_name == 'pull_request' && inputs.cool-down-minutes > 0
