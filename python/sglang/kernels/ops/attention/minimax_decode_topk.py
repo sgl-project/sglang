@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 # Must match TopKTrait::kMaxNumBlocks in minimax_decode_topk.cuh.
-_MAX_NUM_BLOCKS = 16384
+_MAX_NUM_BLOCKS = 16384 if torch.version.hip else 4096
 
 
 @cache_once
