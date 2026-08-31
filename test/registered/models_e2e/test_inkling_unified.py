@@ -155,7 +155,14 @@ class TestInklingUnifiedTriPool(CustomTestCase):
     def test_input_output_logprobs_match(self):
         """Prefill-vs-decode KV consistency through all three sub-pools'
         translates (wrong-slot reads surface as logprob mismatches)."""
-        assert_logprobs_match(self, self.base_url, self.model)
+        assert_logprobs_match(
+            self.base_url,
+            {self.model: {"kl_div": 1e-2}},
+            self.model,
+            max_samples=4,
+            max_new_tokens=256,
+            trust_remote_code=True,
+        )
 
     def test_repeated_prefix_reproduces_logprobs(self):
         """Multi-turn prefix reuse: radix hit + conv COW + swa recycling must
