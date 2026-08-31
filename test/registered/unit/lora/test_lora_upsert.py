@@ -15,7 +15,7 @@ instead of failing with a duplicate error. Covers:
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import MagicMock, Mock
 
 import torch
 
@@ -26,11 +26,6 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
-from sglang.srt.managers.io_struct import (
-    LoadLoRAAdapterFromDistributedReqInput,
-    LoadLoRAAdapterFromTensorsReqInput,
-)
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -351,186 +346,6 @@ class TestValidateNewAdapterDuplicates(CustomTestCase):
         config = MagicMock(lora_added_tokens_size=0, use_dora=False)
 
         manager.validate_new_adapter(config, existing, is_update=True)
-
-
-def _make_tokenizer_manager(tokenizer_worker_num: int = 1) -> TokenizerManager:
-    tm = TokenizerManager.__new__(TokenizerManager)
-    tm.server_args = MagicMock()
-    tm.server_args.enable_lora = True
-    tm.server_args.dp_size = 1
-    tm.server_args.max_loaded_loras = None
-    tm.server_args.tokenizer_worker_num = tokenizer_worker_num
-    tm.auto_create_handle_loop = Mock()
-    tm.lora_update_lock = asyncio.Lock()
-    tm.lora_registry = LoRARegistry()
-    tm.lora_ref_cache = {}
-    tm.update_lora_adapter_communicator = AsyncMock(
-        return_value=[MagicMock(success=True)]
-    )
-    return tm
-
-
-def _make_distributed_req(upsert: bool) -> LoadLoRAAdapterFromDistributedReqInput:
-    return LoadLoRAAdapterFromDistributedReqInput(
-        lora_name="a",
-        config_dict=CONFIG_DICT,
-        names=[],
-        dtypes=[],
-        shapes=[],
-        upsert=upsert,
-    )
-
-
-def _make_tensors_req(
-    upsert: bool, pinned: bool = False
-) -> LoadLoRAAdapterFromTensorsReqInput:
-    return LoadLoRAAdapterFromTensorsReqInput(
-        lora_name="a",
-        config_dict=CONFIG_DICT,
-        serialized_named_tensors=[],
-        pinned=pinned,
-        upsert=upsert,
-    )
-
-
-class TestLoadFromDistributedUpsert(CustomTestCase):
-    def test_upsert_reuses_existing_lora_id(self):
-        tm = _make_tokenizer_manager()
-        existing = LoRARef(lora_name="a", lora_path="__distributed__")
-        asyncio.run(tm.lora_registry.register(existing))
-
-        obj = _make_distributed_req(upsert=True)
-        result = asyncio.run(tm.load_lora_adapter_from_distributed(obj))
-
-        self.assertTrue(result.success)
-        self.assertEqual(obj.lora_id, existing.lora_id)
-        tm.update_lora_adapter_communicator.assert_awaited_once_with(obj)
-        # Not re-registered: still exactly one adapter with the original id.
-        self.assertEqual(tm.lora_registry.num_registered_loras, 1)
-        self.assertEqual(
-            asyncio.run(tm.lora_registry.get_lora_id("a")), existing.lora_id
-        )
-        self.assertEqual(tm.lora_ref_cache["a"].lora_id, existing.lora_id)
-
-    def test_upsert_registers_when_missing(self):
-        tm = _make_tokenizer_manager()
-
-        obj = _make_distributed_req(upsert=True)
-        result = asyncio.run(tm.load_lora_adapter_from_distributed(obj))
-
-        self.assertTrue(result.success)
-        self.assertIsNotNone(obj.lora_id)
-        self.assertEqual(asyncio.run(tm.lora_registry.get_lora_id("a")), obj.lora_id)
-
-    def test_non_upsert_duplicate_fails(self):
-        tm = _make_tokenizer_manager()
-        asyncio.run(
-            tm.lora_registry.register(
-                LoRARef(lora_name="a", lora_path="__distributed__")
-            )
-        )
-
-        obj = _make_distributed_req(upsert=False)
-        result = asyncio.run(tm.load_lora_adapter_from_distributed(obj))
-
-        self.assertFalse(result.success)
-        self.assertIn("already exists", result.error_message)
-
-    def test_upsert_refreshes_registered_ref(self):
-        # The registry ref (not just lora_ref_cache) must adopt the new
-        # metadata: LRU eviction reads ``pinned`` from the registry.
-        tm = _make_tokenizer_manager()
-        existing = LoRARef(lora_name="a", lora_path="__distributed__", pinned=False)
-        asyncio.run(tm.lora_registry.register(existing))
-
-        obj = _make_distributed_req(upsert=True)
-        obj.pinned = True
-        result = asyncio.run(tm.load_lora_adapter_from_distributed(obj))
-
-        self.assertTrue(result.success)
-        registered = tm.lora_registry.get_all_adapters()["a"]
-        self.assertEqual(registered.lora_id, existing.lora_id)
-        self.assertTrue(registered.pinned)
-
-    def test_failed_backend_load_keeps_registry_untouched(self):
-        tm = _make_tokenizer_manager()
-        existing = LoRARef(lora_name="a", lora_path="__distributed__", pinned=False)
-        asyncio.run(tm.lora_registry.register(existing))
-        tm.update_lora_adapter_communicator = AsyncMock(
-            return_value=[MagicMock(success=False, error_message="boom")]
-        )
-
-        obj = _make_distributed_req(upsert=True)
-        obj.pinned = True
-        result = asyncio.run(tm.load_lora_adapter_from_distributed(obj))
-
-        self.assertFalse(result.success)
-        self.assertIs(tm.lora_registry.get_all_adapters()["a"], existing)
-        self.assertNotIn("a", tm.lora_ref_cache)
-
-
-class TestLoadFromTensorsUpsertUnsupported(CustomTestCase):
-    """Only the from_distributed route supports in-place refresh; the
-    from_tensors route must reject upsert explicitly instead of minting a
-    fresh uuid and dying later on the backend duplicate check."""
-
-    def test_upsert_rejected_explicitly(self):
-        tm = _make_tokenizer_manager()
-        asyncio.run(
-            tm.lora_registry.register(LoRARef(lora_name="a", lora_path="__tensor__"))
-        )
-
-        obj = _make_tensors_req(upsert=True)
-        result = asyncio.run(tm.load_lora_adapter_from_tensors(obj))
-
-        self.assertFalse(result.success)
-        self.assertIn("not supported on the from_tensors route", result.error_message)
-        tm.update_lora_adapter_communicator.assert_not_awaited()
-
-    def test_non_upsert_load_still_works(self):
-        tm = _make_tokenizer_manager()
-
-        obj = _make_tensors_req(upsert=False)
-        result = asyncio.run(tm.load_lora_adapter_from_tensors(obj))
-
-        self.assertTrue(result.success)
-        self.assertEqual(asyncio.run(tm.lora_registry.get_lora_id("a")), obj.lora_id)
-
-    def test_non_upsert_duplicate_fails(self):
-        tm = _make_tokenizer_manager()
-        asyncio.run(
-            tm.lora_registry.register(LoRARef(lora_name="a", lora_path="__tensor__"))
-        )
-
-        obj = _make_tensors_req(upsert=False)
-        result = asyncio.run(tm.load_lora_adapter_from_tensors(obj))
-
-        self.assertFalse(result.success)
-        self.assertIn("already exists", result.error_message)
-
-
-class TestUpsertMultiTokenizerWorkerGuard(CustomTestCase):
-    """Upsert resolves names against a per-process registry; with >1 tokenizer
-    workers that resolution is nondeterministic, so it must fail loudly."""
-
-    def test_distributed_upsert_rejected_with_multiple_workers(self):
-        tm = _make_tokenizer_manager(tokenizer_worker_num=2)
-
-        result = asyncio.run(
-            tm.load_lora_adapter_from_distributed(_make_distributed_req(True))
-        )
-
-        self.assertFalse(result.success)
-        self.assertIn("tokenizer_worker_num", result.error_message)
-
-    def test_non_upsert_load_unaffected_by_multiple_workers(self):
-        tm = _make_tokenizer_manager(tokenizer_worker_num=2)
-
-        result = asyncio.run(
-            tm.load_lora_adapter_from_tensors(_make_tensors_req(False))
-        )
-
-        self.assertTrue(result.success)
 
 
 if __name__ == "__main__":

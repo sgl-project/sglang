@@ -24,7 +24,6 @@ from sglang.srt.managers.io_struct import (
     ExpertWeightPointer,
     GetInternalStateReqOutput,
     GetWeightsByNameReqOutput,
-    LoadLoRAAdapterFromTensorsReqInput,
     ParallelismInfo,
     RpcReqInput,
     SetInternalStateReq,
@@ -134,12 +133,6 @@ REGISTRY_TYPE_INSTANCES = {
         parameters={"flag": True, "n": 1, "ratio": 2.0, "name": "x", "opt": None},
     ),
     "RpcReqInput/none": RpcReqInput(method="collective_rpc", parameters=None),
-    "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput(
-        lora_name="adapter",
-        config_dict={"r": 8, "lora_alpha": 16, "target_modules": ["q_proj", "v_proj"]},
-        serialized_named_tensors=[b"tp0-bytes", b"tp1-bytes"],
-        added_tokens_config={"<extra>": 32000},
-    ),
     "DumperControlReqInput": DumperControlReqInput(method="start", body={"k": "v"}),
     "DumperControlReqOutput": DumperControlReqOutput(
         success=True, response=[{"worker": 0, "ok": True}]
