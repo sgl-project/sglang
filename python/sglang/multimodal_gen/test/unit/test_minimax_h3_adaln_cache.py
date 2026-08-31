@@ -37,6 +37,11 @@ def _ensure_single_process_parallel_runtime() -> None:
     maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
 
+def _weights_fill(*shape: int, scale: float) -> torch.Tensor:
+    values = torch.arange(int(torch.tensor(shape).prod()), dtype=torch.float32)
+    return ((values % 7) * 0.01 * scale).reshape(shape)
+
+
 def _write_online_weights(
     path: Path,
     *,
@@ -46,8 +51,7 @@ def _write_online_weights(
     # State-machine tests only need checkpoint-compatible shapes (scale 0);
     # value-equality tests pass a nonzero scale for distinguishable outputs.
     def _fill(*shape: int) -> torch.Tensor:
-        values = torch.arange(int(torch.tensor(shape).prod()), dtype=torch.float32)
-        return ((values % 7) * 0.01 * scale).reshape(shape)
+        return _weights_fill(*shape, scale=scale)
 
     tensors: dict[str, torch.Tensor] = {}
     for layer in range(_ARCH.num_layers):
@@ -280,6 +284,41 @@ def test_host_tier_lru_eviction_and_shared_plan_refcount(tmp_path):
     assert cache.stats.host_evicted_groups == 1
     keys = {tuple(tier.timesteps(key).tolist()) for key in tier._plans}
     assert keys == {(1.0,), (3.0,), (4.0,)}
+
+
+def test_precision_fp32_projects_in_fp32_then_stores_bf16(tmp_path):
+    _ensure_single_process_parallel_runtime()
+    weight_path = tmp_path / "model.safetensors"
+    _write_online_weights(weight_path, scale=1.0)
+    cache = MiniMaxH3AdalnCache(
+        _ARCH,
+        weight_files=[str(weight_path)],
+        max_plans=2,
+        max_plan_width=1,
+        precision="fp32",
+    )
+    cache.load(torch.device("cpu"))
+    plan = torch.tensor([0.31])
+
+    def bf16_embed(timesteps: torch.Tensor) -> torch.Tensor:
+        # The production embed stays fp32 in this mode; a bf16 input here
+        # proves the cache upcasts before the projection (a 'match'-style
+        # bf16 x fp32 GEMM would fail on dtype mismatch).
+        return _embed(timesteps).bfloat16()
+
+    cache.build([plan], embed=bf16_embed)
+    slot = cache.resolve_slots([plan])[0]
+
+    adaln_input = bf16_embed(plan).float()
+    weight = _weights_fill(_BLOCK_WIDTH, _ARCH.time_embed_dim, scale=1.0)
+    bias = _weights_fill(_BLOCK_WIDTH, scale=1.0)
+    for layer in range(_ARCH.num_layers):
+        expected = torch.nn.functional.linear(adaln_input, weight, bias).bfloat16()
+        got = torch.cat(cache.block(layer, slot, 1), dim=-1).reshape(1, _BLOCK_WIDTH)
+        assert torch.equal(got, expected)
+
+    with pytest.raises(ValueError, match="precision"):
+        MiniMaxH3AdalnCache(_ARCH, weight_files=[str(weight_path)], precision="fp64")
 
 
 def test_invalidate_drops_all_tiers_and_allows_rebuild(tmp_path):

@@ -1531,15 +1531,21 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         is bit-identical to what resident adaln_proj weights would have
         produced.
         """
-        if self.adaln_cache is None:
+        cache = self.adaln_cache
+        if cache is None:
             return None
-        if self.adaln_cache.weight_files is not None:
+        if cache.weight_files is not None:
 
             def embed(timesteps: torch.Tensor) -> torch.Tensor:
-                return nn.functional.silu(self.time_embedder(timesteps)).to(_BF16_DTYPE)
+                out = nn.functional.silu(self.time_embedder(timesteps))
+                # 'match' replicates forward's bf16 cast bit-exactly; 'fp32'
+                # keeps the embedding in fp32 for the one-time projection.
+                if cache.precision == "match":
+                    out = out.to(_BF16_DTYPE)
+                return out
 
-            self.adaln_cache.build(step_timesteps, embed=embed)
-        return self.adaln_cache.resolve_slots(step_timesteps)
+            cache.build(step_timesteps, embed=embed)
+        return cache.resolve_slots(step_timesteps)
 
     def _can_batch_block_adaln(self) -> bool:
         return (
@@ -1626,6 +1632,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         adaln_plan_width: int = MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
         adaln_max_plans: int = 64,
         adaln_host_cache_bytes: int = 0,
+        adaln_precision: str = "match",
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         arch = self.config
@@ -1762,6 +1769,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 max_plans=adaln_max_plans,
                 max_plan_width=adaln_plan_width,
                 host_cache_bytes=adaln_host_cache_bytes,
+                precision=adaln_precision,
             )
             if self._adaln_precomputed
             else None

@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 import struct
 from collections import OrderedDict
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Callable
 
 import msgspec
@@ -48,6 +48,24 @@ def _plan_key(timesteps: torch.Tensor) -> tuple[int, ...]:
         struct.unpack("<I", struct.pack("<f", float(value)))[0]
         for value in timesteps.tolist()
     )
+
+
+@contextmanager
+def _fp32_gemm_guard(*, enabled: bool, device: torch.device):
+    """Neighboring stages flip the process-global TF32 switches; without this
+    an 'fp32' build silently becomes tf32-once."""
+    if not enabled or device.type != "cuda":
+        yield
+        return
+    allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    matmul_precision = torch.get_float32_matmul_precision()
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.set_float32_matmul_precision(matmul_precision)
 
 
 class MiniMaxH3AdalnCacheStats(msgspec.Struct):
@@ -360,6 +378,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         max_plans: int = 64,
         max_plan_width: int = MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
         host_cache_bytes: int = 0,
+        precision: str = "match",
     ) -> None:
         super().__init__()
         if (path is None) == (weight_files is None):
@@ -373,6 +392,11 @@ class MiniMaxH3AdalnCache(nn.Module):
             raise ValueError(
                 "MiniMax H3 AdaLN cache max_plan_width must be positive; "
                 "set --minimax-h3-adaln-plan-width to at least 1"
+            )
+        if precision not in ("match", "fp32"):
+            raise ValueError(
+                "MiniMax H3 AdaLN cache precision must be 'match' (bit-exact "
+                f"with resident adaln_proj weights) or 'fp32', got {precision!r}"
             )
         self.path = path
         self.model_variant = model_variant
@@ -388,6 +412,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         self._slots: OrderedDict[tuple[int, ...], int] = OrderedDict()
         self._free_slots: list[int] = list(range(max_plans))
         self.host_cache_bytes = host_cache_bytes
+        self.precision = precision
         # Constructed in load(): needs the device and the distributed runtime.
         self._host_tier: MiniMaxH3AdalnHostTier | None = None
         self.stats = MiniMaxH3AdalnCacheStats()
@@ -565,7 +590,11 @@ class MiniMaxH3AdalnCache(nn.Module):
         slots = []
         for key, timesteps in missing.items():
             slot = pending_slots[key]
-            slots.append((slot, timesteps.numel(), embed(timesteps.to(device))))
+            adaln_input = embed(timesteps.to(device))
+            if self.precision == "fp32":
+                # Compute the projections in fp32 once; the slab stays bf16.
+                adaln_input = adaln_input.float()
+            slots.append((slot, timesteps.numel(), adaln_input))
             self.plan_timesteps[slot, : timesteps.numel()] = timesteps.to(device)
 
         # adaln_proj is a ColumnParallelLinear: each rank owns a slice of the
@@ -577,9 +606,10 @@ class MiniMaxH3AdalnCache(nn.Module):
         tp_rank = get_tp_rank() if tp_size > 1 else 0
 
         try:
-            self._project_plans_from_checkpoint(
-                slots, tp_size=tp_size, tp_rank=tp_rank, device=device
-            )
+            with _fp32_gemm_guard(enabled=self.precision == "fp32", device=device):
+                self._project_plans_from_checkpoint(
+                    slots, tp_size=tp_size, tp_rank=tp_rank, device=device
+                )
         except BaseException:
             # The pending slots never became visible (their lengths stayed
             # zero); hand them back so a retry does not leak capacity.
@@ -694,10 +724,14 @@ class MiniMaxH3AdalnCache(nn.Module):
 
             def read_shard(name: str, out_features: int) -> torch.Tensor:
                 if tp_size == 1:
-                    return index[name].get_tensor(name)
-                shard = out_features // tp_size
-                start = tp_rank * shard
-                return index[name].get_slice(name)[start : start + shard]
+                    tensor = index[name].get_tensor(name)
+                else:
+                    shard = out_features // tp_size
+                    start = tp_rank * shard
+                    tensor = index[name].get_slice(name)[start : start + shard]
+                if self.precision == "fp32":
+                    tensor = tensor.float()
+                return tensor
 
             def project(adaln_input: torch.Tensor, weight, bias) -> torch.Tensor:
                 out = nn.functional.linear(adaln_input, weight, bias)

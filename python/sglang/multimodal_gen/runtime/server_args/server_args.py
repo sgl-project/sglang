@@ -358,6 +358,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # evicted from the GPU slab swap back in from here instead of re-reading
     # the 24.2 GiB checkpoint.
     minimax_h3_adaln_host_cache_gb: float = 8.0
+    # 'match' = bit-exact with resident adaln_proj weights; 'fp32' = one-time
+    # fp32 projection at build time (not bit-comparable to the resident path).
+    minimax_h3_adaln_precision: str = "match"
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -1963,6 +1966,20 @@ class ServerArgs(DisaggServerArgsMixin):
                 "50-step schedule needs ~0.9 (t2va) / 1.33 (fl2va) / 1.77 "
                 "(ref2va) GB; the default 8 holds several. Groups are evicted "
                 "LRU and over-cap groups just recompute. 0 disables the tier."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-adaln-precision",
+            type=str,
+            choices=["match", "fp32"],
+            default=ServerArgs.minimax_h3_adaln_precision,
+            help=(
+                "Numerics of the --minimax-h3-adaln-online rebuild. 'match' "
+                "(default) replicates the resident-weight bf16 GEMM shapes "
+                "bit-exactly. 'fp32' upcasts the embedding and weights for a "
+                "one-time fp32 projection (TF32 disabled) before storing "
+                "bf16 -- more accurate params, but not bit-comparable to the "
+                "resident path, so gate it on an e2e trajectory check."
             ),
         )
         parser.add_argument(
