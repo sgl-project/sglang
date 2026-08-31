@@ -8,7 +8,10 @@ from transformers import CONFIG_MAPPING
 from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+)
 
 
 class InklingModelConfig(PretrainedConfig):
@@ -210,7 +213,6 @@ class InklingModelConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> Optional[InklingConvCacheParams]:
-        from sglang.srt.runtime_context import get_parallel
 
         try:
             tp_size = get_parallel().attn_tp_size

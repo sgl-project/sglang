@@ -6,7 +6,7 @@ ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
 ARG SGL_KERNEL_VERSION=0.4.6.post1
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.5.post2
+ARG SGL_DEEP_GEMM_VERSION=0.1.6
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG SGL_NCCL_VERSION=2.30.7
@@ -14,8 +14,8 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.17
-ARG MOONCAKE_VERSION=0.3.12.post1
+ARG FLASHINFER_VERSION=0.6.18
+ARG MOONCAKE_VERSION=0.3.13
 ARG MSCCLPP_VERSION=sglang-v0.9.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -260,6 +260,24 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # distro resolves to the apt python3-distro under /usr/lib/python3, which the runtime
 # stage does not COPY; force a pip copy into /usr/local so it survives the stage split.
 RUN python3 -m pip install --ignore-installed --no-deps distro
+
+# Cosmos3 guardrails default ON: sglang enables them whenever `cosmos_guardrail`
+# is importable (Cosmos3Pipeline.create_pipeline_stages); opt out at runtime with
+# SGLANG_DISABLE_COSMOS3_GUARDRAILS=1. Installed with --no-deps because the
+# package metadata conflicts with our pins in ways that don't matter at runtime
+# (imageio>=2.37 vs our ==2.36) or would be harmful (opencv-python — also pulled
+# by retinaface-py — would shadow our opencv-python-headless cv2). The deps not
+# already in the image are installed explicitly; the find_spec check mirrors
+# sglang's availability probe plus cosmos_guardrail's own imports.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --no-deps \
+        cosmos-guardrail==0.3.1 \
+        retinaface-py==0.0.2 \
+    && python3 -m pip install \
+        "better-profanity==0.7.0" \
+        "nltk==3.9.1" \
+        "peft==0.18.1" \
+    && python3 -c "import importlib.util as u; missing = [m for m in ('cosmos_guardrail', 'retinaface', 'better_profanity', 'nltk', 'cv2', 'peft', 'sentencepiece') if u.find_spec(m) is None]; assert not missing, f'guardrail deps missing: {missing}'"
 
 ########################################################
 # PARALLEL STAGE 2: HPC-Ops Builder (needs torch_deps)
@@ -551,6 +569,10 @@ elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nixl nixl-cu13 --no-deps ; \
     python3 -m pip install "cuda-python>=13,<14" ; \
 fi
+
+# Install the latest available AI Dynamo prerelease from NVIDIA's package index.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --pre --extra-index-url https://pypi.nvidia.com/ ai-dynamo
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank

@@ -230,6 +230,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller._num_tokens_by_pool.return_value = {}
         controller._transfer_num_bytes.return_value = 0
         controller.l2_transfer_engine = mock.Mock()
+        controller.load_fence_stream = None
         completion = SimpleNamespace(
             start_event=object(), finish_event=object(), timing_enabled=False
         )
