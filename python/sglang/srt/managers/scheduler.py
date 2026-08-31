@@ -3618,7 +3618,7 @@ class Scheduler(
             logger.info(
                 f"Schedule prefill: #picked={len(can_run_list)}, "
                 f"#left-in-queue={len(self.waiting_queue)}, "
-                f"#running={len(self.running_batch.reqs)}, "
+                f"#running={len(running_batch.reqs)}, "
                 f"kv-free-tokens={pool_stats.full_available_size}, "
                 f"kv-evictable-tokens={pool_stats.full_evictable_size}, "
                 f"picked-rids={[req.rid for req in can_run_list]}"
