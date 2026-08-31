@@ -11,11 +11,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""TeleChat4 model for SGLang.
+"""XingChen4 model for SGLang.
 
-Adapts the TeleChat4 architecture (MLA attention + MoE + mHC residual streams)
+Adapts the XingChen4 architecture (MLA attention + MoE + mHC residual streams)
 on top of sglang's DeepSeek-V2 building blocks.  The mHC module uses sglang's
 fused TileLang kernels (``mhc_pre`` / ``mhc_post``) for performance.
+
+The XingChen4 checkpoint stores the
+mHC operands (``hc_fn`` / ``hc_scale`` / ``hc_base``) directly, so no
+``mapping_proj`` / ``alpha_*`` / ``bias`` materialisation is needed: these
+tensors are the exact fp32 op operands consumed by the fused kernels.
 """
 
 from __future__ import annotations
@@ -33,7 +38,7 @@ from torch import nn
 from sglang.kernels.ops.layernorm.mhc import mhc_post as _mhc_post_orig
 from sglang.kernels.ops.layernorm.mhc import mhc_pre as _mhc_pre_orig
 from sglang.srt.configs.model_config import is_deepseek_dsa
-from sglang.srt.configs.telechat4 import TeleChat4Config
+from sglang.srt.configs.xingchen4 import XingChen4Config
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import RMSNorm
@@ -84,7 +89,7 @@ def _mhc_pre_fake(
 
 
 @register_custom_op(
-    op_name="telechat4_mhc_pre",
+    op_name="xingchen4_mhc_pre",
     mutates_args=[],
     fake_impl=_mhc_pre_fake,
 )
@@ -138,7 +143,7 @@ def mhc_pre(
 
 
 @register_custom_op(
-    op_name="telechat4_mhc_post",
+    op_name="xingchen4_mhc_post",
     mutates_args=[],
     out_shape="residual",
 )
@@ -163,60 +168,57 @@ class mHCModule(nn.Module):
     """mHC (Manifold-constrained Hyper-Connection) module.
 
     Backed by sglang's fused TileLang kernels (``mhc_pre`` / ``mhc_post``).
-    The fp32 op operands (``fn`` / ``hc_scale`` / ``hc_base``) are materialised
-    once in :meth:`finalize` after weight loading.
+
+    The XingChen4 checkpoint stores the fp32 op operands directly as
+    ``hc_fn`` / ``hc_scale`` / ``hc_base`` parameters (they are exactly the
+    tensors consumed by the fused kernels). ``finalize`` only upcasts them to
+    float32 into non-persistent buffers after weight loading.
     """
 
     def __init__(self, config, layer_number: int):
         super().__init__()
         self.config = config
         self.layer_number = layer_number
-        self.n = config.num_residual_streams
+        self.n = config.hc_mult
         self.hidden_size = config.hidden_size
-        self.sinkhorn_iterations = config.mhc_sinkhorn_iterations
+        self.sinkhorn_iterations = config.hc_sinkhorn_iters
 
         # mHC kernel hyper-parameters
         self.norm_eps = 1e-6
-        self.pre_eps = 1e-6
+        self.pre_eps = getattr(config, "hc_eps", 1e-6)
         self.post_mult_value = 2.0
-        self.sinkhorn_eps = 1e-6
+        self.sinkhorn_eps = getattr(config, "hc_eps", 1e-6)
         # splitk GEMM parallelism. hc_hidden_size = n * hidden_size = 4 * 3584
         # = 14336. 14336 / n_splits_pre must be divisible by hidden_block(256).
         self.n_splits_pre = 8
 
         out_features = self.n * self.n + 2 * self.n
-        self.mapping_proj = nn.Linear(
-            self.n * self.hidden_size, out_features, bias=False
+
+        # Persistent parameters matching the checkpoint weight names
+        # (``attn_hc.hc_fn`` / ``attn_hc.hc_scale`` / ``attn_hc.hc_base``).
+        # These are exactly the fp32 op operands consumed by the fused kernels.
+        self.hc_fn = nn.Parameter(
+            torch.empty(out_features, self.n * self.hidden_size)
         )
-
-        init_alpha = config.mhc_init_gating_factor
-        self.alpha_pre = nn.Parameter(torch.full((1,), init_alpha))
-        self.alpha_post = nn.Parameter(torch.full((1,), init_alpha))
-        self.alpha_res = nn.Parameter(torch.full((1,), init_alpha))
-
-        self.bias = nn.Parameter(torch.zeros(out_features))
+        self.hc_scale = nn.Parameter(torch.empty(3))
+        self.hc_base = nn.Parameter(torch.empty(out_features))
 
         # fp32 op operands, filled by finalize() after weight loading.
         self.register_buffer(
-            "fn",
+            "fn_fp32",
             torch.zeros(out_features, self.n * self.hidden_size),
             persistent=False,
         )
-        self.register_buffer("hc_scale", torch.zeros(3), persistent=False)
-        self.register_buffer("hc_base", torch.zeros(out_features), persistent=False)
+        self.register_buffer("scale_fp32", torch.zeros(3), persistent=False)
+        self.register_buffer("base_fp32", torch.zeros(out_features), persistent=False)
         self._finalized = False
 
     @torch.no_grad()
     def finalize(self) -> None:
         """Build the fp32 op operands from the loaded parameters."""
-        self.fn = self.mapping_proj.weight.detach().to(torch.float32).contiguous()
-        self.hc_scale = (
-            torch.cat([self.alpha_pre, self.alpha_post, self.alpha_res])
-            .detach()
-            .to(torch.float32)
-            .contiguous()
-        )
-        self.hc_base = self.bias.detach().to(torch.float32).contiguous()
+        self.fn_fp32 = self.hc_fn.detach().to(torch.float32).contiguous()
+        self.scale_fp32 = self.hc_scale.detach().to(torch.float32).contiguous()
+        self.base_fp32 = self.hc_base.detach().to(torch.float32).contiguous()
         self._finalized = True
 
     def forward(self, hidden_states: torch.Tensor):
@@ -253,9 +255,9 @@ class mHCModule(nn.Module):
         else:
             post_mix, comb_mix, layer_input = mhc_pre(
                 residual=residual,
-                fn=self.fn,
-                hc_scale=self.hc_scale,
-                hc_base=self.hc_base,
+                fn=self.fn_fp32,
+                hc_scale=self.scale_fp32,
+                hc_base=self.base_fp32,
                 rms_eps=self.norm_eps,
                 hc_pre_eps=self.pre_eps,
                 hc_sinkhorn_eps=self.sinkhorn_eps,
@@ -333,10 +335,10 @@ def _get_llama_4_scaling(
     return scaling[..., None, None]
 
 
-class TeleChat4DecoderLayer(nn.Module):
+class XingChen4DecoderLayer(nn.Module):
     def __init__(
         self,
-        config: TeleChat4Config,
+        config: XingChen4Config,
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
         moe_quant_config_override: QuantizationConfig | None = None,
@@ -443,7 +445,7 @@ class TeleChat4DecoderLayer(nn.Module):
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
-        self.n = getattr(config, "num_residual_streams", 1)
+        self.n = getattr(config, "hc_mult", 1)
         self.enable_mhc = self.n > 1
         if self.enable_mhc and not self.is_mtp_layer:
             self.attn_hc = mHCModule(config, config.num_hidden_layers)
@@ -513,6 +515,7 @@ class TeleChat4DecoderLayer(nn.Module):
                 "zero_allocator": zero_allocator,
                 "layer_scatter_modes": self.layer_scatter_modes,
                 "llama_4_scaling": llama_4_scaling,
+                "prev_topk_indices": prev_topk_indices,
             }
             hidden_states = self.self_attn(**attn_kwargs)
             if isinstance(hidden_states, tuple):
@@ -589,6 +592,7 @@ class TeleChat4DecoderLayer(nn.Module):
             "forward_batch": forward_batch,
             "zero_allocator": zero_allocator,
             "layer_scatter_modes": self.layer_scatter_modes,
+            "prev_topk_indices": prev_topk_indices,
         }
         if not self.use_mha:
             attn_kwargs["llama_4_scaling"] = llama_4_scaling
@@ -719,10 +723,10 @@ class TeleChat4DecoderLayer(nn.Module):
         return output
 
 
-class TeleChat4Model(nn.Module):
+class XingChen4Model(nn.Module):
     def __init__(
         self,
-        config: TeleChat4Config,
+        config: XingChen4Config,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -746,7 +750,7 @@ class TeleChat4Model(nn.Module):
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: TeleChat4DecoderLayer(
+            lambda idx, prefix: XingChen4DecoderLayer(
                 config,
                 layer_id=idx,
                 quant_config=quant_config,
@@ -764,7 +768,7 @@ class TeleChat4Model(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
-        self.num_residual_streams = getattr(config, "num_residual_streams", 1)
+        self.hc_mult = getattr(config, "hc_mult", 1)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -785,14 +789,14 @@ class TeleChat4Model(nn.Module):
                 if input_ids is None:
                     raise ValueError(
                         "Either input_ids or inputs_embeds must be provided "
-                        "to TeleChat4Model.forward"
+                        "to XingChen4Model.forward"
                     )
                 hidden_states = self.embed_input_ids(input_ids)
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors.inputs_embeds
 
-        n_streams = self.num_residual_streams
+        n_streams = self.hc_mult
         if n_streams > 1:
             S = hidden_states.shape[0]
             C = hidden_states.shape[1]
@@ -811,15 +815,17 @@ class TeleChat4Model(nn.Module):
             device=device,
         )
 
+        topk_indices = None
         for layer in self.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
-            hidden_states, residual, _topk_indices = layer(
+            hidden_states, residual, topk_indices = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 residual=residual,
                 zero_allocator=zero_allocator,
+                prev_topk_indices=topk_indices,
             )
 
         if not self.pp_group.is_last_rank:
@@ -833,14 +839,14 @@ class TeleChat4Model(nn.Module):
         return hidden_states
 
 
-class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
+class XingChen4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
     def __init__(
         self,
-        config: TeleChat4Config,
+        config: XingChen4Config,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -868,7 +874,7 @@ class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.num_fused_shared_experts = 0
         self.use_dsa = is_deepseek_dsa(config)
 
-        self.model = TeleChat4Model(
+        self.model = XingChen4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
 
@@ -936,30 +942,10 @@ class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            if "indexer.k_norm_bias" in name:
-                name = name.replace("indexer.k_norm_bias", "indexer.k_norm.bias")
-
-            if "attn_hc.mapping_weight" in name:
-                name = name.replace(
-                    "attn_hc.mapping_weight", "attn_hc.mapping_proj.weight"
-                )
-            if "ffn_hc.mapping_weight" in name:
-                name = name.replace(
-                    "ffn_hc.mapping_weight", "ffn_hc.mapping_proj.weight"
-                )
-
-            # Skip split bias parameters; the checkpoint stores a merged bias.
-            skip_patterns = [
-                "attn_hc.bias_pre",
-                "attn_hc.bias_post",
-                "attn_hc.bias_res",
-                "ffn_hc.bias_pre",
-                "ffn_hc.bias_post",
-                "ffn_hc.bias_res",
-            ]
-            if any(p in name for p in skip_patterns):
-                continue
-
+            # The XingChen4 checkpoint stores the mHC operands directly
+            # (attn_hc.hc_fn / attn_hc.hc_scale / attn_hc.hc_base), so no
+            # mapping_weight/alpha/bias remapping or split-bias skipping is
+            # needed; the parameter names already match named_parameters().
             if "attn_hc" in name or "ffn_hc" in name:
                 hc_weights.append((name, loaded_weight))
             else:
@@ -993,8 +979,8 @@ class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self.do_load_weights(processed_weights, is_nextn)
 
-        # Build fp32 op operands (fn / hc_scale / hc_base) for every mHC module
-        # so that the fused mhc_pre / mhc_post kernels can run without per-step
+        # Upcast the mHC operands (hc_fn / hc_scale / hc_base) to fp32 buffers
+        # so the fused mhc_pre / mhc_post kernels can run without per-step
         # parameter materialisation.
         for m in self.modules():
             if isinstance(m, mHCModule):
@@ -1024,4 +1010,4 @@ class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         )
 
 
-EntryClass = [TeleChat4ForCausalLM]
+EntryClass = [XingChen4ForCausalLM]

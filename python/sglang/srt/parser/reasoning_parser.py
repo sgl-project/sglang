@@ -1186,10 +1186,10 @@ class _PoolsideV1Detector(Qwen3Detector):
         self.reasoning_default = "explicit_enable_thinking"
 
 
-class TeleChat4Detector(BaseReasoningFormatDetector):
-    """Detector for TeleChat4 models.
+class XingChen4Detector(BaseReasoningFormatDetector):
+    """Detector for XingChen4 models.
 
-    TeleChat4 models use <think> and </think> as reasoning markers.
+    XingChen4 models use<think> and </think> as reasoning markers.
     The chat template injects these markers into the prompt via ``enable_thinking`` parameter.
 
     When ``enable_thinking=True``:
@@ -1938,7 +1938,7 @@ class ReasoningParser:
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
         "cohere_command4": CohereCommand4Detector,
-        "telechat4": TeleChat4Detector,
+        "xingchen4": XingChen4Detector,
     }
 
     def __init__(

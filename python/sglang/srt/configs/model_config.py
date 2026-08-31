@@ -116,7 +116,7 @@ def is_deepseek_dsa(config) -> bool:
             "GlmMoeDsaForCausalLMNextN",
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
-            "TeleChat4ForCausalLM",
+            "XingChen4ForCausalLM",
         )
         and _hf_attr(config, "index_topk") is not None
     )
@@ -621,9 +621,9 @@ class ModelConfig:
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
-        # TeleChat4 bundles a DeepSeek-V3-compatible MTP head (layer index ==
+        # XingChen4 bundles a DeepSeek-V3-compatible MTP head (layer index ==
         # num_hidden_layers); reuse DeepseekV3ForCausalLMNextN as the draft arch.
-        if is_draft_model and self.hf_config.architectures[0] == "TeleChat4ForCausalLM":
+        if is_draft_model and self.hf_config.architectures[0] == "XingChen4ForCausalLM":
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
@@ -902,7 +902,7 @@ class ModelConfig:
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
             or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
             or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
-            or "TeleChat4ForCausalLM" in self.hf_config.architectures
+            or "XingChen4ForCausalLM" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -1038,12 +1038,32 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
-        self.spec_hidden_size = (
-            self.hidden_size * hc_mult if hc_mult > 1 else self.hidden_size
+        # spec_hidden_size is the width of the hidden states fed to the Eagle
+        # draft model (== logits_output.hidden_states width). mHC models feed
+        # either the mHC-flattened residual (n * hidden_size) or the contracted
+        # hidden_size to the draft, depending on their architecture:
+        #  * DeepSeek-V4 exposes pre_hc_head (n * hidden_size, via
+        #    hidden_states_before_norm) to its draft  -> expanded.
+        #  * Models that merge the mHC streams back to hidden_size before the
+        #    draft (e.g. via an output_contract) declare
+        #    ``hc_contract_for_draft=True`` -> contracted (hidden_size).
+        # The default (False) preserves the DeepSeek-V4 behaviour; contracting
+        # models opt in via their config. The check stays model-agnostic: it
+        # relies on the declaring flag, not on any specific model_type, so it
+        # also works for the draft config whose architectures are remapped to
+        # DeepseekV3ForCausalLMNextN while model_type is unchanged.
+        contract_for_draft = getattr(
+            self.hf_text_config, "hc_contract_for_draft", False
         )
-        # mHC-flattened hidden size; None when not running an mHC model
-        # (e.g. non-DeepSeek-V4 configs without ``hc_mult``).
-        self.hc_hidden_size = self.spec_hidden_size if hc_mult > 1 else None
+        if hc_mult > 1 and not contract_for_draft:
+            self.spec_hidden_size = self.hidden_size * hc_mult
+        else:
+            self.spec_hidden_size = self.hidden_size
+        # mHC-flattened hidden size (n * hidden_size); None when not running an
+        # mHC model (e.g. non-DeepSeek-V4 configs without ``hc_mult``). This is
+        # the width of the mHC-internal residual stream (used to size the main
+        # model's activation buffers), distinct from spec_hidden_size.
+        self.hc_hidden_size = self.hidden_size * hc_mult if hc_mult > 1 else None
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:

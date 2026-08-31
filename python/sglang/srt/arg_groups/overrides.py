@@ -599,6 +599,7 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     "GlmMoeDsaForCausalLM",
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
+    "XingChen4ForCausalLM",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     """Order-safe declarations of the DeepSeek/DSA branch. The CP parallel
@@ -1758,6 +1759,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "GlmMoeDsaForCausalLM",
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
+        "XingChen4ForCausalLM",
     }
 )
 
@@ -1975,7 +1977,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3_5ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
-        "TeleChat4ForCausalLM",
+        "XingChen4ForCausalLM",
     }
 )
 

@@ -1,12 +1,11 @@
-"""Tool call detector for TeleChat4 models.
+"""Tool call detector for XingChen4 models.
 
-Supports two tool-call formats inside ``<tool_call>...</tool_call>`` blocks:
+Supports two tool-call formats inside special tool blocks:
 
-1. **JSON** – ``<tool_call>{"name": "func", "arguments": {...}}</tool_call>``
-2. **Tag-based** – ``<tool_call>func<param_key>k1</param_key><param_value>v1
-   </param_value>...</tool_call>``
+1. **JSON** - a JSON object with "name" and "arguments" fields.
+2. **Tag-based** - func name followed by param_key/param_value tags.
 
-Usage: ``--enable-auto-tool-choice --tool-call-parser telechat4``
+Usage: ``--enable-auto-tool-choice --tool-call-parser xingchen4``
 """
 
 import ast
@@ -153,17 +152,16 @@ def _partial_suffix_len(text: str, token: str) -> int:
     return 0
 
 
-class TeleChat4Detector(BaseFormatDetector):
-    """Detector for TeleChat4 tool call format.
+class XingChen4Detector(BaseFormatDetector):
+    """Detector for XingChen4 tool call format.
 
     Format::
 
-        <tool_call>{"name": "func", "arguments": {...}}</tool_call>
+        A JSON object with "name" and "arguments" fields enclosed in tool tokens
 
     or::
 
-        <tool_call>func<param_key>k1</param_key><param_value>v1</param_value>
-        ...</tool_call>
+        func name followed by param_key/param_value tags enclosed in tool tokens
     """
 
     def __init__(self):
@@ -188,7 +186,7 @@ class TeleChat4Detector(BaseFormatDetector):
             for match in TOOL_CALL_REGEX.finditer(text):
                 tool_name, arguments = _parse_payload(match.group(1), tools)
                 if not tool_name or tool_name not in tool_indices:
-                    logger.warning("TeleChat4Detector: unknown tool '%s'", tool_name)
+                    logger.warning("XingChen4Detector: unknown tool '%s'", tool_name)
                     continue
                 calls.append(
                     ToolCallItem(
@@ -198,7 +196,7 @@ class TeleChat4Detector(BaseFormatDetector):
                     )
                 )
         except Exception:
-            logger.exception("TeleChat4Detector: failed to parse tool calls")
+            logger.exception("XingChen4Detector: failed to parse tool calls")
             return StreamingParseResult(normal_text=text)
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
@@ -245,9 +243,9 @@ class TeleChat4Detector(BaseFormatDetector):
 
         def get_info(name: str) -> StructureInfo:
             return StructureInfo(
-                begin=f'<tool_call>{{"name": "{name}", "arguments":',
-                end="}</tool_call>",
-                trigger="<tool_call>",
+                begin=f'{TOOL_START_TOKEN}{{"name": "{name}", "arguments":',
+                end=f"}}{TOOL_END_TOKEN}",
+                trigger=TOOL_START_TOKEN,
             )
 
         return get_info
