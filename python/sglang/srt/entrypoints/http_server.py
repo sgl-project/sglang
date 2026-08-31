@@ -409,7 +409,7 @@ async def lifespan(fast_api_app: FastAPI):
             if server_args.sidecar is not None:
                 from sglang.srt.entrypoints.sidecar import start_sidecar
 
-                sidecar = start_sidecar(server_args)
+                sidecar = start_sidecar()
 
         # Execute the general warmup
         warmup_thread = threading.Thread(
@@ -483,8 +483,10 @@ from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
 
+from sglang.srt.arg_groups.serving_hook import ssl_verify_of
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 from sglang.srt.runtime_context import (
+    describe_kv_events_publisher,
     get_disagg,
     get_exec,
     get_lora,
@@ -674,6 +676,13 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
+    # Let an external E2E driver establish a balanced DP batch before health traffic.
+    if envs.SGLANG_DIAG_BYPASS_HEALTH_GENERATE.get() and request.url.path in (
+        "/health",
+        "/health_generate",
+    ):
+        return Response(status_code=200)
+
     if (
         not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
         and request.url.path == "/health"
@@ -825,8 +834,8 @@ async def server_info():
             "version": __version__,
             # Structured KV-event publisher descriptor for KV-aware routers.
             # `None` when publishing is disabled or misconfigured; see
-            # `ServerArgs.describe_kv_events_publisher` for the precise contract.
-            "kv_events": server_args.describe_kv_events_publisher(),
+            # `runtime_context.describe_kv_events_publisher` for the contract.
+            "kv_events": describe_kv_events_publisher(server_args),
         }
     )
 
@@ -2191,7 +2200,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
-    ssl_verify = server_args.ssl_verify()
+    ssl_verify = ssl_verify_of(server_args)
 
     # Wait until the server is launched
     success = False
@@ -2367,7 +2376,7 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
             server_args.url() + "/freeze_gc",
             headers=freeze_headers,
             timeout=10,
-            verify=server_args.ssl_verify(),
+            verify=ssl_verify_of(server_args),
         )
         res.raise_for_status()
     except requests.exceptions.RequestException:
@@ -2438,6 +2447,7 @@ def _run_granian_server(
     port,
     log_level,
     http2_max_concurrent_streams,
+    http2_initial_connection_window_size,
     tokenizer_worker_num=1,
     ssl_certfile=None,
     ssl_keyfile=None,
@@ -2475,7 +2485,8 @@ def _run_granian_server(
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
         http2_settings=HTTP2Settings(
-            max_concurrent_streams=http2_max_concurrent_streams
+            initial_connection_window_size=http2_initial_connection_window_size,
+            max_concurrent_streams=http2_max_concurrent_streams,
         ),
         log_level=log_level,
         ssl_cert=ssl_certfile,
@@ -2610,6 +2621,9 @@ def _setup_and_run_http_server(
                     http2_max_concurrent_streams=(
                         server_args.http2_max_concurrent_streams
                     ),
+                    http2_initial_connection_window_size=(
+                        server_args.http2_initial_connection_window_size
+                    ),
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_keyfile=server_args.ssl_keyfile,
                     ssl_ca_certs=server_args.ssl_ca_certs,
@@ -2699,6 +2713,9 @@ def _setup_and_run_http_server(
                     or get_observability().log_level,
                     http2_max_concurrent_streams=(
                         server_args.http2_max_concurrent_streams
+                    ),
+                    http2_initial_connection_window_size=(
+                        server_args.http2_initial_connection_window_size
                     ),
                     tokenizer_worker_num=server_args.tokenizer_worker_num,
                     ssl_certfile=server_args.ssl_certfile,
