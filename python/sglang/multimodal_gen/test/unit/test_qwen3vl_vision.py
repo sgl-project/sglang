@@ -170,6 +170,52 @@ def test_native_vision_keeps_position_math_in_fp32():
     assert block.position_embedding_dtypes == (torch.float32, torch.float32)
 
 
+def test_qwen3vl_ties_lm_head_to_input_embeddings():
+    vision_config = SimpleNamespace(
+        hidden_size=16,
+        intermediate_size=24,
+        hidden_act="gelu_pytorch_tanh",
+        num_heads=2,
+        depth=0,
+        patch_size=2,
+        temporal_patch_size=1,
+        in_channels=3,
+        num_position_embeddings=16,
+        spatial_merge_size=2,
+        out_hidden_size=16,
+        deepstack_visual_indexes=[],
+    )
+    text_config = SimpleNamespace(
+        hidden_size=16,
+        vocab_size=32,
+        pad_token_id=0,
+        num_hidden_layers=0,
+        rms_norm_eps=1e-6,
+        tie_word_embeddings=True,
+    )
+    arch_config = SimpleNamespace(
+        vision_config=vision_config,
+        text_config=text_config,
+        tie_word_embeddings=True,
+        _fsdp_shard_conditions=[],
+        stacked_params_mapping=[],
+    )
+    config = SimpleNamespace(arch_config=arch_config)
+
+    with get_parallel().override(tp_size=1, tp_rank=0):
+        model = Qwen3VLForConditionalGeneration(config)
+
+    assert model.lm_head.weight is model.model.get_input_embeddings().weight
+    parameters = dict(model.named_parameters())
+    parameters_with_duplicates = dict(model.named_parameters(remove_duplicate=False))
+    assert "model.language_model.embed_tokens.weight" in parameters
+    assert "lm_head.weight" not in parameters
+    assert (
+        parameters_with_duplicates["lm_head.weight"]
+        is parameters["model.language_model.embed_tokens.weight"]
+    )
+
+
 def test_qwen3_multimodal_encoders_layerwise_offload_vision_blocks():
     assert "model.visual.blocks" in Qwen3VLForConditionalGeneration.layer_names
     assert "model.visual.blocks" in MiniMaxH3Qwen3VLEncoder.layer_names

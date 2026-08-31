@@ -5,6 +5,7 @@ import dataclasses
 import multiprocessing as mp
 import os
 import re
+import threading
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import (
@@ -40,7 +41,10 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
 )
-from sglang.srt.runtime_context import get_mm, get_serving
+from sglang.srt.runtime_context import (
+    get_mm,
+    get_serving,
+)
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     configure_media_url_security,
@@ -191,6 +195,17 @@ class MultimodalSpecialTokens:
         return self.combined_regex
 
 
+def _tokenizer_of(processor):
+    """The tokenizer reached from an HF processor.
+
+    Some processors (e.g. InternVL) are handed a tokenizer directly as their
+    ``_processor`` rather than one that wraps a tokenizer. Every path that
+    resolves a tokenizer -- construction and per-worker processor clones alike --
+    goes through here, so a clone cannot resolve differently from the original.
+    """
+    return processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
@@ -199,12 +214,20 @@ class BaseMultimodalProcessor(ABC):
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
     preserve_processor_input_ids = False
-    auto_mm_processor_worker_num = 1
+    # None lets the worker count follow where preprocessing actually runs; a
+    # model that measured its own optimum assigns a number instead. See
+    # `_resolve_auto_mm_processor_worker_num`.
+    auto_mm_processor_worker_num = None
     auto_mm_io_worker_num = 4
     # Models opt in by assigning a non-zero default. A user-provided server
     # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
-    supports_mm_processor_concurrency = False
+    # Processors opt out only when their preprocessing is not thread-safe. The
+    # worker pool gives each thread its own `copy.deepcopy` of the HF processor
+    # and injects it, and the single function it runs --
+    # `process_and_combine_mm_data` -- resolves that clone instead of
+    # `self._processor`, so isolation does not depend on the subclass.
+    supports_mm_processor_concurrency = True
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -272,12 +295,7 @@ class BaseMultimodalProcessor(ABC):
                 "trusted" if self.trust_mm_content_hashes else "verified",
             )
 
-        # Resolve tokenizer: some processors (e.g. InternVL) pass a tokenizer
-        # directly as _processor rather than a processor that wraps a tokenizer.
-        if hasattr(self._processor, "tokenizer"):
-            self._tokenizer = self._processor.tokenizer
-        else:
-            self._tokenizer = self._processor
+        self._tokenizer = _tokenizer_of(self._processor)
 
         # Same guard as in serving_chat.py against double BOS.
         try:
@@ -314,7 +332,8 @@ class BaseMultimodalProcessor(ABC):
         self.mm_processor_worker_num = (
             1
             if skip_mm_pool
-            else requested_mm_processor_worker_num or self.auto_mm_processor_worker_num
+            else requested_mm_processor_worker_num
+            or self._resolve_auto_mm_processor_worker_num()
         )
         if (
             self.mm_processor_worker_num > 1
@@ -329,8 +348,11 @@ class BaseMultimodalProcessor(ABC):
         self.mm_processor_executor = None
         if self.mm_processor_worker_num > 1:
             try:
+                # A callable, not the object: subclasses finish customizing
+                # `_processor` after this returns, and the workers must clone it
+                # as the subclass left it.
                 self.mm_processor_executor = MultimodalProcessorExecutor(
-                    self._processor, self.mm_processor_worker_num
+                    lambda: self._processor, self.mm_processor_worker_num
                 )
             except Exception:
                 logger.warning(
@@ -346,13 +368,8 @@ class BaseMultimodalProcessor(ABC):
                 self.mm_processor_worker_num,
                 "auto" if requested_mm_processor_worker_num == 0 else "explicit",
             )
-        cpu_worker_start_method = (
-            "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
-        )
-        self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
-            mp_context=mp.get_context(cpu_worker_start_method),
-            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
-        )
+        self._cpu_executor_lock = threading.Lock()
+        self.cpu_executor = self._create_cpu_executor()
 
         # Mapping from attribute names to modality types
         self.ATTR_NAME_TO_MODALITY = {
@@ -471,6 +488,41 @@ class BaseMultimodalProcessor(ABC):
         self.cpu_executor.shutdown(wait=False, cancel_futures=True)
         if self.mm_processor_executor is not None:
             self.mm_processor_executor.shutdown()
+
+    def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
+        start_method = "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
+        return concurrent.futures.ProcessPoolExecutor(
+            mp_context=mp.get_context(start_method),
+            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+        )
+
+    def _replace_broken_cpu_executor(
+        self, failed_executor: concurrent.futures.ProcessPoolExecutor
+    ) -> None:
+        """Replace a failed preprocess pool once across concurrent requests."""
+        with self._cpu_executor_lock:
+            if self.cpu_executor is not failed_executor:
+                return
+            self.cpu_executor = self._create_cpu_executor()
+        logger.warning("Replaced a broken multimodal CPU preprocess pool")
+        threading.Thread(
+            target=self._shutdown_broken_cpu_executor,
+            args=(failed_executor,),
+            name="sglang-mm-cpu-pool-cleanup",
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _shutdown_broken_cpu_executor(
+        failed_executor: concurrent.futures.ProcessPoolExecutor,
+    ) -> None:
+        try:
+            failed_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            logger.warning(
+                "Failed to shut down a broken multimodal CPU preprocess pool",
+                exc_info=True,
+            )
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.
@@ -594,7 +646,44 @@ class BaseMultimodalProcessor(ABC):
     def _resolve_processor(self, processor=None):
         if processor is None:
             return self._processor, self._tokenizer
-        return processor, processor.tokenizer
+        return processor, _tokenizer_of(processor)
+
+    def _preprocessing_competes_with_the_scheduler(self) -> bool:
+        """Whether image preprocessing submits its work to the serving GPU.
+
+        The fast image processor runs inside the tokenizer process but on
+        ``cuda:{base_gpu_id}`` -- the device the scheduler serves from. A second
+        preprocessing worker there is one more competitor for that device rather
+        than added parallelism.
+        """
+        if _is_cpu or self.server_args.rl_on_policy_target is not None:
+            return False
+        if self.disable_fast_image_processor:
+            return False
+        image_processor = getattr(self._processor, "image_processor", None)
+        return isinstance(image_processor, BaseImageProcessor)
+
+    def _resolve_auto_mm_processor_worker_num(self) -> int:
+        """The worker count to use when the user did not ask for one.
+
+        Two workers overlap preprocessing that runs on the CPU, where the second
+        thread is real parallelism: measured on Qwen2.5-VL with full-page images
+        at 32-way concurrency, 4.46 -> 6.08 req/s on H200 and 7.07 -> 8.76 on
+        GB300.
+
+        The GPU path is capped at one worker even when a model declares more.
+        A declaration records what its author measured on one platform and one
+        image shape; contending for the device the scheduler is serving from is a
+        property of the path itself, and it does not go away because a subclass
+        asked for concurrency. Qwen-VL declares two and is the model that
+        measures 9.30 -> 4.02 req/s on GB300 full-page images, so honouring the
+        declaration here would exempt exactly the case that regresses.
+        `--mm-processor-worker-num` still overrides this.
+        """
+        if self._preprocessing_competes_with_the_scheduler():
+            return 1
+        declared = self.auto_mm_processor_worker_num
+        return 2 if declared is None else declared
 
     def _fast_image_processor_device(self, processor) -> Optional[str]:
         """The device for the fast image processor, or None to leave it unset.
@@ -608,6 +697,8 @@ class BaseMultimodalProcessor(ABC):
         if _is_xpu:
             return "xpu"
         if not _is_npu:
+            # Per-worker placement travels as a constructor argument, and
+            # this record is that argument.
             return f"cuda:{server_args.base_gpu_id}"
         if processor.__class__.__name__ == "MiniMaxVLProcessor":
             # MiniMax's image/video processors create 10-dim tensors during
@@ -803,11 +894,8 @@ class BaseMultimodalProcessor(ABC):
                 img, _ = load_image(data, cls.gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
-                # PIL decodes lazily; do it here in the io worker so the decode
-                # doesn't run later on the event-loop thread.
                 if discard_alpha_channel and img.mode != "RGB":
                     return img.convert("RGB")
-                img.load()
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
