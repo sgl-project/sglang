@@ -1,8 +1,8 @@
-"""Triton sparse MLA decode kernel with fp8 KV cache support.
+"""Triton sparse MLA decode kernel with FP8 and BF16 KV cache support.
 
 Adapted from aiter's unified_attention_sparse_mla kernel for DSA shapes:
-  q:       [bs, H, DIM]     fp8 (DIM=576 = D_V+D_TAIL)
-  kv:      [num_pages, 1, DIM]  fp8
+  q:       [bs, H, DIM]     fp8/bf16 (DIM=576 = D_V+D_TAIL)
+  kv:      [num_pages, 1, DIM]  fp8/bf16
   indices: [bs, 1, topk]    int32
   output:  [1, bs, H, D_V]  bf16
 
@@ -20,6 +20,7 @@ import triton.language as tl
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _no_async_copy,
     _row_strides,
+    _validate_input_dtypes,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
@@ -124,6 +125,7 @@ def _sparse_mla_decode_fused_kernel(
     STRIDE_QN_H: tl.constexpr,
     STRIDE_QR_T: tl.constexpr,
     STRIDE_QR_H: tl.constexpr,
+    IS_FP8: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -135,8 +137,11 @@ def _sparse_mla_decode_fused_kernel(
     dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
-    fp8_type = q_nope_ptr.dtype.element_ty
-    inv_fp8_max = 1.0 / fp8_max
+    input_type = q_nope_ptr.dtype.element_ty
+    if IS_FP8:
+        p_dot_scale = 1.0 / fp8_max
+    else:
+        p_dot_scale = 1.0
 
     qn_base = q_nope_ptr + t * STRIDE_QN_T
     qn_row = qn_base + h_offs[:, None] * STRIDE_QN_H
@@ -144,30 +149,30 @@ def _sparse_mla_decode_fused_kernel(
         qn_row + g[None, :],
         mask=h_mask[:, None],
         other=0.0,
-    ).to(fp8_type)
+    ).to(input_type)
     if NUM_GROUPS >= 2:
         q1 = tl.load(
             qn_row + (_G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
-        ).to(fp8_type)
+        ).to(input_type)
     if NUM_GROUPS >= 3:
         q2 = tl.load(
             qn_row + (2 * _G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
-        ).to(fp8_type)
+        ).to(input_type)
     if NUM_GROUPS >= 4:
         q3 = tl.load(
             qn_row + (3 * _G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
-        ).to(fp8_type)
+        ).to(input_type)
     q_tail = tl.load(
         q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
         mask=h_mask[:, None],
         other=0.0,
-    ).to(fp8_type)
+    ).to(input_type)
 
     neg_large = -3.4028234663852886e38
     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
@@ -197,30 +202,30 @@ def _sparse_mla_decode_fused_kernel(
             kv_base + g[None, :],
             mask=valid[:, None],
             other=0.0,
-        ).to(fp8_type)
+        ).to(input_type)
         if NUM_GROUPS >= 2:
             kv1 = tl.load(
                 kv_base + (_G + g)[None, :],
                 mask=valid[:, None],
                 other=0.0,
-            ).to(fp8_type)
+            ).to(input_type)
         if NUM_GROUPS >= 3:
             kv2 = tl.load(
                 kv_base + (2 * _G + g)[None, :],
                 mask=valid[:, None],
                 other=0.0,
-            ).to(fp8_type)
+            ).to(input_type)
         if NUM_GROUPS >= 4:
             kv3 = tl.load(
                 kv_base + (3 * _G + g)[None, :],
                 mask=valid[:, None],
                 other=0.0,
-            ).to(fp8_type)
+            ).to(input_type)
         kv_tail = tl.load(
             kv_base + (D_V + dt)[None, :],
             mask=valid[:, None],
             other=0.0,
-        ).to(fp8_type)
+        ).to(input_type)
 
         scores = tl.dot(q0, tl.trans(kv0))
         if NUM_GROUPS >= 2:
@@ -239,19 +244,22 @@ def _sparse_mla_decode_fused_kernel(
         p = tl.exp2(scores - m_new[:, None])
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
-        p_fp8 = (p * fp8_max).to(fp8_type)
-        acc0 = acc0 * alpha[:, None] + tl.dot(p_fp8, kv0).to(tl.float32) * inv_fp8_max
+        if IS_FP8:
+            p_dot = (p * fp8_max).to(input_type)
+        else:
+            p_dot = p.to(input_type)
+        acc0 = acc0 * alpha[:, None] + tl.dot(p_dot, kv0).to(tl.float32) * p_dot_scale
         if NUM_GROUPS >= 2:
             acc1 = (
-                acc1 * alpha[:, None] + tl.dot(p_fp8, kv1).to(tl.float32) * inv_fp8_max
+                acc1 * alpha[:, None] + tl.dot(p_dot, kv1).to(tl.float32) * p_dot_scale
             )
         if NUM_GROUPS >= 3:
             acc2 = (
-                acc2 * alpha[:, None] + tl.dot(p_fp8, kv2).to(tl.float32) * inv_fp8_max
+                acc2 * alpha[:, None] + tl.dot(p_dot, kv2).to(tl.float32) * p_dot_scale
             )
         if NUM_GROUPS >= 4:
             acc3 = (
-                acc3 * alpha[:, None] + tl.dot(p_fp8, kv3).to(tl.float32) * inv_fp8_max
+                acc3 * alpha[:, None] + tl.dot(p_dot, kv3).to(tl.float32) * p_dot_scale
             )
         m_i = m_new
         l_i = l_new
@@ -312,6 +320,7 @@ def _sparse_mla_decode_split_kernel(
     STRIDE_QN_H: tl.constexpr,
     STRIDE_QR_T: tl.constexpr,
     STRIDE_QR_H: tl.constexpr,
+    IS_FP8: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -325,8 +334,11 @@ def _sparse_mla_decode_split_kernel(
     dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
-    fp8_type = q_nope_ptr.dtype.element_ty
-    inv_fp8_max = 1.0 / fp8_max
+    input_type = q_nope_ptr.dtype.element_ty
+    if IS_FP8:
+        p_dot_scale = 1.0 / fp8_max
+    else:
+        p_dot_scale = 1.0
 
     qn_base = q_nope_ptr + t * STRIDE_QN_T
     qn_row = qn_base + h_offs[:, None] * STRIDE_QN_H
@@ -334,30 +346,30 @@ def _sparse_mla_decode_split_kernel(
         qn_row + g[None, :],
         mask=h_mask[:, None],
         other=0.0,
-    ).to(fp8_type)
+    ).to(input_type)
     if NUM_GROUPS >= 2:
         q1 = tl.load(
             qn_row + (_G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
-        ).to(fp8_type)
+        ).to(input_type)
     if NUM_GROUPS >= 3:
         q2 = tl.load(
             qn_row + (2 * _G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
-        ).to(fp8_type)
+        ).to(input_type)
     if NUM_GROUPS >= 4:
         q3 = tl.load(
             qn_row + (3 * _G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
-        ).to(fp8_type)
+        ).to(input_type)
     q_tail = tl.load(
         q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
         mask=h_mask[:, None],
         other=0.0,
-    ).to(fp8_type)
+    ).to(input_type)
 
     tiles_per_segment = tl.cdiv(topk, KV_SPLITS * BLOCK_K)
     if pid_k * tiles_per_segment * BLOCK_K >= topk:
@@ -392,30 +404,30 @@ def _sparse_mla_decode_split_kernel(
             kv_base + g[None, :],
             mask=valid[:, None],
             other=0.0,
-        ).to(fp8_type)
+        ).to(input_type)
         if NUM_GROUPS >= 2:
             kv1 = tl.load(
                 kv_base + (_G + g)[None, :],
                 mask=valid[:, None],
                 other=0.0,
-            ).to(fp8_type)
+            ).to(input_type)
         if NUM_GROUPS >= 3:
             kv2 = tl.load(
                 kv_base + (2 * _G + g)[None, :],
                 mask=valid[:, None],
                 other=0.0,
-            ).to(fp8_type)
+            ).to(input_type)
         if NUM_GROUPS >= 4:
             kv3 = tl.load(
                 kv_base + (3 * _G + g)[None, :],
                 mask=valid[:, None],
                 other=0.0,
-            ).to(fp8_type)
+            ).to(input_type)
         kv_tail = tl.load(
             kv_base + (D_V + dt)[None, :],
             mask=valid[:, None],
             other=0.0,
-        ).to(fp8_type)
+        ).to(input_type)
 
         scores = tl.dot(q0, tl.trans(kv0))
         if NUM_GROUPS >= 2:
@@ -434,19 +446,22 @@ def _sparse_mla_decode_split_kernel(
         p = tl.exp2(scores - m_new[:, None])
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
-        p_fp8 = (p * fp8_max).to(fp8_type)
-        acc0 = acc0 * alpha[:, None] + tl.dot(p_fp8, kv0).to(tl.float32) * inv_fp8_max
+        if IS_FP8:
+            p_dot = (p * fp8_max).to(input_type)
+        else:
+            p_dot = p.to(input_type)
+        acc0 = acc0 * alpha[:, None] + tl.dot(p_dot, kv0).to(tl.float32) * p_dot_scale
         if NUM_GROUPS >= 2:
             acc1 = (
-                acc1 * alpha[:, None] + tl.dot(p_fp8, kv1).to(tl.float32) * inv_fp8_max
+                acc1 * alpha[:, None] + tl.dot(p_dot, kv1).to(tl.float32) * p_dot_scale
             )
         if NUM_GROUPS >= 3:
             acc2 = (
-                acc2 * alpha[:, None] + tl.dot(p_fp8, kv2).to(tl.float32) * inv_fp8_max
+                acc2 * alpha[:, None] + tl.dot(p_dot, kv2).to(tl.float32) * p_dot_scale
             )
         if NUM_GROUPS >= 4:
             acc3 = (
-                acc3 * alpha[:, None] + tl.dot(p_fp8, kv3).to(tl.float32) * inv_fp8_max
+                acc3 * alpha[:, None] + tl.dot(p_dot, kv3).to(tl.float32) * p_dot_scale
             )
         m_i = m_new
         l_i = l_new
@@ -564,12 +579,13 @@ def triton_sparse_mla_decode_splitk(
 ) -> torch.Tensor:
     """Split-K Triton sparse MLA decode (DSv4 pattern).
 
-    q_nope:  [bs, H, d_v] fp8
-    q_rope:  [bs, H, d_tail] fp8
-    kv:      [num_pages, 1, DIM] fp8
+    q_nope:  [bs, H, d_v] fp8/bf16
+    q_rope:  [bs, H, d_tail] fp8/bf16
+    kv:      [num_pages, 1, DIM] fp8/bf16
     indices: [bs, 1, topk] int32
     returns: [1, bs, H, d_v] bf16
     """
+    is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
     bs, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     d_tail = q_rope.shape[-1]
@@ -594,9 +610,22 @@ def triton_sparse_mla_decode_splitk(
 
     max_kv_splits = max(1, topk // BLOCK_K)
     if kv_splits is None:
+        num_cu = _cu_count()
+        base_ctas = max(1, bs * n_head_blocks)
+        # Very sparse BF16 launches benefit from enough split-K work to queue
+        # two workgroups per CU. Once token/head parallelism is less sparse, keep the
+        # one-wave target to avoid paying extra partial-output reduction cost.
+        target_wg_per_cu = 1.0
+        if not is_fp8 and base_ctas <= max(1, num_cu // 16):
+            target_wg_per_cu = 2.0
         kv_splits = min(
             _kv_splits_heuristic(
-                bs, H, BLOCK_H, target_wg_per_cu=1.0, max_kv_splits=max_kv_splits
+                bs,
+                H,
+                BLOCK_H,
+                num_cu=num_cu,
+                target_wg_per_cu=target_wg_per_cu,
+                max_kv_splits=max_kv_splits,
             ),
             max_kv_splits,
         )
@@ -626,6 +655,7 @@ def triton_sparse_mla_decode_splitk(
                 STRIDE_QN_H=stride_qn_h,
                 STRIDE_QR_T=stride_qr_t,
                 STRIDE_QR_H=stride_qr_h,
+                IS_FP8=is_fp8,
                 BLOCK_H=BLOCK_H,
                 BLOCK_K=BLOCK_K,
                 num_warps=4,
@@ -665,6 +695,7 @@ def triton_sparse_mla_decode_splitk(
             STRIDE_QN_H=stride_qn_h,
             STRIDE_QR_T=stride_qr_t,
             STRIDE_QR_H=stride_qr_h,
+            IS_FP8=is_fp8,
             KV_SPLITS=kv_splits,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,

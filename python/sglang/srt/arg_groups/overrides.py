@@ -1963,12 +1963,6 @@ def _check_dsa_backend_constraints(
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
-    if hip and kv_cache_dtype != "fp8_e4m3" and rocm_only:
-        raise ValueError(
-            f"The {'/'.join(sorted(rocm_only))} DSA kernels on ROCm require "
-            "fp8_e4m3 KV cache. Use --kv-cache-dtype fp8_e4m3."
-        )
-
 
 def _check_tilelang_dsa_fp8_kv(
     kv_cache_dtype: str,
@@ -2045,10 +2039,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         )
         return declared
 
-    if not user_set_prefill and not user_set_decode and is_hip():
-        default = "triton" if kv_cache_dtype == "fp8_e4m3" else "tilelang"
-        declared["dsa_prefill_backend"] = default
-        declared["dsa_decode_backend"] = default
+    if is_hip():
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "triton"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "triton"
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"
