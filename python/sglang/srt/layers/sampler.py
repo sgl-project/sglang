@@ -491,9 +491,7 @@ class Sampler(nn.Module):
             selected_weight = selected_from_weights
 
         support = weights > 0
-        support_mass = torch.where(support, weights, torch.zeros_like(weights)).sum(
-            dim=-1, dtype=torch.float32
-        )
+        support_mass = weights.sum(dim=-1, dtype=torch.float32)
         selected_weight = selected_weight.float()
         selected_logprobs = torch.log(selected_weight / support_mass)
         valid = (
