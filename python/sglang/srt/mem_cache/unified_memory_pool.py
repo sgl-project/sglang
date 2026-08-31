@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""UnifiedKVPool — one physical `uint8` byte buffer shared by N sub-pools.
+"""UnifiedKVPool -- one physical `uint8` byte buffer shared by N sub-pools.
 
 Two END `MultiEndedAllocator`s grow inward from opposite ends; optional
 "float" MIDDLE pools live between their frontiers (chain order
@@ -1903,7 +1903,7 @@ def init_unified_mamba_swa_pools(
     if unified_total_bytes is not None:
         # PROFILED byte budget for the token side (captured pre-ratio-floor);
         # the state pool's bytes ride on top. The token counts stay boot
-        # labels / conserve caps — the runtime split floats.
+        # labels / conserve caps -- the runtime split floats.
         total_bytes = (
             unified_total_bytes + max_mamba_cache_size * mamba_spec.entry_bytes()
         )

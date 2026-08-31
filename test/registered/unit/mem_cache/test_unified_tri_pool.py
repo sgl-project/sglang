@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tri-pool composite (`UnifiedMambaSWATokenToKVPoolAllocator`) — full KV +
+"""Tri-pool composite (`UnifiedMambaSWATokenToKVPoolAllocator`) -- full KV +
 SWA KV + mamba/conv state in ONE unified byte buffer, chain
 ``[mamba (up END) | swa (FLOAT) | full (down END)]``.
 
@@ -224,7 +224,7 @@ class TestUnifiedTriPool(unittest.TestCase):
     # -- steady-state SWA churn: tombstones -> holes -> in-place reuse --
 
     def _swa_interior_block(self, allocator, blocks):
-        """The block whose SWA-physical pages touch neither float boundary —
+        """The block whose SWA-physical pages touch neither float boundary --
         `free_swa` on it must create interior holes (a boundary block would be
         absorbed instead; both are zero-copy, different mechanisms)."""
         sa = allocator.swa_attn_allocator
@@ -419,7 +419,7 @@ class TestTriPagedFreeGroup(unittest.TestCase):
         self.assertTrue(allocator.swa_attn_allocator._is_frontier_transparent())
 
     def test_float_free_honours_caller_supplied_pages(self):
-        """`_pages` must be USED, not merely accepted — re-deriving it is the
+        """`_pages` must be USED, not merely accepted -- re-deriving it is the
         host sync the paged free path exists to avoid."""
         pool, allocator = self._build_paged()
         v = allocator.alloc(8)
@@ -432,7 +432,7 @@ class TestTriPagedFreeGroup(unittest.TestCase):
         self.assertEqual(sa._live_pages(), live_before - pages.numel())
 
     def test_ungrouped_segment_free_also_reaches_the_float(self):
-        """`free_segment` outside a free group releases reps immediately —
+        """`free_segment` outside a free group releases reps immediately --
         the same float call, one frame shallower."""
         pool, allocator = self._build_paged()
         v = allocator.alloc(8)
@@ -542,7 +542,7 @@ class TestGeneralizedRebalance(unittest.TestCase):
         got = ma.alloc(int(fit) * ma.page_size)
         self.assertIsNotNone(got)
         low_before = sa.low_wm_page
-        # One more slot does NOT fit below the float — only a rebalance helps.
+        # One more slot does NOT fit below the float -- only a rebalance helps.
         more = ma.alloc(ma.page_size)
         self.assertIsNotNone(more, "state alloc must succeed via float rebalance")
         self.assertGreater(sa.low_wm_page, low_before)  # float slid UP
@@ -598,7 +598,7 @@ class TestGeneralizedRebalance(unittest.TestCase):
 
     def test_index_cap_guard_never_moves_data_uselessly(self):
         """When the caller's own INDEX space binds, no amount of float
-        movement helps — make_room must not be called (poisoned)."""
+        movement helps -- make_room must not be called (poisoned)."""
         from unittest import mock
 
         alloc = self._tri()
@@ -613,7 +613,7 @@ class TestGeneralizedRebalance(unittest.TestCase):
 
 
 class TestComputedShortSide(unittest.TestCase):
-    """`_ask_float_for_room` must open the side that MEASURES short — never
+    """`_ask_float_for_room` must open the side that MEASURES short -- never
     "the side facing full". These pin the per-side computation, including
     the coupled-ends-on-both-sides shape a DSV4-style composite
     (C128 | swa-float | C4) will need.
@@ -652,7 +652,7 @@ class TestComputedShortSide(unittest.TestCase):
         # so the low band is small and the geometry below is expressible.
         b_low0, b_high0 = self._sides(alloc)
         # Two positioning moves: pack the float low (leapfrog over-opens by
-        # design), then open the LOW side back to ~2 full-pages — small
+        # design), then open the LOW side back to ~2 full-pages -- small
         # enough that F outgrows it, wide enough that the integer need_n
         # window below is non-empty.
         sa.make_room(side="high", min_bytes=b_low0 + b_high0 - 2 * e_f)
@@ -869,7 +869,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
 
     def test_deferral_is_conservative_never_over_reports(self):
         """Availability with a stale-wide span must never EXCEED the absorbed
-        value — under-reporting is safe, over-reporting would over-admit."""
+        value -- under-reporting is safe, over-reporting would over-admit."""
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
         alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)
@@ -916,7 +916,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         self.assertEqual(alloc.verify_byte_accounting(), [])
 
     def test_transparency_still_exact_without_absorption(self):
-        """Park-on-empty stays in `free` because it is sync-free — a float
+        """Park-on-empty stays in `free` because it is sync-free -- a float
         that empties must go transparent immediately, with no flush needed."""
         alloc = self._tri()
         v = alloc.alloc(4 * self.PS)
@@ -1004,7 +1004,7 @@ class TestTriFactorySizing(unittest.TestCase):
 
     def test_bs1_floor_fails_loud_before_construction(self):
         """A budget far below one worst-case request must raise BEFORE any
-        pool construction — under-sizing is a retract LIVELOCK at runtime."""
+        pool construction -- under-sizing is a retract LIVELOCK at runtime."""
         with self.assertRaisesRegex(RuntimeError, "bs=1 floor"):
             init_unified_mamba_swa_pools(
                 **self._factory_kwargs(
@@ -1040,7 +1040,7 @@ class TestTriPoolHardening(unittest.TestCase):
         b_high_pages = fa._current_gap_bytes() // fa.entry_bytes_per_page
         grab = fa.alloc(max(0, (b_high_pages - 2)))
         self.assertIsNotNone(grab)
-        # The honest gate under-reports (no slide credit) — asking BEYOND it
+        # The honest gate under-reports (no slide credit) -- asking BEYOND it
         # is what fires the rebalance remedy; the ask still fits total free
         # bytes because the LOW band holds them behind the float.
         avail = allocator.available_size()

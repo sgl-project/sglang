@@ -439,7 +439,7 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
 
     def test_ratchet_shape_free_swa_never_syncs(self):
         """Aligned bounds (the ratchet guarantees them at ps>1): no unique,
-        no item — on the lazy production config."""
+        no item -- on the lazy production config."""
         alloc = self._swa_composite(lazy=True)
         v = alloc.alloc(8 * self.PS)
         self.assertIsNotNone(v)

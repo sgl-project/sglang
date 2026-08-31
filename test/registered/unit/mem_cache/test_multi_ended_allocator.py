@@ -3107,7 +3107,7 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
         self._check_float_state(fla, kv)
 
     def test_boundary_free_absorbed_at_the_deferred_point(self):
-        """Boundary holes shrink the span ZERO-COPY — but the shrink is
+        """Boundary holes shrink the span ZERO-COPY -- but the shrink is
         DEFERRED out of `free`, which must stay host-sync-free (deciding how
         far to walk needs the hole set on the host). `free` records the holes;
         `_absorb_span_boundary_holes` (per-step flush / shortfall ladder) reclaims

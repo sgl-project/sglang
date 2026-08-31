@@ -46,7 +46,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-# Plain unittest.TestCase, importing only ci_register — the deliberate
+# Plain unittest.TestCase, importing only ci_register -- the deliberate
 # hermetic convention of the pool-geometry tests in this directory (see
 # test_multi_ended_allocator.py): no heavy sglang.test.test_utils import
 # chain, so the suite runs in a lean torch-only environment.

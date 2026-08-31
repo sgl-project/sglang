@@ -152,7 +152,7 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         allocator.available_size()
         fa.available_size()
         fa.schedulable_available_size()
-        # Mutate capacity state BYPASSING the _CapacityField descriptor — the
+        # Mutate capacity state BYPASSING the _CapacityField descriptor -- the
         # epoch does not move, so the memos go stale undetectably for readers...
         fa.__dict__["watermark_physical"] = fa.watermark_physical + 2
         # ...but the idle-time coherence check must flag it.
@@ -176,7 +176,7 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         self.assertGreaterEqual(after, before)  # holes only ever add room
 
     def test_float_only_span_move_invalidates_every_memo(self):
-        """A hole-free float alloc rebinds NO free-list and has no watermark —
+        """A hole-free float alloc rebinds NO free-list and has no watermark --
         the span fields are its ONLY capacity state. If they are not
         `_CapacityField` descriptors, the float's own memo AND both
         neighbours' (the span flips transparency, walling off their gaps)

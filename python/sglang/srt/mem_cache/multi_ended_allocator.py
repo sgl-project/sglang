@@ -139,7 +139,7 @@ class _CapacityField(Generic[_T]):
 
 
 def _float_open_short_side(flt, demand) -> None:
-    """THE float-relocate policy, driven by a DEMAND VECTOR — one entry per
+    """THE float-relocate policy, driven by a DEMAND VECTOR -- one entry per
     band, in PAGES of that band, zero for bands the operation does not touch
     (e.g. mamba during a decode-token alloc). Any allocation event — a
     band's own pages, a coupled token spanning several bands, or a future
@@ -214,7 +214,7 @@ def _float_open_short_side(flt, demand) -> None:
 
 
 def _relieve_for_alloc(short_pool, need_tokens: int) -> bool:
-    """THE shortfall ladder. Every allocation shortfall in the unified pool —
+    """THE shortfall ladder. Every allocation shortfall in the unified pool --
     a single band's own alloc, or a composite's coupled multi-band alloc —
     runs exactly this, cheapest remedy first:
 
@@ -392,7 +392,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             os.environ.get("SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL", "4096")
         )
 
-        # Epoch-keyed memos for the capacity views — pure functions of chain
+        # Epoch-keyed memos for the capacity views -- pure functions of chain
         # state between mutations, but schedulers read them O(queue) times per
         # step (see `available_size` / `schedulable_available_size`).
         self._avail_memo_epoch: Optional[int] = None
@@ -644,7 +644,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         return total
 
     def _growth_side_neighbor(self) -> Optional[MultiEndedAllocator]:
-        """Nearest NON-transparent chain member on this pool's GROWTH side —
+        """Nearest NON-transparent chain member on this pool's GROWTH side --
         the one whose compaction/flush releases bytes reachable at this pool's
         frontier."""
         p = self.high_peer if self.grow_direction == "up" else self.low_peer
@@ -737,7 +737,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """A band short on its OWN pages: demand vector = {me: pages}; the
         float, if the nearest non-transparent growth-side member is one,
         opens the side facing me. Everything else — side derivation, index
-        guard, total-target ask — is the shared policy."""
+        guard, total-target ask -- is the shared policy."""
         blocker = self._growth_side_neighbor()
         if not isinstance(blocker, FloatMultiEndedAllocator):
             return
@@ -2147,7 +2147,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             "is end-pool machinery and must stay off for float middles"
         )
         # Base __init__ ends with self.clear(), which reads these via our
-        # _reset_watermarks override — pre-seed so the override can run.
+        # _reset_watermarks override -- pre-seed so the override can run.
         self.low_wm_page = 0
         self.high_wm_page = 0
         super().__init__(**kwargs)
@@ -2322,7 +2322,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         self, v_pages: torch.Tensor, N: int
     ) -> Optional[torch.Tensor]:
         # Holes-first always routes through take_physical_pages (no fused
-        # watermark fast path — float alloc cadence doesn't need it).
+        # watermark fast path -- float alloc cadence doesn't need it).
         if N == 0:
             return torch.empty(0, dtype=torch.int64, device=self.device)
         phys_pages = self.take_physical_pages(N)
@@ -2370,7 +2370,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])
             # Park is sync-free (span/hole COUNTS only); boundary absorption is
-            # DEFERRED — see `_absorb_span_boundary_holes`.
+            # DEFERRED -- see `_absorb_span_boundary_holes`.
             self._holes_dirty = True
             self._park_if_empty()
 
@@ -2611,7 +2611,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         return out
 
     def _flush(self, *, urgent: bool) -> int:
-        """Boundary absorption only — never data movement. The base `_flush`
+        """Boundary absorption only -- never data movement. The base `_flush`
         treats `_free_phys_pages` as a lazy compaction backlog to be drained,
         but for a float those entries are INTERIOR HOLES, reusable assets by
         design; relocation happens on demand via `make_room` /
@@ -2622,7 +2622,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         return self._absorb_span_boundary_holes()
 
     def flush_opportunistic(self) -> int:
-        """Public gated wrapper around `_flush(urgent=False)` — the base's
+        """Public gated wrapper around `_flush(urgent=False)` -- the base's
         exact shape. The ONLY reason for the override is the gate: the base
         keys its fast path on `lazy_compaction`, which a float never has; a
         float's flushable work is its deferred boundary absorption, so the
@@ -2670,9 +2670,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         assert retreat_side in ("low", "high")
         if self._hole_pages() == 0:
             return 0
-        # Order the copies after the in-flight forward, or they carry pre-write
-        # bytes and the rebind sends readers to a destination that never got
-        # them. One wait covers read AND write: the event is post-forward.
+        # Settle before the first copy -- see `make_room`.
         self._settle_inflight_forward()
         holes = set(int(x) for x in self._free_phys_pages.tolist())
         live_sorted = [
@@ -3131,7 +3129,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self._wire_peers()
 
         # Epoch-keyed memo for the joint capacity view (any chain member's
-        # mutation invalidates — see `MultiEndedAllocator._chain_capacity_epoch`).
+        # mutation invalidates -- see `MultiEndedAllocator._chain_capacity_epoch`).
         self._joint_avail_memo_epoch: Optional[int] = None
         self._joint_avail_memo_tokens: int = 0
 
@@ -3302,7 +3300,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return (self.full_attn_allocator, self.swa_attn_allocator)
 
     def _ask_float_for_room(self, need_tokens: int) -> None:
-        """No float in a two-END chain — nothing can slide."""
+        """No float in a two-END chain -- nothing can slide."""
         return None
 
     # `size_full` / `size_swa` are inherited; they read `_size_full`/`_size_swa`
@@ -3547,7 +3545,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             return
         if ps == 1:
             # token == page and the live filter just deduped against the v2p
-            # table, so these ARE unique page ids — same skip as `_free_lazy`.
+            # table, so these ARE unique page ids -- same skip as `_free_lazy`.
             self.swa_attn_allocator.free(live, _pages=live)
         else:
             self.swa_attn_allocator.free(live)
@@ -3739,7 +3737,7 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
         )
-        # Per-request state END pool (grow-up; page_size=1 — state is
+        # Per-request state END pool (grow-up; page_size=1 -- state is
         # per-request, orthogonal to KV paging).
         self.mamba_allocator = MultiEndedAllocator(
             kvcache=mamba_kvcache,
@@ -3882,7 +3880,7 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         )
 
     def _alloc_demand(self, need_tokens: int):
-        """Demand VECTOR for one composite allocation, in pages per band —
+        """Demand VECTOR for one composite allocation, in pages per band --
         zero for bands the operation does not touch. A composite token
         (prefill extend and decode alike) needs a full page AND a swa page;
         it never draws a state slot — those are per-REQUEST allocations that
@@ -3942,7 +3940,7 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         out_cache_loc_virtual: Optional[torch.Tensor],
     ) -> None:
         # full + swa are written per new token via set_kv_buffer; the mamba
-        # state is written by the conv kernels, not out_cache_loc — pass None
+        # state is written by the conv kernels, not out_cache_loc -- pass None
         # (the 2-pool mamba composite's convention).
         super().set_inflight_forward(forward_done, out_cache_loc_virtual)
         self.mamba_allocator.set_inflight_forward(forward_done, None)
@@ -3979,7 +3977,7 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         """Per-step reclaim across the whole chain. The float participates:
         its holes are not flushable BACKLOG (never moved here), but its
         deferred boundary absorption is exactly the work this quiescent point
-        exists for — and it is where the float's single D2H is paid."""
+        exists for -- and it is where the float's single D2H is paid."""
         fa, ma = self.full_attn_allocator, self.mamba_allocator
         sa = self.swa_attn_allocator
         if (

@@ -145,7 +145,7 @@ class SchedulerInvariantChecker:
         allocator = self.token_to_kv_pool_allocator
         swa_available = ps.swa_available_size
         if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
-            # Tri-pool: same floating-boundary phantom as the full pool — use the
+            # Tri-pool: same floating-boundary phantom as the full pool -- use the
             # slot-conservation view, not the byte-coordinated min (see _check_full_pool).
             swa_available = allocator.conserve_swa_available_size()
         return self._check_pool_invariant(

@@ -1,4 +1,4 @@
-"""Inkling under ``--enable-unified-memory`` — the first TRI-pool model.
+"""Inkling under ``--enable-unified-memory`` -- the first TRI-pool model.
 
 Boots the shrunken ``thinkingmachines/Inkling`` checkpoint (``test`` revision)
 with the unified memory pool: one byte buffer, chain
@@ -200,7 +200,7 @@ class TestInklingUnifiedTriPool(CustomTestCase):
 )
 class TestInklingUnifiedVsStaticParity(CustomTestCase):
     """Greedy logprob parity: unified tri-pool vs static pools, same prompts.
-    Two sequential boots — the strongest wrong-slot tripwire short of GSM8K."""
+    Two sequential boots -- the strongest wrong-slot tripwire short of GSM8K."""
 
     @classmethod
     def _collect(cls, other_args):
