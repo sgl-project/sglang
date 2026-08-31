@@ -4136,21 +4136,17 @@ class MLATokenToKVPool(KVCache):
                 fp8_dtype,
             )
         elif self.dsa_kv_cache_store_fp8:
-            # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
-            # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
-            # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
-            cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
-                cache_k_nope, cache_k_rope
+            # OPTIMIZATION: Fused per-block fp8 quantization of k_nope + bf16 k_rope
+            # + direct paged store, replacing the two-step
+            # quantize_k_cache_separate() + set_mla_kv_buffer_triton().
+            from sglang.kernels.ops.attention.dsa.fused_dsa_quant_store import (
+                fused_dsa_quant_store,
             )
-
-            # Reuse existing two-tensor write kernel (works with FP8 byte layout)
-            # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
-            # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
-            set_mla_kv_buffer_triton(
+            fused_dsa_quant_store(
+                cache_k_nope.view(-1, 512),
+                cache_k_rope.view(-1, 64),
                 dst_buffer,
                 loc,
-                cache_k_nope_fp8,
-                cache_k_rope_fp8,
             )
         else:
             if cache_k_nope.dtype != self.dtype:
