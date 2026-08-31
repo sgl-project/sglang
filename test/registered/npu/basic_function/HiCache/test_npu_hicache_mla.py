@@ -79,7 +79,7 @@ class TestAscendMlaHicache(CustomTestCase):
                             TEST_MODEL_MATRIX[model]["accuracy"],
                         )
                 finally:
-                    terminate_and_kill_process_tree(process, wait_timeout=60)
+                    terminate_and_kill_process_tree(process)
 
 
 if __name__ == "__main__":

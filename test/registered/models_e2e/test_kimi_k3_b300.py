@@ -31,7 +31,7 @@ GPU_IDLE_TIMEOUT = 120
 
 def _stop_server(process):
     if process:
-        terminate_and_kill_process_tree(process, wait_timeout=60)
+        terminate_and_kill_process_tree(process)
         _wait_for_gpu_idle_in_ci(timeout=GPU_IDLE_TIMEOUT)
 
 

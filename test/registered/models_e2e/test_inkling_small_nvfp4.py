@@ -118,7 +118,7 @@ class TestInklingSmallNvfp4(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+            terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         """Answer quality on the real checkpoint: guards the modelopt_fp4 weight
@@ -208,7 +208,7 @@ class TestInklingSmallNvfp4DsparkDeterministic(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+            terminate_and_kill_process_tree(cls.process)
 
     def _run(self, helper, **kwargs):
         helper(
@@ -323,7 +323,7 @@ class TestInklingSmallNvfp4HiCacheDeterministic(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+            terminate_and_kill_process_tree(cls.process)
 
     def test_multiturn_decode_cache_hit_over_hicache(self):
         """Nine interleaved branches, three turns, decode hits served through the

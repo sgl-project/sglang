@@ -150,9 +150,9 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
 
         time.sleep(10)
 
-        terminate_and_kill_process_tree(self.process_prefill, wait_timeout=60)
-        terminate_and_kill_process_tree(self.process_decode, wait_timeout=60)
-        terminate_and_kill_process_tree(self.process_lb, wait_timeout=60)
+        terminate_and_kill_process_tree(self.process_prefill)
+        terminate_and_kill_process_tree(self.process_decode)
+        terminate_and_kill_process_tree(self.process_lb)
 
         self.start_prefill()
         self.start_decode()

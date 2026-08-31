@@ -48,7 +48,7 @@ class TestHiCache(CustomTestCase, MMLUMixin):
 
     @classmethod
     def tearDownClass(cls):
-        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+        terminate_and_kill_process_tree(cls.process)
         time.sleep(5)
 
 

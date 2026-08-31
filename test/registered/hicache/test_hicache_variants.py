@@ -51,7 +51,7 @@ class HiCacheBaseServer(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+        terminate_and_kill_process_tree(cls.process)
 
 
 class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):

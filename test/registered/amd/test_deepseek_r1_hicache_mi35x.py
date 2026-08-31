@@ -129,7 +129,7 @@ class TestDeepSeekR1HiCacheMI35x(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+            terminate_and_kill_process_tree(cls.process)
         if getattr(cls, "l3_storage_dir", None):
             shutil.rmtree(cls.l3_storage_dir, ignore_errors=True)
 

@@ -74,7 +74,7 @@ class TestPPWithHiCache(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process"):
-            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+            terminate_and_kill_process_tree(cls.process)
         cls._stop_mooncake_services()
 
     @classmethod

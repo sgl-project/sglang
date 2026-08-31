@@ -93,7 +93,7 @@ class TestQwen35WithHiCache(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+        terminate_and_kill_process_tree(cls.process)
         shutil.rmtree(cls.storage_dir, ignore_errors=True)
 
     def _run_gsm8k(self):

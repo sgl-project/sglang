@@ -222,7 +222,7 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             )
             self.assertEqual(code_detach_no_admin, 400)
         finally:
-            terminate_and_kill_process_tree(process1, wait_timeout=60)
+            terminate_and_kill_process_tree(process1)
             time.sleep(2)
 
         self._check_attach_detach_lifecycle()
@@ -367,7 +367,7 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             )
             self.assertEqual(code_detach2, 200, f"{code_detach2} - {body_detach2}")
         finally:
-            terminate_and_kill_process_tree(process2, wait_timeout=60)
+            terminate_and_kill_process_tree(process2)
             time.sleep(2)
 
 

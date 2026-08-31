@@ -63,7 +63,7 @@ class HiCacheStorageBaseMixin:
     def tearDownClass(cls):
         """Clean up test environment"""
         if hasattr(cls, "process") and cls.process:
-            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+            terminate_and_kill_process_tree(cls.process)
 
         import shutil
 

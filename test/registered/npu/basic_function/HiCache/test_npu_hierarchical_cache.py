@@ -51,7 +51,7 @@ class TestNPUHierarchicalCache(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+        terminate_and_kill_process_tree(cls.process)
 
     def test_hierarchical_cache_reused_long_identical(self):
         """Long identical texts should reuse HierarchicalCache"""
