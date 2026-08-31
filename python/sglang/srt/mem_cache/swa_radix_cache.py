@@ -465,14 +465,14 @@ class SWARadixCache(BasePrefixCache):
         """Cache request when it finishes."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_len_to_handle
+                req.kv.req_pool_idx, :kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_len_to_handle
+            req.kv.req_pool_idx, :kv_len_to_handle
         ]
 
         radix_key = RadixKey(
@@ -516,7 +516,7 @@ class SWARadixCache(BasePrefixCache):
         """Cache request when it is unfinished."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.extend_range.end
+                req.kv.req_pool_idx, : req.extend_range.end
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
@@ -525,7 +525,7 @@ class SWARadixCache(BasePrefixCache):
 
         token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, : len(token_ids)
         ]
 
         radix_key = RadixKey(
@@ -561,7 +561,7 @@ class SWARadixCache(BasePrefixCache):
         assert old_prefix_len <= len(new_indices), f"{old_prefix_len=}, {new_indices=}"
         assert new_prefix_len <= len(new_indices), f"{new_prefix_len=}, {new_indices=}"
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
+            (req.kv.req_pool_idx, slice(old_prefix_len, len(new_indices))),
             new_indices[old_prefix_len:],
         )
 
