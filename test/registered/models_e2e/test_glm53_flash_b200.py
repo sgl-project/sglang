@@ -53,7 +53,6 @@ def _stop_server(process):
 
 class _GLM53FlashB200Base(CustomTestCase):
     server_args: list[str]
-    gsm8k_score_threshold = 0.93
 
     @classmethod
     def setUpClass(cls):
@@ -77,6 +76,7 @@ class TestGLM53FlashB200LowLatency(
     GSM8KMixin,
     _GLM53FlashB200Base,
 ):
+    gsm8k_score_threshold = 0.93
     accept_length_thres = 4.0
     bs_1_speed_thres = 300
     server_args = [
@@ -97,6 +97,7 @@ class TestGLM53FlashB200HighThroughput(
     GSM8KMixin,
     _GLM53FlashB200Base,
 ):
+    gsm8k_score_threshold = 0.93
     server_args = [
         *COMMON_SERVER_ARGS,
         "--enable-dp-attention",
