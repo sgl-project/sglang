@@ -212,6 +212,16 @@ jobs:
               # shellcheck disable=SC1091
               source "${venv}/bin/activate"
               uv pip install "setuptools>=61.0" "setuptools-rust>=1.11" "setuptools-scm>=8.0" "torch==2.13.0" wheel
+              # torch-sys resolves libtorch from the active interpreter and bakes that
+              # path into the persistent cargo cache. venv_root is per-run and deleted on
+              # exit, so a later run reuses a "Fresh torch-sys" whose -L points at a gone
+              # directory and fails with "unable to find library -ltorch". Pin LIBTORCH and
+              # drop the torch-shim units so they rebuild against this run's venv.
+              LIBTORCH="$(python -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent)')"
+              export LIBTORCH
+              export LD_LIBRARY_PATH="${LIBTORCH}/lib:${LD_LIBRARY_PATH:-}"
+              cargo clean --release --manifest-path rust/mem-cache/Cargo.toml \
+                  -p torch-sys -p mem_cache 2>/dev/null || true
               (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
               python - <<'PY'
           import importlib.util
