@@ -47,7 +47,6 @@ def _build(device, page_size=1, kernel_page_multiplier=None):
         device=device,
         enable_memory_saver=False,
         page_size=page_size,
-        view_tail_pad_bytes=page_size * full_spec.entry_bytes(),
     )
     kvcache = UnifiedMLATokenToKVPool(
         unified_buffer=buf,

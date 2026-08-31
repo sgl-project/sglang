@@ -364,7 +364,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 if (
                     save_kv_cache
                     and self._fused_set_kv_concat_q_fp8
-                    and not self._unified_mla
+                    and not self.kv_index_translator.is_translating
                 ):
                     # Static pool: out_cache_loc is already the physical loc.
                     # Fused: bf16->fp8 quantize + KV scatter + q concat in one
