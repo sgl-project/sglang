@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 
+from sglang.test.ascend.test_ascend_utils import DEEPSEEK_V4_FLASH_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -30,16 +31,14 @@ def _cleanup_residual_sglang():
 
 class DisaggregationExtraSlotsBase(PDDisaggregationServerBase):
     """Base class for disaggregation extra slots validation tests.
-    Reuses the standard PD disaggregation server lifecycle and provides
+    Reuses the standard PD disaggregation server lifecycle and providesv
     log capture and c128_state_fixed extraction utilities.
     """
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = os.environ.get(
-            "MODEL_PATH", "/home/weights/DeepseekV4-Flash"
-        )
+        cls.model = os.environ.get("MODEL_PATH", DEEPSEEK_V4_FLASH_WEIGHTS_PATH)
         cls.temp_dir = tempfile.mkdtemp()
         cls.transfer_backend = ["--disaggregation-transfer-backend", "ascend"]
         cls.tp_size = int(os.environ.get("TP", "8"))
@@ -54,31 +53,48 @@ class DisaggregationExtraSlotsBase(PDDisaggregationServerBase):
     def _start_prefill_with_capture(cls):
         """Launch prefill server with stdout/stderr captured to a temp log file."""
         prefill_args = [
-            "--attention-backend", "dsv4",
+            "--attention-backend",
+            "dsv4",
             "--trust-remote-code",
-            "--disaggregation-mode", "prefill",
-            "--tp-size", str(cls.tp_size),
-            "--dtype", "bfloat16",
+            "--disaggregation-mode",
+            "prefill",
+            "--tp-size",
+            str(cls.tp_size),
+            "--dtype",
+            "bfloat16",
             "--disable-radix-cache",
             "--disable-cuda-graph",
             "--page-size", "128",
-            "--dp-size", str(cls.tp_size),
+            "--dp-size",
+            str(cls.tp_size),
             "--enable-dp-attention",
-            "--device", "npu",
-            "--watchdog-timeout", "9000",
-            "--chunked-prefill-size", "-1",
-            "--max-running-requests", "128",
-            "--moe-a2a-backend", "deepep",
-            "--deepep-mode", "auto",
-            "--quantization", "modelslim",
+            "--device",
+            "npu",
+            "--watchdog-timeout",
+            "9000",
+            "--chunked-prefill-size",
+            "-1",
+            "--max-running-requests",
+            "128",
+            "--moe-a2a-backend",
+            "deepep",
+            "--deepep-mode",
+            "auto",
+            "--quantization", 
+            "modelslim",
             "--enable-dp-lm-head",
-            "--kv-cache-dtype", "auto",
+            "--kv-cache-dtype",
+            "auto",
             "--skip-server-warmup",
-            "--disaggregation-transfer-backend", "ascend",
-            "--mem-fraction-static", "0.8",
-            "--prefill-max-requests", "1",
+            "--disaggregation-transfer-backend",
+            "ascend",
+            "--mem-fraction-static",
+            "0.8",
+            "--prefill-max-requests",
+            "1",
             "--disable-overlap-schedule",
-            "--disaggregation-bootstrap-port", "8998",
+            "--disaggregation-bootstrap-port",
+            "8998",
         ]
         prefill_args += cls.transfer_backend
 
@@ -126,11 +142,15 @@ class DisaggregationExtraSlotsBase(PDDisaggregationServerBase):
         host = host[2:]
 
         command = [
-            "sglang", "serve",
-            "--model-path", cls.model,
+            "sglang",
+            "serve",
+            "--model-path",
+            cls.model,
             *prefill_args,
-            "--host", host,
-            "--port", port,
+            "--host",
+            host,
+            "--port",
+            port,
         ]
         print(f"[PREFILL] command={' '.join(command)}")
 
@@ -154,33 +174,57 @@ class DisaggregationExtraSlotsBase(PDDisaggregationServerBase):
         Applies --disaggregation-decode-extra-slots when specified.
         """
         decode_args = [
-            "--attention-backend", "dsv4",
+            "--attention-backend",
+            "dsv4",
             "--trust-remote-code",
-            "--disaggregation-mode", "decode",
-            "--tp-size", str(cls.tp_size),
-            "--dtype", "bfloat16",
+            "--disaggregation-mode",
+            "decode",
+            "--tp-size", 
+            str(cls.tp_size),
+            "--dtype",
+            "bfloat16",
             "--disable-radix-cache",
             "--disable-cuda-graph",
-            "--page-size", "128",
-            "--dp-size", str(cls.tp_size),
+            "--page-size",
+            "128",
+            "--dp-size",
+            str(cls.tp_size),
             "--enable-dp-attention",
-            "--device", "npu",
-            "--watchdog-timeout", "9000",
-            "--chunked-prefill-size", "-1",
-            "--max-running-requests", "32",
-            "--moe-a2a-backend", "deepep",
-            "--deepep-mode", "auto",
-            "--quantization", "modelslim",
+            "--device",
+            "npu",
+            "--watchdog-timeout",
+            "9000",
+            "--chunked-prefill-size",
+            "-1",
+            "--max-running-requests",
+            "32",
+            "--moe-a2a-backend",
+            "deepep",
+            "--deepep-mode",
+            "auto",
+            "--quantization",
+            "modelslim",
             "--enable-dp-lm-head",
-            "--kv-cache-dtype", "auto",
+            "--kv-cache-dtype",
+            "auto",
             "--skip-server-warmup",
-            "--disaggregation-transfer-backend", "ascend",
-            "--mem-fraction-static", "0.85",
-            "--cuda-graph-bs", "1", "2", "3", "4",
-            "--speculative-algorithm", "EAGLE",
-            "--speculative-num-steps", "2",
-            "--speculative-eagle-topk", "1",
-            "--speculative-num-draft-tokens", "3",
+            "--disaggregation-transfer-backend",
+            "ascend",
+            "--mem-fraction-static",
+            "0.85",
+            "--cuda-graph-bs",
+            "1",
+            "2",
+            "3",
+            "4",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "2",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "3",
         ]
 
         if extra_slots is not None:
@@ -236,11 +280,15 @@ class DisaggregationExtraSlotsBase(PDDisaggregationServerBase):
         host = host[2:]
 
         command = [
-            "sglang", "serve",
-            "--model-path", cls.model,
+            "sglang",
+            "serve",
+            "--model-path",
+            cls.model,
             *decode_args,
-            "--host", host,
-            "--port", port,
+            "--host",
+            host,
+            "--port",
+            port,
         ]
         print(f"[DECODE] command={' '.join(command)}")
 

@@ -13,10 +13,9 @@ import time
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
 
-QWEN3_0_6B_WEIGHTS_PATH = "/home/weights/Qwen3-0.6B"
 
 register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
 
@@ -55,16 +54,24 @@ class TestNpuSmgGrpcMode(unittest.TestCase):
         cls.grpc_port = 30001  # From log: gRPC server listening on 127.0.0.1:30001
 
         command = [
-            "sglang", "serve",
-            "--model-path", cls.model,
-            "--tokenizer-path", cls.model,
-            "--device", "npu",
+            "sglang",
+            "serve",
+            "--model-path",
+            cls.model,
+            "--tokenizer-path",
+            cls.model,
+            "--device",
+            "npu",
             "--trust-remote-code",
-            "--log-requests-level", "2",
-            "--mem-fraction-static", "0.85",
-            "--attention-backend", "ascend",
+            "--log-requests-level",
+            "2",
+            "--mem-fraction-static",
+            "0.85",
+            "--attention-backend",
+            "ascend",
             "--disable-cuda-graph",
-            "--dtype", "bfloat16",
+            "--dtype",
+            "bfloat16",
             "--disable-radix-cache",
             "--enable-metrics",
             "--smg-grpc-mode",
@@ -134,9 +141,7 @@ class TestNpuSmgGrpcMode(unittest.TestCase):
                     f"Server process exited early with code {cls.process.poll()}."
                 )
             time.sleep(interval)
-        raise TimeoutError(
-            f"gRPC server did not become ready within {timeout}s."
-        )
+        raise TimeoutError(f"gRPC server did not become ready within {timeout}s.")
 
     def test_smg_grpc_server_starts_and_ready(self):
         """Verify SMG gRPC mode starts successfully and reports ready."""
@@ -163,7 +168,8 @@ class TestNpuSmgGrpcMode(unittest.TestCase):
         try:
             result = sock.connect_ex(("127.0.0.1", self.grpc_port))
             self.assertEqual(
-                result, 0,
+                result,
+                0,
                 f"SMG gRPC port {self.grpc_port} is not listening",
             )
         finally:

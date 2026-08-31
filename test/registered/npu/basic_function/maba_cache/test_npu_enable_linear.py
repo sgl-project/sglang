@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from urllib.parse import urlparse
 
+from sglang.test.ascend.test_ascend_utils import QWEN3_6_35B_A3B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -22,8 +23,6 @@ from sglang.test.test_utils import (
     kill_process_tree,
 )
 
-from sglang.test.ascend.test_ascend_utils import QWEN3_6_35B_A3B_WEIGHTS_PATH
-# QWEN3_6_35B_A3B_WEIGHTS_PATH = "/home/weights/Qwen3.6-35B-A3B"
 
 register_npu_ci(
     est_time=400,
@@ -37,7 +36,7 @@ def _load_ascend_env(base_env: dict) -> dict:
     script = (
         "source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null; "
         "source /usr/local/Ascend/nnal/atb/set_env.sh 2>/dev/null; "
-        "python3 -c \"import os, json; print(json.dumps(dict(os.environ)))\""
+        'python3 -c "import os, json; print(json.dumps(dict(os.environ)))"'
     )
     try:
         result = subprocess.run(
@@ -77,18 +76,20 @@ class TestLinearAttentionAndReplaySSM(CustomTestCase):
         env = _load_ascend_env(env)
 
         # Apply business-specific environment variables
-        env.update({
-            "SGLANG_SET_CPU_AFFINITY": "1",
-            "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
-            "STREAMS_PER_DEVICE": "32",
-            "HCCL_BUFFSIZE": "1600",
-            "HCCL_OP_EXPANSION_MODE": "AIV",
-            "HCCL_SOCKET_IFNAME": "lo",
-            "GLOO_SOCKET_IFNAME": "lo",
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "32",
-            "SGLANG_DEEPEP_EF16_DISPATCH": "1",
-            "ENABLE_ASCEND_MOE_NZ": "1",
-        })
+        env.update(
+            {
+                "SGLANG_SET_CPU_AFFINITY": "1",
+                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+                "STREAMS_PER_DEVICE": "32",
+                "HCCL_BUFFSIZE": "1600",
+                "HCCL_OP_EXPANSION_MODE": "AIV",
+                "HCCL_SOCKET_IFNAME": "lo",
+                "GLOO_SOCKET_IFNAME": "lo",
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "32",
+                "SGLANG_DEEPEP_EF16_DISPATCH": "1",
+                "ENABLE_ASCEND_MOE_NZ": "1",
+            }
+        )
 
         cls.env = env
 
@@ -100,18 +101,31 @@ class TestLinearAttentionAndReplaySSM(CustomTestCase):
 
         # Construct server startup arguments
         server_args = [
-            "--model-path", QWEN3_6_35B_A3B_WEIGHTS_PATH,
-            "--attention-backend", "ascend",
-            "--device", "npu",
-            "--tp-size", "2",
+            "--model-path",
+            QWEN3_6_35B_A3B_WEIGHTS_PATH,
+            "--attention-backend",
+            "ascend",
+            "--device",
+            "npu",
+            "--tp-size",
+            "2",
             "--trust-remote-code",
-            "--host", cls.host,
-            "--max-running-requests", "12",
-            "--mem-fraction-static", "0.85",
-            "--port", str(cls.port),
-            "--cuda-graph-bs", "2", "4", "8",
-            "--dtype", "bfloat16",
-            "--linear-attn-verify-backend", "flashinfer",
+            "--host",
+            cls.host,
+            "--max-running-requests",
+            "12",
+            "--mem-fraction-static",
+            "0.85",
+            "--port",
+            str(cls.port),
+            "--cuda-graph-bs",
+            "2",
+            "4",
+            "8",
+            "--dtype",
+            "bfloat16",
+            "--linear-attn-verify-backend",
+            "flashinfer",
             "--enable-linear-replayssm-spec",
         ]
 
