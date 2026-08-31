@@ -6,9 +6,6 @@ from functools import cache
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
-    is_batch_invariant,
-)
 from sglang.kernels.ops.attention.inkling_rel_proj import rel_proj_small_t
 from sglang.kernels.ops.attention.inkling_row_scale import row_compact_bf16
 from sglang.kernels.ops.attention.log_scaling_tau import (
@@ -45,12 +42,19 @@ try:
     import cutlass.cute as cute
     from cutlass.cute import Float32
 
+    from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+        is_batch_invariant,
+    )
     from sglang.kernels.ops.attention.flash_attn.cute.seqlen_info import SeqlenInfoQK
 except Exception as _import_error:
     cute = None
     Float32 = None
     SeqlenInfoQK = None
     _cute_import_error = _import_error
+
+    def is_batch_invariant() -> bool:
+        return False
+
 else:
     _cute_import_error = None
 
