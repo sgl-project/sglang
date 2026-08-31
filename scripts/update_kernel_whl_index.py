@@ -55,6 +55,7 @@ def _update_non_cuda_wheel_index(
     version=None,
     package_name="sglang_kernel",
     index_package_name="sglang-kernel",
+    release_tag_suffix="",
 ):
     backend_dir = f"{backend}{version or ''}"
     index_dir = pathlib.Path(f"sgl-whl/{backend_dir}/{index_package_name}")
@@ -71,7 +72,7 @@ def _update_non_cuda_wheel_index(
             rf"{re.escape(package_name)}-([0-9.]+(?:\.post[0-9]+)?)(?:\+{backend}[0-9]+)?-",
             path.name,
         )[0]
-        full_url = f"{base_url}/v{ver}/{path.name}#sha256={sha256}"
+        full_url = f"{base_url}/v{ver}{release_tag_suffix}/{path.name}#sha256={sha256}"
         with (index_dir / "index.html").open("a") as f:
             f.write(f'<a href="{full_url}">{path.name}</a><br>\n')
 
@@ -81,6 +82,7 @@ def update_wheel_index_xpu():
         "xpu",
         package_name="sglang_kernel_xpu",
         index_package_name="sglang-kernel-xpu",
+        release_tag_suffix="+xpu",
     )
 
 
