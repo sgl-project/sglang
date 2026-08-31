@@ -3995,9 +3995,7 @@ class Scheduler(
                 self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
-            elif not batch.spec_algorithm.is_none() and (
-                not _is_npu or self.pp_group.is_last_rank
-            ):
+            elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
@@ -4026,7 +4024,7 @@ class Scheduler(
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
-                    if (self.spec_algorithm.is_none() or _is_npu)
+                    if self.spec_algorithm.is_none()
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
