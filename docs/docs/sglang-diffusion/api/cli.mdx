@@ -131,6 +131,7 @@ pipeline's registered module name:
 | --- | --- | --- | --- |
 | Replace a component | `--component-paths.<component> {MODEL}` | `--<component>-path {MODEL}` | Load the replacement component's configuration and weights |
 | Replace only its weights | `--component-weights-paths.<component> {WEIGHTS}` | `--<component>-weights-path {WEIGHTS}` | Retain the base component configuration and replace its weights |
+| Direct-load an eligible component | `--component-direct-gpu-weight-loading.<component>` | None | Use that component's audited direct-GPU loader; it must stay resident |
 | Quantize an unquantized component online | `--component-quantizations.<component> {METHOD}` | `--<component>-quantization {METHOD}` | Apply a method supported by that component's native loader |
 | Keep selected component layers unquantized | `--component-quantization-ignored-layers.<component> {PATTERN...}` | None | Pass component-local ignored-layer patterns to its online quantizer |
 
@@ -165,6 +166,14 @@ for the current component matrix. A model cookbook is the source of truth for
 published, model-specific checkpoint examples; for example, all H3 sources and
 their exact overlays are kept in one
 [MiniMax-H3 compatibility table](/cookbook/diffusion/MiniMax/MiniMax-H3#checkpoint-and-adapter-formats).
+
+Direct-GPU loading is also capability-based. The existing
+`--direct-gpu-weight-loading` remains the primary DiT path. The component form
+currently supports standard native `vae` and `video_vae` state dicts on CUDA:
+it streams each safetensors tensor directly to the resident
+module, rather than materializing a complete CPU state dict. It rejects custom
+Diffusers `auto_map` classes, quantized checkpoints, tied state entries, and
+any component-offload or layerwise-offload placement.
 
 Component overrides accept a local component directory, a standalone Hub
 repository, or a Hub component subfolder written as `owner/repo/subfolder`.
@@ -248,7 +257,7 @@ sglang generate \
 HTTP server-only arguments are ignored by `sglang generate`.
 </Note>
 
-For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Cache-DiT. For the diffusers backend, use `--backend diffusers --cache-dit-config ...`. See [Cache-DiT](../cache_dit).
+For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Cache-DiT. It can run with DiT layerwise offload; it cannot run with FSDP. For the diffusers backend, use `--backend diffusers --cache-dit-config ...`. See [Cache-DiT](../cache_dit).
 
 For supported image pipelines, breakable CUDA graph can be enabled with `--enable-breakable-cuda-graph`, but you must declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 
@@ -300,7 +309,7 @@ Selectors match exact loaded component keys from `model_index.json`, including n
 
 The existing `--dit-cpu-offload`, `--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`, `--vae-cpu-offload`, and `--cpu-offload-components` options remain supported. New and legacy options may be mixed: `--component-residency` wins only for components it matches, while unmatched legacy settings remain effective. Legacy layerwise selectors take precedence over legacy component-offload selectors for the same component. Explicit `--dit-layerwise-offload false` makes the DiT resident unless another explicit DiT selector, such as `--dit-cpu-offload true` or `--component-residency dit=component-offload`, selects a different mode.
 
-Layerwise selection is strict. A native weighted component selected for `layerwise-offload` must declare its layer structure; otherwise startup fails with the unsupported component name instead of silently changing modes. FSDP applies only to resident components. The Diffusers backend supports only pipeline-wide `all=resident` and `all=component-offload`.
+Layerwise selection is strict. A native weighted component selected for `layerwise-offload` must declare its layer structure; otherwise startup fails with the unsupported component name instead of silently changing modes. Explicit non-resident placement also requires a request-time component-use declaration, so it cannot silently select a module that the pipeline does not manage. FSDP applies only to resident components. The Diffusers backend supports only pipeline-wide `all=resident` and `all=component-offload`.
 
 ### Layerwise Offload Tuning
 
@@ -316,7 +325,7 @@ sglang generate \
 
 Values passed to the compatibility option `--layerwise-offload-components` must match loaded component keys, such as `transformer`, `text_encoder`, `image_encoder`, `vae`, `condition_image_encoder`, `spatial_upsampler`, or `vocoder`. Its `default` group selects text encoders, image encoders, and VAEs. Use `all` to select every layerwise-offloadable component.
 
-Layerwise tuning options such as `--dit-offload-prefetch-size`, `--dit-layerwise-resident-layers`, and `--dit-layerwise-residency-policy` continue to control the streamed layer working set. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency.
+Layerwise tuning options such as `--dit-offload-prefetch-size`, `--dit-layerwise-resident-layers`, and `--dit-layerwise-residency-policy` continue to control the streamed layer working set. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency. DiT layerwise offload can run with Cache-DiT: skipped blocks are not streamed, and the first layer after a skip may sync-load. Cache-DiT remains incompatible with FSDP.
 
 Those three set the default for every streamed component. To give one component its own values, use the `component=value` forms, which also accept JSON:
 
