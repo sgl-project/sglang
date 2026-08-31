@@ -595,10 +595,10 @@ def handle_model_capability_adjustments(server_args: Any):
     hf_config = model_config.hf_config
 
     # DeepSeek-V4-Vision: the visible-window attention inside image spans
-    # assumes every image span is prefilled in a single extend with no
-    # prefix reuse (spans split by chunked prefill or partially hit by radix
-    # cache silently degrade to a causal window). Force both off so the
-    # assumption always holds.
+    # assumes every image span is prefilled in a single extend. Chunked
+    # prefill truncation points are span-aligned by the scheduler (see
+    # image_span_aligned_extend_end), but a radix prefix hit ending mid-span
+    # would still cut a span, so prefix caching stays off for this model.
     is_dsv4_vision = (
         "DeepseekV4ForCausalLM" in getattr(hf_config, "architectures", [])
         and getattr(hf_config, "vision_n_layers", 0) > 0
@@ -607,17 +607,12 @@ def handle_model_capability_adjustments(server_args: Any):
         declare_resolution(
             server_args,
             "_handle_model_capability_adjustments",
-            chunked_prefill_size=-1,
-        )
-        declare_resolution(
-            server_args,
-            "_handle_model_capability_adjustments",
             disable_radix_cache=True,
         )
         logger.warning(
-            "DeepSeek-V4-Vision detected: forcing --chunked-prefill-size=-1 "
-            "and --disable-radix-cache (image-span visible-window attention "
-            "requires single-shot prefill without prefix reuse)."
+            "DeepSeek-V4-Vision detected: forcing --disable-radix-cache "
+            "(a prefix hit ending inside an image span would cut the span; "
+            "chunked prefill is span-aligned and stays enabled)."
         )
 
     # HRM-Text needs bidirectional prompt attention (prefill), which only

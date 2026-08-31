@@ -57,11 +57,14 @@ def _iter_fully_contained_image_spans(
             if not item.is_image() or not item.offsets:
                 continue
             for span_start, span_end_incl in item.offsets:
-                # Degrade to the causal window when the span is cut by this
-                # chunk (chunked prefill / radix-cache hit mid-span).
                 if span_start >= prefix and span_end_incl < extend_end:
                     yield req_idx, int(span_start), int(span_end_incl) + 1
-                else:
+                elif span_start < extend_end and span_end_incl >= prefix:
+                    # Genuine cut: the span overlaps this chunk (or the prefix)
+                    # but is not fully inside it — chunked prefill without
+                    # span alignment, or a radix hit mid-span. Spans that lie
+                    # entirely before the prefix or entirely after this chunk
+                    # are irrelevant here and must not warn.
                     _warn_degraded_span_once()
 
 
@@ -129,3 +132,27 @@ def compute_visible_window_overrides(
         win_starts.extend([0] * pad)
         win_lens.extend([1] * pad)
     return win_starts, win_lens
+
+
+def image_span_aligned_extend_end(mm_input, extend_end: int) -> int:
+    """Move a chunked-prefill truncation point past any image span it cuts.
+
+    The visible-window attention above requires every image sentinel span to
+    be prefilled in a single extend. If ``extend_end`` (absolute position in
+    the request's padded input ids) falls strictly inside a span, it is moved
+    to the span end, overshooting the chunk budget by at most one span (a few
+    hundred tokens — the budget is a scheduling heuristic, not a hard memory
+    limit). Extending is preferred over shrinking to the span start because
+    shrinking can make zero progress when the span starts at the current
+    position.
+    """
+    if mm_input is None:
+        return extend_end
+    for item in mm_input.mm_items:
+        if not item.is_image() or not item.offsets:
+            continue
+        for span_start, span_end_incl in item.offsets:
+            span_end = span_end_incl + 1
+            if span_start < extend_end < span_end:
+                extend_end = span_end
+    return extend_end
