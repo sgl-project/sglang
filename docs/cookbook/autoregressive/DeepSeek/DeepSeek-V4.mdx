@@ -52,11 +52,11 @@ docker run --gpus all \
 AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
 
 For example:
-- **MI355X** → `lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260822`
-- **MI300X** → `lmsysorg/sglang-rocm:v0.5.17-rocm720-mi30x-20260822`
+- **MI355X** → `lmsysorg/sglang-rocm:v0.5.18-rocm720-mi35x-20260829`
+- **MI300X** → `lmsysorg/sglang-rocm:v0.5.18-rocm720-mi30x-20260829`
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.17-rocm720-{mi35x,mi30x}-20260822
+docker pull lmsysorg/sglang-rocm:v0.5.18-rocm720-{mi35x,mi30x}-20260829
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -66,7 +66,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.17-rocm720-{mi35x,mi30x}-20260822 \
+    lmsysorg/sglang-rocm:v0.5.18-rocm720-{mi35x,mi30x}-20260829 \
     sglang serve <use args below>
 ```
 
@@ -205,6 +205,18 @@ For the original Flash and Pro checkpoints:
 - `high-throughput`: MTP disabled — at saturation the verify step costs more than it saves.
 - MTP runs on the v2 speculative path.
 
+**Shared experts fusion (Blackwell, flashinfer_mxfp4)**
+
+On the Blackwell fp4 recipes (`--moe-runner-backend flashinfer_mxfp4`), the shared expert runs as a separate FP8 MLP on an alternate stream by default. Adding:
+
+```bash Command
+--enforce-shared-experts-fusion
+```
+
+routes it as one extra MXFP4 expert through the same trtllm-gen MoE kernel, so the whole MoE runs on a single stream (~4 fewer kernel launches and 2 fewer stream syncs per MoE layer). The shared expert is requantized from FP8 to MXFP4 at load time. Measured on GB200 tp4: gsm8k and AIME25 accuracy on par with the unfused baseline; Mean TTFT -13% to -21% and P99 ITL -15% to -53% at QPS 1-8 with neutral throughput.
+
+Only for deployments without expert parallelism (e.g. the single-node low-latency recipes): with `moe_ep_size > 1` the flag is rejected at startup, unless the DeepEP/MegaMOE per-rank shared-slot path is in use.
+
 **Compressed attention state dtype**
 
 DeepSeek-V4 uses hybrid compressed attention for long-context efficiency. `SGLANG_DSV4_COMPRESS_STATE_DTYPE` controls the dtype of the C4 / C128 compressed attention state pools. Supported values are `float32` / `fp32` (default: `float32`) and `bfloat16` / `bf16`. For BF16 on the offline compression path:
@@ -326,6 +338,26 @@ HiCache and MegaMoE are **not** supported on RTX PRO 6000.
 - **TP / DP setting** — both TP=4 and TP=8 are supported. At low concurrency we recommend **TP-only**; at high concurrency use **TP + DP**, which additionally needs `--dp 8 --enable-dp-attention --enable-prefill-delayer --prefill-delayer-max-delay-ms 5000`.
 - **MTP** — speculative decoding is supported; add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`.
 - **Kernels** — uses the Unified KV attention and the flydsl MoE.
+
+**MoRI EP (AMD expert parallelism)**
+
+On AMD, expert parallelism uses the **MoRI** all-to-all backend (`--moe-a2a-backend mori`), not DeepEP. Add the flags below on top of the verified recipe when sharding experts across GPUs; set `--ep-size` to the EP degree (typically the GPU count on one node).
+
+Two optional env vars improve MoRI throughput (both off by default):
+
+```bash Command
+export SGLANG_MORI_DISPATCH_DTYPE=mxfp8
+export SGLANG_MORI_RECV_BOUND=1
+
+sglang serve \
+  --model-path {MODEL_PATH} \
+  --tp 8 --dp 8 --enable-dp-attention \
+  --ep-size 8 --moe-a2a-backend mori --deepep-mode normal \
+  <other args from the Deploy panel>
+```
+
+- **FP4**: enable both env vars.
+- **FP8**: use `SGLANG_MORI_RECV_BOUND=1` only; omit `SGLANG_MORI_DISPATCH_DTYPE=mxfp8`.
 
 **MegaMoE**
 

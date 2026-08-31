@@ -143,23 +143,20 @@ class TestProfileSpsTable(CustomTestCase):
 
 
 def _build_sps_cost_table_for(testcase, *, sps_table_path):
-    from sglang.srt.runtime_context import get_context, get_server_args
+    from sglang.srt.runtime_context import get_context
     from sglang.srt.speculative.dspark_components.dspark_planner import (
         build_sps_cost_table,
     )
 
-    # The table bound reads `max_running_requests` from the published bags, so
-    # the case publishes it; the table path stays on the handed record, which is
-    # what `build_sps_cost_table` takes.
+    # Both the table path and the bound come from the published bags, so the
+    # case publishes them.
     override = get_context().override_server_args(
         speculative_dspark_sps_table_path=sps_table_path,
         max_running_requests=4,
     )
     override.install()
     testcase.addCleanup(override.restore)
-    return build_sps_cost_table(
-        server_args=get_server_args(), verify_num_draft_tokens=5
-    )
+    return build_sps_cost_table(verify_num_draft_tokens=5)
 
 
 class TestBuildSpsCostTableContract(CustomTestCase):
