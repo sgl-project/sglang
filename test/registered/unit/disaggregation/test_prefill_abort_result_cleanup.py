@@ -16,8 +16,10 @@ class _Req:
     def __init__(self, *, inflight_middle_chunks: int, allocated: bool = True):
         self.rid = "aborted-prefill"
         self.inflight_middle_chunks = inflight_middle_chunks
-        self.req_pool_idx = 1 if allocated else None
-        self.kv = ReqKvInfo(kv_allocated_len=1 if allocated else 0)
+        self.kv = ReqKvInfo(
+            req_pool_idx=1 if allocated else None,
+            kv_allocated_len=1 if allocated else 0,
+        )
         self.mamba_pool_idx = object() if allocated else None
         self.metadata_buffer_index = 7 if allocated else -1
         self.pending_bootstrap = allocated
@@ -35,10 +37,6 @@ class _Req:
             set_last_chunked_prefill_finish_time=Mock(),
             set_completion_time=Mock(),
         )
-
-    @property
-    def is_holding_kv(self):
-        return self.req_pool_idx is not None
 
     def finished(self):
         return self.finished_reason is not None
@@ -82,7 +80,7 @@ def _result():
 
 def _free_req(req, _tree_cache, *, is_insert):
     assert is_insert is False
-    req.req_pool_idx = None
+    req.kv.req_pool_idx = None
     req.kv.mark_released()
     req.mamba_pool_idx = None
 
