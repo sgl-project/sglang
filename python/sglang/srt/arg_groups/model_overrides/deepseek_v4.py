@@ -1,6 +1,6 @@
 """Config-time override declarations for deepseek_v4.
 
-Architectures: DeepseekV4ForCausalLM.
+Architectures: DeepseekV4ForCausalLM, DeepseekV4VLForCausalLM.
 """
 
 import logging
@@ -17,7 +17,7 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
-@_register_for("DeepseekV4ForCausalLM")
+@_register_for("DeepseekV4ForCausalLM", "DeepseekV4VLForCausalLM")
 def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     """DeepSeek V4 attention/page/window/MoE-runner defaults (from
     arg_groups/deepseek_v4_hook.py). The kv-cache dtype and NPU split-backend

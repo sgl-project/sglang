@@ -25,6 +25,7 @@ export const config = {
   variants: [
     { id: "flash", label: "Flash", subtitle: "284B" },
     { id: "flash-official", label: "Flash Official", subtitle: "284B · 0731" },
+    { id: "flash-vision", label: "Flash Vision", subtitle: "284B · multimodal" },
     { id: "pro",   label: "Pro",   subtitle: "1.6T" },
     { id: "pro-official", label: "Pro Official", subtitle: "1.6T · 0813" },
   ],
@@ -49,6 +50,7 @@ export const config = {
     "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|nvfp4": "nvidia/DeepSeek-V4-Flash-NVFP4",
     "flash-official|fp4": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "flash-vision|fp4": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
     "pro|fp4":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|fp8":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|nvfp4": "nvidia/DeepSeek-V4-Pro-NVFP4",
@@ -1107,6 +1109,57 @@ sgl-eval run aime25 \\
     // ====================================================================
     // GB300 + FP4
     // ====================================================================
+    // Flash Vision is multimodal: the vision tower runs replicated on every
+    // rank outside the CUDA graph, and images are prefilled with bidirectional
+    // attention inside each image's token block.
+    {
+      match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.90",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--mem-fraction-static 0.85",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     {
       match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,

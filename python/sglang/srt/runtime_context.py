@@ -606,6 +606,11 @@ class ForwardFlags:
         "fuse_mlp_allreduce": False,
         "mlp_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,
+        # This forward's token batch may contain image tokens, which route to
+        # routed experts through a second bias (DeepSeek-V4-Vision). Host-side
+        # so the MoE can keep its fused single-bias top-k for text-only batches
+        # without a device sync on the mask.
+        "vision_expert_routing": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, communicator,
@@ -620,6 +625,7 @@ class ForwardFlags:
             "fuse_mlp_allreduce",
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
+            "vision_expert_routing",
         }
     )
 

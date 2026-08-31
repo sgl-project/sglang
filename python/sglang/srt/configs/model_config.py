@@ -159,12 +159,29 @@ def is_qwen3_5(config) -> bool:
     )
 
 
+DEEPSEEK_V4_MODEL_ARCHS = (
+    "DeepseekV4ForCausalLM",
+    "DeepseekV4VLForCausalLM",
+    "DeepseekV4ForCausalLMNextN",
+    "DeepseekV4ForCausalLMDSpark",
+)
+
+
 def is_deepseek_v4(config) -> bool:
-    return _hf_arch(config) in (
-        "DeepseekV4ForCausalLM",
-        "DeepseekV4ForCausalLMNextN",
-        "DeepseekV4ForCausalLMDSpark",
-    )
+    return _hf_arch(config) in DEEPSEEK_V4_MODEL_ARCHS
+
+
+def is_deepseek_v4_vision(config) -> bool:
+    """A DeepSeek-V4 checkpoint that also carries the vision tower.
+
+    Checked on the config rather than the architecture string, because the
+    checkpoint declares plain ``DeepseekV4ForCausalLM`` and only the
+    ``vision_*`` fields distinguish it. ``ModelConfig`` rewrites the
+    architecture to ``DeepseekV4VLForCausalLM`` once, on this test, and then
+    backfills ``vision_n_layers=0`` on the checkpoints that lack it -- so the
+    default here is only for the one call that runs before that backfill.
+    """
+    return is_deepseek_v4(config) and getattr(config, "vision_n_layers", 0) > 0
 
 
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
@@ -441,6 +458,25 @@ class ModelConfig:
             if n_group is not None:
                 self.hf_config.topk_group = n_group
 
+            # DeepSeek-V4-Flash-Vision ships as plain "DeepseekV4ForCausalLM"
+            # and is told apart only by its vision_* fields. Rewrite the
+            # architecture once, here, so the model registry, the multimodal
+            # arch lists and the processor registry all agree. Draft
+            # architectures are already resolved by _config_draft_model above
+            # and carry no tower of their own.
+            if is_deepseek_v4_vision(self.hf_config) and self.hf_config.architectures[
+                0
+            ] == ("DeepseekV4ForCausalLM"):
+                self.hf_config.architectures[0] = "DeepseekV4VLForCausalLM"
+                logger.info(
+                    "Detected the DeepSeek-V4 vision tower; loading arch "
+                    "DeepseekV4VLForCausalLM."
+                )
+            # Give every DeepSeek-V4 config the field, so downstream code can
+            # read it directly whether or not the checkpoint has a tower.
+            if not hasattr(self.hf_config, "vision_n_layers"):
+                self.hf_config.vision_n_layers = 0
+
         # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
         self.nvfp4_moe_meta: Optional[dict] = None
         hybrid_quant_cfg = _quant_config_to_dict(
@@ -503,9 +539,11 @@ class ModelConfig:
         # vision_config to None, which presence alone would read as image-capable
         # (MuseGlimmerConfig's text-only layouts are one such case).
         # TODO: requires further polishing
-        self.is_image_understandable_model = (
-            self.is_multimodal
-            and getattr(self.hf_config, "vision_config", None) is not None
+        self.is_image_understandable_model = self.is_multimodal and (
+            getattr(self.hf_config, "vision_config", None) is not None
+            # DeepSeek-V4-Vision keeps its tower's fields flat in config.json
+            # rather than under a vision_config sub-config.
+            or is_deepseek_v4_vision(self.hf_config)
         )
 
         # Models expose audio_config at different nesting levels:
@@ -798,13 +836,7 @@ class ModelConfig:
             logger.debug(f"Hybrid swa model: {self.hf_config.architectures=}")
 
             self.is_deepseek_v4_arch = any(
-                arch
-                in [
-                    "DeepseekV4ForCausalLM",
-                    "DeepseekV4ForCausalLMNextN",
-                    "DeepseekV4ForCausalLMDSpark",
-                ]
-                for arch in self.hf_config.architectures
+                arch in DEEPSEEK_V4_MODEL_ARCHS for arch in self.hf_config.architectures
             )
 
             if not self.is_deepseek_v4_arch:
@@ -963,10 +995,8 @@ class ModelConfig:
             )
             # In transformers v5, rope_scaling is just rope_parameters.
             self._init_mla_scaling(self.hf_text_config.rope_scaling)
-        elif (
-            "DeepseekV4ForCausalLM" in self.hf_config.architectures
-            or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
-            or "DeepseekV4ForCausalLMDSpark" in self.hf_config.architectures
+        elif any(
+            arch in DEEPSEEK_V4_MODEL_ARCHS for arch in self.hf_config.architectures
         ):
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
@@ -1886,6 +1916,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 multimodal_model_archs = [
     "CLIPModel",
     "Cohere2VisionForConditionalGeneration",
+    "DeepseekV4VLForCausalLM",
     "DeepseekVL2ForCausalLM",
     "Ernie4_5_VLMoeForConditionalGeneration",
     "MiniMaxM3SparseForConditionalGeneration",
@@ -1958,9 +1989,7 @@ multimodal_model_archs = [
 ]
 
 piecewise_cuda_graph_disabled_model_archs = [
-    "DeepseekV4ForCausalLM",
-    "DeepseekV4ForCausalLMNextN",
-    "DeepseekV4ForCausalLMDSpark",
+    *DEEPSEEK_V4_MODEL_ARCHS,
     "Qwen3NextForCausalLM",
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",
@@ -2119,9 +2148,7 @@ def is_hybrid_swa_model(
 
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
-        "DeepseekV4ForCausalLM",
-        "DeepseekV4ForCausalLMNextN",
-        "DeepseekV4ForCausalLMDSpark",
+        *DEEPSEEK_V4_MODEL_ARCHS,
         *SWA_SINK_ARCHS,
         *MIMO_V2_MODEL_ARCHS,
         "MiMoV2MTP",

@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 CP_DECODE_ATTN_TP_SUPPORTED_ARCHS: Tuple[str, ...] = (
     # DeepSeek-V4
     "DeepseekV4ForCausalLM",
+    "DeepseekV4VLForCausalLM",
     "DeepseekV4ForCausalLMNextN",
     "DeepseekV4ForCausalLMDSpark",
     # GLM-5.x (inherits DeepseekV2 attention; DSA path)

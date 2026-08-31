@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import msgspec
 import torch
@@ -461,6 +461,214 @@ def build_causal_swa_page_indices(
     return torch.nn.functional.pad(
         swa_indices, (0, padded_width - swa_window), value=-1
     )
+
+
+def compute_image_visible_spans(
+    *,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    vocab_size: int,
+    compress_pad_to: int,
+    max_image_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-token visible counts inside each image block, for both directions.
+
+    DeepSeek-V4-Flash-Vision attends bidirectionally within one image's span --
+    the ``[IMAGE_START, IMAGE_END]`` range of its token block -- while the rest
+    of the sequence stays causal. This returns, per query token, how many tokens
+    of its own span sit to its left and to its right; both are 0 for a token
+    outside any span, which leaves it on the plain sliding window.
+
+    A block is a maximal run of multimodal placeholder tokens (their ids are pad
+    sentinels above ``vocab_size``) inside one request. Its leading
+    ``compress_pad_to`` alignment padding is *not* part of the span: the block
+    is laid out as ``pad* IMAGE_START ... IMAGE_END``, with the pad count fixed
+    by the block's own start position, so the span starts at a computable offset
+    into the run.
+
+    Both tensors are ``int32[num_tokens]``.
+    """
+    device = input_ids.device
+    num_tokens = input_ids.shape[0]
+    idx = torch.arange(num_tokens, dtype=torch.int32, device=device)
+    positions = positions.to(torch.int32)
+    is_image = input_ids >= vocab_size
+
+    # A run breaks on a non-image token and at a request boundary, which shows
+    # up as a position that does not continue the previous token's.
+    prev_is_image = torch.cat(
+        [torch.zeros(1, dtype=torch.bool, device=device), is_image[:-1]]
+    )
+    prev_pos = torch.cat([positions.new_zeros(1), positions[:-1]])
+    starts_run = is_image & (~prev_is_image | (positions != prev_pos + 1))
+    next_is_image = torch.cat(
+        [is_image[1:], torch.zeros(1, dtype=torch.bool, device=device)]
+    )
+    next_pos = torch.cat([positions[1:], positions.new_zeros(1)])
+    ends_run = is_image & (~next_is_image | (next_pos != positions + 1))
+
+    run_start = torch.where(starts_run, idx, idx.new_full((), -1)).cummax(0)[0]
+    run_end = (
+        torch.where(ends_run, idx, idx.new_full((), num_tokens))
+        .flip(0)
+        .cummin(0)[0]
+        .flip(0)
+    )
+
+    block_start_pos = positions[run_start.clamp(min=0).to(torch.long)]
+    compress_pad = compress_pad_to - 1 - block_start_pos % compress_pad_to
+    span_start = run_start + compress_pad
+    in_span = is_image & (idx >= span_start)
+
+    left = torch.where(in_span, idx - span_start, idx.new_zeros(()))
+    right = torch.where(in_span, run_end - idx, idx.new_zeros(()))
+    return (
+        left.clamp_(min=0, max=max_image_tokens - 1),
+        right.clamp_(min=0, max=max_image_tokens),
+    )
+
+
+class BuildVisionSwaPageIndices:
+    """The sliding-window gather, widened where an image span is visible.
+
+    Same contract as :class:`BuildCausalSwaPageIndices` -- a per-query list of
+    SWA-pool slots plus the number of leading entries that are valid -- except
+    that a query inside an image span reaches back to the span's start and
+    forward to its end. The gathered range stays contiguous in position, so the
+    valid entries stay packed at the front.
+    """
+
+    @classmethod
+    def execute(cls, *args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+        if _inputs_on_cuda(*args, **kwargs):
+            return cls.triton(*args, **kwargs)
+        return cls.torch(*args, **kwargs)
+
+    @classmethod
+    def torch(cls, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+        return build_vision_swa_page_indices(**kwargs)
+
+    @classmethod
+    def triton(cls, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+        return build_vision_swa_page_indices_triton(**kwargs)
+
+
+def _vision_window_extent(
+    seq_lens_casual: torch.Tensor,
+    visible_left: torch.Tensor,
+    visible_right: torch.Tensor,
+    swa_window: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """First visible position per query, and how many positions are visible."""
+    pos = seq_lens_casual.to(torch.int32) - 1
+    back = torch.clamp(visible_left, min=swa_window - 1)
+    back = torch.minimum(back, pos)
+    return pos - back, back + 1 + visible_right
+
+
+def build_vision_swa_page_indices(
+    *,
+    req_to_token: torch.Tensor,
+    full_to_swa_mapping: torch.Tensor,
+    req_pool_indices_repeated: torch.Tensor,
+    seq_lens_casual: torch.Tensor,
+    visible_left: torch.Tensor,
+    visible_right: torch.Tensor,
+    swa_window: int,
+    width: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    device = seq_lens_casual.device
+    first_pos, lengths = _vision_window_extent(
+        seq_lens_casual, visible_left, visible_right, swa_window
+    )
+    offsets = first_pos.unsqueeze(1) + torch.arange(
+        width, dtype=torch.int32, device=device
+    ).unsqueeze(0)
+    valid = torch.arange(width, dtype=torch.int32, device=device).unsqueeze(
+        0
+    ) < lengths.unsqueeze(1)
+    raw_indices = req_to_token[
+        req_pool_indices_repeated[:, None].to(torch.long),
+        torch.where(valid, offsets, offsets.new_zeros(())).to(torch.long),
+    ]
+    swa_indices = full_to_swa_mapping[raw_indices.to(torch.long)].to(torch.int32)
+    # -1 past topk_length, matching the triton path: the sentinel the attention
+    # kernel's index contract documents, rather than whatever the mapping holds
+    # for the slot the masked gather happened to read.
+    swa_indices = torch.where(valid, swa_indices, swa_indices.new_full((), -1))
+    return swa_indices, lengths
+
+
+@triton.jit
+def _vision_swa_page_indices_kernel(
+    req_to_token_ptr,
+    full_to_swa_ptr,
+    req_pool_ptr,
+    seq_lens_ptr,
+    visible_left_ptr,
+    visible_right_ptr,
+    out_ptr,
+    lengths_ptr,
+    rt_stride,
+    swa_window,
+    width,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(0)
+    pos = tl.load(seq_lens_ptr + row).to(tl.int64) - 1
+    left = tl.load(visible_left_ptr + row).to(tl.int64)
+    right = tl.load(visible_right_ptr + row).to(tl.int64)
+    back = tl.minimum(tl.maximum(left, swa_window - 1), pos)
+    first_pos = pos - back
+    length = back + 1 + right
+    tl.store(lengths_ptr + row, length.to(tl.int32))
+
+    rp = tl.load(req_pool_ptr + row).to(tl.int64)
+    base = req_to_token_ptr + rp * rt_stride
+    out_base = out_ptr + row.to(tl.int64) * width
+
+    for k0 in range(0, width, BLOCK_K):
+        k = k0 + tl.arange(0, BLOCK_K)
+        kmask = k < width
+        off = first_pos + k.to(tl.int64)
+        valid = (k.to(tl.int64) < length) & kmask
+        full_loc = tl.load(base + tl.where(valid, off, 0), mask=valid, other=-1).to(
+            tl.int64
+        )
+        swa = tl.load(full_to_swa_ptr + full_loc, mask=valid, other=-1).to(tl.int32)
+        tl.store(out_base + k, tl.where(valid, swa, -1), mask=kmask)
+
+
+def build_vision_swa_page_indices_triton(
+    *,
+    req_to_token: torch.Tensor,
+    full_to_swa_mapping: torch.Tensor,
+    req_pool_indices_repeated: torch.Tensor,
+    seq_lens_casual: torch.Tensor,
+    visible_left: torch.Tensor,
+    visible_right: torch.Tensor,
+    swa_window: int,
+    width: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    num_qo_tokens = seq_lens_casual.size(0)
+    device = seq_lens_casual.device
+    out = torch.empty((num_qo_tokens, width), dtype=torch.int32, device=device)
+    lengths = torch.empty(num_qo_tokens, dtype=torch.int32, device=device)
+    _vision_swa_page_indices_kernel[(num_qo_tokens,)](
+        req_to_token,
+        full_to_swa_mapping,
+        req_pool_indices_repeated,
+        seq_lens_casual,
+        visible_left,
+        visible_right,
+        out,
+        lengths,
+        req_to_token.stride(0),
+        swa_window,
+        width,
+        BLOCK_K=256,
+    )
+    return out, lengths
 
 
 @triton.jit

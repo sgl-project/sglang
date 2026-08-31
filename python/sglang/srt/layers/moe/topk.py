@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 from dataclasses import dataclass
@@ -678,6 +679,38 @@ class TopK(BaseFusedOp):
                 )
         return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
+    def forward_per_token_correction_bias(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        correction_bias: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
+        """Route with a ``[num_tokens, num_experts]`` bias instead of the layer's.
+
+        DeepSeek-V4-Vision picks between two routed-expert biases per token. No
+        fused top-k kernel accepts a per-token bias, so this forces the torch
+        selection path and its STANDARD output; the caller reaches for it only
+        on batches that carry image tokens.
+        """
+        assert correction_bias.dim() == 2, correction_bias.shape
+        topk_output = select_experts(
+            hidden_states=hidden_states,
+            layer_id=self.layer_id,
+            router_logits=router_logits,
+            topk_config=dataclasses.replace(
+                self.topk_config,
+                correction_bias=correction_bias,
+                output_format=TopKOutputFormat.STANDARD,
+                torch_native=False,
+            ),
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
+        return self._apply_waterfill(topk_output, hidden_states.shape[0])
+
     def forward_cpu(
         self,
         hidden_states: torch.Tensor,
@@ -1270,6 +1303,71 @@ def kimi_k2_biased_topk_impl(
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     return topk_weights, topk_ids
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def biased_topk_per_token_bias_impl(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    scoring_func: str = "sqrtsoftplus",
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+):
+    """Biased top-k where ``correction_bias`` is per token, ``[num_tokens, E]``.
+
+    DeepSeek-V4-Vision carries two routed-expert biases and picks between them
+    per token (image tokens take ``e_score_correction_bias_vl``). Every fused
+    biased-topk kernel takes a single ``[E]`` bias, so batches that actually
+    contain image tokens come through here; text-only batches keep the fused
+    path. Otherwise identical to :func:`biased_topk_impl`, including that the
+    bias shifts selection only while the weights come from unbiased scores.
+    """
+    if scoring_func == "sigmoid":
+        scores = gating_output.sigmoid()
+    elif scoring_func == "sqrtsoftplus":
+        scores = torch.nn.functional.softplus(gating_output).sqrt()
+    else:
+        raise ValueError(
+            f"per-token correction bias does not support scoring_func={scoring_func!r}"
+        )
+
+    num_token, num_experts = scores.shape
+    scores_for_choice = scores + correction_bias
+    _, topk_ids = torch.topk(
+        scores_for_choice,
+        k=topk,
+        dim=-1,
+        sorted=(True if num_fused_shared_experts > 0 else False),
+    )
+    topk_weights = scores.gather(1, topk_ids)
+
+    if num_fused_shared_experts:
+        topk_ids[:, -1] = torch.randint(
+            low=num_experts,
+            high=num_experts + num_fused_shared_experts,
+            size=(num_token,),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        if routed_scaling_factor is not None:
+            topk_weights[:, -1] = (
+                topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
+            )
+
+    if renormalize:
+        topk_weights_sum = (
+            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
+            if num_fused_shared_experts == 0
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
+        )
+        topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
+        if apply_routed_scaling_factor_on_output:
+            topk_weights *= routed_scaling_factor
+
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
@@ -2329,7 +2427,23 @@ def select_experts(
         if has_per_rank_fused_shared_slots(num_fused_shared_experts)
         else num_fused_shared_experts
     )
-    if use_grouped_topk:
+    if correction_bias is not None and correction_bias.dim() == 2:
+        # Per-token routing bias: DeepSeek-V4-Vision only, and only on batches
+        # that carry image tokens.
+        assert (
+            not use_grouped_topk and custom_routing_function is None
+        ), "a per-token correction bias is only supported on the ungrouped top-k path"
+        topk_weights, topk_ids = biased_topk_per_token_bias_impl(
+            gating_output=router_logits,
+            correction_bias=correction_bias,
+            topk=num_routed_topk if _use_aiter else top_k,
+            renormalize=renormalize,
+            scoring_func=scoring_func,
+            num_fused_shared_experts=num_fused_shared_experts_for_gate,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
+    elif use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
         if correction_bias is None:

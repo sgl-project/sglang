@@ -43,9 +43,15 @@ class HashTopK(nn.Module):
         routed_scaling_factor=1.5,
         apply_routed_scaling_factor_on_output=False,
         layer_id: Optional[int] = None,
+        correction_bias_vl: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
+        # DeepSeek-V4-Vision: image tokens do not hash-route at all -- they take
+        # the top-k of scores biased by this second routed-expert bias. Held as a
+        # plain attribute (not a submodule parameter) the way TopK holds the text
+        # bias: the owner is the gate.
+        self.correction_bias_vl = correction_bias_vl
 
         self.enable_waterfill = (
             num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
@@ -210,6 +216,46 @@ class HashTopK(nn.Module):
         else:
             return self._forward_torch(router_logits, input_ids)
 
+    def _scores(self, router_logits: torch.Tensor) -> torch.Tensor:
+        if self.score_func == "softmax":
+            return router_logits.softmax(dim=-1)
+        if self.score_func == "sigmoid":
+            return router_logits.sigmoid()
+        return torch.nn.functional.softplus(router_logits).sqrt()
+
+    def _route_image_tokens(
+        self,
+        router_logits: torch.Tensor,
+        image_mask: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ):
+        """Replace the hash routing of image-token rows with vision-biased top-k.
+
+        Only the routed columns are replaced. A fused shared-expert column, when
+        present, holds ``1 / routed_scaling_factor`` for every row once the
+        routed weights are renormalized, so it needs no per-row fixup.
+        """
+        assert self.correction_bias_vl is not None
+        scores = self._scores(router_logits)
+        num_routed = self.topk - self.num_fused_shared_experts
+        vl_ids = (scores + self.correction_bias_vl.to(scores.dtype)).topk(
+            num_routed, dim=-1, sorted=False
+        )[1]
+        vl_weights = scores.gather(1, vl_ids)
+        if self.score_func != "softmax":
+            vl_weights = vl_weights / vl_weights.sum(dim=-1, keepdim=True)
+
+        mask = image_mask.unsqueeze(-1)
+        routed = slice(None, num_routed)
+        topk_ids[:, routed] = torch.where(
+            mask, vl_ids.to(topk_ids.dtype), topk_ids[:, routed]
+        )
+        topk_weights[:, routed] = torch.where(
+            mask, vl_weights.to(topk_weights.dtype), topk_weights[:, routed]
+        )
+        return topk_weights, topk_ids
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -217,10 +263,18 @@ class HashTopK(nn.Module):
         input_ids: torch.Tensor,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        image_mask: Optional[torch.Tensor] = None,
     ):
         assert (
             input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0]
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
+
+        if image_mask is not None:
+            # Image-token ids are multimodal pad sentinels far above the
+            # vocabulary; the table lookup would read out of bounds. Their rows
+            # are overwritten by _route_image_tokens below, so any in-range
+            # index will do.
+            input_ids = torch.where(image_mask, 0, input_ids)
 
         if _is_xpu:
             topk_weights, topk_ids = self._forward_xpu(router_logits, input_ids)
@@ -237,6 +291,10 @@ class HashTopK(nn.Module):
             )
         else:
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
+        if image_mask is not None:
+            topk_weights, topk_ids = self._route_image_tokens(
+                router_logits, image_mask, topk_weights, topk_ids
+            )
         if _is_hip or _is_npu:
             topk_weights = topk_weights.to(torch.float32)
 

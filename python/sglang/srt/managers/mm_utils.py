@@ -624,6 +624,123 @@ def _embed_mm_inputs_with_split(
     return input_embeds, other_info
 
 
+def compute_mm_input_embeds(
+    input_ids: torch.Tensor,
+    forward_batch: ForwardBatch,
+    embed_tokens: nn.Module,
+    multimodal_model: Optional[nn.Module] = None,
+    data_embedding_funcs: Dict[Modality, DataEmbeddingFunc] = None,
+    placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
+    use_deepstack: Dict[Modality, bool] = {},
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Build the language model's input embeddings for a (possibly) mm batch.
+
+    The embedding half of :func:`general_mm_embed_routine`, split out for models
+    whose language-model call needs more than ``(input_embeds, forward_batch)``
+    -- DeepSeek-V4's hash-routed MoE layers, for instance, also route on
+    ``input_ids``, so they cannot go through the routine's ``input_ids=None``
+    language-model call.
+
+    ``input_ids`` is clamped in place at multimodal positions (they hold pad
+    hashes far above the vocabulary); pass a copy if the caller still needs the
+    sentinels afterwards.
+
+    Returns ``(input_embeds, extra_language_model_kwargs)``.
+    """
+    extra_kwargs: Dict[str, Any] = {}
+    if (
+        not forward_batch.forward_mode.is_decode()
+        and not forward_batch.forward_mode.is_target_verify()
+        and forward_batch.contains_mm_inputs()
+    ):
+        mm_inputs_list = [
+            mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
+        ]
+        extend_prefix_lens = [
+            prefix_len
+            for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
+            if forward_batch.mm_inputs[i] is not None
+        ]
+        extend_seq_lens = [
+            seq_len
+            for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
+            if forward_batch.mm_inputs[i] is not None
+        ]
+        server_args = get_server_args()
+        # Makes VLM profiles directly attributable: this range includes
+        # encoder/ViT execution and multimodal feature placement, while
+        # the language model range below excludes both.
+        with torch.profiler.record_function("sglang.vlm.mm_embedding"):
+            if server_args and get_disagg().enable_adaptive_dispatch_to_encoder:
+                # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
+                input_embeds, other_info = _embed_mm_inputs_with_split(
+                    mm_inputs_list=mm_inputs_list,
+                    extend_prefix_lens=extend_prefix_lens,
+                    extend_seq_lens=extend_seq_lens,
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    input_embedding=embed_tokens,
+                    multimodal_model=multimodal_model,
+                    data_embedding_func_mapping=data_embedding_funcs,
+                    placeholder_tokens=placeholder_tokens,
+                    use_deepstack=use_deepstack,
+                )
+            else:
+                input_embeds, other_info = embed_mm_inputs(
+                    mm_inputs_list=mm_inputs_list,
+                    extend_prefix_lens=extend_prefix_lens,
+                    extend_seq_lens=extend_seq_lens,
+                    input_ids=input_ids,
+                    input_embedding=embed_tokens,
+                    multimodal_model=multimodal_model,
+                    data_embedding_func_mapping=data_embedding_funcs,
+                    placeholder_tokens=placeholder_tokens,
+                    use_deepstack=use_deepstack,
+                )
+
+        # add for qwen3_vl deepstack
+        if use_deepstack:
+            extra_kwargs["input_deepstack_embeds"] = other_info[
+                "input_deepstack_embeds"
+            ]
+        # Offload GPU features to CPU instead of discarding them to balance memory
+        # efficiency and data persistence.
+        # In chunked-prefill, a request is processed across multiple batches, and
+        # the original multimodal data must remain accessible until the entire
+        # prefill phase is complete. Since the multimodal embedding cache is
+        # best-effort, offloading to CPU ensures we have a reliable fallback
+        # if a cache miss occurs in subsequent chunks, while still freeing up
+        # critical GPU memory.
+        if mm_inputs_list:
+            for mm_input_obj in mm_inputs_list:
+                if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
+                    for mm_item in mm_input_obj.mm_items:
+                        feature = getattr(mm_item, "feature", None)
+                        if isinstance(feature, torch.Tensor) and feature.is_cuda:
+                            mm_item.feature = feature.to("cpu", non_blocking=True)
+                        if get_disagg().language_only:
+                            precomputed_embeddings = getattr(
+                                mm_item, "precomputed_embeddings", None
+                            )
+                            if (
+                                isinstance(precomputed_embeddings, torch.Tensor)
+                                and precomputed_embeddings.is_cuda
+                                and not mm_item.keep_device_embedding
+                            ):
+                                mm_item.precomputed_embeddings = (
+                                    precomputed_embeddings.to("cpu", non_blocking=True)
+                                )
+        forward_batch.mm_inputs = None
+        forward_batch.mm_input_embeds = input_embeds
+    else:
+        input_embeds = embed_tokens(input_ids)
+    # Copy to pre-allocated buffer if available (for CUDA graph address stability)
+    if forward_batch.input_embeds is not None:
+        forward_batch.input_embeds.copy_(input_embeds)
+        input_embeds = forward_batch.input_embeds
+    return input_embeds, extra_kwargs
+
+
 def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -652,96 +769,16 @@ def general_mm_embed_routine(
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
     if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
-        if (
-            not forward_batch.forward_mode.is_decode()
-            and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.contains_mm_inputs()
-        ):
-            mm_inputs_list = [
-                mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
-            ]
-            extend_prefix_lens = [
-                prefix_len
-                for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
-                if forward_batch.mm_inputs[i] is not None
-            ]
-            extend_seq_lens = [
-                seq_len
-                for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
-                if forward_batch.mm_inputs[i] is not None
-            ]
-            server_args = get_server_args()
-            # Makes VLM profiles directly attributable: this range includes
-            # encoder/ViT execution and multimodal feature placement, while
-            # the language model range below excludes both.
-            with torch.profiler.record_function("sglang.vlm.mm_embedding"):
-                if server_args and get_disagg().enable_adaptive_dispatch_to_encoder:
-                    # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
-                    input_embeds, other_info = _embed_mm_inputs_with_split(
-                        mm_inputs_list=mm_inputs_list,
-                        extend_prefix_lens=extend_prefix_lens,
-                        extend_seq_lens=extend_seq_lens,
-                        input_ids=input_ids,
-                        forward_batch=forward_batch,
-                        input_embedding=embed_tokens,
-                        multimodal_model=multimodal_model,
-                        data_embedding_func_mapping=data_embedding_funcs,
-                        placeholder_tokens=placeholder_tokens,
-                        use_deepstack=use_deepstack,
-                    )
-                else:
-                    input_embeds, other_info = embed_mm_inputs(
-                        mm_inputs_list=mm_inputs_list,
-                        extend_prefix_lens=extend_prefix_lens,
-                        extend_seq_lens=extend_seq_lens,
-                        input_ids=input_ids,
-                        input_embedding=embed_tokens,
-                        multimodal_model=multimodal_model,
-                        data_embedding_func_mapping=data_embedding_funcs,
-                        placeholder_tokens=placeholder_tokens,
-                        use_deepstack=use_deepstack,
-                    )
-
-            # add for qwen3_vl deepstack
-            if use_deepstack:
-                kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
-            # Offload GPU features to CPU instead of discarding them to balance memory
-            # efficiency and data persistence.
-            # In chunked-prefill, a request is processed across multiple batches, and
-            # the original multimodal data must remain accessible until the entire
-            # prefill phase is complete. Since the multimodal embedding cache is
-            # best-effort, offloading to CPU ensures we have a reliable fallback
-            # if a cache miss occurs in subsequent chunks, while still freeing up
-            # critical GPU memory.
-            if mm_inputs_list:
-                for mm_input_obj in mm_inputs_list:
-                    if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
-                        for mm_item in mm_input_obj.mm_items:
-                            feature = getattr(mm_item, "feature", None)
-                            if isinstance(feature, torch.Tensor) and feature.is_cuda:
-                                mm_item.feature = feature.to("cpu", non_blocking=True)
-                            if get_disagg().language_only:
-                                precomputed_embeddings = getattr(
-                                    mm_item, "precomputed_embeddings", None
-                                )
-                                if (
-                                    isinstance(precomputed_embeddings, torch.Tensor)
-                                    and precomputed_embeddings.is_cuda
-                                    and not mm_item.keep_device_embedding
-                                ):
-                                    mm_item.precomputed_embeddings = (
-                                        precomputed_embeddings.to(
-                                            "cpu", non_blocking=True
-                                        )
-                                    )
-            forward_batch.mm_inputs = None
-            forward_batch.mm_input_embeds = input_embeds
-        else:
-            input_embeds = embed_tokens(input_ids)
-        # Copy to pre-allocated buffer if available (for CUDA graph address stability)
-        if forward_batch.input_embeds is not None:
-            forward_batch.input_embeds.copy_(input_embeds)
-            input_embeds = forward_batch.input_embeds
+        input_embeds, extra_kwargs = compute_mm_input_embeds(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            embed_tokens=embed_tokens,
+            multimodal_model=multimodal_model,
+            data_embedding_funcs=data_embedding_funcs,
+            placeholder_tokens=placeholder_tokens,
+            use_deepstack=use_deepstack,
+        )
+        kwargs.update(extra_kwargs)
     else:
         input_embeds = None
 

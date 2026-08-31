@@ -32,13 +32,16 @@ from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPContr
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
+    BuildVisionSwaPageIndices,
     ExpandPrefillCausally,
+    compute_image_visible_spans,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildBlockSeqLensCausal,
     BuildDsparkSwaPageIndices,
     ComputeDsparkWindowGather,
 )
+from sglang.srt.configs.model_config import is_deepseek_v4_vision
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -69,6 +72,7 @@ from sglang.srt.layers.attention.verify_mask import (
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.multimodal.deepseek_v4_vl_image_processing import COMPRESS_PAD_TO
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
@@ -82,7 +86,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import ceil_align, is_cuda, is_xpu
+from sglang.srt.utils import ceil_align, is_cuda, is_xpu, print_info_once
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -135,6 +139,10 @@ def _get_target_verify_bs(forward_batch: ForwardBatch) -> int:
 
 
 T = TypeVar("T", bound=Optional[torch.Tensor])
+
+
+def _round_up(value: int, multiples_of: int) -> int:
+    return -(-value // multiples_of) * multiples_of
 
 
 def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
@@ -618,6 +626,21 @@ class DeepseekV4AttnBackend(
             not _is_cuda or self.online_c128_mtp.enabled()
         )
 
+        # DeepSeek-V4-Flash-Vision attends bidirectionally inside an image's
+        # token block, so a query there gathers the plain window plus at most a
+        # whole block. 0 disables the widened path for text-only checkpoints.
+        hf_config = model_runner.model_config.hf_config
+        self.vision_max_image_tokens: int = (
+            hf_config.vision_max_n_token if is_deepseek_v4_vision(hf_config) else 0
+        )
+        self.vision_swa_width: int = (
+            _round_up(
+                SWA_WINDOW + self.vision_max_image_tokens, PAGE_INDEX_ALIGNED_SIZE
+            )
+            if self.vision_max_image_tokens
+            else 0
+        )
+
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
@@ -729,6 +752,48 @@ class DeepseekV4AttnBackend(
             out_cache_loc=out_cache_loc,
         )
 
+    def _image_visible_spans(
+        self,
+        forward_batch: Optional[ForwardBatch],
+        num_tokens: int,
+        padded_num_tokens: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Per-token image-span visibility for this prefill, or None.
+
+        None keeps the plain causal sliding window, which is what every
+        text-only batch wants. Returning spans widens the gather to
+        ``vision_swa_width`` for the whole batch, so it is worth paying only
+        when the batch actually carries image tokens.
+
+        Context parallelism is excluded: it round-robins tokens across ranks and
+        the metadata is reindexed afterwards, which would not line up with a
+        per-token mask derived from this rank's token order.
+        """
+        if not self.vision_max_image_tokens or forward_batch is None:
+            return None
+        if forward_batch.input_ids is None or is_cp_v2_active(forward_batch):
+            return None
+        if not forward_batch.contains_mm_inputs():
+            return None
+
+        input_ids = forward_batch.input_ids[:num_tokens]
+        positions = forward_batch.positions[:num_tokens]
+        visible_left, visible_right = compute_image_visible_spans(
+            input_ids=input_ids,
+            positions=positions,
+            vocab_size=self.model_runner.model_config.vocab_size,
+            compress_pad_to=COMPRESS_PAD_TO,
+            max_image_tokens=self.vision_max_image_tokens,
+        )
+        if padded_num_tokens > num_tokens:
+            visible_left = _pad_tensor_to_size(visible_left, padded_num_tokens)
+            visible_right = _pad_tensor_to_size(visible_right, padded_num_tokens)
+        print_info_once(
+            "DeepSeek-V4 vision attention: widening the sliding-window gather to "
+            f"{self.vision_swa_width} so image spans attend bidirectionally."
+        )
+        return visible_left, visible_right
+
     def init_forward_metadata_prefill(
         self,
         max_seq_len: int,
@@ -773,6 +838,9 @@ class DeepseekV4AttnBackend(
             is_prefill=True,
             dspark_block_size=dspark_block_size,
             num_tokens=num_tokens if cp_v2_active else None,
+            image_visible=self._image_visible_spans(
+                forward_batch, num_tokens, padded_num_tokens
+            ),
         )
         if cp_v2_active:
             core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
@@ -1761,6 +1829,7 @@ class DeepseekV4AttnBackend(
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
                 and not get_platform().is_sm120
+                and not self._uses_vision_window(core_attn_metadata)
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -1830,6 +1899,20 @@ class DeepseekV4AttnBackend(
             return o
 
         raise NotImplementedError("ragged attention")
+
+    def _uses_vision_window(self, core_attn_metadata: DSV4AttnMetadata) -> bool:
+        """Whether this chunk's SWA gather was widened for image spans.
+
+        The widened builder is the only one that emits exactly
+        ``vision_swa_width`` columns. The sparse-prefill path rebuilds its own
+        SWA gather from per-request geometry and so cannot express a per-token
+        widening; such a chunk takes flash_mla_with_kvcache, which consumes
+        swa_page_indices as built.
+        """
+        return (
+            self.vision_swa_width > 0
+            and core_attn_metadata.swa_page_indices.shape[-1] == self.vision_swa_width
+        )
 
     def _forward_prefill_sparse(
         self,
@@ -2194,6 +2277,7 @@ class DeepseekV4AttnBackend(
         is_prefill: bool = False,
         dspark_block_size: Optional[int] = None,
         num_tokens: Optional[int] = None,
+        image_visible: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
 
@@ -2223,6 +2307,18 @@ class DeepseekV4AttnBackend(
                 req_pool_indices_repeated=req_pool_indices_repeated,
                 out_loc=out_loc,
                 block_size=dspark_block_size,
+            )
+        elif image_visible is not None:
+            visible_left, visible_right = image_visible
+            swa_page_indices, swa_topk_lengths = BuildVisionSwaPageIndices.execute(
+                req_to_token=self.req_to_token,
+                full_to_swa_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
+                req_pool_indices_repeated=req_pool_indices_repeated,
+                seq_lens_casual=seq_lens_casual,
+                visible_left=visible_left,
+                visible_right=visible_right,
+                swa_window=SWA_WINDOW,
+                width=self.vision_swa_width,
             )
         else:
             swa_page_indices = BuildCausalSwaPageIndices.execute(

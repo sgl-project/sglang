@@ -704,6 +704,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",
         "DeepseekV4ForCausalLM",
+        "DeepseekV4VLForCausalLM",
         "Glm4MoeForCausalLM",
         "Glm4MoeLiteForCausalLM",
         "GlmMoeDsaForCausalLM",

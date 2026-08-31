@@ -1018,12 +1018,12 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         elif is_multimodal:
             # Standard VLMs render a text prompt (with placeholder strings) for the MM
-            # processor to tokenize. Inkling's custom encoder instead produces pre-rendered
-            # input_ids with single placeholders; pass those through so the MM processor
-            # expands them rather than re-tokenizing an empty prompt. Gated on the Inkling
-            # encoding spec so every other model keeps the standard text path.
+            # processor to tokenize. The Inkling and DeepSeek-V4 encoders instead produce
+            # pre-rendered input_ids with single placeholders; pass those through so the MM
+            # processor expands them rather than re-tokenizing an empty prompt. Gated on
+            # the encoding spec so every other model keeps the standard text path.
             if (
-                self.chat_encoding_spec == "inkling"
+                self.chat_encoding_spec in ("inkling", "dsv4")
                 and isinstance(processed_messages.prompt_ids, list)
                 and processed_messages.prompt_ids
             ):
@@ -1258,17 +1258,29 @@ class OpenAIServingChat(OpenAIServingBase):
             # dsv4/dsv32 encoding path
             messages = copy.deepcopy(messages)
 
-            # dsv4/dsv32 are text-only and consume string content; flatten
-            # OpenAI parts-list content here so the encoder sees a plain string.
+            # dsv32, and dsv4 without a vision tower, consume string content;
+            # flatten OpenAI parts-list content so the encoder sees a plain
+            # string. DeepSeek-V4-Vision instead keeps the parts list, so its
+            # encoder can put an image placeholder where each image was.
+            dsv4_multimodal = self.chat_encoding_spec == "dsv4" and is_multimodal
             for i, msg in enumerate(messages):
                 if isinstance(msg.get("content"), list):
                     messages[i] = process_content_for_template_format(
-                        msg, "string", [], [], [], []
+                        msg,
+                        "openai" if dsv4_multimodal else "string",
+                        image_data if dsv4_multimodal else [],
+                        video_data if dsv4_multimodal else [],
+                        audio_data if dsv4_multimodal else [],
+                        modalities if dsv4_multimodal else [],
                     )
 
             for msg in messages:
                 if msg.get("content") is None:
                     msg["content"] = ""
+                if dsv4_multimodal:
+                    # Already normalized above; a second pass would double-count
+                    # the images.
+                    continue
                 processed_msg = process_content_for_template_format(
                     msg,
                     template_content_format,
@@ -1310,6 +1322,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     encoding_dsv4.attach_task_to_last_user_message(
                         messages, request.task
                     )
+                if dsv4_multimodal:
+                    messages, num_images = encoding_dsv4.process_image_messages(
+                        messages
+                    )
+                    if num_images != len(image_data):
+                        raise ValueError(
+                            f"Found {num_images} image content block(s) but "
+                            f"{len(image_data)} image payload(s); they must "
+                            "correspond one to one."
+                        )
                 real_input = encoding_dsv4.encode_messages(
                     messages,
                     thinking_mode=thinking_mode,

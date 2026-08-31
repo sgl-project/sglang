@@ -24,6 +24,9 @@ dsml_token: str = "｜DSML｜"
 USER_SP_TOKEN = "<｜User｜>"
 ASSISTANT_SP_TOKEN = "<｜Assistant｜>"
 LATEST_REMINDER_SP_TOKEN = "<｜latest_reminder｜>"
+# One of these stands in for each image in the prompt; the multimodal processor
+# expands it into that image's block of placeholder tokens.
+IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
 
 # Task special tokens for internal classification tasks
 DS_TASK_SP_TOKENS = {
@@ -362,6 +365,8 @@ def render_message(
                 block_type = block.get("type")
                 if block_type == "text":
                     parts.append(block.get("text", ""))
+                elif block_type == "image":
+                    parts.append(IMAGE_PLACEHOLDER)
                 elif block_type == "tool_result":
                     tool_content = block.get("content", "")
                     if isinstance(tool_content, list):
@@ -369,6 +374,8 @@ def render_message(
                         for b in tool_content:
                             if b.get("type") == "text":
                                 text_parts.append(b.get("text", ""))
+                            elif b.get("type") == "image":
+                                text_parts.append(IMAGE_PLACEHOLDER)
                             else:
                                 text_parts.append(f"[Unsupported {b.get('type')}]")
                         tool_content = "\n\n".join(text_parts)
@@ -528,24 +535,22 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     }
                 )
         elif role == "user":
-            text_block = {"type": "text", "text": msg.get("content", "")}
+            # A multimodal turn arrives as content blocks; a text-only turn is
+            # wrapped into the one block shape the renderer consumes.
+            content_blocks = msg.get("content_blocks")
+            if content_blocks is None:
+                content_blocks = [{"type": "text", "text": msg.get("content", "")}]
             if (
                 merged
                 and merged[-1].get("role") == "user"
                 and "content_blocks" in merged[-1]
                 and merged[-1].get("task") is None
             ):
-                merged[-1]["content_blocks"].append(text_block)
+                merged[-1]["content_blocks"].extend(content_blocks)
             else:
-                new_msg = {
-                    "role": "user",
-                    "content": msg.get("content", ""),
-                    "content_blocks": [text_block],
-                }
-                # Preserve extra fields (task, wo_eos, mask, etc.)
-                for key in ("task", "wo_eos", "mask"):
-                    if key in msg:
-                        new_msg[key] = msg[key]
+                # Keep every message-level field (task, wo_eos, mask, tools, ...).
+                new_msg = msg
+                new_msg["content_blocks"] = content_blocks
                 merged.append(new_msg)
         else:
             merged.append(msg)
@@ -597,6 +602,86 @@ def sort_tool_results_by_call_order(
                 msg["content_blocks"] = new_blocks
 
     return messages
+
+
+# ============================================================
+# Multimodal Preprocessing
+# ============================================================
+
+
+def _replace_image_blocks(blocks: List[Any]) -> Tuple[List[Any], int]:
+    """Turn each image block into a placeholder text block, counting them.
+
+    The payloads are already out: ``serving_chat`` collected them into the
+    request's ``image_data`` and left ``{"type": "image"}`` markers behind, in
+    prompt order. Nested ``tool_result`` content is walked so an image returned
+    by a tool keeps its place in the prompt.
+    """
+    new_blocks: List[Any] = []
+    count = 0
+    for block in blocks:
+        if not isinstance(block, dict):
+            new_blocks.append(block)
+            continue
+        block_type = block.get("type")
+        if block_type in ("image", "image_url", "input_image"):
+            new_blocks.append({"type": "text", "text": IMAGE_PLACEHOLDER})
+            count += 1
+        elif block_type == "tool_result" and isinstance(block.get("content"), list):
+            block = copy.copy(block)
+            block["content"], nested = _replace_image_blocks(block["content"])
+            new_blocks.append(block)
+            count += nested
+        elif block_type == "text":
+            text = block.get("text") or ""
+            if IMAGE_PLACEHOLDER in text:
+                raise ValueError(
+                    f"Text content contains the image placeholder token "
+                    f"{IMAGE_PLACEHOLDER}; pass images as image content blocks."
+                )
+            new_blocks.append(block)
+        else:
+            new_blocks.append(block)
+    return new_blocks, count
+
+
+def process_image_messages(
+    messages: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Normalize image-carrying messages for the text renderer.
+
+    Returns the rewritten messages and the number of images they reference, so
+    the caller can check that against the request's image payloads.
+    """
+    processed: List[Dict[str, Any]] = []
+    total = 0
+    for msg in messages:
+        msg = copy.deepcopy(msg)
+        for field in ("content", "reasoning_content"):
+            value = msg.get(field)
+            if isinstance(value, str) and IMAGE_PLACEHOLDER in value:
+                raise ValueError(
+                    f"Message {field} contains the image placeholder token "
+                    f"{IMAGE_PLACEHOLDER}; pass images as image content blocks."
+                )
+
+        if isinstance(msg.get("content"), list) and "content_blocks" not in msg:
+            msg["content_blocks"] = msg.pop("content")
+
+        if msg.get("content_blocks"):
+            msg["content_blocks"], count = _replace_image_blocks(msg["content_blocks"])
+            total += count
+            if not isinstance(msg.get("content"), str):
+                # Roles the renderer reads as a flat string (system, assistant,
+                # developer) still need the placeholders inline.
+                msg["content"] = "\n\n".join(
+                    block.get("text", "")
+                    for block in msg["content_blocks"]
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+
+        processed.append(msg)
+    return processed, total
 
 
 # ============================================================
