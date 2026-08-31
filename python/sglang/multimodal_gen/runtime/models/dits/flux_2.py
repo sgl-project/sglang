@@ -28,6 +28,7 @@ from sglang.kernels.ops.diffusion import (
     fused_packed_silu_mul_bitexact,
     is_plain_layer_norm,
     residual_gate_add,
+    try_flux2_token_cat_nvfp4,
 )
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
@@ -58,6 +59,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
+    apply_nvfp4_gemm_prequantized,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -575,6 +578,15 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             quant_config=quant_config,
             prefix=f"{prefix}.to_out" if prefix else "to_out",
         )
+        self._enable_nvfp4_token_cat = False
+        capability = current_platform.get_device_capability()
+        if (
+            self.tp_size == 1
+            and capability is not None
+            and (capability.major, capability.minor) == (10, 3)
+            and isinstance(self.to_out.quant_method, ModelOptFp4LinearMethod)
+        ):
+            self._enable_nvfp4_token_cat = True
         if self.tp_size > 1:
             self._patch_to_out_weight_loader()
 
@@ -676,9 +688,25 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         # Handle the feedforward (FF) logic
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
 
-        # Concatenate and parallel output projection
-        hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
-        hidden_states, _ = self.to_out(hidden_states)
+        # Concatenate and parallel output projection. On SM103 NVFP4 the
+        # producer writes the concatenated packed values and swizzled scales
+        # directly, avoiding a full-width BF16 cat materialization.
+        output_shape = (*hidden_states.shape[:-1], self.out_dim)
+        packed = None
+        if self._enable_nvfp4_token_cat:
+            packed = try_flux2_token_cat_nvfp4(
+                hidden_states, mlp_hidden_states, self.to_out.input_scale_inv
+            )
+        if packed is None:
+            hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+            hidden_states, _ = self.to_out(hidden_states)
+        else:
+            hidden_states = apply_nvfp4_gemm_prequantized(
+                self.to_out,
+                *packed,
+                output_dtype=hidden_states.dtype,
+                bias=self.to_out.bias,
+            ).view(*output_shape)
 
         return hidden_states
 

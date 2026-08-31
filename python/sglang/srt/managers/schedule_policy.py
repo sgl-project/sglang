@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
-from collections import Counter, defaultdict
+from collections import Counter
 from contextlib import contextmanager
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
@@ -397,23 +397,8 @@ class SchedulePolicy:
         waiting_queue: List[Req], tree_cache: BasePrefixCache
     ) -> None:
         """Sorts the waiting queue based on a depth-first search weighting."""
-        last_node_to_reqs = defaultdict(list)
-        for req in waiting_queue:
-            last_node = tree_cache.resolve_node_handle(req.last_node)
-            last_node_to_reqs[last_node].append(req)
-
-        node_to_weight = defaultdict(int)
-        for node in last_node_to_reqs:
-            node_to_weight[node] = len(last_node_to_reqs[node])
-        SchedulePolicy._calc_weight(tree_cache.root_node, node_to_weight)
-
-        waiting_queue.clear()
-        SchedulePolicy._get_dfs_priority(
-            tree_cache.root_node,
-            node_to_weight,
-            last_node_to_reqs,
-            waiting_queue,
-        )
+        order = tree_cache.dfs_weight_order([req.last_node for req in waiting_queue])
+        waiting_queue[:] = [waiting_queue[index] for index in order]
 
     @staticmethod
     def _sort_by_longest_output(
@@ -481,27 +466,6 @@ class SchedulePolicy:
         if _ROUTING_KEY_POLICY_DEBUG_LOG:
             waiting_keys_after = [r.routing_key for r in waiting_queue]
             logger.info(f"waiting_keys_after={waiting_keys_after}")
-
-    @staticmethod
-    def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:
-        for child in cur_node.children.values():
-            SchedulePolicy._calc_weight(child, node_to_weight)
-            node_to_weight[cur_node] += node_to_weight[child]
-
-    @staticmethod
-    def _get_dfs_priority(
-        cur_node: TreeNode,
-        node_to_priority: Dict[TreeNode, int],
-        last_node_to_reqs: Dict[TreeNode, List[Req]],
-        q: List,
-    ) -> None:
-        children = [child for child in cur_node.children.values()]
-        children.sort(key=lambda x: -node_to_priority[x])
-        for child in children:
-            SchedulePolicy._get_dfs_priority(
-                child, node_to_priority, last_node_to_reqs, q
-            )
-        q.extend(last_node_to_reqs[cur_node])
 
 
 class AddReqResult(Enum):
