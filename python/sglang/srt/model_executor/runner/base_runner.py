@@ -327,6 +327,15 @@ class BaseRunner(ABC):
                 run_ctx=canary_run_ctx,
             )
 
+        # Before the context below opens: FlashInfer declines to profile a
+        # collective from inside an autotune context it did not open, and the
+        # first reduction of the dummy forward would land in exactly that.
+        from sglang.srt.distributed import get_tp_group
+
+        pcie_ipc_comm = get_tp_group().pcie_ipc_comm
+        if pcie_ipc_comm is not None:
+            pcie_ipc_comm.prepare(mr.model_config.hidden_size)
+
         run_flashinfer_autotune_forward(
             self.model_runner, forward_fn, run_lm_head=False
         )

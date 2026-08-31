@@ -96,14 +96,49 @@ def _decode_width() -> Optional[int]:
         return None
 
 
+def _tune_cache_path(world_size: int) -> Optional[str]:
+    """Where FlashInfer should persist the measured tactics.
+
+    Named explicitly rather than left to default, because the tuning run has to
+    write the file for the *next* server to reuse it; a workspace built without
+    a cache path measures every start.
+    """
+    try:
+        from flashinfer.comm.pcie_ipc_tuning import default_cache_path
+
+        return str(default_cache_path(world_size))
+    except (AttributeError, ImportError):
+        return None
+
+
+def _tune_batches(max_rows: int) -> tuple[int, ...]:
+    """Row counts to profile, bounded by what the workspace can actually take.
+
+    The autotuner measures one tactic per shape, so profiling rows the workspace
+    would reject is wasted startup time. Powers of two cover the captured decode
+    batches; ``max_rows`` is appended because it is the widest reduction served
+    and is not always a power of two.
+    """
+    rows = [r for r in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512) if r <= max_rows]
+    if max_rows >= 1 and max_rows not in rows:
+        rows.append(max_rows)
+    return tuple(rows)
+
+
 class PcieIpcCommunicator:
     """Adapter between ``GroupCoordinator`` and FlashInfer's PCIe-IPC all-reduce."""
 
-    def __init__(self, group: ProcessGroup, device: torch.device | int):
+    def __init__(
+        self,
+        group: ProcessGroup,
+        device: torch.device | int,
+        cpu_group: Optional[ProcessGroup] = None,
+    ):
         self.disabled = True
         self.max_numel = 0
         self._workspace: Optional[Any] = None
         self._bound_stream: Optional[torch.cuda.Stream] = None
+        self._cpu_group = cpu_group
 
         world_size = dist.get_world_size(group=group)
         if world_size not in _SUPPORTED_WORLD_SIZES:
@@ -152,16 +187,20 @@ class PcieIpcCommunicator:
         if self._build_failed:
             return False
 
+        hidden = inp.shape[-1]
         override = envs.SGLANG_PCIE_IPC_MAX_NUMEL.get()
         if override:
             max_numel = override
         else:
-            hidden = inp.shape[-1]
             max_numel = (_decode_width() or _FALLBACK_DECODE_WIDTH) * hidden
 
         try:
             self._workspace = self._workspace_cls(
-                group=self._group, max_numel=max_numel, dtype=torch.bfloat16
+                group=self._group,
+                max_numel=max_numel,
+                dtype=torch.bfloat16,
+                tune_batches=_tune_batches(max_numel // hidden),
+                tune_cache=_tune_cache_path(self._world_size),
             )
         except Exception as e:
             logger.warning(
@@ -180,9 +219,84 @@ class PcieIpcCommunicator:
             "hidden=%d)",
             self._world_size,
             max_numel,
-            inp.shape[-1],
+            hidden,
         )
+        self._tune(hidden)
         return True
+
+    def prepare(self, hidden: int) -> None:
+        """Build and measure ahead of the first reduction.
+
+        Call this from warmup, before any other autotuning starts. Left to the
+        first reduction instead, the build lands inside SGLang's own FlashInfer
+        autotune pass, and FlashInfer refuses to profile a collective from
+        inside an autotune context it did not open -- so the tuning call would
+        return having measured nothing.
+        """
+        if self.disabled or self._workspace is not None:
+            return
+        probe = torch.empty((1, hidden), dtype=torch.bfloat16, device=self._device)
+        self._ensure_workspace(probe)
+
+    def _tune(self, hidden: int) -> None:
+        """Measure the launch tactics for this workspace's shapes.
+
+        Without this the kernels run FlashInfer's seed policy, and ``supports``
+        answers from that policy rather than from measurements on this host.
+        Results persist to FlashInfer's cache, so only the first server pays.
+        """
+        from flashinfer.autotuner import AutoTuner
+
+        if AutoTuner.get().is_tuning_mode:
+            # FlashInfer checks the *installed* autotune process group, which
+            # belongs to whoever opened the enclosing context, so it declines to
+            # profile and the call would measure nothing. Say so rather than
+            # report a tuning that did not happen.
+            logger.warning(
+                "FlashInfer PCIe-IPC all-reduce reached its first reduction inside "
+                "another autotune context; skipping autotune and keeping the seed "
+                "policy. Call PcieIpcCommunicator.prepare() from warmup to tune."
+            )
+            return
+        if self._cpu_group is None:
+            logger.warning(
+                "FlashInfer PCIe-IPC all-reduce has no host group to autotune on; "
+                "running FlashInfer's seed policy instead of measured tactics."
+            )
+            return
+        if torch.cuda.is_current_stream_capturing():
+            logger.warning(
+                "FlashInfer PCIe-IPC all-reduce reached its first reduction inside "
+                "a graph capture; skipping autotune and keeping the seed policy."
+            )
+            return
+        try:
+            tuned = self._workspace.tune(
+                [hidden], dtype=torch.bfloat16, tune_group=self._cpu_group
+            )
+        except Exception as e:
+            logger.warning(
+                "FlashInfer PCIe-IPC autotune failed (%s); keeping the seed policy.",
+                e,
+            )
+            return
+        # Report what tune() covered, not that it returned: it declines shapes
+        # silently, and a log line that only proves no exception was raised is
+        # how an autotune that measured nothing reads as a success.
+        if not tuned:
+            logger.warning(
+                "FlashInfer PCIe-IPC autotune covered no shapes for hidden=%d "
+                "(requested rows %s); the kernels keep the seed policy.",
+                hidden,
+                _tune_batches(self.max_numel // hidden),
+            )
+            return
+        logger.info(
+            "FlashInfer PCIe-IPC all-reduce autotuned %d shape(s) (hidden=%d, rows=%s)",
+            len(tuned),
+            hidden,
+            _tune_batches(self.max_numel // hidden),
+        )
 
     def should_pcie_ipc_ar(self, inp: torch.Tensor) -> bool:
         """Whether FlashInfer has a tuned configuration for this exact shape.
