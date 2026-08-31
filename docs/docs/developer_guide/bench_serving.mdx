@@ -391,7 +391,7 @@ prefix metadata, the benchmark regenerates and replaces that cache entry automat
 Prefix prewarming requires accurate prompt lengths and a single-turn GSP workload, so
 it cannot be combined with `--gsp-fast-prepare` or `--gsp-num-turns` greater than one.
 
-For a repeatable matrix across models, use the sweep wrapper instead of maintaining a
+For a repeatable matrix across models, use the matrix runner instead of maintaining a
 model-specific shell loop:
 
 ```bash Command

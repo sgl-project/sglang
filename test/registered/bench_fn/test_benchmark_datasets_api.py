@@ -1687,7 +1687,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             self.assertNotIn(forbidden, stderr)
 
 
-class TestPrefixCacheSweep(unittest.TestCase):
+class TestPrefixCacheBenchmark(unittest.TestCase):
     def _parse(self, *extra):
         return parse_prefix_cache_benchmark_args(
             [
