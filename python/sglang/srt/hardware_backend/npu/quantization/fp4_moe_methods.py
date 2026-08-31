@@ -419,7 +419,7 @@ def npu_fused_experts_w4a4_mxfp_decode(
     hidden_states, hidden_states_scale = swiglu_quant(
         hidden_states,
         group_list=expert_tokens,
-        group_list_type=0,
+        group_list_type=group_list_type,
         need_quant=True,
         do_limit=True,
         limit=swiglu_limit,
@@ -545,7 +545,7 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
     hidden_states, hidden_states_scale = swiglu_quant(
         hidden_states,
         group_list=group_list,
-        group_list_type=0,
+        group_list_type=group_list_type,
         need_quant=True,
         do_limit=True,
         limit=layer.moe_runner_config.swiglu_limit,
