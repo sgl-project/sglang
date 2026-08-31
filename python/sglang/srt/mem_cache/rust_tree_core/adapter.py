@@ -405,10 +405,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         return _inc_lock_ref_result_from_binding(result)
 
-    def try_lock_device_anchor(self, node_id: NodeId) -> Optional[IncLockRefResult]:
-        result = self._binding.try_lock_device_anchor(node_id)
-        return None if result is None else _inc_lock_ref_result_from_binding(result)
-
     def dec_lock_ref(
         self,
         node_id: NodeId,

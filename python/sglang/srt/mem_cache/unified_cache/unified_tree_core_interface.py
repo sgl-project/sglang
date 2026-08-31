@@ -240,11 +240,6 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
-    def try_lock_device_anchor(self, node_id: NodeId) -> Optional[IncLockRefResult]:
-        """Lock a live device-resident anchor, or return None."""
-        ...
-
-    @abstractmethod
     def dec_lock_ref(
         self,
         node_id: NodeId,

@@ -1068,15 +1068,6 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(IncLockRefResultBinding::from_result(result))
     }
 
-    fn try_lock_device_anchor(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-    ) -> Option<IncLockRefResultBinding> {
-        py.allow_threads(|| self.core().try_lock_device_anchor(node_id))
-            .map(IncLockRefResultBinding::from_result)
-    }
-
     /// Decrease the reference count on a node's component locks.
     fn dec_lock_ref(
         &self,
@@ -2291,14 +2282,6 @@ macro_rules! tree_core_binding {
                 skip_lock_components: Option<Vec<u8>>,
             ) -> PyResult<IncLockRefResultBinding> {
                 self.inner.inc_lock_ref(py, node_id, skip_lock_components)
-            }
-
-            fn try_lock_device_anchor(
-                &self,
-                py: Python<'_>,
-                node_id: NodeId,
-            ) -> Option<IncLockRefResultBinding> {
-                self.inner.try_lock_device_anchor(py, node_id)
             }
 
             /// Decrease the reference count on a node's component locks.

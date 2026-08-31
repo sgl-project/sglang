@@ -764,15 +764,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.inc_lock_ref_with_skip(node_id, &[])
     }
 
-    pub fn try_lock_device_anchor(&mut self, node_id: NodeId) -> Option<IncLockRefResult> {
-        let node_id = self.arena.try_resolve(node_id)?;
-        if !self.arena.node(node_id).has_device_value(FULL) {
-            return None;
-        }
-        let node_handle = self.arena.node(node_id).id;
-        Some(self.inc_lock_ref(node_handle))
-    }
-
     /// Bump component locks, leaving explicitly skipped target components evictable.
     pub fn inc_lock_ref_with_skip(
         &mut self,

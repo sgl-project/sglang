@@ -247,29 +247,6 @@ def test_lock_and_unlock_move_tokens_between_protected_and_evictable():
     assert core.evictable_size() == 5
 
 
-def test_try_lock_device_anchor_handles_live_evicted_and_stale_nodes():
-    core = _tree_core()
-    core.set_hicache_enabled()
-    _insert(core, [1, 2], [10, 11])
-    _insert(core, [1, 2, 3], [20, 21, 12])
-    parent = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).last_device_node
-    leaf = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3]))).last_device_node
-
-    lock = core.try_lock_device_anchor(parent)
-    assert lock is not None
-    assert core.protected_size() == 2
-    core.dec_lock_ref(parent, lock.to_dec_params())
-    assert core.protected_size() == 0
-
-    core.commit_backup(leaf, torch.tensor([100], dtype=torch.int64), {})
-    _accumulate_step(core.demote(leaf), {}, {}, {})
-    assert core.try_lock_device_anchor(leaf) is None
-
-    _accumulate_step(core.drive_host_eviction(ComponentType.FULL, 1), {}, {}, {})
-    assert core.try_lock_device_anchor(leaf) is None
-    core.sanity_check([], [])
-
-
 def test_full_eviction_walk_drains_the_tree():
     core = _tree_core()
     _insert(core, [1, 2, 3], [10, 11, 12])
