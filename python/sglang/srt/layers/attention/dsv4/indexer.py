@@ -668,6 +668,10 @@ class C4IndexerBackendMixin:
         use_aiter_fp4 = c4_indexer.use_fp4_indexer and is_hip()
 
         positions = core_metadata.positions
+        if use_aiter_fp4:
+            widened = getattr(metadata, "fp4_q_positions", None)
+            if widened is not None and widened.shape == positions.shape:
+                positions = widened
         num_queries = min(x.shape[0], q_lora.shape[0], positions.shape[0])
         if x.shape[0] != num_queries:
             x = x[:num_queries]

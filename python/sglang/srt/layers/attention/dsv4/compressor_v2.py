@@ -193,11 +193,17 @@ class CompressorBackendMixin:
             is_online=is_online,
         )
 
+        # The AITER FP4 writer takes BF16; the compressor mirrors its FP32 norm
+        # weight so the conversion stays out of the per-layer forward.
+        norm_weight = norm.weight
+        if _is_hip and use_fp4_indexer:
+            norm_weight = getattr(norm, "fp4_weight_bf16", norm_weight)
+
         # Step 2: norm + rope + store
         compress_norm_rope_store(
             kv_compressed,
             plan,
-            norm_weight=norm.weight,
+            norm_weight=norm_weight,
             norm_eps=norm.variance_epsilon,
             freq_cis=freqs_cis_cache,
             out_loc=out_loc,

@@ -63,7 +63,13 @@ def aiter_q_indexer_fp4(
     import aiter
 
     num_tokens = q.shape[0]
-    positions = positions.to(device=q.device, dtype=torch.int64).contiguous()
+    # AITER asserts int64 positions; the caller normally widens once per forward.
+    if (
+        positions.dtype is not torch.int64
+        or positions.device != q.device
+        or not positions.is_contiguous()
+    ):
+        positions = positions.to(device=q.device, dtype=torch.int64).contiguous()
     q_fp4 = torch.empty(
         (num_tokens, _HEADS, _HEAD_DIM // 2),
         dtype=aiter.dtypes.fp4x2,
@@ -85,6 +91,17 @@ def aiter_q_indexer_fp4(
         do_rotate_act=True,
     )
     return q_fp4, q_scale
+
+
+def _as_int32_1d(t: torch.Tensor) -> torch.Tensor:
+    """Normalize a length vector without dispatching when it already matches.
+
+    Called once per C4 layer, so the no-op fast path matters: the metadata
+    builder already hands us a 1-D contiguous int32 tensor.
+    """
+    if t.dim() == 1 and t.dtype is torch.int32 and t.is_contiguous():
+        return t
+    return t.reshape(-1).to(torch.int32).contiguous()
 
 
 def _decode_cta_count(num_queries: int, max_seq_len: int) -> int:
@@ -123,7 +140,7 @@ def prepare_fp4_decode_workspace(
     )
 
     guarded, max_seq_len = _guard_page_table(page_table)
-    c4_seq_lens = c4_seq_lens.reshape(-1).to(torch.int32).contiguous()
+    c4_seq_lens = _as_int32_1d(c4_seq_lens)
     num_queries = guarded.shape[0]
     cta_count = _decode_cta_count(num_queries, max_seq_len)
     cta_info = torch.empty(
@@ -162,7 +179,7 @@ def prepare_fp4_prefill_workspace(
         compute_prefill_schedule,
     )
 
-    c4_seq_lens = c4_seq_lens.reshape(-1).to(torch.int32).contiguous()
+    c4_seq_lens = _as_int32_1d(c4_seq_lens)
     if workspace is None:
         guarded, max_seq_len = _guard_page_table(page_table)
         num_queries = guarded.shape[0]
@@ -221,7 +238,7 @@ def aiter_fp4_paged_mqa_logits(
     )
 
     num_tokens = q_fp4.shape[0]
-    c4_seq_lens = c4_seq_lens.reshape(-1).to(torch.int32).contiguous()
+    c4_seq_lens = _as_int32_1d(c4_seq_lens)
     workspace = decode_workspace if is_decode else prefill_workspace
     # A workspace is bound to one row count. DP padding or truncated activations
     # can leave it stale, in which case fall back to building the schedule here.
@@ -358,6 +375,10 @@ def aiter_k_indexer_fp4_cache_write(
     assert write_metadata is not None, "FP4 K-write metadata is missing."
 
     positions, slots = write_metadata
+    # The compressor normally hands over its BF16 mirror; convert only when some
+    # caller still passes the FP32 parameter.
+    if norm_weight.dtype is not torch.bfloat16 or norm_weight.device != k.device:
+        norm_weight = norm_weight.to(device=k.device, dtype=torch.bfloat16).contiguous()
 
     import aiter
 
@@ -365,7 +386,7 @@ def aiter_k_indexer_fp4_cache_write(
         k_payload,
         k_scale,
         k.view(num_rows, 1, _HEAD_DIM),
-        norm_weight.to(device=k.device, dtype=torch.bfloat16).contiguous(),
+        norm_weight,
         cos,
         sin,
         positions,

@@ -367,6 +367,9 @@ class DSV4Metadata:
     )
     # Derived by the first C4 layer of a forward and reused by the rest.
     fp4_k_write_metadata: Optional[FP4KWriteMetadata] = field(default=None, repr=False)
+    # AITER's rope kernels require int64 positions while the core metadata keeps
+    # them int32, so widen once per forward instead of once per C4 layer.
+    fp4_q_positions: Optional[torch.Tensor] = field(default=None, repr=False)
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -888,6 +891,9 @@ class DeepseekV4HipRadixBackend(
                 metadata.c4_compress_metadata,
                 metadata.core_attn_metadata.c4_out_loc,
                 self.MAX_SEQ_LEN_FOR_CAPTURE,
+            )
+            metadata.fp4_q_positions = metadata.core_attn_metadata.positions.to(
+                torch.int64
             )
 
         # Decode's schedule builder is capture-safe because the workspace pins
