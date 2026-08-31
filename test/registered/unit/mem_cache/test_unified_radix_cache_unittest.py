@@ -918,6 +918,79 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             canonical_hashes.append(running_hash)
         self.assertNotEqual(canonical_hashes, cache.tree_core.get_hash_values(leaf))
 
+    def test_buffer_anchor_rematch_preserves_bigram_boundary(self):
+        from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+
+        cache, allocator, _ = build_fixture(self.cfg)
+        extra_key = "adapter-a"
+        cache_salt = "tenant-a"
+        prefix_tokens = array("q", [1, 2, 3, 4, 5])
+        value = allocator.alloc(len(prefix_tokens) - 1)
+        self.assertIsNotNone(value)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(
+                    prefix_tokens,
+                    extra_key=extra_key,
+                    cache_salt=cache_salt,
+                ),
+                value=value,
+            )
+        )
+        match = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    prefix_tokens,
+                    extra_key=extra_key,
+                    cache_salt=cache_salt,
+                )
+            )
+        )
+        self.assertEqual(len(match.device_indices), len(prefix_tokens) - 1)
+
+        req_id = "bigram-anchor"
+        prefetch_key = RadixKey(
+            array("q", [prefix_tokens[-1], 6, 7, 8, 9]),
+            extra_key=extra_key,
+            is_bigram=True,
+            cache_salt=cache_salt,
+        )
+        cache.ongoing_prefetch[req_id] = _OngoingPrefetch(
+            anchor_node_id=match.last_device_node,
+            prefetch_key=prefetch_key,
+            host_indices=None,
+            operation=None,
+            anchor_lock_params=None,
+            comp_xfers={},
+        )
+
+        pipeline = BufferModePipeline.__new__(BufferModePipeline)
+        pipeline.anchor_lock_enabled = True
+        pipeline.anchor_locks = {}
+        pipeline.anchor_locked_tokens_ = 0
+        pipeline.anchor_lock_cap_tokens = 10_000
+        pipeline._anchor_lock_cap_skips = 0
+        pipeline._prefetch_prefix_ctx = {
+            req_id: (list(prefix_tokens[:-1]), extra_key, cache_salt)
+        }
+        pipeline._cache = cache
+
+        lock_ref = _device_lock_ref(cache, match.last_device_node, ComponentType.FULL)
+        self.assertEqual(pipeline.try_lock_anchor(req_id), "locked")
+        self.assertEqual(pipeline.anchor_locks[req_id].node_id, match.last_device_node)
+        self.assertEqual(
+            _device_lock_ref(cache, match.last_device_node, ComponentType.FULL),
+            lock_ref + 1,
+        )
+
+        pipeline.release_anchor_lock(req_id)
+        cache.ongoing_prefetch.pop(req_id)
+        self.assertEqual(
+            _device_lock_ref(cache, match.last_device_node, ComponentType.FULL),
+            lock_ref,
+        )
+        cache.sanity_check()
+
 
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
@@ -4253,7 +4326,7 @@ class UnifiedRadixCacheSuite:
 
         req_id = "growth-trim"
         cons.prefetch_from_storage(
-            req_id, cons.root_node.id, array("q", seq), None, None
+            req_id, cons.root_node_handle(), array("q", seq), None, None
         )
         self._pump_hicache_until(
             cons,
@@ -4320,7 +4393,7 @@ class UnifiedRadixCacheSuite:
 
         req_id = "covered-hold"
         cons.prefetch_from_storage(
-            req_id, cons.root_node.id, array("q", seq), None, None
+            req_id, cons.root_node_handle(), array("q", seq), None, None
         )
         self._pump_hicache_until(
             cons,
@@ -4364,7 +4437,7 @@ class UnifiedRadixCacheSuite:
 
         req_id = "covered-at-commit"
         cons.prefetch_from_storage(
-            req_id, cons.root_node.id, array("q", seq), None, None
+            req_id, cons.root_node_handle(), array("q", seq), None, None
         )
         # Wait for the hit verdict WITHOUT draining it (the drain is the
         # scheduler-thread IO commit under test).

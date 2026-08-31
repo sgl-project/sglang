@@ -715,10 +715,18 @@ class BufferModePipeline:
                 )
             return "cap_skip"
         cache = self._cache
+        anchor_tokens = array("q", prefix_tokens)
+        if cache.tree_core.is_eagle:
+            # The suffix owns the boundary token shared with the last matched
+            # bigram, so include it when rebuilding the anchor key.
+            info = cache.ongoing_prefetch.get(req_id)
+            if info is None or not info.prefetch_key.token_ids:
+                return "anchor_lost"
+            anchor_tokens.append(info.prefetch_key.token_ids[0])
         match = cache.match_prefix(
             MatchPrefixParams(
                 key=RadixKey(
-                    array("q", prefix_tokens),
+                    anchor_tokens,
                     extra_key=extra_key,
                     is_bigram=cache.tree_core.is_eagle,
                     cache_salt=cache_salt,
