@@ -19,10 +19,10 @@ from triton_kernels.numerics import InFlexData
 from triton_kernels.swiglu import swiglu_fn
 from triton_kernels.tensor import FP4
 
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cuda
-from sglang.srt.utils.common import is_sm120_supported
 
-if is_sm120_supported():
+if get_platform().is_sm120:
     # use the regular gather/scatter implementation for unsupported devices.
     update_opt_flags_constraints({"is_persistent": False})
 

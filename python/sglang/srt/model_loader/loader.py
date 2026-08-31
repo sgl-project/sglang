@@ -124,7 +124,6 @@ from sglang.srt.model_loader.weight_utils import (
     set_runai_streamer_env,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
@@ -333,6 +332,28 @@ class BaseModelLoader(ABC):
         raise NotImplementedError
 
 
+def _validate_default_loader_extra_config(
+    *, extra_config: dict, load_format: LoadFormat
+) -> None:
+    allowed_keys = {"enable_multithread_load", "num_threads"}
+    if load_format == LoadFormat.FASTSAFETENSORS:
+        allowed_keys.add("enable_gds")
+        if "enable_gds" in extra_config and not isinstance(
+            extra_config["enable_gds"], bool
+        ):
+            raise ValueError(
+                "enable_gds in --model-loader-extra-config must be a boolean"
+            )
+
+    unexpected_keys = set(extra_config.keys()) - allowed_keys
+    if unexpected_keys:
+        raise ValueError(
+            f"Unexpected extra config keys for load format "
+            f"{load_format}: "
+            f"{unexpected_keys}"
+        )
+
+
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
@@ -384,24 +405,10 @@ class DefaultModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        extra_config = load_config.model_loader_extra_config
-        allowed_keys = {"enable_multithread_load", "num_threads"}
-        if load_config.load_format == LoadFormat.FASTSAFETENSORS:
-            allowed_keys.add("enable_gds")
-            if "enable_gds" in extra_config and not isinstance(
-                extra_config["enable_gds"], bool
-            ):
-                raise ValueError(
-                    "enable_gds in --model-loader-extra-config must be a boolean"
-                )
-        unexpected_keys = set(extra_config.keys()) - allowed_keys
-
-        if unexpected_keys:
-            raise ValueError(
-                f"Unexpected extra config keys for load format "
-                f"{load_config.load_format}: "
-                f"{unexpected_keys}"
-            )
+        _validate_default_loader_extra_config(
+            extra_config=load_config.model_loader_extra_config,
+            load_format=load_config.load_format,
+        )
 
     def _maybe_download_from_modelscope(
         self, model: str, revision: Optional[str]
@@ -1884,18 +1891,20 @@ class PreshardedModelLoader(DefaultModelLoader):
         def _safe(fn) -> int:
             try:
                 return fn()
-            except (AssertionError, AttributeError, RuntimeError):
+            except (AssertionError, AttributeError, RuntimeError, ValueError):
                 return 1
+
+        from sglang.srt.layers.dp_attention import get_moe_cp_size
 
         parallel = get_parallel()
         return {
             "tp": _safe(lambda: parallel.tp_size),
-            "dp": _safe(lambda: parallel.moe_dp_size),
+            "dp": _safe(get_moe_cp_size),
             "ep": _safe(lambda: parallel.moe_ep_size),
             "pp": _safe(lambda: parallel.pp_size),
-            "moe_dense_tp_size": parallel.config.moe_dense_tp_size,
-            "moe_dp_size": get_parallel().config.moe_dp_size,
-            "enable_dp_lm_head": parallel.config.enable_dp_lm_head,
+            "moe_dense_tp_size": parallel.moe_dense_tp_size,
+            "moe_dp_size": get_parallel().moe_dp_size,
+            "enable_dp_lm_head": parallel.enable_dp_lm_head,
             "enable_fp32_lm_head": get_exec().features.enable_fp32_lm_head,
             "quantization": model_config.quantization,
             "model_dtype": str(model_config.dtype),
@@ -3228,10 +3237,27 @@ class RemoteInstanceModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         if load_config.model_loader_extra_config:
-            raise ValueError(
-                f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format}"
-            )
+            if (
+                load_config.remote_instance_weight_loader_backend
+                == RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+            ):
+                # ModelExpress falls back to a DefaultModelLoader whenever no
+                # peer holds the weights, so it consumes this config; validate
+                # the keys here so a bad one fails on every rank instead of only
+                # on the ranks that end up taking the fallback.
+                _validate_default_loader_extra_config(
+                    extra_config=load_config.model_loader_extra_config,
+                    load_format=load_config.load_format,
+                )
+            else:
+                # nccl and transfer_engine replace the native loader outright,
+                # so nothing would ever read the config.
+                raise ValueError(
+                    f"Model loader extra config is not supported for "
+                    f"load format {load_config.load_format} with "
+                    f"remote instance weight loader backend "
+                    f"{load_config.remote_instance_weight_loader_backend}"
+                )
         self.remote_instance_transfer_engine_weight_info = None
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -4361,7 +4387,6 @@ def get_model_loader(
         if load_config.weight_cache_socket:
             socket_path = load_config.weight_cache_socket
         else:
-            from sglang.srt.runtime_context import get_parallel
 
             ps = get_parallel()
             global_rank = compute_global_rank(ps.tp_size, ps.pp_rank, ps.tp_rank)

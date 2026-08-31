@@ -23,7 +23,7 @@ always PHYSICAL. Two routing contracts are pinned here:
    `UnifiedSWAKVPool` asserts it's present (the unified memory pool always precomputes
    it); `HybridLinearKVPool` falls back to `loc` for a static (non-shared) pool,
    where `loc` is itself already physical.
-2. SWA. The swa-physical loc rides the backend `swa_out_cache_loc` rail
+2. SWA. The swa-physical loc rides the backend `swa_out_cache_loc` slot
    (`KVWriteLoc.swa_loc`) and is written directly.
 
 Pure dispatch tests: the inner sub-pools are recording stubs, so no GPU / real
@@ -127,7 +127,7 @@ class TestUnifiedSWARouting(unittest.TestCase):
 
         self.assertEqual(len(pool.swa_kv_pool.calls), 1)
         forwarded, kwargs = pool.swa_kv_pool.calls[0]
-        # SWA write rides the backend rail: forward the swa-physical loc directly.
+        # SWA write rides the backend slot: forward the swa-physical loc directly.
         self.assertIs(forwarded, swa_phys)
         self.assertNotIn("already_physical", kwargs)
         # Full pool untouched for an SWA layer.
@@ -138,7 +138,7 @@ class TestUnifiedSWARouting(unittest.TestCase):
         virtual_loc = torch.tensor([10, 11, 12], dtype=torch.int64)
 
         layer = types.SimpleNamespace(layer_id=1)  # SWA layer
-        # No swa_loc bundled -> the rail contract is violated; must assert
+        # No swa_loc bundled -> the write-loc contract is violated; must assert
         # rather than silently writing wrong (un-translated) locations.
         with self.assertRaises(AssertionError):
             pool.set_kv_buffer(
@@ -147,6 +147,46 @@ class TestUnifiedSWARouting(unittest.TestCase):
                 torch.zeros(3, 4, 8),
                 torch.zeros(3, 4, 8),
             )
+
+
+class TestUnifiedSWATombstoneClamp(unittest.TestCase):
+    """`UnifiedSWAKVPool.translate_loc_from_full_to_swa` must clamp tombstoned
+    ids to the reserved padding sink (0).
+
+    A token whose swa page was freed carries -1 in `virtual_to_physical`. Before
+    the clamp, that produced a negative id, which a captured graph stores at a
+    negative offset from the buffer base. The composite allocator's method of
+    the same name already clamped; this path did not.
+    """
+
+    def _make_bare_pool(self, page_size, v2p, multiplier=1):
+        from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
+
+        # A real sub-allocator (not a stand-in): the translation reads its v2p
+        # table, and the pool reaches it through the allocator's own method.
+        swa_allocator = object.__new__(MultiEndedAllocator)
+        swa_allocator.page_size = page_size
+        swa_allocator.virtual_to_physical = v2p
+        swa_allocator.kernel_page_multiplier = multiplier
+        pool = object.__new__(UnifiedSWAKVPool)
+        pool._swa_allocator = swa_allocator
+        return pool
+
+    def test_tombstoned_id_lands_on_sink(self):
+        for ps, mult in ((1, 1), (4, 1), (4, 6)):
+            v2p = torch.tensor([0, -1, 2], dtype=torch.int64)
+            pool = self._make_bare_pool(ps, v2p, multiplier=mult)
+            # Virtual ids covering the tombstoned page (index 1) and a live one.
+            kv_indices = torch.tensor([0, ps, 2 * ps], dtype=torch.int64)
+            out = pool.translate_loc_from_full_to_swa(kv_indices)
+            self.assertEqual(out.dtype, torch.int64)
+            self.assertTrue(
+                bool((out >= 0).all().item()),
+                f"tombstoned swa id stayed negative at page_size={ps}, "
+                f"multiplier={mult}: {out}",
+            )
+            self.assertEqual(int(out[1].item()), 0)
 
 
 class TestHybridLinearFullLocRouting(unittest.TestCase):

@@ -38,6 +38,7 @@ Backend selection comes from cuda_graph_config.prefill:
 from __future__ import annotations
 
 import copy
+import dataclasses
 import inspect
 import logging
 from collections.abc import Sequence
@@ -262,6 +263,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """
 
     def __init__(self, model_runner: ModelRunner):
+        if get_schedule().enable_mixed_chunk:
+            backend = get_exec().graph.cuda_graph_config.prefill.backend
+            assert backend == Backend.BREAKABLE, (
+                "Mixed chunk prefill requires the breakable prefill CUDA "
+                f"graph backend; got '{backend}'."
+            )
         super().__init__(model_runner)
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
@@ -289,16 +296,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_forward_mode = ForwardMode.EXTEND
         # Hidden-state capture mode cases:
         # - Breakable EAGLE draft: LAST.
-        # - Breakable EAGLE target: FULL.
+        # - EAGLE target: FULL.
         # - Return-hidden-states or DFLASH: FULL.
         # - Otherwise: NULL.
-        is_breakable_eagle = (
+        is_eagle = model_runner.spec_algorithm.is_eagle()
+        is_breakable_eagle_draft = (
             self.prefill_backend_name == Backend.BREAKABLE
-            and model_runner.spec_algorithm.is_eagle()
+            and is_eagle
+            and model_runner.is_draft_worker
         )
-        if is_breakable_eagle and model_runner.is_draft_worker:
+        if is_breakable_eagle_draft:
             self.capture_hidden_mode = CaptureHiddenMode.LAST
-        elif is_breakable_eagle or model_runner.spec_algorithm.is_dflash_family():
+        elif (is_eagle and not model_runner.is_draft_worker) or (
+            model_runner.spec_algorithm.is_dflash_family()
+        ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
         else:
             self.capture_hidden_mode = self.return_hidden_states_mode
@@ -321,6 +332,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=input_embeds_hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
+            pp_size=self.pp_size,
+            hc_hidden_size=getattr(
+                self.model_runner.model_config, "hc_hidden_size", None
+            ),
+            pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
+            pp_proxy_residual_num_blocks=(
+                self.model_runner.get_pp_proxy_residual_num_blocks()
+            ),
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -335,7 +354,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=input_embeds_hidden_size,
             embed_dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
-            enable_num_token_non_padded=enable_num_token_non_padded(),
+            # FullCG always pads to a capture bucket. Models that mask padded
+            # hidden rows need the live boundary even without expert parallelism.
+            enable_num_token_non_padded=(
+                enable_num_token_non_padded()
+                or self.prefill_backend_name == Backend.FULL
+            ),
             require_gathered_buffer=require_gathered_buffer(),
             enable_prefill_cp=(
                 is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
@@ -352,7 +376,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
 
-        self.dp_size = get_parallel().config.dp_size
+        self.dp_size = get_parallel().dp_size
         self.require_mlp_tp_gather = require_mlp_tp_gather()
         self.require_attn_tp_gather = require_attn_tp_gather()
 
@@ -629,6 +653,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         return forward_batch.positions
 
+    def _static_pp_proxy_tensors(self, num_tokens: int) -> Optional[PPProxyTensors]:
+        buffers = self.buffers.pp_proxy_tensors
+        if buffers is None:
+            return None
+        return PPProxyTensors(
+            {key: value[:num_tokens] for key, value in buffers.items()}
+        )
+
     @contextmanager
     def _prefill_forward_context(
         self,
@@ -685,6 +717,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         set_is_extend_in_batch(False)
 
         with self._prefill_forward_context(forward_batch):
+            pp_kwargs = self.model_runner._pp_kwargs(
+                self._static_pp_proxy_tensors(num_tokens)
+            )
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
@@ -693,12 +728,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     positions,
                     forward_batch,
                     forward_batch.input_embeds,
+                    **pp_kwargs,
                 )
             # tc_piecewise: compile/capture the outer model.forward path.
             return self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
+                **pp_kwargs,
             )
 
     def _run_dummy_forward(self, num_tokens: int) -> None:
@@ -1488,6 +1525,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_bs=bs,
             raw_num_tokens=num_tokens,
             padded_num_tokens=static_num_tokens,
+            pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
         )
 
         registry = self.buffer_registry
@@ -1527,8 +1565,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             else forward_batch.num_token_non_padded
         )
 
-        # Normalize MIXED→EXTEND so dynamo's guard (captured with EXTEND=1)
-        # doesn't fail on MIXED=3.
+        # MIXED replays the EXTEND-captured graphs.
         pcg_forward_mode = (
             ForwardMode.EXTEND
             if forward_batch.forward_mode == ForwardMode.MIXED
@@ -1539,6 +1576,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.global_forward_mode == ForwardMode.MIXED
             else forward_batch.global_forward_mode
         )
+
+        # The draft tail concatenates hidden states with padded input embeddings;
+        # expose the bucket-sized static view and refresh its live prefix below.
+        padded_spec_info = forward_batch.spec_info
+        if (
+            self.static_draft_hidden_states is not None
+            and padded_spec_info is not None
+            and getattr(padded_spec_info, "hidden_states", None) is not None
+        ):
+            padded_spec_info = dataclasses.replace(
+                padded_spec_info,
+                hidden_states=self.static_draft_hidden_states[:static_num_tokens],
+            )
 
         static_forward_batch = ForwardBatch(
             forward_mode=pcg_forward_mode,
@@ -1583,7 +1633,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             mrope_positions=mrope_positions,
             spec_algorithm=forward_batch.spec_algorithm,
-            spec_info=forward_batch.spec_info,
+            spec_info=padded_spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             num_token_non_padded=num_token_non_padded,
             num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
@@ -1591,6 +1641,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
+            # Multimodal preparation consumes mm_inputs but retains embeddings for
+            # later MTP draft extend, so copy that side channel into the replay view.
+            mm_input_embeds=forward_batch.mm_input_embeds,
             temperature=forward_batch.temperature,
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
@@ -1783,9 +1836,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if isinstance(output, EmbeddingPoolerOutput):
             return output
         assert isinstance(output, PPProxyTensors)
-        raise NotImplementedError(
-            "PPProxyTensors is not supported in PrefillCudaGraphRunner yet."
-        )
+        return output[: self.raw_num_tokens]
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:

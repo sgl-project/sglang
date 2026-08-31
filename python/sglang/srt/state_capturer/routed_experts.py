@@ -15,6 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
+    get_resources,
     get_schedule,
 )
 from sglang.srt.state_capturer.base import BaseTopkCapturer
@@ -76,8 +77,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         # chunked_prefill_size.
         # FIXME: spec decoding's num_verify_tokens is still not accounted for.
         max_batch_size = max(
-            get_schedule().chunked_prefill_size * get_parallel().config.dp_size,
-            max_running_requests * get_parallel().config.dp_size,
+            get_schedule().chunked_prefill_size * get_parallel().dp_size,
+            max_running_requests * get_parallel().dp_size,
         )
 
         super().__init__(
@@ -134,13 +135,11 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
 
 
 def get_global_experts_capturer() -> Optional[RoutedExpertsCapturer]:
-    from sglang.srt.runtime_context import get_resources
 
     return get_resources().experts_capturer
 
 
 def set_global_experts_capturer(capturer: Optional[RoutedExpertsCapturer]):
-    from sglang.srt.runtime_context import get_resources
 
     get_resources().experts_capturer = capturer
 
