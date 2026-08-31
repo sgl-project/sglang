@@ -1625,6 +1625,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         adaln_weight_files: list[str] | None = None,
         adaln_plan_width: int = MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
         adaln_max_plans: int = 64,
+        adaln_host_cache_bytes: int = 0,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         arch = self.config
@@ -1760,6 +1761,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 weight_files=adaln_weight_files,
                 max_plans=adaln_max_plans,
                 max_plan_width=adaln_plan_width,
+                host_cache_bytes=adaln_host_cache_bytes,
             )
             if self._adaln_precomputed
             else None

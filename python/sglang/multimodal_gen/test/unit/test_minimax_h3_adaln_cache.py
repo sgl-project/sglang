@@ -41,16 +41,22 @@ def _write_online_weights(
     path: Path,
     *,
     omit: str | None = None,
+    scale: float = 0.0,
 ) -> None:
-    # These cache-state tests need checkpoint-compatible shapes, not values.
+    # State-machine tests only need checkpoint-compatible shapes (scale 0);
+    # value-equality tests pass a nonzero scale for distinguishable outputs.
+    def _fill(*shape: int) -> torch.Tensor:
+        values = torch.arange(int(torch.tensor(shape).prod()), dtype=torch.float32)
+        return ((values % 7) * 0.01 * scale).reshape(shape)
+
     tensors: dict[str, torch.Tensor] = {}
     for layer in range(_ARCH.num_layers):
         prefix = f"blocks.{layer}.adaln_proj.linear"
-        tensors[f"{prefix}.weight"] = torch.zeros(_BLOCK_WIDTH, _ARCH.time_embed_dim)
-        tensors[f"{prefix}.bias"] = torch.zeros(_BLOCK_WIDTH)
+        tensors[f"{prefix}.weight"] = _fill(_BLOCK_WIDTH, _ARCH.time_embed_dim)
+        tensors[f"{prefix}.bias"] = _fill(_BLOCK_WIDTH)
     prefix = "final_layer.adaln_proj.linear"
-    tensors[f"{prefix}.weight"] = torch.zeros(_FINAL_WIDTH, _ARCH.time_embed_dim)
-    tensors[f"{prefix}.bias"] = torch.zeros(_FINAL_WIDTH)
+    tensors[f"{prefix}.weight"] = _fill(_FINAL_WIDTH, _ARCH.time_embed_dim)
+    tensors[f"{prefix}.bias"] = _fill(_FINAL_WIDTH)
     if omit is not None:
         tensors.pop(omit)
     save_file(tensors, path)
@@ -62,18 +68,25 @@ def _online_cache(
     max_plans: int = 2,
     max_plan_width: int = 2,
     omit: str | None = None,
+    host_cache_bytes: int = 0,
+    scale: float = 0.0,
 ) -> MiniMaxH3AdalnCache:
     _ensure_single_process_parallel_runtime()
     weight_path = tmp_path / "model.safetensors"
-    _write_online_weights(weight_path, omit=omit)
+    _write_online_weights(weight_path, omit=omit, scale=scale)
     cache = MiniMaxH3AdalnCache(
         _ARCH,
         weight_files=[str(weight_path)],
         max_plans=max_plans,
         max_plan_width=max_plan_width,
+        host_cache_bytes=host_cache_bytes,
     )
     cache.load(torch.device("cpu"))
     return cache
+
+
+# One host-tier page for the tiny arch, in bytes (see MiniMaxH3AdalnHostTier).
+_PAGE_BYTES = (_ARCH.num_layers * _BLOCK_WIDTH + _FINAL_WIDTH) * 2
 
 
 def _embed(timesteps: torch.Tensor) -> torch.Tensor:
@@ -182,6 +195,113 @@ def test_online_cache_resolve_slots_after_build(tmp_path):
 def test_slab_buffers_stay_out_of_state_dict(tmp_path):
     cache = _online_cache(tmp_path)
     assert not any("params" in key or "plan" in key for key in cache.state_dict())
+
+
+def test_host_tier_swap_in_restores_evicted_plans_bit_exactly(tmp_path):
+    """A GPU-evicted plan set must return from the host tier byte-identical,
+    without another checkpoint pass."""
+    cache = _online_cache(
+        tmp_path,
+        max_plans=2,
+        max_plan_width=1,
+        host_cache_bytes=64 * _PAGE_BYTES,
+        scale=1.0,
+    )
+    set_a = [torch.tensor([1.0]), torch.tensor([2.0])]
+    set_b = [torch.tensor([3.0]), torch.tensor([4.0])]
+
+    cache.build(set_a, embed=_embed)
+    slots_a = cache.resolve_slots(set_a)
+    snapshot = [
+        (
+            [t.clone() for t in cache.block(0, slots_a[i], 1)],
+            [t.clone() for t in cache.final(slots_a[i], 1)],
+        )
+        for i in range(2)
+    ]
+    assert cache.stats.built_plans == 2
+
+    cache.build(set_b, embed=_embed)  # evicts set_a from the GPU slab
+    passes = cache.rebuilds
+    cache.build(set_a, embed=_embed)  # swaps back in from the host tier
+    assert cache.rebuilds == passes
+    assert cache.stats.host_hit_plans == 2
+
+    slots_a = cache.resolve_slots(set_a)
+    for i in range(2):
+        blocks, finals = snapshot[i]
+        for got, want in zip(cache.block(0, slots_a[i], 1), blocks):
+            assert torch.equal(got, want)
+        for got, want in zip(cache.final(slots_a[i], 1), finals):
+            assert torch.equal(got, want)
+        assert float(cache.plan_timesteps[slots_a[i], 0]) == float(set_a[i][0])
+
+
+def test_host_tier_over_capacity_group_recomputes(tmp_path):
+    """A group that cannot fit is skipped (never raises) and rebuilt later."""
+    cache = _online_cache(
+        tmp_path,
+        max_plans=2,
+        max_plan_width=1,
+        host_cache_bytes=1 * _PAGE_BYTES,  # one page: a 2-plan group never fits
+    )
+    set_a = [torch.tensor([1.0]), torch.tensor([2.0])]
+    set_b = [torch.tensor([3.0]), torch.tensor([4.0])]
+
+    cache.build(set_a, embed=_embed)
+    assert cache.stats.host_pressure_skips == 1
+    cache.build(set_b, embed=_embed)
+    passes = cache.rebuilds
+    cache.build(set_a, embed=_embed)  # host tier empty: full rebuild again
+    assert cache.rebuilds == passes + 1
+
+
+def test_host_tier_lru_eviction_and_shared_plan_refcount(tmp_path):
+    cache = _online_cache(
+        tmp_path,
+        max_plans=4,
+        max_plan_width=1,
+        host_cache_bytes=3 * _PAGE_BYTES,
+    )
+    plan_a = torch.tensor([1.0])
+    plan_b = torch.tensor([2.0])
+    plan_c = torch.tensor([3.0])
+
+    cache.build([plan_a, plan_b], embed=_embed)  # group 1 {a, b}: 2 pages
+    cache.build([plan_a, plan_c], embed=_embed)  # group 2 {a, c}: +1 page (a shared)
+    tier = cache._host_tier
+    assert tier is not None
+    assert len(tier._plans) == 3 and len(tier._free_pages) == 0
+
+    # A third group needs a page; group 1 is LRU. Its shared plan_a must
+    # survive because group 2 still references it.
+    plan_d = torch.tensor([4.0])
+    cache.build([plan_a, plan_d], embed=_embed)
+    assert cache.stats.host_evicted_groups == 1
+    keys = {tuple(tier.timesteps(key).tolist()) for key in tier._plans}
+    assert keys == {(1.0,), (3.0,), (4.0,)}
+
+
+def test_invalidate_drops_all_tiers_and_allows_rebuild(tmp_path):
+    cache = _online_cache(
+        tmp_path,
+        max_plans=2,
+        max_plan_width=1,
+        host_cache_bytes=64 * _PAGE_BYTES,
+    )
+    plan_a = torch.tensor([1.0])
+    cache.build([plan_a], embed=_embed)
+
+    cache.invalidate()
+    with pytest.raises(ValueError, match="does not cover"):
+        cache.lookup(plan_a)
+    with pytest.raises(ValueError, match="does not cover"):
+        cache.resolve_slots([plan_a])
+
+    passes = cache.rebuilds
+    cache.build([plan_a], embed=_embed)  # host tier was cleared too
+    assert cache.rebuilds == passes + 1
+    cache.lookup(plan_a)
 
 
 def test_online_cache_eviction_preserves_in_flight_request_plans(tmp_path):

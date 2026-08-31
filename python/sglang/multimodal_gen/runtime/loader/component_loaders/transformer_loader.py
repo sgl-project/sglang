@@ -429,6 +429,9 @@ class TransformerLoader(ComponentLoader):
             init_params["adaln_max_plans"] = (
                 component_server_args.minimax_h3_adaln_gpu_plans
             )
+            init_params["adaln_host_cache_bytes"] = int(
+                component_server_args.minimax_h3_adaln_host_cache_gb * 1e9
+            )
             checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
 
         runtime_quant_config = init_params["quant_config"]
