@@ -114,9 +114,9 @@ buffer_store_dwordx4(int32x4_t data, int32x4_t srsrc, int32_t voffset, int32_t s
 __quickreduce_device_inline__ static void set_fp16_ovfl(bool const value) {
 #if defined(__gfx942__) || defined(__gfx950__)
   if (value) {
-    asm volatile("s_setreg_imm32_b32 0xdc1, 1;" ::: "memory");
+    asm volatile("s_setreg_imm32_b32 0x5c1, 1;" ::: "memory");
   } else {
-    asm volatile("s_setreg_imm32_b32 0xdc1, 0;" ::: "memory");
+    asm volatile("s_setreg_imm32_b32 0x5c1, 0;" ::: "memory");
   }
 #endif
 }
