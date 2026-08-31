@@ -59,6 +59,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
+    apply_nvfp4_gemm_prequantized,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -584,7 +586,6 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             and (capability.major, capability.minor) == (10, 3)
             and isinstance(self.to_out.quant_method, ModelOptFp4LinearMethod)
         ):
-            self.to_out._accepts_prequantized_fp4 = True
             self._enable_nvfp4_token_cat = True
         if self.tp_size > 1:
             self._patch_to_out_weight_loader()
@@ -690,6 +691,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         # Concatenate and parallel output projection. On SM103 NVFP4 the
         # producer writes the concatenated packed values and swizzled scales
         # directly, avoiding a full-width BF16 cat materialization.
+        output_shape = (*hidden_states.shape[:-1], self.out_dim)
         packed = None
         if self._enable_nvfp4_token_cat:
             packed = try_flux2_token_cat_nvfp4(
@@ -699,8 +701,12 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
             hidden_states, _ = self.to_out(hidden_states)
         else:
-            hidden_states, _ = self.to_out(packed)
-            hidden_states = hidden_states.view(1, -1, hidden_states.shape[-1])
+            hidden_states = apply_nvfp4_gemm_prequantized(
+                self.to_out,
+                *packed,
+                output_dtype=hidden_states.dtype,
+                bias=self.to_out.bias,
+            ).view(*output_shape)
 
         return hidden_states
 
