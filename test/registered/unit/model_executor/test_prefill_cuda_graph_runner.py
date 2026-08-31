@@ -100,6 +100,8 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         # out of the bags.
         override = get_context().override_server_args(
             enable_lora=False,
+            enable_prefill_cp=False,
+            pp_size=1,
             cuda_graph_config=SimpleNamespace(
                 prefill=SimpleNamespace(bs=[1], backend=Backend.BREAKABLE)
             ),
