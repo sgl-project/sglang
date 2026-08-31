@@ -3,7 +3,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.overrides import (
+    model_config_of,
+    resolved_view,
+    resolving_view,
+)
+from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -18,20 +23,14 @@ HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "aiter"}
 HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
 
 
-def _is_hip() -> bool:
-    from sglang.srt.server_args import is_hip
-
-    return is_hip()
-
-
 def _hisparse_default_backend(kv_cache_dtype: str) -> str:
-    if _is_hip():
+    if get_platform().is_hip:
         return "tilelang"
     return "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
 
 
 def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
-    if _is_hip():
+    if get_platform().is_hip:
         return HISPARSE_ROCM_DSA_BACKENDS
     return HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE.get(
         kv_cache_dtype, {"flashmla_sparse", "flashmla_kv", "flashinfer_sparse_mla"}
@@ -45,7 +44,6 @@ def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
 def validate_hisparse_dsa_backend(
     server_args: ServerArgs, attr: str, label: str
 ) -> None:
-    from sglang.srt.arg_groups.overrides import resolved_view
 
     # Invoked after the DSA kv-cache-dtype / split-backend declarations:
     # read the resolving state through the view.
@@ -64,7 +62,6 @@ def validate_hisparse_dsa_backend(
 
 
 def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
-    from sglang.srt.arg_groups.overrides import resolved_view
 
     kv_cache_dtype = resolved_view(server_args).kv_cache_dtype
     if kv_cache_dtype in HISPARSE_KV_CACHE_DTYPES:
@@ -81,6 +78,7 @@ def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
 
 def validate_hisparse(server_args: ServerArgs) -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
+
     cfg = resolving_view(server_args)
     if not cfg.enable_hisparse:
         return
@@ -90,9 +88,9 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         is_deepseek_v4,
     )
 
-    hf_config = server_args.get_model_config().hf_config
+    hf_config = model_config_of(server_args).hf_config
     is_v4_hisparse = is_deepseek_v4(hf_config)
-    is_hip = _is_hip()
+    is_hip = get_platform().is_hip
     assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (
         "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
@@ -122,8 +120,6 @@ def validate_hisparse(server_args: ServerArgs) -> None:
                 "--enable-hisparse."
             )
         return
-
-    from sglang.srt.arg_groups.overrides import resolved_view
 
     if resolved_view(server_args).kv_cache_dtype not in (
         "bfloat16",
