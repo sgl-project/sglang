@@ -1137,6 +1137,15 @@ class Envs:
     # Override DCP paged-decode head tiling for full-model tuning. Zero keeps
     # the backend heuristic.
     SGLANG_DSV4_DCP_BLOCK_H = EnvInt(16)
+    # Experimental gfx950 B1 decode path: make unified paged decode write the
+    # existing destination-major A2A output+LSE send layout directly, removing
+    # only the standalone pack launch. The A2A collective and local combine
+    # remain unchanged.
+    SGLANG_DSV4_DCP_DIRECT_A2A_OUTPUT = EnvBool(False)
+    # Experimental gfx950 DCP8 B1 BF16 decode route. The backend collectively
+    # registers fixed double receive planes before graph capture and otherwise
+    # leaves the established direct-A2A/RCCL route unchanged.
+    SGLANG_DSV4_DCP_REGISTERED_DESTINATION_PUSH = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends

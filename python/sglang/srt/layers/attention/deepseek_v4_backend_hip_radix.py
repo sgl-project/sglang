@@ -19,6 +19,18 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.dcp_a2a import (
+    DSV4_DCP_DIRECT_A2A_HEAD_DIM,
+    DSV4_DCP_DIRECT_A2A_HEADS,
+    DSV4_DCP_DIRECT_A2A_WORLD_SIZES,
+    DCPA2AOutputWorkspace,
+    DCPA2APackedOutput,
+    DCPDestinationPushOutput,
+    DCPDestinationPushWorkspace,
+    dsv4_dcp_decode_reducer_communicator,
+    prepare_dsv4_dcp_full_model_destination_push,
+    select_dsv4_dcp_full_model_output_workspaces,
+)
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
@@ -41,13 +53,32 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     copy_metadata,
     maybe_copy_inplace,
 )
-from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mla, dcp_a2a_lse_reduce
+from sglang.srt.layers.dcp import (
+    cp_lse_ag_out_rs_mla,
+    dcp_a2a_lse_reduce,
+    dcp_registered_destination_push_lse_reduce,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
-from sglang.srt.utils import ceil_align
+from sglang.srt.utils import ceil_align, is_gfx95_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -63,6 +94,13 @@ PAGE_INDEX_ALIGNED_SIZE = 64
 
 
 T = TypeVar("T", bound=Optional[torch.Tensor])
+
+
+def _is_exact_gfx950() -> bool:
+    """Restrict the peer-push route to its validated architecture."""
+    if not is_gfx95_supported():
+        return False
+    return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
 
 
 def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
@@ -523,6 +561,51 @@ class DeepseekV4HipRadixBackend(
                     "parallelism until the two-dimensional token/head exchange is "
                     "implemented."
                 )
+        features = get_exec().features
+        self._direct_a2a_state_capture_configured = bool(
+            features.enable_return_hidden_states
+            or features.return_hidden_states_mode is not None
+            or features.enable_return_routed_experts
+            or features.enable_return_indexer_topk
+        )
+        self._direct_a2a_tbo_configured = bool(
+            model_runner.server_args.enable_two_batch_overlap
+        )
+        self._direct_a2a_speculative_configured = (
+            not model_runner.spec_algorithm.is_none()
+        )
+        self._destination_push_is_gfx950 = _is_exact_gfx950()
+        self._destination_push_workspace: Optional[DCPDestinationPushWorkspace] = None
+        self._destination_push_communicator = None
+        self._destination_push_route_logged = False
+        self._prepare_dsv4_destination_push_workspace(model_runner.dtype)
+        self._direct_a2a_output_workspace: Optional[DCPA2AOutputWorkspace] = None
+        if (
+            envs.SGLANG_DSV4_DCP_DIRECT_A2A_OUTPUT.get()
+            and is_gfx95_supported()
+            and self.dsv4_dcp_size in DSV4_DCP_DIRECT_A2A_WORLD_SIZES
+            and get_parallel().dcp_comm_backend == "a2a"
+            and model_runner.dtype == torch.bfloat16
+            and not self.is_draft_worker
+            and not self._direct_a2a_tbo_configured
+            and not self._direct_a2a_speculative_configured
+            and not get_exec().features.enable_memory_saver
+            and not envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            and self.hisparse_coordinator is None
+            and not self._direct_a2a_state_capture_configured
+            and not check_cuda_graph_backend(Phase.DECODE, Backend.TC_PIECEWISE)
+            and not check_cuda_graph_backend(Phase.DECODE, Backend.BREAKABLE)
+        ):
+            # B1-only fixed storage is allocated before any graph capture. One
+            # workspace is safely reused layer-by-layer because each A2A/combine
+            # consumes it before the next attention producer runs.
+            self._direct_a2a_output_workspace = DCPA2AOutputWorkspace.allocate(
+                world_size=self.dsv4_dcp_size,
+                max_batch_size=1,
+                num_heads=DSV4_DCP_DIRECT_A2A_HEADS,
+                head_dim=DSV4_DCP_DIRECT_A2A_HEAD_DIM,
+                device=self.device,
+            )
         self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens
         if self.is_dspark_draft:
             assert self.speculative_num_draft_tokens is not None
@@ -537,6 +620,109 @@ class DeepseekV4HipRadixBackend(
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
         ] = None
+
+    def _prepare_dsv4_destination_push_workspace(
+        self, model_dtype: torch.dtype
+    ) -> None:
+        """Collectively register the fixed workspace before graph capture."""
+        if (
+            not envs.SGLANG_DSV4_DCP_REGISTERED_DESTINATION_PUSH.get()
+            or not self._destination_push_is_gfx950
+            or self.dsv4_dcp_size != 8
+            or get_parallel().dcp_comm_backend != "a2a"
+            or model_dtype != torch.bfloat16
+            or self.is_draft_worker
+            or self._direct_a2a_tbo_configured
+            or self._direct_a2a_speculative_configured
+            or get_exec().features.enable_memory_saver
+            or envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            or self.hisparse_coordinator is not None
+            or self._direct_a2a_state_capture_configured
+            or check_cuda_graph_backend(Phase.DECODE, Backend.TC_PIECEWISE)
+            or check_cuda_graph_backend(Phase.DECODE, Backend.BREAKABLE)
+        ):
+            return
+
+        parallel = get_parallel()
+        workspace, push_communicator = prepare_dsv4_dcp_full_model_destination_push(
+            dcp_group=parallel.dcp_group,
+            candidate_groups=[
+                ("dcp", parallel.dcp_group),
+                ("tp", parallel.tp_group),
+                ("attn_tp", parallel.attn_tp_group),
+            ],
+            dcp_rank=self.dsv4_dcp_rank,
+            device=self.device,
+        )
+        if workspace is None or push_communicator is None:
+            logger.warning(
+                "Unable to prepare DSV4 registered destination-push workspace "
+                "from equivalent bootstrap groups; retaining the existing A2A route"
+            )
+            return
+
+        # Preserve AITER ownership and registered addresses for graph replay.
+        self._destination_push_workspace = workspace
+        self._destination_push_communicator = push_communicator
+        logger.info(
+            "DSV4 registered destination-push workspace ready from selected group "
+            "(gfx950, DCP8==TP8, B1 BF16 decode)"
+        )
+
+    def _select_dsv4_dcp_decode_workspaces(
+        self,
+        *,
+        q: torch.Tensor,
+        unified_kv: torch.Tensor,
+        comm_backend: str,
+        is_plain_decode: bool,
+        batch_size: int,
+        speculative: bool,
+        memory_saver: bool,
+        state_capture: bool,
+        piecewise_graph: bool,
+        breakable_graph: bool,
+    ) -> tuple[Optional[DCPDestinationPushWorkspace], Optional[DCPA2AOutputWorkspace]]:
+        destination_push_workspace, direct_output_workspace = (
+            select_dsv4_dcp_full_model_output_workspaces(
+                destination_push_workspace=self._destination_push_workspace,
+                direct_output_workspace=self._direct_a2a_output_workspace,
+                communicator=self._destination_push_communicator,
+                destination_push_enabled=envs.SGLANG_DSV4_DCP_REGISTERED_DESTINATION_PUSH.get(),
+                direct_output_enabled=envs.SGLANG_DSV4_DCP_DIRECT_A2A_OUTPUT.get(),
+                is_gfx950=self._destination_push_is_gfx950,
+                direct_platform_supported=is_gfx95_supported(),
+                dcp_size=self.dsv4_dcp_size,
+                tbo=self._direct_a2a_tbo_configured,
+                hisparse=self.hisparse_coordinator is not None,
+                q=q,
+                unified_kv=unified_kv,
+                comm_backend=comm_backend,
+                is_plain_decode=is_plain_decode,
+                batch_size=batch_size,
+                speculative=speculative,
+                memory_saver=memory_saver,
+                state_capture=state_capture,
+                piecewise_graph=piecewise_graph,
+                breakable_graph=breakable_graph,
+            )
+        )
+        if (
+            destination_push_workspace is not None
+            and not self._destination_push_route_logged
+        ):
+            logger.info(
+                "DSV4 registered destination-push route selected "
+                "(gfx950, DCP8, B1 BF16 decode)"
+            )
+            self._destination_push_route_logged = True
+        return destination_push_workspace, direct_output_workspace
+
+    @staticmethod
+    def _reduce_dsv4_destination_push_output(
+        decode_output: DCPDestinationPushOutput, group
+    ) -> torch.Tensor:
+        return dcp_registered_destination_push_lse_reduce(decode_output, group)
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1402,7 +1588,52 @@ class DeepseekV4HipRadixBackend(
                 dcp_sink = dcp_sink + sink_logit_shift
                 sink_logit_shift = 0.0
             dcp_block_h = envs.SGLANG_DSV4_DCP_BLOCK_H.get()
-            partial_out, partial_lse = runtime.decode(
+            comm_backend = get_parallel().dcp_comm_backend
+            actual_forward_mode = getattr(
+                forward_batch, "actual_forward_mode", forward_batch.forward_mode
+            )
+            capture_hidden_mode = getattr(
+                forward_batch, "capture_hidden_mode", CaptureHiddenMode.NULL
+            )
+            is_plain_decode = (
+                forward_batch.forward_mode.is_decode()
+                and actual_forward_mode.is_decode()
+            )
+            speculative = (
+                self._direct_a2a_speculative_configured
+                or getattr(forward_batch, "spec_info", None) is not None
+            )
+            memory_saver = (
+                get_exec().features.enable_memory_saver
+                or envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            )
+            state_capture = (
+                self._direct_a2a_state_capture_configured
+                or capture_hidden_mode not in (None, CaptureHiddenMode.NULL)
+            )
+            piecewise_graph = (
+                is_in_tc_piecewise_cuda_graph()
+                or check_cuda_graph_backend(Phase.DECODE, Backend.TC_PIECEWISE)
+            )
+            breakable_graph = is_in_breakable_cuda_graph() or check_cuda_graph_backend(
+                Phase.DECODE, Backend.BREAKABLE
+            )
+            (
+                destination_push_workspace,
+                direct_output_workspace,
+            ) = self._select_dsv4_dcp_decode_workspaces(
+                q=q,
+                unified_kv=unified,
+                comm_backend=comm_backend,
+                is_plain_decode=is_plain_decode,
+                batch_size=forward_batch.batch_size,
+                speculative=speculative,
+                memory_saver=memory_saver,
+                state_capture=state_capture,
+                piecewise_graph=piecewise_graph,
+                breakable_graph=breakable_graph,
+            )
+            decode_output = runtime.decode(
                 q=q,
                 unified_kv=unified,
                 kv_indices=kv_indices,
@@ -1412,13 +1643,32 @@ class DeepseekV4HipRadixBackend(
                 return_lse=True,
                 attn_sink_logit_shift=sink_logit_shift,
                 block_h=dcp_block_h or None,
+                output_workspace=direct_output_workspace,
+                destination_push_workspace=destination_push_workspace,
             )
-            comm_backend = get_parallel().dcp_comm_backend
+            reducer_group = dsv4_dcp_decode_reducer_communicator(
+                decode_output,
+                destination_push_communicator=self._destination_push_communicator,
+                dcp_group=group,
+            )
+            if isinstance(decode_output, DCPDestinationPushOutput):
+                return self._reduce_dsv4_destination_push_output(
+                    decode_output, reducer_group
+                )
+            if isinstance(decode_output, DCPA2APackedOutput):
+                return dcp_a2a_lse_reduce(
+                    decode_output,
+                    None,
+                    reducer_group,
+                    is_lse_base_on_e=True,
+                    comm_backend=comm_backend,
+                )
+            partial_out, partial_lse = decode_output
             if comm_backend in ("a2a", "fi_a2a"):
                 return dcp_a2a_lse_reduce(
                     partial_out.contiguous(),
                     partial_lse.contiguous(),
-                    group,
+                    reducer_group,
                     is_lse_base_on_e=True,
                     comm_backend=comm_backend,
                 )
@@ -1426,7 +1676,7 @@ class DeepseekV4HipRadixBackend(
                 cp_lse_ag_out_rs_mla(
                     partial_out,
                     partial_lse,
-                    group,
+                    reducer_group,
                     is_lse_base_on_e=True,
                 )
                 .transpose(0, 1)

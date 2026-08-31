@@ -25,6 +25,10 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.attention.dcp_a2a import (
+    DCPA2APackedOutput,
+    DCPDestinationPushOutput,
+)
 from sglang.kernels.ops.attention.dcp_kernels import (
     CPTritonContext,
     _lse_pack_dim,
@@ -450,8 +454,8 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
 
 
 def dcp_a2a_lse_reduce(
-    cp_attn_out: torch.Tensor,
-    cp_attn_lse: torch.Tensor,
+    cp_attn_out: torch.Tensor | DCPA2APackedOutput,
+    cp_attn_lse: Optional[torch.Tensor],
     cp_group: "GroupCoordinator",
     is_lse_base_on_e: bool = True,
     cuda_graph_buffers: Optional[dict] = None,
@@ -460,44 +464,75 @@ def dcp_a2a_lse_reduce(
     """A2A DCP reduce: all-to-all exchange of head partials, then local Triton
     combine. Output + fp32 LSE are packed into ONE all_to_all (LSE reinterpreted
     as output-dtype columns along D) -> 1 NCCL call/layer instead of 2.
+    A ``DCPA2APackedOutput`` means the paged-decode producer already wrote that
+    exact send layout, so the standalone pack launch is skipped.
     is_lse_base_on_e: True=base-e (FlashAttention), False=base-2 (FlashInfer-MLA).
     """
     if cp_group.world_size == 1:
+        if isinstance(cp_attn_out, DCPA2APackedOutput):
+            raise ValueError("prepacked DCP A2A output requires world_size > 1")
         return cp_attn_out
 
+    prepacked = isinstance(cp_attn_out, DCPA2APackedOutput)
     if comm_backend == "fi_a2a":
+        if prepacked:
+            raise ValueError("prepacked DCP output supports only the a2a backend")
+        assert cp_attn_lse is not None
         return _dcp_fi_a2a_lse_reduce(
             cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
         )
 
     N = cp_group.world_size
-    B, H, D = cp_attn_out.shape
-    assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
-    H_per_rank = H // N
-    out_dtype = cp_attn_out.dtype
-    lpd = _lse_pack_dim(out_dtype)  # 2 for bf16/fp16
-
-    if cuda_graph_buffers is not None:
-        send_combined = cuda_graph_buffers["send_combined"]
-        recv_combined = cuda_graph_buffers["recv_combined"]
+    if prepacked:
+        if cp_attn_lse is not None or cuda_graph_buffers is not None:
+            raise ValueError(
+                "prepacked DCP output owns its LSE and send/receive workspace"
+            )
+        workspace = cp_attn_out.workspace
+        if not cp_attn_out.is_valid_for(
+            world_size=N,
+            device=workspace.send_combined.device,
+        ):
+            raise ValueError("invalid prepacked DSV4 DCP A2A output workspace")
+        if is_lse_base_on_e != cp_attn_out.is_lse_base_on_e:
+            raise ValueError("prepacked DCP LSE log base does not match the reducer")
+        B = cp_attn_out.batch_size
+        H = cp_attn_out.num_heads
+        D = cp_attn_out.head_dim
+        H_per_rank = H // N
+        out_dtype = workspace.send_combined.dtype
+        lpd = _lse_pack_dim(out_dtype)
+        send_combined = workspace.send_combined
+        recv_combined = workspace.recv_combined
     else:
-        send_combined = torch.empty(
-            N,
-            B,
-            H_per_rank,
-            D + lpd,
-            dtype=out_dtype,
-            device=cp_attn_out.device,
-        )
-        recv_combined = torch.empty_like(send_combined)
+        assert cp_attn_lse is not None
+        B, H, D = cp_attn_out.shape
+        assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
+        H_per_rank = H // N
+        out_dtype = cp_attn_out.dtype
+        lpd = _lse_pack_dim(out_dtype)  # 2 for bf16/fp16
 
-    send_words = send_combined.view(torch.float32)
-    dcp_pack_a2a_send(
-        cp_attn_out,
-        cp_attn_lse,
-        send_combined[:, :, :, :D],
-        send_words[:, :, :, D // lpd],
-    )
+        if cuda_graph_buffers is not None:
+            send_combined = cuda_graph_buffers["send_combined"]
+            recv_combined = cuda_graph_buffers["recv_combined"]
+        else:
+            send_combined = torch.empty(
+                N,
+                B,
+                H_per_rank,
+                D + lpd,
+                dtype=out_dtype,
+                device=cp_attn_out.device,
+            )
+            recv_combined = torch.empty_like(send_combined)
+
+        send_words = send_combined.view(torch.float32)
+        dcp_pack_a2a_send(
+            cp_attn_out,
+            cp_attn_lse,
+            send_combined[:, :, :, :D],
+            send_words[:, :, :, D // lpd],
+        )
 
     # Transport as raw bytes (uint8): the output may be fp8 (fp8 KV cache),
     # which pynccl's dtype enum can't send; byte a2a is exact for equal chunks.
@@ -511,6 +546,56 @@ def dcp_a2a_lse_reduce(
 
     combined, _ = dcp_lse_combine_triton(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
+    )
+    return combined
+
+
+def dcp_registered_destination_push_lse_reduce(
+    cp_attn_out: DCPDestinationPushOutput,
+    cp_group: "GroupCoordinator",
+    is_lse_base_on_e: bool = True,
+) -> torch.Tensor:
+    """Publish peer-push completion, then run the existing Triton combine."""
+    if not isinstance(cp_attn_out, DCPDestinationPushOutput):
+        raise TypeError("destination-push reducer requires its typed output marker")
+    N = cp_group.world_size
+    workspace = cp_attn_out.workspace
+    if (
+        N not in (2, 4, 8)
+        or workspace.source_rank != cp_group.rank_in_group
+        or not cp_attn_out.is_valid_for(
+            world_size=N, device=workspace.recv_planes.device
+        )
+        or is_lse_base_on_e != cp_attn_out.is_lse_base_on_e
+    ):
+        raise ValueError("invalid registered DSV4 destination-push output")
+    if not hasattr(
+        cp_group, "should_dsv4_dcp_destination_push"
+    ) or not cp_group.should_dsv4_dcp_destination_push(
+        workspace.recv_planes,
+        workspace.peer_recv_ptrs,
+        workspace.epoch,
+    ):
+        raise RuntimeError(
+            "registered DSV4 destination-push eligibility changed after producer launch"
+        )
+
+    # Stream order is producer -> one-block release/acquire barrier -> combine.
+    # Post-selection failures propagate because fallback could mismatch peers.
+    cp_group.dsv4_dcp_destination_push_ready(
+        workspace.recv_planes,
+        workspace.peer_recv_ptrs,
+        workspace.epoch,
+    )
+    recv_output, recv_lse = workspace.receive_output_and_lse_views(
+        batch_size=cp_attn_out.batch_size,
+        head_dim=cp_attn_out.head_dim,
+    )
+    combined, _ = dcp_lse_combine_triton(
+        recv_output,
+        recv_lse,
+        is_lse_base_on_e=is_lse_base_on_e,
+        plane_epoch=workspace.epoch,
     )
     return combined
 

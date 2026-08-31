@@ -31,6 +31,10 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dcp_a2a import (
+    DCPA2AOutputWorkspace,
+    DCPDestinationPushWorkspace,
+)
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
     sparse_attn_v4_paged_decode,
 )
@@ -350,6 +354,8 @@ def decode(
     return_lse: bool = False,
     attn_sink_logit_shift: float = 0.0,
     block_h: int | None = None,
+    output_workspace: DCPA2AOutputWorkspace | None = None,
+    destination_push_workspace: DCPDestinationPushWorkspace | None = None,
 ):
     return sparse_attn_v4_paged_decode(
         q,
@@ -361,6 +367,8 @@ def decode(
         block_h=block_h,
         return_lse=return_lse,
         attn_sink_logit_shift=attn_sink_logit_shift,
+        output_workspace=output_workspace,
+        destination_push_workspace=destination_push_workspace,
     )
 
 

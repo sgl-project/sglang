@@ -484,12 +484,15 @@ def dcp_pack_a2a_send(
 def _dcp_lse_combine_kernel(
     recv_output_ptr,
     recv_lse_ptr,
+    plane_epoch_ptr,
     out_ptr,
     out_lse_ptr,
+    recv_output_stride_P,
     recv_output_stride_N,
     recv_output_stride_B,
     recv_output_stride_H,
     recv_output_stride_D,
+    recv_lse_stride_P,
     recv_lse_stride_N,
     recv_lse_stride_B,
     recv_lse_stride_H,
@@ -500,6 +503,7 @@ def _dcp_lse_combine_kernel(
     HEAD_DIM: tl.constexpr,
     IS_BASE_E: tl.constexpr,
     RETURN_LSE: tl.constexpr,
+    DEVICE_PLANE: tl.constexpr,
 ):
     """Combine N partial attention outputs weighted by their LSE values.
 
@@ -514,7 +518,18 @@ def _dcp_lse_combine_kernel(
     head_idx = tl.program_id(1).to(tl.int64)
     d_offsets = tl.arange(0, HEAD_DIM)
 
-    lse_base = batch_idx * recv_lse_stride_B + head_idx * recv_lse_stride_H
+    if DEVICE_PLANE:
+        completed_epoch = tl.load(plane_epoch_ptr).to(tl.uint32)
+        plane = (completed_epoch - 1) & 1
+        output_plane_base = plane * recv_output_stride_P
+        lse_plane_base = plane * recv_lse_stride_P
+    else:
+        output_plane_base = 0
+        lse_plane_base = 0
+
+    lse_base = (
+        lse_plane_base + batch_idx * recv_lse_stride_B + head_idx * recv_lse_stride_H
+    )
 
     # Pass 1: find max LSE across N shards
     lse_max = tl.load(recv_lse_ptr + lse_base).to(tl.float32)
@@ -547,7 +562,8 @@ def _dcp_lse_combine_kernel(
         weight_sum += w
 
         o_offsets = (
-            i * recv_output_stride_N
+            output_plane_base
+            + i * recv_output_stride_N
             + batch_idx * recv_output_stride_B
             + head_idx * recv_output_stride_H
             + d_offsets * recv_output_stride_D
@@ -576,12 +592,16 @@ def dcp_lse_combine_triton(
     recv_lse: torch.Tensor,
     is_lse_base_on_e: bool = True,
     return_lse: bool = False,
+    plane_epoch: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Launch the Triton LSE-combine kernel.
 
     Args:
         recv_output: [N, B, H_local, D] partial outputs from each DCP rank.
         recv_lse:    [N, B, H_local]    log-sum-exp from each DCP rank.
+        plane_epoch: Optional device int32[1]. When supplied, inputs include a
+                     leading two-plane axis and the kernel selects
+                     ``(epoch - 1) & 1`` entirely on device.
         is_lse_base_on_e: True if LSE uses base-e (FlashAttention),
                           False if base-2 (FlashInfer).
         return_lse: If True, also return the combined global LSE.
@@ -589,7 +609,43 @@ def dcp_lse_combine_triton(
     Returns:
         (combined_output [B, H_local, D], combined_lse [B, H_local] or None)
     """
-    N, B, H_local, D = recv_output.shape
+    device_plane = plane_epoch is not None
+    if device_plane:
+        if (
+            recv_output.ndim != 5
+            or recv_lse.ndim != 4
+            or recv_output.shape[0] != 2
+            or recv_lse.shape[0] != 2
+            or recv_lse.shape[1:] != recv_output.shape[1:4]
+        ):
+            raise ValueError(
+                "device-plane combine expects output [2,N,B,H,D] and LSE [2,N,B,H]"
+            )
+        assert plane_epoch is not None
+        if (
+            plane_epoch.dtype != torch.int32
+            or plane_epoch.device != recv_output.device
+            or plane_epoch.numel() != 1
+            or not plane_epoch.is_contiguous()
+        ):
+            raise ValueError("plane_epoch must be contiguous device int32[1]")
+        _, N, B, H_local, D = recv_output.shape
+        output_plane_stride = recv_output.stride(0)
+        lse_plane_stride = recv_lse.stride(0)
+        output_strides = recv_output.stride()[1:]
+        lse_strides = recv_lse.stride()[1:]
+        epoch_arg = plane_epoch
+    else:
+        if recv_output.ndim != 4 or recv_lse.ndim != 3:
+            raise ValueError(
+                "ordinary combine expects output [N,B,H,D] and LSE [N,B,H]"
+            )
+        N, B, H_local, D = recv_output.shape
+        output_plane_stride = 0
+        lse_plane_stride = 0
+        output_strides = recv_output.stride()
+        lse_strides = recv_lse.stride()
+        epoch_arg = recv_lse
     out = torch.empty(
         (B, H_local, D), device=recv_output.device, dtype=recv_output.dtype
     )
@@ -603,15 +659,18 @@ def dcp_lse_combine_triton(
     _dcp_lse_combine_kernel[grid](
         recv_output,
         recv_lse,
+        epoch_arg,
         out,
         out_lse,
-        recv_output.stride(0),
-        recv_output.stride(1),
-        recv_output.stride(2),
-        recv_output.stride(3),
-        recv_lse.stride(0),
-        recv_lse.stride(1),
-        recv_lse.stride(2),
+        output_plane_stride,
+        output_strides[0],
+        output_strides[1],
+        output_strides[2],
+        output_strides[3],
+        lse_plane_stride,
+        lse_strides[0],
+        lse_strides[1],
+        lse_strides[2],
         out.stride(0),
         out.stride(1),
         out.stride(2),
@@ -619,6 +678,7 @@ def dcp_lse_combine_triton(
         HEAD_DIM=D,
         IS_BASE_E=is_lse_base_on_e,
         RETURN_LSE=return_lse,
+        DEVICE_PLANE=device_plane,
     )
     return out, (out_lse if return_lse else None)
 
