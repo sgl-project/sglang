@@ -114,12 +114,8 @@ class WeightChecker:
             raise Exception(f"Unsupported {action=}")
 
     def _snapshot(self):
-        # Back the snapshot with one mmap so releasing it returns the memory to
-        # the OS: the per-tensor copies are mostly below glibc's mmap threshold,
-        # and freeing arena chunks does not shrink RSS (Grace/64K pages: even
-        # malloc_trim reclaims nothing).
         named_params = [(name, param.data) for name, param in self._model_state()]
-        align = 64
+        align = 64  # torch CPU-allocator alignment
         offsets, total = [], 0
         for _, param in named_params:
             offsets.append(total)
@@ -174,9 +170,6 @@ class WeightChecker:
             ),
             allow_quant_error=allow_quant_error,
         )
-        # The snapshot is a host copy of every weight (tens of GB for a large
-        # model), only ever consumed here. Release it once the check passes --
-        # dropping the arena munmaps it; a failed compare keeps it for debugging.
         self._snapshot_tensors = None
         self._snapshot_arena = None
 
