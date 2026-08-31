@@ -347,6 +347,7 @@ jobs:
       - nightly-xpu-1-gpu
       - nightly-xpu-2-gpu
       - nightly-xpu-4-gpu
+      - nightly-xpu-8-gpu
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed
