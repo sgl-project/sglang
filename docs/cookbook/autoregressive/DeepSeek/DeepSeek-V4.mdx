@@ -86,6 +86,10 @@ import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/deepseek-ai/deepseek-v4.jsx";
 import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4-benchmarks.jsx";
 
+<Note>
+  The **Flash Vision (Exp)** variant runs on a dedicated preview Docker image, `lmsysorg/sglang:dev-dsv4-flash-vision` — its support ([sgl-project/sglang#37253](https://github.com/sgl-project/sglang/pull/37253)) has not shipped in a release yet. The command panel's Docker mode emits that image automatically for Flash Vision cells; see the [Flash Vision notes](#vision-note).
+</Note>
+
 <Deployment config={config} benchmarks={benchmarks} />
 
 <Note>

@@ -636,11 +636,11 @@ export const benchmarks = [
   { match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "high-throughput", nodes: "single" } },
   // ====================================================================
   // B200 + FP4 — Flash Vision (Exp)
-  // Speed numbers pending; MMMU-Pro comes from `defaultAccuracy`.
   // ====================================================================
   {
     match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "dev-dsv4-flash-vision",
+    accuracy: { mmmu_pro_pct: 74.96 },
     notes: "MMMU-Pro (standard, 10-option) measured with sgl-eval on 4×B200 (TP=4) at temperature 1.0, top-p 0.95, --reasoning-effort max.",
   },
   { match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },

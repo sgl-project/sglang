@@ -163,7 +163,6 @@ sgl-eval run mmmu_pro \\
   // Per-variant accuracy applied to every cell; per-cell `accuracy` overrides.
   defaultAccuracy: {
     flash: { gpqa_pct: 88.1, aime25_pct: 95,   gsm8k_pct: 96.13 },
-    "flash-vision": { mmmu_pro_pct: 74.96 },
     pro:   { gpqa_pct: 90.1, aime25_pct: 97.5, gsm8k_pct: 96.13 },
   },
 
