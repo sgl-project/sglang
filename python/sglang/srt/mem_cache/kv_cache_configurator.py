@@ -841,6 +841,103 @@ class KVCacheConfigurator:
             ),
         )
 
+    def _fused_draft_decision(self):
+        """Whether, and where, the EAGLE draft's layers fuse into the target's
+        sub-pools. Fusion applies only for: unified memory ON, a two-pool
+        hybrid-SWA target, an EAGLE-family algorithm whose draft config was
+        loaded at target boot and has no recurrent state of its own;
+        `place_fused_draft` then admits or declines the draft's layer kinds."""
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            FusedDraftDecision,
+            draft_kv_profile,
+            place_fused_draft,
+        )
+        from sglang.srt.mem_cache.unified_memory_pool import _store_dtype_for
+
+        aux = self.spec_aux_config
+        if not (
+            get_memory().enable_unified_memory
+            and self.is_hybrid_swa
+            and self.mambaish_config is None
+            and not self.is_draft_worker
+            and self.spec_algorithm.is_eagle()
+            and aux.eagle_draft_num_layers
+            and aux.draft_model_config is not None
+            and mambaish_config(aux.draft_model_config) is None
+        ):
+            return FusedDraftDecision()
+        profile = draft_kv_profile(
+            aux.draft_model_config,
+            num_layers=int(aux.eagle_draft_num_layers),
+            attn_tp_size=get_parallel().attn_tp_size,
+        )
+        num_runners = (
+            int(get_spec().speculative_num_steps)
+            if self.model_config.is_multi_layer_eagle
+            else 1
+        )
+        return place_fused_draft(
+            profile=profile,
+            num_runners=num_runners,
+            store_dtype=_store_dtype_for(self.kv_cache_dtype),
+        )
+
+    def fused_entry_bytes(self, sub_pool_name: str) -> Optional[int]:
+        """Per-token bytes of ``sub_pool_name``'s FUSED entry (host + draft +
+        pad) for the boot solve's cell model. Single source of truth: assembled
+        through the same spec the pool factory builds, so the priced entry and
+        the allocated entry cannot drift. None when the draft does not fuse
+        into that sub-pool."""
+        placement = self._fused_draft_decision().placement
+        if placement is None or sub_pool_name != "full":
+            return None
+        return self._full_host_spec(placement.region).entry_bytes()
+
+    def _full_host_spec(self, region):
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            MHASubPoolSpec,
+            _store_dtype_for,
+        )
+
+        return MHASubPoolSpec(
+            name="full",
+            layer_num=len(self.layer_info.full_attention_layer_ids),
+            head_num=self.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            ),
+            head_dim=self.model_config.head_dim,
+            store_dtype=_store_dtype_for(self.kv_cache_dtype),
+            grow_direction="down",
+            draft_region=region,
+        )
+
+    def _fused_draft_for_pool_factory(self):
+        """Resolve ONCE per factory call (not inline) so the boot log reports
+        exactly the placement the factory is handed: a declined fusion and an
+        engaged one otherwise look identical from outside."""
+        decision = self._fused_draft_decision()
+        if decision.placement is None:
+            if decision.declined is not None:
+                logger.warning("fused draft KV disabled: %s", decision.declined)
+            return None
+        placement = decision.placement
+        region = placement.region
+        logger.info(
+            "[unified-memory-pool] fused draft region in 'full': %d lane(s) x %d "
+            "kv head(s) x %d/%d k/v head_dim @ %s = %d B/token; runner lanes %s",
+            region.lane_num,
+            region.head_num,
+            region.head_dim,
+            region.resolved_v_head_dim(),
+            region.store_dtype,
+            region.entry_bytes(),
+            [
+                tuple(placement.lanes_for(r))
+                for r in range(len(placement.runner_lane_counts))
+            ],
+        )
+        return placement
+
     def _init_unified_swa_pools(
         self,
         *,
@@ -925,6 +1022,7 @@ class KVCacheConfigurator:
             # charged, see `_check_bs1_feasibility_floor`.
             model_context_len=self.model_config.context_len,
             sliding_window_size=self.model_config.sliding_window_size,
+            fused_draft=self._fused_draft_for_pool_factory(),
         )
         return UnifiedPoolBundle(
             unified_memory_pool=bundle.unified_memory_pool,
