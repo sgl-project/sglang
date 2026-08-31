@@ -1314,6 +1314,7 @@ def chunk_kda(
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
     output_intermediate_states: bool = False,
+    beta_is_raw: bool = False,
     **kwargs: object,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Match the public forward contract of SGLang's Triton ``chunk_kda``."""
@@ -1327,6 +1328,8 @@ def chunk_kda(
         raise ValueError("g and beta must cover every q token")
     g = g[:, :num_tokens]
     beta = beta[:, :num_tokens]
+    if beta_is_raw:
+        beta = beta.float().sigmoid()
     if num_tokens == 1:
         # Tracing constant-folds size-one dimensions, but the resulting kernel
         # can share a cache entry with longer inputs. Keep T=1 on Triton so a

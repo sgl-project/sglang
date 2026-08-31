@@ -115,7 +115,9 @@ def kimi_linear_config(model_config: ModelConfig):
 
 def glm5_next_config(model_config: ModelConfig):
     hf_config = model_config.hf_config
-    if hf_config.model_type == "glm5_next" and not model_config.is_draft_model:
+    if getattr(hf_config, "model_type", None) == "glm5_next" and not getattr(
+        model_config, "is_draft_model", False
+    ):
         return hf_config.get_text_config()
     return None
 
