@@ -60,6 +60,12 @@ def generate_draft_decode_kv_indices(
     kv_indices,
     kv_indptr,
     positions,
+    # Unified pool: v2p page table + kernel page multiplier of the DRAFT
+    # runner's KV family. req_to_token holds VIRTUAL ids there, and the fused
+    # draft pool is indexed by draft-dense ids, so the emitted indices must be
+    # translated in place. None/0 under TRANSLATE=False (compiled out).
+    v2p,
+    kv_mult,
     pool_len: tl.constexpr,
     kv_indices_stride: tl.constexpr,
     kv_indptr_stride: tl.constexpr,
@@ -67,6 +73,7 @@ def generate_draft_decode_kv_indices(
     iter_upper: tl.constexpr,
     num_tokens_upper: tl.constexpr,
     page_size: tl.constexpr,
+    TRANSLATE: tl.constexpr = False,
 ):
     BLOCK_SIZE: tl.constexpr = 128
     iters = tl.program_id(axis=0)
@@ -96,6 +103,14 @@ def generate_draft_decode_kv_indices(
     for _ in range(num_loop):
         mask = kv_offset < seq_len
         data = tl.load(token_pool_ptr + kv_offset, mask=mask)
+        if TRANSLATE:
+            # dense(t) = v2p[t // ps] * (ps * mult) + t % ps, clamped so a
+            # freed (-1) v2p row lands in the page-0 sink -- the
+            # translate_kv_loc_for_kernel formula, in int64 (Pattern A: the
+            # page * stride product overflows int32).
+            d64 = data.to(tl.int64)
+            phys = tl.load(v2p + d64 // page_size, mask=mask, other=0)
+            data = tl.maximum(phys * (page_size * kv_mult) + d64 % page_size, 0)
         tl.store(kv_ptr + kv_offset, data, mask=mask)
         kv_offset += BLOCK_SIZE
 
@@ -119,6 +134,10 @@ def generate_draft_decode_kv_indices(
             token_pool_ptr + start + extend_offset,
             mask=extend_offset < iters,
         )
+    if TRANSLATE:
+        e64 = extend_data.to(tl.int64)
+        phys = tl.load(v2p + e64 // page_size, mask=extend_offset < iters, other=0)
+        extend_data = tl.maximum(phys * (page_size * kv_mult) + e64 % page_size, 0)
 
     tl.store(kv_ptr + seq_len + extend_offset, extend_data, mask=extend_offset < iters)
 

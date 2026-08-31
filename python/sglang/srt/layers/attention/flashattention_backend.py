@@ -3511,6 +3511,8 @@ class FlashAttentionMultiStepBackend:
         self.model_runner = model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        # The backend uses the translator instead of translating by itself.
+        self.kv_index_translator = model_runner.kv_index_translator
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(

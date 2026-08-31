@@ -2413,6 +2413,8 @@ class FlashInferMultiStepDraftBackend:
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.req_to_token_pool = model_runner.req_to_token_pool
+        # The backend uses the translator instead of translating by itself.
+        self.kv_index_translator = model_runner.kv_index_translator
 
     def common_template(
         self,
@@ -2435,6 +2437,8 @@ class FlashInferMultiStepDraftBackend:
             seq_lens_sum=seq_lens_sum,
         )
 
+        translate_args = self.kv_index_translator.full_flat_translate_args()
+        v2p, kv_mult = translate_args if translate_args is not None else (None, 0)
         self.generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
@@ -2444,6 +2448,8 @@ class FlashInferMultiStepDraftBackend:
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
+            v2p,
+            kv_mult,
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
@@ -2451,6 +2457,7 @@ class FlashInferMultiStepDraftBackend:
             next_power_of_2(self.speculative_num_steps),
             next_power_of_2(bs),
             self.page_size,
+            TRANSLATE=translate_args is not None,
         )
 
         assert forward_batch.spec_info is not None

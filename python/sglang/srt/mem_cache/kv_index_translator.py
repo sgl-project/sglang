@@ -238,6 +238,14 @@ class KVIndexTranslator:
         )
         self._index_table_memo: Optional[Tuple[weakref.ref, KVIndexTable]] = None
 
+    def full_flat_translate_args(self) -> Optional[Tuple[torch.Tensor, int]]:
+        """``(v2p_page_table, kernel_page_multiplier)`` for a kernel that
+        translates flat full-side ids itself, or ``None`` when this runner
+        does not translate (pass-through and static pools)."""
+        if not self.is_translating:
+            return None
+        return (self._full_v2p_table, self._full_page_multiplier)
+
     def make_capture_tables(
         self, *, max_bs: int, max_context_len: int
     ) -> Optional[KVReadTables]:

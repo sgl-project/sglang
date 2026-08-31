@@ -238,6 +238,67 @@ class TestKVIndexSourceDraftDisposition(unittest.TestCase):
         src = _source(allocator, other_draft)
         self.assertFalse(src.is_translating)
 
+    def test_full_flat_translate_args_per_disposition(self):
+        """The flat-translate accessor must hand a kernel exactly what
+        `translate_kv_loc_for_kernel` would use: the runner's OWN multiplier over
+        the shared v2p table, and None on a pass-through runner. A refactor
+        rebinding the fused-draft accessor to the host multiplier reintroduces
+        the multi-step draft-decode virtual-id bug silently."""
+        pool, allocator, kvcache, draft_pool = _build()
+        spec = pool.mha_spec("full")
+
+        target = _source(allocator, kvcache)
+        args = target.full_flat_translate_args()
+        self.assertIsNotNone(args)
+        self.assertIs(args[0], allocator.full_v2p_page_table)
+        self.assertEqual(args[1], allocator.kernel_page_multiplier)
+
+        draft = _source(allocator, draft_pool)
+        args = draft.full_flat_translate_args()
+        self.assertIsNotNone(args)
+        self.assertIs(args[0], allocator.full_v2p_page_table)
+        self.assertEqual(args[1], spec.draft_kernel_page_multiplier())
+
+        passthrough = _source(allocator, _FakeKVCache(64))
+        self.assertIsNone(passthrough.full_flat_translate_args())
+
+    def test_multi_step_containers_pass_translate_args_to_the_kernel(self):
+        """Every `generate_draft_decode_kv_indices` launch must thread the
+        runner's flat-translate args and a matching TRANSLATE flag. A launch
+        without them emits raw req_to_token values, which under the unified
+        pool are VIRTUAL ids the fused draft pool cannot address — the exact
+        silent-garbage bug this series fixed."""
+        import pathlib
+        import re
+
+        import sglang.srt.mem_cache.kv_index_translator as _kit
+
+        root = pathlib.Path(_kit.__file__).parent.parent / "layers" / "attention"
+        launching = {}
+        for path in sorted(root.glob("*.py")):
+            text = path.read_text()
+            launches = len(re.findall(r"generate_draft_decode_kv_indices\[", text))
+            if launches:
+                launching[path.name] = (
+                    launches,
+                    len(re.findall(r"TRANSLATE=translate_args is not None", text)),
+                    "full_flat_translate_args" in text,
+                )
+        self.assertGreaterEqual(
+            len(launching), 4, f"launch sites disappeared: {sorted(launching)}"
+        )
+        for name, (launches, translated, has_accessor) in launching.items():
+            self.assertEqual(
+                launches,
+                translated,
+                f"{name}: {launches} kernel launch(es) but only {translated} "
+                "carry TRANSLATE=translate_args is not None",
+            )
+            self.assertTrue(
+                has_accessor,
+                f"{name} launches the kernel without full_flat_translate_args",
+            )
+
 
 class TestDispositionBranchesAgree(unittest.TestCase):
     """Every `__init__` disposition must assign the SAME attribute set.

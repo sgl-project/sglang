@@ -351,6 +351,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
         self.tree_mask_mode = default_tree_mask_mode()
 
+        # Boot guard: under the unified pool the draft's multi-step container
+        # and per-step backends must all carry THIS runner's translator, or
+        # their index builders emit virtual ids the fused draft pool cannot
+        # address.
+        translator = self.draft_runner.kv_index_translator
+        if translator.is_translating:
+            backends = [self.draft_attn_backend, self.draft_extend_attn_backend]
+            if self.draft_attn_backend is not None:
+                backends += self.draft_attn_backend.attn_backends
+            translator.bind_and_verify_backends(backends)
+
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
         self.cuda_graph_runner = None
