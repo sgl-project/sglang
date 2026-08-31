@@ -817,6 +817,7 @@ class ReqLogprob:
 class ReqKvInfo:
     # Device KV a request holds outside the prefix cache. Always present on the Req;
     # whether any KV is held is `holds_kv` (a row is registered).
+    # Match observations and scheduling state stay on the Req itself.
     req_pool_idx: Optional[int] = None  # req_to_token row, the register for the slots
 
     # The request's own KV is [cache_protected_len, kv_allocated_len).
@@ -838,9 +839,6 @@ class ReqKvInfo:
     mamba_last_track_idx: Optional[int] = None  # 0 or 1
     # Seq len of the last cached mamba state
     mamba_last_track_seqlen: Optional[int] = None
-    # The branching point seqlen to track mamba state. If set, given by prefix match,
-    # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
-    mamba_branching_seqlen: Optional[int] = None
     # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
     mamba_cow_src_index: Optional[torch.Tensor] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
@@ -1047,6 +1045,10 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
+        # The branching point seqlen to track mamba state. If set, given by prefix
+        # match, it will be the tracked seqlen in the ping pong buffer for the
+        # right prefill pass.
+        self.mamba_branching_seqlen: Optional[int] = None
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1438,7 +1440,7 @@ class Req(ReqDllmMixin):
                 self.host_hit_length,
                 self.swa_host_hit_length,
                 self.mamba_host_hit_length,
-                self.kv.mamba_branching_seqlen,
+                self.mamba_branching_seqlen,
             ) = (
                 match_result.device_indices,
                 match_result.last_device_node,
@@ -1755,7 +1757,7 @@ class Req(ReqDllmMixin):
         self.kv.mamba_next_track_idx = None
         self.kv.mamba_last_track_idx = None
         self.kv.mamba_last_track_seqlen = None
-        self.kv.mamba_branching_seqlen = None
+        self.mamba_branching_seqlen = None
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
         self.already_computed = 0
@@ -2788,22 +2790,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.kv.mamba_next_track_idx
                     )
                 )
-            if req.kv.mamba_branching_seqlen is not None:
+            if req.mamba_branching_seqlen is not None:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
-                    req.kv.mamba_branching_seqlen - len(req.prefix_indices)
+                    req.mamba_branching_seqlen - len(req.prefix_indices)
                 ) % cache_chunk_size == 0
                 if (
-                    req.kv.mamba_branching_seqlen > len(req.prefix_indices)
-                    and req.kv.mamba_branching_seqlen < mamba_track_seqlen
+                    req.mamba_branching_seqlen > len(req.prefix_indices)
+                    and req.mamba_branching_seqlen < mamba_track_seqlen
                     and branching_seqlen_aligned_mask
                 ):
                     # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                     # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                     # See _force_track_h() for more details.
-                    mamba_track_seqlen = _force_track_h(req.kv.mamba_branching_seqlen)
-                    mamba_track_seqlen_aligned = req.kv.mamba_branching_seqlen
+                    mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
+                    mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.kv.mamba_last_track_seqlen = mamba_track_seqlen_aligned
 
         return _MambaRadixCacheV2TrackEntry(

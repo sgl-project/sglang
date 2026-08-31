@@ -379,7 +379,7 @@ class MlxModelRunner:
 
         chunk_size = mamba_cache_chunk_size()
         track_len = prefix_len + (new_token_count // chunk_size) * chunk_size
-        branching_len = req.kv.mamba_branching_seqlen
+        branching_len = req.mamba_branching_seqlen
         if (
             branching_len is not None
             and prefix_len < branching_len <= prefix_len + new_token_count

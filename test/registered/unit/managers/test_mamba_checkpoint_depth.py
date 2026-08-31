@@ -47,7 +47,7 @@ def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int:
     req.set_extend_range(prefix_len, prefix_len + extend_len)
     req.kv.mamba_ping_pong_track_buffer = torch.tensor([0, 1], dtype=torch.int64)
     req.kv.mamba_next_track_idx = 0
-    req.kv.mamba_branching_seqlen = None
+    req.mamba_branching_seqlen = None
 
     batch = ScheduleBatch(reqs=[req])
     batch.model_config = SimpleNamespace(
