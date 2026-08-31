@@ -8,6 +8,7 @@ import torch.distributed as dist
 from pydantic import BaseModel, ConfigDict
 
 from sglang.srt.managers.mm_utils import tensor_hash
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import alloc_mmap
 from sglang.srt.utils.weight_checker_comparator import (
     CHUNK_NUMEL,
     ComparableWeight,
@@ -86,6 +87,7 @@ class WeightChecker:
         self._get_model = get_model
         self._ps = ps
         self._snapshot_tensors = None
+        self._snapshot_arena = None
 
     def handle(
         self,
@@ -111,12 +113,25 @@ class WeightChecker:
             raise Exception(f"Unsupported {action=}")
 
     def _snapshot(self):
-        named_tensors = [
-            (name, param.data.detach().cpu()) for name, param in self._model_state()
-        ]
-        self._snapshot_tensors = dict(named_tensors)
+        named_params = [(name, param.data) for name, param in self._model_state()]
+        align = 64  # torch CPU-allocator alignment
+        offsets, total = [], 0
+        for _, param in named_params:
+            offsets.append(total)
+            total += (param.nbytes + align - 1) // align * align
+        self._snapshot_arena = alloc_mmap((max(total, align),), torch.uint8)
+        snapshot_tensors = {}
+        for (name, param), offset in zip(named_params, offsets):
+            view = (
+                self._snapshot_arena[offset : offset + param.nbytes]
+                .view(param.dtype)
+                .view(param.shape)
+            )
+            view.copy_(param.detach())
+            snapshot_tensors[name] = view
+        self._snapshot_tensors = snapshot_tensors
         assert len(self._snapshot_tensors) == len(
-            named_tensors
+            named_params
         ), f"should not have duplicated tensor name"
 
     def _skip_compare_names(
@@ -154,6 +169,8 @@ class WeightChecker:
             ),
             allow_quant_error=allow_quant_error,
         )
+        self._snapshot_tensors = None
+        self._snapshot_arena = None
 
     def _compute_checksum(self, skip_tensor_list: Optional[List[str]] = None) -> Dict:
         torch.cuda.synchronize()

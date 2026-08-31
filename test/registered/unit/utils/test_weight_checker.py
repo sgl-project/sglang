@@ -568,6 +568,21 @@ class TestCompare(_WeightCheckerTestBase):
         self.checker._snapshot()
         self.checker._compare()  # no exception
 
+    def test_success_releases_snapshot(self):
+        self.checker._snapshot()
+        self.checker._compare()
+        self.assertIsNone(self.checker._snapshot_tensors)
+        self.assertIsNone(self.checker._snapshot_arena)
+        with self.assertRaises(AssertionError):
+            self.checker._compare()
+
+    def test_failure_keeps_snapshot(self):
+        self.checker._snapshot()
+        self.checker._reset_tensors()
+        with self.assertRaises(Exception):
+            self.checker._compare()
+        self.assertIsNotNone(self.checker._snapshot_tensors)
+
     def test_fails_after_reset_on_normal_param(self):
         self.checker._snapshot()
         self.checker._reset_tensors()
