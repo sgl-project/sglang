@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
+    mount_flux2_nvfp4_swiglu_quant,
     mount_fused_gate_rmsnorm,
     mount_fused_linear_gelu,
     mount_fused_ln_modulate,
@@ -28,6 +29,7 @@ from sglang.kernels.ops.diffusion import (
     mount_lingbot_video_rmsnorm,
     mount_ltx2_rms_norm_modulate,
     mount_sana_video_linear_attention,
+    unmount_flux2_nvfp4_swiglu_quant,
     unmount_fused_gate_rmsnorm,
     unmount_fused_linear_gelu,
     unmount_fused_ln_modulate,
@@ -161,6 +163,11 @@ logger = init_logger(__name__)
 _QUALITY_FUSION_HANDLERS: tuple[
     tuple[str, Callable[[nn.Module], bool], Callable[[nn.Module], None]], ...
 ] = (
+    (
+        "FLUX.2 NVFP4 FC1+SwiGLU+quant",
+        mount_flux2_nvfp4_swiglu_quant,
+        unmount_flux2_nvfp4_swiglu_quant,
+    ),
     (
         "fused linear+GELU (cublasLt epilogue)",
         mount_fused_linear_gelu,

@@ -24,9 +24,11 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fused_layernorm_modulate,
+    flux2_nvfp4_swiglu_quant_active,
     fused_layernorm_modulate_raw,
     fused_packed_silu_mul_bitexact,
     is_plain_layer_norm,
+    mark_flux2_nvfp4_swiglu_quant_site,
     residual_gate_add,
 )
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
@@ -244,7 +246,6 @@ class Flux2FeedForward(nn.Module):
             prefix=f"{prefix}.linear_out" if prefix else "linear_out",
         )
 
-        self._enable_nvfp4_swiglu_quant = False
         capability = current_platform.get_device_capability()
         if (
             _can_use_nvfp4_swiglu_quant_fusion(capability)
@@ -260,11 +261,11 @@ class Flux2FeedForward(nn.Module):
             # available.
             self.linear_in._interleave_for_swiglu_fusion = True
             self.linear_out._accepts_prequantized_fp4 = True
-            self._enable_nvfp4_swiglu_quant = True
+            mark_flux2_nvfp4_swiglu_quant_site(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
-            self._enable_nvfp4_swiglu_quant
+            flux2_nvfp4_swiglu_quant_active(self)
             and getattr(self.linear_in, "_swiglu_fusion_ready", False)
             and not torch.compiler.is_compiling()
             and not torch.cuda.is_current_stream_capturing()
