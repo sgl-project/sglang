@@ -7,10 +7,6 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.kernels.ops.gemm.skinny_ptpc_gemv import (
-    skinny_ptpc_gemv,
-    skinny_ptpc_gemv_supported,
-)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
@@ -209,6 +205,12 @@ if _use_aiter:
     )
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
+
+if _use_aiter_gfx95:
+    from sglang.kernels.ops.gemm.skinny_ptpc_gemv import (
+        skinny_ptpc_gemv,
+        skinny_ptpc_gemv_supported,
+    )
 
 
 if _is_cuda:

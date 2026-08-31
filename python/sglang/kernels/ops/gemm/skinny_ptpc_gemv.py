@@ -29,11 +29,11 @@ def skinny_ptpc_gemv_supported(m: int, n: int, k: int) -> bool:
     # Only the shapes where this measured faster than the aiter dispatch cold
     # (M3 qkv projections: N 1280/1536 at TP8, 2304/2560 at TP4).
     return (
-        m == 1
+        is_gfx95_supported()
+        and m == 1
         and k == 6144
         and 1280 <= n <= 2560
         and n % 64 == 0
-        and is_gfx95_supported()
     )
 
 
