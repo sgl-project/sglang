@@ -325,10 +325,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # Back-compat alias (count of virtual PAGES) consulted by is_slot_allocated.
         self.num_virtual_ids = self.num_pages
 
-        # N-pool chain neighbors: the adjacent sub-pool toward byte 0
-        # (`low_peer`) and toward `total_bytes` (`high_peer`). End pools have
-        # exactly one (wired via `bind_peer`); float middles have both (wired
-        # explicitly via `bind_low_peer`/`bind_high_peer`).
+        # Chain neighbours: `low_peer` toward byte 0, `high_peer` toward
+        # `total_bytes`. Ends have one (`bind_peer`), float middles have both.
         self.low_peer: Optional[MultiEndedAllocator] = None
         self.high_peer: Optional[MultiEndedAllocator] = None
 
@@ -705,11 +703,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if neighbor is None or not neighbor.lazy_compaction:
             return 0
         if neighbor.disagg_move_gate is not None and not neighbor.disagg_move_gate():
-            # The neighbor cannot compact while a PD transfer is in flight, so
-            # these holes are not realizable. Crediting them would let the
-            # scheduler admit work that `_flush_peer_for_alloc` then cannot
-            # satisfy, and the caller treats a failed alloc as a
-            # memory-estimation bug.
+            # Not realizable: a PD transfer blocks the neighbour's compaction.
+            # Crediting them admits work `_flush_peer_for_alloc` cannot satisfy,
+            # which the caller reads as a memory-estimation bug.
             return 0
         return len(neighbor._free_phys_pages) * neighbor.entry_bytes_per_page
 
@@ -858,12 +854,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             new_wm = self.watermark_physical - num_pages
             if new_wm < self.min_page_index - 1:
                 return False
-            # The chain below; `new_wm + 1` (our new lowest live page) must
-            # stay strictly above its high frontier. FLOOR conversion kept
-            # byte-identical to the pre-chain code: this check is a backstop —
-            # callers gate on `available_size()`, whose floor'd gap already
-            # guarantees an in-gap extension — so the floor's partial-page
-            # imprecision on misaligned frontiers is unreachable by contract.
+            # `new_wm + 1` must stay strictly above the chain's high frontier
+            # below. Backstop only: callers gate on `available_size()`, whose
+            # floor'd gap already guarantees the extension fits.
             chain_high_pages = (
                 self._chain_high_frontier_below_bytes() // self.entry_bytes_per_page
             )
@@ -2138,18 +2131,14 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
     """
 
     # The span IS this pool's capacity state (it has no watermark): moving it
-    # changes its own availability AND — via transparency + the chain frontier
-    # walks — both neighbors' gaps. Same `_CapacityField` contract as the end
-    # pools' `watermark_physical`, so a span move on the hole-free extension
-    # path (which rebinds no free-list) still invalidates every capacity memo.
+    # changes its own availability and, through transparency, both neighbours'
+    # gaps. Same `_CapacityField` contract as the ends' `watermark_physical`.
     low_wm_page: _CapacityField[int] = _CapacityField()
     high_wm_page: _CapacityField[int] = _CapacityField()
 
-    # Host-side "a free may have put a hole ON a boundary since the last
-    # absorb". Only `free` can make a boundary page a hole (alloc DRAINS holes
-    # into live pages, and extension adds live pages), so a clean flag means
-    # the boundaries are provably still live and the deferred absorb can skip
-    # its D2H entirely. Span-moving relocation re-arms it.
+    # Only `free` can make a boundary page a hole (alloc drains holes into live
+    # pages, extension adds live ones), so a clean flag proves both boundaries
+    # are live and the deferred absorb skips its D2H. Relocation re-arms it.
     _holes_dirty: bool = False
 
     def __init__(self, **kwargs):
@@ -2209,16 +2198,10 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         return lo, hi
 
     def pages_in_band(self, *, low_byte: int, high_byte: int) -> int:
-        """Pages this float can actually take from the byte band
-        ``[low_byte, high_byte)``, on its OWN page grid.
-
-        Same conservative rounding as `_region_bounds_pages` (low UP, high
-        DOWN) and the same clamps. A raw ``(high - low) // entry_bytes_per_page``
-        OVER-counts by up to one page whenever ``low_byte`` is not a multiple of
-        this pool's page size -- which is the generic case, since the bounding
-        frontier is a multiple of the NEIGHBOUR's entry size and the two entry
-        sizes are unrelated. Callers pricing an extension in bytes must go
-        through here or they hand out a page the grid cannot yield.
+        """Pages obtainable from ``[low_byte, high_byte)`` on this pool's OWN
+        page grid. A raw ``(high - low) // entry_bytes_per_page`` over-counts by
+        a page whenever ``low_byte`` is off the grid, which is the generic case:
+        the bounding frontier is a multiple of the NEIGHBOUR's entry size.
         """
         epp = self.entry_bytes_per_page
         lo = max((low_byte + epp - 1) // epp, self.min_page_index)
@@ -2250,10 +2233,9 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         return len(p._free_phys_pages) * p.entry_bytes_per_page
 
     def _peer_drainable_hole_bytes(self) -> int:
-        """The better of the two sides. The base version asks
-        `_growth_side_neighbor()`, which is undefined for a float: its
-        `grow_direction` is "float", so the base falls through to `low_peer`
-        and silently ignores the high neighbour entirely.
+        """The better of the two sides. `_growth_side_neighbor()` is undefined
+        for a float -- its `grow_direction` is "float", so the base answers
+        `low_peer` and never sees the high neighbour.
         """
         return max(
             self._side_drainable_hole_bytes("low"),
@@ -2263,11 +2245,8 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
     def _available_tokens(self, extra_gap_bytes: int = 0) -> int:
         gap_low, gap_high = self._gap_pages()
         if extra_gap_bytes > 0:
-            # Credit each neighbour to ITS OWN side. The base contract hands
-            # down one undirected scalar because an END pool grows one way; a
-            # float grows both, and adding a LOW neighbour's holes to the HIGH
-            # gap over-reports schedulable capacity -- which the scheduler then
-            # admits work against and the ladder cannot satisfy.
+            # Per side: the base hands down one undirected scalar because an
+            # END pool grows one way, but a float grows both.
             epp = self.entry_bytes_per_page
             gap_low += self._side_drainable_hole_bytes("low") // epp
             gap_high += self._side_drainable_hole_bytes("high") // epp
@@ -2372,14 +2351,10 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             if self.free_group is not None:
                 self.free_group.append(self._copy_for_free_group(free_index))
                 return
-            # Same page-derivation ladder as `_free_lazy`: caller-supplied
-            # ids, the ps==1 identity, then the dedup fallback for arbitrary
-            # (radix-shaped) input. No stale-slot `.item()` assert — same
-            # contract as the lazy path: callers must not double-free (a
-            # tombstoned page here would be appended to the hole list), and
-            # the composite's tombstone filters uphold it. The idle byte
-            # verifier's span == p2v-bound + holes conservation catches a
-            # violation after the fact without a per-free host sync.
+            # Page-derivation ladder, as `_free_lazy`: caller ids, the ps==1
+            # identity, then dedup. No stale-slot assert -- callers must not
+            # double-free (a tombstoned page would join the hole list); the
+            # composite's filters uphold it and the byte verifier catches a miss.
             free_v_pages_raw = free_index.detach().to(torch.int64)
             if _pages is not None:
                 free_v_pages = _pages
@@ -2388,9 +2363,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             else:
                 free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
             freed_p_pages = self.virtual_to_physical[free_v_pages]
-            # `index_fill_`, NOT `t[idx] = -1`: the scalar form materialises -1
-            # as a CPU tensor and issues a host-BLOCKING pageable H2D copy. Same
-            # contract as the END free path.
+            # `index_fill_`, never `t[idx] = -1`: see the END free path.
             self.virtual_to_physical.index_fill_(0, free_v_pages, -1)
             self.physical_to_virtual.index_fill_(0, freed_p_pages, -1)
             if self.is_id_owner:
@@ -2473,15 +2446,9 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         the entry settles the in-flight forward before the first copy.
         """
         assert side in ("low", "high"), f"side must be 'low'|'high'; got {side!r}"
-        # The relocation below MOVES live KV and then rebinds v2p. The in-flight
-        # forward may still be writing the pages about to be copied, so the copy
-        # would carry pre-write bytes and the rebind would point every later
-        # reader at a destination that never received those writes -- silently
-        # wrong KV, no crash. Order the copy after the forward first: a stream
-        # wait, not a host sync. Same discipline as the END pools'
-        # `_flush(urgent=True)`; one wait covers BOTH the write and the read
-        # hazard because the event is recorded after the WHOLE forward, which is
-        # why no write-set classification is needed here.
+        # Order the copies after the in-flight forward, or they carry pre-write
+        # bytes and the rebind sends readers to a destination that never got
+        # them. One wait covers read AND write: the event is post-forward.
         self._settle_inflight_forward()
         epp = self.entry_bytes_per_page
         lo, hi = self._region_bounds_pages()
@@ -2522,11 +2489,8 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             srcs = live_pages_sorted[: min(need_pages, live)]
         src_set = set(srcs)
 
-        # Destinations, all strictly on the far side of EVERY source (keeps
-        # the batched move src/dst-disjoint and actually retreats the edge):
-        # interior holes beyond the source block first (deepest-first, pushing
-        # live mass toward the far side), then fresh far-gap pages (extending
-        # the far boundary).
+        # Strictly on the far side of EVERY source: keeps the batched move
+        # src/dst-disjoint and actually retreats the edge.
         if side == "high":
             usable_holes = sorted(h for h in holes if h < min(srcs))
         else:
@@ -2600,10 +2564,8 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
                 # Overlapping shift: process toward the move direction so each
                 # destination is free by the time it is written.
                 ordered = pairs if final[0] <= live_sorted[0] else list(reversed(pairs))
-                # Build both id tensors ONCE. `torch.tensor(..., device=cuda)`
-                # inside the loop is a pageable H2D per page (two per page here),
-                # and a shift can be as long as the span; slicing a prebuilt
-                # tensor keeps the per-page ordering with 2 copies total.
+                # Built ONCE: `torch.tensor(..., device=cuda)` in the loop is a
+                # pageable H2D per page, and a shift can span the whole pool.
                 src_all = torch.tensor(
                     [s for s, _ in ordered], dtype=torch.int64, device=self.device
                 )
@@ -2708,15 +2670,9 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         assert retreat_side in ("low", "high")
         if self._hole_pages() == 0:
             return 0
-        # The relocation below MOVES live KV and then rebinds v2p. The in-flight
-        # forward may still be writing the pages about to be copied, so the copy
-        # would carry pre-write bytes and the rebind would point every later
-        # reader at a destination that never received those writes -- silently
-        # wrong KV, no crash. Order the copy after the forward first: a stream
-        # wait, not a host sync. Same discipline as the END pools'
-        # `_flush(urgent=True)`; one wait covers BOTH the write and the read
-        # hazard because the event is recorded after the WHOLE forward, which is
-        # why no write-set classification is needed here.
+        # Order the copies after the in-flight forward, or they carry pre-write
+        # bytes and the rebind sends readers to a destination that never got
+        # them. One wait covers read AND write: the event is post-forward.
         self._settle_inflight_forward()
         holes = set(int(x) for x in self._free_phys_pages.tolist())
         live_sorted = [
@@ -3317,13 +3273,10 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.schedulable_swa_available_size(),
         )
 
-    # Public slot-conservation views for the LEAK INVARIANT only. It must pair the
-    # static per-layer total with the conserve view (static cap − live), NEVER the
-    # `min(conserve, byte-coordinated)` that `full_available_size()`/`swa_available_size()`
-    # report to schedulers: under the floating full/swa/mamba boundary the byte term
-    # dips below the conserve cap, and the bytes lent to a peer sub-pool would read as
-    # a spurious leak (see the `_conserve_*` note above). Scheduling/eviction keep the
-    # `min(...)` views; only the invariant checker reads these.
+    # Slot-conservation views for the LEAK INVARIANT only, which pairs the static
+    # per-layer total with (static cap - live). Schedulers keep the `min(...)`
+    # views above: under the floating boundary the byte term dips below the
+    # conserve cap, so bytes lent to a peer sub-pool would read as a leak.
     def conserve_full_available_size(self) -> int:
         return self._conserve_full_available_size()
 
@@ -3805,10 +3758,9 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         self.swa_attn_allocator.bind_high_peer(self.full_attn_allocator)
         self.full_attn_allocator.bind_low_peer(self.swa_attn_allocator)
 
-        # None (not empty): the invariant checker's mamba leak-diagnosis census
-        # mixes physical free-lists with tree-held VIRTUAL ids — meaningless
-        # under the unified pool. `free_pages is None` is the checker's
-        # documented skip contract ("the dump must never crash the watchdog").
+        # None, not empty: the checker's mamba census mixes physical free-lists
+        # with tree-held VIRTUAL ids, meaningless here. `free_pages is None` is
+        # its documented skip contract.
         self.free_pages = None
         self.release_pages = None
 
@@ -3886,10 +3838,8 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
             if ext_f * e_f > b_high:
                 return False
             ext_s = max(0, n - h_s)
-            # Price the float's extension on its OWN page grid, never in raw
-            # bytes: the band's low edge rounds UP to the float's page size, so
-            # a byte budget credits up to one page `take_physical_pages` cannot
-            # yield -- and `alloc_with_virtual` then trips its backstop assert.
+            # On the float's page grid, never in raw bytes: a byte budget
+            # credits a page `take_physical_pages` cannot yield.
             full_low_after = fa._byte_low_frontier() - ext_f * e_f
             if sa._is_frontier_transparent():
                 room = sa.pages_in_band(

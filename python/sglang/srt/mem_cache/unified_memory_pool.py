@@ -327,10 +327,9 @@ class UnifiedKVPool:
 
         self.device = device
         self.total_bytes = total_bytes
-        # Canonical chain order, low byte end -> high byte end: the grow-up end
-        # pool, float middles (input order preserved), the grow-down end pool.
-        # Input list order is otherwise irrelevant (all access is by-name); the
-        # chain order is what the allocators' neighbor wiring follows.
+        # Canonical chain order, low byte end -> high: grow-up end, float
+        # middles (input order preserved), grow-down end. The allocators'
+        # neighbour wiring follows it; all other access is by-name.
         self.sub_pool_specs: List[SubPoolSpec] = [
             up_specs[0],
             *float_specs,
@@ -872,10 +871,9 @@ class UnifiedMambaPool(MambaPool):
     # take PHYSICAL slot ids; callers translate via the slot allocator first.
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        # The cross-pool physical-move contract (same signature every pool the
-        # MultiEndedAllocator wraps implements): compaction moves state
-        # envelopes with it. Ids are PHYSICAL slots; MambaPool.copy_from takes
-        # (src, dst), hence the swap.
+        # Cross-pool physical-move contract, implemented by every pool the
+        # MultiEndedAllocator wraps. Ids are PHYSICAL slots; `MambaPool.copy_from`
+        # takes (src, dst), hence the swap.
         MambaPool.copy_from(self, src_loc, tgt_loc)
 
     # -- PD state transfer (StateType.MAMBA) --
@@ -1872,10 +1870,8 @@ def init_unified_mamba_swa_pools(
     assert len(mamba_layer_ids) > 0, "tri-pool with zero state layers is degenerate"
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
-    # Placement: mamba/conv at the LOWEST bytes (end), full KV at the HIGHEST
-    # (end), SWA floating between — ends never relocate, so the fat request-
-    # granular state pool and the unbounded per-step grower are pinned; SWA's
-    # window-capped span with the cheapest slots to move floats.
+    # mamba/conv at the LOWEST bytes, full KV at the HIGHEST, SWA floating
+    # between: ends never relocate, and SWA's window-capped span is cheapest to move.
     full_spec = MHASubPoolSpec(
         name="full",
         layer_num=len(full_attention_layer_ids),
@@ -1917,13 +1913,10 @@ def init_unified_mamba_swa_pools(
             + swa_max_total_num_tokens * swa_spec.entry_bytes()
             + max_mamba_cache_size * mamba_spec.entry_bytes()
         )
-    # bs=1 floor (the retract loop's terminal guarantee), tri form: full KV at
-    # max context + ONE sliding window of swa KV (+ a page of slack, clamped
-    # to the context) + the state slots ONE running request locks (1 active +
-    # 2 radix checkpoints -- a per-request FLOOR, not headroom) + the reserved
-    # slot-0 sink. The full-attention token side is NOT charged, for the reason
-    # the two sibling factories give: max_req_len already clamps a request to
-    # the full pool's capacity, so it cannot livelock.
+    # bs=1 floor: ONE sliding window of swa KV (+ a page of slack, clamped to
+    # the context) + the state slots one running request locks (1 active + 2
+    # radix checkpoints, a FLOOR not headroom) + the slot-0 sink. The
+    # full-attention side is not charged: `max_req_len` already clamps to the pool.
     swa_bs1_tokens = (
         min(model_context_len, sliding_window_size + page_size)
         if sliding_window_size is not None

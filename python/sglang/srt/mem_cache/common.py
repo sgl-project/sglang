@@ -108,10 +108,9 @@ def free_swa_out_of_window_slots(
         )
 
         if isinstance(token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator):
-            # The slice is a CONTIGUOUS range with host-int, page-aligned
-            # bounds — hand the unified composite its start position so the
-            # per-decode-step free stays host-sync-free (the `free_segment`
-            # contract: page reps by stride math, no `torch.unique`).
+            # Contiguous range with host-int bounds: hand the composite its
+            # start position so the free stays host-sync-free (`free_segment`
+            # derives page reps by stride math instead of `torch.unique`).
             token_to_kv_pool_allocator.free_swa(
                 free_slots, start_pos=req.kv.swa_evicted_seqlen
             )

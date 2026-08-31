@@ -410,11 +410,10 @@ class KVCacheConfigurator:
         if get_memory().enable_unified_memory and req_to_token_pool is None:
             pd_enabled = get_disagg().disaggregation_mode != "null"
             is_dsv4 = is_deepseek_v4(self.model_config.hf_config)
-            # Order matters: an Inkling-class model is BOTH mambaish (conv-only
-            # state rides the mamba machinery) AND hybrid-SWA — routing it to
-            # the mamba pair would silently store the SWA layers' KV at FULL
-            # lifetime (the mamba branch reads the HF config's
-            # full_attention_layer_ids, which for Inkling is ALL layers).
+            # Order matters: an Inkling-class model is BOTH mambaish and
+            # hybrid-SWA, and the mamba pair would store every SWA layer's KV at
+            # FULL lifetime -- its branch reads the HF config's
+            # full_attention_layer_ids, which for Inkling is ALL layers.
             if self.mambaish_config is not None and self.is_hybrid_swa and not is_dsv4:
                 if pd_enabled:
                     # Same limitation as the 2-pool SWA branch below: the
@@ -725,11 +724,9 @@ class KVCacheConfigurator:
             swa_head_dim = head_dim
             swa_v_head_dim = head_dim
 
-        # KV layer split from the sglang ModelConfig WRAPPER (e.g. Inkling:
-        # 11 full / 55 swa), NEVER the HF config's full_attention_layer_ids —
-        # for Inkling that hf property returns ALL layers (it feeds the
-        # conv/attention pairing, not the KV-lifetime split) and using it here
-        # would store every SWA layer's KV at full lifetime.
+        # From the sglang ModelConfig WRAPPER, never the HF config's
+        # full_attention_layer_ids: that property feeds the conv/attention
+        # pairing, not the KV-lifetime split, and returns ALL layers.
         swa_attention_layer_ids = [
             i
             for i in self.model_config.swa_attention_layer_ids

@@ -548,14 +548,10 @@ class PrefillAdder:
 
         self.rem_swa_token_offset = 0
 
-        # Unified-pool joint budget: a new mamba/conv state slot consumes
-        # shared-gap bytes that `rem_total_tokens` (full KV) otherwise counts as
-        # free, so reserve the gap per new state slot or admission over-commits.
-        # Gate on the ALLOCATOR being a unified composite WITH a state end
-        # (the 2-pool mamba pair or the tri-pool mamba+swa chain), NOT on
-        # `is_hybrid_ssm_cache` (False for `ChunkCache`, which would skip the
-        # reservation on the chunk-cache path): the gap coupling is a property
-        # of the byte buffer.
+        # A new state slot eats shared-gap bytes that `rem_total_tokens` counts
+        # as free, so reserve per slot or admission over-commits. Gate on the
+        # ALLOCATOR, not `is_hybrid_ssm_cache`: that is False for `ChunkCache`,
+        # which would skip the reservation on the chunk-cache path.
         self._mamba_slot_cost = 0
         if isinstance(
             self.token_to_kv_pool_allocator,

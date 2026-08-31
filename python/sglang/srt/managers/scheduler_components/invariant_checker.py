@@ -121,12 +121,8 @@ class SchedulerInvariantChecker:
             )
         full_available = ps.full_available_size
         if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
-            # Tri-pool (Inkling): full/swa/mamba share one byte buffer with a
-            # FLOATING boundary, so the leak invariant must see the SLOT-CONSERVATION
-            # view (static cap − live). `ps.full_available_size` reports
-            # `min(conserve, byte-coordinated)`; once swa/mamba borrow full's bytes the
-            # byte term dips below the conserve cap and the borrowed bytes read as a
-            # phantom leak against the static `full_tokens_per_layer` total.
+            # Pair the static per-layer total with the conserve view, never the
+            # byte-coordinated one -- see `conserve_full_available_size`.
             full_available = allocator.conserve_full_available_size()
         leak, msg = self._check_pool_invariant(
             "full",

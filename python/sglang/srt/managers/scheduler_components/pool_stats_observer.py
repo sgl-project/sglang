@@ -288,16 +288,10 @@ class SchedulerPoolStatsObserver:
         )
 
     def _get_swa_token_info(self) -> PoolStats:
-        # `*_num_used` below is `static_cap - (available + evictable)`, so the
-        # available term must be denominated the SAME way as the static cap.
-        # The unified tri-pool's `full_available_size()` is BYTE-coordinated
-        # across a floating boundary: once swa or mamba borrow full's bytes it
-        # dips below the per-side conserve cap, and subtracting it from the
-        # static `full_tokens_per_layer` charges the borrowed bytes as
-        # "used" — inflating `#full token` and `token usage` by a large factor
-        # (observed ~25-90x on tri models). Use the slot-conservation view
-        # there, exactly as the idle leak invariant does for the same
-        # expression.
+        # `*_num_used` is `static_cap - (available + evictable)`, so the
+        # available term must match the static cap's denomination: the conserve
+        # view, never the byte-coordinated one (see
+        # `conserve_full_available_size`). Measured ~25-90x inflated otherwise.
         allocator = self.token_to_kv_pool_allocator
         if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
             full_available_size = allocator.conserve_full_available_size()
