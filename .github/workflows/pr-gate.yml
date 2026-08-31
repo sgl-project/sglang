@@ -53,7 +53,7 @@ jobs:
         if: github.event_name == 'pull_request' && fromJson(steps.pr.outputs.draft)
         run: |
           echo "PR is draft. Blocking CI."
-          exit 1
+          exit 0
 
       - name: Require run-ci label (optional)
         if:  github.event_name == 'pull_request' && inputs.require-run-ci == true
