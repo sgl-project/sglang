@@ -42,7 +42,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     flashinfer_per_tensor_fp8_supported,
-    is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
@@ -63,10 +62,10 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
-    is_sm120_supported,
     round_up,
     set_weight_attrs,
 )
@@ -151,7 +150,7 @@ def fp4_gemm(
     )
 
 
-if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
+if is_cuda() and (not get_platform().is_sm120) and (fp4_quantize is not None):
 
     @register_fake_if_exists("sgl_kernel::scaled_fp4_quant")
     def _sgl_kernel_scaled_fp4_quant_fake(
@@ -776,6 +775,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]],
         quantized_layers: Dict[str, Dict[str, Any]],
         fp8_config: ModelOptFp8Config,
+        fp8_pb_wo_config: Fp8Config,
         nvfp4_config: ModelOptFp4Config,
         nvfp4a16_config: ModelOptFp4Config,
         mxfp8_config: Fp8Config,
@@ -783,6 +783,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
+        self.fp8_pb_wo_config = fp8_pb_wo_config
         self.mxfp8_config = mxfp8_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
@@ -867,6 +868,12 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             exclude_modules=[],
             packed_modules_mapping=packed_modules_mapping,
         )
+        fp8_pb_wo_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+            packed_modules_mapping=packed_modules_mapping,
+        )
         mxfp8_config = Fp8Config(
             is_checkpoint_fp8_serialized=True,
             activation_scheme="dynamic",
@@ -896,6 +903,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             quantized_layers=quantized_layers,
             fp8_config=fp8_config,
+            fp8_pb_wo_config=fp8_pb_wo_config,
             mxfp8_config=mxfp8_config,
             nvfp4_config=nvfp4_config,
             nvfp4a16_config=nvfp4a16_config,
@@ -977,6 +985,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
+            if quant_algo == "FP8_PB_WO":
+                return Fp8LinearMethod(self.fp8_pb_wo_config)
             if quant_algo == "MXFP8":
                 return Fp8LinearMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":
@@ -1396,6 +1406,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "format is experimental and subject to change."
             )
         self.is_awq = is_awq
+        self.is_w4a16 = False
         self.group_size = group_size
         if not is_checkpoint_nvfp4_serialized:
             if use_per_token_activation:
@@ -1550,9 +1561,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
                 )
 
-        if quant_method not in ["FP8", "NVFP4", "NVFP4_AWQ"]:
+        if quant_method not in ["FP8", "NVFP4", "NVFP4_AWQ", "W4A16_NVFP4"]:
             raise ValueError(
-                "ModelOpt currently only supports: FP8, NVFP4, NVFP4_AWQ "
+                "ModelOpt currently only supports: FP8, NVFP4, NVFP4_AWQ, "
+                "W4A16_NVFP4 "
                 "quantizations in sglang. Please check the "
                 "quantization config for your model's configuration."
             )
@@ -1568,14 +1580,17 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "NVFP4 quantization requires group_size and exclude_modules "
                 "specified in the quantization config"
             )
-        return cls(
+        quant_config = cls(
             is_checkpoint_nvfp4_serialized,
             kv_cache_quant_algo,
             group_size,
             exclude_modules,
             config.get("packed_modules_mapping"),
             is_awq="AWQ" in quant_method,
+            use_per_token_activation=(False if quant_method == "W4A16_NVFP4" else None),
         )
+        quant_config.is_w4a16 = quant_method == "W4A16_NVFP4"
+        return quant_config
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         from sglang.srt.layers.linear import LinearBase
@@ -1595,7 +1610,11 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         return self._get_quant_method(
             layer,
             prefix,
-            Linear=ModelOptFp4LinearMethod,
+            Linear=(
+                ModelOptNvFp4A16LinearMethod
+                if self.is_w4a16
+                else ModelOptFp4LinearMethod
+            ),
             Moe=ModelOptNvFp4FusedMoEMethod,
         )
 
@@ -1776,7 +1795,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer.weights_padding_cols = 0
             return
 
-        if not is_blackwell_supported():
+        if not get_platform().is_blackwell:
             raise ValueError(
                 "ModelOpt NVFP4 native dense GEMM backends require SM100+. "
                 "Use --fp4-gemm-backend marlin on SM80-SM90."
@@ -2176,7 +2195,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
             use_marlin_fallback = moe_runner_backend.is_marlin()
-        if not is_blackwell_supported() and not use_marlin_fallback:
+        if not get_platform().is_blackwell and not use_marlin_fallback:
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization with the selected MoE backend. Please use "
@@ -2511,9 +2530,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         if layer.moe_runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
+            runner_config = layer.moe_runner_config
+            is_situ = runner_config.activation == "situ"
             gemm1_clamp_limit = (
-                layer.moe_runner_config.gemm1_clamp_limit
-                or layer.moe_runner_config.swiglu_limit
+                None
+                if is_situ
+                else (runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
             )
             if gemm1_clamp_limit is not None:
                 copy_or_rebind_param(
@@ -2522,21 +2544,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     (gemm1_clamp_limit / layer.g1_alphas).to(torch.float32),
                 )
 
-            if layer.moe_runner_config.gemm1_alpha is not None:
+            if runner_config.gemm1_alpha is not None:
                 copy_or_rebind_param(
                     layer,
                     "gemm1_alpha",
                     torch.full_like(
                         layer.g1_alphas,
-                        layer.moe_runner_config.gemm1_alpha,
+                        runner_config.gemm1_alpha,
                         dtype=torch.float32,
                     ),
                 )
-                copy_or_rebind_param(
-                    layer,
-                    "gemm1_beta",
-                    (1.0 / layer.g1_alphas).to(torch.float32),
+                gemm1_beta = (
+                    torch.full_like(
+                        layer.g1_alphas,
+                        runner_config.gemm1_clamp_limit,
+                        dtype=torch.float32,
+                    )
+                    if is_situ
+                    else (1.0 / layer.g1_alphas).to(torch.float32)
                 )
+                copy_or_rebind_param(layer, "gemm1_beta", gemm1_beta)
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         use_dispatch_fp4 = not self.quant_config.use_per_token_activation and (
@@ -2802,9 +2829,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
 
-        assert (
-            activation in _SUPPORTED_ACT_STRS
-        ), f"{activation=} not in supported {_SUPPORTED_ACT_STRS}"
+        assert activation in _SUPPORTED_ACT_STRS or (
+            activation == "situ" and moe_runner_backend.is_flashinfer_trtllm()
+        ), f"{activation=} is unsupported by {moe_runner_backend}"
         moe_runner_config = self.moe_runner_config
 
         if moe_runner_backend.is_marlin():

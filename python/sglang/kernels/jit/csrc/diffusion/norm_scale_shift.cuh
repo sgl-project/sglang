@@ -40,6 +40,7 @@ struct NormScaleShiftParams {
   void* y;
   void* res_out;
   const void* x;
+  const void* input_bias;
   const void* residual;
   const void* gate;
   const void* scale;
@@ -65,7 +66,7 @@ SGL_DEVICE float cta_reduce_sum(float v, int warp, int lane, float* scratch) {
   return scratch[kWarps];
 }
 
-template <bool kHasResidual>
+template <bool kHasResidual, bool kHasInputBias = false>
 __global__ void norm_scale_shift_kernel(const NormScaleShiftParams __grid_constant__ params) {
   using namespace device;
   using Vec = AlignedVector<bf16_t, kVecElems>;
@@ -87,6 +88,16 @@ __global__ void norm_scale_shift_kernel(const NormScaleShiftParams __grid_consta
 #pragma unroll
   for (int i = 0; i < kVecElems; ++i) {
     v[i] = static_cast<float>(xv[i]);
+  }
+
+  if constexpr (kHasInputBias) {
+    Vec bv;
+    bv.load(static_cast<const bf16_t*>(params.input_bias) + elem_offset);
+#pragma unroll
+    for (int i = 0; i < kVecElems; ++i) {
+      // Match the standalone BF16 output-projection bias addition.
+      v[i] = static_cast<float>(static_cast<bf16_t>(v[i] + static_cast<float>(bv[i])));
+    }
   }
 
   if constexpr (kHasResidual) {
@@ -135,6 +146,31 @@ __global__ void norm_scale_shift_kernel(const NormScaleShiftParams __grid_consta
   yv.store(static_cast<bf16_t*>(params.y) + row_offset + elem_offset);
 }
 
+__global__ void bias_mul_add_kernel(const NormScaleShiftParams __grid_constant__ params) {
+  using namespace device;
+  using Vec = AlignedVector<bf16_t, kVecElems>;
+
+  const int row_offset = blockIdx.x * kHidden;
+  const int elem_offset = threadIdx.x * kVecElems;
+
+  Vec xv;
+  Vec bv;
+  Vec gv;
+  Vec rv;
+  Vec yv;
+  xv.load(static_cast<const bf16_t*>(params.x) + row_offset + elem_offset);
+  bv.load(static_cast<const bf16_t*>(params.input_bias) + elem_offset);
+  gv.load(static_cast<const bf16_t*>(params.gate) + elem_offset);
+  rv.load(static_cast<const bf16_t*>(params.residual) + row_offset + elem_offset);
+
+#pragma unroll
+  for (int i = 0; i < kVecElems; ++i) {
+    const bf16_t biased = static_cast<bf16_t>(static_cast<float>(xv[i]) + static_cast<float>(bv[i]));
+    yv[i] = __hfma(biased, gv[i], rv[i]);
+  }
+  yv.store(static_cast<bf16_t*>(params.y) + row_offset + elem_offset);
+}
+
 inline uint32_t verify_nss_geometry(host::SymbolicSize& num_rows) {
   using namespace host;
   RuntimeCheck(num_rows.unwrap() > 0, "num_rows must be positive");
@@ -162,6 +198,7 @@ struct NormScaleShiftKernel {
         .y = y.data_ptr(),
         .res_out = nullptr,
         .x = x.data_ptr(),
+        .input_bias = nullptr,
         .residual = nullptr,
         .gate = nullptr,
         .scale = scale.data_ptr(),
@@ -201,6 +238,7 @@ struct ScaleResidualNormScaleShiftKernel {
         .y = y.data_ptr(),
         .res_out = res_out.data_ptr(),
         .x = x.data_ptr(),
+        .input_bias = nullptr,
         .residual = residual.data_ptr(),
         .gate = gate.data_ptr(),
         .scale = scale.data_ptr(),
@@ -208,6 +246,84 @@ struct ScaleResidualNormScaleShiftKernel {
         .eps = static_cast<float>(eps),
     };
     LaunchKernel(grid, kThreads, device.unwrap())(norm_scale_shift_kernel<true>, params);
+  }
+};
+
+struct BiasScaleResidualNormScaleShiftKernel {
+  static void
+  run(tvm::ffi::TensorView y,
+      tvm::ffi::TensorView res_out,
+      tvm::ffi::TensorView residual,
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView input_bias,
+      tvm::ffi::TensorView gate,
+      tvm::ffi::TensorView scale,
+      tvm::ffi::TensorView shift,
+      double eps) {
+    using namespace host;
+    auto N = SymbolicSize{"num_rows"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({N, kHidden})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(x)
+        .verify(residual)
+        .verify(y)
+        .verify(res_out);
+    TensorMatcher({kHidden})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(input_bias)
+        .verify(gate)
+        .verify(scale)
+        .verify(shift);
+
+    const uint32_t grid = verify_nss_geometry(N);
+    const auto params = NormScaleShiftParams{
+        .y = y.data_ptr(),
+        .res_out = res_out.data_ptr(),
+        .x = x.data_ptr(),
+        .input_bias = input_bias.data_ptr(),
+        .residual = residual.data_ptr(),
+        .gate = gate.data_ptr(),
+        .scale = scale.data_ptr(),
+        .shift = shift.data_ptr(),
+        .eps = static_cast<float>(eps),
+    };
+    LaunchKernel(grid, kThreads, device.unwrap())(norm_scale_shift_kernel<true, true>, params);
+  }
+};
+
+struct BiasMulAddKernel {
+  static void
+  run(tvm::ffi::TensorView y,
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView input_bias,
+      tvm::ffi::TensorView gate,
+      tvm::ffi::TensorView residual) {
+    using namespace host;
+    auto N = SymbolicSize{"num_rows"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({N, kHidden}).with_dtype<bf16_t>().with_device(device).verify(x).verify(residual).verify(y);
+    TensorMatcher({kHidden}).with_dtype<bf16_t>().with_device(device).verify(input_bias).verify(gate);
+
+    const uint32_t grid = verify_nss_geometry(N);
+    const auto params = NormScaleShiftParams{
+        .y = y.data_ptr(),
+        .res_out = nullptr,
+        .x = x.data_ptr(),
+        .input_bias = input_bias.data_ptr(),
+        .residual = residual.data_ptr(),
+        .gate = gate.data_ptr(),
+        .scale = nullptr,
+        .shift = nullptr,
+        .eps = 0.0f,
+    };
+    LaunchKernel(grid, kThreads, device.unwrap())(bias_mul_add_kernel, params);
   }
 };
 

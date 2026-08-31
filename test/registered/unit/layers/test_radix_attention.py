@@ -73,6 +73,7 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
             out_cache_loc=torch.arange(num_tokens, dtype=torch.int64),
             positions=torch.arange(num_tokens, dtype=torch.int64),
             _attn_output=None,
+            mha_return_lse=False,
         )
         return SimpleNamespace(
             forward_batch=forward_batch,
@@ -221,6 +222,34 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                     self.assertTrue(torch.all(lse[2:] == 0))
                     self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
 
+    def test_extra_kwargs_path_returns_bucket_shaped_lse(self):
+        attention_layer = SimpleNamespace()
+        context = self._new_impl_context([attention_layer])
+        backend = _RecordingAttentionBackend()
+        query = torch.zeros((4, 2, 3))
+
+        with (
+            patch.object(
+                radix_attention_module,
+                "get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            patch.object(
+                radix_attention_module, "get_attn_backend", return_value=backend
+            ),
+        ):
+            lse = radix_attention_module.attention_with_output_extra_kwargs(
+                query,
+                query,
+                query,
+                torch.empty_like(query),
+                False,
+                0,
+                {"return_lse": True},
+            )
+
+        self.assertEqual(lse.tolist(), [[7, 7], [7, 7], [0, 0], [0, 0]])
+
     def test_impl_uses_independent_query_and_key_value_extents(self):
         attention_layer = SimpleNamespace()
         context = self._new_impl_context([attention_layer])
@@ -299,6 +328,117 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
         self.assertIs(backend.calls[-1].attention_layer, attention_layer)
         self.assertTrue(torch.all(output[:2] == 3))
         self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
+
+    def test_impl_zero_real_tokens_returns_zeroed_lse(self):
+        # Regression: an idle DP rank whose fabricated EXTEND batch is masked to
+        # 0 real tokens skips attention entirely. The skip must still honor the
+        # LSE return mode -- unified_attention_with_output_and_lse asserts a
+        # tensor comes back, so returning a bare None raised AssertionError as
+        # soon as any 0-real-token call needed LSE (chunked-prefix MHA merge).
+        attention_layer = SimpleNamespace()
+        context = self._new_impl_context([attention_layer], real_num_tokens=0)
+        backend = _RecordingAttentionBackend()
+        query = torch.zeros((4, 2, 3))
+        output = torch.full_like(query, float("nan"))
+
+        with (
+            patch.object(
+                radix_attention_module,
+                "get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            patch.object(
+                radix_attention_module, "get_attn_backend", return_value=backend
+            ),
+        ):
+            lse = radix_attention_module._unified_attention_with_output_impl(
+                query,
+                query,
+                query,
+                output,
+                False,
+                0,
+                False,
+                True,
+            )
+
+        self.assertEqual(backend.calls, [])
+        self.assertTrue(torch.all(output == 0))
+        # Same shape/dtype the registered fake impl declares, so
+        # unified_attention_with_output_and_lse's `assert lse is not None` holds.
+        self.assertEqual(lse.shape, (4, 2))
+        self.assertEqual(lse.dtype, torch.float32)
+        self.assertTrue(torch.all(lse == 0))
+
+    def test_impl_zero_real_tokens_output_only_returns_none(self):
+        # The 0-token skip must not start returning a tensor on the non-LSE
+        # path: unified_attention_with_output is registered with an inplace
+        # (None-returning) schema.
+        attention_layer = SimpleNamespace()
+        context = self._new_impl_context([attention_layer], real_num_tokens=0)
+        backend = _RecordingAttentionBackend(return_lse=False)
+        query = torch.zeros((4, 2, 3))
+        output = torch.full_like(query, float("nan"))
+
+        with (
+            patch.object(
+                radix_attention_module,
+                "get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            patch.object(
+                radix_attention_module, "get_attn_backend", return_value=backend
+            ),
+        ):
+            lse = radix_attention_module._unified_attention_with_output_impl(
+                query,
+                query,
+                query,
+                output,
+                False,
+                0,
+                False,
+                False,
+            )
+
+        self.assertIsNone(lse)
+        self.assertEqual(backend.calls, [])
+        self.assertTrue(torch.all(output == 0))
+
+    def test_extra_kwargs_zero_real_tokens_zeroes_output(self):
+        # Regression: attention_with_output_extra_kwargs (Inkling score_mod /
+        # aux_tensors) narrowed to query[:0] and copied output[:0], so with 0
+        # real tokens the preallocated torch.empty output was never written and
+        # its garbage (NaN/Inf) flowed into residuals and MoE routing. Only ROCm
+        # zeroed the padded tail, so every other platform leaked it.
+        attention_layer = SimpleNamespace()
+        context = self._new_impl_context([attention_layer], real_num_tokens=0)
+        backend = _RecordingAttentionBackend(return_lse=False)
+        query = torch.zeros((4, 2, 3))
+        output = torch.full_like(query, float("nan"))
+
+        with (
+            patch.object(
+                radix_attention_module,
+                "get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            patch.object(
+                radix_attention_module, "get_attn_backend", return_value=backend
+            ),
+        ):
+            radix_attention_module.attention_with_output_extra_kwargs(
+                query,
+                query,
+                query,
+                output,
+                False,
+                0,
+                {},
+            )
+
+        self.assertEqual(backend.calls, [])
+        self.assertTrue(torch.all(output == 0))
 
     def test_lse_fake_impl_declares_shape_and_dtype(self):
         query = torch.empty((5, 3, 7), dtype=torch.float16)

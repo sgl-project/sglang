@@ -433,38 +433,51 @@ def _query_numa_node_for_gpu(device_id: int):
 
 def init_threads_binding(
     *,
-    tp_rank: int,
-    tp_size: int,
+    numa_index: int,
+    world_size: int,
 ):
     omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
     cpu_ids_by_node = get_cpu_ids_by_node()
     n_numa_node = len(cpu_ids_by_node)
     if omp_cpuids == "all":
-        assert tp_size <= n_numa_node, (
+        assert world_size <= n_numa_node, (
             f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
-            f"tp_size {tp_size} should be smaller than or equal to number of numa node on the machine {n_numa_node}. "
-            f"If you need tp_size to be larger than number of numa node, please set the CPU cores for each tp rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
+            f"the total number of ranks (dp_size * tp_size * pp_size = {world_size}) should be smaller than or equal to number of numa node on the machine {n_numa_node}. "
+            f"If you need more ranks than the number of numa nodes, please set the CPU cores for each rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
             f"For example, on a machine with 2 numa nodes, where core 0-31 are on numa node 0 and core 32-63 are on numa node 1, "
             f"it is suggested to use -tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
             f"This is the default behavior if SGLANG_CPU_OMP_THREADS_BIND is not set and it is the same as setting SGLANG_CPU_OMP_THREADS_BIND=0-31|32-63. "
-            f"If you do need tp_size to be larger than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with -tp 4. "
-            f"If you don't want each tp rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with -tp 2."
+            f"If you do need more ranks than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with -tp 4. "
+            f"If you don't want each rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with -tp 2."
         )
-        if tp_size < n_numa_node:
+        if world_size < n_numa_node:
             logger.warning(
-                f"Detected the current machine has {n_numa_node} numa nodes available, but tp_size is set to {tp_size}, so only {tp_size} numa nodes are used."
+                f"Detected the current machine has {n_numa_node} numa nodes available, but the total number of ranks (dp_size * tp_size * pp_size) is {world_size}, so only {world_size} numa nodes are used."
             )
-        local_omp_cpuid = cpu_ids_by_node[tp_rank]
+        assert 0 <= numa_index < n_numa_node, (
+            f"NUMA index {numa_index} (derived from the worker's global device id / gpu_id) "
+            f"is out of range for {n_numa_node} numa nodes. This usually means dp_size * tp_size "
+            f"exceeds the number of numa nodes; reduce it, or set SGLANG_CPU_OMP_THREADS_BIND explicitly."
+        )
+        local_omp_cpuid = cpu_ids_by_node[numa_index]
     else:
         threads_bind_list = omp_cpuids.split("|")
-        assert tp_size == len(threads_bind_list), (
-            f"SGLANG_CPU_OMP_THREADS_BIND setting must be aligned with TP size parameter ({tp_size}). "
-            f"Please double check your settings."
+        # Bound-check numa_index against the bind list rather than asserting
+        # world_size == len(...): in router mode each worker is an independent
+        # dp_size=1 server, so world_size is locally 1 and can't equal a
+        # multi-group bind string. numa_index (== the global gpu_id) is the
+        # correct frame here, so this per-rank bound both prevents IndexError
+        # and catches an under-sized bind list, without needing the global
+        # rank count.
+        assert 0 <= numa_index < len(threads_bind_list), (
+            f"NUMA index {numa_index} (derived from the worker's global device id / gpu_id) "
+            f"is out of range for the {len(threads_bind_list)} SGLANG_CPU_OMP_THREADS_BIND entries. "
+            f"Ensure the number of '|'-separated bind groups matches dp_size * tp_size * pp_size (across all DP workers)."
         )
-        local_omp_cpuid = threads_bind_list[tp_rank]
-        if tp_size > n_numa_node:
+        local_omp_cpuid = threads_bind_list[numa_index]
+        if world_size > n_numa_node:
             logger.warning(
-                f"TP size ({tp_size})is larger than numa node number ({n_numa_node}), "
+                f"The total number of ranks ({world_size}) is larger than numa node number ({n_numa_node}), "
                 f"in this case the available memory amount of each rank cannot be determined in prior. "
                 f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
             )

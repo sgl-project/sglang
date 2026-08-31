@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
@@ -39,6 +40,7 @@ class TestTokenizerBatchEncode(unittest.TestCase):
         ):
 
             mock_tokenizer.return_value = Mock(vocab_size=32000)
+            publish(self.server_args, role="tokenizer")
             self.tokenizer_manager = TokenizerManager(self.server_args, self.port_args)
 
     def test_batch_encode_enabled(self):
