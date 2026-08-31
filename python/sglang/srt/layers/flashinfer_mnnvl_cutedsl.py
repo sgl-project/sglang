@@ -20,18 +20,12 @@ logger = logging.getLogger(__name__)
 
 
 def _import_kernel_backend():
-    try:
-        from flashinfer.comm import AllReduceFusionPattern, allreduce_fusion
-        from flashinfer.comm.mnnvl_cutedsl import DEFAULT_CONFIG
-        from flashinfer.comm.mnnvl_cutedsl_ar import (
-            MNNVLCuteDSLAllReduceFusionWorkspace,
-        )
-    except ImportError as error:
-        raise RuntimeError(
-            "MNNVL CuTe DSL fusion requires FlashInfer's CuTe DSL all-reduce "
-            "fusion backend (flashinfer >= 0.6.18) and its dependencies, "
-            "including nvidia-cutlass-dsl and cuda-python"
-        ) from error
+    # Imported here rather than at module scope: the CuTe DSL backend drags in
+    # CUDA-only dependencies that CPU-side importers of this module never need.
+    from flashinfer.comm import AllReduceFusionPattern, allreduce_fusion
+    from flashinfer.comm.mnnvl_cutedsl import DEFAULT_CONFIG
+    from flashinfer.comm.mnnvl_cutedsl_ar import MNNVLCuteDSLAllReduceFusionWorkspace
+
     return (
         MNNVLCuteDSLAllReduceFusionWorkspace,
         allreduce_fusion,
@@ -166,8 +160,8 @@ class FlashInferMNNVLCuteDSLARFusion:
                 config=self.workspace_config,
             )
 
-            # Publish only after the mailbox barrier; older FlashInfer workspace
-            # classes may not provide it and would desynchronize Lamport stages.
+            # Publish only after the mailbox barrier; without it the ranks
+            # would desynchronize their Lamport stages.
             torch.cuda.synchronize(self.device)
             dist.barrier(group=process_group)
 
