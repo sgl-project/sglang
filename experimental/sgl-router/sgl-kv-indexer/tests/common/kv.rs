@@ -14,12 +14,22 @@ pub fn dram() -> i32 {
 }
 
 pub fn action(kind: ExternalKvActionType, tier: i32, hashes: &[i64]) -> ExternalKvAction {
+    action_with_parent(kind, tier, None, hashes)
+}
+
+pub fn action_with_parent(
+    kind: ExternalKvActionType,
+    tier: i32,
+    parent_block_hash: Option<i64>,
+    hashes: &[i64],
+) -> ExternalKvAction {
     ExternalKvAction {
         r#type: kind as i32,
         tier,
         hashes: hashes.to_vec(),
         component_masks: Vec::new(),
         block_sizes: Vec::new(),
+        parent_block_hash,
     }
 }
 
@@ -32,12 +42,24 @@ pub fn component_report(
     masks: &[u32],
     block_sizes: &[u32],
 ) -> ExternalKvAction {
+    component_report_with_parent(tier, None, hashes, masks, block_sizes)
+}
+
+#[allow(dead_code)]
+pub fn component_report_with_parent(
+    tier: i32,
+    parent_block_hash: Option<i64>,
+    hashes: &[i64],
+    masks: &[u32],
+    block_sizes: &[u32],
+) -> ExternalKvAction {
     ExternalKvAction {
         r#type: ExternalKvActionType::ActionReport as i32,
         tier,
         hashes: hashes.to_vec(),
         component_masks: masks.to_vec(),
         block_sizes: block_sizes.to_vec(),
+        parent_block_hash,
     }
 }
 
