@@ -312,6 +312,22 @@ class NPUOnlineMoEWeightLoader:
         setattr(self.layer, weight_name, source)
         return source
 
+    def _validate_complete(self, weight_prefix: str) -> None:
+        with self.lock:
+            copied = self.loaded_numel[weight_prefix]
+            target = self.target_numel[weight_prefix]
+            state = self.state[weight_prefix]
+        if copied != target or state not in {
+            "quantizing",
+            "converted",
+            "ready_reload",
+        }:
+            raise RuntimeError(
+                f"Ascend online integer MoE {weight_prefix}_weight was not "
+                "completely loaded through its completion-tracked loader: "
+                f"copied {copied} elements, expected {target}."
+            )
+
     @staticmethod
     def _weight_prefix(weight_name: str) -> str:
         if "w13" in weight_name:

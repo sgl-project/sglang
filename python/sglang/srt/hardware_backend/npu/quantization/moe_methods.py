@@ -936,12 +936,13 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
     ) -> None:
         weight = getattr(layer, weight_name)
         loader = getattr(layer, "_npu_online_moe_loader", None)
-        if loader is None or loader.loaded_numel[weight_prefix] == 0:
+        if loader is None:
             raise RuntimeError(
                 "Ascend online integer MoE requires its completion-tracked "
                 "weight loader; direct, remote, and IPC-cache loading are not "
                 "supported."
             )
+        loader._validate_complete(weight_prefix)
         if (
             loader.state[weight_prefix] == "ready_reload"
             and weight.dtype == loader.params_dtype

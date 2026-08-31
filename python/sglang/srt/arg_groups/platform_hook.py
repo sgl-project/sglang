@@ -8,6 +8,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
     resolving_view,
 )
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
@@ -32,6 +33,21 @@ def handle_npu_backends(server_args: Any):
         from sglang.srt.hardware_backend.npu.utils import set_default_server_args
 
         set_default_server_args(server_args)
+
+        if cfg.online_quantization == "w4a4_int":
+            from sglang.srt.server_args import (
+                W4A4_ONLINE_QUANTIZATION_SUPPORTED_ARCHS,
+            )
+
+            architectures = model_config_of(server_args).hf_config.architectures
+            if not W4A4_ONLINE_QUANTIZATION_SUPPORTED_ARCHS.intersection(
+                architectures
+            ):
+                raise ValueError(
+                    "--online-quantization w4a4_int is disabled for dense models "
+                    "because dense W4A4 is inaccurate; it is currently MoE-only. "
+                    f"Got architectures={architectures}."
+                )
 
         current = cfg.cuda_graph_config.prefill.tc_compiler
         if current is not None and current != "eager":

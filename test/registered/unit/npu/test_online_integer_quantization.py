@@ -6,11 +6,16 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.arg_groups.platform_hook import handle_npu_backends
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUOnlineW8A8Int8LinearMethod,
     get_npu_online_linear_method,
 )
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUUnquantMoEMethod,
+)
 from sglang.srt.hardware_backend.npu.quantization.online_quantization import (
+    NPUOnlineMoEWeightLoader,
     get_npu_online_integer_quant_spec,
     get_npu_online_moe_integer_quant_spec,
     npu_format_online_moe_scale,
@@ -123,18 +128,60 @@ class TestOnlineIntegerQuantizationSelection(CustomTestCase):
         self.assertEqual(w2.shape, (2, 3))
         self.assertTrue(torch.equal(w2, expected))
 
-    def test_w4a4_rejects_dense_qwen_and_accepts_qwen_moe(self):
+    @patch("sglang.srt.hardware_backend.npu.utils.set_default_server_args")
+    def test_w4a4_rejects_dense_qwen_and_accepts_qwen_moe(self, _):
+        """The NPU platform hook must reject inaccurate dense W4A4 models."""
+
         def args_for(architecture):
-            args = ServerArgs(model_path="dummy", online_quantization="w4a4_int")
-            args.model_config = SimpleNamespace(
+            args = ServerArgs(
+                model_path="dummy", device="npu", online_quantization="w4a4_int"
+            )
+            args._model_config = SimpleNamespace(
                 hf_config=SimpleNamespace(architectures=[architecture])
             )
+            args._resolved_overrides = []
             return args
 
         with self.assertRaisesRegex(ValueError, "dense models.*MoE-only"):
-            args_for("Qwen3ForCausalLM")._validate_npu_online_quantization()
+            handle_npu_backends(args_for("Qwen3ForCausalLM"))
 
-        args_for("Qwen3MoeForCausalLM")._validate_npu_online_quantization()
+        handle_npu_backends(args_for("Qwen3MoeForCausalLM"))
+
+    def test_moe_loader_rejects_incomplete_post_load(self):
+        """Post-load must not accept uninitialized regions from missing shards."""
+
+        layer = SimpleNamespace(
+            w13_weight=torch.empty(1),
+            w2_weight=torch.empty(1),
+        )
+        loader = NPUOnlineMoEWeightLoader(
+            layer=layer,
+            params_dtype=torch.float16,
+            original_weight_loader=MagicMock(),
+            specs={},
+        )
+        layer._npu_online_moe_loader = loader
+        method = NPUUnquantMoEMethod.__new__(NPUUnquantMoEMethod)
+
+        for weight_prefix in ("w13", "w2"):
+            loader.target_numel[weight_prefix] = 16
+            for copied in (0, 15, 16):
+                loader.loaded_numel[weight_prefix] = copied
+                loader.state[weight_prefix] = "loading"
+                with self.assertRaisesRegex(
+                    RuntimeError, f"copied {copied}.*expected 16"
+                ):
+                    method._apply_online_integer(
+                        layer=layer,
+                        weight_prefix=weight_prefix,
+                        weight_name=f"{weight_prefix}_weight",
+                        spec=MagicMock(),
+                    )
+
+            loader.loaded_numel[weight_prefix] = 16
+            for state in ("quantizing", "converted", "ready_reload"):
+                loader.state[weight_prefix] = state
+                loader._validate_complete(weight_prefix)
 
 
 if __name__ == "__main__":
