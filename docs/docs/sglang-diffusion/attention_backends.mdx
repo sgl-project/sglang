@@ -9,7 +9,7 @@ This document describes the attention backends available in sglang diffusion (`s
 
 Attention backends are defined by `AttentionBackendEnum` (`sglang.multimodal_gen.runtime.platforms.interface.AttentionBackendEnum`) and selected via the CLI flag `--attention-backend`.
 
-Backend selection is performed by the shared attention layers (e.g. `LocalAttention` / `USPAttention` / `UlyssesAttention` in `sglang.multimodal_gen.runtime.layers.attention.layer`). `--attention-backend` is strict for the diffusion transformer / DiT. Auxiliary components such as encoders and VAEs use it when compatible, then fall back to a component default or a platform-compatible backend. Use `--component-attention-backends` when an auxiliary component must use a specific backend; incompatible component overrides fail unless a sparse backend is being replaced for cross-attention.
+Backend selection is performed by the shared attention layers (e.g. `LocalAttention` / `USPAttention` / `UlyssesAttention` in `sglang.multimodal_gen.runtime.layers.attention.layer`). `--attention-backend` is strict for the diffusion transformer / DiT. Auxiliary components such as encoders and VAEs use it when compatible, then fall back to a component default or a platform-compatible backend. Use `--component-attention-backends` when an auxiliary component must use a specific backend; incompatible overrides, including an override for a component that constructs no SGLang attention layer, fail unless a sparse backend is being replaced for cross-attention.
 
 When using the diffusers backend, `--attention-backend` is passed through to diffusers'
 `set_attention_backend` (e.g., `flash`, `_flash_3_hub`, `sage`, `xformers`, `native`).
