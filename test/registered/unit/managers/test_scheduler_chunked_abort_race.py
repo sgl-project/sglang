@@ -9,6 +9,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -19,7 +20,7 @@ class _FakeReq:
 
     def __init__(self, rid: str):
         self.rid = rid
-        self.kv = SimpleNamespace(req_pool_idx=1)
+        self.kv = ReqKvInfo(req_pool_idx=1)
         self.to_finish = None
         self._finished = False
 

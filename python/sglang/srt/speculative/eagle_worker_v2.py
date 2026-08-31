@@ -268,7 +268,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
         self.dsa_seed_topk_width = (
             get_dsa_mtp_topk_width(hf_config)
-            if self.dsa_index_topk is not None
+            if self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
             else None
         )
         self.seed_dsa_topk_from_draft_extend = (
