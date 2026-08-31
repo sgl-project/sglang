@@ -251,7 +251,7 @@ class DecodeKVCacheOffloadManager:
         # so a previously-released request must be skipped here to avoid
         # non-idempotent side effects (e.g. tree_cache.protected_size_
         # double-decrement, host pool double-free).
-        if not req.kv.holds_kv or req.kv.req_pool_idx == -1:
+        if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
             return
 
         kv_committed_len = req.effective_kv_committed_len()
@@ -329,7 +329,7 @@ class DecodeKVCacheOffloadManager:
         """Free any remaining tail KV that was not offloaded due to non-aligned length."""
         # ReqToTokenPool.free sets req_pool_idx to None on release, so
         # guard against both sentinels here.
-        if not req.kv.holds_kv or req.kv.req_pool_idx == -1:
+        if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
             return
         state = self.offloaded_state.get(req)
         if state is None:
