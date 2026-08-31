@@ -9,7 +9,7 @@ follow the same shard count, or the two describe different tensors.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 from unittest.mock import MagicMock, patch

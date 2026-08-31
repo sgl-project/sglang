@@ -14,7 +14,7 @@ from sglang.srt.function_call.kimik3_format import (
 from sglang.srt.parser.reasoning_parser import KimiK3Detector, ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 def _stream(detector: KimiK3Detector, chunks: list[str]) -> tuple[str, str]:

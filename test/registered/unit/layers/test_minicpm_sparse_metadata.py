@@ -37,7 +37,7 @@ with patch.dict(
     )
     from sglang.srt.runtime_context import get_context, get_schedule
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=24, suite="base-a-test-cpu")
 
 
 def _compression_layout():

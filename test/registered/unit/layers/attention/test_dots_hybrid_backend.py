@@ -22,7 +22,7 @@ from sglang.srt.layers.attention.swa_mla_fallback.ops import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 def _batch(*, bs: int, num_tokens: int, original_bs: int | None = None):

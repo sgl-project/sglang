@@ -30,7 +30,7 @@ from sglang.test.test_utils import (
 
 # OSS FA4 coverage requires Blackwell. The PP test uses two GPUs; the other
 # tests use one GPU.
-register_cuda_ci(est_time=240, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=195, stage="base-b", runner_config="4-gpu-b200")
 
 
 class TestFullCudaGraphPrefill(CustomTestCase):

@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=500, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=865, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
 DFLASH_DRAFT_MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash"

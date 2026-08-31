@@ -36,7 +36,7 @@ from sglang.test.kits.attention_unittest.attention_methods.dense_attention impor
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-a", runner_config="1-gpu-small")
 
 _EXTEND_CASE = DenseAttentionCase(
     name="extend_no_prefix_smoke",
