@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import base64
+import csv
 import functools
 import io
 import json
@@ -60,6 +61,7 @@ from sglang.benchmark.prefix_cache_benchmark import (
 )
 from sglang.benchmark.prefix_cache_benchmark import (
     result_validation_error,
+    write_summary,
 )
 from sglang.benchmark.serving import (
     _BACKEND_API_PATHS,
@@ -1851,6 +1853,27 @@ class TestPrefixCacheBenchmark(unittest.TestCase):
             )
 
         self.assertNotIn(tag, completed)
+
+    def test_summary_records_effective_cache_hit_tolerance(self):
+        row = {
+            "tag": "prefix-cache-in128-out8-hit50-c1",
+            "completed": 50,
+            "total_input_tokens": 6400,
+            "server_info": {"page_size": 64},
+            "cache_report": {"cache_hit_rate_pct": 25.0},
+            "prefix_cache_config": {"expected_hit_rate_pct": 50.0},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_path = Path(temp_dir) / "results.jsonl"
+            summary_path = Path(temp_dir) / "summary.csv"
+            result_path.write_text(json.dumps(row) + "\n")
+            write_summary(result_path, summary_path, cache_hit_tolerance=0.5)
+            with summary_path.open(newline="") as summary_file:
+                summary = next(csv.DictReader(summary_file))
+
+        self.assertEqual(summary["cache_hit_error_percentage_points"], "25.0")
+        self.assertEqual(summary["allowed_cache_hit_error_percentage_points"], "50.0")
+        self.assertEqual(summary["cache_hit_within_tolerance"], "True")
 
 
 if __name__ == "__main__":
