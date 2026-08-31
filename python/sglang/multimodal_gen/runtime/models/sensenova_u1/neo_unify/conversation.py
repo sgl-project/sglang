@@ -338,15 +338,32 @@ def get_conv_template(name: str) -> Conversation:
 # <s> at the beginning of the tokenized sequence, while the neo1_0-chat template does.
 # Therefore, they are completely equivalent during inference.
 
+# These Unicode-escaped strings preserve the exact Chinese prompts from the
+# pinned upstream source while complying with the multimodal_gen source lint.
+# Upstream prompt retained for benchmark compatibility:
+_INTERNVL_SYSTEM_MESSAGE = (
+    "\u4f60\u662f\u7531\u4e0a\u6d77\u4eba\u5de5\u667a\u80fd\u5b9e\u9a8c\u5ba4"
+    "\u8054\u5408\u5546\u6c64\u79d1\u6280\u5f00\u53d1\u7684\u4e66\u751f\u591a"
+    "\u6a21\u6001\u5927\u6a21\u578b\uff0c\u82f1\u6587\u540d\u53ebInternVL, "
+    "\u662f\u4e00\u4e2a\u6709\u7528\u65e0\u5bb3\u7684\u4eba\u5de5\u667a\u80fd"
+    "\u52a9\u624b\u3002"
+)
+# Newer upstream prompt, intentionally not used by the first three templates:
+_INTERNVL2_5_SYSTEM_MESSAGE = (
+    "\u4f60\u662f\u4e66\u751f\xb7\u4e07\u8c61\uff0c\u82f1\u6587\u540d\u662f"
+    "InternVL\uff0c\u662f\u7531\u4e0a\u6d77\u4eba\u5de5\u667a\u80fd\u5b9e\u9a8c"
+    "\u5ba4\u3001\u6e05\u534e\u5927\u5b66\u53ca\u591a\u5bb6\u5408\u4f5c\u5355"
+    "\u4f4d\u8054\u5408\u5f00\u53d1\u7684\u591a\u6a21\u6001\u5927\u8bed\u8a00"
+    "\u6a21\u578b\u3002"
+)
+
 register_conv_template(
     Conversation(
         name="Hermes-2",
         system_template="<|im_start|>system\n{system_message}",
         # note: The new system prompt was not used here to avoid changes in benchmark performance.
-        # system_message="I am InternVL, a multimodal large language model."
-        system_message=(
-            "You are InternVL, a helpful and harmless multimodal AI assistant."
-        ),
+        # system_message=_INTERNVL2_5_SYSTEM_MESSAGE
+        system_message=_INTERNVL_SYSTEM_MESSAGE,
         roles=("<|im_start|>user\n", "<|im_start|>assistant\n"),
         sep_style=SeparatorStyle.MPT,
         sep="<|im_end|>",
@@ -359,10 +376,8 @@ register_conv_template(
         name="internlm2-chat",
         system_template="<|im_start|>system\n{system_message}",
         # note: The new system prompt was not used here to avoid changes in benchmark performance.
-        # system_message="I am InternVL, a multimodal large language model."
-        system_message=(
-            "You are InternVL, a helpful and harmless multimodal AI assistant."
-        ),
+        # system_message=_INTERNVL2_5_SYSTEM_MESSAGE
+        system_message=_INTERNVL_SYSTEM_MESSAGE,
         roles=("<|im_start|>user\n", "<|im_start|>assistant\n"),
         sep_style=SeparatorStyle.MPT,
         sep="<|im_end|>",
@@ -374,10 +389,8 @@ register_conv_template(
         name="phi3-chat",
         system_template="<|system|>\n{system_message}",
         # note: The new system prompt was not used here to avoid changes in benchmark performance.
-        # system_message="I am InternVL, a multimodal large language model."
-        system_message=(
-            "You are InternVL, a helpful and harmless multimodal AI assistant."
-        ),
+        # system_message=_INTERNVL2_5_SYSTEM_MESSAGE
+        system_message=_INTERNVL_SYSTEM_MESSAGE,
         roles=("<|user|>\n", "<|assistant|>\n"),
         sep_style=SeparatorStyle.MPT,
         sep="<|end|>",
@@ -388,7 +401,7 @@ register_conv_template(
     Conversation(
         name="internvl2_5",
         system_template="<|im_start|>system\n{system_message}",
-        system_message="You are InternVL, a multimodal large language model.",
+        system_message=_INTERNVL2_5_SYSTEM_MESSAGE,
         roles=("<|im_start|>user\n", "<|im_start|>assistant\n"),
         sep_style=SeparatorStyle.MPT,
         sep="<|im_end|>\n",

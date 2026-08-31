@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -21,13 +22,23 @@ from sglang.multimodal_gen.registry import (
     get_non_diffusers_pipeline_name,
     is_registered_diffusion_model_path,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    process_generation_batch,
+)
+from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_vit import (
     NEOVisionConfig,
+)
+from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.conversation import (
+    get_conv_template,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
     _randn_with_seed,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
+    PipelineExecutor,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
@@ -53,6 +64,100 @@ class _FakeSenseNovaModel:
                 ]
             ]
         )
+
+
+class _RecordingTraceContext:
+    tracing_enable = True
+
+    def __init__(self):
+        self.finish_count = 0
+        self.started_slices = []
+        self.finished_slices = []
+
+    def trace_req_finish(self):
+        self.finish_count += 1
+
+    def trace_slice_start(self, name, level=0):
+        self.started_slices.append((name, level))
+
+    def trace_slice_end(self, name, level=0, **kwargs):
+        self.finished_slices.append((name, level))
+
+
+class _SequentialTestExecutor(PipelineExecutor):
+    def __init__(self, server_args, *, fail=False):
+        super().__init__(server_args)
+        self.fail = fail
+        self.executed_requests = []
+
+    def execute_group(self, stages, batches, server_args):
+        for batch in batches:
+            batch.metrics.record_stage("InputValidationStage", 0.125)
+            batch.metrics.record_memory_snapshot(
+                "after_validation",
+                MemorySnapshot(
+                    allocated_mb=100.0,
+                    reserved_mb=200.0,
+                    peak_allocated_mb=300.0,
+                    peak_reserved_mb=400.0,
+                ),
+            )
+        return batches
+
+    def execute(self, stages, batch, server_args):
+        self.executed_requests.append(batch)
+        if self.fail:
+            raise RuntimeError(f"generation failed for {batch.request_id}")
+        return OutputBatch(
+            output_file_paths=[batch.output_file_name],
+            metrics=batch.metrics,
+        )
+
+
+class _SequentialTestPipeline:
+    def __init__(self, server_args, *, fail=False):
+        self.input_stage = InputValidationStage()
+        self.executor = _SequentialTestExecutor(server_args, fail=fail)
+
+    def forward_batch_sequentially(self, batches, server_args):
+        return self.executor.execute_group_sequentially(
+            [self.input_stage, object()], batches, server_args
+        )
+
+
+class _WorkerBackedSchedulerClient:
+    def __init__(self, worker):
+        self.worker = worker
+
+    async def forward(self, batches):
+        return next(self.worker.execute_forward_sequentially(batches))
+
+
+@pytest.mark.parametrize(
+    ("template_name", "expected_system_message"),
+    [
+        (
+            "Hermes-2",
+            "\u4f60\u662f\u7531\u4e0a\u6d77\u4eba\u5de5\u667a\u80fd\u5b9e\u9a8c\u5ba4\u8054\u5408\u5546\u6c64\u79d1\u6280\u5f00\u53d1\u7684\u4e66\u751f\u591a\u6a21\u6001\u5927\u6a21\u578b\uff0c\u82f1\u6587\u540d\u53ebInternVL, \u662f\u4e00\u4e2a\u6709\u7528\u65e0\u5bb3\u7684\u4eba\u5de5\u667a\u80fd\u52a9\u624b\u3002",
+        ),
+        (
+            "internlm2-chat",
+            "\u4f60\u662f\u7531\u4e0a\u6d77\u4eba\u5de5\u667a\u80fd\u5b9e\u9a8c\u5ba4\u8054\u5408\u5546\u6c64\u79d1\u6280\u5f00\u53d1\u7684\u4e66\u751f\u591a\u6a21\u6001\u5927\u6a21\u578b\uff0c\u82f1\u6587\u540d\u53ebInternVL, \u662f\u4e00\u4e2a\u6709\u7528\u65e0\u5bb3\u7684\u4eba\u5de5\u667a\u80fd\u52a9\u624b\u3002",
+        ),
+        (
+            "phi3-chat",
+            "\u4f60\u662f\u7531\u4e0a\u6d77\u4eba\u5de5\u667a\u80fd\u5b9e\u9a8c\u5ba4\u8054\u5408\u5546\u6c64\u79d1\u6280\u5f00\u53d1\u7684\u4e66\u751f\u591a\u6a21\u6001\u5927\u6a21\u578b\uff0c\u82f1\u6587\u540d\u53ebInternVL, \u662f\u4e00\u4e2a\u6709\u7528\u65e0\u5bb3\u7684\u4eba\u5de5\u667a\u80fd\u52a9\u624b\u3002",
+        ),
+        (
+            "internvl2_5",
+            "\u4f60\u662f\u4e66\u751f\xb7\u4e07\u8c61\uff0c\u82f1\u6587\u540d\u662fInternVL\uff0c\u662f\u7531\u4e0a\u6d77\u4eba\u5de5\u667a\u80fd\u5b9e\u9a8c\u5ba4\u3001\u6e05\u534e\u5927\u5b66\u53ca\u591a\u5bb6\u5408\u4f5c\u5355\u4f4d\u8054\u5408\u5f00\u53d1\u7684\u591a\u6a21\u6001\u5927\u8bed\u8a00\u6a21\u578b\u3002",
+        ),
+    ],
+)
+def test_sensenova_u1_conversation_preserves_upstream_system_prompt(
+    template_name, expected_system_message
+):
+    assert get_conv_template(template_name).system_message == expected_system_message
 
 
 def _force_generator_fallback(monkeypatch, device_type):
@@ -412,3 +517,102 @@ def test_sensenova_u1_multi_output_request_expands_before_generation_stage():
     for req in expanded:
         output = stage.forward(req, server_args=SimpleNamespace())
         assert len(output.output) == 1
+
+
+def _make_sensenova_u1_sequential_entrypoint(*, fail=False):
+    sampling = SenseNovaU1SamplingParams(
+        prompt="a mountain lake",
+        width=2304,
+        height=4096,
+        num_outputs_per_prompt=2,
+        save_output=False,
+        suppress_logs=True,
+    )
+    trace_ctx = _RecordingTraceContext()
+    batch = Req(
+        request_id="req-0",
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        seed=42,
+        sampling_params=sampling,
+        extra=sampling.build_request_extra(),
+        output_file_name="sample.png",
+        trace_ctx=trace_ctx,
+    )
+    server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+    pipeline = _SequentialTestPipeline(server_args, fail=fail)
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.pipeline = pipeline
+    worker.server_args = server_args
+    worker.is_output_rank = True
+    worker._runtime_peak_reserved_mb = 0.0
+    worker._realtime_sessions = SimpleNamespace(attach=lambda _req: None)
+    return batch, trace_ctx, pipeline.executor, _WorkerBackedSchedulerClient(worker)
+
+
+def _force_cpu_entrypoint(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
+    monkeypatch.setattr(current_platform, "is_mps", lambda: False)
+    monkeypatch.setattr(current_platform, "is_npu", lambda: False)
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.entrypoints.openai.utils.get_global_server_args",
+        lambda: SimpleNamespace(batching_max_size=1),
+    )
+
+
+def test_sensenova_u1_multi_output_entrypoint_success(monkeypatch):
+    _force_cpu_entrypoint(monkeypatch)
+    batch, trace_ctx, executor, scheduler_client = (
+        _make_sensenova_u1_sequential_entrypoint()
+    )
+
+    paths, result = asyncio.run(process_generation_batch(scheduler_client, batch))
+
+    assert paths == ["sample_0.png", "sample_1.png"]
+    assert result.error is None
+    assert [req.request_id for req in executor.executed_requests] == [
+        "req-0:0",
+        "req-0:1",
+    ]
+    assert [req.seed for req in executor.executed_requests] == [42, 43]
+    assert result.metrics_list is not None
+    assert [metrics.request_id for metrics in result.metrics_list] == [
+        "req-0:0",
+        "req-0:1",
+    ]
+    assert all(
+        "InputValidationStage" in metrics.stages
+        and "PipelineExecutor.sequential_wait" in metrics.stages
+        and metrics.memory_snapshots["after_validation"].peak_reserved_mb == 400.0
+        for metrics in result.metrics_list
+    )
+    assert all(req.trace_ctx is trace_ctx for req in executor.executed_requests)
+    assert trace_ctx.started_slices == [("gpu_forward", 2)]
+    assert trace_ctx.finished_slices == [("gpu_forward", 2)]
+    assert trace_ctx.finish_count == 1
+
+
+def test_sensenova_u1_multi_output_entrypoint_failure(monkeypatch):
+    _force_cpu_entrypoint(monkeypatch)
+    batch, trace_ctx, executor, scheduler_client = (
+        _make_sensenova_u1_sequential_entrypoint(fail=True)
+    )
+
+    with pytest.raises(RuntimeError, match="generation failed for req-0:0"):
+        asyncio.run(process_generation_batch(scheduler_client, batch))
+
+    assert [req.request_id for req in executor.executed_requests] == [
+        "req-0:0",
+        "req-0:1",
+    ]
+    assert all(
+        "InputValidationStage" in req.metrics.stages
+        and "PipelineExecutor.sequential_wait" in req.metrics.stages
+        and req.metrics.memory_snapshots["after_validation"].peak_reserved_mb == 400.0
+        for req in executor.executed_requests
+    )
+    assert all(req.trace_ctx is trace_ctx for req in executor.executed_requests)
+    assert trace_ctx.started_slices == [("gpu_forward", 2)]
+    assert trace_ctx.finished_slices == [("gpu_forward", 2)]
+    assert trace_ctx.finish_count == 1
