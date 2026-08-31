@@ -108,6 +108,7 @@ class TestPrepareServerArgs(CustomTestCase):
     def test_pipeline_parallel_speculative_allows_synchronous_schedule(self):
         args = ServerArgs(
             model_path="dummy",
+            served_model_name="dummy",
             pp_size=2,
             disable_overlap_schedule=True,
             speculative_algorithm="EAGLE",
@@ -118,6 +119,7 @@ class TestPrepareServerArgs(CustomTestCase):
     def test_pipeline_parallel_speculative_rejects_overlap_schedule(self):
         args = ServerArgs(
             model_path="dummy",
+            served_model_name="dummy",
             pp_size=2,
             disable_overlap_schedule=False,
             speculative_algorithm="EAGLE",
