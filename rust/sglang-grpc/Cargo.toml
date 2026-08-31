@@ -9,6 +9,9 @@ license.workspace = true
 # of the main sglang wheel at the given import path.
 [package.metadata.sglang]
 python-module = "sglang.srt.rust_extensions._grpc"
+# build.rs compiles schemas from outside the Rust workspace; include them in
+# the source-loader artifact fingerprint.
+source-inputs = ["../../proto"]
 # Always build optimized, even for an editable install.
 debug = false
 
