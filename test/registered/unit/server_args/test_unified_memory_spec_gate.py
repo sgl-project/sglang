@@ -13,11 +13,16 @@
 # ==============================================================================
 """`--enable-unified-memory` speculative-decoding allow-list.
 
-One audited arm today: DSPARK, a chain draft whose draft KV lives in a pool of
-its own. Its verify runs on the backends whose spec paths build their read
-tables through the KV-index translator -- the MLA verify family plus
-`flashmla` / `flashinfer` / `fa3`. Everything else stays refused until its
-verify id rails are audited.
+Two audited arms, each with its own constraints because each rides a different
+draft-KV story:
+  * DSPARK: a chain draft whose KV lives in a pool of its own; verify runs on
+    every backend whose spec path builds through the KV-index translator.
+  * EAGLE/EAGLE3: the draft's KV lives FUSED inside the target's full-attention
+    page envelope, which only the hybrid-SWA unified composite provisions, so
+    the target family is constrained too. Its backends are the MHA-shaped
+    subset -- the MLA verify family cannot serve an MHA draft -- and they are
+    demanded EXPLICITLY, for the draft worker as well (it resolves its own
+    backend: explicit flag first, else it inherits the target's).
 
 Pinned so no arm silently widens to an unaudited algorithm, tree shape, or
 backend. The backend set in particular is a claim about code that exists: a
@@ -43,6 +48,7 @@ def _accepts(
     *,
     topk: int | None = 1,
     backend: str | None = "triton",
+    is_hybrid_swa: bool = True,
     draft_backend: str | None = None,
 ) -> bool:
     """Run just `handle_unified_memory_pool` against a minimal stand-in.
@@ -70,7 +76,9 @@ def _accepts(
     object.__setattr__(
         sa,
         "_model_config",
-        SimpleNamespace(is_hybrid_swa=True, attention_arch=AttentionArch.MHA),
+        SimpleNamespace(
+            is_hybrid_swa=is_hybrid_swa, attention_arch=AttentionArch.MHA
+        ),
     )
     try:
         handle_unified_memory_pool(sa)
@@ -91,13 +99,16 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         "fa3",
     )
     # Algorithms with no audited unified-pool verify rails.
-    UNAUDITED_ALGORITHMS = ("EAGLE", "EAGLE3", "DFLASH", "NGRAM", "STANDALONE")
+    # Backends the FUSED draft arm can verify on (MHA-shaped).
+    EAGLE_BACKENDS = ("triton", "flashinfer", "fa3")
+    # Algorithms with no audited unified-pool verify rails.
+    UNAUDITED_ALGORITHMS = ("DFLASH", "NGRAM", "STANDALONE")
 
     def test_dspark_admitted_on_every_audited_backend(self):
         """Each entry is a claim that the backend's spec verify path
         translates. Adding one here without the code is how a unified run
         silently reads the pool with virtual ids."""
-        for backend in self.AUDITED_BACKENDS:
+        for backend in self.DSPARK_BACKENDS:
             self.assertTrue(
                 _accepts("DSPARK", backend=backend),
                 f"DSPARK should pass on verify-audited backend {backend}",
@@ -126,7 +137,7 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         unaudited backend reachable: every target arm can be audited while the
         draft translates nothing. Unset must still inherit and pass."""
         self.assertTrue(_accepts("DSPARK", draft_backend=None))
-        for draft_backend in self.AUDITED_BACKENDS:
+        for draft_backend in self.DSPARK_BACKENDS:
             self.assertTrue(
                 _accepts("DSPARK", draft_backend=draft_backend),
                 f"audited draft backend {draft_backend} should pass",
@@ -136,6 +147,40 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
                 _accepts("DSPARK", draft_backend=draft_backend),
                 f"unaudited draft backend {draft_backend} must be refused",
             )
+
+    def test_eagle_family_admitted_on_hybrid_swa(self):
+        """EAGLE/EAGLE3 chain on a hybrid-SWA target is the fused-draft-KV
+        configuration -- both spellings, resolved or unset topk, on every
+        MHA-shaped audited backend."""
+        for algorithm in ("EAGLE", "EAGLE3"):
+            for topk in (None, 1):
+                for backend in self.EAGLE_BACKENDS:
+                    self.assertTrue(
+                        _accepts(algorithm, topk=topk, backend=backend),
+                        f"{algorithm} topk={topk} backend={backend} should pass",
+                    )
+
+    def test_eagle_refused_off_hybrid_swa(self):
+        """No fused draft region outside the hybrid-SWA composite: another
+        family must be refused at the gate, not fail at boot."""
+        for algorithm in ("EAGLE", "EAGLE3"):
+            self.assertFalse(_accepts(algorithm, is_hybrid_swa=False))
+
+    def test_eagle_refused_unaudited_and_unset_backends(self):
+        """The MLA verify family must not leak into the MHA-shaped arm, and an
+        unset backend would resolve to a default later in the pipeline."""
+        for backend in ("fa4", "trtllm_mha", "trtllm_mla", "flashmla"):
+            self.assertFalse(_accepts("EAGLE", backend=backend))
+        self.assertFalse(_accepts("EAGLE", backend=None))
+
+    def test_eagle_draft_backend_pinned(self):
+        """The draft worker resolves its own backend: unset inherits the
+        target's, explicit audited passes, anything else refuses."""
+        self.assertTrue(_accepts("EAGLE", draft_backend=None))
+        for draft_backend in self.EAGLE_BACKENDS:
+            self.assertTrue(_accepts("EAGLE", draft_backend=draft_backend))
+        for draft_backend in ("fa4", "trtllm_mha"):
+            self.assertFalse(_accepts("EAGLE", draft_backend=draft_backend))
 
     def test_spec_off_admitted(self):
         """The gate constrains only speculative configurations; spec-off must

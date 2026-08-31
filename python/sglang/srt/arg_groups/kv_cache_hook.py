@@ -267,10 +267,11 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "ships host/C4 rows straight from the allocator, bypassing the "
             "virtual->physical translation the unified pool needs."
         )
-    assert cfg.speculative_algorithm in (None, "DSPARK"), (
+    assert cfg.speculative_algorithm in (None, "DSPARK", "EAGLE", "EAGLE3"), (
         "--enable-unified-memory only supports --speculative-algorithm "
-        "DSPARK (chain draft); other speculative algorithms are not yet "
-        "audited for the unified pool's virtual/kernel-facing loc translation. Got "
+        "DSPARK (chain draft) and EAGLE/EAGLE3 (fused draft KV); other "
+        "speculative algorithms are not yet audited for the unified pool's "
+        "virtual/kernel-facing loc translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
     # Tree-shaped drafting is refused for EVERY algorithm, in one place.
@@ -291,6 +292,37 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "unified pool's page-granular move_kv_cache cannot express. Got "
         f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
     )
+    if cfg.speculative_algorithm in ("EAGLE", "EAGLE3"):
+        assert model_config_of(server_args).is_hybrid_swa, (
+            "--enable-unified-memory + EAGLE/EAGLE3 requires a hybrid-SWA "
+            "target: the draft's KV lives fused inside the full-attention "
+            "page envelope, which only the hybrid-SWA unified composite "
+            "provisions today."
+        )
+        # None refuses EXPLICITLY: an unset backend resolves to a default
+        # later in the pipeline, which would silently leave the audited set.
+        eagle_allowed = {"triton", "flashinfer", "fa3"}
+        eagle_backends = set(attention_backends_of(resolved_view(server_args)))
+        assert (
+            None not in eagle_backends
+            and eagle_backends
+            and eagle_backends <= eagle_allowed
+        ), (
+            "--enable-unified-memory + EAGLE/EAGLE3 requires the "
+            f"spec-verify-audited attention backends {sorted(eagle_allowed)}, "
+            f"set explicitly (got {sorted(eagle_backends, key=str)}). The MLA "
+            "verify family does not apply to an MHA-shaped draft."
+        )
+        # The draft worker resolves its own backend: explicit flag first,
+        # else it inherits the target's (audited, per the assert above).
+        draft_allowed = (None,) + tuple(sorted(eagle_allowed))
+        assert cfg.speculative_draft_attention_backend in draft_allowed, (
+            "--enable-unified-memory + EAGLE/EAGLE3 requires the draft "
+            f"worker on a spec-verify-audited backend {sorted(eagle_allowed)}; "
+            "got --speculative-draft-attention-backend="
+            f"{cfg.speculative_draft_attention_backend!r}. Leave it unset "
+            "to inherit the target's."
+        )
     if cfg.speculative_algorithm == "DSPARK":
         _assert_spec_verify_backends(server_args, algorithm="DSPARK")
     assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
