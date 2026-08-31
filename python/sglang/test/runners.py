@@ -424,16 +424,25 @@ class HFRunner:
                         f"before producing output"
                     )
 
-    def terminate(self):
+    def _stop_model_proc(self):
+        # Fire-and-forget terminate() leaves the child holding the accelerator
+        # during teardown; a follow-on SRTRunner on the same device can then
+        # deadlock in driver init (observed on Intel XPU B580).
         self.model_proc.terminate()
+        self.model_proc.join(timeout=30)
+        if self.model_proc.is_alive():
+            self.model_proc.kill()
+            self.model_proc.join()
         self.in_queue = self.out_queue = None
+
+    def terminate(self):
+        self._stop_model_proc()
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.model_proc.terminate()
-        self.in_queue = self.out_queue = None
+        self._stop_model_proc()
 
     @staticmethod
     def forward_generation_raw(
@@ -577,7 +586,6 @@ class SRTRunner:
         speculative_num_draft_tokens: Optional[int] = None,
         disable_overlap_schedule: bool = False,
         disable_custom_all_reduce: bool = False,
-        torchao_config: Optional[str] = None,
         cuda_graph_max_bs_decode: int = 4,
         sleep_on_idle=False,
         max_lora_rank: Optional[int] = None,
@@ -615,7 +623,6 @@ class SRTRunner:
             dtype=get_dtype_str(torch_dtype),
             port=port,
             model_impl=model_impl,
-            torchao_config=torchao_config,
             mem_fraction_static=mem_fraction_static,
             trust_remote_code=trust_remote_code,
             is_embedding=not self.is_generation,

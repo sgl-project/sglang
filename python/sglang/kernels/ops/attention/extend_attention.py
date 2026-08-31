@@ -35,6 +35,14 @@ if _is_cuda:
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 
+try:
+    _triton_version_parts = tuple(
+        int(part) for part in triton.__version__.split(".")[:2]
+    )
+except (AttributeError, ValueError):
+    _triton_version_parts = (0, 0)
+_is_triton_ge_37 = _triton_version_parts >= (3, 7)
+
 
 def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
     """
@@ -65,12 +73,18 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
 
     # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware
     if _is_hip:
-        if _is_gfx95 and 128 < Lq <= 256:
-            # gfx950 (CDNA4), 128 < head_dim <= 256: a larger query tile halves KV bytes
-            # streamed per call (each workgroup reads the whole prefix); 8 warps
-            # hide the loads. Measured on MI350X head_dim 256: -36% kernel time,
-            # 28% -> 44% MFU, numerically equivalent (BLOCK_N reduction order
-            # unchanged). Other AMD archs / head dims keep the default below.
+        if _is_gfx95 and _is_triton_ge_37 and Lq == 576 and Lv == 512:
+            # Triton 3.7's N64 codegen reaches 512 VGPRs and spills 472 bytes
+            # of scratch on gfx950. N32 keeps BLOCK_M/launch work unchanged,
+            # uses <=433 VGPRs without scratch, and restores the isolated
+            # late-prefill kernel from ~12.57 ms to ~5.24 ms.
+            BLOCK_M, BLOCK_N = (64, 32)
+            num_warps = 4
+        elif _is_gfx95 and Lq <= 256:
+            # gfx950 (CDNA4), head_dim <= 256: every workgroup streams the whole
+            # prefix, so a larger query tile halves the KV bytes read per call;
+            # BLOCK_M / num_warps = 16 rows per warp is exactly one MFMA tile at
+            # matrix_instr_nonkdim=16. Measured on MI350X at head_dim 64, 128, 256.
             BLOCK_M, BLOCK_N = (128, 64)
             num_warps = 8
         else:
@@ -591,7 +605,16 @@ def _fwd_kernel(
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
     extend_end = 0 if SKIP_EXTEND else cur_block_m_end
-    for start_n in range(0, extend_end, BLOCK_N):
+    # The mask below keeps (q, kv) iff q <= kv + SLIDING_WINDOW_SIZE, so no tile
+    # under this floor can hold an unmasked element -- tight for any BLOCK_M/BLOCK_N.
+    # SKIP_TILE already made those tiles no-ops, so bounding the loop is
+    # bit-identical and drops their cross-wave tl.max reduction.
+    extend_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        extend_start = (
+            tl.maximum(cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0) // BLOCK_N
+        ) * BLOCK_N
+    for start_n in range(extend_start, extend_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_block_m_end
 

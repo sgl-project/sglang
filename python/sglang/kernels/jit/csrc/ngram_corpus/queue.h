@@ -5,6 +5,8 @@
 #include <queue>
 #include <utility>
 
+namespace sglang {
+
 namespace utils {
 
 template <typename T>
@@ -71,3 +73,5 @@ class Queue {
 };
 
 }  // namespace utils
+
+}  // namespace sglang

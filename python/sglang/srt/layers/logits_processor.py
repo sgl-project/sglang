@@ -24,7 +24,10 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
     pack_aux_hidden_states,
@@ -52,6 +55,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -70,6 +74,25 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
     "PackWeightMethod",
 }
 
+# None outside a FlashInfer autotune pass; inside one, whether that pass runs the
+# LM head. Not-None means the forward's output is discarded -- attention backends
+# read that via get_in_autotune_dummy_run() to skip a cross-node exchange.
+# Skipping the LM head skips its [batch * dp_size, vocab] all-gather, which OOMs
+# under DP attention with a tight mem_fraction_static.
+_autotune_run_lm_head: Optional[bool] = None
+
+
+def _trace_e2e_logits(stage: str, **fields) -> None:
+    if not envs.SGLANG_TRACE_LOGITS_E2E.get():
+        return
+    try:
+        parallel = get_parallel()
+        rank = f"dp={parallel.attn_dp_rank} " f"tp={parallel.tp_rank}"
+    except Exception:
+        rank = "rank=unknown"
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"SGLANG_TRACE_LOGITS_E2E {rank} stage={stage} {details}", flush=True)
+
 
 def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
     return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
@@ -87,9 +110,8 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
     if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
         return False
 
-    # Some draft models share an unquantized target lm_head tensor while still
-    # carrying the draft model's stale ModelOpt quant_method. Only use the
-    # ModelOpt lm_head kernel when the runtime quantization state matches it.
+    # A shared target lm_head can retain the draft's stale ModelOpt method; use it
+    # only when the runtime tensor layout matches that method.
     if method_name == "ModelOptFp4LinearMethod":
         if lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
             lm_head,
@@ -132,26 +154,23 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
     return True
 
 
-# When set, LogitsProcessor.forward returns an empty output and skips the
-# LM head + tensor-parallel all-gather. FlashInfer autotune only profiles
-# attention/MoE/GEMM kernels, so the LM-head all-gather is wasted work --
-# and its [batch * dp_size, vocab] output OOMs under DP attention with a
-# tight mem_fraction_static.
+# FlashInfer autotune skips the unprofiled LM-head all-gather; its
+# [batch * dp_size, vocab] output can OOM under tight DP-attention memory.
 _in_autotune_dummy_run = False
 
 
 def get_in_autotune_dummy_run() -> bool:
-    return _in_autotune_dummy_run
+    return _autotune_run_lm_head is not None
 
 
 @contextmanager
-def autotune_dummy_run_mode():
-    global _in_autotune_dummy_run
-    _in_autotune_dummy_run = True
+def autotune_dummy_run_mode(*, run_lm_head: bool):
+    global _autotune_run_lm_head
+    _autotune_run_lm_head = run_lm_head
     try:
         yield
     finally:
-        _in_autotune_dummy_run = False
+        _autotune_run_lm_head = None
 
 
 @dataclasses.dataclass
@@ -197,10 +216,21 @@ class LogitsProcessorOutput:
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
 
+    # Beam search only: raw pre-sample logits for the scheduler-side joint
+    # selection; see beam_search.logits_capture.
+    beam: Optional[BeamLogitsCapture] = None
+
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
 
+    ## Part 6: Temporary variables
+    # FIXME: These fields are not logits-related but are passed through here as a
+    # workaround since ForwardBatch is local to forward_batch_generation().
+    # They should be moved to GenerationBatchResult to keep this class clean.
     mm_input_embeds: Optional[torch.Tensor] = None
+
+    # Scheduler-local output copied alongside the ordinary generation result.
+    auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
 
 @dataclasses.dataclass
@@ -350,6 +380,7 @@ class LogitsProcessor(nn.Module):
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
+        self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
@@ -402,10 +433,10 @@ class LogitsProcessor(nn.Module):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
-        # Autotune dummy run discards this output; see _in_autotune_dummy_run.
-        # Placed before the MIS / DLLM / common dispatch so all three LM-head
-        # paths are skipped.
-        if _in_autotune_dummy_run:
+        # Autotune dummy run discards this output. `is False` not `not`: None
+        # means no autotune pass, which must not skip. Placed before the MIS /
+        # DLLM / common dispatch so all three LM-head paths are skipped.
+        if _autotune_run_lm_head is False:
             return LogitsProcessorOutput(next_token_logits=None)
 
         # Multi-item scoring only for prefill-only requests with pre-computed indices.
@@ -460,9 +491,6 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
-                # FIXME: These fields are not logits-related but are passed through here as a
-                # workaround since ForwardBatch is local to forward_batch_generation().
-                # They should be moved to GenerationBatchResult to keep this class clean.
                 mm_input_embeds=logits_metadata.mm_input_embeds,
             )
 
@@ -718,24 +746,65 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
+        _trace_e2e_logits(
+            "get_logits_enter",
+            hidden_shape=tuple(hidden_states.shape),
+            dp_gather=self.do_tensor_parallel_all_gather_dp_attn,
+            tp_gather=self.do_tensor_parallel_all_gather,
+        )
         hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
             hidden_states, logits_metadata
         )
+        _trace_e2e_logits(
+            "dp_hidden_gather_returned",
+            global_shape=tuple(hidden_states.shape),
+            local_shape=tuple(local_hidden_states.shape),
+        )
 
+        if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
+            _trace_e2e_logits("pre_lm_head_sync_enter")
+            torch.cuda.synchronize()
+            _trace_e2e_logits("pre_lm_head_sync_returned")
+
+        _trace_e2e_logits("lm_head_enter", hidden_shape=tuple(hidden_states.shape))
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
+        if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
+            _trace_e2e_logits("post_lm_head_sync_enter")
+            torch.cuda.synchronize()
+            _trace_e2e_logits("post_lm_head_sync_returned")
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
+        used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
+            _trace_e2e_logits(
+                "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
+            )
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
+            elif self._can_use_tp_lm_head_all_to_all(
+                logits, local_hidden_states, lm_head, logits_metadata
+            ):
+                logits = self._tp_lm_head_all_to_all(logits)
+                used_tp_lm_head_all_to_all = True
             else:
                 logits = self._logits_gatherer(logits)
+            _trace_e2e_logits(
+                "tp_logits_gather_returned", logits_shape=tuple(logits.shape)
+            )
 
-        logits = self._scatter_dp_attn_logits(
-            logits, local_hidden_states, logits_metadata
-        )
+        if not used_tp_lm_head_all_to_all:
+            _trace_e2e_logits(
+                "dp_logits_scatter_enter", logits_shape=tuple(logits.shape)
+            )
+            logits = self._scatter_dp_attn_logits(
+                logits, local_hidden_states, logits_metadata
+            )
+            _trace_e2e_logits(
+                "dp_logits_scatter_returned", logits_shape=tuple(logits.shape)
+            )
 
         logits = self._copy_logits_to_buffer(
             logits, logits_metadata, use_buffer=use_logits_buffer
@@ -766,9 +835,25 @@ class LogitsProcessor(nn.Module):
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
             if self.use_fp32_lm_head:
-                logits = torch.matmul(
-                    hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
+                # Avoid materializing FP32 copies for same-dtype CUDA FP16/BF16
+                # inputs. Retain explicit FP32 casts for unsupported devices or
+                # dtype combinations.
+                use_mm_out_dtype = (
+                    hidden_states.is_cuda
+                    and hidden_states.dtype == lm_head.weight.dtype
+                    and hidden_states.dtype in (torch.float16, torch.bfloat16)
                 )
+                if use_mm_out_dtype:
+                    logits = torch.mm(
+                        hidden_states,
+                        lm_head.weight.T,
+                        out_dtype=torch.float32,
+                    )
+                else:
+                    logits = torch.matmul(
+                        hidden_states.to(torch.float32),
+                        lm_head.weight.to(torch.float32).T,
+                    )
             elif use_intel_amx_backend(lm_head):
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
@@ -803,10 +888,27 @@ class LogitsProcessor(nn.Module):
         self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.do_tensor_parallel_all_gather_dp_attn:
+            _trace_e2e_logits(
+                "dp_metadata_enter",
+                local_shape=tuple(hidden_states.shape),
+                global_counts_cpu=logits_metadata.global_num_tokens_for_logprob_cpu,
+            )
             logits_metadata.compute_dp_attention_metadata()
+            _trace_e2e_logits(
+                "dp_metadata_returned",
+                buffer_shape=tuple(logits_metadata.gathered_buffer.shape),
+                local_start=logits_metadata.dp_local_start_pos,
+                local_tokens=logits_metadata.dp_local_num_tokens,
+            )
             local_hidden_states = hidden_states
             hidden_states = logits_metadata.gathered_buffer
+            _trace_e2e_logits(
+                "dp_hidden_gather_enter",
+                global_shape=tuple(hidden_states.shape),
+                local_shape=tuple(local_hidden_states.shape),
+            )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+            _trace_e2e_logits("dp_hidden_gather_collective_returned")
             return hidden_states, local_hidden_states
         return hidden_states, hidden_states
 
@@ -837,6 +939,54 @@ class LogitsProcessor(nn.Module):
                 logits,
             )
         return global_logits
+
+    def _can_use_tp_lm_head_all_to_all(
+        self,
+        logits: torch.Tensor,
+        local_hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> bool:
+        if not self.use_tp_lm_head_all_to_all:
+            return False
+
+        tp_size = get_parallel().tp_size
+        base_lm_head = getattr(lm_head, "base_layer", lm_head)
+        if getattr(base_lm_head, "tp_size", None) != tp_size:
+            # Tied embeddings may be replicated across DP ranks (tp_size=1),
+            # even though the logits processor runs in a larger global TP
+            # group. Such logits are full-vocabulary rather than TP shards and
+            # therefore do not satisfy the all-to-all layout contract.
+            return False
+
+        # Every participant must make the same collective choice. Decode CUDA
+        # graphs omit CPU counts and fill every GPU count with the same padded
+        # bucket size. Eager batches carry the same global CPU count list on
+        # every rank, so they are also safe when all entries are equal.
+        global_counts_cpu = logits_metadata.global_num_tokens_for_logprob_cpu
+        is_equal_padded_graph_layout = global_counts_cpu is None and (
+            logits_metadata.global_num_tokens_for_logprob_gpu is not None
+        )
+        is_equal_eager_layout = (
+            global_counts_cpu is not None
+            and len(global_counts_cpu) == tp_size
+            and len(global_counts_cpu) > 0
+            and all(count == global_counts_cpu[0] for count in global_counts_cpu)
+        )
+        if not (is_equal_padded_graph_layout or is_equal_eager_layout):
+            return False
+
+        local_rows = local_hidden_states.shape[0]
+        return local_rows > 0 and logits.shape[0] == local_rows * tp_size
+
+    def _tp_lm_head_all_to_all(self, logits: torch.Tensor) -> torch.Tensor:
+        """Exchange only the row block owned by each destination DP rank."""
+        logits = logits.contiguous()
+        all_to_all_output = torch.empty_like(logits)
+        get_tp_group().all_to_all_single(all_to_all_output.view(-1), logits.view(-1))
+        return _reassemble_tp_lm_head_all_to_all_output(
+            all_to_all_output, get_parallel().tp_size
+        )
 
     def _scatter_dp_attn_logits(
         self,
@@ -992,8 +1142,86 @@ class LogitsProcessor(nn.Module):
             input_top_logprobs_idx=input_top_logprobs_idx,
             input_token_ids_logprobs_val=input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
-            # FIXME: These fields are not logits-related but are passed through here as a
-            # workaround since ForwardBatch is local to forward_batch_generation().
-            # They should be moved to GenerationBatchResult to keep this class clean.
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
+
+
+def _reassemble_tp_lm_head_all_to_all_output(
+    all_to_all_output: torch.Tensor, tp_size: int
+) -> torch.Tensor:
+    """Convert source-major all-to-all output to row-major full-vocab logits.
+
+    Each source TP rank contributes ``[local_rows, vocab_shard]`` for this
+    destination DP rank. ``all_to_all_single`` concatenates those contributions
+    along dim 0, while the sampler expects the vocab shards concatenated along
+    dim 1.
+    """
+    assert all_to_all_output.shape[0] % tp_size == 0
+    local_rows = all_to_all_output.shape[0] // tp_size
+    vocab_shard = all_to_all_output.shape[1]
+    return (
+        all_to_all_output.view(tp_size, local_rows, vocab_shard)
+        .permute(1, 0, 2)
+        .reshape(local_rows, tp_size * vocab_shard)
+    )
+
+
+def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
+    return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
+
+
+def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
+    if (
+        quant_method is None
+        or not hasattr(lm_head, "weight")
+        or not callable(getattr(quant_method, "apply", None))
+    ):
+        return False
+
+    method_name = type(quant_method).__name__
+    if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
+        return False
+
+    # Some draft models share an unquantized target lm_head tensor while still
+    # carrying the draft model's stale ModelOpt quant_method. Only use the
+    # ModelOpt lm_head kernel when the runtime quantization state matches it.
+    if method_name == "ModelOptFp4LinearMethod":
+        if lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "weight_global_scale",
+                "workspace",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        ):
+            return True
+        return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale_interleaved",
+                "alpha",
+                "input_scale_inv",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
+    if method_name == "ModelOptNvFp4A16LinearMethod":
+        return lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "weight_global_scale",
+                "workspace",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
+    if method_name == "ModelOptFp8LinearMethod":
+        return (
+            lm_head.weight.dtype == torch.float8_e4m3fn
+            and _has_lm_head_runtime_attrs(lm_head, ("weight_scale", "input_scale"))
+        )
+
+    return True

@@ -24,6 +24,7 @@ _TRITON_KERNELS = [
     ("dsa_metadata", "fused_dsa_draft_extend_metadata"),
     ("rocm_mla_decode_rope", "decode_attention_fwd_grouped_rope"),
     ("verify_splitkv", "verify_splitkv_fwd"),
+    ("unified_attention_3d_mtp", "unified_attention_3d_mtp_func"),
     ("pad", "pad_sequence_with_mask"),
     ("pad", "pad_draft_extend_query"),
     ("pad", "unpad_draft_extend_output"),
@@ -116,6 +117,8 @@ for _mod, _fn in [
     ("flash_mla_sm120", "flash_mla_with_kvcache_sm120"),
     ("dcp_kernels", "create_dcp_kv_indices"),
     ("dcp_kernels", "correct_attn_out"),
+    ("dcp_kernels", "dcp_lse_combine_triton"),
+    ("dcp_kernels", "dcp_pack_a2a_send"),
     ("pa_page_table", "_build_pa_page_table"),
     ("nsa_triton_decode", "triton_sparse_attn_decode"),
 ]:

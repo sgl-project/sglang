@@ -61,22 +61,22 @@ def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
     return SimpleNamespace(
         rid=rid,
         prefix_indices=torch.tensor(prefix, dtype=torch.int32),
-        req_pool_idx=req_pool_idx,
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
-        kv_committed_len=len(prefix) if req_pool_idx is not None else 0,
-        kv=(
-            SimpleNamespace(kv_allocated_len=len(prefix) + block_size)
-            if req_pool_idx is not None
-            else None
+        kv=SimpleNamespace(
+            req_pool_idx=req_pool_idx,
+            kv_committed_len=len(prefix) if req_pool_idx is not None else 0,
+            kv_allocated_len=(
+                len(prefix) + block_size if req_pool_idx is not None else 0
+            ),
         ),
     )
 
 
 def _remove_allocated_req_slots(pool, *reqs):
     for req in reqs:
-        if req.req_pool_idx in pool.free_slots:
-            pool.free_slots.remove(req.req_pool_idx)
+        if req.kv.req_pool_idx in pool.free_slots:
+            pool.free_slots.remove(req.kv.req_pool_idx)
 
 
 def _make_batch(pool, allocator, reqs, extend_lens):
@@ -105,8 +105,8 @@ def _make_batch(pool, allocator, reqs, extend_lens):
 
 def _seed_retained_block(pool, req, values):
     prefix_len = len(req.prefix_indices)
-    pool.req_to_token[req.req_pool_idx, :prefix_len] = req.prefix_indices
-    pool.req_to_token[req.req_pool_idx, prefix_len : prefix_len + len(values)] = (
+    pool.req_to_token[req.kv.req_pool_idx, :prefix_len] = req.prefix_indices
+    pool.req_to_token[req.kv.req_pool_idx, prefix_len : prefix_len + len(values)] = (
         torch.tensor(values, dtype=torch.int32)
     )
 
@@ -136,10 +136,17 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         out, _, req_pool_indices_cpu = alloc_for_extend(batch)
 
         self.assertEqual(allocator.alloc_calls, [4])
-        self.assertEqual(req_pool_indices_cpu.tolist(), [1, 2])
+        # Allocation order is not semantically meaningful (ReqToTokenPool.alloc
+        # picks whichever free slot is cheapest to pop), so only pin the
+        # reused row's index and that the fresh row got a different, real slot.
+        self.assertEqual(req_pool_indices_cpu[0].item(), 1)
+        fresh_idx = req_pool_indices_cpu[1].item()
+        self.assertNotEqual(fresh_idx, 1)
         self.assertEqual(out.tolist(), [100, 101, 102, 103, 200, 201, 202, 203])
         self.assertEqual(self.pool.req_to_token[1, 4:8].tolist(), [100, 101, 102, 103])
-        self.assertEqual(self.pool.req_to_token[2, 4:8].tolist(), [200, 201, 202, 203])
+        self.assertEqual(
+            self.pool.req_to_token[fresh_idx, 4:8].tolist(), [200, 201, 202, 203]
+        )
         self.assertEqual(reused.kv.kv_allocated_len, 8)
         self.assertEqual(fresh.kv.kv_allocated_len, 8)
 
@@ -174,7 +181,10 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         batch = _make_batch(self.pool, allocator, [reused, fresh], [4, 4])
         out, _, req_pool_indices_cpu = alloc_for_extend(batch)
 
-        self.assertEqual(req_pool_indices_cpu.tolist(), [1, 2])
+        # See test_alloc_for_extend_mixed_reuse_allocates_only_fresh_and_writes_rows:
+        # allocation order is not semantically meaningful.
+        self.assertEqual(req_pool_indices_cpu[0].item(), 1)
+        self.assertNotEqual(req_pool_indices_cpu[1].item(), 1)
         self.assertEqual(out.tolist(), [100, 101, 102, 103, 500, 501, 502, 503])
         self.assertEqual(
             allocator.extend_calls,
