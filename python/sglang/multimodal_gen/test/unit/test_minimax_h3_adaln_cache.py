@@ -93,6 +93,13 @@ def _online_cache(
 _PAGE_BYTES = (_ARCH.num_layers * _BLOCK_WIDTH + _FINAL_WIDTH) * 2
 
 
+def _reference_block(cache, index, plan, num_timesteps):
+    # Local oracle for block_all: explicit slab indexing, kept out of the
+    # production class so a layout bug cannot "fix itself" in both sides.
+    params = cache.block_params[plan, :num_timesteps, index]
+    return tuple(params.reshape(-1, 6, _ARCH.hidden_size).unbind(dim=1))
+
+
 def _embed(timesteps: torch.Tensor) -> torch.Tensor:
     return timesteps[:, None].expand(-1, _ARCH.time_embed_dim)
 
@@ -130,7 +137,7 @@ def test_minimax_h3_adaln_cache_matches_bf16_embedding(tmp_path):
     cache.load(torch.device("cpu"))
 
     cache_plan_index = cache.lookup(plan_timesteps[1])
-    block = cache.block(1, cache_plan_index, 2)
+    block = _reference_block(cache, 1, cache_plan_index, 2)
     final = cache.final(cache_plan_index, 2)
 
     # block() hands the forward pass six [num_timesteps * modality, hidden]
@@ -173,10 +180,10 @@ def test_sidecar_resolve_slots_and_block_all_match_per_step_paths(tmp_path):
     assert slots.tolist() == [0, 1]
     assert int(cache.lookup(torch.tensor([1.0, 2.0]))) == int(slots[1])
 
-    stacked = cache.block_all(slots[1], 2)
+    stacked = cache.block_all(cache_plan_index=slots[1], num_timesteps=2)
     assert len(stacked) == _ARCH.num_layers
     for index in range(_ARCH.num_layers):
-        expected = cache.block(index, slots[1], 2)
+        expected = _reference_block(cache, index, slots[1], 2)
         for got, want in zip(stacked[index], expected):
             assert torch.equal(got, want)
             assert got.stride() == want.stride()
@@ -218,7 +225,7 @@ def test_host_tier_swap_in_restores_evicted_plans_bit_exactly(tmp_path):
     slots_a = cache.resolve_slots(set_a)
     snapshot = [
         (
-            [t.clone() for t in cache.block(0, slots_a[i], 1)],
+            [t.clone() for t in _reference_block(cache, 0, slots_a[i], 1)],
             [t.clone() for t in cache.final(slots_a[i], 1)],
         )
         for i in range(2)
@@ -234,7 +241,7 @@ def test_host_tier_swap_in_restores_evicted_plans_bit_exactly(tmp_path):
     slots_a = cache.resolve_slots(set_a)
     for i in range(2):
         blocks, finals = snapshot[i]
-        for got, want in zip(cache.block(0, slots_a[i], 1), blocks):
+        for got, want in zip(_reference_block(cache, 0, slots_a[i], 1), blocks):
             assert torch.equal(got, want)
         for got, want in zip(cache.final(slots_a[i], 1), finals):
             assert torch.equal(got, want)
@@ -282,7 +289,12 @@ def test_host_tier_lru_eviction_and_shared_plan_refcount(tmp_path):
     plan_d = torch.tensor([4.0])
     cache.build([plan_a, plan_d], embed=_embed)
     assert cache.stats.host_evicted_groups == 1
-    keys = {tuple(tier.timesteps(key).tolist()) for key in tier._plans}
+    import struct
+
+    keys = {
+        tuple(struct.unpack("<f", struct.pack("<I", bits))[0] for bits in key)
+        for key in tier._plans
+    }
     assert keys == {(1.0,), (3.0,), (4.0,)}
 
 
@@ -314,7 +326,9 @@ def test_precision_fp32_projects_in_fp32_then_stores_bf16(tmp_path):
     bias = _weights_fill(_BLOCK_WIDTH, scale=1.0)
     for layer in range(_ARCH.num_layers):
         expected = torch.nn.functional.linear(adaln_input, weight, bias).bfloat16()
-        got = torch.cat(cache.block(layer, slot, 1), dim=-1).reshape(1, _BLOCK_WIDTH)
+        got = torch.cat(_reference_block(cache, layer, slot, 1), dim=-1).reshape(
+            1, _BLOCK_WIDTH
+        )
         assert torch.equal(got, expected)
 
     with pytest.raises(ValueError, match="precision"):

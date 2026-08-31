@@ -624,14 +624,15 @@ class ServerArgs(DisaggServerArgsMixin):
         self.pipeline_config.validate_server_args(self)
 
     def _validate_minimax_h3_adaln(self) -> None:
-        """The online-rebuild tuning flag does nothing in other AdaLN modes;
-        an explicitly set but ignored flag is a misconfiguration."""
+        # Warn, not raise: config-file and from_kwargs construction mark every
+        # provided key as explicit, so a shared base config pinning the
+        # default (or 0) must not fail non-online launches.
         if self.minimax_h3_adaln_online:
             return
         if self.is_arg_explicitly_set("minimax_h3_adaln_host_cache_gb"):
-            raise ValueError(
+            logger.warning(
                 "--minimax-h3-adaln-host-cache-gb only takes effect with "
-                "--minimax-h3-adaln-online"
+                "--minimax-h3-adaln-online; ignoring it"
             )
 
     def _validate_scheduler_rpc_timeout(self) -> None:

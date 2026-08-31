@@ -22,8 +22,14 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     tensor_model_parallel_all_gather,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import get_tp_rank
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_tp_rank,
+    get_world_group,
+    world_group_is_initialized,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HOST_RESERVE_FRACTION,
+    MIN_HOST_RESERVE_BYTES,
     host_memory_available_bytes,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -32,6 +38,11 @@ logger = init_logger(__name__)
 
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
+
+# The native adaln_proj tensor names the online rebuild streams; a checkpoint
+# without them (Diffusers layout, quantized export) cannot serve as a rebuild
+# source.
+_NATIVE_ADALN_PROBE_KEY = "blocks.0.adaln_proj.linear.weight"
 
 
 # A ref2va request carrying both a visual and an audio reference reaches four
@@ -48,6 +59,23 @@ def _plan_key(timesteps: torch.Tensor) -> tuple[int, ...]:
         struct.unpack("<I", struct.pack("<f", float(value)))[0]
         for value in timesteps.tolist()
     )
+
+
+def native_adaln_weight_files(weights_path: str) -> list[str]:
+    """Safetensors under ``weights_path`` usable as an online rebuild source.
+
+    Returns [] when the directory holds no native-layout adaln tensors, so a
+    caller retargeting the rebuild source can fail closed instead of deferring
+    a KeyError to the next request.
+    """
+    import glob as _glob
+
+    files = sorted(_glob.glob(os.path.join(weights_path, "*.safetensors")))
+    for file in files:
+        with safe_open(file, framework="pt", device="cpu") as handle:
+            if _NATIVE_ADALN_PROBE_KEY in handle.keys():
+                return files
+    return []
 
 
 @contextmanager
@@ -78,8 +106,6 @@ class MiniMaxH3AdalnCacheStats(msgspec.Struct):
 
 class _HostPlan(msgspec.Struct):
     pages: list[int]
-    # Kept on the host so a swap-in can restore plan_timesteps without the key.
-    timesteps: torch.Tensor
     refcount: int = 0
 
 
@@ -117,7 +143,7 @@ class MiniMaxH3AdalnHostTier:
         budget = _host_cache_budget_bytes()
         num_pages = max(0, min(capacity_bytes, budget)) // page_bytes
         self._slab, self.pinned, num_pages = _allocate_host_slab(
-            num_pages, self.page_numel
+            num_pages=num_pages, page_numel=self.page_numel
         )
         num_pages = _all_ranks_min(num_pages, device=device)
         self.num_pages = num_pages
@@ -156,7 +182,7 @@ class MiniMaxH3AdalnHostTier:
     def has_all(self, keys) -> bool:
         return all(key in self._plans for key in keys)
 
-    def register_group(self, group_key, keys) -> None:
+    def register_group(self, *, group_key, keys) -> None:
         """Record (or refresh) a group whose plans are all resident already."""
         if group_key in self._groups:
             self._groups.move_to_end(group_key)
@@ -168,9 +194,6 @@ class MiniMaxH3AdalnHostTier:
         for key in keys:
             self._plans[key].refcount += 1
         self._groups[group_key] = keys
-
-    def timesteps(self, key) -> torch.Tensor:
-        return self._plans[key].timesteps
 
     def copy_to_gpu(
         self,
@@ -198,14 +221,15 @@ class MiniMaxH3AdalnHostTier:
 
     def store_group(
         self,
-        group_key,
-        entries: dict[tuple[int, ...], tuple[int, torch.Tensor]],
         *,
+        group_key,
+        entries: dict[tuple[int, ...], tuple[int, int]],
         block_params: torch.Tensor,
         final_params: torch.Tensor,
     ) -> None:
         """D2H-copy a freshly built group into host pages and commit it.
 
+        ``entries`` maps each plan key to its (GPU slot, timestep count).
         Commits synchronously (the copies are waited on before the group
         becomes visible) so the resident set stays a deterministic function of
         the request stream on every rank. Over capacity the group is simply
@@ -217,7 +241,7 @@ class MiniMaxH3AdalnHostTier:
         new_plans = {
             key: value for key, value in entries.items() if key not in self._plans
         }
-        needed = sum(timesteps.numel() for _, timesteps in new_plans.values())
+        needed = sum(length for _, length in new_plans.values())
         if needed > self.num_pages:
             self._skip_for_pressure(group_key)
             return
@@ -229,16 +253,9 @@ class MiniMaxH3AdalnHostTier:
         while needed > len(self._free_pages) and self._groups:
             self._evict_oldest_group()
         if needed > len(self._free_pages):
-            # Unpin, freeing plans whose last group was evicted above --
-            # leaving them at refcount 0 would strand their pages forever.
             for key in entries:
-                plan = self._plans.get(key)
-                if plan is None:
-                    continue
-                plan.refcount -= 1
-                if plan.refcount == 0:
-                    self._free_pages.extend(plan.pages)
-                    del self._plans[key]
+                if key in self._plans:
+                    self._unpin(key)
             self._skip_for_pressure(group_key)
             return
 
@@ -247,8 +264,7 @@ class MiniMaxH3AdalnHostTier:
             self._stream.wait_stream(torch.cuda.current_stream())
         staged: dict[tuple[int, ...], _HostPlan] = {}
         with self._stream_ctx():
-            for key, (slot, timesteps) in new_plans.items():
-                length = timesteps.numel()
+            for key, (slot, length) in new_plans.items():
                 pages = [self._free_pages.pop() for _ in range(length)]
                 for index, page in enumerate(pages):
                     row = self._slab[page]
@@ -258,9 +274,7 @@ class MiniMaxH3AdalnHostTier:
                     row[self.block_numel :].copy_(
                         final_params[slot, index], non_blocking=True
                     )
-                staged[key] = _HostPlan(
-                    pages=pages, timesteps=timesteps.detach().cpu(), refcount=1
-                )
+                staged[key] = _HostPlan(pages=pages, refcount=1)
         self.synchronize()
         self._plans.update(staged)
         self._groups[group_key] = tuple(entries)
@@ -275,14 +289,17 @@ class MiniMaxH3AdalnHostTier:
             return nullcontext()
         return torch.cuda.stream(self._stream)
 
+    def _unpin(self, key) -> None:
+        plan = self._plans[key]
+        plan.refcount -= 1
+        if plan.refcount == 0:
+            self._free_pages.extend(plan.pages)
+            del self._plans[key]
+
     def _evict_oldest_group(self) -> None:
         _, keys = self._groups.popitem(last=False)
         for key in keys:
-            plan = self._plans[key]
-            plan.refcount -= 1
-            if plan.refcount == 0:
-                self._free_pages.extend(plan.pages)
-                del self._plans[key]
+            self._unpin(key)
         if self.stats is not None:
             self.stats.host_evicted_groups += 1
 
@@ -300,8 +317,10 @@ def _host_cache_budget_bytes() -> int:
     """Per-rank share of the host memory actually available right now.
 
     Co-located ranks each see the same free memory; without the split every
-    rank would size its tier against all of it (the HiCache lesson). Assumes
-    single-node deployments when LOCAL_WORLD_SIZE is unset.
+    rank would size its tier against all of it (the HiCache lesson), and the
+    reserve mirrors HostPinBudget so this pinner honors the same headroom as
+    every other one. Assumes single-node deployments when LOCAL_WORLD_SIZE is
+    unset.
     """
     ranks = int(
         os.environ.get(
@@ -313,11 +332,13 @@ def _host_cache_budget_bytes() -> int:
             ),
         )
     )
-    return host_memory_available_bytes() // max(1, ranks)
+    available = host_memory_available_bytes()
+    reserve = max(int(available * HOST_RESERVE_FRACTION), MIN_HOST_RESERVE_BYTES)
+    return max(0, available - reserve) // max(1, ranks)
 
 
 def _allocate_host_slab(
-    num_pages: int, page_numel: int
+    *, num_pages: int, page_numel: int
 ) -> tuple[torch.Tensor, bool, int]:
     """Pinned slab, halving the page count on failure; pageable as last resort."""
     pages = num_pages
@@ -346,7 +367,7 @@ def _allocate_host_slab(
 def _all_ranks_min(value: int, *, device: torch.device) -> int:
     """Every rank must run the same tier capacity or build()'s collectives
     desynchronize; MIN over the world group is the conservative agreement."""
-    if not torch.distributed.is_initialized():
+    if not torch.distributed.is_initialized() or not world_group_is_initialized():
         return value
     if torch.distributed.get_world_size() == 1:
         return value
@@ -355,7 +376,7 @@ def _all_ranks_min(value: int, *, device: torch.device) -> int:
         dtype=torch.int64,
         device=device if device.type == "cuda" else "cpu",
     )
-    torch.distributed.all_reduce(probe, op=torch.distributed.ReduceOp.MIN)
+    probe = get_world_group().all_reduce(probe, op=torch.distributed.ReduceOp.MIN)
     return int(probe.item())
 
 
@@ -451,8 +472,6 @@ class MiniMaxH3AdalnCache(nn.Module):
             block_params = cache_file.get_tensor("block_params")
             final_params = cache_file.get_tensor("final_params")
 
-        expected_block_width = 6 * MINIMAX_H3_ADALN_MODALITY_NUM * self.hidden_size
-        expected_final_width = 2 * self.hidden_size
         if (
             plan_timesteps.dtype != _FP32_DTYPE
             or plan_timesteps.ndim != 2
@@ -466,13 +485,13 @@ class MiniMaxH3AdalnCache(nn.Module):
             plan_timesteps.shape[0],
             plan_timesteps.shape[1],
             self.num_layers,
-            expected_block_width,
+            self.block_width,
         ):
             raise ValueError("MiniMax H3 AdaLN cache has invalid block_params")
         if final_params.dtype != _BF16_DTYPE or final_params.shape != (
             plan_timesteps.shape[0],
             plan_timesteps.shape[1],
-            expected_final_width,
+            self.final_width,
         ):
             raise ValueError("MiniMax H3 AdaLN cache has invalid final_params")
 
@@ -537,6 +556,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         step_timesteps: list[torch.Tensor],
         *,
         embed: Callable[[torch.Tensor], torch.Tensor],
+        keys: list[tuple[int, ...]] | None = None,
     ) -> None:
         """Fill every plan this request will look up, in one streaming pass.
 
@@ -551,20 +571,27 @@ class MiniMaxH3AdalnCache(nn.Module):
         missing, so a request builds everything it needs before denoising rather
         than filling in step by step.
         """
+        if keys is None:
+            keys = [_plan_key(timesteps) for timesteps in step_timesteps]
         wanted: dict[tuple[int, ...], torch.Tensor] = {}
-        for timesteps in step_timesteps:
-            wanted.setdefault(_plan_key(timesteps), timesteps)
+        for key, timesteps in zip(keys, step_timesteps):
+            wanted.setdefault(key, timesteps)
         missing = {k: v for k, v in wanted.items() if k not in self._slots}
         group_key = tuple(wanted)
         if not missing:
+            # A pure hit is still a use: without the touch, a hot schedule
+            # keeps its build-time LRU stamp and gets evicted first.
+            for key in wanted:
+                self._slots.move_to_end(key)
             self.stats.gpu_hit_plans += len(wanted)
             if self._host_tier is not None:
-                self._host_tier.register_group(group_key, wanted.keys())
+                self._host_tier.register_group(group_key=group_key, keys=wanted)
             return
         if len(wanted) > self.max_plans:
             raise ValueError(
                 f"MiniMax H3 AdaLN rebuild needs {len(wanted)} plans but the "
-                f"slab holds {self.max_plans}; raise --minimax-h3-adaln-gpu-plans"
+                "slab holds "
+                f"{self.max_plans}; raise SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS"
             )
         widest = max(timesteps.numel() for timesteps in wanted.values())
         if widest > self.max_plan_width:
@@ -582,7 +609,7 @@ class MiniMaxH3AdalnCache(nn.Module):
             self._host_tier.fence_prepare_start()
             if self._host_tier.has_all(missing):
                 self._swap_in_from_host(wanted=wanted, missing=missing)
-                self._host_tier.register_group(group_key, wanted.keys())
+                self._host_tier.register_group(group_key=group_key, keys=wanted)
                 return
 
         device = self.block_params.device
@@ -633,8 +660,10 @@ class MiniMaxH3AdalnCache(nn.Module):
         )
         if self._host_tier is not None:
             self._host_tier.store_group(
-                group_key,
-                {key: (self._slots[key], wanted[key]) for key in wanted},
+                group_key=group_key,
+                entries={
+                    key: (self._slots[key], wanted[key].numel()) for key in wanted
+                },
                 block_params=self.block_params,
                 final_params=self.final_params,
             )
@@ -676,14 +705,21 @@ class MiniMaxH3AdalnCache(nn.Module):
         assert self._host_tier is not None
         device = self.block_params.device
         assignments = self._allocate_slots(wanted=wanted, missing=missing)
-        for key, timesteps in missing.items():
-            slot = assignments[key]
-            self.plan_timesteps[slot, : timesteps.numel()] = timesteps.to(device)
-        self._host_tier.copy_to_gpu(
-            assignments,
-            block_params=self.block_params,
-            final_params=self.final_params,
-        )
+        try:
+            for key, timesteps in missing.items():
+                slot = assignments[key]
+                self.plan_timesteps[slot, : timesteps.numel()] = timesteps.to(device)
+            self._host_tier.copy_to_gpu(
+                assignments,
+                block_params=self.block_params,
+                final_params=self.final_params,
+            )
+        except BaseException:
+            # Lengths never flipped, so the slots stayed invisible; hand them
+            # back or the free-list invariant breaks and a later admission-
+            # accepted request pops from an empty list.
+            self._free_slots.extend(assignments.values())
+            raise
         # The compute stream must observe the H2D copies before any forward
         # reads the slots; lengths flip last so half-filled slots stay hidden.
         self._host_tier.fence_gpu_reads()
@@ -753,7 +789,12 @@ class MiniMaxH3AdalnCache(nn.Module):
                 self.final_params[slot, :length] = project(adaln_input, weight, bias)
             del weight, bias
 
-    def resolve_slots(self, step_timesteps: list[torch.Tensor]) -> torch.Tensor:
+    def resolve_slots(
+        self,
+        step_timesteps: list[torch.Tensor],
+        *,
+        keys: list[tuple[int, ...]] | None = None,
+    ) -> torch.Tensor:
         """Per-step slab slots as one device tensor, resolved on the host.
 
         Forward receives one scalar view per step. Keeping it a device tensor
@@ -761,9 +802,11 @@ class MiniMaxH3AdalnCache(nn.Module):
         replay signature (one graph per slot value), and an int baked into a
         captured gather would read the wrong slab row after slot reuse.
         """
+        if keys is None:
+            keys = [_plan_key(timesteps) for timesteps in step_timesteps]
         slots = []
-        for timesteps in step_timesteps:
-            slot = self._slots.get(_plan_key(timesteps))
+        for key in keys:
+            slot = self._slots.get(key)
             if slot is None:
                 raise ValueError(
                     "MiniMax H3 AdaLN cache does not cover the request timestep plan"
@@ -773,6 +816,12 @@ class MiniMaxH3AdalnCache(nn.Module):
 
     def lookup(self, unique_timesteps: torch.Tensor) -> torch.Tensor:
         num_timesteps = unique_timesteps.shape[0]
+        if num_timesteps > self.plan_timesteps.shape[1]:
+            # Without this the slice below silently clamps and the comparison
+            # dies on a shape mismatch instead of the real reason.
+            raise ValueError(
+                "MiniMax H3 AdaLN cache does not cover the request timestep plan"
+            )
         matches = self.plan_lengths.eq(num_timesteps) & self.plan_timesteps[
             :, :num_timesteps
         ].eq(unique_timesteps).all(dim=-1)
@@ -782,26 +831,13 @@ class MiniMaxH3AdalnCache(nn.Module):
             )
         return matches.to(torch.int64).argmax()
 
-    def block(
-        self,
-        index: int,
-        cache_plan_index: torch.Tensor,
-        num_timesteps: int,
-    ) -> tuple[torch.Tensor, ...]:
-        params = self.block_params[cache_plan_index, :num_timesteps, index]
-        params = params.reshape(-1, 6, self.hidden_size)
-        return tuple(params.unbind(dim=1))
-
     def block_all(
         self,
+        *,
         cache_plan_index: torch.Tensor,
         num_timesteps: int,
     ) -> tuple[tuple[torch.Tensor, ...], ...]:
-        """Every block's tuple via one slab gather instead of one per layer.
-
-        Same elements and per-tensor strides as 50 block() calls; the single
-        layer-major gather replaces 50 latency-bound indexing kernels.
-        """
+        """Every block's AdaLN tuple via one layer-major slab gather."""
         stacked = self.block_params.permute(2, 0, 1, 3)[
             :, cache_plan_index, :num_timesteps
         ]

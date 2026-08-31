@@ -7,7 +7,6 @@ contract accepts packed inference keyword arguments and returns packed logits.
 
 from __future__ import annotations
 
-import glob
 import math
 import os
 from collections import defaultdict
@@ -71,6 +70,12 @@ from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
     MiniMaxH3AdalnCache,
+)
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
+    _plan_key as _adaln_plan_key,
+)
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
+    native_adaln_weight_files,
 )
 from sglang.multimodal_gen.runtime.models.parameter import BlockQuantScaleParameter
 from sglang.multimodal_gen.runtime.platforms import (
@@ -1548,6 +1553,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         cache = self.adaln_cache
         if cache is None:
             return None
+        # Keying costs one D2H sync per plan; compute the keys once and share
+        # them between build and resolve.
+        keys = [_adaln_plan_key(timesteps) for timesteps in step_timesteps]
         if cache.weight_files is not None:
 
             def embed(timesteps: torch.Tensor) -> torch.Tensor:
@@ -1558,13 +1566,11 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     out = out.to(_BF16_DTYPE)
                 return out
 
-            cache.build(step_timesteps, embed=embed)
-        return cache.resolve_slots(step_timesteps)
+            cache.build(step_timesteps, embed=embed, keys=keys)
+        return cache.resolve_slots(step_timesteps, keys=keys)
 
-    def refresh_adaln_cache_after_weight_update(
-        self, *, weights_path: str | None
-    ) -> None:
-        """Drop cached AdaLN plans after the checkpoint changed on disk.
+    def refresh_weight_derived_caches(self, *, weights_path: str | None) -> None:
+        """Drop cached AdaLN plans after a weight swap; retarget the rebuild.
 
         Cached plans are weight-derived values; keeping them after an update
         silently serves the previous checkpoint's conditioning.
@@ -1580,17 +1586,17 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             )
             return
         files: list[str] = []
-        if weights_path is not None:
-            if os.path.isdir(weights_path):
-                files = sorted(glob.glob(os.path.join(weights_path, "*.safetensors")))
-            elif weights_path.endswith(".safetensors"):
-                files = [weights_path]
+        if weights_path is not None and os.path.isdir(weights_path):
+            # The rebuild streams native tensor names; a Diffusers-layout or
+            # quantized export would defer a KeyError to the next request.
+            files = native_adaln_weight_files(weights_path)
         if files:
             cache.weight_files = files
         else:
             logger.warning(
-                "MiniMax H3 AdaLN rebuild source not retargeted (no safetensors "
-                "under %s); rebuilds keep reading the original checkpoint",
+                "MiniMax H3 AdaLN rebuild source not retargeted (no native "
+                "adaln_proj safetensors under %s); rebuilds keep reading the "
+                "original checkpoint",
                 weights_path,
             )
         cache.invalidate()
@@ -2378,8 +2384,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     unique_timesteps.view(-1).to(device)
                 )
             block_adaln_params = self.adaln_cache.block_all(
-                adaln_cache_plan_index,
-                adaln_input.shape[0],
+                cache_plan_index=adaln_cache_plan_index,
+                num_timesteps=adaln_input.shape[0],
             )
         elif self._can_batch_block_adaln():
             local_adaln = torch.stack(

@@ -108,6 +108,15 @@ class BaseDiT(nn.Module, ABC):
         """Apply model-specific LoRA transforms after names are normalized."""
         return adapter
 
+    def refresh_weight_derived_caches(self, *, weights_path: str | None) -> None:
+        """Invalidate caches derived from weights after a weight update.
+
+        ``weights_path`` is the new on-disk source, or None for in-memory
+        (tensor RPC) updates. Default no-op; models that precompute values
+        from their weights override this.
+        """
+        return None
+
     @property
     def supported_attention_backends(self) -> set[AttentionBackendEnum]:
         return self._supported_attention_backends

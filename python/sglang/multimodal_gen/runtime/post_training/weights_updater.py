@@ -57,6 +57,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
     LoRAPipeline,
@@ -409,18 +410,12 @@ class WeightsUpdater:
                 self._module_weight_dirs[module_name] = weights_map[module_name]
             if target_modules is None:
                 self.pipeline.model_path = local_model_path
-            # Deferred import: this module must stay importable without the
-            # model zoo.
-            from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
-                MiniMaxH3DiTModel,
-            )
-
             for module_name, module in modules_to_update:
-                if isinstance(module, MiniMaxH3DiTModel):
-                    # Cached AdaLN plans are weight-derived; they must not
-                    # survive a weight swap (regardless of flush_cache, which
-                    # only governs optimization caches like TeaCache).
-                    module.refresh_adaln_cache_after_weight_update(
+                if isinstance(module, BaseDiT):
+                    # Weight-derived caches must not survive a weight swap
+                    # (regardless of flush_cache, which only governs
+                    # optimization caches like TeaCache).
+                    module.refresh_weight_derived_caches(
                         weights_path=weights_map[module_name]
                     )
 
@@ -572,6 +567,12 @@ class WeightsUpdater:
                 )
                 logger.error(error_msg, exc_info=True)
                 return False, error_msg
+
+        for module_name, module in modules_to_update:
+            if isinstance(module, BaseDiT):
+                # Same invariant as the disk path; there is no on-disk source
+                # to retarget the rebuild at, so only the caches drop.
+                module.refresh_weight_derived_caches(weights_path=None)
 
         gc.collect()
         torch.cuda.empty_cache()
