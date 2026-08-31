@@ -240,7 +240,7 @@ class SchedulerMetricsReporter:
         """Initialize Forward Pass Metrics (FPM) publisher if configured."""
         self.scheduler.enable_fpm = False
         if (
-            self.scheduler.server_args.enable_forward_pass_metrics
+            get_observability().enable_forward_pass_metrics
             and self.scheduler.ps.attn_tp_rank == 0
             and self.scheduler.ps.pp_rank == self.scheduler.ps.pp_size - 1
         ):
@@ -254,7 +254,7 @@ class SchedulerMetricsReporter:
                 else 0
             )
             self.scheduler._fpm_worker_id = (
-                self.scheduler.server_args.forward_pass_metrics_worker_id
+                get_observability().forward_pass_metrics_worker_id
             )
             base_endpoint = get_observability().forward_pass_metrics_ipc_name
             if base_endpoint is None:

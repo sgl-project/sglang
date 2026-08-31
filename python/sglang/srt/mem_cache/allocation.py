@@ -297,7 +297,7 @@ def alloc_for_extend(
     reuse_kv = None
     if batch.is_dllm():
         reuse_kv = [
-            r.req_pool_idx is not None and bool(r.dllm_incomplete_ids)
+            r.kv.req_pool_idx is not None and bool(r.dllm_incomplete_ids)
             for r in batch.reqs
         ]
 

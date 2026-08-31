@@ -172,7 +172,7 @@ class MlxTpModelWorker(TpModelWorker):
             self._mlx_runner.store_auxiliary_state_for_request(req.rid)
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
-            req.mamba_last_track_seqlen = None
+            req.kv.mamba_last_track_seqlen = None
 
     def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
         """Classify a request within an extend / mixed batch.
@@ -502,7 +502,7 @@ class MlxTpModelWorker(TpModelWorker):
                         full_token_ids=full_token_ids,
                         prefix_slot_ids=prefix_slot_ids,
                         new_slot_ids=req_new_slots,
-                        req_pool_idx=req.req_pool_idx,
+                        req_pool_idx=req.kv.req_pool_idx,
                         req=req,
                         needs_logits=self._chunk_needs_logits(req),
                         logit_edit_row=edit_rows[req.rid] if edit_rows else None,

@@ -149,7 +149,7 @@ Capacity levers, all in the Playground. Each trades precision or cache behavior 
 
 Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request — the calculator folds this in — and an unset `--max-running-requests` resets to 48 under spec (the command panel reminds you; set it explicitly to raise).
 
-**MoE runner.** Leave `--moe-runner-backend` unset on Blackwell: FlashInfer MXFP4 (W4A8, official trtllm-gen SiTU kernels) is selected with the pinned FlashInfer 0.6.17 dependency; H100/H200 pin Marlin. The B200 Balanced and High-Throughput cells pin `flashinfer_mxfp4` explicitly because that is the shape they were brought up on. The published Docker images install the matching official `flashinfer-python`, `flashinfer-cubin`, and `flashinfer-jit-cache` packages.
+**MoE runner.** Leave `--moe-runner-backend` unset on Blackwell: FlashInfer MXFP4 (W4A8, official trtllm-gen SiTU kernels) is selected; H100/H200 pin Marlin. The B200 Balanced and High-Throughput cells pin `flashinfer_mxfp4` explicitly because that is the shape they were brought up on.
 
 **Attention backend.** Leave all three attention knobs unset on Blackwell: K3 resolves prefill, decode, and — under DSPARK — verification as a set (`trtllm_mla` across the board; `cutedsl_mla` takes decode and verification under DCP). On the non-DCP recipes, setting any one of the three cancels the auto-resolution for the others. The B200 Balanced and High-Throughput cells pin `--decode-attention-backend cutedsl_mla`, which is what auto-resolution picks for those DCP recipes anyway — it is written out because it is the shape they were brought up on, not because it changes the resolution. H100/H200 pin `flashmla` for decode.
 
