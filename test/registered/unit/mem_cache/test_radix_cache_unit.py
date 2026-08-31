@@ -749,6 +749,48 @@ class TestRadixCache(unittest.TestCase):
         ]
         self.assertNotEqual(unsalted_hashes, stored[0].block_hashes)
 
+    def test_extra_key_does_not_move_published_block_hashes(self):
+        """extra_key has no field in the event schema, so a KV-aware router
+        recomputes block hashes from token ids alone; publishing a namespaced
+        hash would make every block of a LoRA or Elastic EP request unmatchable."""
+        tokens = array("q", [1, 2, 3, 4, 5, 6])
+
+        def published_hashes(key, sibling):
+            cache = RadixCache.create_simulated(
+                page_size=2, enable_kv_cache_events=True
+            )
+            cache.insert(
+                InsertParams(
+                    key=key,
+                    value=torch.tensor([10, 20, 30, 40, 50, 60], dtype=torch.int64),
+                )
+            )
+            # A divergent branch splits the node, so the sibling's BlockStored
+            # has to link back to a parent hash.
+            cache.insert(
+                InsertParams(
+                    key=sibling,
+                    value=torch.tensor([10, 20, 70, 80], dtype=torch.int64),
+                )
+            )
+            events = [
+                event for event in cache.take_events() if isinstance(event, BlockStored)
+            ]
+            return [
+                (event.parent_block_hash, tuple(event.block_hashes)) for event in events
+            ]
+
+        namespaced = published_hashes(
+            RadixKey(tokens, extra_key="lora-a"),
+            RadixKey(array("q", [1, 2, 7, 8]), extra_key="lora-a"),
+        )
+
+        self.assertEqual(
+            namespaced,
+            published_hashes(RadixKey(tokens), RadixKey(array("q", [1, 2, 7, 8]))),
+        )
+        self.assertIsNotNone(namespaced[-1][0])
+
     def test_cache_salt_event_hashes_are_preserved_across_node_split(self):
         cache = RadixCache.create_simulated(page_size=2, enable_kv_cache_events=True)
         original = RadixKey(array("q", [1, 2, 3, 4]), cache_salt="tenant-a")

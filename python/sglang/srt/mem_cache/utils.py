@@ -123,8 +123,11 @@ def get_hash_str(
 _CACHE_NAMESPACE_DOMAIN = b"sglang-cache-namespace-v1"
 
 
-def namespace_seed(key: "RadixKey") -> Optional[str]:
-    """The digest a page-hash chain starts from, or None for the default namespace.
+def namespace_seed(
+    extra_key: Optional[str], cache_salt: Optional[str]
+) -> Optional[str]:
+    """The digest a storage page-hash chain starts from, or None for the default
+    namespace.
 
     Page hashes cover token ids only, so a chain that starts unseeded names the
     same L3 page for every namespace. Seeding the head with extra_key/cache_salt
@@ -132,11 +135,11 @@ def namespace_seed(key: "RadixKey") -> Optional[str]:
     its length, so ('a', 'bc') cannot alias ('ab', 'c') and an absent part cannot
     alias an empty one.
     """
-    if key.extra_key is None and key.cache_salt is None:
+    if extra_key is None and cache_salt is None:
         return None
 
     digest = hashlib.sha256(_CACHE_NAMESPACE_DOMAIN)
-    for part in (key.extra_key, key.cache_salt):
+    for part in (extra_key, cache_salt):
         if part is None:
             digest.update(b"\x00")
             continue
@@ -147,10 +150,15 @@ def namespace_seed(key: "RadixKey") -> Optional[str]:
     return digest.hexdigest()
 
 
+def key_namespace_seed(key: "RadixKey") -> Optional[str]:
+    """``namespace_seed`` for the namespace a RadixKey belongs to."""
+    return namespace_seed(key.extra_key, key.cache_salt)
+
+
 def chain_prior_hash(key: "RadixKey", prior_hash: Optional[str]) -> Optional[str]:
     """What this page-hash chain links back to: the prior page when the chain
     continues, else the seed that scopes a fresh chain to its namespace."""
-    return prior_hash if prior_hash else namespace_seed(key)
+    return prior_hash if prior_hash else key_namespace_seed(key)
 
 
 def hash_str_to_int64(hash_str: str) -> int:
@@ -177,15 +185,45 @@ def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
     return hash_values
 
 
+# Domain separator for the KV-event chain's salt seed. Distinct from the storage
+# domain so the two chains of a salted request cannot alias.
+_EVENT_CACHE_SALT_DOMAIN = b"sglang-cache-salt-v1\0"
+
+
+def event_namespace_seed(key: "RadixKey") -> Optional[str]:
+    """The digest the published KV-event chain starts from, or None for an
+    unseeded chain.
+
+    Only cache_salt scopes it: BlockStoredWithMetadata echoes the salt, so a
+    consumer can reproduce the chain. extra_key has no field in the event
+    schema, so seeding with it would publish block hashes that no token-based
+    routing consumer can recompute.
+    """
+    if key.cache_salt is None:
+        return None
+    return hashlib.sha256(
+        _EVENT_CACHE_SALT_DOMAIN + key.cache_salt.encode("utf-8")
+    ).hexdigest()
+
+
+def _cache_namespace(key: "RadixKey") -> Tuple[Optional[str], Optional[str]]:
+    return (key.extra_key, key.cache_salt)
+
+
 def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
-    """Compute and memoize namespace-aware external KV-event hashes."""
-    cache_salt = node.key.cache_salt
-    if cache_salt is None:
+    """Compute and memoize namespace-aware external KV-event hashes.
+
+    Default-namespace nodes reuse the storage chain. Namespaced ones need their
+    own: the storage chain is seeded with ``extra_key`` too, and only
+    ``cache_salt`` reaches the consumer.
+    """
+    if key_namespace_seed(node.key) is None:
         return compute_node_hash_values(node, page_size)
 
     if node.event_hash_value is not None:
         return node.event_hash_value
 
+    namespace = _cache_namespace(node.key)
     missing_nodes = []
     current = node
     while (
@@ -194,8 +232,8 @@ def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
         and len(current.key) > 0
         and current.event_hash_value is None
     ):
-        if current.key.cache_salt != cache_salt:
-            raise ValueError("Radix path contains mismatched cache_salt values")
+        if _cache_namespace(current.key) != namespace:
+            raise ValueError("Radix path contains mismatched cache namespaces")
         missing_nodes.append(current)
         current = current.parent
 
@@ -203,16 +241,14 @@ def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
         current is not None
         and current.key is not None
         and len(current.key) > 0
-        and current.key.cache_salt != cache_salt
+        and _cache_namespace(current.key) != namespace
     ):
-        raise ValueError("Radix path contains mismatched cache_salt values")
+        raise ValueError("Radix path contains mismatched cache namespaces")
 
     if current is not None and current.event_hash_value:
         parent_hash = current.event_hash_value[-1]
     else:
-        parent_hash = hashlib.sha256(
-            b"sglang-cache-salt-v1\0" + cache_salt.encode("utf-8")
-        ).hexdigest()
+        parent_hash = event_namespace_seed(node.key)
 
     for missing_node in reversed(missing_nodes):
         hash_values = get_hash_str(missing_node.key, parent_hash, page_size=page_size)

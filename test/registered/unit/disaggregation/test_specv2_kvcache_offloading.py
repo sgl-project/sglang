@@ -22,6 +22,8 @@ from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.utils import chain_prior_hash, get_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -39,6 +41,8 @@ def _make_mock_req(
     req = MagicMock()
     req.rid = rid
     req.origin_input_ids = list(range(origin_len))
+    req.extra_key = None
+    req.cache_salt = None
     req.kv = ReqKvInfo(
         req_pool_idx=req_pool_idx,
         kv_committed_len=kv_committed_len,
@@ -472,6 +476,81 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         self.assertEqual(len(manager.offloaded_state), 0)
         self.assertEqual(len(manager.offload_inflight), 0)
+
+
+class TestComputePrefixHash(unittest.TestCase):
+    """The decode-side L3 chain must name the same pages as the prefill side for
+    the same request namespace (#26747)."""
+
+    _NAMESPACES = [
+        ("default", None, None),
+        ("extra_key", "lora-a", None),
+        ("cache_salt", None, "tenant-a"),
+        ("both", "lora-a", "tenant-a"),
+    ]
+
+    def _make_manager(self, page_size=4):
+        manager = object.__new__(DecodeKVCacheOffloadManager)
+        manager.page_size = page_size
+        manager.cache_controller = MagicMock()
+        manager.cache_controller.get_hash_str = get_hash_str
+        return manager
+
+    def _make_req(self, extra_key, cache_salt):
+        req = MagicMock()
+        req.extra_key = extra_key
+        req.cache_salt = cache_salt
+        return req
+
+    def test_fresh_chain_matches_the_prefill_side(self):
+        manager = self._make_manager()
+        tokens = list(range(1, 9))
+
+        for name, extra_key, cache_salt in self._NAMESPACES:
+            with self.subTest(name=name):
+                key = RadixKey(tokens, extra_key=extra_key, cache_salt=cache_salt)
+                expected = get_hash_str(
+                    key, chain_prior_hash(key, None), page_size=manager.page_size
+                )
+                self.assertEqual(
+                    manager._compute_prefix_hash(
+                        self._make_req(extra_key, cache_salt), tokens
+                    ),
+                    expected,
+                )
+
+    def test_namespaces_do_not_share_pages(self):
+        manager = self._make_manager()
+        tokens = list(range(1, 9))
+
+        chains = {
+            tuple(
+                manager._compute_prefix_hash(
+                    self._make_req(extra_key, cache_salt), tokens
+                )
+            )
+            for _, extra_key, cache_salt in self._NAMESPACES
+        }
+
+        self.assertEqual(len(chains), len(self._NAMESPACES))
+
+    def test_continued_chain_ignores_the_namespace(self):
+        """Only the head of a chain is seeded; a continuation links to the page
+        the caller already resolved."""
+        manager = self._make_manager()
+        tokens = list(range(1, 9))
+        prior_hash = get_hash_str(list(range(100, 104)))
+
+        chains = {
+            tuple(
+                manager._compute_prefix_hash(
+                    self._make_req(extra_key, cache_salt), tokens, prior_hash
+                )
+            )
+            for _, extra_key, cache_salt in self._NAMESPACES
+        }
+
+        self.assertEqual(len(chains), 1)
 
 
 if __name__ == "__main__":

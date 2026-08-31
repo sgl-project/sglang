@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
     hash_str_to_int64,
+    key_namespace_seed,
 )
 
 
@@ -89,9 +90,9 @@ class KVCacheEventRecorder:
         """Hash values to publish for ``node``, computing them if not yet set."""
         if node.hash_value is None:
             node.hash_value = compute_node_hash_values(node, self.page_size)
-        if node.key.cache_salt is not None:
-            return compute_node_event_hash_values(node, self.page_size)
-        return node.hash_value
+        if key_namespace_seed(node.key) is None:
+            return node.hash_value
+        return compute_node_event_hash_values(node, self.page_size)
 
     def _parent_block_hash(self, node: Any) -> Optional[int]:
         """The hash the first page of ``node`` links back to.
@@ -103,7 +104,7 @@ class KVCacheEventRecorder:
         parent = node.parent
         if parent is None or parent.parent is None:
             return None
-        if node.key.cache_salt is not None:
+        if key_namespace_seed(node.key) is not None:
             parent_hash_values = parent.event_hash_value
             assert parent_hash_values is not None
         else:

@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.utils import namespace_seed
 from sglang.srt.runtime_context import (
     get_memory,
     get_schedule,
@@ -139,7 +140,7 @@ class DecodeKVCacheOffloadManager:
         state = self.offloaded_state.get(req)
         if state is None:
             prefill_hashes = self._compute_prefix_hash(
-                req.origin_input_ids[:prefill_offloaded_len]
+                req, req.origin_input_ids[:prefill_offloaded_len]
             )
             last_prefill_hash = (
                 prefill_hashes[-1] if prefill_offloaded_len > 0 else None
@@ -288,7 +289,7 @@ class DecodeKVCacheOffloadManager:
         self, req, host_indices, incremental_tokens, start_time, prior_hash
     ):
         """Trigger async backup from host to storage."""
-        page_hashes = self._compute_prefix_hash(incremental_tokens, prior_hash)
+        page_hashes = self._compute_prefix_hash(req, incremental_tokens, prior_hash)
         ack_id = self.cache_controller.write_storage(
             host_indices,
             incremental_tokens,
@@ -297,9 +298,11 @@ class DecodeKVCacheOffloadManager:
         self.ongoing_backup[ack_id] = (req.rid, host_indices, start_time)
         return page_hashes[-1] if len(page_hashes) > 0 else prior_hash
 
-    def _compute_prefix_hash(self, tokens, prior_hash=""):
+    def _compute_prefix_hash(self, req, tokens, prior_hash=None):
         page_hashes = []
-        last_hash = prior_hash
+        # A fresh chain starts at the request's cache namespace, so these keys
+        # match the ones the prefill side writes and looks up.
+        last_hash = prior_hash or namespace_seed(req.extra_key, req.cache_salt)
         for offset in range(0, len(tokens), self.page_size):
             page_tokens = tokens[offset : offset + self.page_size]
             last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)

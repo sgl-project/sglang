@@ -71,12 +71,13 @@ class RadixKey:
     ):
         # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
-        # Extra key for caller-defined cache classification.
+        # Extra key for caller-defined cache classification. It namespaces the
+        # in-process radix tree and the L3 storage keys, but not external KV
+        # events: the event schema has no field to echo it back with.
         self.extra_key = extra_key
         # Cache salt is kept distinct so it cannot collide with extra_key.
-        # It namespaces the in-process radix tree and external KV events;
-        # external L3/remote storage keys remain token-only and are outside
-        # this contract.
+        # It namespaces the in-process radix tree, the L3 storage keys, and
+        # external KV events, which echo it in BlockStoredMetadata.
         self.cache_salt = cache_salt or None
         # bigram view over token_ids: length = max(0, len(token_ids) - 1)
         self.is_bigram = is_bigram
