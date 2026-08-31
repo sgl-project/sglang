@@ -696,12 +696,7 @@ class MOVADenoisingStage(PipelineStage):
         visual_context = context.to(device=device, dtype=model_dtype)
         audio_context = context.to(device=device, dtype=model_dtype)
 
-        # [Note] Use temporary_module_dtype for the upcast on CPU
-        # On CPU, torch.autocast("cpu", dtype=torch.float32) emits a warning and silently disables autocast (enabled = False)
-        # CPU takes the non-CUDA branch in autocast.__init__. That branch defines a device_supported_dtypes list containing only bfloat16 and float16.
-        # Since float32 is not in the list, the code hits the "target dtype is not supported. Disabling autocast." branch, warns, and turns autocast off.
-        # https://github.com/pytorch/pytorch/blob/d7245544ad8fe2816425bfac5d2312b6f6f37386/torch/amp/autocast_mode.py#L297-L305
-        # https://github.com/pytorch/pytorch/blob/d7245544ad8fe2816425bfac5d2312b6f6f37386/torch/amp/autocast_mode.py#L248
+        # See [Note] Use temporary_module_dtype for the upcast on CPU
         autocast_ctx = (
             torch.autocast(
                 device_type=current_platform.device_type, dtype=torch.float32
@@ -1014,7 +1009,7 @@ class MOVADecodingStage(PipelineStage):
         ) as audio_vae:
             assert audio_vae is not None
             self.audio_vae = audio_vae
-            # See [Note] Use _module_in_fp32 for the upcast on CPU
+            # See [Note] Use temporary_module_dtype for the upcast on CPU
             autocast_ctx = (
                 torch.autocast(
                     device_type=current_platform.device_type, dtype=torch.float32
