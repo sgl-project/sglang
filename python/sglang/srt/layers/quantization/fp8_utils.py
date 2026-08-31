@@ -822,6 +822,10 @@ def initialize_fp8_gemm_config() -> None:
         backend = "cutlass"
 
     backend = Fp8GemmRunnerBackend(backend)
+    if backend.is_bf16() and not (_is_hip and _is_gfx95_supported):
+        raise ValueError(
+            "--fp8-gemm-backend bf16 is supported only for MXFP8 on AMD gfx950."
+        )
 
     FP8_GEMM_RUNNER_BACKEND = backend
 

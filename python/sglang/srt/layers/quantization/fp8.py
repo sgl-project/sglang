@@ -475,7 +475,7 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.convert_mxfp8_to_block = self.use_mxfp8 and (
             _mxfp8_to_block_fp8_required
-            or envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.get()
+            or (_is_hip and envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.get())
         )
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = None
@@ -2081,7 +2081,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
-        if _is_hip and get_moe_runner_backend().is_aiter():
+        if _is_hip and _is_gfx95_supported and get_moe_runner_backend().is_aiter():
             from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
             from aiter.utility import fp4_utils
 
