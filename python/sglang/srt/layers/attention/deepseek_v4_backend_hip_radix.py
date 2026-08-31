@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -18,6 +19,18 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.dcp_a2a import (
+    DSV4_DCP_DIRECT_A2A_HEAD_DIM,
+    DSV4_DCP_DIRECT_A2A_HEADS,
+    DSV4_DCP_DIRECT_A2A_WORLD_SIZES,
+    DCPA2AOutputWorkspace,
+    DCPA2APackedOutput,
+    DCPDestinationPushOutput,
+    DCPDestinationPushWorkspace,
+    dsv4_dcp_decode_reducer_communicator,
+    prepare_dsv4_dcp_full_model_destination_push,
+    select_dsv4_dcp_full_model_output_workspaces,
+)
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
@@ -28,21 +41,44 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     FusedCompressMetadata,
     create_paged_compressor_data,
 )
+from sglang.srt.layers.attention.dsv4.dcp import (
+    build_local_page_table,
+    local_swa_lens,
+    select_dcp_attn_sink,
+    validate_dsv4_dcp_topology,
+)
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
     copy_metadata,
     maybe_copy_inplace,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import (
-    get_parallel,
-    get_spec,
+from sglang.srt.layers.dcp import (
+    cp_lse_ag_out_rs_mla,
+    dcp_a2a_lse_reduce,
+    dcp_registered_destination_push_lse_reduce,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
-from sglang.srt.utils import ceil_align
+from sglang.srt.utils import ceil_align, is_gfx95_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -58,6 +94,13 @@ PAGE_INDEX_ALIGNED_SIZE = 64
 
 
 T = TypeVar("T", bound=Optional[torch.Tensor])
+
+
+def _is_exact_gfx950() -> bool:
+    """Restrict the peer-push route to its validated architecture."""
+    if not is_gfx95_supported():
+        return False
+    return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
 
 
 def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
@@ -232,7 +275,12 @@ class DSV4AttnMetadata:
             ],
         )
 
-    def init_compression_metadata(self, unified_swa_pages: int = 0):
+    def init_compression_metadata(
+        self,
+        unified_swa_pages: int = 0,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
+    ):
         assert self.page_table.dim() == 2
         assert (
             self.raw_out_loc.shape == self.seq_lens_casual.shape
@@ -255,6 +303,8 @@ class DSV4AttnMetadata:
             self.page_table,
             self.page_size,
             compute_page_indices=True,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
         )
 
         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
@@ -263,8 +313,16 @@ class DSV4AttnMetadata:
         if unified_swa_pages:
             if self.unified is None:
                 self.unified = UnifiedKvMetadata()
-            self.unified.c4_out_loc = self.c4_out_loc + unified_swa_pages
-            self.unified.c128_out_loc = self.c128_out_loc + unified_swa_pages
+            self.unified.c4_out_loc = torch.where(
+                self.c4_out_loc >= 0,
+                self.c4_out_loc + unified_swa_pages,
+                self.c4_out_loc,
+            )
+            self.unified.c128_out_loc = torch.where(
+                self.c128_out_loc >= 0,
+                self.c128_out_loc + unified_swa_pages,
+                self.c128_out_loc,
+            )
 
     _CP_REINDEX_FIELDS = [
         "seq_lens_casual",
@@ -468,6 +526,86 @@ class DeepseekV4HipRadixBackend(
             getattr(model_runner, "is_draft_worker", False)
             and model_runner.spec_algorithm.is_dspark()
         )
+        self.is_draft_worker = getattr(model_runner, "is_draft_worker", False)
+        allocator = model_runner.token_to_kv_pool_allocator
+        self.dsv4_dcp_size = (
+            getattr(allocator, "dcp_size", 1) if not self.is_draft_worker else 1
+        )
+        self.dsv4_dcp_rank = (
+            getattr(allocator, "dcp_rank", 0) if not self.is_draft_worker else 0
+        )
+        if self.dsv4_dcp_size > 1:
+            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+                is_unified_kv_triton,
+            )
+            from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+
+            if not is_unified_kv_triton():
+                raise NotImplementedError(
+                    "DeepSeek V4 DCP requires "
+                    "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton."
+                )
+            parallel = get_parallel()
+            validate_dsv4_dcp_topology(
+                dcp_size=self.dsv4_dcp_size,
+                dcp_rank=self.dsv4_dcp_rank,
+                attn_tp_size=parallel.attn_tp_size,
+                attn_tp_rank=parallel.attn_tp_rank,
+                attn_dp_size=parallel.attn_dp_size,
+                comm_backend=parallel.dcp_comm_backend,
+                disaggregation_mode=get_disagg().disaggregation_mode,
+            )
+            if is_dsa_enable_prefill_cp():
+                raise NotImplementedError(
+                    "DeepSeek V4 DCP cannot be combined with DSA prefill context "
+                    "parallelism until the two-dimensional token/head exchange is "
+                    "implemented."
+                )
+        features = get_exec().features
+        self._direct_a2a_state_capture_configured = bool(
+            features.enable_return_hidden_states
+            or features.return_hidden_states_mode is not None
+            or features.enable_return_routed_experts
+            or features.enable_return_indexer_topk
+        )
+        self._direct_a2a_tbo_configured = bool(
+            model_runner.server_args.enable_two_batch_overlap
+        )
+        self._direct_a2a_speculative_configured = (
+            not model_runner.spec_algorithm.is_none()
+        )
+        self._destination_push_is_gfx950 = _is_exact_gfx950()
+        self._destination_push_workspace: Optional[DCPDestinationPushWorkspace] = None
+        self._destination_push_communicator = None
+        self._destination_push_route_logged = False
+        self._prepare_dsv4_destination_push_workspace(model_runner.dtype)
+        self._direct_a2a_output_workspace: Optional[DCPA2AOutputWorkspace] = None
+        if (
+            envs.SGLANG_DSV4_DCP_DIRECT_A2A_OUTPUT.get()
+            and is_gfx95_supported()
+            and self.dsv4_dcp_size in DSV4_DCP_DIRECT_A2A_WORLD_SIZES
+            and get_parallel().dcp_comm_backend == "a2a"
+            and model_runner.dtype == torch.bfloat16
+            and not self.is_draft_worker
+            and not self._direct_a2a_tbo_configured
+            and not self._direct_a2a_speculative_configured
+            and not get_exec().features.enable_memory_saver
+            and not envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            and self.hisparse_coordinator is None
+            and not self._direct_a2a_state_capture_configured
+            and not check_cuda_graph_backend(Phase.DECODE, Backend.TC_PIECEWISE)
+            and not check_cuda_graph_backend(Phase.DECODE, Backend.BREAKABLE)
+        ):
+            # B1-only fixed storage is allocated before any graph capture. One
+            # workspace is safely reused layer-by-layer because each A2A/combine
+            # consumes it before the next attention producer runs.
+            self._direct_a2a_output_workspace = DCPA2AOutputWorkspace.allocate(
+                world_size=self.dsv4_dcp_size,
+                max_batch_size=1,
+                num_heads=DSV4_DCP_DIRECT_A2A_HEADS,
+                head_dim=DSV4_DCP_DIRECT_A2A_HEAD_DIM,
+                device=self.device,
+            )
         self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens
         if self.is_dspark_draft:
             assert self.speculative_num_draft_tokens is not None
@@ -482,6 +620,109 @@ class DeepseekV4HipRadixBackend(
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
         ] = None
+
+    def _prepare_dsv4_destination_push_workspace(
+        self, model_dtype: torch.dtype
+    ) -> None:
+        """Collectively register the fixed workspace before graph capture."""
+        if (
+            not envs.SGLANG_DSV4_DCP_REGISTERED_DESTINATION_PUSH.get()
+            or not self._destination_push_is_gfx950
+            or self.dsv4_dcp_size != 8
+            or get_parallel().dcp_comm_backend != "a2a"
+            or model_dtype != torch.bfloat16
+            or self.is_draft_worker
+            or self._direct_a2a_tbo_configured
+            or self._direct_a2a_speculative_configured
+            or get_exec().features.enable_memory_saver
+            or envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            or self.hisparse_coordinator is not None
+            or self._direct_a2a_state_capture_configured
+            or check_cuda_graph_backend(Phase.DECODE, Backend.TC_PIECEWISE)
+            or check_cuda_graph_backend(Phase.DECODE, Backend.BREAKABLE)
+        ):
+            return
+
+        parallel = get_parallel()
+        workspace, push_communicator = prepare_dsv4_dcp_full_model_destination_push(
+            dcp_group=parallel.dcp_group,
+            candidate_groups=[
+                ("dcp", parallel.dcp_group),
+                ("tp", parallel.tp_group),
+                ("attn_tp", parallel.attn_tp_group),
+            ],
+            dcp_rank=self.dsv4_dcp_rank,
+            device=self.device,
+        )
+        if workspace is None or push_communicator is None:
+            logger.warning(
+                "Unable to prepare DSV4 registered destination-push workspace "
+                "from equivalent bootstrap groups; retaining the existing A2A route"
+            )
+            return
+
+        # Preserve AITER ownership and registered addresses for graph replay.
+        self._destination_push_workspace = workspace
+        self._destination_push_communicator = push_communicator
+        logger.info(
+            "DSV4 registered destination-push workspace ready from selected group "
+            "(gfx950, DCP8==TP8, B1 BF16 decode)"
+        )
+
+    def _select_dsv4_dcp_decode_workspaces(
+        self,
+        *,
+        q: torch.Tensor,
+        unified_kv: torch.Tensor,
+        comm_backend: str,
+        is_plain_decode: bool,
+        batch_size: int,
+        speculative: bool,
+        memory_saver: bool,
+        state_capture: bool,
+        piecewise_graph: bool,
+        breakable_graph: bool,
+    ) -> tuple[Optional[DCPDestinationPushWorkspace], Optional[DCPA2AOutputWorkspace]]:
+        destination_push_workspace, direct_output_workspace = (
+            select_dsv4_dcp_full_model_output_workspaces(
+                destination_push_workspace=self._destination_push_workspace,
+                direct_output_workspace=self._direct_a2a_output_workspace,
+                communicator=self._destination_push_communicator,
+                destination_push_enabled=envs.SGLANG_DSV4_DCP_REGISTERED_DESTINATION_PUSH.get(),
+                direct_output_enabled=envs.SGLANG_DSV4_DCP_DIRECT_A2A_OUTPUT.get(),
+                is_gfx950=self._destination_push_is_gfx950,
+                direct_platform_supported=is_gfx95_supported(),
+                dcp_size=self.dsv4_dcp_size,
+                tbo=self._direct_a2a_tbo_configured,
+                hisparse=self.hisparse_coordinator is not None,
+                q=q,
+                unified_kv=unified_kv,
+                comm_backend=comm_backend,
+                is_plain_decode=is_plain_decode,
+                batch_size=batch_size,
+                speculative=speculative,
+                memory_saver=memory_saver,
+                state_capture=state_capture,
+                piecewise_graph=piecewise_graph,
+                breakable_graph=breakable_graph,
+            )
+        )
+        if (
+            destination_push_workspace is not None
+            and not self._destination_push_route_logged
+        ):
+            logger.info(
+                "DSV4 registered destination-push route selected "
+                "(gfx950, DCP8, B1 BF16 decode)"
+            )
+            self._destination_push_route_logged = True
+        return destination_push_workspace, direct_output_workspace
+
+    @staticmethod
+    def _reduce_dsv4_destination_push_output(
+        decode_output: DCPDestinationPushOutput, group
+    ) -> torch.Tensor:
+        return dcp_registered_destination_push_lse_reduce(decode_output, group)
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -628,6 +869,7 @@ class DeepseekV4HipRadixBackend(
         use_prefill_cuda_graph: bool = False,
         seq_lens_cpu: Optional[List[int]] = None,
         ragged_layout=None,
+        seq_lens_cpu_is_final: bool = False,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         # HIP path: build target-verify metadata eagerly. The raw/lazy-upgrade route can
         # hit planner invariants during graph capture for DSV4+EAGLE.
@@ -641,6 +883,7 @@ class DeepseekV4HipRadixBackend(
             out_cache_loc=out_cache_loc,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             ragged_layout=ragged_layout,
+            seq_lens_cpu_is_final=seq_lens_cpu_is_final,
         )
 
     def init_forward_metadata_target_verify_old(
@@ -652,6 +895,7 @@ class DeepseekV4HipRadixBackend(
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
         ragged_layout=None,
+        seq_lens_cpu_is_final: bool = False,
     ) -> DSV4Metadata:
         batch_size = len(seq_lens)
         extend_start_loc = None
@@ -677,9 +921,11 @@ class DeepseekV4HipRadixBackend(
             seq_lens_cpu = None
         else:
             seq_lens = seq_lens + self.target_verify_num_draft_tokens
-            seq_lens_cpu = [
-                x + self.target_verify_num_draft_tokens for x in seq_lens_cpu
-            ]
+            if not seq_lens_cpu_is_final:
+                seq_lens_cpu = [
+                    x + self.target_verify_num_draft_tokens for x in seq_lens_cpu
+                ]
+            max_seq_len = max(max_seq_len, max(seq_lens_cpu))
             extend_seq_lens_cpu = [self.target_verify_num_draft_tokens] * batch_size
             num_tokens = self.target_verify_num_draft_tokens * batch_size
             extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
@@ -934,6 +1180,12 @@ class DeepseekV4HipRadixBackend(
         elif bucket == _GraphBucket.TARGET_VERIFY:
             assert out_cache_loc is not None
             ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            seq_lens_cpu_is_final = self.is_dspark_draft and not in_capture
+            if seq_lens_cpu_is_final and ragged_layout is None:
+                num_padding = getattr(forward_batch, "num_padding", 0)
+                if num_padding:
+                    seq_lens_cpu = seq_lens_cpu.clone()
+                    seq_lens_cpu[-num_padding:] += self.target_verify_num_draft_tokens
             if ragged_layout is not None:
                 ragged_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
                 num_tokens_v = ragged_layout.graph_num_tokens
@@ -956,6 +1208,7 @@ class DeepseekV4HipRadixBackend(
                 # pass it so target_verify skips the per-iter seq_lens.tolist() sync.
                 seq_lens_cpu=seq_lens_cpu.tolist(),
                 ragged_layout=ragged_layout,
+                seq_lens_cpu_is_final=seq_lens_cpu_is_final,
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
             num_tokens_per_req = self.draft_extend_num_tokens_per_req
@@ -1037,6 +1290,7 @@ class DeepseekV4HipRadixBackend(
                     seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
                 ),
                 ragged_layout=ragged_layout,
+                seq_lens_cpu_is_final=self.is_dspark_draft,
             )
         elif forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
@@ -1159,6 +1413,8 @@ class DeepseekV4HipRadixBackend(
             win=pool.unified_swa_window,
             ring_stride=pool.unified_swa_ring_size,
             swa_pages=pool.unified_swa_pages,
+            dcp_size=self.dsv4_dcp_size,
+            dcp_rank=self.dsv4_dcp_rank,
         )
         # SWA ring write target, same value for every layer this forward.
         req_slot = state_slot.to(torch.int64)
@@ -1234,8 +1490,24 @@ class DeepseekV4HipRadixBackend(
         ring_stride = pool.unified_swa_ring_size
         swa_pages = pool.unified_swa_pages
 
-        if q.ndim == 4:
+        if q.ndim == 4 and q.shape[1] == 1:
             q = q.squeeze(1)
+        if q.ndim not in (3, 4):
+            raise ValueError(f"unified_kv expects 3D or 4D Q, got {q.shape}")
+        rank_major_q = q.ndim == 4
+        if rank_major_q and (
+            not envs.SGLANG_DSV4_DCP_COMBINED_Q_TOPK.get()
+            or not envs.SGLANG_DSV4_DCP_PACKED_TOPK.get()
+            or self.dsv4_dcp_size <= 1
+            or compress_ratio != 4
+            or not forward_batch.forward_mode.is_decode()
+            or q.shape[1] != self.dsv4_dcp_size
+        ):
+            raise ValueError(
+                "rank-major Q is reserved for combined DCP C4 plain decode; "
+                f"got shape={tuple(q.shape)}, mode={forward_batch.forward_mode}, "
+                f"compress_ratio={compress_ratio}, dcp={self.dsv4_dcp_size}"
+            )
         device = q.device
         positions = forward_batch.positions.to(torch.int64)
         T = q.shape[0]
@@ -1277,23 +1549,138 @@ class DeepseekV4HipRadixBackend(
             elif compress_ratio == 4:
                 kv_indices = unified_metadata.csa_indices
                 kv_indptr = unified_metadata.csa_indptr
-                runtime.fill_compress_tail(
-                    indices=kv_indices,
-                    indptr=kv_indptr,
-                    prefix_len=core_attn_metadata.swa_topk_lengths[:T],
-                    page_indices=c4_pi[:T],
-                    valid_len=core_attn_metadata.c4_sparse_topk_lengths_raw[:T],
-                    swa_pages=swa_pages,
-                )
+                if self.dsv4_dcp_size == 1:
+                    runtime.fill_compress_tail(
+                        indices=kv_indices,
+                        indptr=kv_indptr,
+                        prefix_len=core_attn_metadata.swa_topk_lengths[:T],
+                        page_indices=c4_pi[:T],
+                        valid_len=core_attn_metadata.c4_sparse_topk_lengths_raw[:T],
+                        swa_pages=swa_pages,
+                    )
             else:
                 raise ValueError(f"bad compress_ratio {compress_ratio}")
-            return runtime.decode(
+            if self.dsv4_dcp_size == 1:
+                return runtime.decode(
+                    q=q,
+                    unified_kv=unified,
+                    kv_indices=kv_indices,
+                    kv_indptr=kv_indptr,
+                    attn_sink=attn_sink,
+                    softmax_scale=self.softmax_scale,
+                )
+
+            group = get_parallel().dcp_group
+            if rank_major_q:
+                local_num_heads = q.shape[2]
+            else:
+                local_num_heads = q.shape[1]
+                q = group.all_gather(q.contiguous(), dim=1).contiguous()
+            dcp_sink = select_dcp_attn_sink(
+                attn_sink,
+                local_num_heads,
+                get_parallel().attn_tp_rank,
+                self.dsv4_dcp_size,
+                self.dsv4_dcp_rank,
+            )
+            sink_logit_shift = -math.log(float(self.dsv4_dcp_size))
+            if not envs.SGLANG_DSV4_DCP_INLINE_SINK_SHIFT.get():
+                dcp_sink = dcp_sink + sink_logit_shift
+                sink_logit_shift = 0.0
+            dcp_block_h = envs.SGLANG_DSV4_DCP_BLOCK_H.get()
+            comm_backend = get_parallel().dcp_comm_backend
+            actual_forward_mode = getattr(
+                forward_batch, "actual_forward_mode", forward_batch.forward_mode
+            )
+            capture_hidden_mode = getattr(
+                forward_batch, "capture_hidden_mode", CaptureHiddenMode.NULL
+            )
+            is_plain_decode = (
+                forward_batch.forward_mode.is_decode()
+                and actual_forward_mode.is_decode()
+            )
+            speculative = (
+                self._direct_a2a_speculative_configured
+                or getattr(forward_batch, "spec_info", None) is not None
+            )
+            memory_saver = (
+                get_exec().features.enable_memory_saver
+                or envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            )
+            state_capture = (
+                self._direct_a2a_state_capture_configured
+                or capture_hidden_mode not in (None, CaptureHiddenMode.NULL)
+            )
+            piecewise_graph = (
+                is_in_tc_piecewise_cuda_graph()
+                or check_cuda_graph_backend(Phase.DECODE, Backend.TC_PIECEWISE)
+            )
+            breakable_graph = is_in_breakable_cuda_graph() or check_cuda_graph_backend(
+                Phase.DECODE, Backend.BREAKABLE
+            )
+            (
+                destination_push_workspace,
+                direct_output_workspace,
+            ) = self._select_dsv4_dcp_decode_workspaces(
+                q=q,
+                unified_kv=unified,
+                comm_backend=comm_backend,
+                is_plain_decode=is_plain_decode,
+                batch_size=forward_batch.batch_size,
+                speculative=speculative,
+                memory_saver=memory_saver,
+                state_capture=state_capture,
+                piecewise_graph=piecewise_graph,
+                breakable_graph=breakable_graph,
+            )
+            decode_output = runtime.decode(
                 q=q,
                 unified_kv=unified,
                 kv_indices=kv_indices,
                 kv_indptr=kv_indptr,
-                attn_sink=attn_sink,
+                attn_sink=dcp_sink,
                 softmax_scale=self.softmax_scale,
+                return_lse=True,
+                attn_sink_logit_shift=sink_logit_shift,
+                block_h=dcp_block_h or None,
+                output_workspace=direct_output_workspace,
+                destination_push_workspace=destination_push_workspace,
+            )
+            reducer_group = dsv4_dcp_decode_reducer_communicator(
+                decode_output,
+                destination_push_communicator=self._destination_push_communicator,
+                dcp_group=group,
+            )
+            if isinstance(decode_output, DCPDestinationPushOutput):
+                return self._reduce_dsv4_destination_push_output(
+                    decode_output, reducer_group
+                )
+            if isinstance(decode_output, DCPA2APackedOutput):
+                return dcp_a2a_lse_reduce(
+                    decode_output,
+                    None,
+                    reducer_group,
+                    is_lse_base_on_e=True,
+                    comm_backend=comm_backend,
+                )
+            partial_out, partial_lse = decode_output
+            if comm_backend in ("a2a", "fi_a2a"):
+                return dcp_a2a_lse_reduce(
+                    partial_out.contiguous(),
+                    partial_lse.contiguous(),
+                    reducer_group,
+                    is_lse_base_on_e=True,
+                    comm_backend=comm_backend,
+                )
+            return (
+                cp_lse_ag_out_rs_mla(
+                    partial_out,
+                    partial_lse,
+                    reducer_group,
+                    is_lse_base_on_e=True,
+                )
+                .transpose(0, 1)
+                .contiguous()
             )
 
         # prefill / extend
@@ -1356,23 +1743,65 @@ class DeepseekV4HipRadixBackend(
             swa_pages=swa_pages,
             c128_page_indices=c128_pi,
             c4_sparse_page_indices=c4_pi,
+            dcp_size=self.dsv4_dcp_size,
+            dcp_rank=self.dsv4_dcp_rank,
         )
 
         if kpre_p.shape[0] < T + 1:
             pad = T + 1 - kpre_p.shape[0]
             kpre_p = torch.cat([kpre_p, kpre_p[-1:].expand(pad)])
             kext_p = torch.cat([kext_p, kext_p[-1:].expand(pad)])
-        o = runtime.prefill(
-            q=q,
-            unified_kv=unified,
-            kv_indices_prefix=kpre_i,
-            kv_indptr_prefix=kpre_p,
-            kv_extend=kv,
-            kv_indices_extend=kext_i,
-            kv_indptr_extend=kext_p,
-            attn_sink=attn_sink,
-            softmax_scale=self.softmax_scale,
-        )
+        if self.dsv4_dcp_size == 1:
+            o = runtime.prefill(
+                q=q,
+                unified_kv=unified,
+                kv_indices_prefix=kpre_i,
+                kv_indptr_prefix=kpre_p,
+                kv_extend=kv,
+                kv_indices_extend=kext_i,
+                kv_indptr_extend=kext_p,
+                attn_sink=attn_sink,
+                softmax_scale=self.softmax_scale,
+            )
+        else:
+            group = get_parallel().dcp_group
+            local_num_heads = q.shape[1]
+            q = group.all_gather(q.contiguous(), dim=1).contiguous()
+            dcp_sink = select_dcp_attn_sink(
+                attn_sink,
+                local_num_heads,
+                get_parallel().attn_tp_rank,
+                self.dsv4_dcp_size,
+                self.dsv4_dcp_rank,
+            )
+            partial_out, partial_lse = runtime.prefill(
+                q=q,
+                unified_kv=unified,
+                kv_indices_prefix=kpre_i,
+                kv_indptr_prefix=kpre_p,
+                kv_extend=kv,
+                kv_indices_extend=kext_i,
+                kv_indptr_extend=kext_p,
+                attn_sink=dcp_sink,
+                softmax_scale=self.softmax_scale,
+                return_lse=True,
+                replicated_logit_shift=-math.log(float(self.dsv4_dcp_size)),
+            )
+            # Keep A2A decode-only. During chunked prefill B is the token count
+            # (typically 8192), so packed A2A allocates and exchanges GB-scale
+            # send/recv buffers per layer. Repeated 512K requests exposed an
+            # asynchronous memory fault in that path; AG/RS is stable and does
+            # not affect the decode TPOT benefit of the configured A2A backend.
+            o = (
+                cp_lse_ag_out_rs_mla(
+                    partial_out,
+                    partial_lse,
+                    group,
+                    is_lse_base_on_e=True,
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
 
         # write this chunk's SWA K into the ring for future chunks / decode
         # only the final-window tokens per request
@@ -1683,12 +2112,20 @@ class DeepseekV4HipRadixBackend(
         )
 
         raw_positions = seq_lens_casual - 1
-        swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
+        swa_topk_lengths = local_swa_lens(
+            seq_lens_casual,
+            SWA_WINDOW,
+            self.dsv4_dcp_size,
+            self.dsv4_dcp_rank,
+        ).to(torch.int32)
 
-        page_table = req_to_token[
-            req_pool_indices_repeated, : max_seq_len : self.page_size
-        ]
-        page_table = (page_table // self.page_size).to(torch.int32)
+        page_table = build_local_page_table(
+            req_to_token,
+            req_pool_indices_repeated,
+            max_seq_len,
+            self.page_size,
+            self.dsv4_dcp_size,
+        )
 
         core_attn_metadata = DSV4AttnMetadata(
             page_size=self.page_size,
@@ -1704,7 +2141,11 @@ class DeepseekV4HipRadixBackend(
 
         if need_compress:
             core_attn_metadata.init_compression_metadata(
-                unified_swa_pages=getattr(self.token_to_kv_pool, "unified_swa_pages", 0)
+                unified_swa_pages=getattr(
+                    self.token_to_kv_pool, "unified_swa_pages", 0
+                ),
+                dcp_size=self.dsv4_dcp_size,
+                dcp_rank=self.dsv4_dcp_rank,
             )
             core_attn_metadata.init_flashmla_related()
         else:

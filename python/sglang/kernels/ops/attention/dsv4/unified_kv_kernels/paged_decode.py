@@ -57,6 +57,14 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dcp_a2a import (
+    DCPA2AOutputWorkspace,
+    DCPA2APackedOutput,
+    DCPDestinationPushOutput,
+    DCPDestinationPushWorkspace,
+    prepare_dsv4_dcp_destination_push_output,
+    prepare_dsv4_dcp_direct_a2a_output,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_gfx1250_supported
@@ -215,14 +223,16 @@ def _kv_splits_heuristic(
 
 @triton.jit
 def _paged_decode_fused_kernel(
-    q_ptr,  # [N, H, D]
+    q_ptr,  # [N, H, D] or rank-major [N, DCP, Hlocal, D]
     unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
     kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
     kv_indices_ptr,  # [total_indices] int32
     kv_indptr_ptr,  # [N+1] int32
     attn_sink_ptr,  # [H]
-    out_ptr,  # [N, H, D]
+    out_ptr,  # [T,H,D], or packed [destination,T,H_per_rank,D]
+    lse_out_ptr,  # [T,H], or packed [destination,T,H_per_rank] fp32
     q_stride_t,
+    q_stride_rank,
     q_stride_h,
     q_stride_d,
     kv_stride_n,
@@ -233,14 +243,18 @@ def _paged_decode_fused_kernel(
     out_stride_d,
     qk_scale,  # = softmax_scale * LOG2E
     log2e,  # = LOG2E, to lift natural-log sink into log2 domain
+    attn_sink_logit_shift,  # natural-log scalar applied only to the virtual sink
     H: tl.constexpr,
+    H_LOCAL: tl.constexpr,
     D: tl.constexpr,
+    RANK_MAJOR_Q: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
     QUANT_KV: tl.constexpr,  # True → dequant fp8 KV via kv_scales
     GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
     NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE (constexpr; D % GROUP_SIZE == 0)
+    STORE_LSE: tl.constexpr,
 ):
     """Single-pass online-softmax with sink folded inline — fast path for
     cases where ``kv_splits = 1`` (base grid already saturates the GPU). Skips
@@ -257,11 +271,14 @@ def _paged_decode_fused_kernel(
     h_mask = h_offs < H
     d_mask = d_offs < D
 
+    if RANK_MAJOR_Q:
+        q_head_offsets = (h_offs // H_LOCAL) * q_stride_rank + (
+            h_offs % H_LOCAL
+        ) * q_stride_h
+    else:
+        q_head_offsets = h_offs * q_stride_h
     q = tl.load(
-        q_ptr
-        + t * q_stride_t
-        + h_offs[:, None] * q_stride_h
-        + d_offs[None, :] * q_stride_d,
+        q_ptr + t * q_stride_t + q_head_offsets[:, None] + d_offs[None, :] * q_stride_d,
         mask=h_mask[:, None] & d_mask[None, :],
         other=0.0,
     )
@@ -342,8 +359,9 @@ def _paged_decode_fused_kernel(
 
     # Fold attn_sink as a virtual K of weight 1. sink is a natural-log bias;
     # multiply by log2e so it lives in the same log2 domain as our online m_i.
-    sink_raw = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(
-        tl.float32
+    sink_raw = (
+        tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
+        + attn_sink_logit_shift
     )
     sink = sink_raw * log2e
     m_final = tl.maximum(m_i, sink)
@@ -363,11 +381,18 @@ def _paged_decode_fused_kernel(
         out.to(out_ptr.dtype.element_ty),
         mask=h_mask[:, None] & d_mask[None, :],
     )
+    if STORE_LSE:
+        natural_lse = tl.where(
+            l_final > 0.0,
+            (m_final + tl.log2(l_final)) * 0.6931471805599453,
+            -float("inf"),
+        )
+        tl.store(lse_out_ptr + t * H + h_offs, natural_lse, mask=h_mask)
 
 
 @triton.jit
 def _paged_decode_split_kernel(
-    q_ptr,  # [N, H, D]
+    q_ptr,  # [N, H, D] or rank-major [N, DCP, Hlocal, D]
     unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
     kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
     kv_indices_ptr,  # [total_indices] int32
@@ -376,6 +401,7 @@ def _paged_decode_split_kernel(
     l_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
     acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32
     q_stride_t,
+    q_stride_rank,
     q_stride_h,
     q_stride_d,
     kv_stride_n,
@@ -392,9 +418,11 @@ def _paged_decode_split_kernel(
     ap_stride_h,
     ap_stride_d,
     H: tl.constexpr,
+    H_LOCAL: tl.constexpr,
     D: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     qk_scale,  # = softmax_scale * LOG2E
+    RANK_MAJOR_Q: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -416,11 +444,14 @@ def _paged_decode_split_kernel(
     h_mask = h_offs < H
     d_mask = d_offs < D
 
+    if RANK_MAJOR_Q:
+        q_head_offsets = (h_offs // H_LOCAL) * q_stride_rank + (
+            h_offs % H_LOCAL
+        ) * q_stride_h
+    else:
+        q_head_offsets = h_offs * q_stride_h
     q = tl.load(
-        q_ptr
-        + t * q_stride_t
-        + h_offs[:, None] * q_stride_h
-        + d_offs[None, :] * q_stride_d,
+        q_ptr + t * q_stride_t + q_head_offsets[:, None] + d_offs[None, :] * q_stride_d,
         mask=h_mask[:, None] & d_mask[None, :],
         other=0.0,
     )
@@ -517,6 +548,9 @@ def _paged_decode_reduce_kernel(
     attn_sink_ptr,  # [H]
     kv_indptr_ptr,  # [N+1] int32
     out_ptr,  # [N, H, D]
+    lse_out_ptr,  # [N, H] fp32 when STORE_LSE
+    peer_recv_ptrs,  # device uint64[dcp] for destination push
+    push_epoch_ptr,  # device int32[1] for destination push
     mp_stride_t,
     mp_stride_k,
     mp_stride_h,
@@ -527,16 +561,30 @@ def _paged_decode_reduce_kernel(
     ap_stride_k,
     ap_stride_h,
     ap_stride_d,
+    out_stride_n,
     out_stride_t,
     out_stride_h,
     out_stride_d,
+    lse_stride_n,
+    lse_stride_t,
+    lse_stride_h,
+    push_stride_plane,
+    push_stride_source,
+    push_stride_t,
+    push_stride_h,
     log2e,  # = LOG2E, used to convert natural-log sink → log2 domain
+    attn_sink_logit_shift,  # natural-log scalar applied only to the virtual sink
     H: tl.constexpr,
+    H_PER_RANK: tl.constexpr,
+    SOURCE_RANK: tl.constexpr,
     D: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     BLOCK_D: tl.constexpr,
     D_CHUNK: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    STORE_LSE: tl.constexpr,
+    DIRECT_A2A_OUTPUT: tl.constexpr,
+    DESTINATION_PUSH: tl.constexpr,
 ):
     """2D-tile reduce: combine KV_SPLITS partials, fold attn_sink, write
     final output. Grid: ``(T, H, ceil(D / D_CHUNK))`` — one CTA owns one
@@ -564,6 +612,16 @@ def _paged_decode_reduce_kernel(
        across all dc programs for the same (t, h). They recompute it
        redundantly but it's a tiny scalar reduce; cheaper than passing
        through LDS.
+
+    With DIRECT_A2A_OUTPUT, logical head ``h`` is stored at destination
+    ``h // H_PER_RANK`` and owner-local head ``h % H_PER_RANK``. The supplied
+    strides point into the existing ``[destination,batch,local_head,D+2]`` A2A
+    buffer; output arithmetic and the natural-log LSE expression are unchanged.
+
+    With DESTINATION_PUSH, the same rounded BF16 value and raw FP32 LSE are
+    stored through AITER's device pointer table into
+    ``[epoch&1,source,batch,local_head,D+2]`` on the owning destination. There
+    is no synchronization or wait in this multi-block producer.
     """
     t = tl.program_id(0)
     h = tl.program_id(1)
@@ -572,6 +630,37 @@ def _paged_decode_reduce_kernel(
     d_offs = dc * D_CHUNK + tl.arange(0, D_CHUNK)
     k_offs = tl.arange(0, KV_SPLITS)
     d_mask = d_offs < D
+    if DESTINATION_PUSH:
+        destination = h // H_PER_RANK
+        destination_head = h - destination * H_PER_RANK
+        epoch = tl.load(push_epoch_ptr).to(tl.uint32)
+        plane = epoch & 1
+        target_addr = tl.load(peer_recv_ptrs + destination)
+        push_out_ptr = target_addr.to(tl.pointer_type(tl.bfloat16))
+        push_lse_ptr = target_addr.to(tl.pointer_type(tl.float32))
+        out_base = (
+            plane * push_stride_plane
+            + SOURCE_RANK * push_stride_source
+            + t * push_stride_t
+            + destination_head * push_stride_h
+        )
+        lse_base = 0
+    elif DIRECT_A2A_OUTPUT:
+        destination = h // H_PER_RANK
+        destination_head = h - destination * H_PER_RANK
+        out_base = (
+            destination * out_stride_n
+            + t * out_stride_t
+            + destination_head * out_stride_h
+        )
+        lse_base = (
+            destination * lse_stride_n
+            + t * lse_stride_t
+            + destination_head * lse_stride_h
+        )
+    else:
+        out_base = t * out_stride_t + h * out_stride_h
+        lse_base = t * H + h
 
     neg_large = -3.4028234663852886e38
 
@@ -585,12 +674,30 @@ def _paged_decode_reduce_kernel(
     # and the sink-fold arithmetic. Skipping the whole CTA also halves the
     # reduce-kernel cost on mixed-kv batches with many padded tokens.
     if kv_len == 0:
-        out_off = t * out_stride_t + h * out_stride_h + d_offs * out_stride_d
-        tl.store(
-            out_ptr + out_off,
-            tl.zeros([D_CHUNK], dtype=out_ptr.dtype.element_ty),
-            mask=d_mask,
-        )
+        out_off = out_base + d_offs * out_stride_d
+        if DESTINATION_PUSH:
+            tl.store(
+                push_out_ptr + out_base + d_offs,
+                tl.zeros([D_CHUNK], dtype=tl.bfloat16),
+                mask=d_mask,
+            )
+        else:
+            tl.store(
+                out_ptr + out_off,
+                tl.zeros([D_CHUNK], dtype=out_ptr.dtype.element_ty),
+                mask=d_mask,
+            )
+        if STORE_LSE and dc == 0:
+            if DESTINATION_PUSH:
+                tl.store(
+                    push_lse_ptr + (out_base + D) // 2,
+                    tl.load(attn_sink_ptr + h) + attn_sink_logit_shift,
+                )
+            else:
+                tl.store(
+                    lse_out_ptr + lse_base,
+                    tl.load(attn_sink_ptr + h) + attn_sink_logit_shift,
+                )
         return
     tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
     act_num_segments = tl.cdiv(kv_len, tl.maximum(tiles_per_segment, 1) * BLOCK_K)
@@ -626,7 +733,7 @@ def _paged_decode_reduce_kernel(
     acc_combined = tl.sum(a_p * alpha_split[:, None], axis=0)  # [D_CHUNK]
 
     # Fold attn_sink (recomputed across dc — scalar work, negligible).
-    sink_raw = tl.load(attn_sink_ptr + h).to(tl.float32)
+    sink_raw = tl.load(attn_sink_ptr + h).to(tl.float32) + attn_sink_logit_shift
     sink = sink_raw * log2e
     m_final = tl.maximum(m_max, sink)
     alpha_kv = tl.exp2(m_max - m_final)
@@ -643,11 +750,28 @@ def _paged_decode_reduce_kernel(
     acc_final = acc_combined * alpha_kv
     out = tl.where(l_final > 0.0, acc_final / denom, 0.0)
 
-    tl.store(
-        out_ptr + t * out_stride_t + h * out_stride_h + d_offs * out_stride_d,
-        out.to(out_ptr.dtype.element_ty),
-        mask=d_mask,
-    )
+    if DESTINATION_PUSH:
+        tl.store(
+            push_out_ptr + out_base + d_offs,
+            out.to(tl.bfloat16),
+            mask=d_mask,
+        )
+    else:
+        tl.store(
+            out_ptr + out_base + d_offs * out_stride_d,
+            out.to(out_ptr.dtype.element_ty),
+            mask=d_mask,
+        )
+    if STORE_LSE and dc == 0:
+        natural_lse = tl.where(
+            l_final > 0.0,
+            (m_final + tl.log2(l_final)) * 0.6931471805599453,
+            -float("inf"),
+        )
+        if DESTINATION_PUSH:
+            tl.store(push_lse_ptr + (out_base + D) // 2, natural_lse)
+        else:
+            tl.store(lse_out_ptr + lse_base, natural_lse)
 
 
 # ---------------------------------------------------------------------------
@@ -666,10 +790,19 @@ def _sparse_attn_v4_paged_decode_triton(
     block_h: int | None = None,
     kv_splits: int | None = None,
     block_k: int | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+    attn_sink_logit_shift: float = 0.0,
+    output_workspace: DCPA2AOutputWorkspace | None = None,
+    destination_push_workspace: DCPDestinationPushWorkspace | None = None,
+):
     """V4 sparse decode Triton implementation: split-K with FUSED fast path,
-    exp2 softmax, CG-safe heuristic. ``block_h`` and ``kv_splits`` are
-    escape hatches for benchmarks; production callers pass neither.
+    exp2 softmax, CG-safe heuristic. Q may be contiguous ``[T,H,D]`` or the
+    zero-copy combined-AG view ``[T,DCP,Hlocal,D]``. ``block_h`` and
+    ``kv_splits`` are escape hatches for benchmarks; production callers pass neither.
+    ``output_workspace`` optionally lets the B1 split-reduce path write the
+    existing packed DCP A2A send layout in place.
+    ``destination_push_workspace`` is the mutually-exclusive registered path
+    that writes the owner rank's double receive plane directly.
 
     When ``kv_scales`` is provided, ``unified_kv`` must be e4m3fnuz and
     ``kv_scales`` must be ``[total_pages, D // GROUP_SIZE]`` fp32 — 1xGROUP_SIZE
@@ -713,8 +846,31 @@ def _sparse_attn_v4_paged_decode_triton(
                 f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
             )
 
-    T, H, D = q.shape
-    out = torch.empty_like(q)
+    if q.ndim == 3:
+        T, H, D = q.shape
+        h_local = H
+        q_stride_rank = 0
+        q_stride_h = q.stride(1)
+        q_stride_d = q.stride(2)
+        rank_major_q = False
+    elif q.ndim == 4:
+        T, dcp_size, h_local, D = q.shape
+        if dcp_size <= 0 or h_local <= 0:
+            raise RuntimeError(f"invalid rank-major Q shape: {tuple(q.shape)}")
+        H = dcp_size * h_local
+        q_stride_rank = q.stride(1)
+        q_stride_h = q.stride(2)
+        q_stride_d = q.stride(3)
+        rank_major_q = True
+    else:
+        raise RuntimeError(
+            "sparse_attn_v4_paged_decode expects Q shaped [T,H,D] or "
+            f"[T,DCP,Hlocal,D], got {tuple(q.shape)}"
+        )
+    if attn_sink.numel() < H:
+        raise RuntimeError(
+            f"attn_sink has {attn_sink.numel()} heads but Q needs at least {H}"
+        )
 
     if block_h is None:
         block_h = triton.next_power_of_2(min(H, 64))
@@ -728,6 +884,60 @@ def _sparse_attn_v4_paged_decode_triton(
 
     if kv_splits is None:
         kv_splits = _kv_splits_heuristic(T, H, block_h)
+
+    if output_workspace is not None and destination_push_workspace is not None:
+        raise ValueError(
+            "local packed output and registered destination push are mutually exclusive"
+        )
+
+    # The production B1 geometry always selects split-K. Keep the fused path
+    # unchanged; an explicit kv_splits=1 or any unsupported workspace layout
+    # falls back to the ordinary logical [T,H,D] + [T,H] outputs.
+    direct_views = (
+        prepare_dsv4_dcp_direct_a2a_output(
+            output_workspace,
+            batch_size=T,
+            num_heads=H,
+            head_dim=D,
+            dtype=q.dtype,
+            device=q.device,
+        )
+        if return_lse and kv_splits != 1
+        else None
+    )
+    push_workspace = (
+        prepare_dsv4_dcp_destination_push_output(
+            destination_push_workspace,
+            batch_size=T,
+            num_heads=H,
+            head_dim=D,
+            dtype=q.dtype,
+            device=q.device,
+        )
+        if return_lse and kv_splits != 1
+        else None
+    )
+    direct_a2a_output = direct_views is not None
+    destination_push = push_workspace is not None
+    if push_workspace is not None:
+        push_output, push_lse = push_workspace.receive_output_and_lse_views(
+            batch_size=T,
+            head_dim=D,
+        )
+        # Plane-zero views provide launch types/strides only. The selected
+        # specialization stores through peer_recv_ptrs.
+        out = push_output[0]
+        lse_out = push_lse[0]
+    elif direct_views is not None:
+        out, lse_out = direct_views
+    else:
+        out = (
+            torch.empty((T, H, D), dtype=q.dtype, device=q.device)
+            if rank_major_q
+            else torch.empty_like(q)
+        )
+        lse_out = torch.empty((T, H), dtype=torch.float32, device=q.device)
+    lse_arg = lse_out if return_lse else q.new_empty(1, dtype=torch.float32)
 
     qk_scale = float(softmax_scale) * LOG2E
     _bk, num_warps, num_stages = _kernel_config(block_h)
@@ -765,9 +975,11 @@ def _sparse_attn_v4_paged_decode_triton(
             kv_indptr,
             attn_sink,
             out,
+            lse_arg,
             q.stride(0),
-            q.stride(1),
-            q.stride(2),
+            q_stride_rank,
+            q_stride_h,
+            q_stride_d,
             unified_kv.stride(0),
             unified_kv.stride(1),
             ks_stride_n_arg,
@@ -776,18 +988,22 @@ def _sparse_attn_v4_paged_decode_triton(
             out.stride(2),
             qk_scale,
             LOG2E,
+            attn_sink_logit_shift,
             H,
+            h_local,
             D,
             BLOCK_H=block_h,
             BLOCK_D=block_d,
             BLOCK_K=block_k,
+            RANK_MAJOR_Q=rank_major_q,
             QUANT_KV=quant_kv,
             GROUP_SIZE=_FP8_GROUP_SIZE,
             NUM_GROUPS=num_groups_arg,
+            STORE_LSE=return_lse,
             num_warps=num_warps,
             num_stages=num_stages,
         )
-        return out
+        return (out, lse_out) if return_lse else out
 
     # Split-K path: split kernel writes (m, l, acc) partials in log2 domain;
     # reduce kernel combines them, folds attn_sink, writes final output.
@@ -812,8 +1028,9 @@ def _sparse_attn_v4_paged_decode_triton(
         l_partial,
         acc_partial,
         q.stride(0),
-        q.stride(1),
-        q.stride(2),
+        q_stride_rank,
+        q_stride_h,
+        q_stride_d,
         unified_kv.stride(0),
         unified_kv.stride(1),
         ks_stride_n_arg,
@@ -828,12 +1045,14 @@ def _sparse_attn_v4_paged_decode_triton(
         acc_partial.stride(2),
         acc_partial.stride(3),
         H,
+        h_local,
         D,
         kv_splits,
         qk_scale,
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
+        RANK_MAJOR_Q=rank_major_q,
         QUANT_KV=quant_kv,
         GROUP_SIZE=_FP8_GROUP_SIZE,
         NUM_GROUPS=num_groups_arg,
@@ -859,6 +1078,19 @@ def _sparse_attn_v4_paged_decode_triton(
         d_chunks_needed = max(1, target_reduce_wg // base_grid_t_h)
         d_chunks_needed = min(d_chunks_needed, block_d // 32)
         d_chunk = max(32, triton.next_power_of_2(block_d // d_chunks_needed))
+    packed_h_per_rank = (
+        H // out.shape[0] if direct_a2a_output or destination_push else H
+    )
+    if push_workspace is not None:
+        peer_recv_ptrs_arg = push_workspace.peer_recv_ptrs
+        push_epoch_arg = push_workspace.epoch
+        push_strides = push_workspace.recv_planes.stride()
+        push_source_rank = push_workspace.source_rank
+    else:
+        peer_recv_ptrs_arg = q
+        push_epoch_arg = kv_indptr
+        push_strides = (0, 0, 0, 0, 0)
+        push_source_rank = 0
     grid_reduce = (T, H, (D + d_chunk - 1) // d_chunk)
     _paged_decode_reduce_kernel[grid_reduce](
         m_partial,
@@ -867,6 +1099,9 @@ def _sparse_attn_v4_paged_decode_triton(
         attn_sink,
         kv_indptr,
         out,
+        lse_arg,
+        peer_recv_ptrs_arg,
+        push_epoch_arg,
         m_partial.stride(0),
         m_partial.stride(1),
         m_partial.stride(2),
@@ -877,19 +1112,51 @@ def _sparse_attn_v4_paged_decode_triton(
         acc_partial.stride(1),
         acc_partial.stride(2),
         acc_partial.stride(3),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
+        out.stride(0) if direct_a2a_output else 0,
+        out.stride(1) if direct_a2a_output else out.stride(0),
+        out.stride(2) if direct_a2a_output else out.stride(1),
+        out.stride(3) if direct_a2a_output else out.stride(2),
+        lse_arg.stride(0) if direct_a2a_output else 0,
+        lse_arg.stride(1) if direct_a2a_output else 0,
+        lse_arg.stride(2) if direct_a2a_output else 0,
+        push_strides[0],
+        push_strides[1],
+        push_strides[2],
+        push_strides[3],
         LOG2E,
+        attn_sink_logit_shift,
         H,
+        packed_h_per_rank,
+        push_source_rank,
         D,
         kv_splits,
         BLOCK_D=block_d,
         D_CHUNK=d_chunk,
         BLOCK_K=block_k,
+        STORE_LSE=return_lse,
+        DIRECT_A2A_OUTPUT=direct_a2a_output,
+        DESTINATION_PUSH=destination_push,
         num_warps=4,
     )
-    return out
+    if destination_push:
+        assert push_workspace is not None
+        return DCPDestinationPushOutput(
+            workspace=push_workspace,
+            batch_size=T,
+            num_heads=H,
+            head_dim=D,
+            is_lse_base_on_e=True,
+        )
+    if direct_a2a_output:
+        assert output_workspace is not None
+        return DCPA2APackedOutput(
+            workspace=output_workspace,
+            batch_size=T,
+            num_heads=H,
+            head_dim=D,
+            is_lse_base_on_e=True,
+        )
+    return (out, lse_out) if return_lse else out
 
 
 def sparse_attn_v4_paged_decode(
@@ -900,13 +1167,18 @@ def sparse_attn_v4_paged_decode(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     kv_scales: torch.Tensor | None = None,
-) -> torch.Tensor:
+    block_h: int | None = None,
+    return_lse: bool = False,
+    attn_sink_logit_shift: float = 0.0,
+    output_workspace: DCPA2AOutputWorkspace | None = None,
+    destination_push_workspace: DCPDestinationPushWorkspace | None = None,
+):
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
     When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
     """
-    if _is_gfx1250_supported:
+    if _is_gfx1250_supported and not return_lse:
         # aiter ships only on ROCm, and this module is imported by a CPU-registered
         # test, so the import has to sit behind the same gate as the call.
         from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
@@ -921,13 +1193,17 @@ def sparse_attn_v4_paged_decode(
             has_invalid=False,
             kv_scales=kv_scales,
         )
-    else:
-        return _sparse_attn_v4_paged_decode_triton(
-            q,
-            unified_kv,
-            kv_indices,
-            kv_indptr,
-            attn_sink,
-            softmax_scale,
-            kv_scales=kv_scales,
-        )
+    return _sparse_attn_v4_paged_decode_triton(
+        q,
+        unified_kv,
+        kv_indices,
+        kv_indptr,
+        attn_sink,
+        softmax_scale,
+        kv_scales=kv_scales,
+        block_h=block_h,
+        return_lse=return_lse,
+        attn_sink_logit_shift=attn_sink_logit_shift,
+        output_workspace=output_workspace,
+        destination_push_workspace=destination_push_workspace,
+    )

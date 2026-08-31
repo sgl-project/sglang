@@ -130,7 +130,19 @@ class SchedulerInvariantChecker:
             # KV allocation is physical-page based. Partial physical pages can
             # leave a small page-level slack even when all pages are owned by
             # either the allocator or the prefix cache.
-            return False, f"{msg}, dcp_physical_page_slack_allowed=True"
+            total_accounted = (
+                ps.full_available_size
+                + full_evictable_size
+                + protected
+                + session_held
+                + uncached
+            )
+            slack = abs(total_accounted - total)
+            if slack < allocator.page_size:
+                return (
+                    False,
+                    f"{msg}, dcp_physical_page_slack={slack}",
+                )
         return leak, msg
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:

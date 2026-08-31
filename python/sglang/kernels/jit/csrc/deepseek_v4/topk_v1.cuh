@@ -39,6 +39,8 @@ struct TopKParams {
 };
 
 SGL_DEVICE uint8_t convert_to_uint8(float x) {
+  if (x != x) x = __uint_as_float(0xff800000u);
+  if (x == 0.0f) x = 0.0f;
   __half h = __float2half_rn(x);
   uint16_t bits = __half_as_ushort(h);
   uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
@@ -46,6 +48,8 @@ SGL_DEVICE uint8_t convert_to_uint8(float x) {
 }
 
 SGL_DEVICE uint32_t convert_to_uint32(float x) {
+  if (x != x) x = __uint_as_float(0xff800000u);
+  if (x == 0.0f) x = 0.0f;
   uint32_t bits = __float_as_uint(x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
@@ -78,8 +82,12 @@ SGL_DEVICE void naive_transform(
 }
 
 [[maybe_unused]]
-SGL_DEVICE void
-radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const uint32_t length, const uint32_t topk) {
+SGL_DEVICE bool radix_topk(
+    const float* __restrict__ input,
+    int32_t* __restrict__ output,
+    const uint32_t length,
+    const uint32_t topk,
+    const bool stop_on_scratch_overflow = false) {
   constexpr uint32_t RADIX = 256;
   constexpr uint32_t BLOCK_SIZE = kTopKBlockSize;
   constexpr uint32_t SMEM_INPUT_SIZE = kSMEM / (2 * sizeof(int32_t));
@@ -130,6 +138,7 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
   __syncthreads();
 
   const auto threshold_bin = s_threshold_bin_id;
+  const bool scratch_overflow = s_histogram[threshold_bin] - s_histogram[threshold_bin + 1] > SMEM_INPUT_SIZE;
   remain_topk -= s_histogram[threshold_bin + 1];
   if (remain_topk == 0) {
     for (uint32_t idx = tx; idx < length; idx += BLOCK_SIZE) {
@@ -140,7 +149,9 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
       }
     }
     __syncthreads();
-    return;
+    return false;
+  } else if (scratch_overflow && stop_on_scratch_overflow) {
+    return true;
   } else {
     __syncthreads();
     if (tx < RADIX + 1) {
@@ -234,6 +245,7 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
       __syncthreads();
     }
   }
+  return scratch_overflow;
 }
 
 template <bool kUsePDL>
@@ -275,7 +287,11 @@ void setup_kernel_smem_once(host::DebugInfo where = {}) {
   [[maybe_unused]]
   static const auto result = [] {
     const auto fptr = std::bit_cast<const void*>(f);
+#ifdef USE_ROCM
+    return ::hipFuncSetAttribute(fptr, ::hipFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+#else
     return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+#endif
   }();
   host::RuntimeDeviceCheck(result, where);
 }
@@ -297,7 +313,7 @@ struct TopKKernel {
     auto P = SymbolicSize{"page_table_stride"};
     auto K = SymbolicSize{"topk"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({B, -1})  // strided scores
         .with_strides({S, 1})

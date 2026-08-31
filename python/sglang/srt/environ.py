@@ -1124,6 +1124,28 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    SGLANG_DSV4_DCP_PACKED_TOPK = EnvBool(False)
+    # Experimental gfx950 decode-only PoC: transport the C4 packed candidates
+    # and attention Q in one bf16 DCP all-gather.
+    SGLANG_DSV4_DCP_COMBINED_Q_TOPK = EnvBool(False)
+    # Write packed merge lengths directly to the attention-visible buffer,
+    # avoiding one tiny device copy per C4 layer.
+    SGLANG_DSV4_DCP_DIRECT_TOPK_LENGTHS = EnvBool(True)
+    # Apply the replicated DCP sink compensation inside paged decode instead
+    # of materializing one shifted sink tensor per layer.
+    SGLANG_DSV4_DCP_INLINE_SINK_SHIFT = EnvBool(True)
+    # Override DCP paged-decode head tiling for full-model tuning. Zero keeps
+    # the backend heuristic.
+    SGLANG_DSV4_DCP_BLOCK_H = EnvInt(16)
+    # Experimental gfx950 B1 decode path: make unified paged decode write the
+    # existing destination-major A2A output+LSE send layout directly, removing
+    # only the standalone pack launch. The A2A collective and local combine
+    # remain unchanged.
+    SGLANG_DSV4_DCP_DIRECT_A2A_OUTPUT = EnvBool(False)
+    # Experimental gfx950 DCP8 B1 BF16 decode route. The backend collectively
+    # registers fixed double receive planes before graph capture and otherwise
+    # leaves the established direct-A2A/RCCL route unchanged.
+    SGLANG_DSV4_DCP_REGISTERED_DESTINATION_PUSH = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends

@@ -578,6 +578,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self._unified_kv = is_unified_kv_triton()
+        self.supports_dsv4_dcp = self._unified_kv
 
         if self._unified_kv:
             self.swa_kv_pool = None
@@ -663,6 +664,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
+
+    def register_dcp_geometry(
+        self, *, dcp_size: int, dcp_rank: int, logical_page_size: int
+    ) -> None:
+        self.dcp_size = dcp_size
+        self.dcp_rank = dcp_rank
+        self.logical_page_size = logical_page_size
 
     def get_ring_size(self, compress_ratio: int) -> int:
         is_speculative = get_spec().speculative_algorithm is not None

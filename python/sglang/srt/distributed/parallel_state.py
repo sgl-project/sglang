@@ -1153,6 +1153,50 @@ class GroupCoordinator:
         else:
             torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
+    def prepare_dsv4_dcp_destination_push_workspace(
+        self,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Collectively register AITER's fixed double receive planes."""
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is None
+            or getattr(ca_comm, "disabled", True)
+            or not hasattr(ca_comm, "prepare_dsv4_destination_push_workspace")
+        ):
+            return None
+        return ca_comm.prepare_dsv4_destination_push_workspace()
+
+    def should_dsv4_dcp_destination_push(
+        self,
+        recv_planes: torch.Tensor,
+        peer_recv_ptrs: torch.Tensor,
+        epoch: torch.Tensor,
+    ) -> bool:
+        """Preflight fixed pointers before the first remote producer store."""
+        ca_comm = self.ca_comm
+        return bool(
+            ca_comm is not None
+            and not getattr(ca_comm, "disabled", True)
+            and hasattr(ca_comm, "should_dsv4_destination_push")
+            and ca_comm.should_dsv4_destination_push(recv_planes, peer_recv_ptrs, epoch)
+        )
+
+    def dsv4_dcp_destination_push_ready(
+        self,
+        recv_planes: torch.Tensor,
+        peer_recv_ptrs: torch.Tensor,
+        epoch: torch.Tensor,
+    ) -> torch.Tensor:
+        """Launch the strict one-block peer readiness protocol."""
+        if not self.should_dsv4_dcp_destination_push(
+            recv_planes, peer_recv_ptrs, epoch
+        ):
+            raise RuntimeError("registered DSV4 destination push is unavailable")
+        # Never catch after selection: every rank must execute the same barrier.
+        return self.ca_comm.dsv4_destination_push_ready(
+            recv_planes, peer_recv_ptrs, epoch
+        )
+
     def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
         if self.world_size == 1:
             output.copy_(input)

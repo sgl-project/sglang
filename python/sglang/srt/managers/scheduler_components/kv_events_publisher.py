@@ -79,9 +79,7 @@ class SchedulerKvEventsPublisher:
         kv_metrics = KvMetrics()
         kv_metrics.request_active_slots = self.get_stats().num_running_reqs.total
         kv_metrics.request_total_slots = self.max_running_requests
-        kv_metrics.kv_active_blocks = int(
-            self.get_stats().token_usage * self.max_total_num_tokens
-        )
+        kv_metrics.kv_active_blocks = self.get_stats().num_used_tokens
         kv_metrics.kv_total_blocks = self.max_total_num_tokens
         kv_metrics.num_requests_waiting = self.get_stats().num_queue_reqs.total
         kv_metrics.gpu_cache_usage_perc = self.get_stats().token_usage

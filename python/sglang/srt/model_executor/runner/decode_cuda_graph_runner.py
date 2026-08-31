@@ -678,6 +678,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
+        # A combined DSV4 DCP graph records the plain-decode indexer and its
+        # candidate+Q collective, while IDLE bypasses the indexer entirely.
+        # DECODE and IDLE normally share a graph bucket, so force IDLE through
+        # eager fallback rather than replaying feature-gated decode semantics.
+        if (
+            envs.SGLANG_DSV4_DCP_COMBINED_Q_TOPK.get()
+            and forward_batch.forward_mode.is_idle()
+        ):
+            return False
+
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
