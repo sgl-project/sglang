@@ -27,6 +27,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_shard_model_inputs,
+    get_cp_strategy,
     is_cp_v2_active,
     prepare_cp_forward,
 )
@@ -37,7 +38,11 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     create_chunked_prefix_cache_kv_indices,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
@@ -49,6 +54,9 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
 )
+from sglang.srt.model_executor.runner_utils import (
+    maybe_publish_prefill_shared_read_done,
+)
 from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
@@ -56,7 +64,7 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.common import (
     ceil_align,
     get_eager_max_batch_size,
@@ -113,10 +121,10 @@ class EagerRunner(BaseRunner):
             # (expand_for_topk_draft) before the eager fallback.
             max_bs *= get_spec().speculative_eagle_topk
         # Mirror prepare_mlp_sync_batch padding so the registry holds what load_batch copies.
-        max_bs = get_eager_max_batch_size(sa, max_bs)
+        max_bs = get_eager_max_batch_size(max_bs)
         prefill_ceiling = max(mr.max_total_num_tokens, max_prefill_buffer_tokens())
         max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_req)
-        if require_mlp_sync(sa):
+        if require_mlp_sync():
             from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 
             max_num_token = ceil_align(max_num_token, self.attn_tp_size)
@@ -205,6 +213,12 @@ class EagerRunner(BaseRunner):
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None, **kwargs
     ) -> Any:
         mode = forward_batch.forward_mode
+        if mode.is_mixed() and not is_npu() and get_cp_strategy() is None:
+            # A mixed batch is extend-shaped (decode tails are 1-token
+            # extends); run it as EXTEND. NPU keeps MIXED for its dedicated
+            # kernel; CP keeps it to skip the zigzag split.
+            forward_batch.forward_mode = ForwardMode.EXTEND
+            mode = ForwardMode.EXTEND
         if mode.is_decode():
             return self._execute_decode(forward_batch, pp_proxy_tensors)
         if mode.is_idle():
@@ -305,6 +319,15 @@ class EagerRunner(BaseRunner):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
+            model_runner.attn_backend.prepare_prefill_shared_read_snapshot(
+                forward_batch,
+                num_qo_tokens=len(forward_batch.input_ids),
+            )
+            maybe_publish_prefill_shared_read_done(
+                model_runner,
+                forward_batch,
+                torch.get_device_module(model_runner.device),
+            )
 
         if not cp_v2_active:
             forward_batch.attn_cp_metadata = None

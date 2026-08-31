@@ -195,6 +195,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # [bs, draft_token_num] layout in forward_extend; metadata stays uniform.
     supports_ragged_verify_graph: bool = True
 
+    def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
+        pass
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -282,22 +285,22 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
-        # Unified-memory dense-view hooks (None on the static pool). req_to_token
-        # holds VIRTUAL token ids; the block table needs DENSE page ids, so the
+        # Unified-memory per-layer-view hooks (None on the static pool). req_to_token
+        # holds VIRTUAL token ids; the block table needs kernel-facing page ids, so the
         # kv-index kernels gather virtual->physical page through `_v2p_page_table`
         # then scale by `_kernel_page_multiplier` (= num MLA layers). See
-        # build_dense_mla_views / create_flashmla_kv_indices_triton.
+        # build_mla_views / create_flashmla_kv_indices_triton.
         _hooks = unified_mla_hooks(model_runner.token_to_kv_pool_allocator)
         self._v2p_page_table = _hooks.v2p_page_table
         self._kernel_page_multiplier = _hooks.kernel_page_multiplier
         self._unified_mla = _hooks.enabled
         # virtual token id -> DENSE kernel-facing id, for the KV write loc.
-        self._translate_kv_loc_dense = _hooks.translate_kv_loc_dense
-        # Per-forward dense write loc ([:n] view of a capture-stable buffer),
+        self._translate_kv_loc_dense = _hooks.translate_kv_loc_for_kernel
+        # Per-forward kernel-facing write loc ([:n] view of a capture-stable buffer),
         # set by the cuda-graph out-graph hook; None on the eager path (where the
         # write translates through the pool's _full_translate hook instead).
-        self._decode_dense_loc: Optional[torch.Tensor] = None
-        self.cuda_graph_out_cache_loc_dense: Optional[torch.Tensor] = None
+        self._decode_kernel_loc: Optional[torch.Tensor] = None
+        self.cuda_graph_out_cache_loc_kernel: Optional[torch.Tensor] = None
         # Fused KV-scatter + q-concat on the decode dense-loc path (one launch
         # instead of set_mla_kv_buffer + concat_mla_absorb_q). Disabled under
         # async asserts: the fused path writes the pool directly and would
@@ -405,7 +408,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # out-of-graph in init_forward_metadata_out_graph so the in-graph
         # set_mla_kv_buffer captures no translate.
         if self._unified_mla:
-            self.cuda_graph_out_cache_loc_dense = torch.zeros(
+            self.cuda_graph_out_cache_loc_kernel = torch.zeros(
                 max_num_tokens, dtype=torch.int64, device=self.device
             )
         num_tokens_per_req = max_num_tokens // max_bs
@@ -632,7 +635,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ):
             out_cache_loc = forward_batch.out_cache_loc
             n = out_cache_loc.shape[0]
-            dst = self.cuda_graph_out_cache_loc_dense[:n]
+            dst = self.cuda_graph_out_cache_loc_kernel[:n]
             self._translate_kv_loc_dense(out_cache_loc, out=dst)
             # Replay-prep receives the RAW (unpadded) out_cache_loc
             # (build_replay_fb_view), but the captured write kernel consumes the
@@ -641,16 +644,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # earlier larger replays — a stale tail scatters pad-row garbage into
             # live KV pages. Mirrors the runner's PaddingPolicy.ZERO on its own
             # out_cache_loc slot.
-            self.cuda_graph_out_cache_loc_dense[n:].zero_()
-            self._decode_dense_loc = dst
+            self.cuda_graph_out_cache_loc_kernel[n:].zero_()
+            self._decode_kernel_loc = dst
         else:
-            self._decode_dense_loc = None
+            self._decode_kernel_loc = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
-        # Eager path: no capture-stable dense write loc; the pool's _full_translate
+        # Eager path: no capture-stable kernel-facing write loc; the pool's _full_translate
         # hook translates the write loc (safe out of a cuda graph).
-        self._decode_dense_loc = None
+        self._decode_kernel_loc = None
         # Delegate to parent for non-decode modes.
         if (
             forward_batch.forward_mode.is_extend()
@@ -1055,8 +1058,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             if cos_sin_cache is None:
                 if save_kv_cache and self._fused_set_kv_concat_q_fp8:
                     loc = (
-                        self._decode_dense_loc
-                        if self._decode_dense_loc is not None
+                        self._decode_kernel_loc
+                        if self._decode_kernel_loc is not None
                         else (
                             None if self._unified_mla else forward_batch.out_cache_loc
                         )
@@ -1096,15 +1099,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            if self._decode_dense_loc is not None:
-                # cuda-graph path: dense write loc precomputed out-of-graph, so
+            if self._decode_kernel_loc is not None:
+                # cuda-graph path: kernel-facing write loc precomputed out-of-graph, so
                 # the in-graph write captures no translate allocation.
                 if merge_query and self._fused_set_kv_concat_q:
                     # Fused: KV scatter + [q_nope | q_rope] concat in one
                     # launch; None when the inputs are not covered.
                     query = self._set_kv_and_concat_q_fused(
                         layer=layer,
-                        loc=self._decode_dense_loc,
+                        loc=self._decode_kernel_loc,
                         k=k,
                         k_rope=k_rope,
                         q=q,
@@ -1112,7 +1115,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     )
                 if query is None:
                     self.token_to_kv_pool.set_mla_kv_buffer(
-                        layer, self._decode_dense_loc, k, k_rope, loc_is_dense=True
+                        layer,
+                        self._decode_kernel_loc,
+                        k,
+                        k_rope,
+                        loc_is_kernel_facing=True,
                     )
             else:
                 # eager (or static pool): the pool's _full_translate handles it.
@@ -1256,9 +1263,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            if self._decode_dense_loc is not None:
+            if self._decode_kernel_loc is not None:
                 self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, self._decode_dense_loc, k, k_rope, loc_is_dense=True
+                    layer, self._decode_kernel_loc, k, k_rope, loc_is_kernel_facing=True
                 )
             else:
                 self.token_to_kv_pool.set_mla_kv_buffer(

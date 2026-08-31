@@ -22,7 +22,7 @@ dependencies = [
   "av==16.1.0 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "blobfile==3.0.0",
   "build",
-  "compressed-tensors",
+  "compressed-tensors==0.18.0",
   "cuda-python>=13.0",
   # Transitive dep of flashinfer-python, pinned because 1.6.0rc6 shipped no cp310 linux x86_64 wheel.
   "cuda-tile==1.6.0rc5",
@@ -33,9 +33,9 @@ dependencies = [
   "einops",
   "fastapi",
   "flash-attn-4>=4.0.0b18",
-  "flashinfer_python[cu13]==0.6.17", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_python[cu13]==0.6.18", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
-  "humming-kernels[cu13]==0.1.10",
+  "humming-kernels[cu13]==0.1.12",
   "interegular",
   "IPython",
   "kernels>=0.14.1,<0.15",
@@ -69,7 +69,7 @@ dependencies = [
   "sentencepiece",
   "setproctitle",
   "sgl-deep-ep==0.1.2",
-  "sgl-deep-gemm==0.1.5.post3",
+  "sgl-deep-gemm==0.1.6",
   "sglang-kernel==0.4.6.post1",
   "smg-grpc-servicer>=0.5.0",
   "soundfile==0.13.1",
