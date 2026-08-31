@@ -13,6 +13,7 @@
 # ==============================================================================
 """Fused operators for normalization layers."""
 
+import functools
 import logging
 from functools import lru_cache
 from typing import Optional, Tuple, Union
@@ -27,7 +28,6 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.quantization.fp8_utils import MXFP8_DENSE_PTPC_DECODE_MAX_M
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -149,7 +149,15 @@ if _is_hip:
     except ImportError:
         _has_rocm_triton_gemma_rms_norm = False
 
-_FUSE_NORM_FP8_MAX_M = MXFP8_DENSE_PTPC_DECODE_MAX_M if is_gfx95_supported() else 0
+
+@functools.cache
+def _fuse_norm_fp8_max_m() -> int:
+    if not is_gfx95_supported():
+        return 0
+    from sglang.srt.layers.quantization.fp8_utils import MXFP8_DENSE_PTPC_DECODE_MAX_M
+
+    return MXFP8_DENSE_PTPC_DECODE_MAX_M
+
 
 if _is_cuda:
     # HF-semantics RMSNorm kernel (JIT-compiled).  Used when `cast_x_before_out_mul=True`
@@ -1187,7 +1195,7 @@ class GemmaRMSNorm(BaseFusedOp):
                     residual,
                     self.weight.data,
                     self.variance_epsilon,
-                    emit_fp8=x.numel() // x.shape[-1] <= _FUSE_NORM_FP8_MAX_M,
+                    emit_fp8=x.numel() // x.shape[-1] <= _fuse_norm_fp8_max_m(),
                 )
             return rocm_triton_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
 

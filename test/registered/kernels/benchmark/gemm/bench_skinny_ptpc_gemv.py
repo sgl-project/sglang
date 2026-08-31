@@ -39,9 +39,14 @@ FN_MAP = {"jit": _jit, "aiter_bpreshuffle": _aiter}
 @marker.parametrize("shape", SHAPES, [SHAPES[0], SHAPES[1]])
 @marker.benchmark("impl", ["jit", "aiter_bpreshuffle"])
 def benchmark(shape, impl: str):
-    from aiter.ops.shuffle import shuffle_weight
+    from sglang.kernels.ops.gemm.skinny_ptpc_gemv import skinny_ptpc_gemv_supported
 
     n, k = shape
+    if not skinny_ptpc_gemv_supported(1, n, k):
+        marker.skip("skinny fp8 PTPC GEMV requires gfx950")
+
+    from aiter.ops.shuffle import shuffle_weight
+
     torch.manual_seed(0)
     wq = (
         (torch.randn(n, k, device="cuda") * 0.02)

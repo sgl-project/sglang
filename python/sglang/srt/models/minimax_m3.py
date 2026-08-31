@@ -1359,7 +1359,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
-            enable_fused_ar_quant_per_token=True,
+            enable_fused_ar_quant_per_token=_is_hip,
         )
 
     def forward(
@@ -1397,6 +1397,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 forward_batch
             )
         )
+        if not _is_hip and self.is_layer_sparse and get_parallel().tp_size > 1:
+            # Sparse-layer all-reduce deferral is ROCm-only; force the
+            # immediate all-reduce elsewhere.
+            should_allreduce_fusion = False
+
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )

@@ -668,9 +668,9 @@ class LayerCommunicator:
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     quant_result = None
                     if (
-                        self.enable_fused_ar_quant_per_token
+                        _use_aiter
+                        and self.enable_fused_ar_quant_per_token
                         and _fuse_norm_fp8_quant(hidden_states)
-                        and _use_aiter
                         and hasattr(
                             self.input_layernorm,
                             "forward_with_allreduce_fusion_quant_per_token",
