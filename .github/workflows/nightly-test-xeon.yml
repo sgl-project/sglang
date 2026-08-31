@@ -1,0 +1,134 @@
+name: Nightly Test (Xeon)
+
+# Nightly accuracy + performance benchmark for CPU (Xeon) models, plus a full
+# re-run of the per-commit UT suites. Unlike PR Test (Xeon) this runs the large
+# models (8B-35B) that are too slow for per-commit CI, and uses
+# --continue-on-error so one failing model does not mask the rest.
+
+on:
+  schedule:
+    # 18:07 UTC daily (02:07 Beijing). Off-minute to avoid colliding with the
+    # fleet of :00/:30 scheduled jobs; clear of the XPU nightly at 16:45 UTC.
+    - cron: '7 18 * * *'
+  workflow_dispatch:
+    inputs:
+      continue_on_error:
+        description: 'Continue on error (do not fail the workflow on test failures)'
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to checkout'
+        required: false
+        type: string
+        default: ''
+      continue_on_error:
+        description: 'Continue on error (do not fail the workflow on test failures)'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: nightly-test-xeon-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  nightly-xeon:
+    if: github.repository == 'sgl-project/sglang'
+    # DEBUG: label is 'nightly-gnr' so nightly does not contend for the
+    # upstream PR-test 'xeon-gnr' boxes. CHANGE BACK TO 'xeon-gnr' ONCE MERGED.
+    runs-on: nightly-gnr
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gnr1
+            part_id: 0
+            part_size: 2
+          - name: gnr2
+            part_id: 1
+            part_size: 2
+    steps:
+      - name: Cleanup workspace
+        run: |
+          sudo rm -rf ${{ github.workspace }} || true
+          sudo mkdir -p ${{ github.workspace }}
+          sudo chown $(id -u):$(id -g) ${{ github.workspace }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          clean: false
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Build image
+        run: |
+          # Fixed tag (no SHA): a new build overwrites the previous image so a
+          # self-hosted box does not accumulate multi-GB images across runs.
+          docker build . -f docker/xeon.Dockerfile -t sglang_xeon --no-cache
+
+      - name: Run container
+        run: |
+          docker rm -f ci_sglang_${{ matrix.name }} || true
+          docker run -dt \
+            -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
+            -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+            -v $HOME/.cache/sgl_eval:/root/.cache/sgl_eval \
+            -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
+            --name ci_sglang_${{ matrix.name }} \
+            sglang_xeon
+
+      - name: Check AMX support
+        timeout-minutes: 5
+        run: |
+          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
+            bash -c "source /opt/.venv/bin/activate && python3 -c 'import torch; import sgl_kernel; assert torch.cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\"); '"
+
+      # Phase 1: full per-commit UT suites (same set PR Test runs), partitioned
+      # across the 2 GNR boxes by est_time. Small models -> partitioning safe.
+      - name: Run unit test suites
+        timeout-minutes: 240
+        run: |
+          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite base-b-test-cpu,base-c-test-cpu,base-b-tp-test-cpu --auto-partition-id ${{ matrix.part_id }} --auto-partition-size ${{ matrix.part_size }} --timeout-from-est-time ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}"
+
+      # Phase 2: nightly large-model accuracy + performance suite. Runs AFTER
+      # phase 1 on the same box (serial docker exec), so only one server is ever
+      # resident -> no dual-model OOM. Partitioned across the 2 GNR boxes.
+      - name: Run nightly model accuracy + perf
+        timeout-minutes: 600
+        run: |
+          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite nightly-xeon-models --nightly --auto-partition-id ${{ matrix.part_id }} --auto-partition-size ${{ matrix.part_size }} --timeout-from-est-time ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}"
+
+      - name: Change permission
+        if: always()
+        timeout-minutes: 2
+        run: |
+          docker exec -u root ci_sglang_${{ matrix.name }} bash -c "rm -rf /tmp/ci-home && chown -R $(id -u):$(id -g) /sglang-checkout/ 2>/dev/null || true" 2>/dev/null || true
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f ci_sglang_${{ matrix.name }} || true
+
+  check-all-jobs:
+    if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')
+    needs:
+      - nightly-xeon
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any job failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more nightly test jobs failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more nightly test jobs were cancelled"
+            exit 1
+          fi
+          echo "All nightly test jobs passed"
