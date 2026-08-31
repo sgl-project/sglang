@@ -92,6 +92,7 @@ from sglang.srt.utils.common import (
     get_available_gpu_memory,
     get_device_memory_capacity,
     is_float4_e2m1fn_x2,
+    is_gfx95_supported,
     is_hip,
     is_npu,
 )
@@ -111,6 +112,7 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
 
 
 _is_hip = is_hip()
+_is_gfx95_supported = is_gfx95_supported()
 
 
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
@@ -1724,7 +1726,11 @@ class KVCacheConfigurator:
         # widening-dequant contract.
         if m3_fp8_attn_gemm_enabled(resolving_view(self.server_args)):
             return self.kv_cache_dtype
-        if _is_hip and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get():
+        if (
+            _is_hip
+            and _is_gfx95_supported
+            and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get()
+        ):
             return torch.float8_e4m3fn
         return self.model_dtype
 
