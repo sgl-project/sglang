@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.model_config import ModelConfig
@@ -10,10 +10,11 @@ class DllmConfig:
         self,
         algorithm: str,
         algorithm_config: dict[str, Any],
-        block_size: int,
+        block_size: Optional[int],
         mask_id: int,
         max_running_requests: int,
         first_done_first_out_mode: bool = False,
+        needs_full_prefill: bool = False,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
@@ -21,6 +22,7 @@ class DllmConfig:
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
         self.first_done_first_out_mode = first_done_first_out_mode
+        self.needs_full_prefill = needs_full_prefill
 
     @staticmethod
     def from_server_args(
@@ -40,6 +42,7 @@ class DllmConfig:
             "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
+            "DreamModel": {"block_size": None, "mask_id": 151666},
         }
 
         arch = model_config.hf_config.architectures[0]
@@ -49,6 +52,7 @@ class DllmConfig:
             mask_id = params["mask_id"]
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
+        needs_full_prefill = arch == "DreamModel"
 
         max_running_requests = (
             1 if cfg.max_running_requests is None else cfg.max_running_requests
@@ -76,4 +80,5 @@ class DllmConfig:
             mask_id=mask_id,
             max_running_requests=max_running_requests,
             first_done_first_out_mode=cfg.dllm_fdfo,
+            needs_full_prefill=needs_full_prefill,
         )

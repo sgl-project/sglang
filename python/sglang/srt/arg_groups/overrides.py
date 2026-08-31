@@ -1658,7 +1658,10 @@ def _dllm_attention_backend(view: Any) -> dict:
                 "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
             )
             return {"attention_backend": "ascend"}
-    elif view.cuda_graph_config.decode.backend != Backend.DISABLED:
+    elif (
+        view.cuda_graph_config.decode.backend != Backend.DISABLED
+        or view.cuda_graph_config.prefill.backend != Backend.DISABLED
+    ):
         if view.attention_backend != "flashinfer":
             logger.warning(
                 "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
@@ -1686,6 +1689,8 @@ def _dllm_page_size(view: Any) -> dict:
     from sglang.srt.dllm.config import DllmConfig
 
     config = DllmConfig.from_server_args(view)
+    if config.needs_full_prefill:
+        return {}
     if not view.disable_radix_cache and view.page_size % config.block_size != 0:
         logger.warning(
             f"Setting page size to {config.block_size} for diffusion LLM inference"

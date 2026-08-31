@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.managers.schedule_policy as schedule_policy
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -119,6 +120,71 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def _create_dream_req(self, rid, canvas_len):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=0)
+        req.full_untruncated_fill_ids = list(range(canvas_len))
+        req.prefix_indices = []
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return req
+
+    def test_dream_full_prefill_batches_within_allocator_budget(self):
+        self.mock_token_allocator.available_size.return_value = 32
+        config = DllmConfig(
+            algorithm="Dream",
+            algorithm_config={},
+            block_size=None,
+            mask_id=151666,
+            max_running_requests=1,
+            needs_full_prefill=True,
+        )
+        adder = self.create_adder(
+            self.create_running_batch(),
+            rem_input_tokens=4,
+            dllm_config=config,
+        )
+        reqs = [self._create_dream_req(f"dream-{i}", canvas_len=4) for i in range(2)]
+
+        results = [
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+            for req in reqs
+        ]
+
+        self.assertEqual(len(adder.can_run_list), 2)
+        self.assertEqual(adder.can_run_list, reqs)
+        self.assertEqual(results, [AddReqResult.CONTINUE, AddReqResult.CONTINUE])
+        self.assertEqual([req.extend_range.length for req in reqs], [4, 4])
+
+        self.mock_token_allocator.available_size.return_value = 10
+        constrained_adder = self.create_adder(
+            self.create_running_batch(),
+            rem_input_tokens=100,
+            dllm_config=config,
+        )
+        first, second = (
+            self._create_dream_req("dream-1", 4),
+            self._create_dream_req("dream-2", 4),
+        )
+
+        self.assertEqual(
+            constrained_adder.add_one_req(
+                first, has_chunked_req=False, truncation_align_size=None
+            ),
+            AddReqResult.CONTINUE,
+        )
+        self.assertEqual(
+            constrained_adder.add_one_req(
+                second, has_chunked_req=False, truncation_align_size=None
+            ),
+            AddReqResult.NO_TOKEN,
+        )
+        self.assertEqual(constrained_adder.can_run_list, [first])
 
     def test_preempt_success_high_priority_values_first(self):
         params = [

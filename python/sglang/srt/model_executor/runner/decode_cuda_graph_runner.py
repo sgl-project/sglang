@@ -377,7 +377,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.seq_len_fill_value = (
             self.attn_backend.get_cuda_graph_seq_len_fill_value()
             if self.dllm_config is None
-            else self.dllm_config.block_size
+            else (
+                1
+                if self.dllm_config.needs_full_prefill
+                else self.dllm_config.block_size
+            )
         )
 
         # Non-zero encoder length ensures cross-attention kernels are captured in the graph.

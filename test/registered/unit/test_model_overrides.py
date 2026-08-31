@@ -1334,7 +1334,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 dllm_algorithm="LowConfidence",
                 attention_backend=None,
                 cuda_graph_config=SimpleNamespace(
-                    decode=SimpleNamespace(backend=Backend.DISABLED)
+                    decode=SimpleNamespace(backend=Backend.DISABLED),
+                    prefill=SimpleNamespace(backend=Backend.DISABLED),
                 ),
             )
             defaults.update(kw)
@@ -1392,7 +1393,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         with patch(
             "sglang.srt.dllm.config.DllmConfig.from_server_args",
-            return_value=SimpleNamespace(block_size=32),
+            return_value=SimpleNamespace(block_size=32, needs_full_prefill=False),
         ):
             self.assertEqual(_view() and _dllm_page_size(_view()), {"page_size": 32})
             # aligned but larger than the block: the scheduler-init fallback
@@ -1405,6 +1406,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _dllm_page_size(_view(disable_radix_cache=True, page_size=64)),
                 {"page_size": 32},
             )
+        with patch(
+            "sglang.srt.dllm.config.DllmConfig.from_server_args",
+            return_value=SimpleNamespace(block_size=None, needs_full_prefill=True),
+        ):
+            self.assertEqual(_dllm_page_size(_view()), {})
         self.assertEqual(_dllm_page_size(_view(dllm_algorithm=None)), {})
 
     def test_overlap_disable_passes(self):

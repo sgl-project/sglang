@@ -92,6 +92,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     stop_regex_strs: Optional[Union[str, List[str]]] = None  # from stop_regex
     stop_str_max_len: int = 0  # set by normalize()
     stop_regex_max_len: int = 0  # set by normalize()
+    original_temperature: Optional[float] = None
+    original_top_k: Optional[int] = None
     is_normalized: bool = False  # set by normalize()
 
     def __post_init__(self):
@@ -102,6 +104,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         # has populated tokenizer-derived fields, avoid resetting them.
         if self.is_normalized:
             return
+
+        self.original_temperature = (
+            self.temperature if self.temperature is not None else 1.0
+        )
+        self.original_top_k = self.top_k if self.top_k is not None else -1
 
         self.stop_strs = self.stop
         if self.stop_token_ids:

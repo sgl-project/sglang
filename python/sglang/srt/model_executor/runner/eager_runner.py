@@ -109,8 +109,11 @@ class EagerRunner(BaseRunner):
         else:
             dllm_config = DllmConfig.from_server_args(sa)
             if dllm_config is not None:
-                # dLLM runs block_size tokens/request (DLLM_EXTEND).
-                num_tokens_per_req = dllm_config.block_size
+                # Block dLLMs have a fixed decode-shaped request width. Dream
+                # is ragged and uses the prefill_ceiling below instead.
+                num_tokens_per_req = (
+                    1 if dllm_config.needs_full_prefill else dllm_config.block_size
+                )
         max_bs = mr.max_running_requests
         if (
             mr.is_draft_worker

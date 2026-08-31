@@ -1845,6 +1845,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 if output.next_token_logits is not None
                 else None
             ),
+            full_logits=(
+                output.full_logits[: self.raw_num_tokens]
+                if output.full_logits is not None
+                else None
+            ),
             hidden_states=(
                 output.hidden_states[: self.raw_num_tokens]
                 if output.hidden_states is not None
