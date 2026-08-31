@@ -13,7 +13,10 @@ import torch
 from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp8Config,
+    ModelOptFp8LinearMethod,
+)
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import (
@@ -134,6 +137,144 @@ class _LinearBackendCheck(CustomTestCase):
                     # atol covers single-element UE8M0 scale-rounding outliers
                     # (deep_gemm); a wrong kernel/layout fails by orders more.
                     assert_output_close(self, out, ref, rtol=5e-2, atol=1e-1)
+
+
+class TestModelOptFp8PrequantizedDispatch(unittest.TestCase):
+    @staticmethod
+    def _make_method():
+        method = object.__new__(ModelOptFp8LinearMethod)
+        method.use_marlin = False
+        method.use_sm120_gemv = False
+        method.cutlass_fp8_supported = True
+        return method
+
+    def test_three_item_tuple_preserves_output_dtype(self):
+        method = self._make_method()
+        scale = torch.ones(1)
+        layer = mock.Mock(
+            use_flashinfer_bmm=False,
+            weight=torch.empty((8, 8), dtype=torch.float8_e4m3fn),
+            weight_scale=torch.ones(1),
+            input_scale=scale,
+            orig_dtype=torch.float16,
+        )
+        qx = torch.empty((2, 8), dtype=torch.float8_e4m3fn)
+        expected = torch.empty((2, 8), dtype=torch.float16)
+
+        with mock.patch(
+            "sglang.srt.layers.quantization.modelopt_quant.apply_fp8_linear",
+            return_value=expected,
+        ) as apply_fp8:
+            actual = method.apply(layer, (qx, scale, torch.float16))
+
+        self.assertIs(actual, expected)
+        self.assertEqual(
+            apply_fp8.call_args.kwargs["pre_quant_output_dtype"], torch.float16
+        )
+
+    def test_prequantized_m1_keeps_sm120_gemv_fast_path(self):
+        method = self._make_method()
+        method.use_sm120_gemv = True
+        scale = torch.ones(1)
+        # ModelOpt stores a [K, N] view whose transpose recovers contiguous [N, K].
+        weight_nk = torch.empty((16, 512), dtype=torch.float8_e4m3fn)
+        layer = mock.Mock(
+            use_flashinfer_bmm=False,
+            weight=weight_nk.t(),
+            weight_scale=torch.ones(1),
+            input_scale=scale,
+            orig_dtype=torch.bfloat16,
+            sm120_gemv_alpha=torch.ones(1),
+        )
+        qx = torch.empty((1, 512), dtype=torch.float8_e4m3fn)
+        expected = torch.empty((1, 16), dtype=torch.bfloat16)
+
+        with (
+            mock.patch(
+                "sglang.kernels.ops.gemm.sm120_fp8_gemv.use_sm120_fp8_gemv",
+                return_value=True,
+            ),
+            mock.patch(
+                "sglang.kernels.ops.gemm.sm120_fp8_gemv.sm120_fp8_gemv",
+                return_value=expected,
+            ) as gemv,
+            mock.patch(
+                "sglang.srt.layers.quantization.modelopt_quant.apply_fp8_linear",
+                side_effect=AssertionError("generic FP8 GEMM should not run"),
+            ),
+        ):
+            actual = method.apply(layer, (qx, scale, torch.bfloat16))
+
+        self.assertIs(actual, expected)
+        gemv.assert_called_once()
+        self.assertIs(gemv.call_args.args[0], qx)
+        self.assertEqual(gemv.call_args.args[1].data_ptr(), weight_nk.data_ptr())
+        self.assertEqual(gemv.call_args.args[1].shape, weight_nk.shape)
+        self.assertIs(gemv.call_args.args[2], layer.sm120_gemv_alpha)
+
+    def test_prequantized_tuple_rejects_another_layers_scale(self):
+        method = self._make_method()
+        layer_scale = torch.ones(1)
+        layer = mock.Mock(
+            use_flashinfer_bmm=False,
+            input_scale=layer_scale,
+            orig_dtype=torch.bfloat16,
+        )
+        qx = torch.empty((2, 8), dtype=torch.float8_e4m3fn)
+
+        with self.assertRaisesRegex(ValueError, "layer's input_scale"):
+            method.apply(layer, (qx, layer_scale.clone(), torch.bfloat16))
+
+    def test_prequantized_tuple_rejects_non_fp8_payload(self):
+        method = self._make_method()
+        scale = torch.ones(1)
+        layer = mock.Mock(
+            use_flashinfer_bmm=False,
+            input_scale=scale,
+            orig_dtype=torch.bfloat16,
+        )
+
+        with self.assertRaisesRegex(TypeError, "FP8 tensor"):
+            method.apply(layer, (torch.empty((2, 8), dtype=torch.bfloat16), scale))
+
+    def test_prequantized_tuple_rejects_e4m3fnuz_payload(self):
+        method = self._make_method()
+        scale = torch.ones(1)
+        layer = mock.Mock(
+            use_flashinfer_bmm=False,
+            input_scale=scale,
+            orig_dtype=torch.bfloat16,
+        )
+        qx = torch.empty((2, 8), dtype=torch.float8_e4m3fnuz)
+
+        with self.assertRaisesRegex(TypeError, "E4M3FN"):
+            method.apply(layer, (qx, scale))
+
+    def test_prequantized_tuple_rejects_wrong_output_dtype(self):
+        method = self._make_method()
+        scale = torch.ones(1)
+        layer = mock.Mock(
+            use_flashinfer_bmm=False,
+            input_scale=scale,
+            orig_dtype=torch.bfloat16,
+        )
+        qx = torch.empty((2, 8), dtype=torch.float8_e4m3fn)
+
+        with self.assertRaisesRegex(ValueError, "original dtype"):
+            method.apply(layer, (qx, scale, torch.float16))
+
+    def test_bare_fp8_input_is_not_a_prequantized_contract(self):
+        method = self._make_method()
+        layer = mock.Mock(
+            use_flashinfer_bmm=False,
+            input_scale=torch.ones(1),
+            orig_dtype=torch.bfloat16,
+        )
+        for dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            with self.subTest(dtype=dtype):
+                qx = torch.empty((2, 8), dtype=dtype)
+                with self.assertRaisesRegex(TypeError, "tuple contract"):
+                    method.apply(layer, qx)
 
 
 @unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")
@@ -264,6 +405,51 @@ class TestModeloptFp8PerTensorLinear(_LinearBackendCheck):
 
     def test_auto(self):
         self._check_backend("auto", ["auto"], PER_TENSOR_SHAPES, self._build_layer)
+
+    def test_prequantized_input_skips_static_quant(self):
+        layer, _ = self._build_layer(512, 512)
+        layer.quant_method.process_weights_after_loading(layer)
+        # Exercise the generic scaled-mm/CUTLASS route here. The FlashInfer BMM
+        # helper has its own dispatch test; separating them makes a failure
+        # identify which consumer mishandled the pre-quantized activation.
+        layer.use_flashinfer_bmm = False
+        x = torch.randn((8, 512), device="cuda", dtype=torch.bfloat16) / 10
+        qx, scale = fp8_utils.static_quant_fp8(x, layer.input_scale, repeat_scale=False)
+        expected, _ = layer(x)
+
+        with mock.patch.object(
+            fp8_utils,
+            "static_quant_fp8",
+            side_effect=AssertionError("pre-quantized input was quantized again"),
+        ):
+            actual, _ = layer((qx, scale))
+
+        torch.testing.assert_close(actual, expected, rtol=5e-2, atol=1e-1)
+
+    def test_prequantized_flashinfer_bmm_dispatch(self):
+        qx = torch.zeros((8, 512), device="cuda", dtype=torch.float8_e4m3fn)
+        weight = torch.zeros((512, 512), device="cuda", dtype=torch.float8_e4m3fn)
+        input_scale = torch.ones(1, device="cuda")
+        weight_scale = torch.ones(1, device="cuda")
+        expected = torch.zeros((8, 512), device="cuda", dtype=torch.bfloat16)
+
+        with (
+            mock.patch.object(
+                fp8_utils,
+                "static_quant_fp8",
+                side_effect=AssertionError("pre-quantized input was quantized again"),
+            ),
+            mock.patch.object(
+                fp8_utils, "flashinfer_bmm_fp8", return_value=expected
+            ) as bmm,
+        ):
+            actual = fp8_utils.apply_fp8_linear_bmm_flashinfer(
+                qx, weight, weight_scale, input_scale
+            )
+
+        torch.testing.assert_close(actual, expected)
+        self.assertEqual(bmm.call_args.args[0].data_ptr(), qx.data_ptr())
+        self.assertEqual(bmm.call_args.args[-1], torch.bfloat16)
 
 
 if __name__ == "__main__":

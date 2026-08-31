@@ -647,6 +647,16 @@ def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManage
     return manager
 
 
+def _get_workspace_parallel_info(use_attn_tp_group: bool):
+    """Return the live world size, rank, and coordinator for a workspace."""
+    parallel = get_parallel()
+    if use_attn_tp_group:
+        return parallel.attn_tp_size, parallel.attn_tp_rank, get_attn_tp_group()
+    if parallel.moe_ep_size > 1:
+        return parallel.moe_ep_size, parallel.moe_ep_rank, get_moe_ep_group()
+    return parallel.moe_tp_size, parallel.moe_tp_rank, get_moe_tp_group()
+
+
 def _sync_allreduce_unavailable_across_tp():
     """Synchronize _flashinfer_allreduce_unavailable across all TP ranks.
 
@@ -694,19 +704,7 @@ def ensure_workspace_initialized(
     if not is_flashinfer_available() or _flashinfer_comm is None:
         return False
 
-    if use_attn_tp_group:
-        world_size = get_parallel().attn_tp_size
-        rank = get_parallel().attn_tp_rank
-        coordinator = get_attn_tp_group()
-    else:
-        if get_parallel().moe_ep_size > 1:
-            world_size = get_parallel().moe_ep_size
-            rank = get_parallel().moe_ep_rank
-            coordinator = get_moe_ep_group()
-        else:
-            world_size = get_parallel().moe_tp_size
-            rank = get_parallel().moe_tp_rank
-            coordinator = get_moe_tp_group()
+    world_size, rank, coordinator = _get_workspace_parallel_info(use_attn_tp_group)
 
     # Always pass the coordinator's groups: flashinfer >=0.6.10 reads the
     # rendezvous group from `group=...` (falling back to WORLD when None),
@@ -872,6 +870,167 @@ def flashinfer_allreduce_residual_rmsnorm(
     _flashinfer_comm.allreduce_fusion(**kwargs)
 
     return norm_out, residual_out
+
+
+def fake_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale_factor: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
+    keep_bf16: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    quant_out = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    residual_out = torch.empty_like(residual)
+    norm_out = (
+        torch.empty_like(input_tensor) if keep_bf16 else input_tensor.new_empty((0,))
+    )
+    return quant_out, residual_out, norm_out
+
+
+@register_custom_op(
+    mutates_args=["input_tensor", "residual", "weight"],
+    fake_impl=fake_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant,
+)
+def _flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale_factor: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
+    keep_bf16: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Launch the preflighted static-FP8 allreduce fusion custom op."""
+    pattern_name = (
+        "kARResidualRMSNormOutFP8Quant" if keep_bf16 else "kARResidualRMSNormFP8Quant"
+    )
+    workspace = _get_workspace_manager(use_attn_tp_group).workspace
+    assert workspace is not None
+    patterns = _flashinfer_comm.AllReduceFusionPattern
+
+    quant_out = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    residual_out = torch.empty_like(residual)
+    norm_out = (
+        torch.empty_like(input_tensor) if keep_bf16 else input_tensor.new_empty((0,))
+    )
+    kwargs = dict(
+        input=input_tensor,
+        workspace=workspace,
+        pattern=getattr(patterns, pattern_name),
+        launch_with_pdl=True,
+        residual_out=residual_out,
+        norm_out=norm_out if keep_bf16 else None,
+        quant_out=quant_out,
+        scale_factor=scale_factor,
+        residual_in=residual,
+        rms_gamma=weight,
+        rms_eps=eps,
+        weight_bias=0.0,
+        use_oneshot=use_oneshot,
+        fp32_acc=fp32_acc,
+    )
+    if _flashinfer_allreduce_supports_trigger_completion:
+        kwargs["trigger_completion_at_end"] = trigger_completion_at_end
+    _flashinfer_comm.allreduce_fusion(**kwargs)
+    return quant_out, residual_out, norm_out
+
+
+def try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale_factor: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
+    keep_bf16: bool = False,
+):
+    """Preflight the optional pattern before entering its collective custom op."""
+    if _flashinfer_allreduce_unavailable or _flashinfer_comm is None:
+        return None, None, None
+
+    pattern_name = (
+        "kARResidualRMSNormOutFP8Quant" if keep_bf16 else "kARResidualRMSNormFP8Quant"
+    )
+    patterns = getattr(_flashinfer_comm, "AllReduceFusionPattern", None)
+    if patterns is None or not hasattr(patterns, pattern_name):
+        return None, None, None
+
+    parallel = get_parallel()
+    world_size = (
+        parallel.attn_tp_size
+        if use_attn_tp_group
+        else parallel.moe_ep_size if parallel.moe_ep_size > 1 else parallel.moe_tp_size
+    )
+    if world_size <= 1 or input_tensor.shape[0] > max_token_num:
+        return None, None, None
+    if (
+        input_tensor.dim() != 2
+        or residual.shape != input_tensor.shape
+        or weight.shape != (input_tensor.shape[-1],)
+        or scale_factor.numel() != 1
+        or scale_factor.dtype != torch.float32
+        or scale_factor.device != input_tensor.device
+        or not input_tensor.is_contiguous()
+        or not residual.is_contiguous()
+        or not weight.is_contiguous()
+    ):
+        return None, None, None
+
+    manager = _get_workspace_manager(use_attn_tp_group)
+    if torch.compiler.is_compiling():
+        _, _, coordinator = _get_workspace_parallel_info(use_attn_tp_group)
+        expected_group = (coordinator.device_group, coordinator.cpu_group)
+        if (
+            not manager.initialized
+            or manager.workspace is None
+            or manager.world_size != world_size
+            or manager.group != expected_group
+            or manager.max_token_num is None
+            or manager.hidden_dim is None
+            or manager.dtype is None
+            or input_tensor.shape[0] > manager.max_token_num
+            or input_tensor.shape[-1] > manager.hidden_dim
+            or input_tensor.dtype != manager.dtype
+        ):
+            return None, None, None
+    elif not ensure_workspace_initialized(
+        max_token_num=max_token_num,
+        hidden_dim=input_tensor.shape[-1],
+        use_fp32_lamport=(input_tensor.dtype == torch.float32),
+        dtype=input_tensor.dtype,
+        token_num=input_tensor.shape[0],
+        use_oneshot=use_oneshot,
+        use_attn_tp_group=use_attn_tp_group,
+    ):
+        return None, None, None
+
+    return _flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+        input_tensor,
+        residual,
+        weight,
+        scale_factor,
+        eps,
+        max_token_num,
+        use_oneshot,
+        trigger_completion_at_end,
+        fp32_acc,
+        use_attn_tp_group,
+        keep_bf16,
+    )
 
 
 def can_use_flashinfer_allreduce(

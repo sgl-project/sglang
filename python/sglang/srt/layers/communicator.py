@@ -187,11 +187,15 @@ def _fused_rmsnorm_fp8_per_token_quant(
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
+def is_flashinfer_allreduce_fusion_arch_supported() -> bool:
+    return _is_sm90_supported or _is_sm100_supported
+
+
 def apply_flashinfer_allreduce_fusion(batch_size: int):
     return (
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
         # Ref: https://github.com/sgl-project/sglang/issues/17237
-        (_is_sm90_supported or _is_sm100_supported)
+        is_flashinfer_allreduce_fusion_arch_supported()
         and _is_flashinfer_available
         and not is_dp_attention_enabled()
         and get_exec().comm.flashinfer_allreduce_fusion_backend is not None
@@ -483,6 +487,7 @@ class LayerCommunicator:
         force_layernorm_before_dp_gather: bool = False,
         enable_fused_ar_quant: bool = False,
         fused_ar_quant_keep_bf16: bool = False,
+        fused_ar_quant_linear: Optional[torch.nn.Module] = None,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -493,6 +498,7 @@ class LayerCommunicator:
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
         self.enable_fused_ar_quant = enable_fused_ar_quant
         self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
+        self.fused_ar_quant_linear = fused_ar_quant_linear
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -592,6 +598,7 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        static_fp8_scale = None
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
@@ -627,6 +634,37 @@ class LayerCommunicator:
                             use_attn_tp_group=False,
                             keep_bf16=self.fused_ar_quant_keep_bf16,
                         )
+                    elif (
+                        self.enable_fused_ar_quant
+                        and self.fused_ar_quant_linear is not None
+                        and hasattr(
+                            self.input_layernorm,
+                            "forward_with_allreduce_fusion_static_fp8_quant",
+                        )
+                    ):
+                        quant_result = self.input_layernorm.forward_with_allreduce_fusion_static_fp8_quant(
+                            hidden_states,
+                            residual,
+                            self.fused_ar_quant_linear,
+                            use_attn_tp_group=False,
+                            keep_bf16=self.fused_ar_quant_keep_bf16,
+                        )
+                        if quant_result is not None:
+                            quant_hidden_states, quant_residual = quant_result
+                            # The static scale is replicated model state, not a
+                            # token-major activation. Keep it out of a possible
+                            # scattered-to-full all-gather and restore it after
+                            # the token tensors have crossed the boundary.
+                            if self.fused_ar_quant_keep_bf16:
+                                bf16_out, fp8_out, static_fp8_scale = (
+                                    quant_hidden_states
+                                )
+                                quant_hidden_states = (bf16_out, fp8_out)
+                            else:
+                                quant_hidden_states, static_fp8_scale = (
+                                    quant_hidden_states
+                                )
+                            quant_result = (quant_hidden_states, quant_residual)
                     if quant_result is not None:
                         hidden_states, residual = quant_result
                     else:
@@ -755,6 +793,12 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             context=self._context,
         )
+        if static_fp8_scale is not None:
+            if self.fused_ar_quant_keep_bf16:
+                bf16_out, fp8_out = hidden_states
+                hidden_states = (bf16_out, fp8_out, static_fp8_scale)
+            else:
+                hidden_states = (hidden_states, static_fp8_scale)
         if self.qkv_latent_func is not None:
             attn_inputs = AttentionInputs(
                 hidden_states, forward_batch, self.qkv_latent_func

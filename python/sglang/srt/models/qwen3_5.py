@@ -43,13 +43,21 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    is_flashinfer_allreduce_fusion_arch_supported,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 
 # Layers - Others
-from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.layernorm import (
+    GemmaRMSNorm,
+    _fp8_static_input_scale,
+    _is_static_per_tensor_fp8_linear,
+)
 
 # Layers - Linear
 from sglang.srt.layers.linear import (
@@ -97,6 +105,7 @@ from sglang.srt.models.utils import (
     fused_qk_gemma_rmsnorm_with_gate,
 )
 from sglang.srt.runtime_context import (
+    get_context,
     get_exec,
     get_forward,
     get_parallel,
@@ -235,38 +244,51 @@ if _is_cpu:
     )
 
 
-@lru_cache(maxsize=1)
-def _enable_qwen35_fused_ar_quant() -> bool:
-    """Gate the fused AR+RMSNorm+per-group-FP8-quant path for Qwen3.5.
+def _enable_qwen35_fused_ar_quant(*, allow_cuda: bool = True) -> bool:
+    """Gate the platform's fused allreduce + RMSNorm + FP8-quant path.
 
-    The single-kernel backend is ROCm/aiter/gfx95-only. The model gate stays
-    tied to ROCm/aiter so non-gfx95 HIP can keep the existing 2-kernel fallback
-    behavior for tuple handoff when this branch is used. It replaces the
-    existing ``--enable-aiter-allreduce-fusion`` 3-kernel path
-    (AR → RMSNorm → per-group quant) with either a single fused kernel (when
-    the fully-fused variant is eligible) or a 2-kernel path
-    (fused AR+RMSNorm + separate per-group quant) that still saves one
-    kernel launch vs. baseline. The LayerCommunicator gracefully falls back
-    to ``forward_with_allreduce_fusion`` (plain AR+RMSNorm) when the fused
-    quant helper returns ``None``, so turning this on never regresses the
-    AR+RMSNorm fusion itself.
-
-    Opt-out: set ``SGLANG_DISABLE_FUSED_AR_QUANT=1`` to fall back to the
-    unmodified AR+RMSNorm fusion path.
+    ROCm uses AITER per-group quantization; CUDA uses FlashInfer static
+    per-tensor quantization when ``allow_cuda`` is true. Importing models can
+    keep their existing ROCm-only behavior by passing ``allow_cuda=False``.
+    ``SGLANG_DISABLE_FUSED_AR_QUANT=1`` disables both backends.
     """
-    if not _use_aiter:
-        return False
     if get_bool_env_var("SGLANG_DISABLE_FUSED_AR_QUANT", default="false"):
         return False
-    return bool(get_exec().comm.enable_aiter_allreduce_fusion)
+    if _use_aiter:
+        return bool(get_exec().comm.enable_aiter_allreduce_fusion)
+    if (
+        not allow_cuda
+        or not _is_cuda
+        or not is_flashinfer_allreduce_fusion_arch_supported()
+    ):
+        return False
+    if not get_context().is_config_namespace_published("exec"):
+        return False
+    return get_exec().comm.flashinfer_allreduce_fusion_backend is not None
 
 
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     quant_method = getattr(linear, "quant_method", None)
-    return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
-        getattr(quant_method, "block_quant", False)
-        or getattr(quant_method, "use_mxfp8", False)
-    )
+    if _use_aiter:
+        return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
+            getattr(quant_method, "block_quant", False)
+            or getattr(quant_method, "use_mxfp8", False)
+        )
+    return _fp8_static_input_scale(linear) is not None
+
+
+def _enable_fused_ar_quant_for_linear(linear: nn.Module) -> bool:
+    if not _enable_qwen35_fused_ar_quant():
+        return False
+    if _use_aiter:
+        return _linear_accepts_fp8_tuple(linear)
+    quant_method = getattr(linear, "quant_method", None)
+    return _is_static_per_tensor_fp8_linear(quant_method, linear)
+
+
+def _prequantized_input_for_linear(fp8, scale, linear: nn.Module):
+    orig_dtype = getattr(linear, "orig_dtype", None)
+    return (fp8, scale, orig_dtype) if orig_dtype is not None else (fp8, scale)
 
 
 def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
@@ -275,10 +297,10 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     if len(hidden_states) == 3:
         hs_bf16, hs_fp8, hs_scale = hidden_states
         if _linear_accepts_fp8_tuple(linear):
-            return (hs_fp8, hs_scale)
+            return _prequantized_input_for_linear(hs_fp8, hs_scale, linear)
         return hs_bf16
     if len(hidden_states) == 2 and _linear_accepts_fp8_tuple(linear):
-        return hidden_states
+        return _prequantized_input_for_linear(*hidden_states, linear)
     raise TypeError(
         f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
     )
@@ -644,13 +666,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        # AMD/aiter fused AR+RMSNorm+per-group-quant path ships a
+        # Fused AR+RMSNorm+quant paths ship a
         # ``(bf16, fp8, scale)`` 3-tuple so the FP8 ``in_proj_qkvz`` can
         # consume ``(fp8, scale)`` (skipping its internal quant) while the
-        # bf16 ``in_proj_ba`` consumes the unquantized bf16. Non-aiter runs skip
-        # the tuple branch and keep the original control flow below unchanged.
-        if _use_aiter and isinstance(hidden_states, tuple):
-            return self._forward_input_proj_fused_quant_amd(hidden_states)
+        # bf16 ``in_proj_ba`` consumes the unquantized bf16.
+        if isinstance(hidden_states, tuple):
+            return self._forward_input_proj_fused_quant(hidden_states)
 
         if (
             _is_cpu
@@ -688,8 +709,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
         return projected_states_qkvz, projected_states_ba
 
-    def _forward_input_proj_fused_quant_amd(self, hidden_states):
-        """AMD-only variant for the fused AR+RMSNorm+per-group-quant path.
+    def _forward_input_proj_fused_quant(self, hidden_states):
+        """Consume the dual output from a fused AR+RMSNorm+quant path.
 
         ``hidden_states`` is a ``(bf16, fp8, scale)`` 3-tuple produced by the
         upstream fused kernel. FP8 ``in_proj_qkvz`` takes ``(fp8, scale)``
@@ -931,9 +952,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # GDN layers need both bf16 (for the small in_proj_ba gating
         # projection) and a quantized tuple only when in_proj_qkvz can consume
         # it. Otherwise, stay on the plain AR+RMSNorm path.
-        enable_fused_ar_quant = (
-            _enable_qwen35_fused_ar_quant()
-            and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
+        enable_fused_ar_quant = _enable_fused_ar_quant_for_linear(
+            self.linear_attn.in_proj_qkvz
         )
         self.layer_communicator = _layer_communicator_class(config, is_nextn)(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -943,6 +963,9 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=enable_fused_ar_quant,
+            fused_ar_quant_linear=(
+                self.linear_attn.in_proj_qkvz if enable_fused_ar_quant else None
+            ),
         )
 
     def forward(
@@ -1174,9 +1197,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         # Standard attention layers benefit from a fused quant epilogue only
         # when qkv_proj can consume the returned quantized tuple.
-        enable_fused_ar_quant = (
-            _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
-        )
+        enable_fused_ar_quant = _enable_fused_ar_quant_for_linear(self.qkv_proj)
         self.layer_communicator = _layer_communicator_class(config, is_nextn)(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
@@ -1185,6 +1206,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=False,
+            fused_ar_quant_linear=self.qkv_proj if enable_fused_ar_quant else None,
         )
 
         self.alt_stream = alt_stream
@@ -1226,6 +1248,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def forward_prepare_cuda_fused(self, positions, hidden_states):
         """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave."""
+        if isinstance(hidden_states, tuple):
+            hidden_states = _select_fused_ar_input_for_linear(
+                hidden_states, self.qkv_proj
+            )
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -1248,14 +1274,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             has_gate=self.attn_output_gate,
             mrope_axis_map=(self.rotary_emb.axis_map if positions.dim() == 2 else None),
         )
-        seq_len = hidden_states.shape[0]
+        seq_len = qkv.shape[0]
         q = q_out.view(seq_len, -1)
         k = k_out.view(seq_len, -1)
         gate = gate_out.view(seq_len, -1) if gate_out is not None else None
         return q, k, v, gate
 
     def forward_prepare_native(self, positions, hidden_states):
-        if _use_aiter and isinstance(hidden_states, tuple):
+        if isinstance(hidden_states, tuple):
             hidden_states = _select_fused_ar_input_for_linear(
                 hidden_states, self.qkv_proj
             )
@@ -1278,7 +1304,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         return q, k, v, gate
 
     def forward_prepare_fused_gate(self, positions, hidden_states):
-        if _use_aiter and isinstance(hidden_states, tuple):
+        if isinstance(hidden_states, tuple):
             hidden_states = _select_fused_ar_input_for_linear(
                 hidden_states, self.qkv_proj
             )

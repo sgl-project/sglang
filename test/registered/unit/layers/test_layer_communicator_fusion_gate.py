@@ -2,6 +2,8 @@ import types
 import unittest
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
 from sglang.srt.runtime_context import get_parallel
@@ -59,6 +61,65 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
 
     def test_pure_ep_still_fuses(self):
         self.assertTrue(self._should_fuse(moe_ep_size=4, moe_tp_size=1))
+
+
+class TestStaticFp8ScaleHandoff(CustomTestCase):
+    def test_scattered_gather_keeps_static_scale_scalar(self):
+        scale = torch.ones(1, dtype=torch.float32)
+        quant = torch.zeros(2, 8, dtype=torch.float8_e4m3fn)
+        bf16 = torch.zeros(2, 8, dtype=torch.bfloat16)
+        residual_out = torch.zeros(2, 8, dtype=torch.bfloat16)
+
+        class _Norm:
+            def forward_with_allreduce_fusion(self, *args, **kwargs):
+                raise AssertionError("static-FP8 path should be selected")
+
+            def forward_with_allreduce_fusion_static_fp8_quant(
+                self, *args, keep_bf16, **kwargs
+            ):
+                hidden_states = (bf16, quant, scale) if keep_bf16 else (quant, scale)
+                return hidden_states, residual_out
+
+        def _gather_every_tuple_element(hidden_states, **kwargs):
+            if isinstance(hidden_states, tuple):
+                return tuple(torch.cat((item, item), dim=0) for item in hidden_states)
+            return torch.cat((hidden_states, hidden_states), dim=0)
+
+        for keep_bf16 in (False, True):
+            with self.subTest(keep_bf16=keep_bf16):
+                layer = types.SimpleNamespace(
+                    enable_fused_ar_quant=True,
+                    fused_ar_quant_linear=object(),
+                    fused_ar_quant_keep_bf16=keep_bf16,
+                    input_layernorm=_Norm(),
+                    _communicate_simple_fn=_gather_every_tuple_element,
+                    _context=object(),
+                    qkv_latent_func=None,
+                )
+                hidden_states = torch.zeros(2, 8, dtype=torch.bfloat16)
+                hidden_states._sglang_needs_allreduce_fusion = True
+                with (
+                    patch.object(comm, "_use_aiter", False),
+                    patch.object(
+                        comm, "apply_flashinfer_allreduce_fusion", return_value=True
+                    ),
+                    patch.object(
+                        comm,
+                        "get_attn_tp_context",
+                        return_value=types.SimpleNamespace(input_scattered=False),
+                    ),
+                ):
+                    result, _ = LayerCommunicator.prepare_attn(
+                        layer,
+                        hidden_states,
+                        torch.zeros_like(hidden_states),
+                        types.SimpleNamespace(),
+                    )
+
+                self.assertIs(result[-1], scale)
+                self.assertEqual(result[-1].numel(), 1)
+                for token_tensor in result[:-1]:
+                    self.assertEqual(token_tensor.shape[0], 4)
 
 
 if __name__ == "__main__":

@@ -506,10 +506,9 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        enable_fused_ar_quant = (
-            _enable_qwen35_fused_ar_quant()
-            and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
-        )
+        enable_fused_ar_quant = _enable_qwen35_fused_ar_quant(
+            allow_cuda=False
+        ) and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
@@ -641,9 +640,9 @@ class InternS2MobiusAttentionDecoderLayer(
         )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        enable_fused_ar_quant = (
-            _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
-        )
+        enable_fused_ar_quant = _enable_qwen35_fused_ar_quant(
+            allow_cuda=False
+        ) and _linear_accepts_fp8_tuple(self.qkv_proj)
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
