@@ -333,6 +333,7 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
                 return object()
 
         class _Args:
+            component_precisions = {}
             component_quantizations = {}
 
             @staticmethod
@@ -411,6 +412,7 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
                 return object()
 
         class _Args:
+            component_precisions = {}
             component_quantizations = {}
 
             @staticmethod
@@ -475,6 +477,7 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
                 return object()
 
         class _Args:
+            component_precisions = {}
             component_quantizations = {}
             pipeline_config = SimpleNamespace(native_only_components=())
 
@@ -525,6 +528,7 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
                 return object()
 
         class _Args:
+            component_precisions = {}
             component_quantizations = {}
             pipeline_config = SimpleNamespace(native_only_components=())
 
