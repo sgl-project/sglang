@@ -75,13 +75,13 @@ class MockReq:
             "q", fill_ids[:-1] if len(fill_ids) > 1 else fill_ids
         )
         self.output_ids = array("q", [fill_ids[-1]] if len(fill_ids) > 1 else [])
-        self.req_pool_idx = req_pool_idx
         self.last_node = last_node
         self.extra_key = None
         self.cache_salt = None
         self.prefix_indices = torch.empty(0, dtype=torch.int64)
         self.priority = 0
         self.kv = SimpleNamespace(
+            req_pool_idx=req_pool_idx,
             kv_committed_len=len(fill_ids),
             kv_allocated_len=len(fill_ids),
             cache_protected_len=cache_protected_len,

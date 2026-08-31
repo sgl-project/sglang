@@ -7,6 +7,7 @@ import torch
 from sglang.srt.layers.attention.minicpm.cache import (
     attach_compressed_cache,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
@@ -66,8 +67,8 @@ def make_pool_and_req(capacity: int = 64):
         enable_memory_saver=False,
     )
     req = SimpleNamespace(
-        req_pool_idx=None,
         inflight_middle_chunks=0,
+        kv=SimpleNamespace(req_pool_idx=None),
     )
     req_pool_idx = pool.alloc([req])[0]
     return pool, req, req_pool_idx, allocator
@@ -224,8 +225,7 @@ def test_streaming_session_release_frees_compressed_slots():
         )
     )
     session.slots["session-a"] = SessionSlot(
-        req_pool_idx=req_pool_idx,
-        kv=SimpleNamespace(kv_allocated_len=16, cache_protected_len=0),
+        kv=ReqKvInfo(req_pool_idx=req_pool_idx, kv_allocated_len=16),
     )
 
     session.release_session("session-a")
@@ -293,7 +293,7 @@ def test_partial_failure_rolls_back_and_free_releases_every_slot():
     assert len(cache.free_slots) == 0
 
     pool.free(req)
-    assert req.req_pool_idx is None
+    assert req.kv.req_pool_idx is None
     assert allocator.available_size() == 12
     assert len(cache.free_slots) == 8
 
