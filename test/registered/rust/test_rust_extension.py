@@ -542,7 +542,7 @@ crate-type = ["cdylib"]
             ),
             (
                 "sglang.srt.mem_cache.rust_tree_core.mem_cache",
-                "mem_cache",
+                "sglang-radix-tree",
                 "mem_cache",
                 ("python-extension",),
             ),

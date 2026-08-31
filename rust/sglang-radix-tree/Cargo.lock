@@ -323,17 +323,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mem_cache"
-version = "0.1.0"
-dependencies = [
- "hashbrown",
- "pyo3",
- "sha2",
- "tch",
- "thiserror",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -651,6 +640,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "sglang-radix-tree"
+version = "0.1.0"
+dependencies = [
+ "hashbrown",
+ "pyo3",
+ "sha2",
+ "tch",
+ "thiserror",
 ]
 
 [[package]]
