@@ -28,6 +28,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8LinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.usp import _usp_input_all_to_all_packed_qkv
+from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+    _needs_device_weight_postprocess,
+)
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_BUFFER_NAMES,
@@ -37,6 +40,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     _copy_grouped_qkv_tp_shard,
     _diffusers_h3_checkpoint,
     _modulate_gate,
+    _qkv_scale_block_rows,
     _reorder_grouped_qkv_to_qkv,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -489,6 +493,138 @@ def test_online_fp8_keeps_fp32_boundaries_and_ignored_layers_unquantized():
         model.final_layer.audio_out,
     ):
         assert isinstance(layer.quant_method, UnquantizedLinearMethod)
+
+
+def _block_fp8_quant_config(block: int = 128, **kwargs) -> Fp8Config:
+    return Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=[block, block],
+        **kwargs,
+    )
+
+
+def _meta_h3(quant_config) -> MiniMaxH3DiTModel:
+    _ensure_single_process_parallel_runtime()
+    with torch.device("meta"):
+        return MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(), hf_config={}, quant_config=quant_config
+        )
+
+
+def test_offline_block_fp8_checkpoint_layout_and_cpu_load():
+    quant_config = _block_fp8_quant_config(
+        ignored_layers=[
+            "video_patch_proj",
+            "audio_patch_proj",
+            "time_embedder.proj_in",
+            "time_embedder.proj_out",
+            "final_layer.video_out",
+            "final_layer.audio_out",
+        ],
+    )
+    model = _meta_h3(quant_config)
+
+    params = dict(model.named_parameters())
+    fp8_weights = {name for name, p in params.items() if p.dtype == torch.float8_e4m3fn}
+    scales = {name for name in params if name.endswith("weight_scale_inv")}
+    assert len(fp8_weights) == 260, len(fp8_weights)
+    assert {f"{n[: -len('weight')]}weight_scale_inv" for n in fp8_weights} == scales
+
+    for scale_name in scales:
+        weight = params[f"{scale_name[: -len('weight_scale_inv')]}weight"]
+        n, k = weight.shape
+        assert params[scale_name].dtype == torch.float32, scale_name
+        assert tuple(params[scale_name].shape) == (
+            -(-n // 128),
+            -(-k // 128),
+        ), scale_name
+
+    for layer in (
+        model.video_patch_proj,
+        model.audio_patch_proj,
+        model.time_embedder.proj_in,
+        model.time_embedder.proj_out,
+        model.final_layer.video_out,
+        model.final_layer.audio_out,
+    ):
+        assert isinstance(layer.quant_method, UnquantizedLinearMethod)
+        assert layer.weight.dtype != torch.float8_e4m3fn
+
+    # False keeps the DiT off the GPU during load, which is the point of
+    # loading a pre-quantized checkpoint.
+    assert _needs_device_weight_postprocess(quant_config) is False
+    assert _needs_device_weight_postprocess(Fp8Config()) is True
+
+
+def test_block_fp8_qkv_scale_follows_its_weight_through_the_grouped_reorder():
+    """A block scale is row-indexed in blocks, so it moves with the qkv rows.
+
+    The checkpoint is quantized in the grouped per-head [q, k, v] layout, and
+    the DiT permutes those rows into [q_all, k_all, v_all] as it loads. Leaving
+    the scale behind leaves every 128x128 tile scaling rows it no longer covers:
+    the model loads without error and renders noise.
+    """
+    heads, head_dim, block = 8, 128, 128
+    rows, cols = heads * 3 * head_dim, 256
+    torch.manual_seed(0)
+    weight = torch.randn(rows, cols)
+
+    reordered = _reorder_grouped_qkv_to_qkv(
+        weight, num_query_groups=heads, heads_per_group=1, head_dim=head_dim
+    )
+    # A quantizer sees the grouped layout, so its scales are computed there.
+    tiles = weight.view(rows // block, block, cols // block, block)
+    scale = tiles.abs().amax(dim=(1, 3)) / 448.0
+    reordered_scale = _reorder_grouped_qkv_to_qkv(
+        scale, num_query_groups=heads, heads_per_group=1, head_dim=head_dim // block
+    )
+
+    def tile_max(w: torch.Tensor) -> torch.Tensor:
+        return w.view(rows // block, block, cols // block, block).abs().amax(dim=(1, 3))
+
+    assert torch.equal(tile_max(reordered) / 448.0, reordered_scale)
+    assert not torch.equal(tile_max(reordered) / 448.0, scale)
+
+
+def test_qkv_block_scale_param_is_reordered_in_blocks():
+    model = _meta_h3(_block_fp8_quant_config())
+    arch = model.arch
+    qkv = model.blocks[0].attn.qkv_proj
+    block = 128
+    scale_rows = 3 * arch.num_attention_heads * arch.attention_head_dim // block
+    assert qkv.weight_scale_inv.shape[0] == scale_rows
+
+    # The installed transform is what rank-local FSDP applies and what the
+    # wrapped weight_loader runs before handing off, so it is the contract.
+    loaded = torch.arange(scale_rows * 4, dtype=torch.float32).reshape(scale_rows, 4)
+    expected = _reorder_grouped_qkv_to_qkv(
+        loaded,
+        num_query_groups=arch.num_attention_heads,
+        heads_per_group=1,
+        head_dim=arch.attention_head_dim // block,
+    )
+    got = qkv.weight_scale_inv.rank_local_weight_transform(loaded)
+    assert torch.equal(got, expected)
+    assert not torch.equal(got, loaded)
+
+    # The weight itself keeps the per-row permutation.
+    unblocked = torch.zeros(scale_rows * block, 4)
+    assert qkv.weight.rank_local_weight_transform(unblocked).shape == unblocked.shape
+
+
+def test_unquantized_and_per_tensor_qkv_keep_their_loaders():
+    for quant_config in (None, Fp8Config(is_checkpoint_fp8_serialized=True)):
+        qkv = _meta_h3(quant_config).blocks[0].attn.qkv_proj
+        assert not hasattr(qkv, "weight_scale_inv")
+        assert _qkv_scale_block_rows(qkv, 128) == 1
+
+
+def test_block_that_straddles_heads_is_rejected():
+    # head_dim is 128, so a 256-row block covers two heads' rows at once and no
+    # row permutation can repair it.
+    with pytest.raises(ValueError, match="divides the head dim"):
+        _meta_h3(_block_fp8_quant_config(block=256))
 
 
 def test_sdpa_varlen_fallback_matches_naive_packed_reference():
