@@ -3292,7 +3292,13 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if not self.config.is_kda_layer(layer_id):
                         continue
                     layer = self.model.layers[layer_id].self_attn
-                    if not getattr(layer, "do_fuse_qkvbfg", False):
+                    # Full-rank K3 always instantiates fused_qkvg_proj, including
+                    # ModelSlim-quantized models. The low-rank fused modules are
+                    # still conditional on do_fuse_qkvbfg.
+                    if param_name == ".fused_qkvg_proj":
+                        if not getattr(layer, "use_full_rank_gate", False):
+                            continue
+                    elif not getattr(layer, "do_fuse_qkvbfg", False):
                         continue
                 if weight_name in {".q_proj", ".k_proj", ".v_proj"}:
                     layer_id = int(name.split(".")[2])
