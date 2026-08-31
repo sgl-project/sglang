@@ -85,11 +85,12 @@ def _trace_e2e_sampler(stage: str, **fields) -> None:
 
 
 class _SamplingMaskCapture(NamedTuple):
-    """Actual post-filter sampling weights and their token mapping."""
+    """Compact post-filter weights and their original batch-row mapping."""
 
     weights: torch.Tensor
     token_ids: Optional[torch.Tensor]
     selected_weight: Optional[torch.Tensor]
+    batch_rows: torch.Tensor
 
 
 class Sampler(nn.Module):
@@ -311,6 +312,29 @@ class Sampler(nn.Module):
         Capture work is performed only when return_sampling_mask is enabled.
         """
         sampling_mask_capture = None
+        capture_rows = None
+        capture_all_rows = False
+        if return_sampling_mask:
+            capture_rows_list = [
+                i
+                for i, should_return in enumerate(
+                    sampling_info.return_sampling_masks or []
+                )
+                if should_return
+            ]
+            if not capture_rows_list:
+                raise RuntimeError(
+                    "Sampling-mask capture requested without any opted-in batch rows."
+                )
+            capture_rows = torch.tensor(
+                capture_rows_list, device=probs.device, dtype=torch.long
+            )
+            capture_all_rows = capture_rows_list == list(range(probs.shape[0]))
+
+        def select_capture_rows(tensor: torch.Tensor) -> torch.Tensor:
+            assert capture_rows is not None
+            return tensor if capture_all_rows else tensor.index_select(0, capture_rows)
+
         if simple_sampling_case:
             batch_next_token_ids = sampling_from_probs_torch(
                 probs,
@@ -318,13 +342,16 @@ class Sampler(nn.Module):
                 positions=positions,
             )
             if return_sampling_mask:
+                capture_probs = select_capture_rows(probs)
+                capture_tokens = select_capture_rows(batch_next_token_ids)
                 selected_weight = torch.gather(
-                    probs, 1, batch_next_token_ids.long().view(-1, 1)
+                    capture_probs, 1, capture_tokens.long().view(-1, 1)
                 ).squeeze(1)
                 sampling_mask_capture = _SamplingMaskCapture(
-                    weights=probs,
+                    weights=capture_probs,
                     token_ids=None,
                     selected_weight=selected_weight,
+                    batch_rows=capture_rows,
                 )
         else:
             backend = get_exec().kernel.sampling_backend
@@ -339,21 +366,25 @@ class Sampler(nn.Module):
                         probs, sampling_info.min_ps
                     )
                     if return_sampling_mask:
+                        capture_probs = select_capture_rows(probs)
+                        capture_min_ps = select_capture_rows(sampling_info.min_ps)
+                        capture_tokens = select_capture_rows(batch_next_token_ids)
                         min_p_thresholds = (
-                            probs.max(dim=-1).values * sampling_info.min_ps
+                            capture_probs.max(dim=-1).values * capture_min_ps
                         )
-                        filtered_probs = probs.masked_fill(
-                            probs < min_p_thresholds.view(-1, 1), 0
+                        filtered_probs = capture_probs.masked_fill(
+                            capture_probs < min_p_thresholds.view(-1, 1), 0
                         )
                         selected_weight = torch.gather(
                             filtered_probs,
                             1,
-                            batch_next_token_ids.long().view(-1, 1),
+                            capture_tokens.long().view(-1, 1),
                         ).squeeze(1)
                         sampling_mask_capture = _SamplingMaskCapture(
                             weights=filtered_probs,
                             token_ids=None,
                             selected_weight=selected_weight,
+                            batch_rows=capture_rows,
                         )
                 else:
                     batch_next_token_ids = top_k_top_p_sampling_from_probs(
@@ -367,26 +398,33 @@ class Sampler(nn.Module):
                         # separate renormalization primitives must share cutoff,
                         # tie, and joint-support semantics so captured positive
                         # support exactly describes the sampler's action space.
-                        filtered_probs = probs
+                        capture_probs = select_capture_rows(probs)
+                        capture_top_ks = select_capture_rows(sampling_info.top_ks)
+                        capture_top_ps = select_capture_rows(sampling_info.top_ps)
+                        capture_tokens = select_capture_rows(batch_next_token_ids)
+                        filtered_probs = capture_probs
                         if sampling_info.need_top_k_sampling:
                             filtered_probs = top_k_renorm_prob(
-                                probs, sampling_info.top_ks
+                                capture_probs, capture_top_ks
                             )
                         if sampling_info.need_top_p_sampling:
-                            top_p_probs = top_p_renorm_prob(probs, sampling_info.top_ps)
-                            if filtered_probs is probs:
+                            top_p_probs = top_p_renorm_prob(
+                                capture_probs, capture_top_ps
+                            )
+                            if filtered_probs is capture_probs:
                                 filtered_probs = top_p_probs
                             else:
                                 filtered_probs.masked_fill_(top_p_probs <= 0, 0)
                         selected_weight = torch.gather(
                             filtered_probs,
                             1,
-                            batch_next_token_ids.long().view(-1, 1),
+                            capture_tokens.long().view(-1, 1),
                         ).squeeze(1)
                         sampling_mask_capture = _SamplingMaskCapture(
                             weights=filtered_probs,
                             token_ids=None,
                             selected_weight=selected_weight,
+                            batch_rows=capture_rows,
                         )
             elif backend == "pytorch":
                 # A slower fallback implementation with torch native operations.
@@ -408,9 +446,10 @@ class Sampler(nn.Module):
                         selected_weight,
                     ) = sample_result
                     sampling_mask_capture = _SamplingMaskCapture(
-                        weights=filtered_probs,
-                        token_ids=token_ids,
-                        selected_weight=selected_weight,
+                        weights=select_capture_rows(filtered_probs),
+                        token_ids=select_capture_rows(token_ids),
+                        selected_weight=select_capture_rows(selected_weight),
+                        batch_rows=capture_rows,
                     )
                 else:
                     batch_next_token_ids = sample_result
@@ -453,18 +492,10 @@ class Sampler(nn.Module):
         requested_rows_list = [
             i for i, should_return in enumerate(return_sampling_masks) if should_return
         ]
-        requested_rows = torch.tensor(
-            requested_rows_list,
-            device=sampling_mask_capture.weights.device,
-            dtype=torch.long,
-        )
-        weights = sampling_mask_capture.weights.index_select(0, requested_rows)
+        requested_rows = sampling_mask_capture.batch_rows
+        weights = sampling_mask_capture.weights
         token_ids = sampling_mask_capture.token_ids
-        if token_ids is not None:
-            token_ids = token_ids.index_select(0, requested_rows)
         selected_weight = sampling_mask_capture.selected_weight
-        if selected_weight is not None:
-            selected_weight = selected_weight.index_select(0, requested_rows)
         sampled_tokens = batch_next_token_ids.index_select(0, requested_rows).view(
             -1, 1
         )

@@ -6,6 +6,8 @@ from unittest.mock import patch
 import requests
 import torch
 
+from sglang.srt.layers import sampler as sampler_module
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -71,6 +73,7 @@ class TestSamplingMaskCapture(CustomTestCase):
             ),
             top_ps=torch.full((batch_size,), top_p, device="cuda"),
             min_ps=torch.zeros(batch_size, device="cuda"),
+            return_sampling_masks=[True] * batch_size,
         )
         with patch(
             "sglang.srt.layers.sampler.get_exec",
@@ -87,6 +90,7 @@ class TestSamplingMaskCapture(CustomTestCase):
             )
 
         self.assertIsNotNone(capture)
+        self.assertEqual(capture.batch_rows.cpu().tolist(), list(range(batch_size)))
         actual_support = capture.weights > 0
         self.assertTrue(
             torch.equal(actual_support, expected_support.expand_as(actual_support))
@@ -95,6 +99,117 @@ class TestSamplingMaskCapture(CustomTestCase):
         self.assertTrue(
             bool(actual_support.gather(1, sampled.view(-1, 1)).all().item())
         )
+
+    def test_flashinfer_capture_only_materializes_requested_rows(self):
+        batch_size = 4
+        top_k = 2
+        top_p = 0.45
+        requested_rows = [1, 3]
+        probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device="cuda").repeat(
+            batch_size, 1
+        )
+        sampling_info = SimpleNamespace(
+            sampling_seed=None,
+            need_top_k_sampling=True,
+            need_top_p_sampling=True,
+            need_min_p_sampling=False,
+            top_ks=torch.full((batch_size,), top_k, dtype=torch.int32, device="cuda"),
+            top_ps=torch.full((batch_size,), top_p, device="cuda"),
+            min_ps=torch.zeros(batch_size, device="cuda"),
+            return_sampling_masks=[False, True, False, True],
+        )
+        top_k_renorm = sampler_module.top_k_renorm_prob
+        top_p_renorm = sampler_module.top_p_renorm_prob
+        with (
+            patch(
+                "sglang.srt.layers.sampler.get_exec",
+                return_value=SimpleNamespace(
+                    kernel=SimpleNamespace(sampling_backend="flashinfer")
+                ),
+            ),
+            patch(
+                "sglang.srt.layers.sampler.top_k_renorm_prob",
+                wraps=top_k_renorm,
+            ) as top_k_mock,
+            patch(
+                "sglang.srt.layers.sampler.top_p_renorm_prob",
+                wraps=top_p_renorm,
+            ) as top_p_mock,
+        ):
+            sampled, capture = self.sampler._sample_from_probs(
+                probs,
+                sampling_info,
+                positions=torch.zeros(batch_size, dtype=torch.int64, device="cuda"),
+                simple_sampling_case=False,
+                return_sampling_mask=True,
+            )
+
+        self.assertIsNotNone(capture)
+        self.assertEqual(capture.batch_rows.cpu().tolist(), requested_rows)
+        self.assertEqual(tuple(capture.weights.shape), (len(requested_rows), 5))
+        self.assertEqual(tuple(top_k_mock.call_args.args[0].shape), (2, 5))
+        self.assertEqual(tuple(top_p_mock.call_args.args[0].shape), (2, 5))
+
+        output = LogitsProcessorOutput(next_token_logits=None)
+        self.sampler._attach_sampling_mask_to_output(
+            output, sampling_info, sampled, capture
+        )
+        self.assertIsNone(output.next_token_sampling_mask_idx[0])
+        self.assertEqual(set(output.next_token_sampling_mask_idx[1]), {0, 1, 2})
+        self.assertIsNone(output.next_token_sampling_mask_idx[2])
+        self.assertEqual(set(output.next_token_sampling_mask_idx[3]), {0, 1, 2})
+        self.assertIsNone(output.next_token_sampling_logprobs[0])
+        self.assertIsNotNone(output.next_token_sampling_logprobs[1])
+        self.assertIsNone(output.next_token_sampling_logprobs[2])
+        self.assertIsNotNone(output.next_token_sampling_logprobs[3])
+
+    def test_pytorch_capture_compacts_requested_rows(self):
+        batch_size = 4
+        requested_rows = [1, 3]
+        probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device="cuda").repeat(
+            batch_size, 1
+        )
+        sampling_info = SimpleNamespace(
+            sampling_seed=None,
+            need_top_k_sampling=True,
+            need_top_p_sampling=True,
+            need_min_p_sampling=False,
+            top_ks=torch.full((batch_size,), 2, dtype=torch.int32, device="cuda"),
+            top_ps=torch.full((batch_size,), 0.45, device="cuda"),
+            min_ps=torch.zeros(batch_size, device="cuda"),
+            return_sampling_masks=[False, True, False, True],
+        )
+        with patch(
+            "sglang.srt.layers.sampler.get_exec",
+            return_value=SimpleNamespace(
+                kernel=SimpleNamespace(sampling_backend="pytorch")
+            ),
+        ):
+            sampled, capture = self.sampler._sample_from_probs(
+                probs,
+                sampling_info,
+                positions=torch.zeros(batch_size, dtype=torch.int64, device="cuda"),
+                simple_sampling_case=False,
+                return_sampling_mask=True,
+            )
+
+        self.assertIsNotNone(capture)
+        self.assertEqual(capture.batch_rows.cpu().tolist(), requested_rows)
+        self.assertEqual(tuple(capture.weights.shape), (len(requested_rows), 5))
+        self.assertEqual(tuple(capture.token_ids.shape), (len(requested_rows), 5))
+
+        output = LogitsProcessorOutput(next_token_logits=None)
+        self.sampler._attach_sampling_mask_to_output(
+            output, sampling_info, sampled, capture
+        )
+        for batch_row in requested_rows:
+            self.assertIn(
+                int(sampled[batch_row]),
+                output.next_token_sampling_mask_idx[batch_row],
+            )
+            self.assertIsNotNone(output.next_token_sampling_logprobs[batch_row])
+        self.assertIsNone(output.next_token_sampling_mask_idx[0])
+        self.assertIsNone(output.next_token_sampling_mask_idx[2])
 
 
 class SamplingMaskTestMixin:
