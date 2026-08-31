@@ -409,12 +409,24 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
                 f"got {self.decode_seq_len_splits}"
             )
+        adaptive_scheduler_env = (
+            envs.SGLANG_TRTLLM_MHA_DECODE_ADAPTIVE_SCHEDULER
+        )
+        if adaptive_scheduler_env.is_set():
+            adaptive_scheduler_enabled = adaptive_scheduler_env.get()
+        else:
+            adaptive_scheduler_enabled = (
+                torch.cuda.get_device_capability(model_runner.device) == (10, 3)
+                and self.decode_seq_len_splits == 1
+                and not model_runner.server_args.enable_two_batch_overlap
+                and not model_runner.server_args.disable_cuda_graph
+                and not model_runner.server_args.disable_decode_cuda_graph
+            )
         # Draft CUDA-graph runners do not key graphs by this target-attention
         # variant. Keep their established static path and adapt only the target
         # decode/verify graphs that own the producer bottleneck.
         self.decode_adaptive_scheduler = (
-            envs.SGLANG_TRTLLM_MHA_DECODE_ADAPTIVE_SCHEDULER.get()
-            and not model_runner.is_draft_worker
+            adaptive_scheduler_enabled and not model_runner.is_draft_worker
         )
         if self.decode_adaptive_scheduler and self.decode_seq_len_splits != 1:
             raise ValueError(
