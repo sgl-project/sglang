@@ -3677,6 +3677,7 @@ class HybridLinearKVPool(KVCache):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
+        index_buf_size: Optional[int] = None,
         start_layer: Optional[int] = None,
         layer_shard_rank: Optional[int] = None,
         layer_shard_size: int = 1,
@@ -3780,6 +3781,7 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
+                index_buf_size=index_buf_size,
                 **pool_kwargs,
             )
         else:
@@ -3837,6 +3839,14 @@ class HybridLinearKVPool(KVCache):
     @property
     def index_head_dim(self) -> Optional[int]:
         return getattr(self.full_kv_pool, "index_head_dim", None)
+
+    @property
+    def index_buf_size(self) -> Optional[int]:
+        return getattr(self.full_kv_pool, "index_buf_size", None)
+
+    @property
+    def dcp_localized_writes(self) -> bool:
+        return getattr(self.full_kv_pool, "dcp_localized_writes", False)
 
     @property
     def quant_block_size(self) -> Optional[int]:
@@ -4274,6 +4284,11 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
+        # Sharded (per-rank sized) pools localize the allocator's DCP virtual
+        # locs in-kernel on write; a replicated pool (draft, loc_space_scale)
+        # spans the virtual space and indexes locs raw. The configurator flips
+        # this to False for replicated pools.
+        self.dcp_localized_writes = get_parallel().dcp_enabled
         self.dsa_kv_cache_store_fp8 = (
             use_dsa
             and dtype == torch.float8_e4m3fn
@@ -4375,11 +4390,10 @@ class MLATokenToKVPool(KVCache):
         )
         assert not self.dsa_kv_cache_store_fp8
         parallel = get_parallel()
-        if parallel.dcp_enabled:
+        if parallel.dcp_enabled and self.dcp_localized_writes:
             valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
-            if not valid_mask.all():
-                loc = loc[valid_mask]
-                cache_k = cache_k[valid_mask]
+            loc = loc[valid_mask] // parallel.attn_dcp_size
+            cache_k = cache_k[valid_mask]
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -4423,6 +4437,7 @@ class MLATokenToKVPool(KVCache):
                 loc,
                 cache_k_nope_fp8,
                 cache_k_rope_fp8,
+                dcp_localize=self.dcp_localized_writes,
             )
         else:
             if cache_k_nope.dtype != self.dtype:
@@ -4439,6 +4454,7 @@ class MLATokenToKVPool(KVCache):
                 loc,
                 cache_k_nope,
                 cache_k_rope,
+                dcp_localize=self.dcp_localized_writes,
             )
 
     def set_mla_kv_buffer(

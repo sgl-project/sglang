@@ -348,6 +348,15 @@ class KVCacheConfigurator:
         pool_size = max_total_num_tokens + self.pool_page_size - physical_page_size
         return pool_size, physical_page_size
 
+    def _dsa_index_buf_size(self, size: int) -> Optional[int]:
+        # The DSA index-K cache is read and written with the allocator's
+        # virtual locs untranslated even on the DCP-sharded target (unlike
+        # the main c-KV, which set_mla_kv_buffer localizes in-kernel), so
+        # it must span the virtual loc space. Draft sizes are already
+        # virtual via loc_space_scale.
+        scale = get_parallel().attn_dcp_size // self.loc_space_scale
+        return size * scale if scale > 1 else None
+
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
         max_total_num_tokens = config.max_total_num_tokens
         max_running_requests = config.max_running_requests
@@ -1377,6 +1386,9 @@ class KVCacheConfigurator:
                     self.layer_info.start_layer, self.layer_info.end_layer
                 )
             ]
+        index_buf_size = self._dsa_index_buf_size(max_total_num_tokens)
+        if index_buf_size is not None:
+            pool_kwargs["index_buf_size"] = index_buf_size
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=pool_page_size,
@@ -1401,6 +1413,9 @@ class KVCacheConfigurator:
             max_running_requests=max_running_requests,
             **pool_kwargs,
         )
+        if self.loc_space_scale > 1:
+            # Replicated pool spans the virtual loc space; write locs raw.
+            token_to_kv_pool.dcp_localized_writes = False
         return token_to_kv_pool
 
     def _build_hybrid_mla_swa_kv_pool(
@@ -1633,6 +1648,7 @@ class KVCacheConfigurator:
                             for layer_id in full_attention_layer_ids
                         ]
                     ),
+                    index_buf_size=self._dsa_index_buf_size(max_total_num_tokens),
                 )
                 if dsa_index_kpool > 1:
                     extra_args.update(
@@ -1670,6 +1686,9 @@ class KVCacheConfigurator:
             post_capture_active=self.post_capture_kv_active and quant_method is None,
             **extra_args,
         )
+        if self.loc_space_scale > 1 and hasattr(token_to_kv_pool, "full_kv_pool"):
+            # Replicated pool spans the virtual loc space; write locs raw.
+            token_to_kv_pool.full_kv_pool.dcp_localized_writes = False
         return token_to_kv_pool
 
     def _build_mha_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:

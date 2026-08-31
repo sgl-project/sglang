@@ -504,6 +504,13 @@ class DeepseekSparseAttnBackend(
 
         self.use_mha: bool = False
         self.supports_mha_one_shot: bool = True
+        # A DCP-sharded pool stores each token's c-KV on its owner rank at
+        # loc // dcp_size; the sparse kernels then need rank-filtered local
+        # indices (decode/verify: LSE-merged partials; extend: gathered KV).
+        # False on the replicated draft pool, which indexes virtual locs raw.
+        self._dcp_sharded_kv: bool = get_parallel().dcp_enabled and bool(
+            getattr(model_runner.token_to_kv_pool, "dcp_localized_writes", False)
+        )
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
@@ -962,6 +969,59 @@ class DeepseekSparseAttnBackend(
         raise RuntimeError(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
         )
+
+    def _dcp_localize_page_table(self, page_table_1: torch.Tensor) -> torch.Tensor:
+        """Owner-rule filter for a page_size=1 table of DCP virtual locs.
+
+        Keeps entries this rank stores (loc % dcp == rank) translated to the
+        local slot (loc // dcp); everything else becomes -1 (masked by the
+        sparse kernels). The dropped entries are covered by the other ranks'
+        partials via the decode/verify LSE merge.
+        """
+        parallel = get_parallel()
+        owned = (page_table_1 >= 0) & (
+            page_table_1 % parallel.attn_dcp_size == parallel.attn_dcp_rank
+        )
+        return torch.where(
+            owned,
+            page_table_1 // parallel.attn_dcp_size,
+            page_table_1.new_full((), -1),
+        )
+
+    def _dcp_gather_extend_kv_and_indices(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        k: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sparse extend under DCP: gather the rank-sharded prefix c-KV into a
+        per-request-contiguous [prefix_i ; extend_i] buffer; the RAGGED topk
+        indices are flattened onto that same layout. Extend has no cross-rank
+        LSE merge, so every rank must see the full selected KV.
+        """
+        from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_mha_extend
+
+        dcp_meta = forward_batch.attn_dcp_metadata
+        assert dcp_meta is not None, "DCP extend requires attn_dcp_metadata"
+        kv_a = k.view(k.shape[0], -1)
+        # The gather helper keeps k_pe 3-D ([N, 1, rope]); rope is 0 here.
+        k_pe = kv_a.new_empty((kv_a.shape[0], 1, 0))
+        kv_full, _ = all_gather_kv_cache_for_mha_extend(
+            self.token_to_kv_pool,
+            layer,
+            dcp_meta.dcp_local_prefix_kv_indices,
+            forward_batch.seq_lens,
+            forward_batch.extend_prefix_lens,
+            forward_batch.extend_prefix_lens_cpu,
+            forward_batch.extend_seq_lens,
+            kv_a,
+            k_pe,
+        )
+        # RAGGED topk already emitted flattened [S_0; S_1; ...] indices
+        # (offset by cu_seqlens_k), which is exactly the gathered layout.
+        page_table_1 = topk_indices
+        return page_table_1, kv_full.view(kv_full.shape[0], 1, -1)
 
     def get_device_int32_arange(self, length: int) -> torch.Tensor:
         if length > len(self._arange_buf):
@@ -1597,8 +1657,15 @@ class DeepseekSparseAttnBackend(
 
                 # Validate indices when logical tokens exceed physical capacity
                 # This is likely to be triggered by PP with high kv reuse & parallelism
+                # Under DCP these are virtual locs in [0, size * dcp_world_size).
                 kv_cache_capacity = (
-                    self.token_to_kv_pool.size + self.token_to_kv_pool.page_size
+                    self.token_to_kv_pool.size
+                    * (
+                        get_parallel().attn_dcp_size
+                        if get_parallel().dcp_enabled
+                        else 1
+                    )
+                    + self.token_to_kv_pool.page_size
                 )
                 if forward_batch.seq_lens_sum > kv_cache_capacity:
                     max_idx = page_table_1_flattened.max().item()
@@ -3017,7 +3084,18 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode
         )
 
-        if self.use_fused_topk:
+        if (
+            self._dcp_sharded_kv
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            # Sharded-pool sparse extend: RAGGED topk indices over gathered
+            # per-request KV (see get_topk_transform_method).
+            assert topk_indices is not None and k is not None
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+            page_table_1, kv_cache = self._dcp_gather_extend_kv_and_indices(
+                layer, forward_batch, k, topk_indices
+            )
+        elif self.use_fused_topk:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
@@ -3051,6 +3129,11 @@ class DeepseekSparseAttnBackend(
                     ),
                     cu_seqlens_q=metadata.cu_seqlens_q,
                 )
+
+        if self._dcp_sharded_kv and forward_batch.forward_mode.is_target_verify():
+            # Verify reads the sharded pool directly; keep owned entries local
+            # and let the decode-phase LSE merge combine the ranks' partials.
+            page_table_1 = self._dcp_localize_page_table(page_table_1)
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
@@ -3347,6 +3430,11 @@ class DeepseekSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
+
+        if self._dcp_sharded_kv and self.hisparse_coordinator is None:
+            # Decode reads the sharded pool: keep owned entries local; the
+            # cross-rank LSE merge reconstitutes the full topk attention.
+            page_table_1 = self._dcp_localize_page_table(page_table_1)
 
         if dsa_impl == "flashmla_sparse":
             if q_rope is not None:
@@ -4512,6 +4600,11 @@ class DeepseekSparseAttnBackend(
             and self.dsa_prefill_impl in ("flashmla_sparse", "flashmla_sparse_q8")
             and forward_mode == ForwardMode.EXTEND
         ):
+            topk_transform_method = TopkTransformMethod.RAGGED
+        elif self._dcp_sharded_kv and forward_mode == ForwardMode.EXTEND:
+            # Sharded-pool sparse extend runs over gathered per-request KV
+            # ([S_0; S_1; ...] flattened); RAGGED emits flattened indices into
+            # exactly that layout (offsets are cu_seqlens_k of the full lens).
             topk_transform_method = TopkTransformMethod.RAGGED
         else:
             topk_transform_method = TopkTransformMethod.PAGED

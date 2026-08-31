@@ -92,6 +92,8 @@ def set_mla_kv_buffer_kernel_norope(
     nope_stride: tl.constexpr,
     nope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
+    DCP_RANK: tl.constexpr = 0,
+    DCP_WORLD_SIZE: tl.constexpr = 1,
     USE_GDC: tl.constexpr = False,
 ):
     pid_loc = tl.program_id(0)
@@ -105,13 +107,15 @@ def set_mla_kv_buffer_kernel_norope(
         tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+    is_valid = loc % DCP_WORLD_SIZE == DCP_RANK
+    safe_loc = tl.where(is_valid, loc, 0) // DCP_WORLD_SIZE
+    dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
 
     src = tl.load(
         cache_k_nope_ptr + pid_loc * nope_stride + offs,
         mask=mask,
     )
-    tl.store(dst_ptr, src, mask=mask)
+    tl.store(dst_ptr, src, mask=mask & is_valid)
 
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
@@ -131,6 +135,7 @@ def set_mla_kv_buffer_triton(
     cache_k_rope: Optional[torch.Tensor] = None,
     *,
     reserved_skip_index: int = 0,
+    dcp_localize: Optional[bool] = None,
 ):
     """Dispatch MLA paged-KV scatter writes to the fastest available path.
 
@@ -162,6 +167,14 @@ def set_mla_kv_buffer_triton(
     n_loc = loc.numel()
     nope_dim = cache_k_nope.shape[-1]
 
+    # A DCP-sharded (per-rank sized) pool must localize the allocator's virtual
+    # locs in-kernel; a replicated pool (draft, loc_space_scale) indexes them
+    # raw. Callers that own a replicated pool pass dcp_localize=False.
+    if dcp_localize is None:
+        dcp_localize = get_parallel().dcp_enabled
+    dcp_rank = get_parallel().attn_dcp_rank if dcp_localize else 0
+    dcp_world_size = get_parallel().attn_dcp_size if dcp_localize else 1
+
     if not has_rope:
         BLOCK = triton.next_power_of_2(nope_dim)
         grid = (n_loc, 1)
@@ -176,6 +189,8 @@ def set_mla_kv_buffer_triton(
             cache_k_nope.stride(0),
             nope_dim,
             BLOCK=BLOCK,
+            DCP_RANK=dcp_rank,
+            DCP_WORLD_SIZE=dcp_world_size,
             **pdl_kwargs,
         )
         return
@@ -193,7 +208,7 @@ def set_mla_kv_buffer_triton(
         n_loc >= _TMA_BULK_STORE_MIN_LOCS
         and is_arch_support_pdl()
         and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
-        and not get_parallel().dcp_enabled
+        and not dcp_localize
     ):
         jit_set_mla_kv_buffer(
             kv_buffer,
@@ -226,8 +241,8 @@ def set_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
-        DCP_RANK=get_parallel().attn_dcp_rank,
-        DCP_WORLD_SIZE=get_parallel().attn_dcp_size,
+        DCP_RANK=dcp_rank,
+        DCP_WORLD_SIZE=dcp_world_size,
         **pdl_kwargs,
     )
 
