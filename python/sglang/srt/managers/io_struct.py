@@ -1221,6 +1221,12 @@ class EmbeddingReqInput:
         else:
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
+            elif isinstance(self.rid, str):
+                # Expand a single base rid into per-item rids, mirroring
+                # GenerateReqInput._normalize_rid, so a caller can pass one rid
+                # for a whole batch (e.g. score_request threading a shared
+                # correlation id across the items it fans out into).
+                self.rid = [f"{self.rid}_{i}" for i in range(self.batch_size)]
             else:
                 assert isinstance(self.rid, list), "The rid should be a list."
 
