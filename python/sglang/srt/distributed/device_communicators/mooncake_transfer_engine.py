@@ -213,6 +213,14 @@ class MooncakeTransferEngine:
             protocol,
             device_name if device_name is not None else "",
         )
+        logger.info(
+            "Mooncake TransferEngine initialized: hostname=%s, protocol=%s, "
+            "gpu_id=%s, device_name=%r (empty means mooncake auto-selects)",
+            hostname,
+            protocol,
+            self.gpu_id,
+            device_name if device_name is not None else "",
+        )
         if ret_value != 0:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")

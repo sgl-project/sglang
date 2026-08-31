@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import torch
 
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    get_ib_devices_for_gpu,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -26,6 +30,7 @@ class RemoteInstanceWeightTransporter:
     get_model: Callable[[], torch.nn.Module]
     tp_rank: int
     gpu_id: int
+    is_draft_worker: bool = False
     engine: Optional[Any] = None
     session_id: str = ""
     weight_info: Optional[dict[str, tuple[int, int, int]]] = None
@@ -45,19 +50,43 @@ class RemoteInstanceWeightTransporter:
             return
         self.engine = TransferEngine()
         local_ip = get_local_ip_auto()
+        # Resolved per rank, not passed through: these accept a
+        # {gpu_id: devices} mapping, which mooncake cannot parse -- it would
+        # fall back to taking every NIC on every rank.
+        configured_device = (
+            envs.SGLANG_REMOTE_INSTANCE_IB_DEVICE.get() or envs.MOONCAKE_DEVICE.get()
+        )
+        try:
+            ib_device = get_ib_devices_for_gpu(configured_device, self.gpu_id)
+        except ValueError:
+            logger.warning(
+                "No IB device configured for GPU %s; letting mooncake select "
+                "the HCA for remote-instance transfers.",
+                self.gpu_id,
+            )
+            ib_device = None
         self.engine.initialize(
             local_ip,
             "P2PHANDSHAKE",
             envs.MOONCAKE_PROTOCOL.get(),
-            envs.MOONCAKE_DEVICE.get(),
+            ib_device or "",
         )
         self.session_id = NetworkAddress(
             local_ip, self.engine.get_rpc_port()
         ).to_host_port_str()
+        logger.info(
+            "Remote-instance TransferEngine on GPU %s using ib_device=%r "
+            "(empty means mooncake selects).",
+            self.gpu_id,
+            ib_device or "",
+        )
 
     def maybe_register_and_publish_weight_info(self) -> None:
         if (
             remote_instance_transfer_engine_enabled()
+            # The draft shares the target's tp_rank, the bootstrap server's
+            # key, so publishing here would replace the target's manifest.
+            and not self.is_draft_worker
             # ModelExpress owns TransferEngine memory registration and metadata
             # publishing for backend=modelexpress. Re-registering here would
             # overlap the same weight buffers.
@@ -66,9 +95,27 @@ class RemoteInstanceWeightTransporter:
             and self.engine is not None
             and self.weight_info is None
         ):
-            # Register memory and upstream the transfer engine info to the bootstrap server
-            self.weight_info = register_memory_region(self.model, self.engine)
+            # Off the startup path: ibv_reg_mr runs once per NIC per block,
+            # ~90s over 16 NICs, and none of it is needed for this rank to
+            # serve. A client arriving before it lands disk-loads.
+            threading.Thread(
+                target=self._register_and_publish_weight_info,
+                name=f"weight-mr-register-tp{self.tp_rank}",
+                daemon=True,
+            ).start()
+
+    def _register_and_publish_weight_info(self) -> None:
+        try:
+            # The seed serves handles out of this registration for the life of
+            # the process, so the blocks are never deregistered here.
+            self.weight_info, _ = register_memory_region(self.model, self.engine)
             self._register_to_engine_info_bootstrap()
+        except Exception:
+            logger.exception(
+                "Failed to register weight memory for tp_rank=%s; this instance "
+                "will not be usable as a remote-instance seed.",
+                self.tp_rank,
+            )
 
     def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransporter):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.

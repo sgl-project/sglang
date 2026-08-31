@@ -11,6 +11,22 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+# Arbitrary; enough for the ranks unregistering concurrently to drain.
+_DEREGISTER_MAX_ATTEMPTS = 5
+_DEREGISTER_BACKOFF_S = 0.5
+
+
+def _iter_manifest_parameters(model):
+    """Every name a parameter answers to, not just the canonical one.
+
+    post_load_weights aliases parameters onto their parent
+    (`self._bfa_f_b_w = self.f_b_proj.weight` in kimi_k3), and
+    named_parameters() de-duplicates by identity keeping the parent's name, so
+    the child's vanishes. The client is a fresh skeleton that has run neither
+    the aliasing nor post_load_weights, and looks the child name up.
+    """
+    return model.named_parameters(remove_duplicate=False)
+
 
 class RemoteInstanceWeightLoaderBackend(str, enum.Enum):
     NCCL = "nccl"
@@ -113,27 +129,92 @@ def register_memory_region(model, transfer_engine):
         return register_memory_region_v2(model, transfer_engine)
 
 
+def deregister_memory_region(transfer_engine, registered_blocks) -> bool:
+    """Release the RDMA registration of the given blocks.
+
+    Reader side only: the seed keeps its registration, that is what it serves
+    handles from.
+    """
+    if not registered_blocks:
+        return True
+    addresses = [address for address, _ in registered_blocks]
+    try:
+        if transfer_engine.batch_unregister_memory(addresses) == 0:
+            return True
+        logger.warning("Batch deregistration failed; retrying block by block.")
+    except Exception as e:
+        # EAGAIN when the batch call fans out over too many blocks at once, and
+        # AttributeError on mooncake builds without the batch entry point.
+        logger.warning("Batch deregistration raised (%s); retrying block by block.", e)
+
+    # The pinned pages stay resident until this succeeds -- a caller falling
+    # back to disk has no room to load into while they do. EAGAIN here is the
+    # driver being busy, not a permanent refusal: every rank on the host is
+    # unregistering at once, so back off and retry the stragglers.
+    pending = addresses
+    for attempt in range(_DEREGISTER_MAX_ATTEMPTS):
+        if attempt:
+            time.sleep(_DEREGISTER_BACKOFF_S * attempt)
+        failed = []
+        for address in pending:
+            try:
+                if transfer_engine.unregister_memory(address) != 0:
+                    failed.append(address)
+            except Exception:
+                failed.append(address)
+        if not failed:
+            return True
+        logger.warning(
+            "%d of %d weight memory regions still pinned after attempt %d.",
+            len(failed),
+            len(addresses),
+            attempt + 1,
+        )
+        pending = failed
+
+    logger.error(
+        "Failed to deregister %d of %d weight memory regions; that memory "
+        "stays pinned for the life of the process.",
+        len(pending),
+        len(addresses),
+    )
+    return False
+
+
 def register_memory_region_v1(model, transfer_engine):
     start_tic = time.time()
 
     weight_mr_dict = {}
-    for name, weight in model.named_parameters():
-        ret = transfer_engine.register_memory(
-            weight.data_ptr(), weight.numel() * weight.element_size()
-        )
-        if ret != 0:
-            raise RuntimeError(
-                f"register memory failed for weight {name}, error: {ret}"
+    registered_blocks = []
+    seen_blocks = set()
+    try:
+        for name, weight in _iter_manifest_parameters(model):
+            size = weight.numel() * weight.element_size()
+            block = (weight.data_ptr(), size)
+            # One registration per byte range; aliases would otherwise register
+            # twice, and the second unregister_memory would fail.
+            if block not in seen_blocks:
+                ret = transfer_engine.register_memory(weight.data_ptr(), size)
+                if ret != 0:
+                    raise RuntimeError(
+                        f"register memory failed for weight {name}, error: {ret}"
+                    )
+                seen_blocks.add(block)
+                registered_blocks.append(block)
+            weight_mr_dict[name] = (
+                weight.data_ptr(),
+                weight.numel(),
+                weight.element_size(),
             )
-        weight_mr_dict[name] = (
-            weight.data_ptr(),
-            weight.numel(),
-            weight.element_size(),
-        )
+    except BaseException:
+        # The caller only learns about blocks we return, so a partial
+        # registration would stay pinned with nobody holding a handle.
+        deregister_memory_region(transfer_engine, registered_blocks)
+        raise
 
     end_tic = time.time()
     logger.debug(f"Register memory region time: {(end_tic - start_tic):.4f}s")
-    return weight_mr_dict
+    return weight_mr_dict, registered_blocks
 
 
 def register_memory_region_v2(model, transfer_engine):
@@ -141,7 +222,7 @@ def register_memory_region_v2(model, transfer_engine):
 
     weight_mr_dict = {}
     weight_addr_set = set()
-    for name, weight in model.named_parameters():
+    for name, weight in _iter_manifest_parameters(model):
         weight_mr_dict[name] = (
             weight.data_ptr(),
             weight.numel(),
@@ -181,14 +262,22 @@ def register_memory_region_v2(model, transfer_engine):
             weight_blocks_for_reg_mr.append(current_weight_block)
 
     # Register merged memory blocks that hold weights.
-    for weight_block in weight_blocks_for_reg_mr:
-        address, size = weight_block
-        ret = transfer_engine.register_memory(address, size)
-        if ret != 0:
-            raise RuntimeError(
-                f"register memory failed for weight block at address {address} with size {size}, error: {ret}"
-            )
+    registered_blocks = []
+    try:
+        for weight_block in weight_blocks_for_reg_mr:
+            address, size = weight_block
+            ret = transfer_engine.register_memory(address, size)
+            if ret != 0:
+                raise RuntimeError(
+                    f"register memory failed for weight block at address {address} with size {size}, error: {ret}"
+                )
+            registered_blocks.append(weight_block)
+    except BaseException:
+        # The caller only learns about blocks we return, so a partial
+        # registration would stay pinned with nobody holding a handle.
+        deregister_memory_region(transfer_engine, registered_blocks)
+        raise
 
     end_tic = time.time()
     logger.debug(f"Register memory region v2 time: {(end_tic - start_tic):.4f}s")
-    return weight_mr_dict
+    return weight_mr_dict, registered_blocks
