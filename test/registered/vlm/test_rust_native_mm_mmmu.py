@@ -101,7 +101,7 @@ class QwenGenerateVisionSampler(SamplerBase):
     importlib.util.find_spec("sglang.srt.rust_extensions._server") is None,
     "sglang-server rust extension not installed (e.g. AMD suite)",
 )
-class TestRustNativeMmMMMU(CustomTestCase):
+class TestRustMmMMMU(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         # Capture the server log so the test can pin that the native MM
@@ -139,7 +139,7 @@ class TestRustNativeMmMMMU(CustomTestCase):
 
     def test_mmmu_accuracy(self):
         # Guard the path under test: if the model ever drops off
-        # NATIVE_MM_FAMILIES, launch fails and this names why.
+        # RUST_MM_FAMILIES, launch fails and this names why.
         self.assertIn(
             "native MM pipeline enabled",
             self._read_server_log(),

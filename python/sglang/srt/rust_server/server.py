@@ -25,9 +25,9 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.rust_server.config import _build_server_args, _partition_cores
 from sglang.srt.rust_server.multimodal import (
-    NATIVE_MM_FAMILIES,
-    NativeMmHost,
-    NativeMmSpec,
+    RUST_MM_FAMILIES,
+    RustMmProcessor,
+    RustMmSpec,
 )
 from sglang.srt.runtime_context import get_mm, get_serving
 from sglang.srt.utils.flatten import (
@@ -55,7 +55,7 @@ class RustServer:
     def __init__(
         self,
         server: Server,
-        mm_spec: Optional[NativeMmSpec] = None,
+        mm_spec: Optional[RustMmSpec] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
@@ -100,7 +100,7 @@ class RustServer:
 
         launch_cores, server_cores = _partition_cores(
             mm_workers=(
-                (get_mm().mm_processor_worker_num or NativeMmHost.AUTO_MM_WORKERS)
+                (get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS)
                 if scheduler.model_config.is_multimodal
                 else 0
             )
@@ -129,15 +129,15 @@ class RustServer:
                     logger.warning(
                         "rust server: cannot confine mm threads to server cores: %s", e
                     )
-            mm_host = NativeMmHost(
+            mm_host = RustMmProcessor(
                 server_args=server_args,
                 model_config=scheduler.model_config,
                 processor=scheduler.processor,
             )
-            mm_spec = mm_host.resolve_native_spec()
+            mm_spec = mm_host.resolve_spec()
             if mm_spec is None:
                 supported = sorted(
-                    set(chain.from_iterable(f.model_types for f in NATIVE_MM_FAMILIES))
+                    set(chain.from_iterable(f.model_types for f in RUST_MM_FAMILIES))
                 )
                 raise RuntimeError(
                     "SGLANG_RUST_SERVER=1: no native Rust MM pipeline for "
@@ -223,9 +223,11 @@ class RustServer:
                 # The buffers rode the Rust sidecar, parked before the ring push;
                 # wrapping them into tensors is the only Python step of the native
                 # path. `None` for a text-only request on a multimodal model.
-                native = self.server.take_mm(obj.rid)
-                if native is not None:
-                    obj.mm_inputs = NativeMmHost.build_native_mm(self.mm_spec, native)
+                mm_result = self.server.take_mm_result(obj.rid)
+                if mm_result is not None:
+                    obj.mm_inputs = RustMmProcessor.build_output(
+                        self.mm_spec, mm_result
+                    )
             out.append(obj)
         return out
 
@@ -409,9 +411,9 @@ class RustServer:
             )
 
     @staticmethod
-    def _build_mm_spec(spec: NativeMmSpec) -> MmSpec:
+    def _build_mm_spec(spec: RustMmSpec) -> MmSpec:
         """The typed MM handoff for ``Server.start_mm_workers``: the
-        :class:`NativeMmSpec` fields the Rust pipeline consumes, as the Rust
+        :class:`RustMmSpec` fields the Rust pipeline consumes, as the Rust
         extension's own ``MmSpec`` class (same required-keyword contract as
         :meth:`_build_server_args`; ``family`` / ``resample`` become the
         extension's ``MmFamily`` / ``MmResample`` enums)."""

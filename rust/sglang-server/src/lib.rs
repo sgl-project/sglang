@@ -34,8 +34,8 @@ fn value_error(context: &str, err: impl std::fmt::Display) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(format!("{context}: {err}"))
 }
 
-/// One drained MM result (see [`Server::take_mm`]), consumed by
-/// `RustServer.build_native_mm` to build the scheduler's
+/// One drained MM result (see [`Server::take_mm_result`]), consumed by
+/// `RustServer.build_output` to build the scheduler's
 /// `MultimodalProcessorOutput`.
 #[pyclass(frozen, get_all)]
 struct MmEncodeResult {
@@ -93,7 +93,7 @@ impl Server {
         http_addr = None,
         to_scheduler_cap = 8192,
         from_scheduler_cap = 8192,
-        channel_cap = 8192,
+        stage_channel_cap = 8192,
         cores = None,
     ))]
     // pyo3 `#[new]` constructor: the wide arg list is the Python-facing boot
@@ -104,7 +104,7 @@ impl Server {
         http_addr: Option<String>,
         to_scheduler_cap: usize,
         from_scheduler_cap: usize,
-        channel_cap: usize,
+        stage_channel_cap: usize,
         cores: Option<Vec<usize>>,
     ) -> PyResult<Self> {
         // `server_args` already arrived typed (pyo3 rejected any missing/extra/
@@ -127,7 +127,7 @@ impl Server {
                 http_api_worker_num: server_args.http_api_worker_num(),
                 to_scheduler_cap,
                 from_scheduler_cap,
-                channel_cap,
+                stage_channel_cap,
                 cores,
             },
             server_args: std::sync::Arc::new(server_args),
@@ -201,9 +201,9 @@ impl Server {
     }
 
     /// Spawn the MM worker pool for the pipeline in `spec` (built from the
-    /// resolved processor config; see `NativeMmHost.resolve_native_spec` and
+    /// resolved processor config; see `RustMmProcessor.resolve_spec` and
     /// `RustServer._build_mm_spec`). Image-only requests are processed entirely
-    /// in Rust and parked for [`Server::take_mm`]; anything the pipeline cannot
+    /// in Rust and parked for [`Server::take_mm_result`]; anything the pipeline cannot
     /// serve is rejected back to the client — there is no Python fallback.
     fn start_mm_workers(&self, spec: MmSpec, workers: usize) -> PyResult<()> {
         let ctx = multi_modality::worker::Context::new(
@@ -224,7 +224,7 @@ impl Server {
     /// Runs on the scheduler loop between decode steps, so any per-byte work
     /// here — memcpy or hashing, tens of MB per image-heavy request — would
     /// stall every running request's ITL. Hence the worker-precomputed `hashes`.
-    fn take_mm(&self, py: Python<'_>, rid: &str) -> Option<MmEncodeResult> {
+    fn take_mm_result(&self, py: Python<'_>, rid: &str) -> Option<MmEncodeResult> {
         use numpy::IntoPyArray;
 
         let res = self.rt.mm_sidecar.take(rid)?;

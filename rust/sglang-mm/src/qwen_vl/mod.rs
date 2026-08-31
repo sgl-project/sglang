@@ -65,7 +65,7 @@ pub struct QwenVlProcessor {
     lut: [[f32; 256]; 3],
 }
 
-/// `1 / rescale_factor`; `resolve_native_spec` rejects any other factor.
+/// `1 / rescale_factor`; `resolve_spec` rejects any other factor.
 const INV_RESCALE: f32 = 255.0;
 
 /// u8 → normalized f32, rounded as the mirrored processor rounds. The slow one
@@ -486,7 +486,7 @@ mod python {
     /// `sglang-server` (whose message layer owns the wire-payload parsing).
     #[pyfunction]
     #[pyo3(signature = (input_ids, images, spec_json))]
-    fn process_native_mm<'py>(
+    fn process_mm<'py>(
         py: Python<'py>,
         input_ids: Option<Vec<i32>>,
         images: Vec<PyImageSource>,
@@ -529,7 +529,7 @@ mod python {
         m.add_function(wrap_pyfunction!(preprocess, &m)?)?;
         m.add_function(wrap_pyfunction!(smart_resize_py, &m)?)?;
         m.add_function(wrap_pyfunction!(mrope_image_only_py, &m)?)?;
-        m.add_function(wrap_pyfunction!(process_native_mm, &m)?)?;
+        m.add_function(wrap_pyfunction!(process_mm, &m)?)?;
         parent.add_submodule(&m)?;
         Ok(())
     }

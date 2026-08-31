@@ -18,12 +18,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class NativeMmSpec(msgspec.Struct, frozen=True, kw_only=True):
+class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
     """Resolved parameters of the native Rust MM pipeline for one model,
     consumed by the Rust worker pool (as the typed extension ``MmSpec``, see
     :meth:`RustServer._build_mm_spec`), the ``_multimodal`` parity API
     (:meth:`rust_json`) and the drain adapter
-    (:meth:`NativeMmHost.build_native_mm`)."""
+    (:meth:`RustMmProcessor.build_output`)."""
 
     family: str
     feature_shm: bool
@@ -36,7 +36,7 @@ class NativeMmSpec(msgspec.Struct, frozen=True, kw_only=True):
     image_mean: Tuple[float, ...]
     image_std: Tuple[float, ...]
     # Which HF processor the Rust resize must reproduce bit-exactly, from
-    # `NativeMmHost.NATIVE_IMAGE_PROCESSORS`.
+    # `RustMmProcessor.NATIVE_IMAGE_PROCESSORS`.
     resample: str
     vision_start_token_id: Optional[int]
     vision_end_token_id: Optional[int]
@@ -57,10 +57,10 @@ class NativeMmSpec(msgspec.Struct, frozen=True, kw_only=True):
         return msgspec.json.encode({f: getattr(self, f) for f in fields}).decode()
 
 
-class NativeMmFamily(msgspec.Struct, frozen=True, kw_only=True):
+class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
     """The Python half of one Rust MM family (an arm of
     `sglang_mm::registry::pipeline_from_spec`): which models it serves.
-    Supporting a new model family = one entry in :data:`NATIVE_MM_FAMILIES`
+    Supporting a new model family = one entry in :data:`RUST_MM_FAMILIES`
     plus its Rust arm — the launch gate is data-driven."""
 
     name: str
@@ -71,7 +71,7 @@ class NativeMmFamily(msgspec.Struct, frozen=True, kw_only=True):
     # Model types whose image-only M-RoPE matches the family's fast path.
     model_types: FrozenSet[str]
     # HF image processors the native resize reproduces bit-exactly, each mapped
-    # to the `resample` the Rust pipeline must use (see `NativeMmSpec.resample`).
+    # to the `resample` the Rust pipeline must use (see `RustMmSpec.resample`).
     image_processors: Dict[str, str]
 
     def serves(self, mm_processor_cls: Any, model_type: Optional[str]) -> bool:
@@ -80,8 +80,8 @@ class NativeMmFamily(msgspec.Struct, frozen=True, kw_only=True):
         return mm_processor_cls is cls and model_type in self.model_types
 
 
-NATIVE_MM_FAMILIES: Tuple[NativeMmFamily, ...] = (
-    NativeMmFamily(
+RUST_MM_FAMILIES: Tuple[RustMmFamily, ...] = (
+    RustMmFamily(
         name="qwen_vl",
         mm_processor="sglang.srt.multimodal.processors.qwen_vl:QwenVLImageProcessor",
         model_types=frozenset(
@@ -103,24 +103,24 @@ NATIVE_MM_FAMILIES: Tuple[NativeMmFamily, ...] = (
 )
 
 
-def native_mm_family_for(
+def rust_mm_family_for(
     mm_processor_cls: Any, model_type: Optional[str]
-) -> Optional[NativeMmFamily]:
+) -> Optional[RustMmFamily]:
     """The declared family serving this model, or ``None`` — which
     :meth:`RustServer.launch` turns into a hard error (no Python fallback)."""
     return next(
-        (f for f in NATIVE_MM_FAMILIES if f.serves(mm_processor_cls, model_type)), None
+        (f for f in RUST_MM_FAMILIES if f.serves(mm_processor_cls, model_type)), None
     )
 
 
-class NativeMmHost:
+class RustMmProcessor:
     """Builds and validates the native Rust MM pipeline for one model.
 
     Construction registers the same ``mm_processor`` mapping the Python
     TokenizerManager would build — not to process requests (the Rust worker pool
     does that, GIL-free) but as the source of truth
-    :meth:`resolve_native_spec` resolves the pipeline parameters from. At drain
-    time :meth:`build_native_mm` wraps the Rust-produced buffers into the
+    :meth:`resolve_spec` resolves the pipeline parameters from. At drain
+    time :meth:`build_output` wraps the Rust-produced buffers into the
     scheduler's ``MultimodalProcessorOutput``.
 
     There is no Python fallback: a model without a native spec fails at launch,
@@ -156,8 +156,8 @@ class NativeMmHost:
             import_processors(mm_process_pkg, overwrite=True)
         self._processor = processor or get_processor_wrapper()
 
-    def resolve_native_spec(self) -> Optional[NativeMmSpec]:
-        """The :class:`NativeMmSpec` for this model, or ``None`` when it has no
+    def resolve_spec(self) -> Optional[RustMmSpec]:
+        """The :class:`RustMmSpec` for this model, or ``None`` when it has no
         native pipeline (the launch gate turns that into a hard error).
 
         Carries only resolved settings — patch geometry, pixel limits,
@@ -170,7 +170,7 @@ class NativeMmHost:
         mm_processor_cls = get_mm_processor_cls(
             hf_config, self.server_args, model_config=self.model_config
         )
-        family = native_mm_family_for(
+        family = rust_mm_family_for(
             mm_processor_cls, getattr(hf_config, "model_type", None)
         )
         if family is None:
@@ -202,7 +202,7 @@ class NativeMmHost:
             "max_pixels", getattr(ip, "max_pixels", None) or size.get("longest_edge")
         )
         try:
-            spec = NativeMmSpec(
+            spec = RustMmSpec(
                 family=family.name,
                 feature_shm=self._use_feature_shm(),
                 image_token_id=hf_config.image_token_id,
@@ -248,13 +248,13 @@ class NativeMmHost:
         )
 
     @staticmethod
-    def build_native_mm(spec: NativeMmSpec, entry):
+    def build_output(spec: RustMmSpec, entry):
         """Drain-time adapter: wrap the Rust-produced buffers of one ``MmEncodeResult``
         into the scheduler's ``MultimodalProcessorOutput``. Wrapping only — load,
         resize, patchify, token expansion and M-RoPE all ran in Rust.
 
         Runs on the scheduler loop, so it must stay copy-free *and* hash-free:
-        ``take_mm``'s numpy arrays own the Rust buffers, ``torch.from_numpy`` just
+        ``take_mm_result``'s numpy arrays own the Rust buffers, ``torch.from_numpy`` just
         views them, and each item's ``hash`` is worker-precomputed so
         ``set_pad_value`` skips ``hash_feature``. Any per-byte work here — memcpy,
         sha256, tens of MB per image-heavy request — measurably inflates every
@@ -284,7 +284,7 @@ class NativeMmHost:
                 # segment (see `_use_feature_shm`). Build the stub in its
                 # post-`__setstate__` form: rank 0 never pickle-roundtrips its
                 # own copy, and `materialize()` needs the mapped view.
-                # Ownership of the unlink moved here with `take_mm`.
+                # Ownership of the unlink moved here with `take_mm_result`.
                 feature = ShmPointerMMData.__new__(ShmPointerMMData)
                 feature.__setstate__(
                     {

@@ -51,7 +51,7 @@ def solid_image_data_url(fmt):
     importlib.util.find_spec("sglang.srt.rust_extensions._server") is None,
     "sglang-server rust extension not installed (e.g. AMD suite)",
 )
-class TestRustServerNativeMm(CustomTestCase):
+class TestRustServerMm(CustomTestCase):
     env = {"SGLANG_RUST_SERVER": "1"}
 
     @classmethod
