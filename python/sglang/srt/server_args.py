@@ -800,6 +800,18 @@ class ServerArgs:
         ),
         NS("schedule"),
     ] = "length"
+    max_retraction_count: A[
+        Optional[int],
+        (
+            "The maximum number of times a single request may be retracted and "
+            "re-queued before it is failed fast with HTTP 503. Retracting a request "
+            "discards its KV cache, so every retraction costs a full re-prefill; "
+            "without a bound, a request can livelock between the running batch and "
+            "the waiting queue while burning GPU on repeated prefills. "
+            "None (default) keeps the unlimited legacy behavior."
+        ),
+        NS("schedule")
+    ] = None
     schedule_conservativeness: A[
         float,
         "How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
