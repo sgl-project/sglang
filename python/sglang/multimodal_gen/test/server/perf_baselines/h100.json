@@ -1516,7 +1516,7 @@
             "stages_ms": {
                 "InputValidationStage": 15.59,
                 "ImageVAEEncodingStage": 1484.2,
-                "DecodingStage": 1114.63,
+                "DecodingStage": 2450.0,
                 "LatentPreparationStage": 0.21,
                 "TextEncodingStage": 327.94,
                 "TimestepPreparationStage": 2.47,

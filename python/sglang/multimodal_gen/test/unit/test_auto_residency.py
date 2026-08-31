@@ -3401,6 +3401,10 @@ class TestAutoResidencySkipReason:
             ({"warmup_mode": "request"}, "server warmup"),
             ({"disagg_role": "denoiser"}, "server warmup"),
             ({"backend": "diffusers"}, "diffusers"),
+            (
+                {"ltx2_two_stage_device_mode": "original"},
+                "LTX-2 original two-stage placement",
+            ),
             ({"enable_breakable_cuda_graph": True}, "CUDA graph"),
             # compile warmup strips the memory layout (layerwise DiT +
             # resident aux components on CPU): its peaks are not serving peaks
