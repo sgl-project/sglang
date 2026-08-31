@@ -4952,6 +4952,7 @@ class TestAutoResidencySkipReason:
             nunchaku_config=None,
             direct_gpu_weight_loading=False,
             ltx2_two_stage_device_mode=None,
+            pipeline_class_name=None,
             pipeline_config=SimpleNamespace(
                 task_type=ModelTaskType.T2V,
                 supports_auto_residency=True,
@@ -5002,6 +5003,10 @@ class TestAutoResidencySkipReason:
             (
                 {"ltx2_two_stage_device_mode": "original"},
                 "LTX-2 original two-stage placement",
+            ),
+            (
+                {"pipeline_class_name": "LTX2TwoStagePipeline"},
+                "legacy LTX-2 two-stage placement",
             ),
             ({"enable_breakable_cuda_graph": True}, "CUDA graph"),
             # compile warmup strips the memory layout (layerwise DiT +
