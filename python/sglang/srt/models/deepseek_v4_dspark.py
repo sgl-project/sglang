@@ -1034,7 +1034,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
         mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
         mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
-        mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
+        # Suffix-exact match: a substring replace would also rewrite the
+        # vision model's ".gate.bias_vl" into ".gate.e_score_correction_bias_vl".
+        if mapped_rest.endswith(".gate.bias"):
+            mapped_rest = (
+                mapped_rest.removesuffix(".gate.bias") + ".gate.e_score_correction_bias"
+            )
         mapped_rest = mapped_rest.replace(".scale", ".weight_scale_inv")
         return f"stages.{stage_id}.{mapped_rest}"
 
@@ -1091,7 +1096,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
         mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
         mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
-        mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
+        # Suffix-exact match: a substring replace would also rewrite the
+        # vision model's ".gate.bias_vl" into ".gate.e_score_correction_bias_vl".
+        if mapped_rest.endswith(".gate.bias"):
+            mapped_rest = (
+                mapped_rest.removesuffix(".gate.bias") + ".gate.e_score_correction_bias"
+            )
         if mapped_rest.endswith(".scale"):
             mapped_rest = mapped_rest.removesuffix(".scale") + ".weight_scale_inv"
         return f"stages.{stage_id}.{mapped_rest}"

@@ -383,6 +383,17 @@ class ModelConfig:
                 logger.info(
                     f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
                 )
+            elif self.hf_config.architectures[
+                0
+            ] == "DeepseekV4ForCausalLM" and not getattr(
+                self.hf_config, "vision_n_layers", 0
+            ):
+                enable_multimodal = False
+                logger.info(
+                    "Multimodal is disabled for this DeepseekV4 checkpoint: "
+                    "vision_n_layers not found in the model config "
+                    "(likely a text-only DeepseekV4 variant)."
+                )
             elif self.hf_config.architectures[0] in MIMO_V2_MULTIMODAL_ARCHS and not (
                 hasattr(self.hf_config, "vision_config")
                 and hasattr(self.hf_config, "audio_config")
@@ -1887,6 +1898,7 @@ multimodal_model_archs = [
     "CLIPModel",
     "Cohere2VisionForConditionalGeneration",
     "DeepseekVL2ForCausalLM",
+    "DeepseekV4ForCausalLM",
     "Ernie4_5_VLMoeForConditionalGeneration",
     "MiniMaxM3SparseForConditionalGeneration",
     "Gemma3ForConditionalGeneration",

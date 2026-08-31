@@ -48,10 +48,14 @@ def _combine_topk_swa_indices_kernel(
     gather_lens_ptr,
     compressed_base_ptr,
     swa_base_ptr,
+    swa_win_starts_ptr,
+    swa_win_lens_ptr,
     top_k,
     COMPRESS_RATIO: tl.constexpr,
     WINDOW_SIZE: tl.constexpr,
+    SWA_BLOCK: tl.constexpr,
     PADDED_TOP_K: tl.constexpr,
+    HAS_SWA_WIN: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -80,7 +84,14 @@ def _combine_topk_swa_indices_kernel(
         # min((pos+1)//compress_ratio, topk_tokens) valid entries. Caller
         # passes top_k=0 for SWA-only layers to zero this out.
         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, top_k)
-        swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+        if HAS_SWA_WIN:
+            # Per-query visible window (image spans), already in absolute
+            # sequence positions.
+            swa_len = tl.load(swa_win_lens_ptr + token_idx)
+            swa_start = tl.load(swa_win_starts_ptr + token_idx)
+        else:
+            swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+            swa_start = pos - swa_len + 1
 
         combined_row = token_idx.to(tl.int64) * combined_indices_stride
         topk_row = token_idx.to(tl.int64) * topk_indices_stride
@@ -97,13 +108,13 @@ def _combine_topk_swa_indices_kernel(
             mask=mask,
         )
 
-        offset = tl.arange(0, WINDOW_SIZE)
+        offset = tl.arange(0, SWA_BLOCK)
         # Workspace SWA index: swa_base[r] + (gather_offset_in_buffer).
-        # For positions [pos - swa_len + 1, pos], the buffer offsets are
-        # [pos - swa_len + 1 - gather_start, pos - gather_start].
+        # For positions [swa_start, swa_start + swa_len), the buffer offsets
+        # are [swa_start - gather_start, swa_start + swa_len - gather_start).
         tl.store(
             combined_indices_ptr + combined_row + topk_len + offset,
-            swa_base + offset + pos - swa_len + 1 - gather_start,
+            swa_base + offset + swa_start - gather_start,
             mask=offset < swa_len,
         )
 

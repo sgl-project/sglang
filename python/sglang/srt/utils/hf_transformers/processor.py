@@ -284,6 +284,17 @@ def get_processor(
                 revision=revision,
                 **kwargs,
             )
+        elif config.model_type == "deepseek_v4":
+            # DeepSeek-V4 (incl. the Vision variant) ships no HF processor;
+            # its mm processor only needs the tokenizer — image preprocessing
+            # is implemented inside sglang (multimodal/processors/deepseek_v4_vl.py).
+            processor = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
         else:
             if config.model_type in _CUSTOMIZED_MM_PROCESSOR:
                 processor = _CUSTOMIZED_MM_PROCESSOR[config.model_type].from_pretrained(

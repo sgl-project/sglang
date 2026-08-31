@@ -110,7 +110,12 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    TopK,
+    TopKOutputFormat,
+    per_token_biased_topk,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -501,6 +506,15 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = nn.Parameter(correction_bias)
         else:
             self.e_score_correction_bias = None
+        # DeepSeek-V4-Vision: image tokens are selected with bias_vl instead
+        # of the (text) correction bias. The checkpoint carries it on every
+        # MoE layer (hash and non-hash). Text-only configs never set
+        # vision_n_layers, so nothing changes for them.
+        self.bias_vl = (
+            nn.Parameter(torch.empty(config.n_routed_experts, dtype=torch.float32))
+            if getattr(config, "vision_n_layers", 0) > 0
+            else None
+        )
         if _is_cpu and _is_cpu_amx_available:
             self.quant_method = PackWeightMethod(weight_names=["weight"])
         self.use_dsa = is_deepseek_dsa(config)
@@ -680,6 +694,7 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 layer_id=self.layer_id,
+                bias_vl=self.gate.bias_vl,
             )
         else:
             # Default: grouped noaux_tc top-k. Covers V3/V3.2/GLM-5/Glm4MoeLite.
@@ -988,16 +1003,11 @@ class DeepseekV2MoE(nn.Module):
                 topk_config=self.topk.topk_config,
             )
         else:
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            topk_output = self.topk(
+            topk_output = self._forward_topk(
                 hidden_states,
                 router_logits,
+                input_ids=input_ids_global,
                 expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
             )
         deferred_finalize = (
             has_shared_output
@@ -1062,6 +1072,61 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states += shared_output
         return final_hidden_states
 
+    def _forward_topk(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """self.topk(...) plus the DeepSeek-V4-Vision bias_vl fallback.
+
+        Hash layers route via HashTopK (image-aware when built with bias_vl).
+        Non-hash layers: image tokens must be selected with gate.bias_vl
+        instead of the 1D correction bias the fused kernels take, so a batch
+        containing image tokens falls back to an eager per-token-bias top-k.
+        Text-only batches and non-vision models keep the fused path
+        bit-identical.
+        """
+        if getattr(self, "is_hash", False):
+            return self.topk(
+                hidden_states, router_logits, input_ids=input_ids, **kwargs
+            )
+        bias_vl = self.gate.bias_vl
+        if (
+            bias_vl is not None
+            and input_ids is not None
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # The .any() below syncs, which is illegal under CUDA graph
+            # capture. Capture only sees dummy (pad-free) input_ids, and image
+            # batches never replay graphs (prefill-with-image runs eager;
+            # decode input_ids never contain pad sentinels), so skipping the
+            # check during capture is exact.
+            from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+
+            image_mask = input_ids >= MM_PAD_SHIFT_VALUE
+            if image_mask.any():
+                correction_bias = self.gate.e_score_correction_bias
+                text_bias = (
+                    torch.zeros_like(bias_vl)
+                    if correction_bias is None
+                    else correction_bias.to(torch.float32)
+                )
+                per_token_bias = torch.where(
+                    image_mask.unsqueeze(1), bias_vl, text_bias
+                )
+                topk_output = per_token_biased_topk(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    per_token_correction_bias=per_token_bias,
+                    topk_config=self.topk.topk_config,
+                    layer_id=self.layer_id,
+                    **kwargs,
+                )
+                return self.topk._apply_waterfill(topk_output, hidden_states.shape[0])
+        return self.topk(hidden_states, router_logits, **kwargs)
+
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
@@ -1104,16 +1169,11 @@ class DeepseekV2MoE(nn.Module):
                 )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            topk_output = self.topk(
+            topk_output = self._forward_topk(
                 hidden_states,
                 router_logits,
+                input_ids=input_ids_global,
                 expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
             )
         else:
             pre_quant_input = None
@@ -1293,14 +1353,10 @@ class DeepseekV2MoE(nn.Module):
                         torch.cuda.current_stream().wait_event(shared_event)
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            topk_output = self.topk(
+            topk_output = self._forward_topk(
                 hidden_states,
                 router_logits,
+                input_ids=input_ids_global,
                 num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=(
                     ExpertLocationDispatchInfo.init_new(
@@ -1309,7 +1365,6 @@ class DeepseekV2MoE(nn.Module):
                     if not self.is_nextn
                     else None
                 ),
-                **topk_kwargs,
             )
         else:
             topk_output = self.topk.empty_topk_output(
@@ -1641,21 +1696,19 @@ class DeepseekV2MoE(nn.Module):
         router_logits = state.pop("router_logits")
         hidden_states = state.hidden_states_mlp_input
 
-        # Hash MoE layers (e.g. DeepSeek-V4) route on input_ids; forward_deepep
-        # passes them as a topk kwarg. The per-ubatch forward_batch.input_ids is
-        # already sliced+padded to match hidden_states rows (and equals the
-        # global ids under EP dp-attention). No-op for non-hash models.
-        topk_kwargs = {}
-        if getattr(self, "is_hash", False):
-            topk_kwargs["input_ids"] = state.forward_batch.input_ids
-
+        # Hash MoE layers (e.g. DeepSeek-V4) route on input_ids; _forward_topk
+        # passes them as a topk kwarg (and uses them for the bias_vl fallback
+        # on vision models). The per-ubatch forward_batch.input_ids is already
+        # sliced+padded to match hidden_states rows (and equals the global ids
+        # under EP dp-attention). No-op for non-hash models.
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
-                state.topk_output = self.topk(
+                state.topk_output = self._forward_topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
+                    input_ids=state.forward_batch.input_ids,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
                     expert_location_dispatch_info=(
                         ExpertLocationDispatchInfo.init_new(
@@ -1664,7 +1717,6 @@ class DeepseekV2MoE(nn.Module):
                         if not self.is_nextn
                         else None
                     ),
-                    **topk_kwargs,
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(

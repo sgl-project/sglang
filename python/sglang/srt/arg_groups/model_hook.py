@@ -594,6 +594,32 @@ def handle_model_capability_adjustments(server_args: Any):
     model_config = model_config_of(server_args)
     hf_config = model_config.hf_config
 
+    # DeepSeek-V4-Vision: the visible-window attention inside image spans
+    # assumes every image span is prefilled in a single extend with no
+    # prefix reuse (spans split by chunked prefill or partially hit by radix
+    # cache silently degrade to a causal window). Force both off so the
+    # assumption always holds.
+    is_dsv4_vision = (
+        "DeepseekV4ForCausalLM" in getattr(hf_config, "architectures", [])
+        and getattr(hf_config, "vision_n_layers", 0) > 0
+    )
+    if is_dsv4_vision:
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            chunked_prefill_size=-1,
+        )
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            disable_radix_cache=True,
+        )
+        logger.warning(
+            "DeepSeek-V4-Vision detected: forcing --chunked-prefill-size=-1 "
+            "and --disable-radix-cache (image-span visible-window attention "
+            "requires single-shot prefill without prefix reuse)."
+        )
+
     # HRM-Text needs bidirectional prompt attention (prefill), which only
     # the Triton backend honors at the kernel level. Radix/prefix reuse is
     # also unsafe: the recurrent forward writes direction-dependent KV
