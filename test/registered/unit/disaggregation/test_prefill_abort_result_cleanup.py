@@ -19,8 +19,8 @@ class _Req:
         self.kv = ReqKvInfo(
             req_pool_idx=1 if allocated else None,
             kv_allocated_len=1 if allocated else 0,
+            mamba_pool_idx=object() if allocated else None,
         )
-        self.mamba_pool_idx = object() if allocated else None
         self.metadata_buffer_index = 7 if allocated else -1
         self.pending_bootstrap = allocated
         self.disagg_kv_sender = Mock()
@@ -81,8 +81,8 @@ def _result():
 def _free_req(req, _tree_cache, *, is_insert):
     assert is_insert is False
     req.kv.req_pool_idx = None
-    req.kv.mark_released()
-    req.mamba_pool_idx = None
+    req.kv.mark_kv_released()
+    req.kv.mamba_pool_idx = None
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
@@ -170,14 +170,14 @@ def test_aborted_result_releases_mamba_allocated_before_kv():
     scheduler.tree_cache.supports_mamba.return_value = True
     scheduler.tree_cache.req_to_token_pool.mamba_allocator.free = Mock()
     req = _Req(inflight_middle_chunks=0, allocated=False)
-    req.mamba_pool_idx = torch.tensor([3])
+    req.kv.mamba_pool_idx = torch.tensor([3])
     req.to_finish = FINISH_ABORT()
     req.finished_reason = None
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
     scheduler.tree_cache.req_to_token_pool.mamba_allocator.free.assert_called_once()
-    assert req.mamba_pool_idx is None
+    assert req.kv.mamba_pool_idx is None
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
 
 

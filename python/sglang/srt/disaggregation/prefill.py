@@ -1038,9 +1038,7 @@ class SchedulerDisaggregationPrefillMixin:
         """Release an aborted request when its last prefill result is safe."""
         self.clear_pending_chunk_send(req)
         owns_resources = (
-            req.kv.is_held
-            or req.mamba_pool_idx is not None
-            or req.metadata_buffer_index >= 0
+            req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
         )
         if not owns_resources:
             # A bootstrap failure or earlier abort already retired it.
@@ -1061,7 +1059,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.pending_bootstrap = False
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
-        if req.kv.is_held or req.mamba_pool_idx is not None:
+        if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, is_insert=False)
         return True
 
