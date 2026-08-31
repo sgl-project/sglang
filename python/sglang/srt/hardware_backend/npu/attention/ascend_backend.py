@@ -1565,10 +1565,6 @@ class AscendAttnBackend(AttentionBackend):
                 cp_meta.actual_seq_q_prev_tensor,
                 cp_meta.actual_seq_q_next_tensor,
             )
-            actual_seq_lengths_kv = (
-                cp_meta.kv_len_prev_tensor,
-                cp_meta.kv_len_next_tensor,
-            )
             attn_out = self.do_cp_balance_attn(
                 q_nope,
                 k_nope,
