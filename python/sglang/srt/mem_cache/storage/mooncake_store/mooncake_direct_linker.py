@@ -274,6 +274,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 try:
                     ready_event.synchronize()
                     self.load_layer_wise(counter_index, list(pending.values()))
+                except BaseException as error:
+                    self.layer_done_counter.fail(counter_index, error)
+                    logger.exception("Mooncake layer-wise load batch failed")
                 finally:
                     self.completed_loads.put(list(pending))
             finally:
