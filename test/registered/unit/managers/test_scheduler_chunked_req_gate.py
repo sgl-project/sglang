@@ -34,11 +34,10 @@ def _make_req(
     req.output_ids = array("q")
     req.full_untruncated_fill_ids = array("q", fill_ids)
     req.prefix_indices = prefix_indices
-    req.req_pool_idx = req_pool_idx
     req.extend_range = Range(fill_len - extend_input_len, fill_len)
     req.inflight_middle_chunks = 0
     req.host_hit_length = 0
-    req.kv = ReqKvInfo()
+    req.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
     req.skip_radix_cache_insert = False
     req.last_node = None
     req.swa_uuid_for_lock = None

@@ -188,7 +188,7 @@ class DecodeReqToTokenPool:
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
-        reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
+        reusing = [i for i, r in enumerate(reqs) if r.kv.req_pool_idx is not None]
         assert (
             len(reusing) <= 1
         ), "only one chunked request may reuse req_pool_idx in a batch"
@@ -204,16 +204,16 @@ class DecodeReqToTokenPool:
         self.free_slots = self.free_slots[need_size:]
         offset = 0
         for r in reqs:
-            if r.req_pool_idx is None:
-                r.req_pool_idx = select_index[offset]
-                self.req_generation[r.req_pool_idx] += 1
+            if r.kv.req_pool_idx is None:
+                r.kv.req_pool_idx = select_index[offset]
+                self.req_generation[r.kv.req_pool_idx] += 1
                 offset += 1
-        return [r.req_pool_idx for r in reqs]
+        return [r.kv.req_pool_idx for r in reqs]
 
     def free(self, req: Req):
-        assert req.req_pool_idx is not None, "request must have req_pool_idx"
-        self.free_slots.append(req.req_pool_idx)
-        req.req_pool_idx = None
+        assert req.kv.req_pool_idx is not None, "request must have req_pool_idx"
+        self.free_slots.append(req.kv.req_pool_idx)
+        req.kv.req_pool_idx = None
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
@@ -1376,7 +1376,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx
+                    decode_req.req.kv.req_pool_idx
                 ][total_prefix_len:origin_input_len]
                 kv_indices = (
                     self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
@@ -1390,7 +1390,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return [
                     self.req_to_token_pool.translate_mamba_indices(
                         self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            decode_req.req.req_pool_idx
+                            decode_req.req.kv.req_pool_idx
                         ]
                     )
                     .cpu()
@@ -1402,7 +1402,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 window_start = max(total_prefix_len, seq_len - window_size)
                 window_start = page_align_floor(window_start, page_size)
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, window_start:seq_len
+                    decode_req.req.kv.req_pool_idx, window_start:seq_len
                 ]
                 window_kv_indices_swa = (
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -1413,7 +1413,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, :seq_len
+                    decode_req.req.kv.req_pool_idx, :seq_len
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
@@ -1426,7 +1426,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 window_size = self.token_to_kv_pool.unified_swa_window
                 window_start = max(0, seq_len - window_size)
                 positions = np.arange(window_start, seq_len, dtype=np.int64)
-                state_slot = int(decode_req.req.req_pool_idx)
+                state_slot = int(decode_req.req.kv.req_pool_idx)
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
@@ -1434,7 +1434,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 online = is_dsv4_c128_online_enabled()
                 ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
                 return get_dsv4_c128_state_indices(
-                    int(decode_req.req.req_pool_idx),
+                    int(decode_req.req.kv.req_pool_idx),
                     seq_len,
                     online=online,
                     ring_size=ring_size,
@@ -1446,7 +1446,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.token_to_kv_pool, "clear_c128_req_state", None
                 )
                 if clear_c128_state is not None:
-                    clear_c128_state(int(decode_req.req.req_pool_idx))
+                    clear_c128_state(int(decode_req.req.kv.req_pool_idx))
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
@@ -1465,7 +1465,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 payloads.update(
                     dsv4_state_payloads(
                         self.req_to_token_pool,
-                        decode_req.req.req_pool_idx,
+                        decode_req.req.kv.req_pool_idx,
                         seq_len,
                         self.token_to_kv_pool_allocator.page_size,
                         prefix_len=total_prefix_len,
@@ -1494,7 +1494,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # the C4 sparse physical-slot mapping; carry their logical page IDs
                 # alongside the independently allocated C4 host page IDs.
                 full_kv_indices = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx,
+                    decode_req.req.kv.req_pool_idx,
                     prefix_len:origin_input_len,
                 ]
                 device_page_indices = kv_to_page_indices(
@@ -1787,7 +1787,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         if prefix_len > 0:
             self.req_to_token_pool.write(
-                (req.req_pool_idx, slice(0, prefix_len)), prefix_indices
+                (req.kv.req_pool_idx, slice(0, prefix_len)), prefix_indices
             )
 
         # TODO(retraction): when retraction is implemented with radix cache
@@ -1842,7 +1842,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
                 coordinator.req_to_host_pool,
                 coordinator.req_to_host_pool_allocated_len,
-                req.req_pool_idx,
+                req.kv.req_pool_idx,
                 0,
                 coordinator.host_token_len(fill_len),
             )
@@ -1872,7 +1872,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         self.req_to_token_pool.write(
             (
-                req.req_pool_idx,
+                req.kv.req_pool_idx,
                 slice(total_prefix_len, total_prefix_len + len(kv_loc)),
             ),
             kv_loc,

@@ -719,7 +719,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             full_token_ids=[11, 12, 13],
             prefix_slot_ids=[2, 3],
             new_slot_ids=[4],
-            req_pool_idx=req.req_pool_idx,
+            req_pool_idx=req.kv.req_pool_idx,
         )
         runner.eval_pending(pending)
         runner.prefill_finalize(pending)
@@ -775,7 +775,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             full_token_ids=token_ids,
             prefix_slot_ids=[],
             new_slot_ids=list(range(1, 71)),
-            req_pool_idx=req.req_pool_idx,
+            req_pool_idx=req.kv.req_pool_idx,
             req=req,
         )
         runner.eval_pending(pending)
@@ -837,7 +837,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             full_token_ids=token_ids,
             prefix_slot_ids=list(range(1, 65)),
             new_slot_ids=list(range(65, 258)),
-            req_pool_idx=req.req_pool_idx,
+            req_pool_idx=req.kv.req_pool_idx,
             req=req,
         )
         runner.eval_pending(pending)
@@ -917,7 +917,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req = FakeRequest()
 
         req_indices = pool.alloc([req])
-        auxiliary_state_idx = pool.get_auxiliary_state_indices(req.req_pool_idx)
+        auxiliary_state_idx = pool.get_auxiliary_state_indices(req.kv.req_pool_idx)
         pool.free(req)
 
         # Which free slot a fresh alloc gets is not semantically meaningful
@@ -925,7 +925,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(len(req_indices), 1)
         self.assertIn(req_indices[0], range(1, pool.size + 1))
         self.assertIsNotNone(auxiliary_state_idx)
-        self.assertIsNone(req.req_pool_idx)
+        self.assertIsNone(req.kv.req_pool_idx)
         self.assertIsNotNone(req.mamba_pool_idx)
         self.assertIs(pool.mamba_allocator, pool.mamba_pool)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
@@ -1518,7 +1518,7 @@ if _HAS_MLX:
 
     class FakeRequest:
         def __init__(self):
-            self.req_pool_idx = None
+            self.kv = SimpleNamespace(req_pool_idx=None)
             self.mamba_pool_idx = None
             self.inflight_middle_chunks = 0
 

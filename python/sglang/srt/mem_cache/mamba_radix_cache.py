@@ -548,7 +548,7 @@ class MambaRadixCache(BasePrefixCache):
         """Cache request when it finishes."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_len_to_handle
+                req.kv.req_pool_idx, :kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
             self.req_to_token_pool.free_mamba_cache(req)
@@ -556,7 +556,7 @@ class MambaRadixCache(BasePrefixCache):
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_len_to_handle
+            req.kv.req_pool_idx, :kv_len_to_handle
         ]
 
         if is_insert:
@@ -676,7 +676,7 @@ class MambaRadixCache(BasePrefixCache):
 
         def _skip_cache_unfinished_req(req: Req) -> None:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.extend_range.end
+                req.kv.req_pool_idx, : req.extend_range.end
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
@@ -693,7 +693,7 @@ class MambaRadixCache(BasePrefixCache):
             return _skip_cache_unfinished_req(req)
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, : len(token_ids)
         ]
         # kv_indices is the kv indices to be cached
         kv_indices = kv_indices_orig[:cache_len]
@@ -786,7 +786,7 @@ class MambaRadixCache(BasePrefixCache):
         ), f"{new_prefix_len=}, {len(new_indices)=}"
 
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
+            (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
         )
 

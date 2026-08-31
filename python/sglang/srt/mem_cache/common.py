@@ -62,7 +62,7 @@ def free_swa_out_of_window_slots(
     is_chunk_cache: bool = False,
     retain_floor: int | None = None,
 ) -> None:
-    if not req.is_holding_kv:
+    if not req.kv.is_held:
         return
 
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
@@ -99,7 +99,7 @@ def free_swa_out_of_window_slots(
 
     if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
         free_slots = req_to_token_pool.req_to_token[
-            req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
+            req.kv.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
         token_to_kv_pool_allocator.free_swa(free_slots)
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
@@ -199,9 +199,9 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-    assert (not req.is_holding_kv) == req.kv.is_released
+    assert (not req.kv.is_held) == req.kv.is_released
     # MambaRadixCache may alloc mamba state before alloc KV cache
-    if not req.is_holding_kv:
+    if not req.kv.is_held:
         assert (
             tree_cache.supports_mamba()
         ), "Only MambaRadixCache allow freeing before alloc"
@@ -222,8 +222,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     # StreamingSession.cache_finished_req handles speculative tail trim
     # internally, then sets req_pool_idx = None.
-    assert (not req.is_holding_kv) == req.kv.is_released
-    if not req.is_holding_kv:
+    assert (not req.kv.is_held) == req.kv.is_released
+    if not req.kv.is_held:
         return
 
     start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
@@ -261,9 +261,9 @@ def _release_overallocated_kv_indices(
         start_p = ceil_align(start_p, page_size)
 
     if start_p < end_p:
-        indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
-            start_p:end_p
-        ]
+        indices_to_free = tree_cache.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx
+        ][start_p:end_p]
         # start_p is aligned to the allocator's physical page size above, so it
         # never shares a page with cache_finished_req's tail free in this group.
         allocator.free_segment(indices_to_free, start_pos=start_p)
