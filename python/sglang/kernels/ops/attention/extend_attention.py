@@ -857,6 +857,18 @@ def extend_attention_fwd(
     stride_lse_bs = lse_extend.stride(0) if STORE_LSE else 0
     stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
 
+    _long_extend_num_stages = 1
+    if (
+        _is_hip
+        and BLOCK_M == 128
+        and BLOCK_N == 64
+        and num_warps == 8
+        and (sliding_window_size is None or sliding_window_size <= 0)
+        and max_len_extend >= 8192
+    ):
+        BLOCK_M = 256
+        _long_extend_num_stages = 2
+
     # Compact grid: AMD/HIP-only optimization (parity with flash-attn's ragged-aware
     # launch). Explicitly check _is_hip and allow env var override.
     use_compact_tile_grid = (
@@ -877,7 +889,7 @@ def extend_attention_fwd(
         grid = (compact_q_tiles, head_num)
     else:
         grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
+    num_stages = _long_extend_num_stages
 
     extra_kargs = {}
     if _is_hip:
