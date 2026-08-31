@@ -587,6 +587,14 @@ def handle_deterministic_inference(server_args: Any):
                     "implements on those archs."
                 )
 
+        if attention_backend == "dsv4" and get_platform().is_sm120:
+            raise ValueError(
+                "Deterministic inference on the dsv4 attention backend requires "
+                "SM90 or SM100: the SM120 kernel is an autotuned Triton kernel "
+                "whose tile size, and with it the softmax rescaling order, is "
+                "picked from measured timings."
+            )
+
         if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
             # Currently, only certain backends support radix cache. Support for other backends is in progress
             declare_resolution(

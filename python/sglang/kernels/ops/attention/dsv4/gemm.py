@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var, is_hip
 
@@ -147,6 +148,11 @@ def linear_bf16_fp32(
     *,
     hpc_kernel_min_m: Optional[int] = None,
 ) -> torch.Tensor:
+    if is_batch_invariant_mode_enabled():
+        # cuBLAS goes through torch.mm, which the batch-invariant library
+        # overrides. The aiter, HPC-Ops and DeepGEMM paths do not, and the
+        # HPC-Ops one additionally dispatches on the row count.
+        return _linear_bf16_fp32_cublas(x, y)
     if _use_aiter and y.dtype == torch.bfloat16:
         return tgemm.mm(x, y, otype=x.dtype).float()
     elif hpc_kernel_min_m is not None:
