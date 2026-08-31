@@ -171,12 +171,12 @@ class DecodeStagingHandler:
         # exact only when the prefix is page-aligned. Fail just this request on a
         # mismatch instead of raising, which would kill the prefill scheduler.
         page_size = self.kv_buffer_info["page_size"]
-        if decode_req.req.cache_protected_len % page_size != 0:
+        if decode_req.req.kv.cache_protected_len % page_size != 0:
             logger.error(
                 "[STAGING] decode prefix length %s is not page-aligned "
                 "(page_size=%s); failing room=%s (staging scatter offsets "
                 "would be wrong).",
-                decode_req.req.cache_protected_len,
+                decode_req.req.kv.cache_protected_len,
                 page_size,
                 room,
             )
@@ -411,10 +411,10 @@ class DecodeStagingHandler:
 
         staging_view = self.staging_allocator.buffer.buffer[staging_offset:]
 
-        req_pool_idx = decode_req.req.req_pool_idx
+        req_pool_idx = decode_req.req.kv.req_pool_idx
         # page_start is suffix-relative (pages after the decode-side cached
         # prefix); req_to_token rows are absolute.
-        prefix_tokens = decode_req.req.cache_protected_len
+        prefix_tokens = decode_req.req.kv.cache_protected_len
         token_start = prefix_tokens + page_start * page_size
         token_end = token_start + num_pages * page_size
         prefill_tp = receiver.prefill_info.attn_tp_size

@@ -15,15 +15,15 @@
 
 Covers, CPU-only (pure torch — no GPU / Triton kernels):
   - `MLASubPoolSpec` byte math;
-  - `build_dense_mla_views` addressing: view_l[dense(t)] must land exactly at
+  - `build_mla_views` addressing: view_l[kernel_id(t)] must land exactly at
     the page-major envelope byte offset `p*(L*ps*D) + l*(ps*D) + s*D`, the
-    overlapping per-layer views must not alias at equal dense ids, and the
+    overlapping per-layer views must not alias at equal kernel-facing ids, and the
     missing-tail-pad case must fail loud;
   - `UnifiedKVPool` MLA plumbing: `view_tail_pad_bytes` extends the allocation
     only, and the reserved sink floor covers the whole page-0 envelope;
   - `UnifiedMLATokenToKVPool`: buffer wiring, V-as-prefix-slice, and the
     page-envelope `move_kv_cache` (REAL physical token ids, page-major runs);
-  - `MultiEndedAllocator.translate_kv_loc_dense`: dense = v2p-page * (ps*L) +
+  - `MultiEndedAllocator.translate_kv_loc_for_kernel`: dense = v2p-page * (ps*L) +
     offset, tombstone clamp to the sink, `out=` contract, multiplier-1
     fallback, and correctness across eager compaction.
 
@@ -42,7 +42,7 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.layout.page_major import (
-    build_dense_mla_views,
+    build_mla_views,
     mla_entry_bytes,
 )
 from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
@@ -98,12 +98,11 @@ def _make_unified(page_size=1, n_full_tokens=64, n_mamba_slots=8):
         device=_DEV,
         enable_memory_saver=False,
         page_size=page_size,
-        view_tail_pad_bytes=page_size * full.entry_bytes(),
     )
     return pool, full, mamba
 
 
-def _dense(t, ps, layer_num):
+def _kernel_id(t, ps, layer_num):
     return (t // ps) * (ps * layer_num) + t % ps
 
 
@@ -142,7 +141,7 @@ class TestDenseMLAViews(unittest.TestCase):
         for ps in (1, 4):
             num_pages = 6
             raw, _ = self._make_raw(ps, num_pages)
-            views = build_dense_mla_views(
+            views = build_mla_views(
                 raw,
                 layer_num=_L,
                 kv_cache_dim=_D,
@@ -151,9 +150,9 @@ class TestDenseMLAViews(unittest.TestCase):
                 num_pages=num_pages,
             )
             self.assertEqual(len(views), _L)
-            n_dense = num_pages * _L * ps
+            n_rows = num_pages * _L * ps
             for v in views:
-                self.assertEqual(tuple(v.shape), (n_dense, 1, _D))
+                self.assertEqual(tuple(v.shape), (n_rows, 1, _D))
                 # contiguous in the (row, dim) sense — .view(-1, ps, D) legality
                 self.assertEqual(v.stride(0), _D)
                 self.assertEqual(v.stride(2), 1)
@@ -161,7 +160,7 @@ class TestDenseMLAViews(unittest.TestCase):
             for p, l, s in [(0, 0, 0), (1, 2, ps - 1), (4, 1, ps // 2), (5, 2, 0)]:
                 t = p * ps + s
                 marker = float(p * 100 + l * 10 + s + 1)
-                views[l][_dense(t, ps, _L)] = marker
+                views[l][_kernel_id(t, ps, _L)] = marker
                 # envelope formula, in elements
                 elem = p * (_L * ps * _D) + l * (ps * _D) + s * _D
                 self.assertTrue(
@@ -173,7 +172,7 @@ class TestDenseMLAViews(unittest.TestCase):
         ps = 4
         num_pages = 4
         raw, _ = self._make_raw(ps, num_pages)
-        views = build_dense_mla_views(
+        views = build_mla_views(
             raw,
             layer_num=_L,
             kv_cache_dim=_D,
@@ -182,7 +181,7 @@ class TestDenseMLAViews(unittest.TestCase):
             num_pages=num_pages,
         )
         t = 2 * ps + 1  # page 2, slot 1
-        d = _dense(t, ps, _L)
+        d = _kernel_id(t, ps, _L)
         for l in range(_L):
             views[l][d] = float(l + 1)
         for l in range(_L):
@@ -193,7 +192,7 @@ class TestDenseMLAViews(unittest.TestCase):
         num_pages = 4
         raw, _ = self._make_raw(ps, num_pages, pad_pages=0)
         with self.assertRaises(AssertionError):
-            build_dense_mla_views(
+            build_mla_views(
                 raw,
                 layer_num=_L,
                 kv_cache_dim=_D,
@@ -279,7 +278,7 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
         # write through the views at src, expect it at dst after the move
         for l in range(_L):
             for s in range(ps):
-                kv_pool.kv_buffer[l][_dense(src_page * ps + s, ps, _L)] = float(
+                kv_pool.kv_buffer[l][_kernel_id(src_page * ps + s, ps, _L)] = float(
                     l * ps + s + 1
                 )
         offsets = torch.arange(ps, dtype=torch.int64)
@@ -289,7 +288,7 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
         )
         for l in range(_L):
             for s in range(ps):
-                got = kv_pool.kv_buffer[l][_dense(dst_page * ps + s, ps, _L)]
+                got = kv_pool.kv_buffer[l][_kernel_id(dst_page * ps + s, ps, _L)]
                 self.assertTrue(
                     torch.all(got == float(l * ps + s + 1)), f"(l={l}, s={s})"
                 )
@@ -331,7 +330,7 @@ class TestTranslateKvLocDense(unittest.TestCase):
         v = alloc.alloc(8)
         self.assertIsNotNone(v)
         phys = alloc.translate_kv_loc(v)
-        dense = alloc.translate_kv_loc_dense(v)
+        dense = alloc.translate_kv_loc_for_kernel(v)
         self.assertTrue(torch.all(dense == phys * _L))
 
     def test_dense_matches_formula_paged(self):
@@ -340,15 +339,15 @@ class TestTranslateKvLocDense(unittest.TestCase):
         v = alloc.alloc(3 * ps)
         self.assertIsNotNone(v)
         phys = alloc.translate_kv_loc(v)
-        dense = alloc.translate_kv_loc_dense(v)
+        dense = alloc.translate_kv_loc_for_kernel(v)
         expected = (phys // ps) * (ps * _L) + phys % ps
         self.assertTrue(torch.all(dense == expected))
 
     def test_tombstone_clamps_to_sink(self):
         alloc = self._build(ps=1)
-        # never-allocated virtual ids -> v2p == -1 -> dense id 0
+        # never-allocated virtual ids -> v2p == -1 -> kernel-facing id 0
         virt = torch.tensor([alloc.min_slot_index + 1], dtype=torch.int64)
-        dense = alloc.translate_kv_loc_dense(virt)
+        dense = alloc.translate_kv_loc_for_kernel(virt)
         self.assertTrue(torch.all(dense == 0))
 
     def test_out_matches_and_aliases(self):
@@ -356,14 +355,14 @@ class TestTranslateKvLocDense(unittest.TestCase):
             alloc = self._build(ps=ps)
             v = alloc.alloc(2 * ps)
             self.assertIsNotNone(v)
-            no_out = alloc.translate_kv_loc_dense(v)
+            no_out = alloc.translate_kv_loc_for_kernel(v)
             out = torch.empty_like(v)
-            ret = alloc.translate_kv_loc_dense(v, out=out)
+            ret = alloc.translate_kv_loc_for_kernel(v, out=out)
             self.assertIs(ret, out)
             self.assertTrue(torch.all(out == no_out))
             # canonical in-place aliasing: translate(x, out=x)
             x = v.clone()
-            alloc.translate_kv_loc_dense(x, out=x)
+            alloc.translate_kv_loc_for_kernel(x, out=x)
             self.assertTrue(torch.all(x == no_out))
 
     def test_multiplier_one_falls_back_to_physical(self):
@@ -371,7 +370,7 @@ class TestTranslateKvLocDense(unittest.TestCase):
         v = alloc.alloc(4)
         self.assertIsNotNone(v)
         self.assertTrue(
-            torch.all(alloc.translate_kv_loc_dense(v) == alloc.translate_kv_loc(v))
+            torch.all(alloc.translate_kv_loc_for_kernel(v) == alloc.translate_kv_loc(v))
         )
 
     def test_dense_follows_compaction(self):
@@ -383,8 +382,8 @@ class TestTranslateKvLocDense(unittest.TestCase):
         alloc.free(b)  # eager compaction relocates survivors
         phys_a = alloc.translate_kv_loc(a)
         phys_c = alloc.translate_kv_loc(c)
-        self.assertTrue(torch.all(alloc.translate_kv_loc_dense(a) == phys_a * _L))
-        self.assertTrue(torch.all(alloc.translate_kv_loc_dense(c) == phys_c * _L))
+        self.assertTrue(torch.all(alloc.translate_kv_loc_for_kernel(a) == phys_a * _L))
+        self.assertTrue(torch.all(alloc.translate_kv_loc_for_kernel(c) == phys_c * _L))
 
 
 if __name__ == "__main__":
