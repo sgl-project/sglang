@@ -639,6 +639,64 @@ async fn prefix_fast_path_matches_default_impl() {
 }
 
 #[tokio::test]
+async fn prefix_fast_path_returns_worker_depths_with_uncached_suffix() {
+    let (fast, reference) = shared_state_pair();
+    fast.apply_external_kv_batch(report("w-long", "10.0.0.1:1", 1, &[1, 2, 3]))
+        .await
+        .unwrap();
+    fast.apply_external_kv_batch(report("w-short", "10.0.0.2:1", 1, &[1, 2]))
+        .await
+        .unwrap();
+
+    // Blocks 4 and 5 are the newly appended turn and are not cached anywhere.
+    // They must cap the maximum prefix without disabling the known-prefix path.
+    let query = [1, 2, 3, 4, 5];
+    let fast_response = fast
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+    let reference_response = reference
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        prefix_pairs(&fast_response),
+        prefix_pairs(&reference_response)
+    );
+    assert_eq!(
+        prefix_pairs(&fast_response),
+        vec![("w-long".to_string(), 3), ("w-short".to_string(), 2)]
+    );
+}
+
+#[tokio::test]
+async fn prefix_fast_path_falls_back_on_existing_parent_conflict() {
+    let (fast, reference) = shared_state_pair();
+    fast.apply_external_kv_batch(report("w1", "10.0.0.1:1", 1, &[1, 2]))
+        .await
+        .unwrap();
+    // Hash 9 is an independent root, not a child of hash 1.
+    fast.apply_external_kv_batch(report("w1", "10.0.0.1:1", 2, &[9]))
+        .await
+        .unwrap();
+
+    let query = [1, 9];
+    let fast_response = fast
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+    let reference_response = reference
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+    assert_eq!(
+        prefix_pairs(&fast_response),
+        prefix_pairs(&reference_response)
+    );
+}
+
+#[tokio::test]
 async fn prefix_first_block_miss_reads_one_block() {
     let b = backend();
     // No worker holds the first queried block; the scan stops after one read.

@@ -362,8 +362,8 @@ impl InMemoryKvIndexerBackend {
                 blocks_read: 1,
             });
         };
-        let chain_is_known = request_matches_chain(&state, hashes);
-        let fast_worker_ids: HashSet<&str> = if chain_is_known {
+        let known_prefix_len = known_request_prefix_len(&state, hashes).unwrap_or(0);
+        let fast_worker_ids: HashSet<&str> = if known_prefix_len > 0 {
             first
                 .prefix_complete_workers
                 .iter()
@@ -411,7 +411,7 @@ impl InMemoryKvIndexerBackend {
             .collect();
         let mut entries = Vec::with_capacity(fast_worker_ids.len() + candidates.len());
         let mut unresolved = fast_worker_ids;
-        for (index, hash) in hashes.iter().enumerate().rev() {
+        for (index, hash) in hashes[..known_prefix_len].iter().enumerate().rev() {
             if unresolved.is_empty() {
                 break;
             }
@@ -617,18 +617,26 @@ fn recompute_worker_subtrees(
     }
 }
 
-fn request_matches_chain(state: &State, hashes: &[i64]) -> bool {
-    hashes.iter().enumerate().all(|(index, hash)| {
+/// Returns the length of the longest leading request chain already known to the
+/// Indexer. A missing block starts the normal uncached suffix; a present block
+/// with the wrong parent is a chain conflict and disables the derived fast path.
+fn known_request_prefix_len(state: &State, hashes: &[i64]) -> Option<usize> {
+    let mut known = 0;
+    for (index, hash) in hashes.iter().enumerate() {
         let expected = if index == 0 {
             ParentLink::Root
         } else {
             ParentLink::Hash(hashes[index - 1])
         };
-        state
-            .blocks
-            .get(hash)
-            .is_some_and(|block| block.parent == expected)
-    })
+        let Some(block) = state.blocks.get(hash) else {
+            break;
+        };
+        if block.parent != expected {
+            return None;
+        }
+        known += 1;
+    }
+    Some(known)
 }
 
 fn revoke_one(state: &mut State, worker_id: &str, hash: &i64, tier: i32) {
@@ -761,5 +769,15 @@ mod tests {
             .unwrap();
         drop(read_guard);
         query.join().unwrap();
+    }
+
+    #[test]
+    fn known_request_prefix_stops_at_uncached_suffix_and_rejects_conflicts() {
+        let mut state = State::default();
+        link_report_chain(&mut state, None, &[1, 2, 3]).unwrap();
+        link_report_chain(&mut state, None, &[9]).unwrap();
+
+        assert_eq!(known_request_prefix_len(&state, &[1, 2, 3, 4, 5]), Some(3));
+        assert_eq!(known_request_prefix_len(&state, &[1, 9]), None);
     }
 }
