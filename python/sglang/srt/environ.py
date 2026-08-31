@@ -1239,6 +1239,9 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # Opt-in: release image feature tensors once their token spans enter the
+    # KV cache instead of retaining them until request completion.
+    SGLANG_ENABLE_MM_RELEASE_AT_CONSUMPTION = EnvBool(False)
 
     # ===================================================================
     # Multimodal CUDA IPC transport

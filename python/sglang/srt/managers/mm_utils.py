@@ -624,6 +624,46 @@ def _embed_mm_inputs_with_split(
     return input_embeds, other_info
 
 
+def _is_releasable_feature(feature) -> bool:
+    if isinstance(feature, torch.Tensor):
+        return True
+    return (
+        isinstance(feature, (list, tuple))
+        and bool(feature)
+        and all(isinstance(tensor, torch.Tensor) for tensor in feature)
+    )
+
+
+def should_release_mm_features(server_args) -> bool:
+    """Requires radix caching (retract re-prefill reads the retained prompt
+    KV) and pp_size==1 (only the first PP stage releases)."""
+    if not envs.SGLANG_ENABLE_MM_RELEASE_AT_CONSUMPTION.get():
+        return False
+    if getattr(server_args, "pp_size", 1) != 1:
+        return False
+    return not getattr(server_args, "disable_radix_cache", False)
+
+
+def release_consumed_mm_features(
+    mm_inputs_list: List[MultimodalInputs],
+    extend_prefix_lens: List[int],
+    extend_seq_lens: List[int],
+) -> None:
+    """Release image features fully covered by this extend chunk."""
+    for mm_inputs, prefix_len, seq_len in zip(
+        mm_inputs_list, extend_prefix_lens, extend_seq_lens, strict=True
+    ):
+        chunk_end = prefix_len + seq_len
+        for item in mm_inputs.mm_items:
+            if (
+                item.is_image()
+                and _is_releasable_feature(item.feature)
+                and item.offsets
+                and all(end < chunk_end for _, end in item.offsets)
+            ):
+                item.release_feature(consumed=True)
+
+
 def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -713,6 +753,10 @@ def general_mm_embed_routine(
             # best-effort, offloading to CPU ensures we have a reliable fallback
             # if a cache miss occurs in subsequent chunks, while still freeing up
             # critical GPU memory.
+            if mm_inputs_list and should_release_mm_features(server_args):
+                release_consumed_mm_features(
+                    mm_inputs_list, extend_prefix_lens, extend_seq_lens
+                )
             if mm_inputs_list:
                 for mm_input_obj in mm_inputs_list:
                     if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
@@ -1327,28 +1371,37 @@ class ShmPointerMMData:
         self.dtype = state["dtype"]
         self.precomputed_hash = state.get("precomputed_hash")
         self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
-        # Zero-copy view into shared memory (no clone, no unlink)
         self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
             self.shape
         )
+        self.tensor.untyped_storage()._shm_keepalive = self._shm_handle
 
     def materialize(self) -> torch.Tensor:
         """Clone tensor from shm to owned memory, then release shm handle."""
         tensor = self.tensor.clone()
         if self._shm_handle is not None:
-            self._shm_handle.close()
             try:
                 self._shm_handle.unlink()
             except FileNotFoundError:
                 pass  # Another rank already unlinked
             self._shm_handle = None
+        self.tensor = None
         return tensor
 
+    def release(self) -> None:
+        """Unlink the receiver segment without invalidating live tensor views."""
+        handle = getattr(self, "_shm_handle", None)
+        self.tensor = None
+        self._shm_handle = None
+        if handle is None:
+            return
+        try:
+            handle.unlink()
+        except FileNotFoundError:
+            pass  # Another rank already unlinked
+
     def __del__(self):
-        # Only close; never unlink. Unlinking is materialize()'s job.
-        if getattr(self, "_shm_handle", None) is not None:
-            self._shm_handle.close()
-            self._shm_handle = None
+        self.release()
 
 
 def _get_is_default_transport():

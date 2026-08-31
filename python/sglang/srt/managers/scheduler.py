@@ -2989,6 +2989,9 @@ class Scheduler(
             req_to_abort,
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        # Session requests share mm_inputs with later turns; never release those.
+        if req_to_abort.multimodal_inputs is not None and not req_to_abort.session:
+            req_to_abort.multimodal_inputs.release_features()
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
@@ -3014,6 +3017,8 @@ class Scheduler(
                     ),
                     req,
                 )
+                if req.multimodal_inputs is not None and not req.session:
+                    req.multimodal_inputs.release_features()
                 deleted_reqs.add(req)
                 self.beam_coordinator.retire_group(req)
 
@@ -3021,6 +3026,40 @@ class Scheduler(
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in deleted_reqs
             ]
+
+    def _abort_mm_req_with_released_features(self, req: Req) -> None:
+        """Abort a waiting request that can no longer re-encode MM features."""
+        if (
+            req.kv is not None
+            and req.kv.holds_mamba
+            and self.disaggregation_mode != DisaggregationMode.DECODE
+        ):
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+        elif self.enable_hierarchical_cache:
+            self.tree_cache.terminate_prefetch(req.rid)
+        if req.multimodal_inputs is not None and not req.session:
+            req.multimodal_inputs.release_features()
+        self.beam_coordinator.retire_group(req)
+        message = (
+            "Multimodal features for this request were released after prefill "
+            "and its cached KV prefix was evicted after retraction/preemption, "
+            "so it cannot be re-encoded. Please retry the request."
+        )
+        logger.warning("Aborting request %s: %s", req.rid, message)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            _make_abort_req(
+                req,
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": message,
+                },
+            ),
+            req,
+        )
+        req.time_stats.trace_ctx.abort(abort_info={"reason": message})
 
     def handle_embedding_request(
         self,
@@ -3504,6 +3543,7 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
+        mm_released_abort_reqs: List[Req] = []
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
@@ -3561,6 +3601,17 @@ class Scheduler(
                 if held_tokens > 0:
                     req.host_hit_length = held_tokens
                     req.swa_host_hit_length = held_swa_tokens
+
+            if (
+                req.multimodal_inputs is not None
+                and req.multimodal_inputs.has_released_items_beyond_prefix(
+                    len(req.prefix_indices) + req.host_hit_length
+                )
+            ):
+                self._abort_mm_req_with_released_features(req)
+                mm_released_abort_reqs.append(req)
+                continue
+
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3598,6 +3649,10 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+
+        if mm_released_abort_reqs:
+            aborted_set = set(mm_released_abort_reqs)
+            self.waiting_queue = [x for x in self.waiting_queue if x not in aborted_set]
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -4865,6 +4920,8 @@ class Scheduler(
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
+            if req.multimodal_inputs is not None and not req.session:
+                req.multimodal_inputs.release_features()
             logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:
