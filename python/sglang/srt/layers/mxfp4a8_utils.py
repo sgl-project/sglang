@@ -443,7 +443,7 @@ def silu_and_mul_quant_and_build_scale_fused(
 
     x_fp8 = torch.empty(m, n, dtype=torch.float8_e4m3fn, device=device)
     as_packed = torch.zeros(total, dtype=torch.bfloat16, device=device)
-    as_strides = torch.stack([m_pads, m_pads], dim=1).contiguous()
+    as_strides = torch.stack([m_pads, estart // nblk], dim=1).contiguous()
     if m == 0:
         return x_fp8, as_packed, as_strides
 
@@ -572,8 +572,13 @@ def _build_grouped_act_block_scale_compact(
         if blocks
         else torch.zeros(0, dtype=torch.bfloat16, device=device)
     )
+    prefixes = []
+    cur = 0
+    for m_pad in m_pads:
+        prefixes.append(cur)
+        cur += int(m_pad)
     as_strides = torch.tensor(
-        [[m_pads[e]] * 2 for e in range(num_experts)],
+        [[int(m_pads[e]), int(prefixes[e])] for e in range(num_experts)],
         dtype=torch.int64,
         device=device,
     )
@@ -672,7 +677,7 @@ def _build_grouped_act_block_scale_compact_device(
             A=A,
             BLKN=BLKN,
         )
-    as_strides = torch.stack([m_pads, m_pads], dim=1).contiguous()
+    as_strides = torch.stack([m_pads, estart // nblk], dim=1).contiguous()
     return as_packed, as_strides
 
 
@@ -760,7 +765,7 @@ def quantize_activation_and_build_scale_fused(
 
     x_fp8 = torch.empty(m, k, dtype=torch.float8_e4m3fn, device=device)
     as_packed = torch.zeros(total, dtype=torch.bfloat16, device=device)
-    as_strides = torch.stack([m_pads, m_pads], dim=1).contiguous()
+    as_strides = torch.stack([m_pads, estart // nblk], dim=1).contiguous()
     if m == 0:
         return x_fp8, as_packed, as_strides
 
@@ -837,12 +842,11 @@ def _build_grouped_act_block_scale_capture_safe(
         .contiguous()
     )
     as_packed = packed.reshape(-1).contiguous()
-    as_strides = torch.full(
-        (num_experts, 2),
-        m_stride,
-        dtype=torch.int64,
-        device=device,
-    )
+    expert_prefix = torch.arange(num_experts, dtype=torch.int64, device=device) * m_stride
+    as_strides = torch.stack(
+        [torch.full((num_experts,), m_stride, dtype=torch.int64, device=device), expert_prefix],
+        dim=1,
+    ).contiguous()
     return as_packed, as_strides
 
 

@@ -170,11 +170,65 @@ class Mxfp4CutlassMoEMethod:
         The checkpoint's native ``[gate; up]`` order already matches the kernel,
         so no de-interleave is needed.
         """
+        source_versions = (
+            layer.w13_weight._version,
+            layer.w2_weight._version,
+            layer.w13_weight_scale_inv._version,
+            layer.w2_weight_scale_inv._version,
+        )
+        if getattr(layer, "_cutlass_mxfp4_source_versions", None) == source_versions:
+            return
+
+        from flashinfer.fused_moe import (
+            preprocess_moe_weights_for_sm90_mixed_gemm_humming,
+        )
         from sglang.srt.layers.mxfp4a8_utils import repack_hf_mxfp4_to_kernel
         from sglang.srt.layers.quantization.marlin_utils_fp4 import (
             _normalize_scale_tensor,
         )
         from sglang.srt.layers.quantization.w4afp8 import interleave_scales
+
+        def _raw_e8m0_bytes(scale: torch.Tensor) -> torch.Tensor:
+            if scale.dtype == torch.float8_e8m0fnu:
+                return scale.view(torch.uint8).contiguous()
+            if scale.dtype == torch.uint8:
+                return scale.contiguous()
+            if scale.dtype == torch.int8:
+                return scale.view(torch.uint8).contiguous()
+            return scale.to(torch.float8_e8m0fnu).view(torch.uint8).contiguous()
+
+        # Build the fused MXFP4A8 assets from the untouched checkpoint tensors.  The
+        # legacy CUTLASS tensors below remain registered for the EP fallback.
+        w13_fused, w13_offset, w13_residual = (
+            preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+                layer.w13_weight.data.view(torch.uint8),
+                _raw_e8m0_bytes(layer.w13_weight_scale_inv.data),
+            )
+        )
+        w2_fused, w2_offset, w2_residual = (
+            preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+                layer.w2_weight.data.view(torch.uint8),
+                _raw_e8m0_bytes(layer.w2_weight_scale_inv.data),
+            )
+        )
+        layer.w13_weight_fused = Parameter(
+            w13_fused.view(torch.int8).contiguous(), requires_grad=False
+        )
+        layer.w2_weight_fused = Parameter(
+            w2_fused.view(torch.int8).contiguous(), requires_grad=False
+        )
+        layer.w13_weight_scale_fused = Parameter(
+            w13_offset.contiguous(), requires_grad=False
+        )
+        layer.w2_weight_scale_fused = Parameter(
+            w2_offset.contiguous(), requires_grad=False
+        )
+        layer.w13_weight_residual_fused = Parameter(
+            (w13_residual * 64.0).contiguous(), requires_grad=False
+        )
+        layer.w2_weight_residual_fused = Parameter(
+            (w2_residual * 64.0).contiguous(), requires_grad=False
+        )
 
         # --- weights: HF-natural nibble packing passed through as int8 ---
         w13 = repack_hf_mxfp4_to_kernel(layer.w13_weight.data).contiguous()
@@ -197,13 +251,21 @@ class Mxfp4CutlassMoEMethod:
         layer.w2_weight_scale = Parameter(w2_scale, requires_grad=False)
 
         layer._dsv4_mxfp4_backend = "cutlass"
+        layer._cutlass_mxfp4_source_versions = (
+            layer.w13_weight._version,
+            layer.w2_weight._version,
+            layer.w13_weight_scale_inv._version,
+            layer.w2_weight_scale_inv._version,
+        )
 
     def apply(
         self,
         layer: Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.cutlass_mxfp4a8_moe import cutlass_mxfp4a8_moe
+        from sglang.srt.layers.moe.cutlass_mxfp4a8_fused_moe import (
+            cutlass_mxfp4a8_fused_moe,
+        )
         from sglang.srt.layers.moe.token_dispatcher.standard import (
             StandardCombineInput,
         )
@@ -211,12 +273,18 @@ class Mxfp4CutlassMoEMethod:
         x = dispatch_output.hidden_states
         topk_weights, topk_ids, _ = dispatch_output.topk_output
 
-        output = cutlass_mxfp4a8_moe(
+        output = cutlass_mxfp4a8_fused_moe(
             x,
             layer.w13_weight,
             layer.w2_weight,
             layer.w13_weight_scale,
             layer.w2_weight_scale,
+            layer.w13_weight_fused,
+            layer.w2_weight_fused,
+            layer.w13_weight_scale_fused,
+            layer.w2_weight_scale_fused,
+            layer.w13_weight_residual_fused,
+            layer.w2_weight_residual_fused,
             topk_weights,
             topk_ids,
             self.a_strides1,

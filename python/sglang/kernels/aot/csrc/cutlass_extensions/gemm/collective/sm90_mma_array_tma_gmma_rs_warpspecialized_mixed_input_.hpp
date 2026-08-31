@@ -1020,17 +1020,43 @@ struct CollectiveMmaArrayMixedInput<
     }
   }
   /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  struct NoopReleasedStageProducer {
+    CUTLASS_DEVICE void operator()() const {}
+  };
+
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Consumer Perspective
   template <class FrgTensorC>
-  CUTLASS_DEVICE void
-  mma(MainloopPipeline pipeline,
+  CUTLASS_DEVICE void mma(
+      MainloopPipeline pipeline,
       PipelineState smem_pipe_read,
       FrgTensorC& accum,
       int k_tile_count,
       int thread_idx,
       TensorStorage& shared_tensors,
       Params const& mainloop_params) {
+    NoopReleasedStageProducer released_stage_producer;
+    mma_with_released_stage_producer(
+        pipeline,
+        smem_pipe_read,
+        accum,
+        k_tile_count,
+        thread_idx,
+        shared_tensors,
+        mainloop_params,
+        released_stage_producer);
+  }
+
+  template <class FrgTensorC, class ReleasedStageProducer>
+  CUTLASS_DEVICE void mma_with_released_stage_producer(
+      MainloopPipeline pipeline,
+      PipelineState smem_pipe_read,
+      FrgTensorC& accum,
+      int k_tile_count,
+      int thread_idx,
+      TensorStorage& shared_tensors,
+      Params const& mainloop_params,
+      ReleasedStageProducer& released_stage_producer) {
     static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
     static_assert(cute::rank(SmemLayoutA{}) == 3, "Smem layout must be rank 3.");
     static_assert(cute::rank(SmemLayoutB{}) == 3, "Smem layout must be rank 3.");
@@ -1350,6 +1376,7 @@ struct CollectiveMmaArrayMixedInput<
           if (k_block == K_BLOCK_MAX - 1) {
             pipeline.consumer_release(smem_pipe_release);  // UNLOCK smem_pipe_release, done _computing_ on it
             ++smem_pipe_release;
+            released_stage_producer();
           }
 
           if (k_block == 0) {
@@ -1447,6 +1474,7 @@ struct CollectiveMmaArrayMixedInput<
           // release prior barrier
           pipeline.consumer_release(smem_pipe_release);  // UNLOCK smem_pipe_release, done _computing_ on it
           ++smem_pipe_release;
+          released_stage_producer();
         }
 
         if (k_block < K_BLOCK_MAX - 2) {

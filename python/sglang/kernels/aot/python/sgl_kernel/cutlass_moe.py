@@ -45,6 +45,56 @@ def get_cutlass_w4a8_moe_mm_data(
     )
 
 
+def get_cutlass_w4a8_moe_mm_data_with_permutation(
+    topk_ids: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    problem_sizes1: torch.Tensor,
+    problem_sizes2: torch.Tensor,
+    input_permutation: torch.Tensor,
+    output_permutation: torch.Tensor,
+    num_experts: int,
+    n: int,
+    k: int,
+):
+    """Prepare w4a8/MXFP4A8 problem sizes and permutations in one CUDA path."""
+    torch.ops.sgl_kernel.get_cutlass_w4a8_moe_mm_data_with_permutation.default(
+        topk_ids,
+        expert_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        input_permutation,
+        output_permutation,
+        num_experts,
+        n,
+        k,
+    )
+
+
+def compact_cutlass_w4a8_moe_mm_data(
+    expert_offsets: torch.Tensor,
+    problem_sizes1: torch.Tensor,
+    problem_sizes2: torch.Tensor,
+    compact_expert_offsets: torch.Tensor,
+    compact_problem_sizes1: torch.Tensor,
+    compact_problem_sizes2: torch.Tensor,
+    compact_expert_ids: torch.Tensor,
+    num_experts: int,
+    max_groups: int,
+):
+    """Compact non-empty expert GEMM problems to the front of fixed-size buffers."""
+    torch.ops.sgl_kernel.compact_cutlass_w4a8_moe_mm_data.default(
+        expert_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        compact_expert_offsets,
+        compact_problem_sizes1,
+        compact_problem_sizes2,
+        compact_expert_ids,
+        num_experts,
+        max_groups,
+    )
+
+
 def cutlass_w4a8_moe_mm(
     d: torch.Tensor,
     a: torch.Tensor,
@@ -131,6 +181,7 @@ def cutlass_mxfp4a8_moe_mm(
     act_block_scales: Optional[torch.Tensor] = None,
     as_strides: Optional[torch.Tensor] = None,
     act_scale_group: int = 0,
+    expert_ids: Optional[torch.Tensor] = None,
 ):
     """
     Perform grouped matrix multiplication between MXFP4 weights and fp8 activations.
@@ -175,4 +226,5 @@ def cutlass_mxfp4a8_moe_mm(
         act_block_scales,
         as_strides,
         act_scale_group,
+        expert_ids,
     )

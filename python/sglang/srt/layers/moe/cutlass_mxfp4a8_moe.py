@@ -20,6 +20,7 @@ import torch
 
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_cuda_alike
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
 _is_cuda = is_cuda()
 _is_cuda_alike = is_cuda_alike()
@@ -170,6 +171,12 @@ def cutlass_mxfp4a8_moe(
         n,
         k,
     )
+    active_expert_ids = None
+    if not get_is_capture_mode():
+        expert_counts = expert_offsets[1:] - expert_offsets[:-1]
+        active_expert_ids = torch.nonzero(expert_counts > 0, as_tuple=False).flatten().to(torch.int32)
+        if active_expert_ids.numel() == num_local_experts:
+            active_expert_ids = None
 
     # Per-token + per-block fp8 quant of the reordered activation, then build the
     # per-expert-concatenated (even-padded) block-scale buffer + strides.
@@ -177,8 +184,35 @@ def cutlass_mxfp4a8_moe(
         gateup_input_bf16, block_size=MXFP4_CHUNK_SIZE
     )
     a1_as_packed, a1_as_strides = build_grouped_act_block_scale(
-        a1_blk_scale, expert_offsets, block_size=MXFP4_CHUNK_SIZE
+        a1_blk_scale, expert_offsets, block_size=MXFP4_CHUNK_SIZE, capture_safe=True
     )
+    if active_expert_ids is not None:
+        active_idx = active_expert_ids.to(torch.long)
+        expert_offsets_gemm = expert_offsets[:-1].index_select(0, active_idx)
+        problem_sizes1_gemm = problem_sizes1.index_select(0, active_idx)
+        problem_sizes2_gemm = problem_sizes2.index_select(0, active_idx)
+        a_strides1_gemm = a_strides1.index_select(0, active_idx)
+        b_strides1_gemm = b_strides1.index_select(0, active_idx)
+        c_strides1_gemm = c_strides1.index_select(0, active_idx)
+        s_strides13_gemm = s_strides13.index_select(0, active_idx)
+        a_strides2_gemm = a_strides2.index_select(0, active_idx)
+        b_strides2_gemm = b_strides2.index_select(0, active_idx)
+        c_strides2_gemm = c_strides2.index_select(0, active_idx)
+        s_strides2_gemm = s_strides2.index_select(0, active_idx)
+        a1_as_strides_gemm = a1_as_strides.index_select(0, active_idx)
+    else:
+        expert_offsets_gemm = expert_offsets[:-1]
+        problem_sizes1_gemm = problem_sizes1
+        problem_sizes2_gemm = problem_sizes2
+        a_strides1_gemm = a_strides1
+        b_strides1_gemm = b_strides1
+        c_strides1_gemm = c_strides1
+        s_strides13_gemm = s_strides13
+        a_strides2_gemm = a_strides2
+        b_strides2_gemm = b_strides2
+        c_strides2_gemm = c_strides2
+        s_strides2_gemm = s_strides2
+        a1_as_strides_gemm = a1_as_strides
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((m * topk, k), device=device, dtype=torch.bfloat16)
@@ -189,24 +223,30 @@ def cutlass_mxfp4a8_moe(
         w1_q,
         ones_scale,
         w1_scale,
-        expert_offsets[:-1],
-        problem_sizes1,
-        a_strides1,
-        b_strides1,
-        c_strides1,
-        s_strides13,
+        expert_offsets_gemm,
+        problem_sizes1_gemm,
+        a_strides1_gemm,
+        b_strides1_gemm,
+        c_strides1_gemm,
+        s_strides13_gemm,
         MXFP4_CHUNK_SIZE,
         topk,
         a1_as_packed,
-        a1_as_strides,
+        a1_as_strides_gemm,
         MXFP4_CHUNK_SIZE,
+        active_expert_ids,
     )
 
     # GEMM2 activation: fused SwiGLU (+clamp) + silu_and_mul + per-token/per-block
     # fp8 quant (native kernel when no clamp, Triton fallback for the clamp path).
     intermediate_q, a2_blk_scale = _silu_mul_quant(c1, n, swiglu_limit)
     a2_as_packed, a2_as_strides = build_grouped_act_block_scale(
-        a2_blk_scale, expert_offsets, block_size=MXFP4_CHUNK_SIZE
+        a2_blk_scale, expert_offsets, block_size=MXFP4_CHUNK_SIZE, capture_safe=True
+    )
+    a2_as_strides_gemm = (
+        a2_as_strides.index_select(0, active_expert_ids.to(torch.long))
+        if active_expert_ids is not None
+        else a2_as_strides
     )
 
     cutlass_mxfp4a8_moe_mm(
@@ -215,17 +255,18 @@ def cutlass_mxfp4a8_moe(
         w2_q,
         ones_scale,
         w2_scale,
-        expert_offsets[:-1],
-        problem_sizes2,
-        a_strides2,
-        b_strides2,
-        c_strides2,
-        s_strides2,
+        expert_offsets_gemm,
+        problem_sizes2_gemm,
+        a_strides2_gemm,
+        b_strides2_gemm,
+        c_strides2_gemm,
+        s_strides2_gemm,
         MXFP4_CHUNK_SIZE,
         topk,
         a2_as_packed,
-        a2_as_strides,
+        a2_as_strides_gemm,
         MXFP4_CHUNK_SIZE,
+        active_expert_ids,
     )
 
     output = torch.empty_like(a)

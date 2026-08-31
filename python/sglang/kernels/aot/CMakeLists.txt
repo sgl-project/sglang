@@ -331,6 +331,9 @@ Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION}
 target_compile_options(common_ops_sm90_build PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
 )
+target_compile_definitions(common_ops_sm90_build PRIVATE
+    CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1
+)
 target_include_directories(common_ops_sm90_build PRIVATE ${INCLUDES})
 # Set output name and separate build directory to avoid conflicts
 set_target_properties(common_ops_sm90_build PROPERTIES

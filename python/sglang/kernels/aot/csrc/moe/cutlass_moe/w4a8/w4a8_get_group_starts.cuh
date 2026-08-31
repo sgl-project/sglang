@@ -4,22 +4,29 @@
 #include <cuda.h>
 #include <torch/all.h>
 
+#include <type_traits>
+
 #include "cutlass/bfloat16.h"
 #include "cutlass/float8.h"
 
-template <typename ElementA, typename ElementB, typename ElementC, typename ElementAccumulator>
+template <
+    typename ElementA,
+    typename ElementB,
+    typename ElementC,
+    typename ElementAccumulator,
+    typename ElementBScale>
 __global__ void int4_fp8_get_group_gemm_starts(
     int32_t* expert_offsets,
     ElementA** a_offsets,
     ElementB** b_offsets,
     ElementC** out_offsets,
     ElementAccumulator** a_scales_offsets,
-    cutlass::bfloat16_t** b_scales_offsets,
+    ElementBScale** b_scales_offsets,
     ElementA* a_base_as_int,
     ElementB* b_base_as_int,
     ElementC* out_base_as_int,
     ElementAccumulator* a_scales_base_as_int,
-    cutlass::bfloat16_t* b_scales_base_as_int,
+    ElementBScale* b_scales_base_as_int,
     int64_t n,
     int64_t k,
     bool per_act_token,
@@ -44,45 +51,48 @@ __global__ void int4_fp8_get_group_gemm_starts(
     // pointer must advance by the exclusive cumsum of these padded strides -- NOT
     // by the (real) expert_offset used for the M-contiguous activation tensor.
     // nullptr for int4a8 (act-scale path disabled).
-    int64_t const* as_strides = nullptr) {
-  int expert_id = threadIdx.x;
-  int32_t expert_offset = expert_offsets[expert_id];
+    int64_t const* as_strides = nullptr,
+    int32_t const* expert_ids = nullptr) {
+  int group_id = threadIdx.x;
+  int expert_id = expert_ids != nullptr ? expert_ids[group_id] : group_id;
+  int32_t expert_offset = expert_offsets[group_id];
 
-  a_offsets[expert_id] = a_base_as_int + expert_offset * k;
-  b_offsets[expert_id] = b_base_as_int + expert_id * k * n / 2;
-  out_offsets[expert_id] = out_base_as_int + expert_offset * n;
-  a_scales_offsets[expert_id] = a_scales_base_as_int + (per_act_token ? expert_offset : 0);
-  b_scales_offsets[expert_id] =
+  a_offsets[group_id] = a_base_as_int + expert_offset * k;
+  b_offsets[group_id] = b_base_as_int + expert_id * k * n / 2;
+  out_offsets[group_id] = out_base_as_int + expert_offset * n;
+  a_scales_offsets[group_id] = a_scales_base_as_int + (per_act_token ? expert_offset : 0);
+  b_scales_offsets[group_id] =
       b_scales_base_as_int + (per_out_ch ? expert_id * n * k / weight_scale_group : expert_id);
   if (as_offsets != nullptr && as_base_as_int != nullptr) {
-    // Exclusive cumsum of the PADDED per-expert token strides (as_strides[j][0],
-    // laid out as [E,2] so element j is at index j*2). Falls back to the real
-    // expert_offset when no stride array is supplied (defensive; the mxfp4a8
-    // caller always passes as_strides). E is tiny (<=256) so the serial scan is
-    // negligible in this single-block launch.
+    // as_strides is laid out as [E,2]. Column 0 is the per-expert padded token
+    // stride consumed by the TMA descriptor. Column 1 is the exclusive
+    // padded-token prefix, precomputed by the caller to avoid an O(E^2) serial
+    // scan in this launch.
     int64_t as_tok_off = expert_offset;
     if (as_strides != nullptr) {
-      as_tok_off = 0;
-      for (int j = 0; j < expert_id; ++j) {
-        as_tok_off += as_strides[j * 2];
-      }
+      as_tok_off = as_strides[expert_id * 2 + 1];
     }
-    as_offsets[expert_id] = as_base_as_int + as_tok_off * (k / act_scale_group);
+    as_offsets[group_id] = as_base_as_int + as_tok_off * (k / act_scale_group);
   }
 }
 
-template <typename ElementA, typename ElementB, typename ElementC, typename ElementAccumulator>
+template <
+    typename ElementA,
+    typename ElementB,
+    typename ElementC,
+    typename ElementAccumulator,
+    typename ElementBScale>
 __global__ void int4_fp8_get_group_gemm_starts_3d(
     ElementA** a_offsets,
     ElementB** b_offsets,
     ElementC** out_offsets,
     ElementAccumulator** a_scales_offsets,
-    cutlass::bfloat16_t** b_scales_offsets,
+    ElementBScale** b_scales_offsets,
     ElementA* a_base_as_int,
     ElementB* b_base_as_int,
     ElementC* out_base_as_int,
     ElementAccumulator* a_scales_base_as_int,
-    cutlass::bfloat16_t* b_scales_base_as_int,
+    ElementBScale* b_scales_base_as_int,
     int64_t n,
     int64_t m,
     int64_t k,
@@ -105,21 +115,22 @@ __global__ void int4_fp8_get_group_gemm_starts_3d(
   b_scales_offsets[expert_id] = b_scales_base_as_int + b_scales_offset;
 }
 
-#define __CALL_W4A8_GET_STARTS_KERNEL(TENSOR_C_TYPE, C_TYPE)                              \
-  else if (out_tensors.dtype() == TENSOR_C_TYPE) {                                        \
-    int4_fp8_get_group_gemm_starts<cutlass::float_e4m3_t, cutlass::int8_t, C_TYPE, float> \
-        <<<1, num_experts, 0, stream>>>(                                                  \
+#define __CALL_W4A8_GET_STARTS_KERNEL(TENSOR_C_TYPE, C_TYPE)                                             \
+  else if (out_tensors.dtype() == TENSOR_C_TYPE) {                                                       \
+    int4_fp8_get_group_gemm_starts<                                                                     \
+        cutlass::float_e4m3_t, cutlass::int8_t, C_TYPE, float, ElementBScale>                           \
+        <<<1, num_experts, 0, stream>>>(                                                                 \
             static_cast<int32_t*>(expert_offsets.data_ptr()),                             \
             static_cast<cutlass::float_e4m3_t**>(a_ptrs.data_ptr()),                      \
             static_cast<cutlass::int8_t**>(b_ptrs.data_ptr()),                            \
             static_cast<C_TYPE**>(out_ptrs.data_ptr()),                                   \
             static_cast<float**>(a_scales_ptrs.data_ptr()),                               \
-            static_cast<cutlass::bfloat16_t**>(b_scales_ptrs.data_ptr()),                 \
+            static_cast<ElementBScale**>(b_scales_ptrs.data_ptr()),                                      \
             static_cast<cutlass::float_e4m3_t*>(a_tensors.data_ptr()),                    \
             static_cast<cutlass::int8_t*>(b_tensors.data_ptr()),                          \
             static_cast<C_TYPE*>(out_tensors.data_ptr()),                                 \
             static_cast<float*>(a_scales.data_ptr()),                                     \
-            static_cast<cutlass::bfloat16_t*>(b_scales.data_ptr()),                       \
+            static_cast<ElementBScale*>(b_scales.data_ptr()),                                            \
             out_tensors.size(1),                                                          \
             a_tensors.size(1),                                                            \
             per_act_token,                                                                \
@@ -128,23 +139,25 @@ __global__ void int4_fp8_get_group_gemm_starts_3d(
             as_base_raw,                                                                  \
             act_scale_group,                                                              \
             weight_scale_group,                                                           \
-            as_strides_raw);                                                              \
+            as_strides_raw,                                                               \
+            expert_ids_raw);                                                              \
   }
 
-#define __CALL_W4A8_GET_STARTS_KERNEL_3D(TENSOR_C_TYPE, C_TYPE)                              \
-  else if (out_tensors.dtype() == TENSOR_C_TYPE) {                                           \
-    int4_fp8_get_group_gemm_starts_3d<cutlass::float_e4m3_t, cutlass::int8_t, C_TYPE, float> \
-        <<<1, num_experts, 0, stream>>>(                                                     \
+#define __CALL_W4A8_GET_STARTS_KERNEL_3D(TENSOR_C_TYPE, C_TYPE)                                       \
+  else if (out_tensors.dtype() == TENSOR_C_TYPE) {                                                     \
+    int4_fp8_get_group_gemm_starts_3d<                                                               \
+        cutlass::float_e4m3_t, cutlass::int8_t, C_TYPE, float, ElementBScale>                         \
+        <<<1, num_experts, 0, stream>>>(                                                               \
             static_cast<cutlass::float_e4m3_t**>(a_ptrs.data_ptr()),                         \
             static_cast<cutlass::int8_t**>(b_ptrs.data_ptr()),                               \
             static_cast<C_TYPE**>(out_ptrs.data_ptr()),                                      \
             static_cast<float**>(a_scales_ptrs.data_ptr()),                                  \
-            static_cast<cutlass::bfloat16_t**>(b_scales_ptrs.data_ptr()),                    \
+            static_cast<ElementBScale**>(b_scales_ptrs.data_ptr()),                                    \
             static_cast<cutlass::float_e4m3_t*>(a_tensors.data_ptr()),                       \
             static_cast<cutlass::int8_t*>(b_tensors.data_ptr()),                             \
             static_cast<C_TYPE*>(out_tensors.data_ptr()),                                    \
             static_cast<float*>(a_scales.data_ptr()),                                        \
-            static_cast<cutlass::bfloat16_t*>(b_scales.data_ptr()),                          \
+            static_cast<ElementBScale*>(b_scales.data_ptr()),                                          \
             out_tensors.size(2),                                                             \
             a_tensors.size(1),                                                               \
             a_tensors.size(2),                                                               \
@@ -155,6 +168,7 @@ __global__ void int4_fp8_get_group_gemm_starts_3d(
 
 namespace {
 
+template <typename ElementBScale = cutlass::bfloat16_t>
 void run_int4_fp8_get_group_gemm_starts(
     torch::Tensor const& expert_offsets,
     torch::Tensor& a_ptrs,
@@ -181,11 +195,16 @@ void run_int4_fp8_get_group_gemm_starts(
     // compute the exclusive cumsum of PADDED per-expert token strides so the
     // per-expert act-scale pointer lands on the correctly-padded (16B-aligned)
     // sub-buffer. Left empty for int4a8.
-    std::optional<torch::Tensor> as_strides = std::nullopt) {
+    std::optional<torch::Tensor> as_strides = std::nullopt,
+    std::optional<torch::Tensor> expert_ids = std::nullopt) {
   TORCH_CHECK(a_tensors.dtype() == torch::kFloat8_e4m3fn);
   TORCH_CHECK(b_tensors.dtype() == torch::kInt8);
   TORCH_CHECK(a_scales.dtype() == torch::kFloat32);
-  TORCH_CHECK(b_scales.dtype() == torch::kBFloat16);
+  if constexpr (std::is_same_v<ElementBScale, cutlass::float_ue8m0_t>) {
+    TORCH_CHECK(b_scales.dtype() == torch::kUInt8, "prescale weight scales must be raw uint8 E8M0");
+  } else {
+    TORCH_CHECK(b_scales.dtype() == torch::kBFloat16);
+  }
 
   int num_experts = static_cast<int>(expert_offsets.size(0));
   bool per_act_token = a_scales.numel() != 1;
@@ -203,6 +222,12 @@ void run_int4_fp8_get_group_gemm_starts(
       TORCH_CHECK(as_strides->dtype() == torch::kInt64, "as_strides must be int64");
       as_strides_raw = static_cast<int64_t const*>(as_strides->data_ptr());
     }
+  }
+  int32_t const* expert_ids_raw = nullptr;
+  if (expert_ids.has_value()) {
+    TORCH_CHECK(expert_ids->dtype() == torch::kInt32, "expert_ids must be int32");
+    TORCH_CHECK(expert_ids->numel() == num_experts, "expert_ids must have one entry per grouped problem");
+    expert_ids_raw = static_cast<int32_t const*>(expert_ids->data_ptr());
   }
 
   auto stream = at::cuda::getCurrentCUDAStream(expert_offsets.device().index());

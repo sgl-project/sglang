@@ -26,6 +26,8 @@
 
 namespace cutlass {
 
+#if !defined(SGL_KERNEL_USE_CUTLASS_BUILTIN_E2M1_CONVERTER)
+
 /// Partial specialization for Array<cutlass::float_e4m3_t, N> <= Array<cutlass::float_e2m1_t, N>
 ///
 /// Mirrors NumericArrayConverter<float_e4m3_t, int4b_t, N> (numeric_conversion.h),
@@ -137,6 +139,8 @@ struct NumericArrayConverter<cutlass::float_e4m3_t, cutlass::float_e2m1_t, N, Ro
     return convert(s);
   }
 };
+
+#endif  // !defined(SGL_KERNEL_USE_CUTLASS_BUILTIN_E2M1_CONVERTER)
 
 }  // namespace cutlass
 
