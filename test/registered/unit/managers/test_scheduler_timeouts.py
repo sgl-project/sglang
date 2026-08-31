@@ -52,6 +52,7 @@ def _scheduler(waiting_queue):
     s = Scheduler.__new__(Scheduler)
     s.waiting_queue = waiting_queue
     s.enable_hicache_storage = False
+    s.enable_unified_cache_external_linker = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
     s.beam_coordinator = MagicMock()
     return s
