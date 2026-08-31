@@ -93,6 +93,30 @@ class KVIndexTable(msgspec.Struct, frozen=True):
         through the pool's own full->swa map."""
         return self.sliding_window_ids if self.is_translated else self.ids
 
+    @classmethod
+    def passthrough(
+        cls, *, req_to_token: torch.Tensor, req_pool_indices: torch.Tensor
+    ) -> KVIndexTable:
+        """The raw (req_to_token, req_pool_indices) table -- for a caller on a
+        plain pool with no translator in reach (the aiter updaters)."""
+        return cls(
+            ids=req_to_token,
+            row_ids=req_pool_indices,
+            row_stride=req_to_token.stride(0),
+            entry_page_size=1,
+            is_translated=False,
+            sliding_window_ids=None,
+        )
+
+    def swa_view(self) -> KVIndexTable:
+        """This table re-aimed at the sliding-window gather source -- for a
+        consumer whose kernel reads the window sub-pool. Untranslated tables
+        keep the full ids (the caller's full->swa rewrite still applies)."""
+        ids = self.sliding_window_read_ids()
+        if ids is self.ids:
+            return self
+        return msgspec.structs.replace(self, ids=ids)
+
 
 class KVIndexTranslator:
     """Built once per ModelRunner."""
@@ -194,6 +218,7 @@ class KVIndexTranslator:
         seq_lens: torch.Tensor,
         max_pages: Optional[int] = None,
         into: Optional[KVReadTables] = None,
+        seq_len_delta: int = 0,
     ) -> KVIndexTable:
         """The one per-batch entry point.
 
@@ -202,6 +227,10 @@ class KVIndexTranslator:
         returns the table WHOLE, so a caller needing a stable pointer (a
         captured graph bakes it) passes its own tables in ``into``;
         ``into=None`` allocates of width ``max_pages`` instead.
+
+        ``seq_len_delta`` widens every row's live prefix -- the whole-sequence
+        verify contract (draft KV read back from the pool). An eager caller's
+        ``max_pages`` must already cover the delta.
         """
         if not self.is_translating or self.defer_read_translate:
             return KVIndexTable(
@@ -246,6 +275,7 @@ class KVIndexTranslator:
             page_size=self.page_size,
             max_pages=width,
             out=out_full,
+            seq_len_delta=seq_len_delta,
         )
         if out_swa is not None:
             build_kv_read_table(
@@ -257,6 +287,7 @@ class KVIndexTranslator:
                 page_size=self.page_size,
                 max_pages=width,
                 out=out_swa,
+                seq_len_delta=seq_len_delta,
             )
         return KVIndexTable(
             ids=out_full,
@@ -273,6 +304,7 @@ class KVIndexTranslator:
         out: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        seq_len_delta: int = 0,
     ) -> None:
         """`build_index_table(into=...)` for a caller that owns a bare block
         table rather than a KVReadTables: trtllm_mla / flashmla consume that
@@ -285,6 +317,7 @@ class KVIndexTranslator:
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             into=KVReadTables(full=out, sliding_window=None),
+            seq_len_delta=seq_len_delta,
         )
 
     def index_table_for_batch(self, forward_batch) -> KVIndexTable:
@@ -318,6 +351,30 @@ class KVIndexTranslator:
         )
         self._index_table_memo = (weakref.ref(forward_batch), view)
         return view
+
+    def widened_index_table(self, forward_batch, *, seq_len_delta: int) -> KVIndexTable:
+        """Whole-sequence-verify view: every row's live prefix widened by
+        `seq_len_delta` columns (the drafts are read back from the pool).
+        Not memoized -- verify is one consumer, and the batch's memoized
+        prefix table stays valid for the others."""
+        max_pages = None
+        if self.is_translating:
+            slc = forward_batch.seq_lens_cpu
+            if (
+                forward_batch.seq_lens_sum is not None
+                and slc is not None
+                and slc.numel() > 0
+            ):
+                max_seq = int(slc.max()) + seq_len_delta
+            else:
+                max_seq = self.req_to_token.shape[1]
+            max_pages = max(-(-max_seq // self.page_size), 1)
+        return self.build_index_table(
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            max_pages=max_pages,
+            seq_len_delta=seq_len_delta,
+        )
 
     def bind_and_verify_backends(self, backends) -> None:
         """Boot: make every reachable backend carry THIS translator.
