@@ -85,12 +85,12 @@ class FuzzyKVRealizer:
             try:
                 self._realize_one(req)
             finally:
-                req.fuzzy_realized_locs = None
-                req.cache_fuzzy_matched_len = 0
+                req.kv.fuzzy_realized_locs = None
+                req.kv.cache_fuzzy_matched_len = 0
 
     def _realize_one(self, req: Req) -> None:
-        fuzzy_match_result = req.fuzzy_match_result
-        num_fuzzy = req.cache_fuzzy_matched_len
+        fuzzy_match_result = req.kv.fuzzy_match_result
+        num_fuzzy = req.kv.cache_fuzzy_matched_len
         if fuzzy_match_result is None or num_fuzzy <= 0:
             return
         if not self.pool_supported or self.rotary_emb is None:
@@ -102,7 +102,7 @@ class FuzzyKVRealizer:
                 "(non-MHA pool or missing rotary_emb)"
             )
 
-        req_idx = req.req_pool_idx
+        req_idx = req.kv.req_pool_idx
         prefix_len = len(req.prefix_indices)
 
         if fuzzy_match_result.segments:
@@ -138,7 +138,7 @@ class FuzzyKVRealizer:
             self._free_realization_slots(req)
             return
 
-        new_fuzzy_locs = req.fuzzy_realized_locs
+        new_fuzzy_locs = req.kv.fuzzy_realized_locs
         if new_fuzzy_locs is None:
             # Pre-alloc contract violated; skipping is safer than allocating
             # here (would re-introduce a partial-commit window).
@@ -183,7 +183,7 @@ class FuzzyKVRealizer:
 
         # The fuzzy span is now request-owned, not tree-owned; narrow the
         # protected prefix so duplicate-free ranges cover the realized slots.
-        req.cache_protected_len = exact_matched_len
+        req.kv.cache_protected_len = exact_matched_len
 
         logger.info(
             "[FUZZY] Realized %d fuzzy tokens (contiguous): copied donor KV "
@@ -204,7 +204,7 @@ class FuzzyKVRealizer:
         slots ``alloc_for_extend`` placed there are freed — otherwise they
         have no owner after the overwrite.
         """
-        realized_locs = req.fuzzy_realized_locs
+        realized_locs = req.kv.fuzzy_realized_locs
         if realized_locs is None:
             logger.warning(
                 "[FUZZY] segments correction: realized_locs missing; skipping"
@@ -270,6 +270,6 @@ class FuzzyKVRealizer:
             self.token_to_kv_pool_allocator.free(realized_locs[cursor:])
 
     def _free_realization_slots(self, req: Req) -> None:
-        if req.fuzzy_realized_locs is not None:
-            self.token_to_kv_pool_allocator.free(req.fuzzy_realized_locs)
-            req.fuzzy_realized_locs = None
+        if req.kv.fuzzy_realized_locs is not None:
+            self.token_to_kv_pool_allocator.free(req.kv.fuzzy_realized_locs)
+            req.kv.fuzzy_realized_locs = None

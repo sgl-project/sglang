@@ -272,18 +272,18 @@ class FuzzyRadixCache(RadixCache):
             return result
         # Chunked-prefill resume: release slots from a previous round.
         self._reclaim_realization_slots(req)
-        req.fuzzy_realized_locs = realized_locs
+        req.kv.fuzzy_realized_locs = realized_locs
 
-        if donor_node is not None and donor_node is not req.fuzzy_donor_node:
+        if donor_node is not None and donor_node is not req.kv.fuzzy_donor_node:
             # Release any prior donor pin before acquiring a new one
             # (chunked-prefill / re-scheduling case). A re-fire on the same
             # donor keeps the existing single pin.
-            if req.fuzzy_donor_node is not None:
-                self.dec_lock_ref(req.fuzzy_donor_node)
+            if req.kv.fuzzy_donor_node is not None:
+                self.dec_lock_ref(req.kv.fuzzy_donor_node)
             self.inc_lock_ref(donor_node)
-            req.fuzzy_donor_node = donor_node
+            req.kv.fuzzy_donor_node = donor_node
 
-        req.fuzzy_match_result = fuzzy_result
+        req.kv.fuzzy_match_result = fuzzy_result
 
         quality = fuzzy_result.quality_signals
         logger.info(
@@ -325,7 +325,7 @@ class FuzzyRadixCache(RadixCache):
         """Register the finished request as a donor while its KV is live."""
         if not self._fuzzy_cache_enabled or self.fuzzy_match_provider is None:
             return
-        if insert_result.prefix_len > req.cache_protected_len:
+        if insert_result.prefix_len > req.kv.cache_protected_len:
             # The insert deduplicated against existing tree content, so the
             # kv indices captured here are freed right after this callback.
             # Registering them would hand the provider dangling slots; the
@@ -356,15 +356,15 @@ class FuzzyRadixCache(RadixCache):
 
     def _reclaim_realization_slots(self, req: Req) -> None:
         """Free pre-allocated realization slots the forward pass never used."""
-        if req.fuzzy_realized_locs is not None:
-            self.token_to_kv_pool_allocator.free(req.fuzzy_realized_locs)
-            req.fuzzy_realized_locs = None
+        if req.kv.fuzzy_realized_locs is not None:
+            self.token_to_kv_pool_allocator.free(req.kv.fuzzy_realized_locs)
+            req.kv.fuzzy_realized_locs = None
 
     def _release_donor(self, req: Req) -> None:
         """Drop the donor pin acquired in match_prefix."""
-        if req.fuzzy_donor_node is not None:
-            self.dec_lock_ref(req.fuzzy_donor_node)
-            req.fuzzy_donor_node = None
+        if req.kv.fuzzy_donor_node is not None:
+            self.dec_lock_ref(req.kv.fuzzy_donor_node)
+            req.kv.fuzzy_donor_node = None
 
     # --- node registry maintenance -------------------------------------
     # Donors are addressed by TreeNode.id; keep an id -> node map in sync

@@ -15,6 +15,8 @@ from array import array
 from typing import List, Optional
 from unittest.mock import MagicMock, patch
 
+from types import SimpleNamespace
+
 import torch
 
 import sglang.srt.mem_cache.fuzzy_match as fuzzy_match_pkg
@@ -101,16 +103,19 @@ class _StubReq:
         self.extra_key = None
         self.cache_salt = None
         self.priority = 0
-        self.cache_protected_len = 0
-        self.cache_fuzzy_matched_len = 0
-        self.fuzzy_match_result = None
-        self.fuzzy_donor_node = None
-        self.fuzzy_realized_locs = None
         self.origin_input_ids = list(origin_input_ids or [])
         self.output_ids = list(output_ids or [])
-        self.req_pool_idx = req_pool_idx
         self.last_node = None
         self.kv_committed_len = committed_kv_len
+        # Per-request KV lifecycle state lives on the kv record (ReqKvInfo).
+        self.kv = SimpleNamespace(
+            req_pool_idx=req_pool_idx,
+            cache_protected_len=0,
+            cache_fuzzy_matched_len=0,
+            fuzzy_match_result=None,
+            fuzzy_donor_node=None,
+            fuzzy_realized_locs=None,
+        )
 
 
 class _ScriptedProvider(FuzzyMatchProvider):
@@ -307,9 +312,9 @@ class TestFuzzyResultApplication(CustomTestCase):
         self.assertEqual(result.device_indices.tolist(), [10, 11, 12, 50, 51])
         self.assertEqual(result.fuzzy_matched_len, 2)
         self.assertEqual(result.cache_protected_len, 5)
-        self.assertIs(req.fuzzy_match_result, scripted)
-        self.assertIsNotNone(req.fuzzy_realized_locs)
-        self.assertEqual(int(req.fuzzy_realized_locs.numel()), 2)
+        self.assertIs(req.kv.fuzzy_match_result, scripted)
+        self.assertIsNotNone(req.kv.fuzzy_realized_locs)
+        self.assertEqual(int(req.kv.fuzzy_realized_locs.numel()), 2)
         self.assertEqual(allocator.alloc_calls, [2])
         call = provider.match_calls[0]
         self.assertEqual(call["prompt_token_ids"], [1, 2, 3, 7, 8, 9])
@@ -336,8 +341,8 @@ class TestFuzzyResultApplication(CustomTestCase):
         self.assertEqual(result.device_indices.tolist(), [10, 11, 12])
         self.assertIsNone(result.fuzzy_matched_len)
         self.assertEqual(allocator.alloc_calls, [])
-        self.assertIsNone(req.fuzzy_realized_locs)
-        self.assertIsNone(req.fuzzy_match_result)
+        self.assertIsNone(req.kv.fuzzy_realized_locs)
+        self.assertIsNone(req.kv.fuzzy_match_result)
 
     def test_stale_donor_node_id_falls_back_to_exact_only(self):
         """A donor whose tree node is gone (flush/eviction race) cannot be
@@ -360,9 +365,9 @@ class TestFuzzyResultApplication(CustomTestCase):
         self.assertEqual(result.device_indices.tolist(), [10, 11, 12])
         self.assertIsNone(result.fuzzy_matched_len)
         self.assertIsNone(result.cache_protected_len)
-        self.assertIsNone(req.fuzzy_match_result)
-        self.assertIsNone(req.fuzzy_donor_node)
-        self.assertIsNone(req.fuzzy_realized_locs)
+        self.assertIsNone(req.kv.fuzzy_match_result)
+        self.assertIsNone(req.kv.fuzzy_donor_node)
+        self.assertIsNone(req.kv.fuzzy_realized_locs)
         self.assertEqual(allocator.alloc_calls, [])
 
     def test_kv_indices_length_mismatch_falls_back_without_leaking(self):
@@ -383,8 +388,8 @@ class TestFuzzyResultApplication(CustomTestCase):
 
         self.assertEqual(result.device_indices.tolist(), [10, 11, 12])
         self.assertIsNone(result.fuzzy_matched_len)
-        self.assertIsNone(req.fuzzy_match_result)
-        self.assertIsNone(req.fuzzy_realized_locs)
+        self.assertIsNone(req.kv.fuzzy_match_result)
+        self.assertIsNone(req.kv.fuzzy_realized_locs)
         self.assertEqual(allocator.outstanding_slots, 0)
 
     def test_alloc_failure_falls_back_without_pinning_donor(self):
@@ -410,9 +415,9 @@ class TestFuzzyResultApplication(CustomTestCase):
         self.assertIsNone(result.fuzzy_matched_len)
         self.assertEqual(int(result.device_indices.numel()), 0)
         self.assertEqual(donor.lock_ref, 0)
-        self.assertIsNone(req.fuzzy_match_result)
-        self.assertIsNone(req.fuzzy_donor_node)
-        self.assertIsNone(req.fuzzy_realized_locs)
+        self.assertIsNone(req.kv.fuzzy_match_result)
+        self.assertIsNone(req.kv.fuzzy_donor_node)
+        self.assertIsNone(req.kv.fuzzy_realized_locs)
 
 
 class TestDonorLifecycle(CustomTestCase):
@@ -445,15 +450,15 @@ class TestDonorLifecycle(CustomTestCase):
         cache.match_prefix(MatchPrefixParams(key=_key([90, 91, 92]), req=req))
 
         self.assertEqual(donor.lock_ref, 1)
-        self.assertIs(req.fuzzy_donor_node, donor)
-        realized = req.fuzzy_realized_locs
+        self.assertIs(req.kv.fuzzy_donor_node, donor)
+        realized = req.kv.fuzzy_realized_locs
         self.assertIsNotNone(realized)
 
         cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
 
         self.assertEqual(donor.lock_ref, 0)
-        self.assertIsNone(req.fuzzy_donor_node)
-        self.assertIsNone(req.fuzzy_realized_locs)
+        self.assertIsNone(req.kv.fuzzy_donor_node)
+        self.assertIsNone(req.kv.fuzzy_realized_locs)
         self.assertTrue(any(t is realized for t in allocator.free_calls))
         self.assertEqual(allocator.outstanding_slots, 0)
 
@@ -495,7 +500,7 @@ class TestDonorLifecycle(CustomTestCase):
 
     def test_realization_narrows_protected_prefix_to_exact(self):
         """(bug regression) After the realizer repoints the fuzzy span to
-        request-owned slots, ``req.cache_protected_len`` must shrink from
+        request-owned slots, ``req.kv.cache_protected_len`` must shrink from
         exact+fuzzy to exact. If it keeps claiming the span is tree-owned
         and a concurrent request extends the shared tree path past
         ``exact`` before this request finishes, the finish-time
@@ -516,10 +521,10 @@ class TestDonorLifecycle(CustomTestCase):
 
         req = _StubReq(rid="narrow", req_pool_idx=0)
         req.prefix_indices = torch.arange(5)  # exact 3 + fuzzy 2
-        req.cache_protected_len = 5
-        req.cache_fuzzy_matched_len = 2
-        req.fuzzy_realized_locs = torch.tensor([500, 501], dtype=torch.int64)
-        req.fuzzy_match_result = _scripted_fuzzy_result(
+        req.kv.cache_protected_len = 5
+        req.kv.cache_fuzzy_matched_len = 2
+        req.kv.fuzzy_realized_locs = torch.tensor([500, 501], dtype=torch.int64)
+        req.kv.fuzzy_match_result = _scripted_fuzzy_result(
             cached_token_count=2, kv_indices=[10, 11], cached_start_pos=0
         )
 
@@ -528,10 +533,10 @@ class TestDonorLifecycle(CustomTestCase):
         ):
             realizer.realize(fuzzy_reqs=[req])
 
-        self.assertEqual(req.cache_protected_len, 3)
+        self.assertEqual(req.kv.cache_protected_len, 3)
         self.assertEqual(pool.req_to_token[0, 3:5].tolist(), [500, 501])
-        self.assertIsNone(req.fuzzy_realized_locs)
-        self.assertEqual(req.cache_fuzzy_matched_len, 0)
+        self.assertIsNone(req.kv.fuzzy_realized_locs)
+        self.assertEqual(req.kv.cache_fuzzy_matched_len, 0)
 
     def test_finished_insert_registers_donor_before_duplicate_free(self):
         """With ``cache_fuzzy_results`` on, a finishing request must be
@@ -664,12 +669,28 @@ class _RegistryIsolationMixin:
         super().tearDown()
 
 
-def _make_ctx(*, backend, disable_radix_cache=False, is_eagle=False):
-    server_args = MagicMock()
-    server_args.radix_cache_backend = backend
-    server_args.enable_streaming_session = False
-    server_args.enable_lmcache = False
-    server_args.enable_flexkv = False
+def _publish(testcase, **fields):
+    """Install a published config for one case and restore on its cleanup.
+
+    The factory reads the cache-backend leaves off the published bags, so a
+    unit case must publish them rather than only setting them on a stub.
+    """
+    from sglang.srt.runtime_context import get_context, get_server_args
+
+    override = get_context().override_server_args(**fields)
+    override.install()
+    testcase.addCleanup(override.restore)
+    return get_server_args()
+
+
+def _make_ctx(testcase, *, backend, disable_radix_cache=False, is_eagle=False):
+    server_args = _publish(
+        testcase,
+        radix_cache_backend=backend,
+        enable_streaming_session=False,
+        enable_lmcache=False,
+        enable_flexkv=False,
+    )
     params = MagicMock()
     params.is_eagle = is_eagle
     return TreeCacheBuildContext(
@@ -707,7 +728,7 @@ class TestBackendRegistration(_RegistryIsolationMixin, CustomTestCase):
         registration cannot masquerade as a pass."""
         with self.assertRaises(ValueError) as caught:
             create_tree_cache(
-                _make_ctx(backend="fuzzy_match", disable_radix_cache=True)
+                _make_ctx(self, backend="fuzzy_match", disable_radix_cache=True)
             )
         self.assertIn("disable-radix-cache", str(caught.exception))
 
@@ -716,7 +737,7 @@ class TestBackendRegistration(_RegistryIsolationMixin, CustomTestCase):
         backend does not support yet; silently constructing the cache would
         run donor KV reuse against bigram keys it was never validated on."""
         with self.assertRaises(ValueError) as caught:
-            create_tree_cache(_make_ctx(backend="fuzzy_match", is_eagle=True))
+            create_tree_cache(_make_ctx(self, backend="fuzzy_match", is_eagle=True))
         self.assertIn("EAGLE", str(caught.exception))
 
 

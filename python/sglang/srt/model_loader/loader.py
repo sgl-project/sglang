@@ -42,13 +42,13 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GIB_BYTES
+from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
 from sglang.srt.runtime_context import (
-    configured_moe_dp_size,
     get_exec,
     get_model,
     get_parallel,
@@ -124,7 +124,6 @@ from sglang.srt.model_loader.weight_utils import (
     set_runai_streamer_env,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
@@ -150,61 +149,15 @@ logger = logging.getLogger(__name__)
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
     if target_device.type == "cpu":
-        # If target is CPU, no need to move anything
         yield module
         return
 
-    original_infos: Dict[str, Dict] = {}
-
-    # Store original device states and move parameters to GPU if they're on CPU
-    for name, p in module.named_parameters():
-        if p.device.type == "cpu":
-            original_data = p.data
-            device_data = p.data.to(target_device)
-            original_infos[name] = dict(
-                device=p.device,
-                original_data=original_data,
-                device_data=device_data,
-            )
-            p.data = device_data
-        # Parameters already on target device are not touched
-
-    try:
+    with stage_module_for_post_load(
+        module,
+        target_device,
+        pin_memory=target_device.type != "cpu" and is_pin_memory_available(),
+    ):
         yield module
-
-    finally:
-        # Restore parameters to their original devices, ignoring new parameters
-        pin_memory = is_pin_memory_available()
-        for name, p in module.named_parameters():
-            if name in original_infos:
-                original_info = original_infos[name]
-                device_data = original_info["device_data"]
-                original_data = original_info["original_data"]
-                original_device: torch.device = original_info["device"]
-
-                if (
-                    (device_data.device == p.data.device)
-                    and (device_data.data_ptr() == p.data.data_ptr())
-                    and (device_data.shape == p.data.shape)
-                    and (device_data.dtype == p.data.dtype)
-                ):
-                    original_data.copy_(p.data.to(original_data.device))
-                    p.data = original_data
-                elif original_device.type == "cpu":
-                    # `torch.empty_like` does not support `pin_memory` argument
-                    cpu_data = torch.empty_strided(
-                        size=p.data.size(),
-                        stride=p.data.stride(),
-                        dtype=p.data.dtype,
-                        layout=p.data.layout,
-                        device="cpu",
-                        pin_memory=pin_memory,
-                    )
-                    cpu_data.copy_(p.data)
-                    p.data = cpu_data
-                else:
-                    p.data = p.data.to(original_device)
-        # New parameters or parameters already on target device are untouched
 
 
 logger = logging.getLogger(__name__)
@@ -257,7 +210,6 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
-        # Carry DSV4 expert layout into quant configs so downstream readers don't read env.
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         if isinstance(quant_config, Fp8Config):
@@ -357,6 +309,10 @@ def _post_load_weights(model: nn.Module) -> None:
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
+    # Rank-local weight memory already resident when ModelRunner sampled its
+    # pre-load baseline. Shared allocations must be reported by only one loader.
+    preloaded_weights_bytes: int = 0
+
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
 
@@ -374,6 +330,28 @@ class BaseModelLoader(ABC):
     ) -> nn.Module:
         """Load a model with the given configurations."""
         raise NotImplementedError
+
+
+def _validate_default_loader_extra_config(
+    *, extra_config: dict, load_format: LoadFormat
+) -> None:
+    allowed_keys = {"enable_multithread_load", "num_threads"}
+    if load_format == LoadFormat.FASTSAFETENSORS:
+        allowed_keys.add("enable_gds")
+        if "enable_gds" in extra_config and not isinstance(
+            extra_config["enable_gds"], bool
+        ):
+            raise ValueError(
+                "enable_gds in --model-loader-extra-config must be a boolean"
+            )
+
+    unexpected_keys = set(extra_config.keys()) - allowed_keys
+    if unexpected_keys:
+        raise ValueError(
+            f"Unexpected extra config keys for load format "
+            f"{load_format}: "
+            f"{unexpected_keys}"
+        )
 
 
 class DefaultModelLoader(BaseModelLoader):
@@ -427,24 +405,10 @@ class DefaultModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        extra_config = load_config.model_loader_extra_config
-        allowed_keys = {"enable_multithread_load", "num_threads"}
-        if load_config.load_format == LoadFormat.FASTSAFETENSORS:
-            allowed_keys.add("enable_gds")
-            if "enable_gds" in extra_config and not isinstance(
-                extra_config["enable_gds"], bool
-            ):
-                raise ValueError(
-                    "enable_gds in --model-loader-extra-config must be a boolean"
-                )
-        unexpected_keys = set(extra_config.keys()) - allowed_keys
-
-        if unexpected_keys:
-            raise ValueError(
-                f"Unexpected extra config keys for load format "
-                f"{load_config.load_format}: "
-                f"{unexpected_keys}"
-            )
+        _validate_default_loader_extra_config(
+            extra_config=load_config.model_loader_extra_config,
+            load_format=load_config.load_format,
+        )
 
     def _maybe_download_from_modelscope(
         self, model: str, revision: Optional[str]
@@ -1927,17 +1891,19 @@ class PreshardedModelLoader(DefaultModelLoader):
         def _safe(fn) -> int:
             try:
                 return fn()
-            except (AssertionError, AttributeError, RuntimeError):
+            except (AssertionError, AttributeError, RuntimeError, ValueError):
                 return 1
+
+        from sglang.srt.layers.dp_attention import get_moe_cp_size
 
         parallel = get_parallel()
         return {
             "tp": _safe(lambda: parallel.tp_size),
-            "dp": _safe(lambda: parallel.moe_dp_size),
+            "dp": _safe(get_moe_cp_size),
             "ep": _safe(lambda: parallel.moe_ep_size),
             "pp": _safe(lambda: parallel.pp_size),
             "moe_dense_tp_size": parallel.moe_dense_tp_size,
-            "moe_dp_size": configured_moe_dp_size(),
+            "moe_dp_size": get_parallel().moe_dp_size,
             "enable_dp_lm_head": parallel.enable_dp_lm_head,
             "enable_fp32_lm_head": get_exec().features.enable_fp32_lm_head,
             "quantization": model_config.quantization,
@@ -3271,10 +3237,27 @@ class RemoteInstanceModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         if load_config.model_loader_extra_config:
-            raise ValueError(
-                f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format}"
-            )
+            if (
+                load_config.remote_instance_weight_loader_backend
+                == RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+            ):
+                # ModelExpress falls back to a DefaultModelLoader whenever no
+                # peer holds the weights, so it consumes this config; validate
+                # the keys here so a bad one fails on every rank instead of only
+                # on the ranks that end up taking the fallback.
+                _validate_default_loader_extra_config(
+                    extra_config=load_config.model_loader_extra_config,
+                    load_format=load_config.load_format,
+                )
+            else:
+                # nccl and transfer_engine replace the native loader outright,
+                # so nothing would ever read the config.
+                raise ValueError(
+                    f"Model loader extra config is not supported for "
+                    f"load format {load_config.load_format} with "
+                    f"remote instance weight loader backend "
+                    f"{load_config.remote_instance_weight_loader_backend}"
+                )
         self.remote_instance_transfer_engine_weight_info = None
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -4347,6 +4330,11 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.GGUF:
         return GGUFModelLoader(load_config)
 
+    if load_config.load_format == LoadFormat.EXPERT_PACK:
+        from sglang.srt.model_loader.expert_pack_loader import ExpertPackModelLoader
+
+        return ExpertPackModelLoader(load_config)
+
     if load_config.load_format == LoadFormat.LAYERED:
         return LayeredModelLoader(load_config)
 
@@ -4391,22 +4379,10 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.IPC_CACHE:
         from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
-        from sglang.srt.weight_cache.protocol import (
-            compute_global_rank,
-            get_socket_path,
-        )
 
-        if load_config.weight_cache_socket:
-            socket_path = load_config.weight_cache_socket
-        else:
-            from sglang.srt.runtime_context import get_parallel
-
-            ps = get_parallel()
-            global_rank = compute_global_rank(ps.tp_size, ps.pp_rank, ps.tp_rank)
-            socket_path = get_socket_path(global_rank=global_rank)
         return IpcModelLoader(
             load_config=load_config,
-            socket_path=socket_path,
+            socket_path=load_config.weight_cache_socket,
             weight_cache_mode=load_config.weight_cache_mode,
             fallback_load_format=load_config.fallback_load_format,
         )

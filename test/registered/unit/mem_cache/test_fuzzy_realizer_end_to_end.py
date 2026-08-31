@@ -109,16 +109,18 @@ class TestContiguousRealization(CustomTestCase):
 
         req_to_token[1, target_pos] = donor_locs
         req = SimpleNamespace(
-            fuzzy_match_result=SimpleNamespace(
-                segments=None,
-                cached_start_pos=100,
-                layer_zero_mask=None,
+            kv=SimpleNamespace(
+                req_pool_idx=1,
+                cache_protected_len=exact + n,
+                cache_fuzzy_matched_len=n,
+                fuzzy_match_result=SimpleNamespace(
+                    segments=None,
+                    cached_start_pos=100,
+                    layer_zero_mask=None,
+                ),
+                fuzzy_realized_locs=realized_locs,
             ),
-            cache_fuzzy_matched_len=n,
-            fuzzy_realized_locs=realized_locs,
-            req_pool_idx=1,
             prefix_indices=torch.arange(0, exact + n, dtype=torch.long),
-            cache_protected_len=exact + n,
         )
 
         realizer.realize(fuzzy_reqs=[req])
@@ -130,9 +132,9 @@ class TestContiguousRealization(CustomTestCase):
             )
             torch.testing.assert_close(pool.v_buffer[layer][realized_locs], v_ref)
         self.assertTrue(torch.equal(req_to_token[1, target_pos], realized_locs))
-        self.assertEqual(req.cache_protected_len, exact)
-        self.assertIsNone(req.fuzzy_realized_locs)
-        self.assertEqual(req.cache_fuzzy_matched_len, 0)
+        self.assertEqual(req.kv.cache_protected_len, exact)
+        self.assertIsNone(req.kv.fuzzy_realized_locs)
+        self.assertEqual(req.kv.cache_fuzzy_matched_len, 0)
 
 
 class TestSegmentsRealization(CustomTestCase):
@@ -163,16 +165,18 @@ class TestSegmentsRealization(CustomTestCase):
             length=n,
         )
         req = SimpleNamespace(
-            fuzzy_match_result=SimpleNamespace(
-                segments=[segment],
-                cached_start_pos=0,
-                layer_zero_mask=None,
+            kv=SimpleNamespace(
+                req_pool_idx=2,
+                cache_protected_len=0,
+                cache_fuzzy_matched_len=n,
+                fuzzy_match_result=SimpleNamespace(
+                    segments=[segment],
+                    cached_start_pos=0,
+                    layer_zero_mask=None,
+                ),
+                fuzzy_realized_locs=realized_locs,
             ),
-            cache_fuzzy_matched_len=n,
-            fuzzy_realized_locs=realized_locs,
-            req_pool_idx=2,
             prefix_indices=torch.arange(0, 32, dtype=torch.long),
-            cache_protected_len=0,
         )
 
         realizer.realize(fuzzy_reqs=[req])
@@ -186,7 +190,7 @@ class TestSegmentsRealization(CustomTestCase):
         self.assertTrue(
             any(f.numel() == 1 and f.item() == realized_locs[-1].item() for f in freed)
         )
-        self.assertIsNone(req.fuzzy_realized_locs)
+        self.assertIsNone(req.kv.fuzzy_realized_locs)
 
 
 if __name__ == "__main__":

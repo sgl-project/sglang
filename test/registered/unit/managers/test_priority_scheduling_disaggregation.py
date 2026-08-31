@@ -41,6 +41,8 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req = MagicMock()
         req.priority = priority
         req.rid = "req"
+        req.output_ids = []
+        req.weight_version_events = []
         req.time_stats = MagicMock()
         req.time_stats.trace_ctx = MagicMock()
         return req
@@ -73,7 +75,11 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.abort_on_priority_when_disabled = True
         req = self._new_req(priority=10)
 
-        scheduler._add_request_to_queue(req)
+        with patch(
+            "sglang.srt.managers.scheduler.get_serving",
+            return_value=SimpleNamespace(weight_version="v0"),
+        ):
+            scheduler._add_request_to_queue(req)
 
         scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
@@ -87,11 +93,10 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             priority=priority,
             origin_input_ids=[1, 2, 3],
             output_ids=[],
-            req_pool_idx=int(priority) % 8,
             finished_reason=FINISH_ABORT("failed") if failed else None,
             return_logprob=False,
             sampling_params=SimpleNamespace(max_new_tokens=8),
-            cache_protected_len=0,
+            kv=SimpleNamespace(req_pool_idx=int(priority) % 8, cache_protected_len=0),
             time_stats=MagicMock(),
         )
         return SimpleNamespace(

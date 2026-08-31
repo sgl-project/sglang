@@ -376,9 +376,15 @@ class TestFuzzyDonorLockAccounting(CustomTestCase):
         reqs = [
             SimpleNamespace(
                 rid=f"req-{i}",
-                fuzzy_donor_node=None,
-                fuzzy_realized_locs=None,
-                fuzzy_match_result=None,
+                cache_salt=None,
+                kv=SimpleNamespace(
+                    req_pool_idx=i,
+                    cache_protected_len=0,
+                    cache_fuzzy_matched_len=0,
+                    fuzzy_donor_node=None,
+                    fuzzy_realized_locs=None,
+                    fuzzy_match_result=None,
+                ),
             )
             for i in range(8)
         ]
@@ -391,7 +397,7 @@ class TestFuzzyDonorLockAccounting(CustomTestCase):
                 )
             )
             self.assertEqual(result.fuzzy_matched_len, 2)
-            self.assertIs(req.fuzzy_donor_node, donor)
+            self.assertIs(req.kv.fuzzy_donor_node, donor)
 
         with ThreadPoolExecutor(max_workers=4) as pool:
             list(pool.map(run_match, reqs))
@@ -399,8 +405,8 @@ class TestFuzzyDonorLockAccounting(CustomTestCase):
         self.assertEqual(donor.lock_ref, len(reqs))
 
         for req in reqs:
-            cache.dec_lock_ref(req.fuzzy_donor_node)
-            req.fuzzy_donor_node = None
+            cache.dec_lock_ref(req.kv.fuzzy_donor_node)
+            req.kv.fuzzy_donor_node = None
 
         self.assertEqual(donor.lock_ref, 0)
 

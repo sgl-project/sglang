@@ -77,10 +77,10 @@ SGLang `>=0.5.10` is required for Qwen3.6. You can install from PyPI, from sourc
 
 ```bash Command
 # Install from PyPI
-uv pip install sglang
+uv pip install --prerelease=allow sglang
 
 # Or install from source
-uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
+uv pip install --prerelease=allow 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 
 # Or use Docker (NVIDIA GPUs; also serves the NVFP4 variants)
 docker pull lmsysorg/sglang:latest

@@ -9,8 +9,10 @@ import torch
 from sglang.srt.layers.moe.utils import (
     MoeA2ABackend,
     MoeRunnerBackend,
+    MoeRunnerBackendLike,
     RoutingMethodType,
 )
+from sglang.srt.runtime_context import get_forward
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.triton import (
@@ -28,7 +30,6 @@ if TYPE_CHECKING:
 
 def moe_output_buffer_ctx(buf: torch.Tensor):
     """Provide the MoE output buffer for the current forward scope."""
-    from sglang.srt.runtime_context import get_forward
 
     return get_forward().scoped(moe_output_buffer=buf)
 
@@ -111,6 +112,26 @@ class MoeRunnerCore(ABC):
 
     def runner_backend_is_triton(self) -> TypeGuard[TritonRunnerCore]:
         return self.runner_backend == MoeRunnerBackend.TRITON
+
+
+class DispatchMoeRunnerCore(ABC):
+    """Runner core that consumes the standard dispatch representation directly."""
+
+    def __init__(self, config: MoeRunnerConfig):
+        self.config = config
+
+    @property
+    @abstractmethod
+    def runner_backend(self) -> MoeRunnerBackendLike: ...
+
+    @abstractmethod
+    def run_from_dispatch(
+        self,
+        dispatch_output: DispatchOutput,
+        quant_info: MoeQuantInfo,
+        runner_config: MoeRunnerConfig,
+        hooks: Any = None,
+    ) -> CombineInput: ...
 
 
 class FusedOpPool:
