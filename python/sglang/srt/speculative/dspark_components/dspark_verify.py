@@ -134,15 +134,15 @@ class TargetVerifyExecutor:
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
-        correct_len, bonus, cap_trim_lens = accept_draft_tokens(
-            candidates=verify_ids_2d,
+        correct_len, bonus, cap_trim_lens = self._accept_draft_tokens(
+            bs=bs,
+            verify_ids_2d=verify_ids_2d,
             target_logits=target_logits,
             draft_block=draft_block,
             sampling_info=sampling_info,
             draft_input=draft_input,
-            gamma=self.num_drafts,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            cutoff_layout=layout,
+            layout=layout,
+            prefix_lens=prefix_lens,
         )
         if self._simulate_acc_len > 0:
             correct_len = self._simulated_correct_len(
@@ -177,6 +177,30 @@ class TargetVerifyExecutor:
             commit_lens=finalized.commit_lens,
             new_seq_lens=finalized.new_seq_lens,
             out_tokens=out_tokens,
+        )
+
+    def _accept_draft_tokens(
+        self,
+        *,
+        bs: int,
+        verify_ids_2d: torch.Tensor,
+        target_logits: Optional[torch.Tensor],
+        draft_block: DraftBlockResult,
+        sampling_info,
+        draft_input: DFlashDraftInputV2,
+        layout: Optional[RaggedVerifyLayout],
+        prefix_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Accept primitive; returns cutoff-capped (correct_len, bonus, cap_trim_lens)."""
+        return accept_draft_tokens(
+            candidates=verify_ids_2d,
+            target_logits=target_logits,
+            draft_block=draft_block,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=self.num_drafts,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            cutoff_layout=layout,
         )
 
     def _simulated_correct_len(
