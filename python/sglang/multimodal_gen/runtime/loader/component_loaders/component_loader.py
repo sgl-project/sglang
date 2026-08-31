@@ -23,6 +23,7 @@ from transformers.quantizers import AutoHfQuantizer
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    ComponentAttentionBackendNotAppliedError,
     component_attn_backend_context_manager,
     get_component_attn_backend_context,
 )
@@ -137,6 +138,10 @@ class ComponentLoader(ABC):
     # Gates only --component-quantizations.<name>. Quantization declared by a
     # checkpoint is discovered and admitted by the component's normal loader.
     supports_online_quantization_override = False
+    # Gates only --component-direct-gpu-weight-loading.<name>. The checkpoint
+    # source stays component-specific because its streaming ABI is loader-owned.
+    supports_direct_gpu_weight_loading = False
+    supports_fsdp_inference = False
 
     _loaders_registered = False
 
@@ -168,13 +173,42 @@ class ComponentLoader(ABC):
     ) -> dict[str, Any]:
         return {}
 
+    def component_load_precision(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        """Return an exact precision override or reject an unsupported one."""
+        precision = server_args.component_precisions.get(component_name)
+        if precision is not None:
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} does not support an exact component precision "
+                "override"
+            )
+        return None
+
+    def supports_direct_gpu_weight_loading_for_component(
+        self, _component_name: str
+    ) -> bool:
+        return self.supports_direct_gpu_weight_loading
+
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
-        native_only_components = getattr(
-            server_args.pipeline_config, "native_only_components", ()
-        )
-        return component_name in native_only_components
+        return component_name in server_args.pipeline_config.native_only_components
+
+    def validate_native_fallback(
+        self, _server_args: ServerArgs, _component_name: str
+    ) -> None:
+        """Validate that fallback preserves the exact component's runtime contract."""
+        pass
+
+    def disable_unsupported_component_fsdp(
+        self, server_args: ServerArgs, component_name: str
+    ) -> None:
+        if (
+            not self.supports_fsdp_inference
+            and server_args.should_use_fsdp_for_component(component_name)
+        ):
+            server_args.disable_fsdp_for_component(component_name)
 
     def _load_customized_with_context(
         self,
@@ -184,11 +218,13 @@ class ComponentLoader(ABC):
         attn_backend: Any,
         component_attn_name: str | None,
         allow_global_backend_fallback: bool,
+        require_backend_selection: bool,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
             attn_backend,
             component_name=component_attn_name,
             allow_global_backend_fallback=allow_global_backend_fallback,
+            require_backend_selection=require_backend_selection,
         ):
             load_kwargs = self.customized_load_kwargs_for_component(
                 server_args, component_name
@@ -206,11 +242,13 @@ class ComponentLoader(ABC):
         attn_backend: Any,
         component_attn_name: str | None,
         allow_global_backend_fallback: bool,
+        require_backend_selection: bool,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
             attn_backend,
             component_name=component_attn_name,
             allow_global_backend_fallback=allow_global_backend_fallback,
+            require_backend_selection=require_backend_selection,
         ):
             component = self.load_native(
                 component_model_path,
@@ -226,6 +264,9 @@ class ComponentLoader(ABC):
         server_args: ServerArgs,
         component_name: str,
         transformers_or_diffusers: str,
+        *,
+        component_attn_backend: Any = None,
+        component_attn_name: str | None = None,
     ) -> tuple[AutoModel, float]:
         """
         Template method that standardizes logging around the core load implementation.
@@ -236,6 +277,14 @@ class ComponentLoader(ABC):
 
         """
         self._native_load_manages_placement = False
+        self.component_load_precision(server_args, component_name)
+        if server_args.should_direct_gpu_weight_load_component(
+            component_name
+        ) and not self.supports_direct_gpu_weight_loading_for_component(component_name):
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} does not support direct GPU weight loading"
+            )
+        self.disable_unsupported_component_fsdp(server_args, component_name)
         component_quantization = server_args.component_quantizations.get(component_name)
         if (
             component_quantization is not None
@@ -254,32 +303,55 @@ class ComponentLoader(ABC):
             component_model_path,
             gpu_mem_before_loading,
         )
-        attn_backend = None
-        component_attn_name = None
-        if get_component_attn_backend_context() is None:
-            attn_backend, matched_backend_key = (
+        if (
+            component_attn_backend is None
+            and component_attn_name is None
+            and get_component_attn_backend_context() is None
+        ):
+            component_attn_backend, matched_backend_key = (
                 server_args.resolve_component_attention_backend(component_name)
             )
             component_attn_name = matched_backend_key or component_name
-            if attn_backend is not None:
+            if component_attn_backend is not None:
                 logger.info(
                     "Using %s backend for component: %s",
-                    attn_backend.name.lower(),
+                    component_attn_backend.name.lower(),
                     matched_backend_key,
                 )
+        requested_backend = (
+            server_args.requested_component_attention_backend(component_attn_name)
+            if component_attn_name is not None
+            else None
+        )
+        require_backend_selection = requested_backend is not None
+        if require_backend_selection and (
+            component_attn_backend is None
+            or component_attn_backend.name.lower() != requested_backend
+        ):
+            raise ValueError(
+                f"Component attention backend for {component_attn_name!r} no longer "
+                f"matches the explicit request {requested_backend!r}"
+            )
         try:
             component = self._load_customized_with_context(
                 component_model_path,
                 server_args,
                 component_name,
-                attn_backend,
+                component_attn_backend,
                 component_attn_name,
                 self.allow_global_attention_backend_fallback,
+                require_backend_selection,
             )
             source = "sgl-diffusion"
-        except (ComponentCheckpointUnsupportedError, ComponentResidencyError):
+        except (
+            ComponentAttentionBackendNotAppliedError,
+            ComponentCheckpointUnsupportedError,
+            ComponentResidencyError,
+        ):
             raise
         except Exception as e:
+            if require_backend_selection:
+                raise
             native_loader_required = isinstance(e, NativeComponentLoaderRequired)
             if self.should_raise_customized_load_error(server_args, component_name):
                 if native_loader_required:
@@ -289,6 +361,7 @@ class ComponentLoader(ABC):
                     f"Failed to load customized {component_name}; native fallback "
                     "is disabled for this component configuration."
                 ) from e
+            self.validate_native_fallback(server_args, component_name)
             if native_loader_required:
                 logger.info("%s", e)
             elif "Unsupported model architecture" in str(e):
@@ -306,9 +379,10 @@ class ComponentLoader(ABC):
                 server_args,
                 component_name,
                 transformers_or_diffusers,
-                attn_backend,
+                component_attn_backend,
                 component_attn_name,
                 self.allow_global_attention_backend_fallback,
+                require_backend_selection,
             )
             source = "native"
             logger.warning(
@@ -541,6 +615,11 @@ class ComponentLoader(ABC):
 class PlainStateDictComponentLoader(ComponentLoader):
     """Base for native loaders whose current materializer expects plain weights."""
 
+    def component_load_precision(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return server_args.component_precisions.get(component_name)
+
     @staticmethod
     def ensure_plain_state_dict_checkpoint(config: object, component_name: str) -> None:
         try:
@@ -697,19 +776,14 @@ class PipelineComponentLoader:
         )
 
         try:
-            with component_attn_backend_context_manager(
-                component_attn_backend,
-                component_name=component_attn_name,
-                allow_global_backend_fallback=(
-                    loader.allow_global_attention_backend_fallback
-                ),
-            ):
-                return loader.load(
-                    component_model_path,
-                    server_args,
-                    component_name,
-                    transformers_or_diffusers,
-                )
+            return loader.load(
+                component_model_path,
+                server_args,
+                component_name,
+                transformers_or_diffusers,
+                component_attn_backend=component_attn_backend,
+                component_attn_name=component_attn_name,
+            )
         except Exception:
             logger.error(
                 f"Error while loading component: {component_name}, {component_model_path=}"

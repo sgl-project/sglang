@@ -54,7 +54,7 @@ import math
 import os
 import sys
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -833,6 +833,25 @@ def _build_config_bags(server_args: Any) -> dict:
     return tops
 
 
+def _resolved_or_field(server_args: Any, name: str, default: Any) -> Any:
+    """What resolution decided for `name`, falling back to the field.
+
+    Publishes that carry no config at all (sentinels, mocks) have neither, and
+    answer with `default`.
+    """
+    if server_args is None:
+        return default
+    from sglang.srt.arg_groups.overrides import resolution_result
+
+    decided = resolution_result(server_args, name)
+    if decided is not None:
+        return decided
+    # The default is for the callers that hand over something record-shaped but
+    # not a record -- the fake configs the context tests publish, and `object()`
+    # for the sentinel publish. A real ServerArgs always has the field.
+    return getattr(server_args, name, default)
+
+
 class RuntimeContext:
     """Container for the structured runtime accessors; exposes ``parallel``,
     ``server_args``, the resolved config namespace bags, ``flags``,
@@ -914,9 +933,10 @@ class RuntimeContext:
         stash, which is what the bags are projected from.
         """
         # Seed the capture tier for the new lifecycle (defaults for sentinel
-        # and mock publishes, which carry no config).
-        self.flags.capture.enable_torch_compile = getattr(
-            server_args, "enable_torch_compile", False
+        # and mock publishes, which carry no config). Through the resolution,
+        # not the field: the field is the operator's input.
+        self.flags.capture.enable_torch_compile = bool(
+            _resolved_or_field(server_args, "enable_torch_compile", False)
         )
         self._server_args = server_args
         # The adaptive draft-token bound memoizes on the config *path*, so a new
@@ -1145,7 +1165,6 @@ class _ServerArgsOverride:
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
         from sglang.srt.arg_groups.overrides import (
-            _apply_fields,
             declare_late_resolution,
         )
 
@@ -1162,18 +1181,20 @@ class _ServerArgsOverride:
             )
         # Declared so the projection sees it; late, because the record is
         # resolved already and not yet published.
-        # Underscore names are not fields at all (they seed private property
-        # caches), so they stay a direct write.
-        declared = {
-            name: value for name, value in self._fields.items() if name[0] != "_"
-        }
+        # Split on whether the name is a field, not on whether it starts with
+        # an underscore: `_speculative_draft_quantization_explicitly_set` is a
+        # real field, and seeding it as a raw attribute would leave the earlier
+        # declaration authoritative, so `resolution_result` and the bag would
+        # both keep answering the pre-override value.
+        fields = set(type(server_args).__dataclass_fields__)
+        declared = {n: v for n, v in self._fields.items() if n in fields}
         if declared:
             declare_late_resolution(server_args, "override_server_args", **declared)
-        # This hook stands in for a launch: the caller's values are both what
-        # the operator passed and what resolution decided, so they go on the
-        # record as well as into the stash. Production late resolution declares
-        # only -- there the record stays the operator's input.
-        _apply_fields(server_args, self._fields)
+        # What is left seeds the record's own private caches (`_model_config`
+        # and friends), which are not configuration and never were.
+        seeds = {n: v for n, v in self._fields.items() if n not in fields}
+        for name, value in seeds.items():
+            object.__setattr__(server_args, name, value)
         ctx.set_server_args(server_args)
         self._installed = True
         return server_args
@@ -1696,8 +1717,8 @@ def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
 
     Derived from published leaves across four bags (``disagg`` / ``schedule`` /
     ``exec.graph`` / ``spec``) plus the configured parallel sizes, so it follows
-    a post-publish override; ``ServerArgs.pre_capture_activation_reserve_mb`` is
-    the pre-publish equivalent and
+    a post-publish override; ``pre_capture_activation_reserve_mb_of`` in
+    ``arg_groups.overrides`` is the config-shaped equivalent and
     ``TestDerivedPredicatesAgreeAcrossTiers`` pins the two equal.
     """
     schedule = get_schedule()
@@ -1721,6 +1742,142 @@ def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
     if gpu_mem is not None and gpu_mem > 60 * 1024:
         reserved_mem = max(reserved_mem, 10 * 1024)
     return reserved_mem
+
+
+# --- Platform facts -----------------------------------------------------------
+#
+# One address for what kind of machine this is, so a reader asks
+# `get_platform().is_sm100` and an override is stated once instead of patched
+# into every module that imported a probe. True before publish, so the context
+# probes when no override is installed; `utils.common` holds the implementation.
+
+_PLATFORM_PROBES: Dict[str, str] = {
+    "is_cuda": "is_cuda",
+    "is_hip": "is_hip",
+    "is_npu": "is_npu",
+    "is_xpu": "is_xpu",
+    "is_musa": "is_musa",
+    "is_sm90": "is_sm90_supported",
+    "is_sm100": "is_sm100_supported",
+    "is_sm100_or_sm110": "is_sm100_or_sm110_supported",
+    "is_sm120": "is_sm120_supported",
+    "is_blackwell": "is_blackwell_supported",
+    "is_hopper_with_cuda_12_3": "is_hopper_with_cuda_12_3",
+    "has_amx": "cpu_has_amx_support",
+    "has_flashinfer": "is_flashinfer_available",
+}
+
+# Not yes/no facts, same address.
+_PLATFORM_VALUES: Dict[str, str] = {
+    "device_sm": "get_device_sm",
+    "device_capability": "get_device_capability",
+}
+
+
+class PlatformContext:
+    """The machine's own facts, with one place to override them.
+
+    Every name maps to a probe in `utils.common`; the probes are
+    `lru_cache`-d, so reading through here costs a call and a dict lookup
+    (~26 ns) rather than a device query.
+    """
+
+    __slots__ = ("_overrides",)
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "_overrides", {})
+
+    def __getattr__(self, name: str) -> Any:
+        probe = _PLATFORM_PROBES.get(name) or _PLATFORM_VALUES.get(name)
+        if probe is None:
+            known = sorted(set(_PLATFORM_PROBES) | set(_PLATFORM_VALUES))
+            raise AttributeError(
+                f"unknown platform fact {name!r}; known: {', '.join(known)}"
+            )
+        overrides = object.__getattribute__(self, "_overrides")
+        if name in overrides:
+            return overrides[name]
+        from sglang.srt.utils import common as _common
+
+        return getattr(_common, probe)()
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(
+            "platform facts are not assigned; use "
+            "`sglang.srt.runtime_context.override_platform(...)` so every "
+            "reader agrees"
+        )
+
+    def _install(self, **facts: Any) -> Dict[str, Any]:
+        unknown = set(facts) - set(_PLATFORM_PROBES) - set(_PLATFORM_VALUES)
+        if unknown:
+            raise ValueError(f"unknown platform fact(s): {sorted(unknown)}")
+        overrides = object.__getattribute__(self, "_overrides")
+        previous = {k: overrides[k] for k in facts if k in overrides}
+        missing = [k for k in facts if k not in overrides]
+        overrides.update(facts)
+        return {"previous": previous, "missing": missing}
+
+    def _restore(self, saved: Dict[str, Any]) -> None:
+        overrides = object.__getattribute__(self, "_overrides")
+        overrides.update(saved["previous"])
+        for k in saved["missing"]:
+            overrides.pop(k, None)
+
+
+_PLATFORM = PlatformContext()
+
+
+def get_platform() -> PlatformContext:
+    """The machine's facts. Answers before publish, unlike a config bag."""
+    return _PLATFORM
+
+
+class _PlatformOverride:
+    """Scoped platform override: `with override_platform(is_sm100=True): ...`"""
+
+    __slots__ = ("_facts", "_saved")
+
+    def __init__(self, **facts: Any) -> None:
+        self._facts = facts
+        self._saved = None
+
+    def install(self) -> PlatformContext:
+        self._saved = _PLATFORM._install(**self._facts)
+        return _PLATFORM
+
+    def restore(self) -> None:
+        if self._saved is not None:
+            _PLATFORM._restore(self._saved)
+            self._saved = None
+
+    def __enter__(self) -> PlatformContext:
+        return self.install()
+
+    def __exit__(self, *exc: Any) -> None:
+        self.restore()
+
+    def __call__(self, fn: Any) -> Any:
+        """Also usable as a decorator, like the `patch` it replaces.
+
+        A fresh scope per call: the same object decorating two tests must not
+        share one saved state.
+        """
+        import functools
+
+        facts = dict(self._facts)
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with _PlatformOverride(**facts):
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+
+def override_platform(**facts: Any) -> _PlatformOverride:
+    """Say what kind of machine this is, once, for every reader."""
+    return _PlatformOverride(**facts)
 
 
 # --- Derived config accessors ------------------------------------------------
@@ -1873,3 +2030,124 @@ def is_ep_joiner() -> bool:
 def is_ep_scale_joiner() -> bool:
     """True in a process launched as an elastic-EP scale-up joiner."""
     return get_exec().moe.ep_join_mode == "scale"
+
+
+def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
+    """Return a structured description of this server's KV-event
+    publisher, or `None` if publishing is disabled / misconfigured.
+
+    This is the wire contract surfaced under the `kv_events` key on
+    `/server_info` so KV-aware routers (e.g. the SGLang model
+    gateway) can subscribe per-worker without operator-supplied port
+    coordination. The router constructs the per-DP-rank SUB endpoint
+    as tcp://<worker_host>:<endpoint_port_base + dp_rank> for
+    every rank reported in dp_size.
+
+    Returned descriptor shape:
+
+        {
+            "publisher": "zmq",
+            "endpoint_host": "*",             # may be a ZMQ wildcard
+                                              # ("*", "0.0.0.0", "::");
+                                              # subscribers MUST substitute
+                                              # the worker URL's host when
+                                              # dialing
+            "endpoint_port_base": 5557,       # base TCP port; per-rank
+                                              # port = base + dp_rank
+            "topic": "",                      # ZMQ topic prefix on the
+                                              # SUB filter (empty =
+                                              # subscribe-all)
+            "block_size": <kv_event_block_size>,  # subscribers MUST
+                                              # hash prompts at this size
+            "dp_size": <dp_size>,             # number of SUB sockets to
+                                              # open; not DCP-scaled, as
+                                              # DCP shards within a rank
+                                              # rather than adding
+                                              # publishers
+            "load_endpoint_port_base": <resolved>,
+                                              # base TCP port of the load
+                                              # range (load rank r = base
+                                              # + r). Consumers MUST read
+                                              # this key, not re-derive
+                                              # it; present only when
+                                              # --load-publish-endpoint
+                                              # opted in and a range
+                                              # resolved
+            "load_topic": "load",             # SUB filter for the load
+                                              # socket; present iff
+                                              # load_endpoint_port_base
+                                              # is present
+        }
+
+    Returns None (i.e. "no publisher to describe") when any of:
+
+    * --kv-events-config is unset / empty / malformed JSON,
+    * the configured publisher is "null",
+    * page_size is missing or non-positive (a placeholder
+      block_size would cause silent KV-cache misses by hashing
+      prompts at the wrong granularity on the router side),
+    * the endpoint is not a routable TCP address (inproc:// /
+      ipc://, missing port, non-integer port, port outside
+      1..65535, or a bare unbracketed IPv6 host, which is
+      ambiguous).
+
+    NOTE for load-socket consumers: pair the load port with the worker's
+    own URL host, as with the KV SUB endpoints — endpoint_host is a
+    wildcard ("*", "0.0.0.0", "::") whenever the default packing applies,
+    so splicing it yields tcp://*:PORT and connects to nothing.
+
+    Reuses parse_advertisable_tcp and resolve_load_pub_range — the same
+    helpers the scheduler binds through — so the advertisement cannot
+    drift from the sockets.
+    """
+    from sglang.srt.arg_groups.overrides import kv_event_block_size_of, resolving_view
+
+    # Lazy import so loading server_args doesn't pull in
+    # disaggregation / msgspec / zmq at module top level.
+    from sglang.srt.disaggregation.kv_events import (
+        LOAD_TOPIC,
+        KVEventsConfig,
+        parse_advertisable_tcp,
+        resolve_load_pub_range,
+    )
+
+    resolved = resolving_view(server_args)
+    raw = resolved.kv_events_config
+    page_size = resolved.page_size
+    if not raw or page_size is None or page_size <= 0:
+        return None
+    try:
+        cfg = KVEventsConfig.from_cli(raw)
+    except Exception:
+        # Malformed JSON / schema mismatch. The publisher would
+        # have failed at server startup; /server_info must
+        # keep working, so just report "no publisher" to consumers.
+        return None
+    if cfg.publisher == "null" or not cfg.endpoint:
+        return None
+    resolved_kv = parse_advertisable_tcp(cfg.endpoint)
+    if resolved_kv is None:
+        return None
+    host, port = resolved_kv
+
+    descriptor = {
+        "publisher": cfg.publisher,
+        "endpoint_host": host,
+        "endpoint_port_base": port,
+        "topic": cfg.topic,
+        "block_size": kv_event_block_size_of(resolved),
+        "dp_size": resolved.dp_size,
+    }
+    # Load range, from the same resolver SchedulerLoadPublisher binds
+    # with (so the two can't drift). The decline reason is logged once at
+    # startup, not here — this runs per /server_info request.
+    resolved_range, _reason = resolve_load_pub_range(
+        kv_endpoint=cfg.endpoint,
+        replay_endpoint=cfg.replay_endpoint,
+        dp_size=resolved.dp_size,
+        load_publish_endpoint=resolved.load_publish_endpoint,
+    )
+    if resolved_range is not None:
+        descriptor["load_endpoint_port_base"] = resolved_range[1]
+        descriptor["load_topic"] = LOAD_TOPIC
+    return descriptor

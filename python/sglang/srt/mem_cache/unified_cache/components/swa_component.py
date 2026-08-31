@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
+    EvictParams,
     IncLockRefResult,
     InsertParams,
     InsertResult,
@@ -32,6 +33,8 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    ExternalLinkerLoadPhase,
+    LinkerTransferPhase,
     LRURefreshPhase,
     PreparePrefetchResult,
     TreeComponent,
@@ -268,6 +271,7 @@ class SWAComponent(TreeComponent):
         total_prefix_len: int,
         value_slice: torch.Tensor,
         params: InsertParams,
+        result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> int:
         if params.prev_prefix_len >= total_prefix_len + prefix_len:
@@ -288,12 +292,22 @@ class SWAComponent(TreeComponent):
 
         if swa_evicted_seqlen <= total_prefix_len:
             # Branch 1: entire value_slice is within SWA window — recover
+            result.record_adopted_range(
+                self.component_type,
+                total_prefix_len,
+                total_prefix_len + prefix_len,
+            )
             old_full = full_cd.value
             if full_cd.lock_ref > 0:
                 cache_actions.append(
                     RecoverSWAWithLockedFull(node.id, old_full, value_slice)
                 )
                 return 0
+            result.record_adopted_range(
+                BASE_COMPONENT_TYPE,
+                total_prefix_len,
+                total_prefix_len + prefix_len,
+            )
             full_cd.value = value_slice.clone()
             cache_actions.append(FreeDeviceKVFullOnly([old_full]))
             cache_actions.append(SWARebuild(node.id, value_slice))
@@ -301,6 +315,11 @@ class SWAComponent(TreeComponent):
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
             # Branch 2: value_slice[start_idx:] is within SWA window — partial recover
             start_idx = swa_evicted_seqlen - total_prefix_len
+            result.record_adopted_range(
+                self.component_type,
+                swa_evicted_seqlen,
+                total_prefix_len + prefix_len,
+            )
             is_locked = full_cd.lock_ref > 0
             old_full = full_cd.value[start_idx:]
             _, action = self.tree_core._split_node(node.key, node, start_idx)
@@ -312,6 +331,11 @@ class SWAComponent(TreeComponent):
                     RecoverSWAWithLockedFull(node.id, old_full, new_full)
                 )
                 return start_idx
+            result.record_adopted_range(
+                BASE_COMPONENT_TYPE,
+                swa_evicted_seqlen,
+                total_prefix_len + prefix_len,
+            )
             node.component_data[BASE_COMPONENT_TYPE].value = new_full.clone()
             cache_actions.append(FreeDeviceKVFullOnly([old_full]))
             cache_actions.append(SWARebuild(node.id, new_full))
@@ -326,6 +350,7 @@ class SWAComponent(TreeComponent):
         prefix_len: int,
         total_prefix_len: int,
         params: InsertParams,
+        result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         # _unevict_node_on_insert already wrote the request's fresh KV slice
@@ -351,6 +376,11 @@ class SWAComponent(TreeComponent):
                 cache_actions.append(action)
         else:
             return
+        result.record_adopted_range(
+            self.component_type,
+            max(total_prefix_len, swa_evicted_seqlen),
+            total_prefix_len + prefix_len,
+        )
         cache_actions.append(
             SWARebuild(
                 node.id,
@@ -370,10 +400,16 @@ class SWAComponent(TreeComponent):
             return
 
         node_start = result.prefix_len
+        node_end = node_start + len(node.key)
         split_pos = params.swa_evicted_seqlen - node_start
         if split_pos >= len(node.key):
             # Entire leaf is outside the SWA window — left as a tombstone.
             return
+        result.record_adopted_range(
+            self.component_type,
+            max(node_start, params.swa_evicted_seqlen),
+            node_end,
+        )
         if split_pos > 0:
             # Node straddles the boundary: split into an out-of-window parent
             # (tombstone) and an in-window child; `node` becomes the child.
@@ -907,6 +943,99 @@ class SWAComponent(TreeComponent):
             ]
 
         return None
+
+    def build_external_linker_transfer(
+        self,
+        phase: LinkerTransferPhase,
+        node: Optional[UnifiedTreeNode],
+        keys: Optional[Sequence[str]],
+    ) -> Optional[PoolTransfer]:
+        page = self.cache.page_size
+        window_pages = (self.sliding_window_size + page - 1) // page
+
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[self.component_type].value
+            if value is None or len(value) < page:
+                return None
+
+            num_pages = len(value) // page
+            return PoolTransfer(
+                name=PoolName.SWA,
+                device_indices=value[-num_pages * page :].to(torch.int64),
+                keys=node.hash_value[-num_pages:],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+
+        if not keys:
+            return None
+
+        # `keys` already start at the first device-uncached page, so the trailing
+        # window is simply their tail.
+        tail_keys = list(keys[max(0, len(keys) - window_pages) :])
+        if not tail_keys:
+            return None
+
+        transfer = PoolTransfer(
+            name=PoolName.SWA,
+            keys=tail_keys,
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        if phase == LinkerTransferPhase.LOAD:
+            num_tokens = len(tail_keys) * page
+            allocator = self.cache.token_to_kv_pool_allocator.swa_attn_allocator
+            shortfall = max(0, num_tokens - allocator.available_size())
+            if shortfall:
+                self.cache.evict(EvictParams(swa_num_tokens=shortfall))
+            transfer.device_indices = allocator.alloc(num_tokens)
+            if transfer.device_indices is None:
+                return None
+            transfer.device_indices = transfer.device_indices.to(torch.int64)
+        return transfer
+
+    def update_external_linker_load(
+        self,
+        phase: ExternalLinkerLoadPhase,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        *,
+        insert_result: Optional[InsertResult] = None,
+        canonical_full: Optional[torch.Tensor] = None,
+    ) -> Optional[PoolTransfer]:
+        if phase == ExternalLinkerLoadPhase.ABORT:
+            self.cache.token_to_kv_pool_allocator.swa_attn_allocator.free(
+                transfer.device_indices
+            )
+            return None
+
+        allocator = self.cache.token_to_kv_pool_allocator
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            swa_len = len(transfer.device_indices)
+            allocator.set_full_to_swa_mapping(
+                full_transfer.device_indices[-swa_len:], transfer.device_indices
+            )
+            page = self.cache.page_size
+            window = ((self.sliding_window_size + page - 1) // page) * page
+            boundary = max(0, prefix_len - window)
+            if req.kv is None:
+                from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+                req.kv = ReqKvInfo(
+                    kv_allocated_len=prefix_len,
+                    swa_evicted_seqlen=boundary,
+                )
+            else:
+                req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, boundary)
+            return transfer
+
+        assert phase == ExternalLinkerLoadPhase.COMMIT
+        assert insert_result is not None and canonical_full is not None
+        assert len(canonical_full) == len(transfer.device_indices)
+        allocator.set_full_to_swa_mapping(canonical_full, transfer.device_indices)
+        return transfer
 
     def commit_hicache_transfer(
         self,

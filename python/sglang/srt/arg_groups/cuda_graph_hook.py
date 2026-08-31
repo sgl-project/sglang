@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
     declare_resolution,
     model_config_of,
     resolved_view,
@@ -22,12 +23,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     with_phase,
 )
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     is_cpu,
-    is_hip,
     is_mps,
-    is_npu,
-    is_xpu,
     parse_connector_type,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
@@ -111,7 +110,6 @@ def apply_cuda_graph_compatibility(server_args: Any):
     prefill backend (this folds in the old
     --enforce-piecewise-cuda-graph contract).
     """
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
@@ -167,7 +165,11 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
         ("pipeline parallelism (pp_size > 1)", lambda: cfg.pp_size > 1),
         (
             "non-CUDA hardware (HIP/NPU/CPU/MPS/XPU)",
-            lambda: is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu(),
+            lambda: get_platform().is_hip
+            or get_platform().is_npu
+            or is_cpu()
+            or is_mps()
+            or get_platform().is_xpu,
         ),
         (
             "OOT platform without piecewise support",
@@ -330,7 +332,6 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
     breakable) trtllm_mla falls back to FlashAttention for prefill and regresses
     performance, so disable whichever prefill graph backend is in effect.
     """
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
 
