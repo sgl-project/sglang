@@ -23,6 +23,7 @@ from transformers.quantizers import AutoHfQuantizer
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    ComponentAttentionBackendNotAppliedError,
     component_attn_backend_context_manager,
     get_component_attn_backend_context,
 )
@@ -217,17 +218,13 @@ class ComponentLoader(ABC):
         attn_backend: Any,
         component_attn_name: str | None,
         allow_global_backend_fallback: bool,
+        require_backend_selection: bool,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
             attn_backend,
             component_name=component_attn_name,
             allow_global_backend_fallback=allow_global_backend_fallback,
-            require_component_backend_selection=(
-                attn_backend is None
-                or not server_args.is_component_attention_backend_automatic(
-                    component_attn_name
-                )
-            ),
+            require_backend_selection=require_backend_selection,
         ):
             load_kwargs = self.customized_load_kwargs_for_component(
                 server_args, component_name
@@ -245,17 +242,13 @@ class ComponentLoader(ABC):
         attn_backend: Any,
         component_attn_name: str | None,
         allow_global_backend_fallback: bool,
+        require_backend_selection: bool,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
             attn_backend,
             component_name=component_attn_name,
             allow_global_backend_fallback=allow_global_backend_fallback,
-            require_component_backend_selection=(
-                attn_backend is None
-                or not server_args.is_component_attention_backend_automatic(
-                    component_attn_name
-                )
-            ),
+            require_backend_selection=require_backend_selection,
         ):
             component = self.load_native(
                 component_model_path,
@@ -271,6 +264,9 @@ class ComponentLoader(ABC):
         server_args: ServerArgs,
         component_name: str,
         transformers_or_diffusers: str,
+        *,
+        component_attn_backend: Any = None,
+        component_attn_name: str | None = None,
     ) -> tuple[AutoModel, float]:
         """
         Template method that standardizes logging around the core load implementation.
@@ -307,32 +303,55 @@ class ComponentLoader(ABC):
             component_model_path,
             gpu_mem_before_loading,
         )
-        attn_backend = None
-        component_attn_name = None
-        if get_component_attn_backend_context() is None:
-            attn_backend, matched_backend_key = (
+        if (
+            component_attn_backend is None
+            and component_attn_name is None
+            and get_component_attn_backend_context() is None
+        ):
+            component_attn_backend, matched_backend_key = (
                 server_args.resolve_component_attention_backend(component_name)
             )
             component_attn_name = matched_backend_key or component_name
-            if attn_backend is not None:
+            if component_attn_backend is not None:
                 logger.info(
                     "Using %s backend for component: %s",
-                    attn_backend.name.lower(),
+                    component_attn_backend.name.lower(),
                     matched_backend_key,
                 )
+        requested_backend = (
+            server_args.requested_component_attention_backend(component_attn_name)
+            if component_attn_name is not None
+            else None
+        )
+        require_backend_selection = requested_backend is not None
+        if require_backend_selection and (
+            component_attn_backend is None
+            or component_attn_backend.name.lower() != requested_backend
+        ):
+            raise ValueError(
+                f"Component attention backend for {component_attn_name!r} no longer "
+                f"matches the explicit request {requested_backend!r}"
+            )
         try:
             component = self._load_customized_with_context(
                 component_model_path,
                 server_args,
                 component_name,
-                attn_backend,
+                component_attn_backend,
                 component_attn_name,
                 self.allow_global_attention_backend_fallback,
+                require_backend_selection,
             )
             source = "sgl-diffusion"
-        except (ComponentCheckpointUnsupportedError, ComponentResidencyError):
+        except (
+            ComponentAttentionBackendNotAppliedError,
+            ComponentCheckpointUnsupportedError,
+            ComponentResidencyError,
+        ):
             raise
         except Exception as e:
+            if require_backend_selection:
+                raise
             native_loader_required = isinstance(e, NativeComponentLoaderRequired)
             if self.should_raise_customized_load_error(server_args, component_name):
                 if native_loader_required:
@@ -360,9 +379,10 @@ class ComponentLoader(ABC):
                 server_args,
                 component_name,
                 transformers_or_diffusers,
-                attn_backend,
+                component_attn_backend,
                 component_attn_name,
                 self.allow_global_attention_backend_fallback,
+                require_backend_selection,
             )
             source = "native"
             logger.warning(
@@ -756,25 +776,14 @@ class PipelineComponentLoader:
         )
 
         try:
-            with component_attn_backend_context_manager(
-                component_attn_backend,
-                component_name=component_attn_name,
-                allow_global_backend_fallback=(
-                    loader.allow_global_attention_backend_fallback
-                ),
-                require_component_backend_selection=(
-                    component_attn_backend is None
-                    or not server_args.is_component_attention_backend_automatic(
-                        component_attn_name
-                    )
-                ),
-            ):
-                return loader.load(
-                    component_model_path,
-                    server_args,
-                    component_name,
-                    transformers_or_diffusers,
-                )
+            return loader.load(
+                component_model_path,
+                server_args,
+                component_name,
+                transformers_or_diffusers,
+                component_attn_backend=component_attn_backend,
+                component_attn_name=component_attn_name,
+            )
         except Exception:
             logger.error(
                 f"Error while loading component: {component_name}, {component_model_path=}"
