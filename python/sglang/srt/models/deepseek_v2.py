@@ -203,6 +203,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_model,
     get_parallel,
+    get_platform,
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -764,11 +765,10 @@ class DeepseekV2MoE(nn.Module):
             from sglang.srt.layers.quantization.modelopt_quant import (
                 ModelOptFp4LinearMethod,
             )
-            from sglang.srt.utils.common import is_sm100_supported
 
             fc1_n = self.shared_experts.gate_up_proj.output_size_per_partition
             if (
-                is_sm100_supported()
+                get_platform().is_sm100
                 and isinstance(
                     self.shared_experts.gate_up_proj.quant_method,
                     ModelOptFp4LinearMethod,
@@ -2740,7 +2740,12 @@ class DeepseekV2Model(nn.Module):
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
                     # tp_size = get_parallel().tp_size
-                    is_a2a_moe = is_deepep_class_backend()
+                    # Keep the original deepep-class scope here and only add DeepEP v2,
+                    # so unrelated backends' allocator sizing is unchanged.
+                    is_a2a_moe = (
+                        is_deepep_class_backend()
+                        or get_moe_a2a_backend().is_deepep_v2()
+                    )
                     tp_size = 1 if is_a2a_moe else get_parallel().tp_size
                     intermediate_size = (
                         config.moe_intermediate_size * config.n_shared_experts
@@ -3007,7 +3012,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
         else:
             # ranks other than the last rank will have a placeholder layer

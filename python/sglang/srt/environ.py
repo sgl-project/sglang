@@ -37,6 +37,11 @@ def _default_cache_subdir(name: str) -> str:
     return os.path.join(os.path.expanduser(envs.SGLANG_CACHE_DIR.get()), name)
 
 
+def _default_tree_cache_sanity_check() -> bool:
+    """Enable the expensive tree-cache sanity check by default in CI."""
+    return envs.SGLANG_IS_IN_CI.get()
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -323,6 +328,7 @@ class Envs:
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
+    SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
 
     # ===================================================================
     # Logging
@@ -441,12 +447,21 @@ class Envs:
     SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD = EnvInt(100)
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
+    SGLANG_TRACE_LOGITS_E2E = EnvBool(False)
+    SGLANG_TRACE_LOGITS_E2E_SYNC = EnvBool(False)
+    SGLANG_TRACE_SAMPLER_E2E = EnvBool(False)
+    SGLANG_TRACE_QWEN_MOE_DEEPEP_E2E = EnvBool(False)
+    SGLANG_DEEPEP_V2_TRACE_CONTIG = EnvBool(False)
+    SGLANG_DEEPEP_V2_TRACE_MASKED = EnvBool(False)
 
     # ===================================================================
     # Debugging and invariant checks
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
+    SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
+    SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
@@ -454,6 +469,9 @@ class Envs:
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
+    # The explicit environment variable still takes precedence over this CI
+    # default, so production remains opt-in and CI remains opt-out if needed.
+    SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_tree_cache_sanity_check)
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
@@ -686,6 +704,8 @@ class Envs:
     # ===================================================================
     # HiCache storage backends and mmap allocation
     # ===================================================================
+    # Per-call cudaHostRegister limit in GB.
+    SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
@@ -746,6 +766,7 @@ class Envs:
     # ===================================================================
     # MoRI transport and expert dispatch
     # ===================================================================
+    SGLANG_DEEPEP_V2_FORCE_MAX_LEN = EnvBool(False)
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
     SGLANG_MORI_SEND_AUX_RDMA = EnvBool(False)
     # Number of RDMA Queue Pairs (QPs) used per transfer operation. Higher
@@ -960,6 +981,19 @@ class Envs:
     # ===================================================================
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
+    # A-B kill-switch for Work-Centric (Lean) Attention. When True, forces the
+    # standard Triton decode kernel even if --enable-lean-attention or the auto-gate
+    # would select Lean. Used to isolate the Lean kernel in benchmarks.
+    SGLANG_DISABLE_LEAN_ATTENTION = EnvBool(False)
+    # Persistent-grid size multiplier for the Lean decode kernel:
+    # total_programs = round(device_CU_count * this). Default 1.0 (one CTA per CU), which
+    # maximizes KV work-tiles per CTA and minimizes the cross-CTA combine/atomic reduction.
+    # Kernel + E2E A/B sweeps found 1.0 beats 2.0 across uniform and ragged configs on both
+    # MI300X (gfx942) and MI355X (gfx950) — 2.0 oversubscribed the CUs and regressed high-batch
+    # decode. Exposed as a knob (e.g. set 2.0) for grid A/B tuning without a rebuild.
+    SGLANG_FORCE_LEAN_GRID_CU_MULT = EnvFloat(1.0)
+
+    # Torch Compile
     # Compact extend-attention query-tile grid: AMD/HIP-only optimization
     # (parity with flash-attn's ragged-aware launch). The feature checks _is_hip
     # explicitly in code; this env var allows override (0=force off, 1=force on).
@@ -996,6 +1030,9 @@ class Envs:
     # DeepGEMM
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
+    # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
+    SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
@@ -1004,6 +1041,9 @@ class Envs:
     # load imbalance (they otherwise OOM saturated --moe-runner-backend
     # deep_gemm serving).  Costs one D2H sync per MoE layer.
     SGLANG_OPT_DG_MASKED_M_CAP = EnvBool(False)
+    # Wide-DP eager prefill uses compact routing storage; masked storage scales
+    # with num_local_experts and can OOM on skewed batches.
+    SGLANG_OPT_DG_COMPACT_EAGER = EnvBool(False)
     # Drop dp-attention MAX_LEN pad rows from MoE dispatch (StandardDispatcher
     # post-translation topk_ids -> -1): pad rows otherwise run the router on
     # stale hidden values and burn expert compute whose outputs are discarded;
@@ -1070,6 +1110,9 @@ class Envs:
     # DeepGEMM Mega MoE
     # ===================================================================
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
+    # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
+    # residency margin so every cluster can launch beside other streams.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
 
     # ===================================================================
     # Top-k kernels
@@ -1162,6 +1205,11 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
+    # it under live traffic isolates where ranks actually diverge. Comma
+    # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
+    # and numbers, each negatable with a leading "-": "all,-dspark-plan,-6".
+    SGLANG_SPEC_TP_SYNC = EnvStr("all")
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
@@ -1516,6 +1564,16 @@ class Envs:
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
+    # Qwen3.5 and GDN
+    SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    SGLANG_TRACE_QWEN35_FINAL_NORM = EnvBool(False)
+    SGLANG_QWEN35_NATIVE_FINAL_NORM = EnvBool(False)
+    # One switch enables deferred MoE finalize and AR + residual + RMSNorm.
+    SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION = EnvBool(False)
+    # Distinct workspace configurations allowed in one process. Production
+    # uses one model/configuration per rank, so fail closed on accidental reuse.
+    SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES = EnvInt(1)
+
     # ===================================================================
     # Plugin system
     # ===================================================================
@@ -1669,6 +1727,8 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN": _DeprecatedEnv(),
     # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
     "SGLANG_OPT_USE_CUDA_SCONV": _DeprecatedEnv(),
+    # The direct dense BF16 GEMM source is vendored in-tree.
+    "SGLANG_FLASHINFER_PR4266_SOURCE": _DeprecatedEnv(),
     # DSV4 compressor V2 is always used.
     "SGLANG_OPT_USE_COMPRESSOR_V2": _DeprecatedEnv(),
     # Replaced by CLI flags.

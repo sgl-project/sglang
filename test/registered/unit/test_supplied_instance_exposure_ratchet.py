@@ -483,8 +483,8 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                 tgts = [node.target]
             elif (
                 isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_declare"
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "declare_resolution"
             ):
                 targets |= {
                     kw.arg
@@ -511,12 +511,28 @@ class TestSuppliedInstanceExposure(CustomTestCase):
             "prefill_attention_backend",
             "speculative_draft_attention_backend",
         }
-        deprecated = next(
-            node
-            for node in ast.walk(sa_class)
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_handle_deprecated_args"
-        )
+
+        # The handler lives in `arg_groups/serving_hook.py`, reached either as a
+        # record method or as a bare-name call, so look the loop up by both.
+        def _deprecated_alias_handler():
+            for node in ast.walk(sa_class):
+                if (
+                    isinstance(node, ast.FunctionDef)
+                    and node.name == "_handle_deprecated_args"
+                    and any(isinstance(n, ast.For) for n in ast.walk(node))
+                ):
+                    return node
+            for path in sorted((_PACKAGE_ROOT / "arg_groups").glob("*.py")):
+                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                for node in tree.body:
+                    if (
+                        isinstance(node, ast.FunctionDef)
+                        and node.name == "handle_deprecated_args"
+                    ):
+                        return node
+            raise AssertionError("the deprecated-alias handler was not found")
+
+        deprecated = _deprecated_alias_handler()
         found_tuples = [
             {elt.value for elt in node.iter.elts if isinstance(elt, ast.Constant)}
             for node in ast.walk(deprecated)
@@ -606,7 +622,7 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         for path in sorted(root.rglob("*.py")):
             rel = path.relative_to(root).as_posix()
             source = path.read_text(encoding="utf-8-sig")
-            if "_late_resolution" not in source:
+            if "declare_late_resolution" not in source:
                 continue
             try:
                 tree = ast.parse(source)

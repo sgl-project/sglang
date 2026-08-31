@@ -1,11 +1,13 @@
 ---
 title: "Qwen3.5-397B-A17B"
 metatags:
-  description: "Best Practice for Qwen3.5-397B on Ascend NPU"
+  description: "Best Practice for Qwen3.5-397B-A17B on Ascend NPU"
 ---
 
 <Note>
-This page focuses on optimal configuration and benchmark results for Qwen3.5-397B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3.5-397B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_5_397b).
+This page focuses on optimal configuration and benchmark results for Qwen3.5-397B-A17B on the Ascend NPU. For environment
+setup, model weight download, feature configuration, and deployment instructions, etc., see
+the [Qwen3.5-397B-A17B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_5_397b).
 
 On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
@@ -14,29 +16,29 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128k+1k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-20ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 16k+1k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in16k-out1k-20ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in3k5-out1k5-20ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64k+1k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-20ms) |
+| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 128k+1k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in128k-out1k-20ms) |
+| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 16k+1k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in16k-out1k-20ms) |
+| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 22.2ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in3k5-out1k5-22-2ms) |
+| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 64k+1k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in64k-out1k-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128k+1k (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-prefix90-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 16k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in16k-out1k-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in3k5-out1k5-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-prefix90-50ms) |
+| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 128k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in128k-out1k-50ms) |
+| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 128k+1k (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in128k-out1k-prefix90-50ms) |
+| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 16k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in16k-out1k-50ms) |
+| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in3k5-out1k5-50ms) |
+| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 64k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in64k-out1k-50ms) |
+| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in64k-out1k-prefix90-50ms) |
 
 ## Optimal Configuration
 
 <a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
 
-### Qwen3.5-397B W4A8 8P IN128K OUT1K 20ms
+### Qwen3.5-397B-A17B W4A8 8P IN128K OUT1K 20ms
 
-**Model**: Qwen3.5-397B
+**Model**: Qwen3.5-397B-A17B
 
 **Hardware**: Atlas 800I A3
 
@@ -87,6 +89,7 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -135,18 +138,21 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
+    --warmup-requests 2 \
     --max-concurrency 3 \
+    --num-prompts 3 \
     --random-input-len 131072 \
     --random-output-len 1024 \
-    --num-prompts 3 \
     --random-range-ratio 1 \
+    --seed 1 \
     --request-rate inf \
-    --warmup-requests 2
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
-### Qwen3.5-397B W4A8 8P IN128K OUT1K 50ms
+### Qwen3.5-397B-A17B W4A8 8P IN128K OUT1K 50ms
 
-**Model**: Qwen3.5-397B
+**Model**: Qwen3.5-397B-A17B
 
 **Hardware**: Atlas 800I A3
 
@@ -197,6 +203,7 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -218,7 +225,6 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --max-running-requests 16 \
     --mem-fraction-static 0.6 \
-    --cuda-graph-bs 2 4 6 8 12 14 16 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -245,18 +251,21 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
+    --warmup-requests 8 \
     --max-concurrency 10 \
+    --num-prompts 10 \
     --random-input-len 131072 \
     --random-output-len 1024 \
-    --num-prompts 10 \
     --random-range-ratio 1 \
+    --seed 1 \
     --request-rate inf \
-    --warmup-requests 8
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
-### Qwen3.5-397B W4A8 8P IN128K OUT1K PREFIX90 50ms
+### Qwen3.5-397B-A17B W4A8 8P IN128K OUT1K PREFIX90 50ms
 
-**Model**: Qwen3.5-397B
+**Model**: Qwen3.5-397B-A17B
 
 **Hardware**: Atlas 800I A3
 
@@ -296,17 +305,18 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
+export DEEPEP_HCCL_BUFFSIZE=2200
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GDN_ATTN_BACKEND_TRITON=1
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_BUFFSIZE=2200
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -320,7 +330,7 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 131072 \
     --max-mamba-cache-size 320 \
     --prefill-max-requests 10 \
-    --mamba-radix-cache-strategy extra_buffer \
+    --mamba-scheduler-strategy extra_buffer \
     --trust-remote-code \
     --max-running-requests 64 \
     --mem-fraction-static 0.6 \
@@ -343,8 +353,8 @@ python3 -m sglang.launch_server \
 #### Benchmark
 
 We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
-`--gsp-system-prompt-len 117964` = `int(131072 * 0.9)` is the shared prefix portion.
-`--gsp-question-len 13107` = `int(131072 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-system-prompt-len 117965` = `round(131072 * 0.9)` is the shared prefix portion.
+`--gsp-question-len 13107` = `round(131072 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```bash Command
@@ -355,17 +365,19 @@ python -m sglang.bench_serving \
     --port 6688 \
     --gsp-num-groups 1 \
     --gsp-prompts-per-group 40 \
-    --gsp-system-prompt-len 117964 \
+    --gsp-system-prompt-len 117965 \
     --gsp-question-len 13107 \
     --gsp-output-len 1024 \
     --max-concurrency 40 \
     --num-prompts 40 \
-    --request-rate inf
+    --request-rate inf \
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
-### Qwen3.5-397B W4A8 8P IN16K OUT1K 20ms
+### Qwen3.5-397B-A17B W4A8 8P IN16K OUT1K 20ms
 
-**Model**: Qwen3.5-397B
+**Model**: Qwen3.5-397B-A17B
 
 **Hardware**: Atlas 800I A3
 
@@ -416,6 +428,7 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -468,18 +481,21 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
+    --warmup-requests 32 \
     --max-concurrency 40 \
+    --num-prompts 40 \
     --random-input-len 16384 \
     --random-output-len 1024 \
-    --num-prompts 40 \
     --random-range-ratio 1 \
+    --seed 1 \
     --request-rate inf \
-    --warmup-requests 32
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
-### Qwen3.5-397B W4A8 8P IN16K OUT1K 50ms
+### Qwen3.5-397B-A17B W4A8 8P IN16K OUT1K 50ms
 
-**Model**: Qwen3.5-397B
+**Model**: Qwen3.5-397B-A17B
 
 **Hardware**: Atlas 800I A3
 
@@ -530,6 +546,7 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -582,18 +599,21 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
+    --warmup-requests 8 \
     --max-concurrency 132 \
+    --num-prompts 132 \
     --random-input-len 16384 \
     --random-output-len 1024 \
-    --num-prompts 132 \
     --random-range-ratio 1 \
+    --seed 1 \
     --request-rate inf \
-    --warmup-requests 8
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
-### Qwen3.5-397B W4A8 8P IN3K5 OUT1K5 20ms
+### Qwen3.5-397B-A17B W4A8 8P IN3K5 OUT1K5 22.2ms
 
-**Model**: Qwen3.5-397B
+**Model**: Qwen3.5-397B-A17B
 
 **Hardware**: Atlas 800I A3
 
@@ -605,7 +625,7 @@ python -m sglang.bench_serving \
 
 **Dataset**: 3.5k+1.5k
 
-**TPOT**: 20ms
+**TPOT**: 22.2ms
 
 #### Model Deployment
 
@@ -644,6 +664,7 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -695,18 +716,21 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
+    --warmup-requests 64 \
     --max-concurrency 160 \
+    --num-prompts 160 \
     --random-input-len 3500 \
     --random-output-len 1500 \
-    --num-prompts 160 \
     --random-range-ratio 1 \
+    --seed 1 \
     --request-rate inf \
-    --warmup-requests 64
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
-### Qwen3.5-397B W4A8 8P IN3K5 OUT1K5 50ms
+### Qwen3.5-397B-A17B W4A8 8P IN3K5 OUT1K5 50ms
 
-**Model**: Qwen3.5-397B
+**Model**: Qwen3.5-397B-A17B
 
 **Hardware**: Atlas 800I A3
 
@@ -757,6 +781,7 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -808,18 +833,21 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
+    --warmup-requests 16 \
     --max-concurrency 432 \
+    --num-prompts 432 \
     --random-input-len 3500 \
     --random-output-len 1500 \
-    --num-prompts 432 \
     --random-range-ratio 1 \
+    --seed 1 \
     --request-rate inf \
-    --warmup-requests 16
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
-### Qwen3.5-397B W4A8 8P IN64K OUT1K 20ms
+### Qwen3.5-397B-A17B W4A8 8P IN64K OUT1K 20ms
 
-**Model**: Qwen3.5-397B
+**Model**: Qwen3.5-397B-A17B
 
 **Hardware**: Atlas 800I A3
 
@@ -870,6 +898,7 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -922,18 +951,21 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
+    --warmup-requests 6 \
     --max-concurrency 6 \
+    --num-prompts 6 \
     --random-input-len 65536 \
     --random-output-len 1024 \
-    --num-prompts 6 \
     --random-range-ratio 1 \
+    --seed 1 \
     --request-rate inf \
-    --warmup-requests 6
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
-### Qwen3.5-397B W4A8 8P IN64K OUT1K 50ms
+### Qwen3.5-397B-A17B W4A8 8P IN64K OUT1K 50ms
 
-**Model**: Qwen3.5-397B
+**Model**: Qwen3.5-397B-A17B
 
 **Hardware**: Atlas 800I A3
 
@@ -984,6 +1016,7 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -1036,18 +1069,21 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-concurrency 28 \
+    --warmup-requests 8 \
+    --max-concurrency 24 \
+    --num-prompts 24 \
     --random-input-len 65536 \
     --random-output-len 1024 \
-    --num-prompts 28 \
     --random-range-ratio 1 \
+    --seed 1 \
     --request-rate inf \
-    --warmup-requests 8
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
-### Qwen3.5-397B W4A8 8P IN64K OUT1K PREFIX90 50ms
+### Qwen3.5-397B-A17B W4A8 8P IN64K OUT1K PREFIX90 50ms
 
-**Model**: Qwen3.5-397B
+**Model**: Qwen3.5-397B-A17B
 
 **Hardware**: Atlas 800I A3
 
@@ -1087,17 +1123,18 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
+export DEEPEP_HCCL_BUFFSIZE=2200
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GDN_ATTN_BACKEND_TRITON=1
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_BUFFSIZE=2200
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -1110,7 +1147,7 @@ python3 -m sglang.launch_server \
     --chunked-prefill-size -1 \
     --max-prefill-tokens 65536 \
     --max-mamba-cache-size 640 \
-    --mamba-radix-cache-strategy extra_buffer \
+    --mamba-scheduler-strategy extra_buffer \
     --trust-remote-code \
     --max-running-requests 128 \
     --mem-fraction-static 0.6 \
@@ -1137,8 +1174,8 @@ python3 -m sglang.launch_server \
 #### Benchmark
 
 We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
-`--gsp-system-prompt-len 58982` = `int(65536 * 0.9)` is the shared prefix portion.
-`--gsp-question-len 6553` = `int(65536 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-system-prompt-len 58982` = `round(65536 * 0.9)` is the shared prefix portion.
+`--gsp-question-len 6554` = `round(65536 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```bash Command
@@ -1148,11 +1185,13 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --gsp-num-groups 1 \
-    --gsp-prompts-per-group 112 \
+    --gsp-prompts-per-group 96 \
     --gsp-system-prompt-len 58982 \
-    --gsp-question-len 6553 \
+    --gsp-question-len 6554 \
     --gsp-output-len 1024 \
-    --max-concurrency 112 \
-    --num-prompts 112 \
-    --request-rate inf
+    --max-concurrency 96 \
+    --num-prompts 96 \
+    --request-rate inf \
+    --temperature 0.6 \
+    --top-p 0.95
 ```

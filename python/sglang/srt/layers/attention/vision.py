@@ -17,12 +17,17 @@ from sglang.kernels.ops.layernorm.norm import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_context, get_exec, get_mm, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_mm,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_capability,
-    is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_hip,
@@ -30,7 +35,6 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
     print_info_once,
-    use_intel_xpu_backend,
 )
 from sglang.srt.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
@@ -1266,10 +1270,10 @@ class VisionAttention(nn.Module):
         elif _is_cpu and _is_cpu_amx_available:
             backend = "amx_attn"
         elif _is_xpu:
-            backend = "triton_attn" if not use_intel_xpu_backend() else "xpu_attn"
+            backend = "xpu_attn"
         else:
             backend = "sdpa"
-        if backend == "fa3" and is_blackwell_supported():
+        if backend == "fa3" and get_platform().is_blackwell:
             raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
 
         return backend
