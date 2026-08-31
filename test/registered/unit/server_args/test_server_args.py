@@ -42,6 +42,29 @@ _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
 _mock_device.start()
 
 
+class TestLoraTargetModules(CustomTestCase):
+    def test_gdn_target_modules_are_accepted_by_cli(self):
+        """Accept every GDN projection supported by the runtime."""
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        parsed = parser.parse_args(
+            [
+                "--model",
+                "dummy",
+                "--lora-target-modules",
+                "in_proj_qkvz",
+                "in_proj_ba",
+                "out_proj",
+            ]
+        )
+
+        self.assertEqual(
+            parsed.lora_target_modules,
+            ["in_proj_qkvz", "in_proj_ba", "out_proj"],
+        )
+
+
 class TestPrepareServerArgs(CustomTestCase):
     def test_return_hidden_states_mode_configuration(self):
         disabled = ServerArgs(model_path="dummy")
