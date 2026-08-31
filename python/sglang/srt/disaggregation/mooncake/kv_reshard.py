@@ -10,9 +10,10 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import numpy as np
+if TYPE_CHECKING:
+    from mooncake.reshard.kv_cache import KVCacheTransferBatch
 
 KV_RESHARD_PROTOCOL = "KV_RESHARD"
 
@@ -44,14 +45,6 @@ def _participant_id(role: str, dp_rank: int, pp_rank: int, tp_rank: int) -> str:
 class KVReshardRoutePlan:
     bootstrap_infos: tuple[dict[str, Any], ...]
     expected_writer_ids: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class KVReshardNativeBatch:
-    endpoint: str
-    source_addresses: tuple[int, ...]
-    target_addresses: tuple[int, ...]
-    sizes: tuple[int, ...]
 
 
 class KVReshardRuntime:
@@ -452,24 +445,6 @@ class KVReshardRuntime:
         target_binding = kv_cache_runtime_binding_from_json(target_binding_json)
         return prepare_kv_cache_transfer(logical_plan, self.binding, target_binding)
 
-    @staticmethod
-    def _physical_slots(
-        page_ids: Iterable[int],
-        *,
-        page_size: int,
-        first_page_offset: int,
-        token_count: int,
-    ) -> np.ndarray:
-        pages = np.asarray(tuple(page_ids), dtype=np.int64)
-        required_pages = (first_page_offset + token_count + page_size - 1) // page_size
-        if pages.ndim != 1 or len(pages) != required_pages:
-            raise ValueError("page_ids length does not cover the logical token span")
-        if np.any(pages < 0):
-            raise ValueError("page_ids must be non-negative")
-        offsets = first_page_offset + np.arange(token_count, dtype=np.int64)
-        page_positions, in_page = np.divmod(offsets, page_size)
-        return pages[page_positions] * page_size + in_page
-
     def lower_chunk(
         self,
         *,
@@ -479,143 +454,26 @@ class KVReshardRuntime:
         token_start: int,
         token_count: int,
         max_batch_operations: int = 1024,
-    ) -> tuple[KVReshardNativeBatch, ...]:
-        from mooncake.reshard.kv_cache import KVCachePreparedTransferPlan
+    ) -> tuple[KVCacheTransferBatch, ...]:
+        from mooncake.reshard.kv_cache import (
+            KVCachePreparedTransferPlan,
+            lower_kv_cache_transfer,
+        )
 
         if self.binding is None or self.transfer_engine is None:
             raise RuntimeError("KV reshard runtime is not physically bound")
         if not isinstance(prepared_plan, KVCachePreparedTransferPlan):
             raise TypeError("prepared_plan must be a KVCachePreparedTransferPlan")
-        if max_batch_operations <= 0:
-            raise ValueError("max_batch_operations must be positive")
-        if token_count <= 0:
-            raise ValueError("token_count must be positive")
-
-        first_page_offset = token_start % self.page_size
-        source_slots = self._physical_slots(
+        return lower_kv_cache_transfer(
+            prepared_plan,
             source_page_ids,
-            page_size=prepared_plan.page_size,
-            first_page_offset=first_page_offset,
-            token_count=token_count,
-        )
-        target_slots = self._physical_slots(
             target_page_ids,
-            page_size=prepared_plan.page_size,
-            first_page_offset=first_page_offset,
+            token_start=token_start,
             token_count=token_count,
+            max_batch_operations=max_batch_operations,
         )
-        max_source_slot = int(source_slots.max())
-        max_target_slot = int(target_slots.max())
 
-        pending: dict[
-            tuple[str, int | None], tuple[list[int], list[int], list[int]]
-        ] = {}
-        batches = []
-
-        def flush(key: tuple[str, int | None]) -> None:
-            sources, targets, sizes = pending[key]
-            if not sizes:
-                return
-            batches.append(
-                KVReshardNativeBatch(
-                    endpoint=key[0],
-                    source_addresses=tuple(sources),
-                    target_addresses=tuple(targets),
-                    sizes=tuple(sizes),
-                )
-            )
-            sources.clear()
-            targets.clear()
-            sizes.clear()
-
-        def append_ops(
-            endpoint: str, sources, targets, sizes, batch_limit: int | None
-        ) -> None:
-            key = (endpoint, batch_limit)
-            state = pending.setdefault(key, ([], [], []))
-            sources = list(sources)
-            targets = list(targets)
-            sizes = list(sizes)
-            if batch_limit is None:
-                state[0].extend(sources)
-                state[1].extend(targets)
-                state[2].extend(sizes)
-                return
-            offset = 0
-            while offset < len(sizes):
-                room = batch_limit - len(state[2])
-                take = min(room, len(sizes) - offset)
-                state[0].extend(sources[offset : offset + take])
-                state[1].extend(targets[offset : offset + take])
-                state[2].extend(sizes[offset : offset + take])
-                offset += take
-                if len(state[2]) == batch_limit:
-                    flush(key)
-
-        full_row_starts = full_row_ends = None
-        if any(edge.is_full_row for edge in prepared_plan.edges):
-            breaks = (
-                np.flatnonzero(
-                    (np.diff(source_slots) != 1) | (np.diff(target_slots) != 1)
-                )
-                + 1
-            )
-            full_row_starts = np.concatenate((np.asarray([0]), breaks))
-            full_row_ends = np.concatenate((breaks, np.asarray([token_count])))
-
-        for edge in prepared_plan.edges:
-            source_end = (
-                max_source_slot * edge.source_row_stride
-                + edge.source_head_offset_bytes
-                + edge.nbytes
-            )
-            target_end = (
-                max_target_slot * edge.target_row_stride
-                + edge.target_head_offset_bytes
-                + edge.nbytes
-            )
-            if source_end > edge.source_capacity:
-                raise ValueError("source page map exceeds KV buffer capacity")
-            if target_end > edge.target_capacity:
-                raise ValueError("target page map exceeds KV buffer capacity")
-
-            if edge.is_full_row:
-                assert full_row_starts is not None and full_row_ends is not None
-                append_ops(
-                    edge.endpoint,
-                    (
-                        edge.source_base_address
-                        + source_slots[full_row_starts] * edge.source_row_stride
-                    ).tolist(),
-                    (
-                        edge.target_base_address
-                        + target_slots[full_row_starts] * edge.target_row_stride
-                    ).tolist(),
-                    ((full_row_ends - full_row_starts) * edge.nbytes).tolist(),
-                    None,
-                )
-            else:
-                append_ops(
-                    edge.endpoint,
-                    (
-                        edge.source_base_address
-                        + source_slots * edge.source_row_stride
-                        + edge.source_head_offset_bytes
-                    ).tolist(),
-                    (
-                        edge.target_base_address
-                        + target_slots * edge.target_row_stride
-                        + edge.target_head_offset_bytes
-                    ).tolist(),
-                    [edge.nbytes] * token_count,
-                    max_batch_operations,
-                )
-        for key in tuple(pending):
-            flush(key)
-
-        return tuple(batches)
-
-    def submit_chunk(self, batches: Iterable[KVReshardNativeBatch]) -> int:
+    def submit_chunk(self, batches: Iterable[KVCacheTransferBatch]) -> int:
         if self.transfer_engine is None:
             raise RuntimeError("KV reshard runtime is not physically bound")
         for batch in batches:
