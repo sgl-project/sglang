@@ -319,6 +319,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 self.assertEqual(target_name, source_name)
                 self.assertIsNone(merge_index)
                 self.assertIsNone(total_shards)
+
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
         return_value=None,
