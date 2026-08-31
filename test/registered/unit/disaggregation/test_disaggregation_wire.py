@@ -9,7 +9,11 @@ import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.staging_buffer import (
+    StagingAllocator,
+)
 from sglang.srt.disaggregation.common.staging_handler import (
+    DecodeStagingHandler,
     handle_staging_req,
 )
 from sglang.srt.disaggregation.common.utils import (
@@ -218,6 +222,37 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+
+class TestStagingWatermark(unittest.TestCase):
+    @patch("sglang.srt.disaggregation.common.staging_buffer.StagingBuffer")
+    def test_empty_ring_restarts_at_zero(self, staging_buffer):
+        staging_buffer.return_value.data_ptr = 0
+        allocator = StagingAllocator(100, "cpu", 0)
+        alloc_id, _, _ = allocator.assign(60)
+
+        allocator.free(alloc_id)
+
+        self.assertEqual(allocator.get_watermark(), (1, 0))
+        self.assertEqual(allocator.assign(70)[1:], (0, 1))
+
+    def test_new_watermark_subscriber_receives_current_allocator_state(self):
+        sock = Mock()
+        bootstrap_info = {"host": "prefill", "port": 7200}
+        receiver = Mock(
+            bootstrap_infos=[bootstrap_info],
+        )
+        receiver._connect_to_bootstrap_server.return_value = (sock, threading.Lock())
+        handler = object.__new__(DecodeStagingHandler)
+        handler.staging_allocator = Mock()
+        handler.staging_allocator.get_watermark.return_value = (3, 0)
+        handler._wm_subscribers = {}
+
+        handler.register_wm_subscriber(receiver, "session-new")
+
+        sock.send_multipart.assert_called_once_with(
+            [b"WATERMARK", b"3", b"0", b"session-new"]
+        )
 
 
 class TestMooncakePPStaging(unittest.TestCase):
