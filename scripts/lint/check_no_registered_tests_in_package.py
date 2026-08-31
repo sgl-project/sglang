@@ -29,6 +29,7 @@ _MARKERS = (
     "register_npu_ci",
     "register_xpu_ci",
     "register_musa_ci",
+    "register_mps_ci",
 )
 
 

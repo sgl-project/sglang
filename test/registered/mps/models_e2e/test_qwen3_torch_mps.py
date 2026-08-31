@@ -49,7 +49,7 @@ class TestQwen3TorchMps(CustomTestCase):
     def test_standard_runner_reuses_radix_cache(self):
         # Ensure the child uses Torch rather than the MLX runner.
         env = os.environ.copy()
-        env.pop("SGLANG_USE_MLX", None)
+        env["SGLANG_USE_MLX"] = "0"
         process = popen_launch_server(
             self.model,
             self.base_url,
