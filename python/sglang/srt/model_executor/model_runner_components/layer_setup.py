@@ -138,6 +138,7 @@ def resolve_layer_indices(
 
     _assert_pp_mtp_compat(
         model_has_mtp_layers=model_has_mtp_layers,
+        is_draft_worker=is_draft_worker,
         spec_algorithm=spec_algorithm,
         num_effective_layers=num_effective_layers,
         model_num_layers=model_num_layers,
@@ -192,18 +193,25 @@ def _resolve_pp_layer_range(*, model: Any, model_num_layers: int) -> _PPLayerRan
 def _assert_pp_mtp_compat(
     *,
     model_has_mtp_layers: bool,
+    is_draft_worker: bool,
     spec_algorithm: SpeculativeAlgorithm,
     num_effective_layers: int,
     model_num_layers: int,
 ) -> None:
+    # The target model may be partitioned across pipeline stages. Its embedded
+    # NextN weights are filtered during target weight loading, while the draft
+    # worker is built separately on the last PP stage. The draft itself must
+    # remain unpartitioned because its KV pool and layer indexing assume all
+    # NextN stages are local.
     assert (
         (not model_has_mtp_layers)
         or (spec_algorithm.is_none())
+        or (not is_draft_worker)
         or (
             (not spec_algorithm.is_none())
             and (num_effective_layers == model_num_layers)
         )
-    ), "PP is not compatible with MTP models."
+    ), "Pipeline partitioning is not supported for MTP draft workers."
 
 
 def adjust_hybrid_swa_layer_ids(
