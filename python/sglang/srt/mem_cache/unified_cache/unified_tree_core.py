@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentData,
     ComponentType,
     EvictLayer,
+    LinkerTransferPhase,
     LRURefreshPhase,
     TreeComponent,
     get_and_increase_time_counter,
@@ -2157,6 +2158,57 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 node.load_back_pending_id = None
             self._update_duplicate_tracking(node)
             node = node.parent
+
+    def build_external_linker_offload_transfers(
+        self, node_id: NodeId
+    ) -> Optional[list[PoolTransfer]]:
+        """Build direct device-to-external-store transfers for an unstored node."""
+        node = self.node_by_id(node_id)
+        if node.external_cache_stored:
+            return None
+
+        transfers = []
+        for component in self.components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.OFFLOAD, node, None
+            )
+            if transfer is not None:
+                transfers.append(transfer)
+        return transfers
+
+    def mark_external_cache_stored_path(
+        self, from_node_id: NodeId, until_node_id: NodeId
+    ) -> None:
+        """Mark an externally restored path, excluding its existing anchor."""
+        until_node = self.node_by_id(until_node_id)
+        node = self.node_by_id(from_node_id)
+        path = []
+        while node is not until_node:
+            if node.parent is None:
+                raise RuntimeError(
+                    f"node {until_node_id} is not an ancestor of node {from_node_id}"
+                )
+            path.append(node)
+            node = node.parent
+
+        for node in path:
+            node.external_cache_stored = True
+
+    def mark_external_linker_offload_pending(self, node_id: NodeId) -> None:
+        """Publish an accepted external offload as pending and externally stored."""
+        node = self.node_by_id(node_id)
+        node.write_through_pending_id = node_id
+        node.external_cache_stored = True
+
+    def finish_external_linker_offload(
+        self, node_ids: Sequence[NodeId], ack_id: NodeId, success: bool
+    ) -> None:
+        """Finalize external-store state for an offload and its split fragments."""
+        nodes = [self.node_by_id(node_id) for node_id in node_ids]
+        for node in nodes:
+            if node.write_through_pending_id == ack_id:
+                node.write_through_pending_id = None
+            node.external_cache_stored = success
 
     def mark_write_through_pending(self, node_id: NodeId) -> None:
         """Mark a node as having an in-flight write-through backup."""

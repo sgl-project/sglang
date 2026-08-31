@@ -146,6 +146,7 @@ class UnifiedTreeCoreInterface(ABC):
     device: torch.device
     enable_hicache: bool
     enable_storage: bool
+    enable_external_cache_linker: bool
     write_through_threshold: int
     is_write_back: bool
     has_swa_host_pool: bool
@@ -524,6 +525,37 @@ class UnifiedTreeCoreInterface(ABC):
     @abstractmethod
     def finish_load_back(self, anchor_node_id: NodeId) -> None:
         """Clear the in-flight H->D marks on the anchor's root path at ack time."""
+        ...
+
+    # ==== External Cache Linker ====
+
+    @abstractmethod
+    def build_external_linker_offload_transfers(
+        self, node_id: NodeId
+    ) -> Optional[list[PoolTransfer]]:
+        """Build direct device-to-external-store transfers for an unstored node.
+
+        Return None when the node is already known to be stored externally.
+        """
+        ...
+
+    @abstractmethod
+    def mark_external_cache_stored_path(
+        self, from_node_id: NodeId, until_node_id: NodeId
+    ) -> None:
+        """Mark the path from ``from_node_id`` to, but excluding, ``until_node_id``."""
+        ...
+
+    @abstractmethod
+    def mark_external_linker_offload_pending(self, node_id: NodeId) -> None:
+        """Publish an accepted external offload as pending and externally stored."""
+        ...
+
+    @abstractmethod
+    def finish_external_linker_offload(
+        self, node_ids: Sequence[NodeId], ack_id: NodeId, success: bool
+    ) -> None:
+        """Finish one external offload for every current fragment of its node."""
         ...
 
     # Order-sensitive digest of write_back duplicate-reclaim victim ids,

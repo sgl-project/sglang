@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -83,9 +84,37 @@ class _MappingRecorder:
         self.mapping.append((full.clone(), swa.clone()))
 
 
+class _FakeExternalTreeCore:
+    def __init__(self, nodes=None, offload_transfers=None):
+        self.enable_external_cache_linker = False
+        self.nodes = nodes or {}
+        self.offload_transfers = offload_transfers or [
+            PoolTransfer(name=PoolName.KV, keys=["page"])
+        ]
+
+    def build_external_linker_offload_transfers(self, node_id):
+        node = self.nodes[node_id]
+        if node.external_cache_stored:
+            return None
+        return list(self.offload_transfers)
+
+    def mark_external_linker_offload_pending(self, node_id):
+        node = self.nodes[node_id]
+        node.write_through_pending_id = node_id
+        node.external_cache_stored = True
+
+    def finish_external_linker_offload(self, node_ids, ack_id, success):
+        for node_id in node_ids:
+            node = self.nodes[node_id]
+            if node.write_through_pending_id == ack_id:
+                node.write_through_pending_id = None
+            node.external_cache_stored = success
+
+
 def _cache_for_wrapper(**kwargs):
     defaults = {
         "tree_core": SimpleNamespace(enable_external_cache_linker=False),
+        "tree_components": (ComponentType.FULL,),
         "write_through_threshold": 256,
         "pp_size": 1,
         "pp_group": None,
@@ -100,6 +129,7 @@ def test_cache_linker_attachment_is_backend_independent():
         enable_external_cache_linker=False,
         write_through_threshold=256,
     )
+    cache.tree_components = (ComponentType.FULL,)
     cache.linker = None
     linker = _FakeLinker()
 
@@ -109,6 +139,91 @@ def test_cache_linker_attachment_is_backend_independent():
     assert cache.tree_core.enable_external_cache_linker
     assert cache.write_through_threshold == 1
     assert cache.linker.layer_done_counter is linker.layer_done_counter
+
+
+@pytest.mark.parametrize("component_type", [ComponentType.MAMBA, ComponentType.C128])
+def test_cache_linker_rejects_unsupported_tree_components(component_type):
+    cache = _cache_for_wrapper(tree_components=(ComponentType.FULL, component_type))
+
+    with pytest.raises(ValueError, match=component_type.name):
+        UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+
+    assert not cache.tree_core.enable_external_cache_linker
+
+
+def test_python_tree_core_builds_opaque_external_offload_transfers():
+    node = SimpleNamespace(id=7, external_cache_stored=False)
+    transfer = PoolTransfer(name=PoolName.KV, keys=["page"])
+
+    class _Component:
+        def build_external_linker_transfer(self, phase, raw_node, keys):
+            assert phase == LinkerTransferPhase.OFFLOAD
+            assert raw_node is node
+            assert keys is None
+            return transfer
+
+    core = UnifiedTreeCore.__new__(UnifiedTreeCore)
+    core._node_arena = {node.id: node}
+    core.components = (_Component(),)
+
+    assert core.build_external_linker_offload_transfers(node.id) == [transfer]
+    node.external_cache_stored = True
+    assert core.build_external_linker_offload_transfers(node.id) is None
+
+
+def test_python_tree_core_external_state_updates_are_atomic_and_path_scoped():
+    root = SimpleNamespace(
+        id=1,
+        parent=None,
+        external_cache_stored=False,
+        write_through_pending_id=None,
+    )
+    anchor = SimpleNamespace(
+        id=2,
+        parent=root,
+        external_cache_stored=False,
+        write_through_pending_id=None,
+    )
+    middle = SimpleNamespace(
+        id=3,
+        parent=anchor,
+        external_cache_stored=False,
+        write_through_pending_id=None,
+    )
+    tail = SimpleNamespace(
+        id=4,
+        parent=middle,
+        external_cache_stored=False,
+        write_through_pending_id=None,
+    )
+    unrelated = SimpleNamespace(
+        id=5,
+        parent=None,
+        external_cache_stored=False,
+        write_through_pending_id=None,
+    )
+    core = UnifiedTreeCore.__new__(UnifiedTreeCore)
+    core._node_arena = {
+        node.id: node for node in (root, anchor, middle, tail, unrelated)
+    }
+
+    with pytest.raises(RuntimeError, match="not an ancestor"):
+        core.mark_external_cache_stored_path(tail.id, unrelated.id)
+    assert not middle.external_cache_stored
+    assert not tail.external_cache_stored
+
+    core.mark_external_cache_stored_path(tail.id, anchor.id)
+    assert tail.external_cache_stored
+    assert middle.external_cache_stored
+    assert not anchor.external_cache_stored
+
+    core.mark_external_linker_offload_pending(tail.id)
+    middle.write_through_pending_id = tail.id
+    core.finish_external_linker_offload([middle.id, tail.id], tail.id, success=False)
+    assert middle.write_through_pending_id is None
+    assert tail.write_through_pending_id is None
+    assert not middle.external_cache_stored
+    assert not tail.external_cache_stored
 
 
 def test_restorable_prefix_intersects_sparse_rank_results():
@@ -127,11 +242,6 @@ def test_restorable_prefix_intersects_sparse_rank_results():
 
 
 def test_async_offload_pins_node_until_completion():
-    class _Component:
-        def build_external_linker_transfer(self, phase, node, keys):
-            assert phase == LinkerTransferPhase.OFFLOAD
-            return PoolTransfer(name=PoolName.KV, keys=["page"])
-
     linker = _FakeLinker()
     lock_params = object()
     locks = []
@@ -148,16 +258,9 @@ def test_async_offload_pins_node_until_completion():
         write_through_pending_id=None,
     )
     cache = _cache_for_wrapper(
-        tree_core=SimpleNamespace(
-            enable_external_cache_linker=False,
-            mark_write_through_pending=lambda value: setattr(
-                node, "write_through_pending_id", value
-            ),
-        ),
-        _components_tuple=(_Component(),),
+        tree_core=_FakeExternalTreeCore({node_id: node}),
         inc_lock_ref=inc_lock_ref,
         dec_lock_ref=lambda node, params: unlocks.append((node, params)),
-        resolve_node_handle=lambda value: node if value == node_id else None,
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
 
@@ -173,6 +276,24 @@ def test_async_offload_pins_node_until_completion():
 
     assert not node.external_cache_stored
     assert unlocks == [(node_id, lock_params)]
+
+
+def test_offload_skips_node_already_stored_by_tree_core():
+    linker = _FakeLinker()
+    node = SimpleNamespace(
+        id=7,
+        external_cache_stored=True,
+        write_through_pending_id=None,
+    )
+    cache = _cache_for_wrapper(
+        tree_core=_FakeExternalTreeCore({node.id: node}),
+        inc_lock_ref=lambda node_id: pytest.fail("stored node must not be locked"),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+
+    wrapper.offload_nodes([node.id])
+
+    assert linker.queued_offloads == []
 
 
 def test_async_load_pins_node_until_completion():
@@ -224,10 +345,6 @@ def test_release_request_cancels_queued_load():
 
 
 def test_failed_offload_rolls_back_split_fragments():
-    class _Component:
-        def build_external_linker_transfer(self, phase, node, keys):
-            return PoolTransfer(name=PoolName.KV, keys=["page"])
-
     linker = _FakeLinker()
     lock_params = object()
     unlocks = []
@@ -243,18 +360,10 @@ def test_failed_offload_rolls_back_split_fragments():
     )
     nodes = {child.id: child, parent.id: parent}
 
-    def mark_pending(node_id):
-        nodes[node_id].write_through_pending_id = node_id
-
     cache = _cache_for_wrapper(
-        tree_core=SimpleNamespace(
-            enable_external_cache_linker=False,
-            mark_write_through_pending=mark_pending,
-        ),
-        _components_tuple=(_Component(),),
+        tree_core=_FakeExternalTreeCore(nodes),
         inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=lambda: lock_params),
         dec_lock_ref=lambda node_id, params: unlocks.append((node_id, params)),
-        resolve_node_handle=nodes.__getitem__,
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
     wrapper.offload_nodes([child.id])
@@ -297,10 +406,6 @@ def test_split_action_retargets_pending_external_offload():
 
 
 def test_reset_quiesces_backend_before_releasing_pending_locks():
-    class _Component:
-        def build_external_linker_transfer(self, phase, node, keys):
-            return PoolTransfer(name=PoolName.KV, keys=["page"])
-
     events = []
 
     class _QuiescentFakeLinker(_FakeLinker):
@@ -315,16 +420,9 @@ def test_reset_quiesces_backend_before_releasing_pending_locks():
         write_through_pending_id=None,
     )
     cache = _cache_for_wrapper(
-        tree_core=SimpleNamespace(
-            enable_external_cache_linker=False,
-            mark_write_through_pending=lambda value: setattr(
-                node, "write_through_pending_id", value
-            ),
-        ),
-        _components_tuple=(_Component(),),
+        tree_core=_FakeExternalTreeCore({node.id: node}),
         inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=object),
         dec_lock_ref=lambda node_id, params: events.append(("unlock", node_id)),
-        resolve_node_handle=lambda node_id: node,
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
     wrapper._queue_load("rid", node.id, [object()])

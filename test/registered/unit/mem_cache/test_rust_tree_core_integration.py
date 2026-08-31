@@ -187,6 +187,13 @@ def test_stale_handle_operations_raise_key_error_without_poisoning_the_core():
             ComponentType.FULL, stale_root, CacheTransferPhase.BACKUP_STORAGE
         ),
         lambda: core.build_load_back_spec(stale_root),
+        lambda: core.build_external_linker_offload_transfers(stale_root),
+        lambda: core.mark_external_cache_stored_path(stale_root, live_root),
+        lambda: core.mark_external_cache_stored_path(live_root, stale_root),
+        lambda: core.mark_external_linker_offload_pending(stale_root),
+        lambda: core.finish_external_linker_offload(
+            [live_root, stale_root], live_root, True
+        ),
         lambda: core.get_hash_values(stale_root),
         lambda: core.dfs_weight_order([stale_root]),
     )
@@ -341,12 +348,18 @@ def test_configuration_reads_the_locked_rust_state():
     assert swa_core.has_swa_host_pool is True
 
 
-def test_external_cache_linker_is_rejected():
+def test_external_cache_linker_enablement_and_component_guard():
     core = _tree_core()
     assert core.enable_external_cache_linker is False
-    with pytest.raises(ValueError, match="External cache linker"):
-        core.enable_external_cache_linker = True
+    core.enable_external_cache_linker = True
+    assert core.enable_external_cache_linker is True
+    core.enable_external_cache_linker = False
     assert core.enable_external_cache_linker is False
+
+    mamba_core = _mamba_tree_core()
+    with pytest.raises(AssertionError, match="(?i)mamba"):
+        mamba_core.enable_external_cache_linker = True
+    assert mamba_core.enable_external_cache_linker is False
 
 
 def test_sanity_check_passes_after_the_full_flow():
