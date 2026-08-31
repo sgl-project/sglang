@@ -464,9 +464,10 @@ class ModelConfig:
             # arch lists and the processor registry all agree. Draft
             # architectures are already resolved by _config_draft_model above
             # and carry no tower of their own.
-            if is_deepseek_v4_vision(self.hf_config) and self.hf_config.architectures[
-                0
-            ] == ("DeepseekV4ForCausalLM"):
+            arch = self.hf_config.architectures[0]
+            if arch == "DeepseekV4ForCausalLM" and is_deepseek_v4_vision(
+                self.hf_config
+            ):
                 self.hf_config.architectures[0] = "DeepseekV4VLForCausalLM"
                 logger.info(
                     "Detected the DeepSeek-V4 vision tower; loading arch "

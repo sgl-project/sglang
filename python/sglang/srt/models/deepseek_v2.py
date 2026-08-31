@@ -48,6 +48,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_n_heads,
     get_dsa_index_topk,
     is_deepseek_dsa,
+    is_deepseek_v4_vision,
 )
 from sglang.srt.distributed import (
     divide,
@@ -510,7 +511,7 @@ class MoEGate(nn.Module):
         # checkpoint carries both biases on every layer -- including the
         # hash-routed ones, where the text bias goes unused because text tokens
         # there route by token-id lookup rather than by score.
-        vision_routing = getattr(config, "vision_n_layers", 0) > 0
+        vision_routing = is_deepseek_v4_vision(config)
         if config.topk_method == "noaux_tc" and (not is_hash_moe or vision_routing):
             self.e_score_correction_bias = _new_correction_bias()
         else:

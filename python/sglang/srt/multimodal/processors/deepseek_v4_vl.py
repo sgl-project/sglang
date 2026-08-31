@@ -107,7 +107,7 @@ class DeepseekV4VLImageProcessor(BaseMultimodalProcessor):
             next_image += 1
             # The block's own start position fixes how much leading alignment
             # padding it carries, so the expansion has to walk left to right.
-            slot_types, aligner_perm, _ = build_image_block(
+            slot_types, aligner_perm, compress_pad = build_image_block(
                 image["n_llm_h"], image["n_llm_w"], len(expanded)
             )
             start = len(expanded)
@@ -122,6 +122,11 @@ class DeepseekV4VLImageProcessor(BaseMultimodalProcessor):
                         "n_vit_w": image["n_vit_w"],
                         "slot_types": slot_types,
                         "aligner_perm": aligner_perm,
+                        # How far into the block the bidirectional span opens:
+                        # the leading alignment padding sits outside it. A
+                        # length, not a position, so it stays correct when a
+                        # session prefix shifts `offsets`.
+                        "compress_pad": compress_pad,
                     },
                 )
             )

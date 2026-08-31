@@ -3,12 +3,14 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
     declare_resolution,
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.configs.model_config import is_deepseek_v4_vision
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
@@ -160,6 +162,18 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_prefill_cp:
         return
+
+    hf_config = model_config_of(server_args).hf_config
+    if is_deepseek_v4_vision(hf_config):
+        # CP round-robins tokens across ranks and reindexes the attention
+        # metadata afterwards, which the per-token image-span counts cannot
+        # follow. Serving anyway would put every image on the plain causal
+        # window with no diagnostic.
+        raise ValueError(
+            "DeepSeek-V4-Flash-Vision does not support prefill context "
+            "parallelism: image spans would silently lose their bidirectional "
+            "attention. Drop --enable-prefill-cp."
+        )
 
     if cfg.cp_strategy != "interleave":
         raise ValueError(

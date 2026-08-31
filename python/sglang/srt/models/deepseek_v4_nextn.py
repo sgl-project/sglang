@@ -147,7 +147,13 @@ class DeepseekV4ModelNextN(nn.Module):
         cp_v2_active = is_cp_v2_active(forward_batch)
         use_prefill_cp = dsa_use_prefill_cp(forward_batch)
         if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+            # Multimodal pad sentinels (MM_PAD_SHIFT_VALUE + hash) sit out of
+            # vocab; clamp so the gather stays in range. The draft gets an
+            # image's semantics from the target's hidden_states, so the
+            # embedding at those positions only shapes the proposal.
+            hidden_states = self.embed_tokens(
+                input_ids.clamp(min=0, max=self.config.vocab_size - 1)
+            )
         else:
             hidden_states = input_embeds
 

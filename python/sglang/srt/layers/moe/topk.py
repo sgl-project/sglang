@@ -691,9 +691,11 @@ class TopK(BaseFusedOp):
         """Route with a ``[num_tokens, num_experts]`` bias instead of the layer's.
 
         DeepSeek-V4-Vision picks between two routed-expert biases per token. No
-        fused top-k kernel accepts a per-token bias, so this forces the torch
-        selection path and its STANDARD output; the caller reaches for it only
-        on batches that carry image tokens.
+        fused top-k kernel accepts a per-token bias, so select_experts routes a
+        2-D one to biased_topk_per_token_bias_impl; pinning the output format
+        keeps a runner that would otherwise route internally from a single
+        bias off the BYPASSED path. The caller reaches for this only on batches
+        that carry image tokens.
         """
         assert correction_bias.dim() == 2, correction_bias.shape
         topk_output = select_experts(

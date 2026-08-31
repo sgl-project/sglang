@@ -548,9 +548,15 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             ):
                 merged[-1]["content_blocks"].extend(content_blocks)
             else:
-                # Keep every message-level field (task, wo_eos, mask, tools, ...).
-                new_msg = msg
-                new_msg["content_blocks"] = content_blocks
+                new_msg = {
+                    "role": "user",
+                    "content": msg.get("content") or "",
+                    "content_blocks": content_blocks,
+                }
+                # Preserve extra fields (task, wo_eos, mask, etc.)
+                for key in ("task", "wo_eos", "mask"):
+                    if key in msg:
+                        new_msg[key] = msg[key]
                 merged.append(new_msg)
         else:
             merged.append(msg)

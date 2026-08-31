@@ -1111,7 +1111,9 @@ sgl-eval run aime25 \\
     // ====================================================================
     // Flash Vision is multimodal: the vision tower runs replicated on every
     // rank outside the CUDA graph, and images are prefilled with bidirectional
-    // attention inside each image's token block.
+    // attention inside each image's token block. DSPARK is validated with the
+    // tower; EAGLE/MTP is not (the draft head routes image tokens with the text
+    // bias). Prefill context parallelism is refused with the tower.
     {
       match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,

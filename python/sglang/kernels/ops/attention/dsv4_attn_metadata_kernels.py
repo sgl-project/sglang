@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import msgspec
 import torch
@@ -463,68 +463,58 @@ def build_causal_swa_page_indices(
     )
 
 
-def compute_image_visible_spans(
+class ImageSpan(msgspec.Struct, frozen=True):
+    """One image block's bidirectionally-visible extent, in flat-batch rows.
+
+    ``left_origin`` is the row that ``visible_left`` counts from. It is below
+    ``row_start`` when the span opened in an earlier prefill chunk, and equal to
+    it when the span opens in this one.
+    """
+
+    row_start: int
+    row_end: int
+    left_origin: int
+
+
+def build_image_visible_spans(
     *,
-    input_ids: torch.Tensor,
-    positions: torch.Tensor,
-    vocab_size: int,
-    compress_pad_to: int,
+    spans: List[ImageSpan],
+    num_tokens: int,
     max_image_tokens: int,
+    device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-token visible counts inside each image block, for both directions.
+    """Per-token visible counts inside each image span, for both directions.
 
     DeepSeek-V4-Flash-Vision attends bidirectionally within one image's span --
     the ``[IMAGE_START, IMAGE_END]`` range of its token block -- while the rest
     of the sequence stays causal. This returns, per query token, how many tokens
     of its own span sit to its left and to its right; both are 0 for a token
-    outside any span, which leaves it on the plain sliding window.
+    outside every span, which leaves it on the plain sliding window.
 
-    A block is a maximal run of multimodal placeholder tokens (their ids are pad
-    sentinels above ``vocab_size``) inside one request. Its leading
-    ``compress_pad_to`` alignment padding is *not* part of the span: the block
-    is laid out as ``pad* IMAGE_START ... IMAGE_END``, with the pad count fixed
-    by the block's own start position, so the span starts at a computable offset
-    into the run.
+    Spans arrive already resolved and clipped by the caller. Deliberately not
+    inferred from runs of placeholder ids in ``input_ids``: two images whose
+    blocks land next to each other form one run, and so do two requests whose
+    positions happen to be contiguous across a batch boundary -- either merge
+    would let one image attend into the next and push the gather length past the
+    indices row it addresses.
 
     Both tensors are ``int32[num_tokens]``.
     """
-    device = input_ids.device
-    num_tokens = input_ids.shape[0]
-    idx = torch.arange(num_tokens, dtype=torch.int32, device=device)
-    positions = positions.to(torch.int32)
-    is_image = input_ids >= vocab_size
-
-    # A run breaks on a non-image token and at a request boundary, which shows
-    # up as a position that does not continue the previous token's.
-    prev_is_image = torch.cat(
-        [torch.zeros(1, dtype=torch.bool, device=device), is_image[:-1]]
-    )
-    prev_pos = torch.cat([positions.new_zeros(1), positions[:-1]])
-    starts_run = is_image & (~prev_is_image | (positions != prev_pos + 1))
-    next_is_image = torch.cat(
-        [is_image[1:], torch.zeros(1, dtype=torch.bool, device=device)]
-    )
-    next_pos = torch.cat([positions[1:], positions.new_zeros(1)])
-    ends_run = is_image & (~next_is_image | (next_pos != positions + 1))
-
-    run_start = torch.where(starts_run, idx, idx.new_full((), -1)).cummax(0)[0]
-    run_end = (
-        torch.where(ends_run, idx, idx.new_full((), num_tokens))
-        .flip(0)
-        .cummin(0)[0]
-        .flip(0)
-    )
-
-    block_start_pos = positions[run_start.clamp(min=0).to(torch.long)]
-    compress_pad = compress_pad_to - 1 - block_start_pos % compress_pad_to
-    span_start = run_start + compress_pad
-    in_span = is_image & (idx >= span_start)
-
-    left = torch.where(in_span, idx - span_start, idx.new_zeros(()))
-    right = torch.where(in_span, run_end - idx, idx.new_zeros(()))
+    visible_left = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    visible_right = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    for span in spans:
+        width = span.row_end - span.row_start + 1
+        rows = slice(span.row_start, span.row_end + 1)
+        first_left = span.row_start - span.left_origin
+        visible_left[rows] = torch.arange(
+            first_left, first_left + width, dtype=torch.int32, device=device
+        )
+        visible_right[rows] = torch.arange(
+            width - 1, -1, -1, dtype=torch.int32, device=device
+        )
     return (
-        left.clamp_(min=0, max=max_image_tokens - 1),
-        right.clamp_(min=0, max=max_image_tokens),
+        visible_left.clamp_(max=max_image_tokens - 1),
+        visible_right.clamp_(max=max_image_tokens),
     )
 
 
@@ -558,12 +548,27 @@ def _vision_window_extent(
     visible_left: torch.Tensor,
     visible_right: torch.Tensor,
     swa_window: int,
+    width: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """First visible position per query, and how many positions are visible."""
+    """First visible position per query, and how many positions are visible.
+
+    ``visible_right`` must already be clipped so that ``pos + right`` stays
+    inside the query's own request -- the caller does that when it resolves the
+    spans, and only the caller knows where the request ends. Reaching past it
+    would gather ``req_to_token`` columns the request never wrote.
+
+    An exact span also keeps ``left + right`` inside one block, which bounds the
+    result by ``swa_window + max_image_tokens`` -- the gather's own width. The
+    clamp is the backstop for that one: a layout that broke the bound would
+    otherwise hand the attention kernel a topk_length past the end of its
+    indices row, and losing the far end of an image's forward reach beats
+    reading out of bounds.
+    """
     pos = seq_lens_casual.to(torch.int32) - 1
     back = torch.clamp(visible_left, min=swa_window - 1)
     back = torch.minimum(back, pos)
-    return pos - back, back + 1 + visible_right
+    lengths = (back + 1 + visible_right).clamp_(max=width)
+    return pos - back, lengths
 
 
 def build_vision_swa_page_indices(
@@ -579,7 +584,7 @@ def build_vision_swa_page_indices(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     device = seq_lens_casual.device
     first_pos, lengths = _vision_window_extent(
-        seq_lens_casual, visible_left, visible_right, swa_window
+        seq_lens_casual, visible_left, visible_right, swa_window, width
     )
     offsets = first_pos.unsqueeze(1) + torch.arange(
         width, dtype=torch.int32, device=device
@@ -620,7 +625,8 @@ def _vision_swa_page_indices_kernel(
     right = tl.load(visible_right_ptr + row).to(tl.int64)
     back = tl.minimum(tl.maximum(left, swa_window - 1), pos)
     first_pos = pos - back
-    length = back + 1 + right
+    # Same backstop as the torch path: never address past the indices row.
+    length = tl.minimum(back + 1 + right, width)
     tl.store(lengths_ptr + row, length.to(tl.int32))
 
     rp = tl.load(req_pool_ptr + row).to(tl.int64)

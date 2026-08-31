@@ -13,11 +13,12 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+    ImageSpan,
     _vision_window_extent,
     build_causal_swa_page_indices_triton,
+    build_image_visible_spans,
     build_vision_swa_page_indices,
     build_vision_swa_page_indices_triton,
-    compute_image_visible_spans,
 )
 from sglang.srt.multimodal.deepseek_v4_vl_image_processing import COMPRESS_PAD_TO
 from sglang.srt.utils import get_device
@@ -30,10 +31,6 @@ SWA_WINDOW = 128
 MAX_IMAGE_TOKENS = 384
 WIDTH = SWA_WINDOW + MAX_IMAGE_TOKENS
 PAGE_INDEX_ALIGNED_SIZE = 64
-VOCAB_SIZE = 129280
-# What MultimodalDataItem.pad_value looks like: MM_PAD_SHIFT_VALUE + a hash.
-PAD_SENTINEL = 1_000_000 + 5
-
 NUM_REQS, MAX_LEN, NUM_SLOTS = 8, 4096, 40000
 
 
@@ -62,31 +59,29 @@ class TestDeepseekV4VisionSwaGather(CustomTestCase):
         )
 
     def _image_batch(self, span_lens):
-        """One request: text, an image block per span length, text. Returns the
-        flat input_ids / positions plus each span's index range."""
-        input_ids, spans = [], []
-        for span_len in span_lens:
-            input_ids.extend((11, 12, 13))
-            compress_pad = COMPRESS_PAD_TO - 1 - len(input_ids) % COMPRESS_PAD_TO
-            start = len(input_ids) + compress_pad
-            input_ids.extend([PAD_SENTINEL] * (compress_pad + span_len))
-            spans.append((start, start + span_len - 1))
-            input_ids.extend((14, 15))
-        positions = torch.arange(len(input_ids), dtype=torch.int32, device=self.device)
-        return (
-            torch.tensor(input_ids, device=self.device),
-            positions,
-            spans,
-        )
+        """One request: text, then one image block per span length, then text.
 
-    def _spans(self, input_ids, positions):
-        return compute_image_visible_spans(
-            input_ids=input_ids,
-            positions=positions,
-            vocab_size=VOCAB_SIZE,
-            compress_pad_to=COMPRESS_PAD_TO,
+        Returns the flat-batch positions plus the visible counts the backend
+        would resolve from the items' offsets.
+        """
+        spans, cursor = [], 0
+        for span_len in span_lens:
+            cursor += 3  # leading text
+            compress_pad = COMPRESS_PAD_TO - 1 - cursor % COMPRESS_PAD_TO
+            row_start = cursor + compress_pad
+            row_end = row_start + span_len - 1
+            spans.append(
+                ImageSpan(row_start=row_start, row_end=row_end, left_origin=row_start)
+            )
+            cursor = row_end + 1 + 2  # trailing text
+        positions = torch.arange(cursor, dtype=torch.int32, device=self.device)
+        left, right = build_image_visible_spans(
+            spans=spans,
+            num_tokens=cursor,
             max_image_tokens=MAX_IMAGE_TOKENS,
+            device=self.device,
         )
+        return positions, left, right, spans
 
     def test_degenerates_to_the_causal_window_without_images(self):
         seq_lens = torch.randint(1, 2000, (600,), dtype=torch.int32, device=self.device)
@@ -116,8 +111,7 @@ class TestDeepseekV4VisionSwaGather(CustomTestCase):
             )
 
     def test_triton_matches_torch(self):
-        input_ids, positions, _ = self._image_batch((37, 200, 381, 5))
-        left, right = self._spans(input_ids, positions)
+        positions, left, right, _ = self._image_batch((37, 200, 381, 5))
         seq_lens = positions + 1
         reqs = torch.zeros_like(seq_lens)
         torch_indices, torch_lengths = self._vision(
@@ -130,16 +124,17 @@ class TestDeepseekV4VisionSwaGather(CustomTestCase):
         self.assertTrue(torch.equal(torch_indices, triton_indices))
 
     def test_gathered_slots_are_the_visible_positions(self):
-        input_ids, positions, _ = self._image_batch((37, 200))
-        left, right = self._spans(input_ids, positions)
+        positions, left, right, _ = self._image_batch((37, 200))
         seq_lens = positions + 1
         reqs = torch.zeros_like(seq_lens)
         indices, lengths = self._vision(
             build_vision_swa_page_indices_triton, seq_lens, reqs, left, right
         )
-        first_pos, extents = _vision_window_extent(seq_lens, left, right, SWA_WINDOW)
+        first_pos, extents = _vision_window_extent(
+            seq_lens, left, right, SWA_WINDOW, WIDTH
+        )
         self.assertTrue(torch.equal(lengths, extents))
-        for row in range(input_ids.numel()):
+        for row in range(positions.numel()):
             length = int(extents[row])
             wanted = torch.arange(
                 int(first_pos[row]),
@@ -154,16 +149,48 @@ class TestDeepseekV4VisionSwaGather(CustomTestCase):
             if tail.numel():
                 self.assertEqual(int(tail.max()), -1, f"row {row} tail")
 
+    def test_topk_length_never_exceeds_the_indices_row(self):
+        """The clamp is what stands between a bad span and an out-of-bounds read.
+
+        flash_mla_with_kvcache reads ``indices[0:topk_length]`` with no bound of
+        its own, so both builders must cap the length at the gather width even
+        when handed visible counts a correct span layout could not produce.
+        """
+        rows = 64
+        # Positions far enough in that the backward reach stays inside the
+        # request, and far enough from the end that the forward reach does too:
+        # clipping the reach to the sequence is the collector's job, and this
+        # test is about the width bound alone.
+        seq_lens = torch.full((rows,), 1200, dtype=torch.int32, device=self.device)
+        reqs = torch.zeros_like(seq_lens)
+        # Deliberately impossible for a real span: both directions maxed at once,
+        # so left + right exceeds one block.
+        left = torch.full(
+            (rows,), MAX_IMAGE_TOKENS - 1, dtype=torch.int32, device=self.device
+        )
+        right = torch.full(
+            (rows,), MAX_IMAGE_TOKENS, dtype=torch.int32, device=self.device
+        )
+        _, unclamped = _vision_window_extent(seq_lens, left, right, SWA_WINDOW, 1 << 30)
+        self.assertGreater(int(unclamped.max()), WIDTH)
+        for builder in (
+            build_vision_swa_page_indices,
+            build_vision_swa_page_indices_triton,
+        ):
+            with self.subTest(builder=builder.__name__):
+                indices, lengths = self._vision(builder, seq_lens, reqs, left, right)
+                self.assertEqual(indices.shape[-1], WIDTH)
+                self.assertLessEqual(int(lengths.max()), indices.shape[-1])
+
     def test_a_span_is_visible_in_both_directions(self):
         span_len = 381
         # The leading span puts the span under test past position SWA_WINDOW, so
         # its backward reach is the window rather than the start of the sequence.
-        input_ids, positions, spans = self._image_batch((200, span_len))
-        left, right = self._spans(input_ids, positions)
+        positions, left, right, spans = self._image_batch((200, span_len))
         first_pos, extents = _vision_window_extent(
-            positions + 1, left, right, SWA_WINDOW
+            positions + 1, left, right, SWA_WINDOW, WIDTH
         )
-        start, end = spans[1]
+        start, end = spans[1].row_start, spans[1].row_end
         self.assertGreater(start, SWA_WINDOW)
         # Backward reach is unchanged at the span's first token, but it now sees
         # forward all the way to IMAGE_END.

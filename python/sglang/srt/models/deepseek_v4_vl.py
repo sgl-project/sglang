@@ -27,6 +27,15 @@ DeepSeek-V4-Flash with three additions, all of which live here:
 
 The vision tower is replicated on every rank: the checkpoint does not shard it,
 and at ~0.4B parameters it is negligible next to the 284B language model.
+
+Speculative decoding: DSPARK is validated with the tower. EAGLE/MTP is not --
+the NextN draft head clamps the multimodal pad sentinels so it cannot fault, but
+it routes image tokens with the text bias and nothing exercises the combination,
+so its acceptance rate at image positions is unmeasured.
+
+Not supported with the tower: prefill context parallelism, which ServerArgs
+refuses -- it round-robins tokens and reindexes the attention metadata, which
+the per-token image-span counts cannot follow.
 """
 
 from __future__ import annotations
@@ -43,6 +52,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     compute_mm_input_embeds,
+    has_mm_inputs_to_embed,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -364,8 +374,13 @@ class DeepseekV4VLForCausalLM(DeepseekV4ForCausalLM):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # Read before embedding: compute_mm_input_embeds clears mm_inputs.
-        vision_routing = forward_batch.contains_mm_inputs()
+        # Read before embedding: compute_mm_input_embeds clears mm_inputs. The
+        # predicate is the embedding path's, so the two cannot drift: a request
+        # keeps its mm_inputs until it finishes, and every decode and
+        # target-verify step of one that once carried an image would otherwise
+        # drag the whole batch onto the unfused per-token-bias top-k for a mask
+        # that is uniformly false there.
+        vision_routing = has_mm_inputs_to_embed(forward_batch)
         if input_embeds is None and self.pp_group.is_first_rank:
             # Embed here rather than through general_mm_embed_routine: the
             # hash-routed MoE layers route on input_ids, so the language model

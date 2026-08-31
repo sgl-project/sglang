@@ -14,9 +14,15 @@ from PIL import Image
 
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     _vision_window_extent,
-    compute_image_visible_spans,
+    build_image_visible_spans,
 )
 from sglang.srt.entrypoints.openai import encoding_dsv4
+from sglang.srt.layers.attention.deepseek_v4_backend import collect_image_spans
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.models.deepseek_v4_vl import DeepseekV4VisionModel
 from sglang.srt.multimodal.deepseek_v4_vl_image_processing import (
     COMPRESS_PAD_TO,
@@ -42,9 +48,8 @@ PARAMS = DeepseekV4VisionParams(
     min_pixels=147456,
     max_wh_ratio=8,
 )
-VOCAB_SIZE = 129280
-# What MultimodalDataItem.pad_value looks like: MM_PAD_SHIFT_VALUE + a hash.
-PAD_SENTINEL = 1_000_000 + 12345
+# The widened gather's width: the plain window plus at most one whole block.
+WIDTH = 128 + PARAMS.max_n_token
 
 
 class TestDeepseekV4VLImagePreprocessing(CustomTestCase):
@@ -306,80 +311,188 @@ class TestDeepseekV4VLPromptEncoding(CustomTestCase):
             )
 
 
-class TestDeepseekV4VLImageVisibleSpans(CustomTestCase):
-    """Bidirectional visibility must cover exactly [IMAGE_START, IMAGE_END]."""
+class TestDeepseekV4VLImageSpanCollection(CustomTestCase):
+    """Span extents come from the items' offsets, not from placeholder runs.
+
+    Each case below is a layout where inferring "one image block in one
+    request" from a maximal run of out-of-vocabulary ids at contiguous
+    positions gives the wrong answer.
+    """
 
     WINDOW = 128
 
     @staticmethod
-    def _batch(spans, leading_text=3, trailing_text=2, first_position=0):
-        """One request: text, then one block per span length, then text."""
-        input_ids, expected = [], []
-        for span_len in spans:
-            input_ids.extend(range(100, 100 + leading_text))
-            compress_pad = COMPRESS_PAD_TO - 1 - len(input_ids) % COMPRESS_PAD_TO
-            span_start = len(input_ids) + compress_pad
-            input_ids.extend([PAD_SENTINEL] * (compress_pad + span_len))
-            expected.append((span_start, span_start + span_len - 1))
-            input_ids.extend(range(200, 200 + trailing_text))
-        positions = torch.arange(
-            first_position, first_position + len(input_ids), dtype=torch.int32
+    def _item(block_start, span_len):
+        """One image whose block starts at ``block_start`` in its request."""
+        compress_pad = COMPRESS_PAD_TO - 1 - block_start % COMPRESS_PAD_TO
+        block_end = block_start + compress_pad + span_len - 1
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=torch.zeros(1, 3, PARAMS.patch_size, PARAMS.patch_size),
+            offsets=[(block_start, block_end)],
+            model_specific_data={"compress_pad": compress_pad},
         )
-        return torch.tensor(input_ids), positions, expected
+        return item, block_start + compress_pad, block_end
 
-    def _spans(self, input_ids, positions):
-        return compute_image_visible_spans(
-            input_ids=input_ids,
-            positions=positions,
-            vocab_size=VOCAB_SIZE,
-            compress_pad_to=COMPRESS_PAD_TO,
-            max_image_tokens=PARAMS.max_n_token,
+    def _collect(self, mm_items_per_req, prefix_lens, extend_lens):
+        mm_inputs = [
+            None if items is None else MultimodalInputs(mm_items=items)
+            for items in mm_items_per_req
+        ]
+        return collect_image_spans(
+            mm_inputs=mm_inputs,
+            extend_prefix_lens=prefix_lens,
+            extend_seq_lens=extend_lens,
+            swa_window=self.WINDOW,
         )
+
+    def _visible(self, spans, num_tokens):
+        return build_image_visible_spans(
+            spans=spans,
+            num_tokens=num_tokens,
+            max_image_tokens=PARAMS.max_n_token,
+            device="cpu",
+        )
+
+    def test_adjacent_blocks_stay_separate(self):
+        """Two images can land back to back; they are two spans, not one.
+
+        Merging them would let the first image attend into the second and, at
+        full block size, push the gather length past the indices row it
+        addresses.
+        """
+        span_len = PARAMS.max_n_token - (COMPRESS_PAD_TO - 1)
+        first, first_start, first_end = self._item(0, span_len)
+        second, second_start, second_end = self._item(first_end + 1, span_len)
+        total = second_end + 1
+
+        spans = self._collect([[first, second]], [0], [total])
+        self.assertEqual(len(spans), 2)
+        self.assertEqual(
+            [(s.row_start, s.row_end) for s in spans],
+            [(first_start, first_end), (second_start, second_end)],
+        )
+
+        left, right = self._visible(spans, total)
+        # The first block's last token sees nothing forward: its span ends there.
+        self.assertEqual(int(right[first_end]), 0)
+        self.assertEqual(int(left[second_start]), 0)
+        _, lengths = _vision_window_extent(
+            torch.arange(1, total + 1, dtype=torch.int32),
+            left,
+            right,
+            self.WINDOW,
+            WIDTH,
+        )
+        self.assertLessEqual(int(lengths.max()), WIDTH)
+
+    def test_requests_with_contiguous_positions_stay_separate(self):
+        """Request B's prefix can continue A's positions across the batch.
+
+        A merge there would give A's tokens a forward reach past their own
+        sequence end, into req_to_token slots A never wrote.
+        """
+        first, _, first_end = self._item(3, 16)
+        len_a = first_end + 1 + 2
+        second, _, second_end = self._item(0, 30)
+        len_b = second_end + 1
+
+        spans = self._collect([[first], [second]], [0, len_a], [len_a, len_b])
+        self.assertEqual(len(spans), 2)
+        left, right = self._visible(spans, len_a + len_b)
+
+        # A's span ends inside A, and A's trailing text is on the plain window.
+        self.assertEqual(spans[0].row_end, first_end)
+        self.assertEqual(int(right[first_end]), 0)
+        self.assertEqual(int(left[first_end + 1 : len_a].max()), 0)
+        self.assertEqual(int(right[first_end + 1 : len_a].max()), 0)
+        # B's span lives entirely in B's rows.
+        self.assertGreaterEqual(spans[1].row_start, len_a)
+
+    def test_a_split_block_keeps_its_true_start_and_stops_at_the_chunk(self):
+        """A chunk opening mid-block must not re-anchor the span to the chunk.
+
+        Backward reach is clipped to the oldest SWA-resident token rather than
+        to the chunk start, and forward reach stops at the chunk's last token,
+        whose KV is the newest that exists.
+        """
+        block_start, span_len = 100, 300
+        item, span_start, block_end = self._item(block_start, span_len)
+        prefix_len, extend_len = 250, 200
+        chunk_last = prefix_len + extend_len - 1
+        resident_first = max(0, prefix_len - (self.WINDOW - 1))
+
+        spans = self._collect([[item]], [prefix_len], [extend_len])
+        self.assertEqual(len(spans), 1)
+        span = spans[0]
+        # The span opened before this chunk, so left counts from before row 0.
+        self.assertLess(span.left_origin, span.row_start)
+        self.assertEqual(span.row_start, 0)
+        self.assertEqual(span.row_end, min(block_end, chunk_last) - prefix_len)
+
+        left, right = self._visible(spans, extend_len)
+        self.assertEqual(
+            int(left[span.row_start]), prefix_len - max(span_start, resident_first)
+        )
+        self.assertEqual(int(right[span.row_end]), 0)
+        _, lengths = _vision_window_extent(
+            torch.arange(
+                prefix_len + 1, prefix_len + extend_len + 1, dtype=torch.int32
+            ),
+            left,
+            right,
+            self.WINDOW,
+            WIDTH,
+        )
+        self.assertLessEqual(int(lengths.max()), WIDTH)
+
+    def test_a_chunk_before_the_block_yields_no_span(self):
+        item, _, _ = self._item(4000, 100)
+        self.assertEqual(self._collect([[item]], [0], [512]), [])
+
+    def test_text_only_requests_shift_the_row_cursor(self):
+        """A text-only request between two image ones must still advance rows."""
+        first, _, first_end = self._item(0, 8)
+        second, _, second_end = self._item(0, 8)
+        len_a, len_text, len_b = first_end + 1, 17, second_end + 1
+        spans = self._collect(
+            [[first], None, [second]], [0, 0, 0], [len_a, len_text, len_b]
+        )
+        self.assertEqual(len(spans), 2)
+        # Identical geometry, so the second span sits at the same offset inside
+        # its own request's rows as the first does inside its own.
+        third_req_row = len_a + len_text
+        self.assertEqual(spans[1].row_start - third_req_row, spans[0].row_start)
+        self.assertLess(spans[1].row_end, third_req_row + len_b)
 
     def test_visibility_covers_the_span_and_nothing_else(self):
-        input_ids, positions, expected = self._batch([37, 200])
-        left, right = self._spans(input_ids, positions)
-        inside = torch.zeros(len(input_ids), dtype=torch.bool)
-        for start, end in expected:
-            inside[start : end + 1] = True
-            self.assertTrue(
-                torch.equal(left[start : end + 1].long(), torch.arange(end - start + 1))
+        item, span_start, block_end = self._item(3, 37)
+        total = block_end + 1 + 5
+        spans = self._collect([[item]], [0], [total])
+        left, right = self._visible(spans, total)
+        span_len = block_end - span_start + 1
+        self.assertTrue(
+            torch.equal(left[span_start : block_end + 1].long(), torch.arange(span_len))
+        )
+        self.assertTrue(
+            torch.equal(
+                right[span_start : block_end + 1].long(),
+                torch.arange(span_len - 1, -1, -1),
             )
-            self.assertTrue(
-                torch.equal(
-                    right[start : end + 1].long(),
-                    torch.arange(end - start, -1, -1),
-                )
-            )
-        # Text and the block's lead padding stay on the plain causal window.
-        self.assertEqual(int(left[~inside].max()), 0)
-        self.assertEqual(int(right[~inside].max()), 0)
-
-    def test_runs_do_not_merge_across_requests(self):
-        """A flat batch concatenates requests; positions restart at each one."""
-        ids_a, pos_a, expected_a = self._batch([16])
-        ids_b, pos_b, expected_b = self._batch([16])
-        offset = len(ids_a)
-        input_ids = torch.cat([ids_a, ids_b])
-        positions = torch.cat([pos_a, pos_b])
-        left, right = self._spans(input_ids, positions)
-        for start, end in expected_a:
-            self.assertEqual(int(left[end]), end - start)
-        for start, end in expected_b:
-            self.assertEqual(int(left[offset + end]), end - start)
-
-    def test_gather_stays_within_the_widened_window(self):
-        max_span = PARAMS.max_n_token - (COMPRESS_PAD_TO - 1)
-        input_ids, positions, _ = self._batch([max_span])
-        left, right = self._spans(input_ids, positions)
-        _, lengths = _vision_window_extent(positions + 1, left, right, self.WINDOW)
-        self.assertLessEqual(int(lengths.max()), self.WINDOW + PARAMS.max_n_token)
+        )
+        outside = torch.ones(total, dtype=torch.bool)
+        outside[span_start : block_end + 1] = False
+        self.assertEqual(int(left[outside].max()), 0)
+        self.assertEqual(int(right[outside].max()), 0)
 
     def test_window_extent_matches_the_reference_formula(self):
-        input_ids, positions, _ = self._batch([37, 200])
-        left, right = self._spans(input_ids, positions)
+        item, _, block_end = self._item(3, 200)
+        total = block_end + 1
+        spans = self._collect([[item]], [0], [total])
+        left, right = self._visible(spans, total)
+        positions = torch.arange(total, dtype=torch.int32)
         first_pos, lengths = _vision_window_extent(
-            positions + 1, left, right, self.WINDOW
+            positions + 1, left, right, self.WINDOW, WIDTH
         )
         for i, position in enumerate(positions.tolist()):
             # Reference: start = idx - max(window - 1, left), end = idx + right.

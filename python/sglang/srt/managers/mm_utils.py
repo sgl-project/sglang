@@ -624,6 +624,21 @@ def _embed_mm_inputs_with_split(
     return input_embeds, other_info
 
 
+def has_mm_inputs_to_embed(forward_batch: ForwardBatch) -> bool:
+    """Whether this forward has multimodal inputs that still need embedding.
+
+    A request keeps its ``multimodal_inputs`` until it finishes, so
+    ``contains_mm_inputs()`` alone stays true for every decode and
+    target-verify step after the prompt is embedded. Callers that key work off
+    "this batch carries image tokens" want this narrower test.
+    """
+    return (
+        not forward_batch.forward_mode.is_decode()
+        and not forward_batch.forward_mode.is_target_verify()
+        and forward_batch.contains_mm_inputs()
+    )
+
+
 def compute_mm_input_embeds(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -648,11 +663,7 @@ def compute_mm_input_embeds(
     Returns ``(input_embeds, extra_language_model_kwargs)``.
     """
     extra_kwargs: Dict[str, Any] = {}
-    if (
-        not forward_batch.forward_mode.is_decode()
-        and not forward_batch.forward_mode.is_target_verify()
-        and forward_batch.contains_mm_inputs()
-    ):
+    if has_mm_inputs_to_embed(forward_batch):
         mm_inputs_list = [
             mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
         ]

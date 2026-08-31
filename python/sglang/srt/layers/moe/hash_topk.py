@@ -142,13 +142,7 @@ class HashTopK(nn.Module):
     def _forward_torch(
         self, router_logits: torch.Tensor, input_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.score_func == "softmax":
-            scores = router_logits.softmax(dim=-1)
-        elif self.score_func == "sigmoid":
-            scores = router_logits.sigmoid()
-        else:
-            scores = torch.nn.functional.softplus(router_logits).sqrt()
-
+        scores = self._scores(router_logits)
         num_token = scores.shape[0]
 
         topk_ids = torch.zeros(
