@@ -337,18 +337,18 @@ class NemotronHMoE(nn.Module):
         final_hidden_states: torch.Tensor,
         shared_output: torch.Tensor | None,
     ) -> torch.Tensor:
-        quant_method = self.fc2_latent_proj.quant_method
-        if shared_output is not None and isinstance(
-            quant_method, UnquantizedLinearMethod
-        ):
-            return quant_method.apply_with_addend(
-                self.fc2_latent_proj,
-                final_hidden_states,
-                shared_output,
-                self.fc2_latent_proj.bias,
-            )
+        projection = self.fc2_latent_proj
+        if shared_output is not None and isinstance(projection, ReplicatedLinear):
+            quant_method = projection.quant_method
+            if isinstance(quant_method, UnquantizedLinearMethod):
+                return quant_method.apply_with_addend(
+                    projection,
+                    final_hidden_states,
+                    shared_output,
+                    projection.bias,
+                )
 
-        final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
+        final_hidden_states, _ = projection(final_hidden_states)
         if shared_output is not None:
             final_hidden_states += shared_output
         return final_hidden_states

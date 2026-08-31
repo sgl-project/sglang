@@ -413,6 +413,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if (
             torch.compiler.is_compiling()
             or _use_aiter
+            or not _is_cuda
             or not x.is_cuda
             or x.ndim != 2
             or x.dtype != torch.bfloat16
@@ -430,13 +431,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         backend = get_bf16_gemm_backend()
         if backend in (Bf16GemmBackend.AUTO, Bf16GemmBackend.TORCH):
             return True
-        return (
-            backend.is_cutedsl()
-            and _use_cutedsl_bf16_gemm is not None
-            and not _use_cutedsl_bf16_gemm(
-                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
-            )
-        )
+        if not backend.is_optimized() or _use_cutedsl_bf16_gemm is None:
+            return False
+
+        m, n, k = x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+        # Preserve any custom dispatcher route. Accumulate into the addend only
+        # when the optimized backend would fall through to F.linear/cuBLAS.
+        if _enable_bf16_splitk_gemm and use_flashinfer_pr4266_bf16_gemm(m, n, k):
+            return False
+        return not _use_cutedsl_bf16_gemm(m, n, k)
 
     def apply_with_addend(
         self,
@@ -448,6 +451,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         """Return ``linear(x) + addend`` and reuse ``addend`` when supported.
 
         The fast path overwrites ``addend``. Callers must treat it as consumed.
+        Unlike ``apply_into``, this uses the existing buffer as the GEMM beta
+        input (beta=1) instead of treating it as write-only output (beta=0).
         """
         if self._can_apply_with_addend(layer, x, addend, bias):
             # Reuse addend as beta input and output; cuBLAS rounds once after GEMM.

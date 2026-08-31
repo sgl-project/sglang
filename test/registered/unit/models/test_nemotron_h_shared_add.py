@@ -3,11 +3,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 import sglang.srt.layers.quantization.unquant as unquant
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.unquant import (
     Bf16GemmBackend,
-    UnquantizedLinearMethod,
 )
 from sglang.srt.models.nemotron_h import NemotronHMoE
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -16,14 +17,14 @@ register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
 
 def _make_projection(input_size: int, output_size: int):
-    weight = torch.randn(
-        output_size,
+    projection = ReplicatedLinear(
         input_size,
-        device="cuda",
-        dtype=torch.bfloat16,
-    ) / (input_size**0.5)
-    method = UnquantizedLinearMethod()
-    return SimpleNamespace(weight=weight, bias=None, quant_method=method), method
+        output_size,
+        bias=False,
+        params_dtype=torch.bfloat16,
+    ).cuda()
+    projection.weight.copy_(torch.randn_like(projection.weight) / (input_size**0.5))
+    return projection, projection.quant_method
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -31,7 +32,9 @@ def _make_projection(input_size: int, output_size: int):
 def test_latent_projection_accumulates_into_shared_output_and_replays_graph(
     monkeypatch,
 ):
+    """A graph replay must consume the newly produced shared buffer each time."""
     monkeypatch.setattr(unquant, "_BF16_GEMM_BACKEND", Bf16GemmBackend.CUTEDSL)
+    monkeypatch.setattr(unquant, "_enable_bf16_splitk_gemm", False)
     monkeypatch.setattr(unquant, "_use_cutedsl_bf16_gemm", lambda *args: False)
     projection, _ = _make_projection(64, 128)
     moe = SimpleNamespace(fc2_latent_proj=projection)
@@ -68,13 +71,18 @@ def test_latent_projection_accumulates_into_shared_output_and_replays_graph(
     torch.testing.assert_close(graph_output, replay_reference, rtol=1e-2, atol=3.125e-2)
 
 
-@pytest.mark.parametrize("fallback", ["noncontiguous", "compiled", "aiter", "cutedsl"])
+@pytest.mark.parametrize(
+    "fallback",
+    ["noncontiguous", "compiled", "aiter", "cutedsl", "splitk", "rocm"],
+)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @torch.inference_mode()
 def test_latent_projection_preserves_unfused_fallbacks(monkeypatch, fallback):
-    backend = (
-        Bf16GemmBackend.CUTEDSL if fallback == "cutedsl" else Bf16GemmBackend.TORCH
-    )
+    """Unsupported platforms and custom kernels must retain separate-add semantics."""
+    backend = {
+        "cutedsl": Bf16GemmBackend.CUTEDSL,
+        "splitk": Bf16GemmBackend.FLASHINFER_PR4266,
+    }.get(fallback, Bf16GemmBackend.TORCH)
     monkeypatch.setattr(unquant, "_BF16_GEMM_BACKEND", backend)
     projection, method = _make_projection(64, 128)
     routed = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
@@ -98,6 +106,16 @@ def test_latent_projection_preserves_unfused_fallbacks(monkeypatch, fallback):
             "_cutedsl_bf16_gemm",
             lambda x, weight, bias: F.linear(x, weight, bias),
         )
+    elif fallback == "splitk":
+        monkeypatch.setattr(unquant, "_enable_bf16_splitk_gemm", True)
+        monkeypatch.setattr(
+            unquant, "use_flashinfer_pr4266_bf16_gemm", lambda *args: True
+        )
+        linear_output = F.linear(routed, projection.weight)
+        monkeypatch.setattr(method, "apply", lambda layer, x, bias: linear_output)
+    elif fallback == "rocm":
+        # HIP tensors also report ``is_cuda``; the platform guard must win.
+        monkeypatch.setattr(unquant, "_is_cuda", False)
 
     candidate = method.apply_with_addend(projection, routed, shared)
     reference = F.linear(routed, projection.weight) + shared_before
@@ -108,16 +126,35 @@ def test_latent_projection_preserves_unfused_fallbacks(monkeypatch, fallback):
 
 
 def test_latent_projection_preserves_non_unquantized_path():
-    class Projection:
-        quant_method = object()
+    """A non-unquantized base projection must dispatch through its own method."""
 
-        def __call__(self, x):
-            return 2 * x, None
+    class DoubleMethod:
+        def apply(self, layer, x, bias):
+            return 2 * x
 
     routed = torch.randn(4, 8)
     shared = torch.randn_like(routed)
-    moe = SimpleNamespace(fc2_latent_proj=Projection())
+    projection = ReplicatedLinear(8, 8, bias=False)
+    projection.quant_method = DoubleMethod()
+    moe = SimpleNamespace(fc2_latent_proj=projection)
 
     output = NemotronHMoE._apply_latent_projection(moe, routed, shared)
 
     torch.testing.assert_close(output, 2 * routed + shared, rtol=0, atol=0)
+
+
+def test_latent_projection_preserves_lora_wrapper_path():
+    """A wrapped projection without quant_method must run its wrapper forward."""
+
+    class LoraLikeProjection(nn.Module):
+        # Production LoRA wrappers intentionally do not expose quant_method.
+        def forward(self, x):
+            return 2 * x + 1, None
+
+    routed = torch.randn(4, 8)
+    shared = torch.randn_like(routed)
+    moe = SimpleNamespace(fc2_latent_proj=LoraLikeProjection())
+
+    output = NemotronHMoE._apply_latent_projection(moe, routed, shared)
+
+    torch.testing.assert_close(output, 2 * routed + 1 + shared, rtol=0, atol=0)
