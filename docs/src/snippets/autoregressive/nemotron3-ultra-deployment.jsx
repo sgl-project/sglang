@@ -5,7 +5,7 @@ export const Nemotron3UltraDeployment = () => {
   };
 
   // Verified {model, hardware, tp} combinations. Any tuple not in this list is
-  // blocked by `generateCommand` so the UI cannot emit an unvalidated launch.
+  // blocked by `generateCommand`; optional knobs have separate constraints.
   // Keep in sync with the "Supported GPUs" section of Nemotron3-Ultra.mdx.
   const VERIFIED_CONFIGS = [
     { model: 'bf16',  hardware: 'h100',  tp: '16', multinode: true },
@@ -158,10 +158,10 @@ export const Nemotron3UltraDeployment = () => {
       name: 'mambabackend',
       title: 'Mamba Backend',
       items: [
-        { id: 'triton',     label: 'Triton',     subtitle: 'Runtime default',    default: false },
-        { id: 'flashinfer', label: 'FlashInfer', subtitle: 'Higher throughput',  default: true  }
+        { id: 'triton',     label: 'Triton',     subtitle: 'SGLang default',       default: false },
+        { id: 'flashinfer', label: 'FlashInfer', subtitle: 'MTP decode throughput', default: true  }
       ],
-      commandRule: (value) => value === 'flashinfer' ? '--mamba-backend flashinfer' : null
+      commandRule: (value) => `--mamba-backend ${value}`
     },
     mambassmdtype: {
       name: 'mambassmdtype',
