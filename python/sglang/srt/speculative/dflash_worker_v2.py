@@ -1500,6 +1500,19 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
+        # The locs arrive VIRTUAL: both callers read them off the target's
+        # req_to_token (post-verify) or the ScheduleBatch (prefill), and the
+        # write rebind deliberately leaves those aliases virtual. Every pool
+        # call below is a DIRECT KVCache write, so translate here -- this is
+        # the one choke point they all pass through. Identity on a plain pool.
+        # Fresh tensors only: the callers keep using their virtual copies
+        # afterwards (the post-verify 2-D loc is a persistent buffer that the
+        # compact req_to_token rebuild re-reads as virtual ids).
+        translator = self.draft_model_runner.kv_index_translator
+        cache_loc = translator.translate_full_attn_ids(cache_loc)
+        if cache_loc_2d is not None:
+            cache_loc_2d = translator.translate_full_attn_ids(cache_loc_2d)
+
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
 

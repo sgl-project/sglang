@@ -37,7 +37,10 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache import kv_index_translator
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_index_translator import (
+    KVIndexTable,
+    KVIndexTranslator,
+)
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedSWATokenToKVPoolAllocator,
 )
@@ -136,7 +139,7 @@ def _source(allocator, pool_obj):
     )
 
 
-class TestKVIndexSourceDraftDisposition(unittest.TestCase):
+class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
     def test_target_runner_uses_the_host_multiplier(self):
         _, allocator, kvcache, _ = _build()
         src = _source(allocator, kvcache)
@@ -237,6 +240,162 @@ class TestKVIndexSourceDraftDisposition(unittest.TestCase):
         _, other_alloc, _, other_draft = _build()
         src = _source(allocator, other_draft)
         self.assertFalse(src.is_translating)
+
+    def test_seq_len_delta_matches_widened_lens(self):
+        """``seq_len_delta=k`` must be byte-identical to building with
+        ``seq_lens + k`` — the two spellings of the whole-sequence verify
+        widening. A kernel applying the delta to the page count but not the
+        loads (or vice versa) silently truncates the verify tail."""
+        _, allocator, kvcache, _ = _build()
+        v = allocator.alloc(6 * _PS)
+        self.assertIsNotNone(v)
+        rt = torch.zeros((2, 16), dtype=torch.int32)
+        rt[0, : v.numel()] = v.to(torch.int32)
+        src = KVIndexTranslator(
+            req_to_token=rt,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=kvcache,
+            page_size=_PS,
+            device=_DEV,
+        )
+        rpi = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([3], dtype=torch.int64)
+        delta = 2 * _PS + 1
+        max_pages = -(-(3 + delta) // _PS)
+        widened = src.build_index_table(
+            req_pool_indices=rpi,
+            seq_lens=seq,
+            max_pages=max_pages,
+            seq_len_delta=delta,
+        )
+        by_lens = src.build_index_table(
+            req_pool_indices=rpi, seq_lens=seq + delta, max_pages=max_pages
+        )
+        torch.testing.assert_close(widened.ids, by_lens.ids, rtol=0, atol=0)
+        # The delta genuinely widened: entries exist past the unwidened prefix.
+        plain_pages = -(-3 // _PS)
+        self.assertTrue(bool((widened.ids[0, plain_pages:] > 0).any()))
+
+    def test_widened_index_table_matches_widened_lens(self):
+        """`widened_index_table` (the verify entry point) must equal the
+        widened-lens build over the SAME batch: derive max_pages from the
+        widened max and forward the delta. Deriving max_pages from the
+        un-widened lens silently truncates the verify tail's pages."""
+        _, allocator, kvcache, _ = _build()
+        v = allocator.alloc(6 * _PS)
+        self.assertIsNotNone(v)
+        rt = torch.zeros((2, 16), dtype=torch.int32)
+        rt[0, : v.numel()] = v.to(torch.int32)
+        src = KVIndexTranslator(
+            req_to_token=rt,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=kvcache,
+            page_size=_PS,
+            device=_DEV,
+        )
+        rpi = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([3], dtype=torch.int64)
+        delta = 2 * _PS + 1
+        fb = SimpleNamespace(
+            req_pool_indices=rpi,
+            seq_lens=seq,
+            seq_lens_cpu=seq.cpu(),
+            # `seq_lens_sum` is the liveness signal for seq_lens_cpu: it is a
+            # non-None but STALE slice on a gpu_only batch, so the build only
+            # trusts it when the sum is present. Without the field the stand-in
+            # batch falls back to the full req_to_token width.
+            seq_lens_sum=int(seq.sum()),
+            out_cache_loc=None,
+        )
+        widened = src.widened_index_table(fb, seq_len_delta=delta)
+        max_pages = -(-(3 + delta) // _PS)
+        by_lens = src.build_index_table(
+            req_pool_indices=rpi, seq_lens=seq + delta, max_pages=max_pages
+        )
+        self.assertEqual(widened.ids.shape, by_lens.ids.shape)
+        torch.testing.assert_close(widened.ids, by_lens.ids, rtol=0, atol=0)
+
+    def test_swa_view_per_disposition(self):
+        """`swa_view()` re-aims a table at the window gather source: the
+        target's separate swa array when one exists, the SAME table under the
+        fused draft's single-space swa, and the SAME table when untranslated
+        (the caller's full->swa rewrite still applies). Handing a window
+        kernel the full-side ids under translation reads the wrong pool."""
+        pool, allocator, kvcache, draft_pool = _build()
+        v = allocator.alloc(2 * _PS)
+        self.assertIsNotNone(v)
+        rt = torch.zeros((2, 8), dtype=torch.int32)
+        rt[0, : v.numel()] = v.to(torch.int32)
+        rpi = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([2], dtype=torch.int64)
+
+        target = KVIndexTranslator(
+            req_to_token=rt,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=kvcache,
+            page_size=_PS,
+            device=_DEV,
+        ).build_index_table(req_pool_indices=rpi, seq_lens=seq, max_pages=2)
+        self.assertIsNotNone(target.sliding_window_ids)
+        self.assertIs(target.swa_view().ids, target.sliding_window_ids)
+
+        fused = KVIndexTranslator(
+            req_to_token=rt,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=draft_pool,
+            page_size=_PS,
+            device=_DEV,
+        ).build_index_table(req_pool_indices=rpi, seq_lens=seq, max_pages=2)
+        self.assertIsNone(fused.sliding_window_ids)
+        self.assertIs(fused.swa_view(), fused)
+
+        raw = KVIndexTable.passthrough(req_to_token=rt, req_pool_indices=rpi)
+        self.assertIs(raw.swa_view(), raw)
+
+    def test_target_hidden_injectors_translate_their_locs(self):
+        """BUG REGRESSION (eval_568). DFLASH and DSPARK do not compute their
+        draft KV from the draft's own forward -- they PROJECT the target's
+        hidden states and write them straight into the draft pool. Those
+        writes take locs read off the target's req_to_token (VIRTUAL) and call
+        the KVCache API directly, bypassing the write rebind, which by design
+        leaves the caller's aliases virtual. Under fusion the draft pool
+        expects DRAFT-DENSE ids, so every such write landed at the wrong row:
+        the draft then attended over its own mask-token KV and accept length
+        collapsed to 1.0 (zero drafts accepted) with no crash -- and the stray
+        rows overwrote host KV blocks in the same pages. Identity on a plain
+        pool, which is why it only ever broke the fused arm."""
+        import sglang.srt.mem_cache.kv_index_translator as _kit
+
+        root = pathlib.Path(_kit.__file__).parent.parent
+        for rel, func in (
+            (
+                "speculative/dflash_worker_v2.py",
+                "_append_target_hidden_to_draft_kv_by_loc",
+            ),
+            (
+                "speculative/dspark_components/dspark_kv_inject.py",
+                "inject_target_hidden",
+            ),
+        ):
+            src = (root / rel).read_text()
+            tree = ast.parse(src)
+            fn = next(
+                (
+                    n
+                    for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == func
+                ),
+                None,
+            )
+            self.assertIsNotNone(fn, f"{func} not found in {rel}")
+            body = ast.unparse(fn)
+            self.assertIn(
+                "translate_full_attn_ids",
+                body,
+                f"{rel}::{func} writes draft KV without translating its locs; "
+                "under a fused draft region those virtual ids address the "
+                "wrong rows (silent corruption, accept collapses to 1.0).",
+            )
 
     def test_full_flat_translate_args_per_disposition(self):
         """The flat-translate accessor must hand a kernel exactly what

@@ -69,6 +69,17 @@ class TargetHiddenKvInjector:
                 device=device, dtype=torch.int64, non_blocking=True
             )
 
+        # Same contract as the DFLASH injector: these locs are VIRTUAL (they
+        # come from the target's req_to_token via assign_extend_cache_locs, or
+        # from the ScheduleBatch), and everything below is a DIRECT KVCache
+        # write. Translate once here -- identity on a plain pool, so the
+        # private-draft arm (and its MLA branch) is untouched, while a FUSED
+        # draft gets its own dense ids instead of silently writing target rows.
+        translator = self.draft_model_runner.kv_index_translator
+        cache_loc = translator.translate_full_attn_ids(cache_loc)
+        if cache_loc_2d is not None:
+            cache_loc_2d = translator.translate_full_attn_ids(cache_loc_2d)
+
         pool = self.draft_model_runner.token_to_kv_pool
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
             self._inject_mla(
