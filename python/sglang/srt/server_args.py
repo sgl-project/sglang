@@ -1887,13 +1887,9 @@ class ServerArgs:
         Optional[List[int]],
         Arg(
             help=(
-                "Maximum final-context lengths captured by the breakable/full "
-                "prefill CUDA graph. The largest seq_len in a replay batch is "
-                "rounded up to the nearest bucket; context-shaped attention "
-                "metadata and C4 indexer logits use that bucket instead of the "
-                "model maximum. Values are page-aligned by the runner; replay "
-                "falls back to eager when no bucket fits or padding would "
-                "exceed 2x the live maximum context. "
+                "Maximum context lengths captured by the breakable/full "
+                "prefill CUDA graph. Context-shaped attention metadata and indexer logits use that bucket instead of the "
+                "model maximum. Replay falls back to eager when no bucket fits or padding exceeds 2x the live maximum context."
                 f"\n\n{human_readable_int.__doc__}"
             ),
             type_parser=human_readable_int,
