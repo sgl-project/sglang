@@ -61,8 +61,13 @@ class TestOnlineIntegerQuantizationSelection(CustomTestCase):
     @patch(
         "sglang.srt.hardware_backend.npu.quantization.online_quantization.get_server_args"
     )
-    @patch("sglang.srt.layers.linear.current_platform.is_npu")
-    def test_linear_selection_uses_live_platform(self, is_npu, get_server_args):
+    @patch("sglang.srt.layers.linear.is_npu")
+    @patch("sglang.srt.layers.linear.current_platform.is_npu", return_value=False)
+    def test_linear_selection_uses_runtime_npu_detection(
+        self, _, is_npu, get_server_args
+    ):
+        """Dense W8A8 works when torch-NPU is available without a platform plugin."""
+
         get_server_args.return_value = SimpleNamespace(online_quantization="w8a8_int")
         is_npu.return_value = True
         npu_layer = LinearBase(2, 2, prefix="model.layers.0.qkv_proj")
