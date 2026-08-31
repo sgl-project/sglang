@@ -11,7 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""How a draft-shaped KVCacheConfigurator binds its KV under the unified pool.
+"""Draft-shaped KVCacheConfigurator dispatch under the unified pool.
+
+BUG REGRESSION (fast path). The fast path was gated on `req_to_token_pool is
+None` alone, but a compact-window DFLASH draft (`--speculative-draft-window-size`)
+also passes None — it builds a private req_to_token of its own — so the draft
+worker would allocate a SECOND unified byte buffer at boot. A draft-shaped
+configurator must fall through to the normal pool build instead.
 
 DERIVED PROPERTY (binding dispatch). The fused-vs-private draft binding
 dispatches on the spec algorithm, not the allocator kind: a non-EAGLE draft on
@@ -44,6 +50,81 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class _ReachedNormalBuild(Exception):
+    """Sentinel: control flow fell past the unified fast path."""
+
+
+class TestUnifiedFastPathDraftGate(CustomTestCase):
+    def _run(self, *, is_draft_worker: bool):
+        cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        cfg.is_draft_worker = is_draft_worker
+        cfg.mambaish_config = object()  # would select the mamba unified arm
+        cfg.is_hybrid_swa = False  # not the mamba+SWA tri-pool arm
+        cfg.model_config = SimpleNamespace(hf_config={})  # not DSV4
+        # Every field the fast path reads: a missing one raises while the
+        # arm's arguments are evaluated, which reads here as "took the fast
+        # path but called nothing".
+        sizes = SimpleNamespace(
+            max_running_requests=8,
+            max_total_num_tokens=64,
+            full_max_total_num_tokens=64,
+            swa_max_total_num_tokens=32,
+            unified_total_bytes=1 << 20,
+        )
+        taken = []
+        with (
+            patch.object(
+                kcc,
+                "get_memory",
+                return_value=SimpleNamespace(enable_unified_memory=True),
+            ),
+            patch.object(
+                kcc,
+                "get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="null"),
+            ),
+            patch.object(
+                kcc.KVCacheConfigurator,
+                "_init_unified_mamba_pools",
+                lambda self, **kw: taken.append("mamba") or None,
+            ),
+            patch.object(
+                kcc.KVCacheConfigurator,
+                "_init_unified_swa_pools",
+                lambda self, **kw: taken.append("swa") or None,
+            ),
+            patch.object(
+                kcc.KVCacheConfigurator,
+                "_build_req_to_token_pool",
+                side_effect=_ReachedNormalBuild,
+            ),
+        ):
+            try:
+                cfg._init_pools(
+                    sizes=sizes,
+                    req_to_token_pool=None,
+                    token_to_kv_pool_allocator=None,
+                )
+            except _ReachedNormalBuild:
+                return "normal", taken
+            except (AttributeError, TypeError):
+                # The stubbed unified arm returned None; anything past the
+                # fast-path dispatch counts as having taken it.
+                return "unified", taken
+        return "unified", taken
+
+    def test_draft_worker_falls_through_to_the_normal_build(self):
+        path, taken = self._run(is_draft_worker=True)
+        self.assertEqual(path, "normal")
+        self.assertEqual(taken, [])
+
+    def test_target_worker_still_takes_the_fast_path(self):
+        """The guard must narrow to drafts only — a target regression here
+        silently turns --enable-unified-memory into a no-op."""
+        path, taken = self._run(is_draft_worker=False)
+        self.assertEqual(taken, ["mamba"])
 
 
 class _FakeKVCache:

@@ -405,9 +405,16 @@ class KVCacheConfigurator:
         token_to_kv_pool = None
 
         # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
-        # from one byte buffer, then return. Gated to the target worker
-        # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
-        if get_memory().enable_unified_memory and req_to_token_pool is None:
+        # from one byte buffer, then return. Gated to the target worker:
+        # `req_to_token_pool is None` alone is not enough — a compact-window
+        # DFLASH draft also passes None (it builds a private req_to_token) and
+        # would allocate a SECOND unified byte buffer here. Supports hybrid
+        # Mamba and hybrid SWA (not DSV4).
+        if (
+            get_memory().enable_unified_memory
+            and req_to_token_pool is None
+            and not self.is_draft_worker
+        ):
             pd_enabled = get_disagg().disaggregation_mode != "null"
             is_dsv4 = is_deepseek_v4(self.model_config.hf_config)
             # Order matters: an Inkling-class model is BOTH mambaish and
