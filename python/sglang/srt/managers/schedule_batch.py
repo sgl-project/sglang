@@ -820,7 +820,7 @@ class ReqKvInfo:
     req_pool_idx: Optional[int] = None  # req_to_token row, the register for the slots
 
     # The request's own KV is [cache_protected_len, kv_allocated_len).
-    cache_protected_len: int = 0  # tree cache owns [0, here) (matched or inserted)
+    cache_protected_len: int = 0  # Tree cache owns [0, here) (matched or inserted)
     kv_committed_len: int = 0  # KV content committed up to here, <= kv_allocated_len
     kv_allocated_len: int = 0
 
@@ -836,9 +836,9 @@ class ReqKvInfo:
     mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
     mamba_next_track_idx: Optional[int] = None  # 0 or 1
     mamba_last_track_idx: Optional[int] = None  # 0 or 1
-    # seq len of the last cached mamba state
+    # Seq len of the last cached mamba state
     mamba_last_track_seqlen: Optional[int] = None
-    # the branching point seqlen to track mamba state. If set, given by prefix match,
+    # The branching point seqlen to track mamba state. If set, given by prefix match,
     # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
     mamba_branching_seqlen: Optional[int] = None
     # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
