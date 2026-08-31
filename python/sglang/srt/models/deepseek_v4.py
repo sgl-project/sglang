@@ -156,7 +156,13 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_platform,
+)
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -852,9 +858,7 @@ class MQALayer(MqaAttentionBase):
             self.alt_streams = None
             self.alt_streams_indexer = None
 
-        from sglang.srt.utils import is_blackwell_supported
-
-        self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
+        self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
 
         self.compressor = None
         self.indexer = None

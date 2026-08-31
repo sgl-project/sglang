@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, 
 
 from sglang.srt.runtime_context import (
     attention_backends,
+    get_context,
     get_device,
     get_disagg,
     get_exec,
@@ -41,6 +42,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
+    publish,
 )
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
@@ -292,14 +294,15 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import get_context, publish
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
-from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
+from sglang.srt.speculative.eagle_utils import (
+    get_draft_recurrent_hidden_state_spec_from_config,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -577,6 +580,12 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        if self.enable_hierarchical_cache:
+            cache_controller = self.tree_cache.cache_controller
+            if cache_controller is not None:
+                cache_controller.load_fence_stream = (
+                    self.tp_worker.model_runner.forward_stream
+                )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -1292,7 +1301,6 @@ class Scheduler(
                     attn_tp_size=self.ps.attn_tp_size,
                     cpu_group=self.tp_cpu_group,
                     device_group=self.tp_group.device_group,
-                    server_args=self.server_args,
                     metrics_collector=(
                         self.metrics_collector
                         if self.metrics_reporter.enable_metrics
@@ -1374,11 +1382,18 @@ class Scheduler(
         )
 
         if self.spec_algorithm.carries_draft_hidden_states():
-            # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
-            # worker, so a single accessor covers both shapes.
-            draft_runner = self.draft_worker.draft_worker.draft_runner
+            # Derive the rank-uniform PD wire schema from config because only the
+            # last prefill PP stage owns a draft runner.
+            draft_model_config = ModelConfig.from_server_args(
+                self.server_args,
+                model_path=get_spec().speculative_draft_model_path,
+                model_revision=get_spec().speculative_draft_model_revision,
+                is_draft_model=True,
+            )
             disagg_hidden_size, disagg_hidden_states_dtype = (
-                get_draft_recurrent_hidden_state_spec(draft_runner)
+                get_draft_recurrent_hidden_state_spec_from_config(
+                    draft_model_config, self.spec_algorithm
+                )
             )
         else:
             disagg_hidden_size = 16  # minimal padding size for RDMA
@@ -2805,7 +2820,7 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
-            buffer_mode = self.server_args.hicache_host_memory_mode == "buffer_only"
+            buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
             last_host_node = req.last_host_node
             # Buffer mode host-backups nothing, so match_prefix anchors at
             # root; re-anchor on the deepest device node. The anchor is only
@@ -2845,7 +2860,39 @@ class Scheduler(
                     tree_cache.get_last_hash_value(last_host_node),
                     prefix_keys,
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
+                    extra_key=req.extra_key,
+                    cache_salt=req.cache_salt,
                 )
+
+    def _retry_missed_storage_prefetches(self):
+        """Re-issue the availability check for queued requests whose prefetch
+        missed. Pacing counts scheduling passes so TP ranks re-issue on the
+        same pass; a sweep (the admission loop stops at the first
+        unschedulable request) covers the whole queue."""
+        interval = get_memory().hicache_storage_prefetch_retry_poll_interval
+        if interval <= 0 or not self.waiting_queue:
+            return
+        max_attempts = get_memory().hicache_storage_prefetch_retry_max_attempts
+        for req in self.waiting_queue:
+            if self.tree_cache.pop_storage_prefetch_miss(req.rid):
+                req.storage_prefetch_retry_pending = True
+                req.storage_prefetch_retry_wait_polls = 0
+            if (
+                not req.storage_prefetch_retry_pending
+                or req.storage_prefetch_retry_attempts >= max_attempts
+            ):
+                continue
+            req.storage_prefetch_retry_wait_polls += 1
+            if req.storage_prefetch_retry_wait_polls <= interval:
+                continue
+            req.storage_prefetch_retry_pending = False
+            req.storage_prefetch_retry_attempts += 1
+            logger.debug(
+                "HiCache storage prefetch retry req=%s attempt=%d",
+                req.rid,
+                req.storage_prefetch_retry_attempts,
+            )
+            self._prefetch_kvcache(req)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -3077,7 +3124,7 @@ class Scheduler(
         if self.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
             # it. Drop the marker once the request is actually gone.
-            if req.finished() or req.req_pool_idx is None:
+            if req.finished() or req.kv.req_pool_idx is None:
                 self._pending_chunked_abort_req = None
             return
 
@@ -3114,7 +3161,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
         )
 
-        req_pool_indices = [r.req_pool_idx for r in reqs]
+        req_pool_indices = [r.kv.req_pool_idx for r in reqs]
         batch.req_pool_indices = torch.tensor(
             req_pool_indices, dtype=torch.int64, device=device
         )
@@ -3353,6 +3400,8 @@ class Scheduler(
 
         if self.enable_hierarchical_cache or get_memory().enable_flexkv:
             self.tree_cache.check_hicache_events()
+            if self.enable_hicache_storage:
+                self._retry_missed_storage_prefetches()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -3478,7 +3527,7 @@ class Scheduler(
             if running_batch.batch_is_full:
                 if (
                     not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                    or not adder.preempt_to_schedule(req)
                 ):
                     break
 
@@ -3495,21 +3544,23 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache)
             if (
                 self.enable_hicache_storage
-                and self.server_args.hicache_host_memory_mode == "buffer_only"
+                and get_memory().hicache_host_memory_mode == "buffer_only"
             ):
                 # Buffer mode: surface a staged prefetch as the request's host
                 # hit (consumed through init_load_back) plus its SWA window,
                 # which consumption allocates and the request lock pins —
-                # uncharged, the batch alloc can OOM. Set AFTER
+                # uncharged, the batch alloc can OOM. Planned against the same
+                # live prefix admission uses, so only the splice-able span
+                # tail is charged and unusable holds are freed. Set AFTER
                 # init_next_round_input (which recomputes host_hit). Mamba
                 # (fenced in init_hicache) will need the same charge via
                 # mamba_host_hit_length.
-                held_tokens = self.tree_cache.staged_prefetch_tokens(req.rid)
+                held_tokens, held_swa_tokens = self.tree_cache.plan_staged_splice(
+                    req.rid, len(req.prefix_indices)
+                )
                 if held_tokens > 0:
                     req.host_hit_length = held_tokens
-                    req.swa_host_hit_length = (
-                        self.tree_cache.staged_prefetch_swa_tokens(req.rid)
-                    )
+                    req.swa_host_hit_length = held_swa_tokens
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3536,15 +3587,13 @@ class Scheduler(
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
-                    req.mamba_cow_src_index = None
-                    req.mamba_needs_clear = False
-                    if req.mamba_pool_idx is not None and not getattr(
-                        req, "session", None
-                    ):
+                    req.kv.mamba_cow_src_index = None
+                    req.kv.mamba_needs_clear = False
+                    if req.kv.holds_mamba and not getattr(req, "session", None):
                         self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                            req.mamba_pool_idx.unsqueeze(-1)
+                            req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
-                        req.mamba_pool_idx = None
+                        req.kv.mamba_pool_idx = None
                 break
 
         if mamba_allocator is not None:
@@ -3597,7 +3646,7 @@ class Scheduler(
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.swa_evict_floor = req.extend_range.end
+                req.kv.swa_evict_floor = req.extend_range.end
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -3949,7 +3998,9 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3960,12 +4011,14 @@ class Scheduler(
                         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)
-                # Sync D2H so the result processor can read CPU tensors.
+                # Only the last PP rank owns real results requiring D2H; other ranks
+                # consume device tensors rebuilt from the output ring.
                 batch_result.copy_done = self.device_module.Event()
-                batch_result.copy_to_cpu(
-                    return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
-                )
+                if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
+                    batch_result.copy_to_cpu(
+                        return_logprob=batch.return_logprob,
+                        return_hidden_states=batch.return_hidden_states,
+                    )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
@@ -4397,7 +4450,7 @@ class Scheduler(
                 if tc.enable_storage:
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
-                    if self.server_args.hicache_host_memory_mode == "buffer_only":
+                    if get_memory().hicache_host_memory_mode == "buffer_only":
                         # Queued writes, staged prefetches, and in-flight
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
@@ -4797,7 +4850,7 @@ class Scheduler(
 
             # For mamba radix cache
             if (
-                req.mamba_pool_idx is not None
+                req.kv.holds_mamba
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
@@ -4812,10 +4865,7 @@ class Scheduler(
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
                 )
-                if (
-                    req.req_pool_idx is not None
-                    or getattr(req, "mamba_pool_idx", None) is not None
-                ):
+                if req.kv.holds_kv or req.kv.holds_mamba:
                     release_kv_cache(req, self.tree_cache, is_insert=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
