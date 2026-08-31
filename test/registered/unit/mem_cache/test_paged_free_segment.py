@@ -82,6 +82,19 @@ class TestFreeSegment(unittest.TestCase):
         alloc.free_group_end()
         self.assertEqual(len(alloc.free_pages), before + 2)
 
+    def test_group_owns_deferred_page_representatives(self):
+        alloc = _make_allocator()
+        row = _make_kv_row(alloc, 2 * PAGE_SIZE)
+        expected_pages = torch.unique(row // PAGE_SIZE)
+
+        alloc.free_group_begin()
+        alloc.free_segment(row, start_pos=0)
+        row.zero_()
+        alloc.free_group_end()
+
+        freed_pages = alloc.free_pages[: expected_pages.numel()]
+        self.assertTrue(torch.equal(torch.sort(freed_pages)[0], expected_pages))
+
     def test_group_end_debug_assert_catches_cross_call_double_free(self):
         # legacy free() + free_segment() on the same page in one group must
         # trip free_group_end's debug assert
@@ -118,7 +131,7 @@ class TestFreeSegment(unittest.TestCase):
             token_to_kv_pool_allocator=alloc,
             req_to_token_pool=SimpleNamespace(req_to_token=row.unsqueeze(0)),
         )
-        req = SimpleNamespace(req_pool_idx=0)
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0))
 
         before = len(alloc.free_pages)
         alloc.free_group_begin()

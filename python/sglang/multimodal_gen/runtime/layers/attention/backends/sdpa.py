@@ -24,6 +24,8 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.MATH,
 ]
 
+_MPS_VARLEN_QUERY_CHUNK_SIZE = 128
+
 
 class SDPABackend(AttentionBackend):
 
@@ -79,10 +81,24 @@ class SDPAImpl(AttentionImpl):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
+        attn_mask = None
+        is_causal = self.causal
+        if self.causal and query.shape[-2] != key.shape[-2]:
+            is_causal = False
+            if query.shape[-2] > 1:
+                query_length = query.shape[-2]
+                key_length = key.shape[-2]
+                attn_mask = torch.ones(
+                    query_length,
+                    key_length,
+                    dtype=torch.bool,
+                    device=query.device,
+                ).tril(diagonal=key_length - query_length)
+
         attn_kwargs = {
-            "attn_mask": None,
+            "attn_mask": attn_mask,
             "dropout_p": self.dropout,
-            "is_causal": self.causal,
+            "is_causal": is_causal,
             "scale": self.softmax_scale,
         }
         if query.shape[1] != key.shape[1]:
@@ -114,13 +130,31 @@ class SDPAImpl(AttentionImpl):
         for start, stop in zip(bounds[:-1], bounds[1:]):
             if start == stop:
                 continue
-            segment = self.forward(
-                query[start:stop].unsqueeze(0),
-                key[start:stop].unsqueeze(0),
-                value[start:stop].unsqueeze(0),
-                None,
-            )
-            output[start:stop].copy_(segment[0])
+            if query.device.type != "mps":
+                segment = self.forward(
+                    query[start:stop].unsqueeze(0),
+                    key[start:stop].unsqueeze(0),
+                    value[start:stop].unsqueeze(0),
+                    None,
+                )
+                output[start:stop].copy_(segment[0])
+                continue
+
+            # mps SDPA materializes a quadratic temporary for a varlen segment
+            # chunking query rows keeps every row's complete K/V context intact
+            keys = key[start:stop].unsqueeze(0)
+            values = value[start:stop].unsqueeze(0)
+            for query_start in range(start, stop, _MPS_VARLEN_QUERY_CHUNK_SIZE):
+                query_stop = min(query_start + _MPS_VARLEN_QUERY_CHUNK_SIZE, stop)
+                segment = self.forward(
+                    query[query_start:query_stop].unsqueeze(0),
+                    keys,
+                    values,
+                    None,
+                )
+                output[query_start:query_stop].copy_(segment[0])
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
         return output
 
 

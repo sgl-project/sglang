@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <limits>
 
+namespace sglang {
+
 namespace host::compress {
 
 constexpr auto kDLUInt8 = DLDataType{.code = kDLUInt, .bits = 8, .lanes = 1};
@@ -45,6 +47,8 @@ struct Prefill0Params {
   uint32_t num_q_tokens;
   int32_t compress_ratio;
   int32_t swa_page_size;
+  /// \brief Trailing tokens the write plan keeps resident in the compress state ring.
+  /// Derived from the ring in `plan_compress_prefill`; see the bound there.
   int32_t mtp_pad;
 };
 
@@ -150,11 +154,6 @@ __global__ __launch_bounds__(1024, 1)  //
     counter_c = 0;
     counter_w = 0;
   }
-  if (tx < kNumWarps) {
-    warp_max[tx] = 0;
-    warp_min[tx] = 0xFFFFFFFFu;
-  }
-
   // === Stage B: min/max(extend_len) for MTP-uniform detection ===
   // For min, treat threads outside `batch_size` as +inf so they don't pull the min down.
   const uint32_t e_for_max = static_cast<uint32_t>(extend_len);
@@ -507,12 +506,18 @@ inline PrefillPlan plan_compress_prefill(
   RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
   // `swa_page_size` >= `ring_size` >= `compress_ratio`
   RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
+  // Write pad: trailing tokens kept resident so a verify batch's committed tail survives
+  // any accept length. Zero without speculation -- nothing rolls back, and the ring is
+  // then exactly one window wide. Otherwise the ring bounds it: a write at `w` aliases
+  // onto `w - ring_size`, and the earliest position a future compression still needs is
+  // `prefix_len - window_size + 2` (the next batch commits >= 1 token, and `run_prefill`
+  // launches the compress kernel before the write kernel, so a batch's own compressions
+  // read the pre-write ring). Padding past the extend range is harmless: the loops only
+  // span `[prefix_len, seq_len)`.
+  const auto mtp_pad = ring_size > window_size ? ring_size - window_size + 2 : 0;
 
   const auto device = device_.unwrap();
   const auto stream = LaunchKernel::resolve_device(device);
-
-  constexpr int32_t kMaxMTPDraftTokens = 4;
-  const auto mtp_pad = std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
 
   if (cpu_or_gpu.unwrap().device_type == kDLGPU) {
     // GPU input path: kernel0 builds the (CPU-loop-equivalent) plan metadata directly
@@ -573,7 +578,7 @@ inline PrefillPlan plan_compress_prefill(
     const int32_t extend_len = ext_ptr[i];
     const int32_t prefix_len = seq_len - extend_len;
     const int32_t last_c_pos = seq_len / compress_ratio * compress_ratio;
-    const int32_t first_w_pos = last_c_pos - (is_overlap ? compress_ratio : 0);
+    const int32_t first_w_pos = std::min(last_c_pos - (is_overlap ? compress_ratio : 0), seq_len - mtp_pad);
     RuntimeCheck(0 < extend_len && extend_len <= seq_len);
     const auto should_write = [=](int32_t position) {
       if (position >= first_w_pos) return true;
@@ -840,3 +845,5 @@ inline tvm::ffi::Tensor plan_compress_decode_legacy(
 }  // namespace host::compress
 
 using namespace host::compress;  // expose binding
+
+}  // namespace sglang

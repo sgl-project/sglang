@@ -1,4 +1,4 @@
-"""Guard the MLX stub's ``alloc_memory_pool`` override against drift.
+"""Guard the MLX stub's ``ModelRunner`` overrides against drift.
 
 The base ``ModelRunner.alloc_memory_pool`` runs ``_init_pools`` which
 asserts ``is_draft_worker`` (model_runner_kv_cache_mixin.py:409); the
@@ -6,8 +6,16 @@ MLX stub manages its own KV cache via ``MlxAttentionKVPool`` and must
 short-circuit that GPU-allocation path.  If the override is lost, every
 MLX startup crashes inside ``Scheduler.init_target_memory_pool``.
 
-The checks are signature/identity-only and MLX-gated because importing
-the stub pulls in ``mlx.core``.
+Similarly, the base ``init_attention_backends`` constructs the torch
+attention backend named by ``server_args.attention_backend``; MLX never
+uses one, and some backends read real KV buffers in ``__init__``, which
+crashes on ``_DummyKVCache``.
+
+The base ``preloaded_weights_bytes`` property reads the Torch model loader.
+The MLX stub never creates one because its native runner owns model loading
+and KV sizing, so it must report zero for the Torch accounting hook.
+
+The checks are MLX-gated because importing the stub pulls in ``mlx.core``.
 """
 
 from __future__ import annotations
@@ -17,6 +25,7 @@ import inspect
 import unittest
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
@@ -30,8 +39,15 @@ if _HAS_MLX:
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
-class TestMlxRunnerPoolContract(unittest.TestCase):
-    """``MlxModelRunnerStub.alloc_memory_pool`` must override the base."""
+class TestMlxRunnerPoolContract(CustomTestCase):
+    """Guard the stub's scheduler-facing ``ModelRunner`` contracts."""
+
+    def test_stub_reports_no_preloaded_torch_weights(self):
+        runner = object.__new__(MlxModelRunnerStub)
+        runner.pre_model_load_memory = 1.0
+        self.assertEqual(runner.preloaded_weights_bytes, 0)
+        runner.account_preloaded_weights(runner.preloaded_weights_bytes)
+        self.assertEqual(runner.pre_model_load_memory, 1.0)
 
     def test_stub_overrides_base_alloc_memory_pool(self):
         self.assertIn(
@@ -74,6 +90,31 @@ class TestMlxRunnerPoolContract(unittest.TestCase):
                 "MlxModelRunnerStub.alloc_memory_pool must accept an "
                 f"optional MemoryPoolConfig argument: {exc}"
             )
+
+    def test_stub_overrides_base_init_attention_backends(self):
+        self.assertIn(
+            "init_attention_backends",
+            vars(MlxModelRunnerStub),
+            msg=(
+                "MlxModelRunnerStub lost its init_attention_backends "
+                "override. The base implementation constructs the backend "
+                "named by server_args.attention_backend; some backends "
+                "read real KV buffers in __init__, which crashes on "
+                "_DummyKVCache. MLX never uses a torch attention backend "
+                "— re-add the override that keeps attn_backend = None."
+            ),
+        )
+        self.assertIsNot(
+            MlxModelRunnerStub.init_attention_backends,
+            ModelRunner.init_attention_backends,
+            msg="init_attention_backends must be overridden on the MLX "
+            "stub, not inherited from ModelRunner.",
+        )
+
+    def test_stub_init_attention_backends_keeps_attn_backend_none(self):
+        runner = object.__new__(MlxModelRunnerStub)
+        MlxModelRunnerStub.init_attention_backends(runner)
+        self.assertIsNone(runner.attn_backend)
 
 
 if __name__ == "__main__":

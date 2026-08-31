@@ -33,6 +33,11 @@ def _trailing_padding_used_len(
 
 
 class SageAttentionBackend(AttentionBackend):
+
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        return True
+
     accept_output_buffer: bool = True
 
     @staticmethod

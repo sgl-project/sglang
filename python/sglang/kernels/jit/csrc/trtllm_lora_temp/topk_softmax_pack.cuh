@@ -32,7 +32,7 @@
 #include <cfloat>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 static constexpr int WARP_SIZE = 32;
 
@@ -409,4 +409,4 @@ void topk_softmax_pack(
   }
 }
 
-}  // namespace
+}  // namespace sglang

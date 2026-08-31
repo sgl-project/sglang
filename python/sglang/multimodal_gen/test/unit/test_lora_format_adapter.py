@@ -16,7 +16,7 @@ import torch
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
-from sglang.multimodal_gen.runtime.pipelines_core.lora_format_adapter import (
+from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
     LoRAFormat,
     detect_lora_format_from_state_dict,
     normalize_lora_state_dict,
@@ -275,6 +275,18 @@ def _run_all_tests() -> List[Dict]:
             repo_id="renderartist/Classic-Painting-Z-Image-Turbo-LoRA",
             filename="Classic_Painting_Z_Image_Turbo_v1_renderartist_1750.safetensors",
             local_name="classic_painting_z_image_turbo_v1_renderartist_1750.safetensors",
+            expected_before=LoRAFormat.STANDARD,
+            expected_after=LoRAFormat.STANDARD,
+        )
+    )
+
+    # MiniMax-H3 Turbo LoRA (native diffusers/PEFT-style keys).
+    results.append(
+        run_single_test(
+            name="MiniMax H3 Turbo LoRA",
+            repo_id="larryvrh/MiniMax-H3-Turbo-Lora",
+            filename="minimax_h3_turbo_4step.safetensors",
+            local_name="minimax_h3_turbo_4step.safetensors",
             expected_before=LoRAFormat.STANDARD,
             expected_after=LoRAFormat.STANDARD,
         )

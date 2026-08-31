@@ -73,33 +73,42 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_platform,
+    get_spec,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
-    is_sm90_supported,
-    is_sm100_supported,
 )
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
-_is_sm90_supported = _is_cuda and is_sm90_supported()
-_is_sm100_supported = _is_cuda and is_sm100_supported()
+_is_sm90_supported = _is_cuda and get_platform().is_sm90
+_is_sm100_supported = _is_cuda and get_platform().is_sm100
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 if _use_aiter:
-    from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
-    from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
-
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
+
+    if _is_gfx1250_supported:
+        from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+    else:
+        from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
+        from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
 
     if _is_gfx95_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -129,6 +138,22 @@ def _fused_rmsnorm_fp8_per_token_quant(
         If residual is None:  (out_fp8, scale)
         If residual provided: ((out_fp8, scale), residual_out)
     """
+    if _is_gfx1250_supported:
+        # per-token quant == group quant with group_size == hidden size, giving
+        # an (M, 1) scale.
+        N = hidden_states.shape[-1]
+        (out_fp8, scale), _out1, _out2, residual_out = fused_rms_fp8_group_quant(
+            hidden_states,
+            weight,
+            epsilon,
+            group_size=N,
+            dtype_quant=_aiter_fp8_dtype,
+            res1=residual,
+        )
+        if residual is not None:
+            return (out_fp8, scale), residual_out
+        return (out_fp8, scale)
+
     M, N = hidden_states.shape
     out_fp8 = torch.empty((M, N), dtype=_aiter_fp8_dtype, device=hidden_states.device)
     scale = torch.empty(M, dtype=torch.float32, device=hidden_states.device)
@@ -814,6 +839,18 @@ class LayerCommunicator:
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at
         # TP_ATTN_FULL size, causing a shape mismatch.
         if is_enable_moe_cp_allgather():
+            return False
+
+        # Fusing makes the next layer's residual+LN absorb the post-experts
+        # all-reduce, and that fused kernel reduces over a single group. Under
+        # hybrid EP+TP the post-experts reduction spans two disjoint groups
+        # (moe_expert_parallel_all_reduce over _MOE_EP, then
+        # moe_tensor_model_parallel_all_reduce over _MOE_TP), and
+        # should_skip_post_experts_all_reduce() skips *both* once fusion is
+        # published -- so the fused reduce would cover only half the peers and
+        # silently return under-reduced activations.
+        parallel = get_parallel()
+        if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
             return False
 
         if (

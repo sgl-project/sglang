@@ -786,20 +786,24 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         assert isinstance(resp.output, list)
         assert resp.status in (
             "completed",
+            "incomplete",
             "in_progress",
             "queued",
             "failed",
             "cancelled",
         )
-        if resp.status == "completed":
+        if resp.status in ("completed", "incomplete"):
             assert resp.usage is not None
-            assert resp.usage.prompt_tokens >= 0
-            assert resp.usage.completion_tokens >= 0
+            assert resp.usage.input_tokens >= 0
+            assert resp.usage.output_tokens >= 0
             assert resp.usage.total_tokens >= 0
         if hasattr(resp, "error"):
             assert resp.error is None
         if hasattr(resp, "incomplete_details"):
-            assert resp.incomplete_details is None
+            if resp.status == "incomplete":
+                assert resp.incomplete_details.reason == "max_output_tokens"
+            else:
+                assert resp.incomplete_details is None
         if getattr(resp, "text", None):
             fmt = resp.text.get("format") if isinstance(resp.text, dict) else None
             if fmt:
@@ -818,8 +822,8 @@ class TestOpenAIServerv1Responses(CustomTestCase):
 
     def test_response_completion(self):
         resp = self.run_response(temperature=0, max_output_tokens=16)
-        assert resp.status in ("completed", "in_progress", "queued")
-        if resp.status == "completed":
+        assert resp.status in ("completed", "incomplete", "in_progress", "queued")
+        if resp.status in ("completed", "incomplete"):
             assert resp.usage is not None
             assert resp.usage.total_tokens >= 0
 
@@ -900,9 +904,10 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         self.assertEqual(body.get("object"), "response")
         self.assertIn("output", body)
         self.assertIn("status", body)
-        if "usage" in body:
-            self.assertIn("prompt_tokens", body["usage"])
-            self.assertIn("total_tokens", body["usage"])
+        self.assertIn("usage", body)
+        self.assertIn("input_tokens", body["usage"])
+        self.assertIn("output_tokens", body["usage"])
+        self.assertIn("total_tokens", body["usage"])
 
     def test_response_prefill(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)

@@ -62,5 +62,38 @@ class TestDispatchMLASubtype(CustomTestCase):
         self.assertEqual(method, AttnForwardMethod.MLA)
 
 
+class TestResolveRocmForwardMethod(CustomTestCase):
+    """The generic MHA/MLA methods must never reach the CUDA forward paths on
+    ROCm: those were stripped of their AMD branches when the AITER kernels moved
+    into forward_mha_rocm.py / forward_mla_rocm.py."""
+
+    def test_hip_routes_shared_methods_to_rocm(self):
+        with mock.patch.object(abh, "_is_hip", True):
+            self.assertEqual(
+                abh.resolve_rocm_forward_method(AttnForwardMethod.MHA),
+                AttnForwardMethod.MHA_ROCM,
+            )
+            self.assertEqual(
+                abh.resolve_rocm_forward_method(AttnForwardMethod.MHA_ONE_SHOT),
+                AttnForwardMethod.MHA_ONE_SHOT_ROCM,
+            )
+            self.assertEqual(
+                abh.resolve_rocm_forward_method(AttnForwardMethod.MLA),
+                AttnForwardMethod.MLA_ROCM,
+            )
+
+    def test_hip_leaves_platform_specific_methods_alone(self):
+        with mock.patch.object(abh, "_is_hip", True):
+            self.assertEqual(
+                abh.resolve_rocm_forward_method(AttnForwardMethod.MLA_FUSED_ROPE_ROCM),
+                AttnForwardMethod.MLA_FUSED_ROPE_ROCM,
+            )
+
+    def test_non_hip_is_identity(self):
+        with mock.patch.object(abh, "_is_hip", False):
+            for method in AttnForwardMethod:
+                self.assertEqual(abh.resolve_rocm_forward_method(method), method)
+
+
 if __name__ == "__main__":
     unittest.main()

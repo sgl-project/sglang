@@ -7,6 +7,7 @@ import unittest
 from collections import deque
 from types import SimpleNamespace
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -46,6 +47,7 @@ if _HAS_MLX:
         MlxPendingJob,
         SchedulerMlxOverlapMixin,
     )
+    from sglang.srt.hardware_backend.mlx.tp_worker import MlxLaunch
     from sglang.srt.managers.scheduler_components import (
         batch_result_processor as batch_result_processor_module,
     )
@@ -309,7 +311,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             new_slot_ids=[4],
             req_pool_idx=0,
         )
-        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        runner.eval_pending(pending)
         mx.eval(*runner._attention_kv_pool.all_buffers())
         runner.prefill_finalize(pending)
 
@@ -350,7 +352,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
                     calls.append(
                         (len(caches), batched_input.tolist(), list(helper_req_ids))
                     )
-                    return mx.array(list(range(len(caches))), dtype=mx.int32)
+                    # Last-token logits whose argmax is the row index.
+                    return mx.eye(len(caches), 8, dtype=mx.float32)
 
                 def fail_native(*args, **kwargs):
                     raise AssertionError("dense decode should use batched attention")
@@ -386,7 +389,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         def fake_batched(caches, batched_input, helper_req_ids):
             calls.append((len(caches), batched_input.tolist(), list(helper_req_ids)))
-            return mx.array([8], dtype=mx.int32)
+            # Last-token logits whose argmax is token 8.
+            return mx.arange(9, dtype=mx.float32)[None, :]
 
         def fail_native(*args, **kwargs):
             raise AssertionError("dense chained decode should use batched attention")
@@ -502,12 +506,13 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             ]
         ]
 
-        lazy_tokens = runner._decode_with_batched_attention(
+        lazy_logits = runner._decode_with_batched_attention(
             cache,
             mx.array([[7]], dtype=mx.int32),
             ["r0"],
         )
-        mx.eval(lazy_tokens, *MlxModelRunner._cache_state_arrays(cache))
+        lazy_tokens = mx.argmax(lazy_logits, axis=-1)
+        mx.eval(lazy_tokens, *MlxModelRunner.cache_state_arrays(cache))
 
         self.assertEqual(lazy_tokens.tolist(), [0])
         self.assertEqual(cache[0][0].offset, 1)
@@ -558,6 +563,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             req_pool_idx={"r0": 0, "r1": 1},
             req_to_token_pool=req_to_token_pool,
             attention_layer_indices=[0],
+            # The fused scatter addresses pool buffers by full-attention index,
+            # so the context requires the map whenever the RoPE kernel is live.
+            full_kv_pool_index_by_layer={0: 0},
         )
 
         self.assertEqual(ctx.seq_lens, [1, 2])
@@ -578,7 +586,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         def fake_hybrid(caches, batched_input, helper_req_ids):
             calls.append((len(caches), batched_input.tolist(), list(helper_req_ids)))
-            return mx.array([4, 5], dtype=mx.int32)
+            # Last-token logits whose argmax is 4 for row 0, 5 for row 1.
+            return mx.eye(8, dtype=mx.float32)[4:6]
 
         def fail_batched(*args, **kwargs):
             raise AssertionError(
@@ -700,7 +709,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req = FakeRequest()
         runner._req_to_token_pool.alloc([req])
         runner._req_to_token_pool.auxiliary_state_pool.store_cache(
-            req.mamba_pool_idx,
+            req.kv.mamba_pool_idx,
             [FakeNativeCache(mx.array([42.0], dtype=mx.float32)), None],
             [0],
         )
@@ -711,9 +720,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             full_token_ids=[11, 12, 13],
             prefix_slot_ids=[2, 3],
             new_slot_ids=[4],
-            req_pool_idx=req.req_pool_idx,
+            req_pool_idx=req.kv.req_pool_idx,
         )
-        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        runner.eval_pending(pending)
         runner.prefill_finalize(pending)
 
         self.assertEqual(runner.model.seen_inputs, [[[13]]])
@@ -723,7 +732,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertIsInstance(pending.cache[1], ContiguousAttentionKVCache)
         restored = [FakeNativeCache(), None]
         runner._req_to_token_pool.auxiliary_state_pool.restore_cache(
-            req.mamba_pool_idx, restored, [0]
+            req.kv.mamba_pool_idx, restored, [0]
         )
         self.assertEqual(restored[0].state[0].tolist(), [1.0])
 
@@ -767,18 +776,18 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             full_token_ids=token_ids,
             prefix_slot_ids=[],
             new_slot_ids=list(range(1, 71)),
-            req_pool_idx=req.req_pool_idx,
+            req_pool_idx=req.kv.req_pool_idx,
             req=req,
         )
-        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        runner.eval_pending(pending)
         runner.prefill_finalize(pending)
         tracked = [FakeNativeCache(), None]
         runner._req_to_token_pool.auxiliary_state_pool.restore_cache(
-            req.mamba_ping_pong_track_buffer[0], tracked, [0]
+            req.kv.mamba_ping_pong_track_buffer[0], tracked, [0]
         )
 
         self.assertEqual([len(x[0]) for x in runner.model.seen_inputs], [64, 6])
-        self.assertEqual(req.mamba_last_track_seqlen, 64)
+        self.assertEqual(req.kv.mamba_last_track_seqlen, 64)
         self.assertEqual(tracked[0].state[0].tolist(), [64.0])
         self.assertEqual(pending.synced_offset, 70)
 
@@ -817,7 +826,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req = FakeRequest()
         runner._req_to_token_pool.alloc([req])
         runner._req_to_token_pool.auxiliary_state_pool.store_cache(
-            req.mamba_pool_idx,
+            req.kv.mamba_pool_idx,
             [FakeNativeCache(mx.array([64.0], dtype=mx.float32)), None],
             [0],
         )
@@ -829,19 +838,19 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             full_token_ids=token_ids,
             prefix_slot_ids=list(range(1, 65)),
             new_slot_ids=list(range(65, 258)),
-            req_pool_idx=req.req_pool_idx,
+            req_pool_idx=req.kv.req_pool_idx,
             req=req,
         )
-        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        runner.eval_pending(pending)
         runner.prefill_finalize(pending)
         tracked = [FakeNativeCache(), None]
         runner._req_to_token_pool.auxiliary_state_pool.restore_cache(
-            req.mamba_ping_pong_track_buffer[0], tracked, [0]
+            req.kv.mamba_ping_pong_track_buffer[0], tracked, [0]
         )
 
         self.assertEqual([len(x[0]) for x in runner.model.seen_inputs], [192, 1])
         self.assertEqual(runner.model.seen_auxiliary_states, [[64.0], [192.0]])
-        self.assertEqual(req.mamba_last_track_seqlen, 256)
+        self.assertEqual(req.kv.mamba_last_track_seqlen, 256)
         self.assertEqual(tracked[0].state[0].tolist(), [192.0])
         self.assertEqual(pending.synced_offset, 257)
 
@@ -868,6 +877,17 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(first.tolist(), [1, 2])
         self.assertEqual(forked.tolist(), [3])
         self.assertEqual(restored[0].state[0].tolist(), [1.0])
+        self.assertEqual(pool.available_size(), 3)
+        self.assertEqual(pool.schedulable_available_size(), 3)
+
+    def test_auxiliary_state_pool_returns_unused_group_slots(self):
+        pool = MlxAuxiliaryStatePool(size=4, device="cpu")
+
+        pool.alloc_group_begin(3)
+        allocated = pool.alloc(1)
+        pool.alloc_group_end()
+
+        self.assertEqual(allocated.tolist(), [1])
         self.assertEqual(pool.available_size(), 3)
 
     def test_auxiliary_state_pool_restores_instance_meta_state(self):
@@ -898,16 +918,20 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req = FakeRequest()
 
         req_indices = pool.alloc([req])
-        auxiliary_state_idx = pool.get_auxiliary_state_indices(req.req_pool_idx)
+        auxiliary_state_idx = pool.get_auxiliary_state_indices(req.kv.req_pool_idx)
         pool.free(req)
 
-        self.assertEqual(req_indices, [1])
+        # Which free slot a fresh alloc gets is not semantically meaningful
+        # (see ReqToTokenPool.alloc); only pin that it's a real, valid slot.
+        self.assertEqual(len(req_indices), 1)
+        self.assertIn(req_indices[0], range(1, pool.size + 1))
         self.assertIsNotNone(auxiliary_state_idx)
-        self.assertIsNone(req.req_pool_idx)
-        self.assertIsNotNone(req.mamba_pool_idx)
+        self.assertIsNone(req.kv.req_pool_idx)
+        self.assertIsNotNone(req.kv.mamba_pool_idx)
+        self.assertIs(pool.mamba_allocator, pool.mamba_pool)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
         pool.free_auxiliary_state_cache(req)
-        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_pool_idx)
         self.assertEqual(pool.available_size(), 2)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 4)
 
@@ -921,13 +945,13 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         req = FakeRequest()
         pool.alloc([req])
-        req.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
-        req.mamba_next_track_idx = 0
+        req.kv.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
+        req.kv.mamba_next_track_idx = 0
 
         pool.free_auxiliary_state_cache(req, track_buffer_to_keep=0)
 
-        self.assertIsNone(req.mamba_pool_idx)
-        self.assertIsNone(req.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_ping_pong_track_buffer)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
 
     def test_auxiliary_state_component_inserts_tracked_slot_and_frees_live_slot(self):
@@ -940,9 +964,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         req = FakeRequest()
         pool.alloc([req])
-        req.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
-        req.mamba_next_track_idx = 0
-        req.mamba_last_track_seqlen = 64
+        req.kv.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
+        req.kv.mamba_next_track_idx = 0
+        req.kv.mamba_last_track_seqlen = 64
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
             SimpleNamespace(enable_mamba_extra_buffer=False),
@@ -965,9 +989,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(cache_len, 64)
         self.assertTrue(getattr(insert_params, "mlx_auxiliary_state_uses_track_slot"))
         self.assertEqual(insert_params.mamba_value.tolist(), [2])
-        self.assertIsNone(req.mamba_pool_idx)
-        self.assertIsNone(req.mamba_ping_pong_track_buffer)
-        self.assertIsNone(req.mamba_last_track_seqlen)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
 
     def test_auxiliary_state_component_unfinished_frees_tracked_source_slot(self):
@@ -980,9 +1004,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         req = FakeRequest()
         pool.alloc([req])
-        req.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
-        req.mamba_next_track_idx = 0
-        req.mamba_last_track_seqlen = 64
+        req.kv.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
+        req.kv.mamba_next_track_idx = 0
+        req.kv.mamba_last_track_seqlen = 64
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
             SimpleNamespace(enable_mamba_extra_buffer=False),
@@ -1004,9 +1028,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         self.assertEqual(cache_len, 64)
         self.assertEqual(insert_params.mamba_value.tolist(), [3])
-        self.assertIsNotNone(req.mamba_pool_idx)
-        self.assertIsNone(req.mamba_ping_pong_track_buffer)
-        self.assertIsNone(req.mamba_last_track_seqlen)
+        self.assertIsNotNone(req.kv.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 2)
 
     def test_auxiliary_state_component_frees_stale_track_slot_when_live_slot_inserted(
@@ -1021,8 +1045,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         req = FakeRequest()
         pool.alloc([req])
-        req.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
-        req.mamba_next_track_idx = 0
+        req.kv.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
+        req.kv.mamba_next_track_idx = 0
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
             SimpleNamespace(enable_mamba_extra_buffer=False),
@@ -1045,9 +1069,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(cache_len, 7)
         self.assertFalse(getattr(insert_params, "mlx_auxiliary_state_uses_track_slot"))
         self.assertEqual(insert_params.mamba_value.tolist(), [1])
-        self.assertIsNone(req.mamba_pool_idx)
-        self.assertIsNone(req.mamba_ping_pong_track_buffer)
-        self.assertIsNone(req.mamba_next_track_idx)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.kv.mamba_next_track_idx)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
 
     def test_auxiliary_state_component_frees_duplicate_live_slot(self):
@@ -1079,7 +1103,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             insert_params=insert_params,
         )
 
-        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_pool_idx)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 4)
 
 
@@ -1094,11 +1118,13 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler.last_batch = stale_batch
 
         pending = MlxPendingJob(
-            lazy_tokens=None,
-            prefills=["prefill"],
-            extends=[],
-            decode=None,
-            mode="extend",
+            launch=MlxLaunch(
+                lazy_tokens=None,
+                prefills=["prefill"],
+                extends=[],
+                decode=None,
+                mode="extend",
+            ),
             batch_copy=batch_copy,
             schedule_batch=schedule_batch,
             reqs=[SimpleNamespace(rid="r0")],
@@ -1175,10 +1201,6 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             disaggregation_mode=None,
             enable_overlap=False,
             enable_overlap_mlx=False,
-            server_args=SimpleNamespace(
-                disaggregation_decode_enable_offload_kvcache=False,
-                enable_hisparse=False,
-            ),
             model_config=None,
             token_to_kv_pool_allocator=None,
             tree_cache=tree_cache,
@@ -1195,6 +1217,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             ),
             logprob_result_processor=None,
             output_streamer=None,
+            beam_coordinator=None,
             abort_request=lambda req: None,
         )
         # Stub out the methods _handle_finish_state_updated_req calls that
@@ -1222,13 +1245,16 @@ class TestMlxOverlapScheduler(unittest.TestCase):
                 set_completion_time=lambda: events.append(("completion", "r0"))
             ),
         )
-        batch = SimpleNamespace()
+        batch = SimpleNamespace(
+            mamba_track_mask_cpu=None,
+            mamba_track_mask_next_cpu=None,
+            mamba_decode_batch_idx_cpu=None,
+        )
         result = SimpleNamespace()
         i = 0
         logits_output = SimpleNamespace(customized_info=None)
         original_release = batch_result_processor_module.release_kv_cache
         original_get_indexer = batch_result_processor_module.get_global_indexer_capturer
-        original_get_server_args = batch_result_processor_module.get_server_args
 
         def fake_release_kv_cache(release_req, tree_cache, is_insert=False):
             events.append(("release", release_req.rid))
@@ -1236,21 +1262,26 @@ class TestMlxOverlapScheduler(unittest.TestCase):
 
         batch_result_processor_module.release_kv_cache = fake_release_kv_cache
         batch_result_processor_module.get_global_indexer_capturer = lambda: None
-        batch_result_processor_module.get_server_args = lambda: SimpleNamespace(
-            enable_mamba_extra_buffer_lazy=lambda: False
+        # The lazy predicate reads the published bags; publish the non-lazy
+        # strategy instead of stubbing the accessor.
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args(
+            mamba_radix_cache_strategy="extra_buffer"
         )
+        override.install()
         try:
             SchedulerBatchResultProcessor._handle_finish_state_updated_req(
                 processor, req, batch, result, i, logits_output
             )
         finally:
+            override.restore()
             for name, original in saved.items():
                 setattr(SchedulerBatchResultProcessor, name, original)
             batch_result_processor_module.release_kv_cache = original_release
             batch_result_processor_module.get_global_indexer_capturer = (
                 original_get_indexer
             )
-            batch_result_processor_module.get_server_args = original_get_server_args
 
         self.assertEqual(
             events,
@@ -1488,10 +1519,8 @@ if _HAS_MLX:
 
     class FakeRequest:
         def __init__(self):
-            self.req_pool_idx = None
-            self.mamba_pool_idx = None
+            self.kv = ReqKvInfo()
             self.inflight_middle_chunks = 0
-            self.kv_committed_len = 0
 
     class FakeTpWorker:
         def __init__(self, next_token_ids):

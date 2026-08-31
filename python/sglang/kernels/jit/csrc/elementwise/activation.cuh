@@ -13,7 +13,7 @@
 #include <limits>
 #include <string>
 
-namespace {
+namespace sglang {
 
 enum class ActivationKind : uint32_t {
   kSiLU,
@@ -284,4 +284,4 @@ struct ActivationKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

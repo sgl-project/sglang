@@ -10,7 +10,6 @@ Blackwell-only: the MLA DCP decode path needs ``tokenspeed_mla`` (SM100/12x).
 import subprocess
 import unittest
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
 from sglang.test.kl_multiturn_utils import (
@@ -23,6 +22,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=1500, stage="extra-b", runner_config="4-gpu-b200")
@@ -42,7 +42,6 @@ class TestUnifiedKimiLinearDcpHiCache(UnifiedRadixTreeTestMixin, CustomTestCase)
 
     kl_threshold = 0.01
     gsm8k_threshold = 0.85
-    mmlu_threshold = 0.4
     prefill_cache_assert = staticmethod(
         make_mamba_prefill_assert(chunk_size=WIDENED_PAGE)
     )
@@ -105,7 +104,7 @@ class TestUnifiedKimiLinearDcpHiCache(UnifiedRadixTreeTestMixin, CustomTestCase)
             cls.process.wait(timeout=60)
         except subprocess.TimeoutExpired:
             pass
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
 
 if __name__ == "__main__":

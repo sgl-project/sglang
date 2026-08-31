@@ -34,10 +34,7 @@ import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(
-    est_time=360,
-    suite="nightly-8-gpu-b200",
-)
+register_cuda_ci(est_time=420, stage="nightly", runner_config="8-gpu-b200")
 
 BASE_MODEL = "moonshotai/Kimi-K2.5"
 LORA_HF_REPO = "yushengsu/lora-diff-Kimi-K2.5"
