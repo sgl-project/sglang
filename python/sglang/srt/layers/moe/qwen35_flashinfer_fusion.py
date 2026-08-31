@@ -7,6 +7,11 @@ already folded to w + 1.
 
 from __future__ import annotations
 
+from typing import Optional
+
+import torch
+
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.moe.cutedsl_ar_fusion import (
     CuteDSLFusionLayerCommunicator,
     CuteDSLFusionService,
@@ -31,7 +36,11 @@ __all__ = [
 
 
 class Qwen35FlashInferLayerCommunicator(CuteDSLFusionLayerCommunicator):
-    NORM_WEIGHT_ATTR = "gemma_weight"
+    @classmethod
+    def _norm_gamma(cls, layernorm) -> Optional[torch.Tensor]:
+        if not isinstance(layernorm, GemmaRMSNorm):
+            return None
+        return layernorm.gemma_weight
 
 
 def prepare_qwen35_flashinfer_fusion(model, model_runner) -> None:

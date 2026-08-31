@@ -27,6 +27,10 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 logger = logging.getLogger(__name__)
 
 
+def _forward_m(forward_batch: ForwardBatch) -> int:
+    return int(forward_batch.input_ids.shape[0])
+
+
 def is_supported_forward_mode(forward_mode: ForwardMode) -> bool:
     return forward_mode in (
         ForwardMode.DECODE,
@@ -224,13 +228,16 @@ class CuteDSLFusionService:
 class CuteDSLFusionLayerCommunicator(LayerCommunicator):
     """Fusion hooks; the generic LayerCommunicator stays backend agnostic."""
 
-    NORM_WEIGHT_ATTR: str = "weight"
+    # Whether this layer's MoE runner can hand back an unfinalized output.
+    # Set at install time; the finalize pattern is unreachable without it.
+    experts_can_defer_finalize: bool = True
 
     fusion_service: CuteDSLFusionService | None = None
 
     @classmethod
-    def _norm_gamma(cls, layernorm):
-        return getattr(layernorm, cls.NORM_WEIGHT_ATTR, None)
+    def _norm_gamma(cls, layernorm) -> Optional[torch.Tensor]:
+        """The gamma the fused RMSNorm reads, or None for the wrong norm flavour."""
+        raise NotImplementedError
 
     def prepare_attn(
         self,
@@ -248,8 +255,7 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             gamma = self._norm_gamma(self.input_layernorm)
             if gamma is None:
                 raise RuntimeError(
-                    "deferred finalize requires an RMSNorm exposing "
-                    f"{self.NORM_WEIGHT_ATTR!r}"
+                    "deferred finalize requires this family's RMSNorm flavour"
                 )
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
@@ -310,7 +316,8 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
     def should_use_finalize(self, forward_batch: ForwardBatch, m: int) -> bool:
         parallel = get_parallel()
         return (
-            self._common_eligible(forward_batch, m)
+            self.experts_can_defer_finalize
+            and self._common_eligible(forward_batch, m)
             and self.layer_scatter_modes.mlp_mode is not ScatterMode.SCATTERED
             and parallel.moe_ep_size == 1
         )
@@ -329,15 +336,14 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             and self._context.tp_size > 1
         )
 
+    def should_defer_moe_finalize(self, forward_batch: ForwardBatch) -> bool:
+        """Whether the MoE should hand its deferred finalize to this layer."""
+        return self.should_use_finalize(forward_batch, _forward_m(forward_batch))
+
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
-        m = (
-            int(forward_batch.input_ids.shape[0])
-            if getattr(forward_batch, "input_ids", None) is not None
-            else 0
-        )
-        if self.should_use_finalize(forward_batch, m):
+        if self.should_defer_moe_finalize(forward_batch):
             # The model consumes the final layer's handoff with its own final
             # norm, so this is intentionally also true for that layer.
             return True
@@ -345,7 +351,7 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
 
 
 def prepare_cutedsl_fusion(model, model_runner, *, label: str) -> None:
-    service = getattr(model, "flashinfer_mnnvl_cutedsl_fusion", None)
+    service = model.flashinfer_mnnvl_cutedsl_fusion
     if service is None:
         return
     if model_runner.server_args.enable_pdmux:
