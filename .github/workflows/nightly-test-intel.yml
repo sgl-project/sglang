@@ -95,16 +95,26 @@ jobs:
       - name: Nightly Test (1-GPU XPU)
         timeout-minutes: 240
         run: |
-          touch github_summary.md
+          touch github_summary.md nightly-xpu-1-gpu-metrics.jsonl
           docker exec ci_sglang_xpu bash -c "
             source /opt/venv/bin/activate &&
             cd /sglang-checkout/test &&
             OLMOCR_BENCH_DIR=/sglang-checkout/olmOCR-bench/bench_data \
             GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
+            SGLANG_TEST_METRICS_FILE=/sglang-checkout/nightly-xpu-1-gpu-metrics.jsonl \
             python3 run_suite.py --hw xpu --suite nightly-xpu-1-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           " || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Upload per-model metrics jsonl
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-xpu-1-gpu-metrics
+          path: nightly-xpu-1-gpu-metrics.jsonl
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Cleanup container
         if: always()
@@ -170,15 +180,25 @@ jobs:
       - name: Nightly Test (2-GPU XPU)
         timeout-minutes: 240
         run: |
-          touch github_summary.md
+          touch github_summary.md nightly-xpu-2-gpu-metrics.jsonl
           docker exec ci_sglang_xpu bash -c "
             source /opt/venv/bin/activate &&
             cd /sglang-checkout/test &&
             GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
+            SGLANG_TEST_METRICS_FILE=/sglang-checkout/nightly-xpu-2-gpu-metrics.jsonl \
             python3 run_suite.py --hw xpu --suite nightly-xpu-2-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           " || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Upload per-model metrics jsonl
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-xpu-2-gpu-metrics
+          path: nightly-xpu-2-gpu-metrics.jsonl
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Cleanup container
         if: always()
@@ -244,15 +264,25 @@ jobs:
       - name: Nightly Test (4-GPU XPU)
         timeout-minutes: 480
         run: |
-          touch github_summary.md
+          touch github_summary.md nightly-xpu-4-gpu-metrics.jsonl
           docker exec ci_sglang_xpu bash -c "
             source /opt/venv/bin/activate &&
             cd /sglang-checkout/test &&
             GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
+            SGLANG_TEST_METRICS_FILE=/sglang-checkout/nightly-xpu-4-gpu-metrics.jsonl \
             python3 run_suite.py --hw xpu --suite nightly-xpu-4-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           " || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Upload per-model metrics jsonl
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-xpu-4-gpu-metrics
+          path: nightly-xpu-4-gpu-metrics.jsonl
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Cleanup container
         if: always()
