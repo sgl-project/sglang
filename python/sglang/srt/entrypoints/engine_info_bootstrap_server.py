@@ -38,7 +38,7 @@ class EngineInfoBootstrapServer:
         self.host = host
         self.port = port
 
-        # Storage: {tp_rank: (session_id, weights_info_dict)}
+        # Storage: {rank: (session_id, weights_info_dict)}
         self.transfer_engine_info: Dict[int, Tuple] = {}
         self.lock = threading.Lock()
 
@@ -51,19 +51,21 @@ class EngineInfoBootstrapServer:
         @app.put("/register_transfer_engine_info")
         def register_transfer_engine_info(data: dict):
             try:
-                tp_rank = data["tp_rank"]
+                # Keep accepting tp_rank for compatibility with older clients.
+                # Prefer rank when both fields are present; rank=0 is valid.
+                rank = data["rank"] if "rank" in data else data["tp_rank"]
                 info = data["transfer_engine_info"]
                 session_id = info["session_id"]
                 weights_info_dict = info["weights_info_dict"]
 
                 with self.lock:
-                    self.transfer_engine_info[tp_rank] = (
+                    self.transfer_engine_info[rank] = (
                         session_id,
                         weights_info_dict,
                     )
 
                 logger.info(
-                    f"Registered transfer engine info for tp_rank={tp_rank}, "
+                    f"Registered transfer engine info for rank={rank}, "
                     f"session_id={session_id}"
                 )
                 return PlainTextResponse("OK")

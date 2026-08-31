@@ -96,6 +96,7 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         common = dict(
             server_args=server_args,
             tp_rank=0,
+            remote_instance_weight_loader_rank=3,
             remote_instance_weight_transporter_engine=None,
             remote_instance_weight_transporter_session_id=None,
             draft_model_idx=None,
@@ -105,6 +106,10 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         self.assertEqual(build_load_config(**common).load_format, "auto")
         self.assertEqual(
             build_load_config(load_format="dummy", **common).load_format, "dummy"
+        )
+        self.assertEqual(
+            build_load_config(**common).remote_instance_weight_loader_rank,
+            3,
         )
 
     # -- the attention backend is per-runner, not a config variant -------------

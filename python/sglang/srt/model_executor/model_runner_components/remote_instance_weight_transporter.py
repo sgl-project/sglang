@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True, kw_only=True)
 class RemoteInstanceWeightTransporter:
     get_model: Callable[[], torch.nn.Module]
-    tp_rank: int
+    rank: int
     gpu_id: int
     engine: Optional[Any] = None
     session_id: str = ""
@@ -92,7 +92,7 @@ class RemoteInstanceWeightTransporter:
         url = f"{bootstrap_na.to_url()}/register_transfer_engine_info"
 
         payload = {
-            "tp_rank": self.tp_rank,
+            "rank": self.rank,
             "transfer_engine_info": {
                 "session_id": self.session_id,
                 "weights_info_dict": self.weight_info,
@@ -103,15 +103,15 @@ class RemoteInstanceWeightTransporter:
             resp = http_requests.put(url, json=payload, timeout=5)
             if resp.status_code == 200:
                 logger.info(
-                    f"Registered transfer engine info for tp_rank={self.tp_rank} "
+                    f"Registered transfer engine info for rank={self.rank} "
                     f"with bootstrap server at {bootstrap_na}"
                 )
             else:
                 logger.error(
-                    f"Failed to register transfer engine info for tp_rank={self.tp_rank}: "
+                    f"Failed to register transfer engine info for rank={self.rank}: "
                     f"{resp.status_code}, {resp.text}"
                 )
         except Exception as e:
             logger.error(
-                f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
+                f"Failed to register transfer engine info for rank={self.rank}: {e}"
             )

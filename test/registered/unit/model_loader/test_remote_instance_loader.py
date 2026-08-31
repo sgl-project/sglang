@@ -1,6 +1,9 @@
 """Unit tests for RemoteInstanceModelLoader construction - no server, no weights."""
 
 import unittest
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import sglang.srt.model_loader.loader as loader_mod
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -71,6 +74,50 @@ class TestRemoteInstanceModelLoaderExtraConfig(CustomTestCase):
             with self.subTest(backend=backend):
                 loader = loader_mod.RemoteInstanceModelLoader(_load_config(backend))
                 self.assertFalse(loader.load_config.model_loader_extra_config)
+
+
+class TestRemoteInstanceTransferEngineRank(CustomTestCase):
+    def test_transfer_engine_queries_metadata_by_global_rank(self):
+        transfer_engine = MagicMock()
+        transfer_engine.batch_transfer_sync_read.return_value = 0
+        load_config = LoadConfig(
+            load_format=LoadFormat.REMOTE_INSTANCE,
+            tp_rank=1,
+            remote_instance_weight_loader_backend=(
+                RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE
+            ),
+            remote_instance_weight_loader_rank=3,
+            remote_instance_weight_loader_transfer_engine=transfer_engine,
+            remote_instance_weight_loader_seed_instance_ip="127.0.0.1",
+            remote_instance_weight_loader_seed_instance_service_port=12345,
+        )
+        loader = loader_mod.RemoteInstanceModelLoader(load_config)
+        model = MagicMock()
+        model.named_parameters.return_value = []
+        model.eval.return_value = model
+
+        with (
+            patch.object(loader_mod, "_get_quantization_config", return_value=None),
+            patch.object(
+                loader_mod, "set_default_torch_dtype", return_value=nullcontext()
+            ),
+            patch.object(loader_mod.torch, "device", return_value=nullcontext()),
+            patch.object(loader_mod, "_initialize_model", return_value=model),
+            patch.object(loader_mod, "register_memory_region"),
+            patch.object(
+                loader_mod,
+                "get_remote_instance_transfer_engine_info_per_rank",
+                return_value=("seed-session", {}),
+            ) as get_remote_info,
+            patch.object(loader_mod, "_post_load_weights"),
+        ):
+            loaded_model = loader.load_model(
+                model_config=SimpleNamespace(dtype=None),
+                device_config=SimpleNamespace(device="cpu"),
+            )
+
+        self.assertIs(loaded_model, model)
+        get_remote_info.assert_called_once_with("http://127.0.0.1:12345", 3)
 
 
 if __name__ == "__main__":

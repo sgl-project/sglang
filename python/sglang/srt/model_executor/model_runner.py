@@ -235,6 +235,7 @@ from sglang.srt.utils.offloader import (
 from sglang.srt.utils.profile_utils import build_step_span_name
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
+from sglang.srt.weight_cache.protocol import compute_global_rank
 
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -332,6 +333,9 @@ class ModelRunner:
         self.memory_pool_config = memory_pool_config
         self.gpu_id = gpu_id
         self.ps = ps
+        self.remote_instance_rank = compute_global_rank(
+            ps.tp_size, ps.pp_rank, ps.tp_rank
+        )
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -580,7 +584,7 @@ class ModelRunner:
     def init_remote_instance_weight_transporter(self):
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
             get_model=lambda: self.model,
-            tp_rank=self.ps.tp_rank,
+            rank=self.remote_instance_rank,
             gpu_id=self.gpu_id,
         )
 
@@ -1138,6 +1142,7 @@ class ModelRunner:
             server_args=self.server_args,
             load_format=draft_load_format,
             tp_rank=self.ps.tp_rank,
+            remote_instance_weight_loader_rank=self.remote_instance_rank,
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
             draft_model_idx=self.draft_model_idx,

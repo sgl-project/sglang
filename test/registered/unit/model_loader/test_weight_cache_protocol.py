@@ -237,6 +237,8 @@ class TestQuantConfigHashing(CustomTestCase):
 
 class TestGlobalRankAndPaths(CustomTestCase):
     def test_compute_global_rank_formula(self):
+        self.assertEqual(compute_global_rank(tp_size=1, pp_rank=0, tp_rank=0), 0)
+        self.assertEqual(compute_global_rank(tp_size=1, pp_rank=1, tp_rank=0), 1)
         self.assertEqual(compute_global_rank(tp_size=4, pp_rank=0, tp_rank=3), 3)
         self.assertEqual(compute_global_rank(tp_size=4, pp_rank=1, tp_rank=0), 4)
         self.assertEqual(compute_global_rank(tp_size=4, pp_rank=2, tp_rank=1), 9)

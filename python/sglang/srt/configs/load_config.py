@@ -81,6 +81,7 @@ class LoadConfig:
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
     remote_instance_weight_loader_backend: Optional[str] = None
+    remote_instance_weight_loader_rank: Optional[int] = None
     remote_instance_weight_loader_transfer_engine: Optional[Any] = None
     remote_instance_weight_loader_transfer_engine_session_id: Optional[str] = None
     modelexpress_url: Optional[str] = None
