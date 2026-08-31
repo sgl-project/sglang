@@ -66,7 +66,7 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
-from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils import BumpAllocator, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -81,72 +81,88 @@ _has_fused_qk_pertoken_fp8 = False
 fused_qk_rmsnorm_q_pertoken_fp8 = None
 
 if _use_aiter:
-    # aiter ROCm/aiter#2958 renamed the public `fused_qk_rmsnorm` in
-    # `aiter.ops.fused_qk_norm_rope_cache_quant` to a private `_fused_qk_rmsnorm`
-    # and introduced a unified entry point in `aiter.ops.fused_qk_rmsnorm_group_quant`
-    # with a different (in-place, kwarg-only, no-return) signature. Probe for the
-    # new symbol first so SGLang works with both pre- and post-#2958 aiter without
-    # requiring the docker pin to be bumped atomically.
-    try:
-        from aiter.ops.enum import QuantType as _AiterQuantType
-        from aiter.ops.fused_qk_rmsnorm_group_quant import (
-            fused_qk_rmsnorm as _aiter_fused_qk_rmsnorm_unified,
-        )
-
-        def fused_qk_rmsnorm_bf16(q, q_weight, q_eps, k, k_weight, k_eps):
-            q_out = torch.empty_like(q)
-            k_out = torch.empty_like(k)
-            _aiter_fused_qk_rmsnorm_unified(
-                q_out_quantized=q_out,
-                k_out=k_out,
-                q=q,
-                q_weight=q_weight,
-                q_epsilon=q_eps,
-                k=k,
-                k_weight=k_weight,
-                k_epsilon=k_eps,
-                quant_type=_AiterQuantType.No,
+    # On gfx1250 the aiter `module_fused_qk_norm_rope_cache_quant_shuffle` kernel
+    # fails to JIT-build (its `rope_common.h` / `ck_tile/vec_convert.h` are
+    # incompatible with this image's composable_kernel), which crashes the very
+    # first MLA forward. This path is a pure RMSNorm (quant_type=No), so under the
+    # gfx1250 workaround flag (AITER_FORCE_A8W4) substitute a self-contained Triton
+    # RMSNorm that never touches the aiter fp4 kernel build.
+    if get_bool_env_var("AITER_FORCE_A8W4", "false"):
+        if get_bool_env_var("SGLANG_QK_RMSNORM_TORCH", "false"):
+            from sglang.srt.models.deepseek_common.attention_forward_methods.triton_qk_rmsnorm import (
+                fused_qk_rmsnorm_torch as fused_qk_rmsnorm_bf16,
             )
-            return q_out, k_out
-
-        def fused_qk_rmsnorm_q_pertoken_fp8(q, q_weight, q_eps, k, k_weight, k_eps):
-            # Fold the q_b_proj per-token fp8 activation quant INTO the fused
-            # q/kv RMSNorm: q is emitted as (fp8, x_scale[m,1], orig_dtype) ready
-            # for the tuned gemm_a8w8_bpreshuffle, eliminating the standalone
-            # per-token quant launch before q_b_proj. orig_dtype carries the
-            # pre-quant activation dtype so apply_fp8_linear can preserve it
-            # (FP16 must not be silently promoted to BF16). k (kv_a) stays bf16
-            # (it feeds the absorbed w_kc/w_vc BMMs, not a bpreshuffle GEMM).
-            q_q = torch.empty_like(q, dtype=torch.float8_e4m3fn)
-            q_s = torch.empty((q.shape[0], 1), dtype=torch.float32, device=q.device)
-            k_out = torch.empty_like(k)
-            _aiter_fused_qk_rmsnorm_unified(
-                q_out_quantized=q_q,
-                q_out_scale=q_s,
-                k_out=k_out,
-                q=q,
-                q_weight=q_weight,
-                q_epsilon=q_eps,
-                k=k,
-                k_weight=k_weight,
-                k_epsilon=k_eps,
-                quant_type=_AiterQuantType.per_Token,
+        else:
+            from sglang.srt.models.deepseek_common.attention_forward_methods.triton_qk_rmsnorm import (
+                fused_qk_rmsnorm_triton as fused_qk_rmsnorm_bf16,
             )
-            return (q_q, q_s, q.dtype), k_out
+    else:
+        # aiter ROCm/aiter#2958 renamed the public `fused_qk_rmsnorm` in
+        # `aiter.ops.fused_qk_norm_rope_cache_quant` to a private `_fused_qk_rmsnorm`
+        # and introduced a unified entry point in `aiter.ops.fused_qk_rmsnorm_group_quant`
+        # with a different (in-place, kwarg-only, no-return) signature. Probe for the
+        # new symbol first so SGLang works with both pre- and post-#2958 aiter without
+        # requiring the docker pin to be bumped atomically.
+        try:
+            from aiter.ops.enum import QuantType as _AiterQuantType
+            from aiter.ops.fused_qk_rmsnorm_group_quant import (
+                fused_qk_rmsnorm as _aiter_fused_qk_rmsnorm_unified,
+            )
 
-        _has_fused_qk_pertoken_fp8 = True
+            def fused_qk_rmsnorm_bf16(q, q_weight, q_eps, k, k_weight, k_eps):
+                q_out = torch.empty_like(q)
+                k_out = torch.empty_like(k)
+                _aiter_fused_qk_rmsnorm_unified(
+                    q_out_quantized=q_out,
+                    k_out=k_out,
+                    q=q,
+                    q_weight=q_weight,
+                    q_epsilon=q_eps,
+                    k=k,
+                    k_weight=k_weight,
+                    k_epsilon=k_eps,
+                    quant_type=_AiterQuantType.No,
+                )
+                return q_out, k_out
 
-    except ImportError:
-        from aiter.ops.fused_qk_norm_rope_cache_quant import (
-            fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
+            def fused_qk_rmsnorm_q_pertoken_fp8(q, q_weight, q_eps, k, k_weight, k_eps):
+                # Fold the q_b_proj per-token fp8 activation quant INTO the fused
+                # q/kv RMSNorm: q is emitted as (fp8, x_scale[m,1], orig_dtype) ready
+                # for the tuned gemm_a8w8_bpreshuffle, eliminating the standalone
+                # per-token quant launch before q_b_proj. orig_dtype carries the
+                # pre-quant activation dtype so apply_fp8_linear can preserve it
+                # (FP16 must not be silently promoted to BF16). k (kv_a) stays bf16
+                # (it feeds the absorbed w_kc/w_vc BMMs, not a bpreshuffle GEMM).
+                q_q = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+                q_s = torch.empty((q.shape[0], 1), dtype=torch.float32, device=q.device)
+                k_out = torch.empty_like(k)
+                _aiter_fused_qk_rmsnorm_unified(
+                    q_out_quantized=q_q,
+                    q_out_scale=q_s,
+                    k_out=k_out,
+                    q=q,
+                    q_weight=q_weight,
+                    q_epsilon=q_eps,
+                    k=k,
+                    k_weight=k_weight,
+                    k_epsilon=k_eps,
+                    quant_type=_AiterQuantType.per_Token,
+                )
+                return (q_q, q_s, q.dtype), k_out
+
+            _has_fused_qk_pertoken_fp8 = True
+
+        except ImportError:
+            from aiter.ops.fused_qk_norm_rope_cache_quant import (
+                fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
+            )
+
+            fused_qk_rmsnorm_q_pertoken_fp8 = None
+            _has_fused_qk_pertoken_fp8 = False
+
+        from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
+            batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
         )
-
-        fused_qk_rmsnorm_q_pertoken_fp8 = None
-        _has_fused_qk_pertoken_fp8 = False
-
-    from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
-        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
-    )
 
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import (
@@ -613,7 +629,15 @@ class DeepseekMLARocmForwardMixin:
                 not _use_aiter
                 or not _is_gfx95_supported
                 or self.use_dsa
-                or self.current_attention_backend == "triton"
+                # Non-fused, non-specialized attention backends (e.g. Triton) run
+                # the cat path in forward_absorb_core and need RoPE applied here;
+                # only the aiter fused MLA path and the specialized MLA backends
+                # defer RoPE to their own kernels.
+                or (
+                    self.current_attention_backend
+                    not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+                    and self.current_attention_backend != "aiter"
+                )
             )
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)

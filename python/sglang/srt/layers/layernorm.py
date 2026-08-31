@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -112,8 +113,17 @@ _aiter_fp8_dtype = None
 if _use_aiter:
     import aiter as _aiter
     from aiter import layernorm2d_fwd as layer_norm
-    from aiter import rmsnorm2d_fwd as rms_norm
-    from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
+
+    if is_gfx1250_supported():
+        from aiter.ops.triton.normalization.rmsnorm import (
+            rms_norm,
+        )
+        from aiter.ops.triton.normalization.rmsnorm import (
+            rmsnorm2d_fwd_with_add as fused_add_rms_norm,
+        )
+    else:
+        from aiter import rmsnorm2d_fwd as rms_norm
+        from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
     # Cache the HIP quant functor and the FP8 dtype so fallback paths don't
     # re-import aiter on every forward.

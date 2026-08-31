@@ -429,7 +429,7 @@ sglang generate \
   --component-attention-backends text_encoder=torch_sdpa
 ```
 
-The component key must match a pipeline module key such as `text_encoder`, `text_encoder_2`, `transformer`, `transformer_2`, or `connectors`. Component overrides take precedence over the global `--attention-backend` only while that component is being constructed and otherwise fail if the component cannot satisfy them. Sparse self-attention backends use a compatible dense backend for cross-attention layers. The global backend remains strict for DiT components, while auxiliary components may fall back to a compatible backend.
+The component key must match a pipeline module key such as `text_encoder`, `text_encoder_2`, `transformer`, `transformer_2`, or `connectors`. Component overrides take precedence over the global `--attention-backend` while that component is being constructed and fail if the component cannot satisfy them. A native component may explicitly defer backend selection until first use; components with fixed attention reject the override. Sparse self-attention backends use a compatible dense backend for cross-attention layers. The global backend remains strict for DiT components, while auxiliary components may fall back to a compatible backend. The Diffusers backend supports only the global backend passthrough.
 
 You can also pass dotted CLI entries:
 
