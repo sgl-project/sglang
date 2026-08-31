@@ -691,8 +691,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.max_seq_len_q = num_tokens_per_req
             metadata.sum_seq_lens_q = num_tokens_per_req * bs
             seq_lens = seq_lens[:bs]
-            metadata.seq_lens_k.copy_(seq_lens)
-            local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
+            metadata.global_seq_lens_k.copy_(seq_lens)
+            metadata.seq_lens_k.copy_(self._get_dcp_local_seq_lens(seq_lens))
+            local_seq_lens = metadata.seq_lens_k
         else:
             seq_lens = seq_lens[:bs]
             metadata.global_seq_lens_k.copy_(seq_lens)
@@ -911,6 +912,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 if (
                     forward_batch.forward_mode.is_target_verify()
                     or forward_batch.forward_mode.is_decode_or_idle()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
                 ) and metadata.seq_lens_k is not None:
                     # The branches above stored the int32 GLOBAL lengths in
                     # seq_lens_k. Keep those as global_seq_lens_k and derive the
