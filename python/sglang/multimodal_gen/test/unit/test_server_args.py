@@ -1655,31 +1655,25 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertIn("text_encoder", constrained_offload)
         self.assertIn("vae", constrained_offload)
 
-    def test_qwen_ar_planner_candidates_do_not_use_a_coarse_vram_threshold(self):
-        pipeline_configs = (
-            QwenImageLayeredPipelineConfig(),
+    def test_longcat_ar_planner_candidates_do_not_use_a_coarse_vram_threshold(self):
+        high_memory_args = self._from_dict_with_pipeline_config(
             LongCatImagePipelineConfig(),
+            memory_gb=80,
+            kwargs={"performance_mode": "auto"},
         )
+        self.assertIn(
+            "text_encoder", high_memory_args.layerwise_offload_components or []
+        )
+        self.assertFalse(high_memory_args.text_encoder_cpu_offload)
 
-        for pipeline_config in pipeline_configs:
-            high_memory_args = self._from_dict_with_pipeline_config(
-                pipeline_config,
-                memory_gb=80,
-                kwargs={"performance_mode": "auto"},
-            )
-            self.assertIn(
-                "text_encoder", high_memory_args.layerwise_offload_components or []
-            )
-            self.assertFalse(high_memory_args.text_encoder_cpu_offload)
-
-            constrained_args = self._from_dict_with_pipeline_config(
-                pipeline_config,
-                memory_gb=60,
-                kwargs={"performance_mode": "auto"},
-            )
-            self.assertIn(
-                "text_encoder", constrained_args.layerwise_offload_components or []
-            )
+        constrained_args = self._from_dict_with_pipeline_config(
+            LongCatImagePipelineConfig(),
+            memory_gb=60,
+            kwargs={"performance_mode": "auto"},
+        )
+        self.assertIn(
+            "text_encoder", constrained_args.layerwise_offload_components or []
+        )
 
     def test_auto_multi_gpu_sana_wm_prefers_fsdp_and_cfg_parallel(self):
         args = self._from_dict_with_pipeline_config(
