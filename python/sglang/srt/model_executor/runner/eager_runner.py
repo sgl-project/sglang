@@ -67,6 +67,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.common import (
     ceil_align,
+    get_current_device_stream_fast,
     get_eager_max_batch_size,
     require_mlp_sync,
 )
@@ -393,7 +394,11 @@ class EagerRunner(BaseRunner):
             model_kwargs = {"input_embeds": sharded_input_embeds}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-            hidden_states = model.model(
+            cp_model_getter = getattr(model, "get_context_parallel_model", None)
+            cp_model = (
+                cp_model_getter() if cp_model_getter is not None else model.model
+            )
+            hidden_states = cp_model(
                 forward_batch.input_ids,
                 sharded_positions,
                 forward_batch,
@@ -411,7 +416,7 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
-        stream = torch.cuda.current_stream()
+        stream = get_current_device_stream_fast()
         hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
         # DSpark aux tensors ride the same CP token split; gather them the same way.
         if aux_hidden_states is not None:

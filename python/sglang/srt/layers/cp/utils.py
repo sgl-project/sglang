@@ -45,6 +45,7 @@ CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
         "DeepseekV32ForCausalLM",
         "GlmMoeDsaForCausalLM",
         "GptOssForCausalLM",
+        "KimiK3ForConditionalGeneration",
         "MiMoV2FlashForCausalLM",
         "MiMoV2ForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -137,11 +138,15 @@ def enable_cp_v2() -> bool:
 
 
 def is_cp_v2_active(forward_batch) -> bool:
-    """Return whether the current forward batch is running through CP-v2."""
+    """Return whether the current local forward batch should use CP-v2."""
     if not enable_cp_v2():
         return False
     forward_mode = getattr(forward_batch, "forward_mode", None)
-    if forward_mode is None or not forward_mode.is_context_parallel_extend():
+    if (
+        forward_mode is None
+        or not forward_mode.is_context_parallel_extend()
+        or getattr(forward_mode, "is_mixed", lambda: False)()
+    ):
         return False
 
     strategy = get_cp_strategy()
