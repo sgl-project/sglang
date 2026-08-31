@@ -19,6 +19,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
 if TYPE_CHECKING:
@@ -172,7 +173,6 @@ def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
         get_dp_global_num_tokens,
         get_is_extend_in_batch,
     )
-    from sglang.srt.runtime_context import get_parallel
 
     if get_is_extend_in_batch():
         return 0
@@ -446,7 +446,21 @@ def _pre_permute_deepep_to_aiter(
             "SGLANG_USE_AITER_MOE_GU_ITLV", "true"
         )
 
-        if is_w4a4 and a1_scale is not None and not is_fp4_dispatch:
+        # MXFP8 dispatch already carries fp8 data with group-32 e8m0 scales,
+        # which is what per_1x32 wants, so hand it straight to fused_moe. Only
+        # fp8 dispatch's group-128/fp32 scales need the dequant round trip; it is
+        # distinguishable by scale dtype (fp32 there, e8m0 here).
+        is_mx_fp8_dispatch = (
+            a1_scale is not None
+            and a1_scale.dtype == torch.float8_e8m0fnu
+            and not is_fp4_dispatch
+        )
+        if (
+            is_w4a4
+            and a1_scale is not None
+            and not is_fp4_dispatch
+            and not is_mx_fp8_dispatch
+        ):
             # W4A4 weights with FP8 dispatch: dequant FP8->BF16 first; the
             # FP4 per_1x32 path needs BF16 input.
             hidden_states = upscale(
