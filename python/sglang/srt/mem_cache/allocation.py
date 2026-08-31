@@ -296,10 +296,7 @@ def alloc_for_extend(
 
     reuse_kv = None
     if batch.is_dllm():
-        reuse_kv = [
-            r.req_pool_idx is not None and bool(r.dllm_incomplete_ids)
-            for r in batch.reqs
-        ]
+        reuse_kv = [r.kv.holds_kv and bool(r.dllm_incomplete_ids) for r in batch.reqs]
 
     # Create tensors for allocation
     pin_memory = is_pin_memory_available(batch.device)
@@ -385,13 +382,9 @@ def alloc_for_extend(
             batch.seq_lens_cpu,
         )
 
-    from sglang.srt.managers.schedule_batch import ReqKvInfo
-
     for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
-        if req.kv is None:
-            req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
-        else:
-            req.kv.kv_allocated_len = seq_len
+        req.kv.kv_allocated_len = seq_len
+        req.kv.kv_committed_len = seq_len
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
@@ -416,7 +409,7 @@ def _alloc_extend_loc_with_kv_reuse(
         retained_len = len(req.dllm_incomplete_ids)
         if extend_len != retained_len:
             raise RuntimeError("dLLM FDFO retained KV must be reused as a full block.")
-        if req.kv is None or prefix_len + extend_len > req.kv.kv_allocated_len:
+        if prefix_len + extend_len > req.kv.kv_allocated_len:
             raise RuntimeError("dLLM FDFO retained KV is missing.")
 
     alloc_extend_lens = [
@@ -586,6 +579,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     for req in batch.reqs:
         req.kv.kv_allocated_len += token_per_req
+        req.kv.kv_committed_len += token_per_req
 
     return out_cache_loc
 

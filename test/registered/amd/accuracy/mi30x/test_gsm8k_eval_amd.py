@@ -20,7 +20,6 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -80,9 +79,6 @@ def remove_failing_models(model_str):
     return ",".join(filtered)
 
 
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = remove_failing_models(
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1
-)
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = remove_failing_models(
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2
 )
@@ -206,7 +202,6 @@ class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_groups = [
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),

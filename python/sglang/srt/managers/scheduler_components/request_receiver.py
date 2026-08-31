@@ -37,7 +37,7 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-    from sglang.srt.managers.rust_server import RustServer
+    from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (

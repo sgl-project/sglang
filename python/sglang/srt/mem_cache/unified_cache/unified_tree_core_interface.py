@@ -80,6 +80,22 @@ class RadixCacheWalkResult(msgspec.Struct, frozen=True, kw_only=True):
     prev_slot_indices: torch.Tensor
 
 
+class BufferBackupSnapshot(msgspec.Struct, frozen=True):
+    node_id: NodeId
+    parent_node_id: NodeId
+    parent_is_root: bool
+    parent_last_hash: Optional[str]
+    hash_values: list[str]
+    key: RadixKey
+    prefix_keys: Optional[list[str]]
+
+
+class BufferBackupState(msgspec.Struct, frozen=True):
+    parent_node_id: NodeId
+    parent_is_root: bool
+    parent_last_hash: Optional[str]
+
+
 class InsertStepResult(msgspec.Struct, frozen=True):
     """One step of a resumable insert: the Controller executes ``actions``, then
     resumes while ``result`` is None; ``result`` is set on the final step."""
@@ -182,6 +198,20 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def snapshot_buffer_backup(
+        self, node_id: NodeId, pass_prefix_keys: bool
+    ) -> Optional[BufferBackupSnapshot]:
+        """Snapshot an eligible buffer-only backup node."""
+        ...
+
+    @abstractmethod
+    def validate_buffer_backup(
+        self, node_id: NodeId, expected_key_length: int
+    ) -> Optional[BufferBackupState]:
+        """Validate a queued backup and return its current parent state."""
+        ...
+
+    @abstractmethod
     def backfill_missing_hash_values(self) -> int:
         """Hash every node built while storage was disabled; return how many.
 
@@ -194,6 +224,11 @@ class UnifiedTreeCoreInterface(ABC):
     @abstractmethod
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The NodeId anchoring matches for the namespace."""
+        ...
+
+    @abstractmethod
+    def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
+        """Return input indices in depth-first, subtree-weight order."""
         ...
 
     @abstractmethod

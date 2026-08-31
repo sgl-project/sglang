@@ -443,7 +443,10 @@ class CudaPlatformBase(Platform):
     @lru_cache(maxsize=1)
     def get_modelopt_flashinfer_fp4_backend(cls) -> str:
         backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
-        default_backend = "trtllm"
+        # flashinfer.mm_fp4 rejects backend="trtllm" on sm_120 ("does not support
+        # backend 'trtllm' with capability 120"); "auto" resolves to its sm_12x
+        # NVFP4 kernel there.
+        default_backend = "auto" if cls.is_sm120() else "trtllm"
         if backend is None:
             return default_backend
 
