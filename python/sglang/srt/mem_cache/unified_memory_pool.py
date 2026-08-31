@@ -1920,8 +1920,10 @@ def init_unified_mamba_swa_pools(
     # bs=1 floor (the retract loop's terminal guarantee), tri form: full KV at
     # max context + ONE sliding window of swa KV (+ a page of slack, clamped
     # to the context) + the state slots ONE running request locks (1 active +
-    # 2 radix checkpoints — a per-request FLOOR, not headroom) + the reserved
-    # slot-0 sink.
+    # 2 radix checkpoints -- a per-request FLOOR, not headroom) + the reserved
+    # slot-0 sink. The full-attention token side is NOT charged, for the reason
+    # the two sibling factories give: max_req_len already clamps a request to
+    # the full pool's capacity, so it cannot livelock.
     swa_bs1_tokens = (
         min(model_context_len, sliding_window_size + page_size)
         if sliding_window_size is not None
@@ -1930,7 +1932,6 @@ def init_unified_mamba_swa_pools(
     _check_bs1_feasibility_floor(
         total_bytes=total_bytes,
         floor_terms=[
-            ("full_ctx_kv", model_context_len * full_spec.entry_bytes()),
             ("swa_window_kv", swa_bs1_tokens * swa_spec.entry_bytes()),
             ("bs1_state_slots", 3 * mamba_spec.entry_bytes()),
             (

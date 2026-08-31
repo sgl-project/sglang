@@ -65,12 +65,55 @@ def _paged_allocator(lazy: bool):
 # 1. tombstone scatters
 # --------------------------------------------------------------------------
 
+_TABLES = {"virtual_to_physical", "physical_to_virtual"}
+
+# Methods that MUST tombstone through index_fill_. Explicit, because "this
+# method writes a tombstone" is a design fact per method, not something a scan
+# can infer -- but `test_every_allocator_free_path_is_listed` below fails if a
+# new allocator arrives with its own free path and is not added here.
 _TOMBSTONE_METHODS = [
     (mea.MultiEndedAllocator, "_free_lazy"),
     (mea.MultiEndedAllocator, "free"),
     (mea.MultiEndedAllocator, "_commit_move_batch"),
+    (mea.FloatMultiEndedAllocator, "free"),
+    (mea.FloatMultiEndedAllocator, "make_room"),
+    (mea.FloatMultiEndedAllocator, "_relocate_to_positions"),
 ]
-_TABLES = {"virtual_to_physical", "physical_to_virtual"}
+
+
+def _allocators_in_module():
+    """Every allocator class DEFINED in multi_ended_allocator (not imported)."""
+    return sorted(
+        (
+            c
+            for c in vars(mea).values()
+            if isinstance(c, type)
+            and c.__module__ == mea.__name__
+            and "Allocator" in c.__name__
+        ),
+        key=lambda c: c.__name__,
+    )
+
+
+def _table_touching_methods():
+    """Every own method of every allocator whose source names a page table.
+
+    DISCOVERY, not a list: a hardcoded list stops guarding the moment a new
+    allocator class arrives with its own free path -- which is what happened
+    when FloatMultiEndedAllocator was added and inherited no coverage.
+    """
+    out = []
+    for cls in _allocators_in_module():
+        for name, fn in vars(cls).items():
+            if not inspect.isfunction(fn):
+                continue
+            try:
+                src = inspect.getsource(fn)
+            except OSError:
+                continue
+            if any(f".{t}[" in src for t in _TABLES):
+                out.append((cls, name))
+    return sorted(out, key=lambda pair: (pair[0].__name__, pair[1]))
 
 
 def _scalar_index_assignments(fn):
@@ -102,13 +145,22 @@ def _scalar_index_assignments(fn):
                 continue
             if isinstance(tgt.slice, ast.Slice):
                 continue
+            # A CONSTANT integer index (`t[0] = 0`, `t[-1] = -1`) is a
+            # single-element sentinel write, not the tensor-index tombstone this
+            # guard exists to find, and the only such writes are in `clear()`.
+            if _is_scalar_literal(tgt.slice):
+                continue
             bad.append(ast.unparse(node))
     return bad
 
 
 class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
     def test_no_scalar_index_assignment(self):
-        for cls, name in _TOMBSTONE_METHODS:
+        discovered = _table_touching_methods()
+        self.assertGreaterEqual(
+            len(discovered), len(_TOMBSTONE_METHODS), "discovery scan went blind"
+        )
+        for cls, name in discovered:
             with self.subTest(method=f"{cls.__name__}.{name}"):
                 bad = _scalar_index_assignments(getattr(cls, name))
                 self.assertEqual(
@@ -131,6 +183,41 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
             self.virtual_to_physical[free_v_pages] = -1  # noqa: F821
 
         self.assertEqual(len(_scalar_index_assignments(_offender)), 1)
+
+    def test_every_allocator_free_path_is_listed(self):
+        """The positive list must name every allocator that owns a free path.
+
+        REGRESSION: the list used to hold three MultiEndedAllocator methods, so
+        adding FloatMultiEndedAllocator with its own `free` silently dropped that
+        free path out of coverage -- and it shipped a scalar tombstone. Fail here
+        instead, loudly, the next time an allocator arrives.
+        """
+        listed = {(cls.__name__, name) for cls, name in _TOMBSTONE_METHODS}
+        for cls in _allocators_in_module():
+            for name, fn in vars(cls).items():
+                if not inspect.isfunction(fn):
+                    continue
+                try:
+                    src = inspect.getsource(fn)
+                except OSError:
+                    continue
+                # WRITES a page table -- either correctly (index_fill_) or in the
+                # banned scalar form the scan below catches. A method that only
+                # READS a table has nothing to tombstone.
+                if not (
+                    any(f"{t}.index_fill_" in src for t in _TABLES)
+                    or _scalar_index_assignments(fn)
+                ):
+                    continue
+                self.assertIn(
+                    (cls.__name__, name),
+                    listed,
+                    msg=(
+                        f"{cls.__name__}.{name} writes a page table but is not in "
+                        f"_TOMBSTONE_METHODS, so the index_fill_ guard does not "
+                        f"cover it. Add it."
+                    ),
+                )
 
     def test_free_paths_actually_use_index_fill(self):
         """Positive form, so deleting the scatter entirely cannot pass."""

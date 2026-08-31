@@ -2208,6 +2208,23 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         hi = min(hi, self.num_pages)
         return lo, hi
 
+    def pages_in_band(self, *, low_byte: int, high_byte: int) -> int:
+        """Pages this float can actually take from the byte band
+        ``[low_byte, high_byte)``, on its OWN page grid.
+
+        Same conservative rounding as `_region_bounds_pages` (low UP, high
+        DOWN) and the same clamps. A raw ``(high - low) // entry_bytes_per_page``
+        OVER-counts by up to one page whenever ``low_byte`` is not a multiple of
+        this pool's page size -- which is the generic case, since the bounding
+        frontier is a multiple of the NEIGHBOUR's entry size and the two entry
+        sizes are unrelated. Callers pricing an extension in bytes must go
+        through here or they hand out a page the grid cannot yield.
+        """
+        epp = self.entry_bytes_per_page
+        lo = max((low_byte + epp - 1) // epp, self.min_page_index)
+        hi = min(high_byte // epp, self.num_pages)
+        return max(0, hi - lo)
+
     def _gap_pages(self) -> Tuple[int, int]:
         """(gap_low, gap_high) in own page units; both == the whole region
         when the span is empty/parked."""
@@ -2219,10 +2236,42 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
 
     # -- availability --
 
+    def _side_drainable_hole_bytes(self, side: str) -> int:
+        """Realizable gap bytes an urgent flush of the neighbour on ``side``
+        would release, walking past transparent members like the frontier walk.
+        """
+        p = self.low_peer if side == "low" else self.high_peer
+        while p is not None and p._is_frontier_transparent():
+            p = p.low_peer if side == "low" else p.high_peer
+        if p is None or not p.lazy_compaction:
+            return 0
+        if p.disagg_move_gate is not None and not p.disagg_move_gate():
+            return 0
+        return len(p._free_phys_pages) * p.entry_bytes_per_page
+
+    def _peer_drainable_hole_bytes(self) -> int:
+        """The better of the two sides. The base version asks
+        `_growth_side_neighbor()`, which is undefined for a float: its
+        `grow_direction` is "float", so the base falls through to `low_peer`
+        and silently ignores the high neighbour entirely.
+        """
+        return max(
+            self._side_drainable_hole_bytes("low"),
+            self._side_drainable_hole_bytes("high"),
+        )
+
     def _available_tokens(self, extra_gap_bytes: int = 0) -> int:
         gap_low, gap_high = self._gap_pages()
+        if extra_gap_bytes > 0:
+            # Credit each neighbour to ITS OWN side. The base contract hands
+            # down one undirected scalar because an END pool grows one way; a
+            # float grows both, and adding a LOW neighbour's holes to the HIGH
+            # gap over-reports schedulable capacity -- which the scheduler then
+            # admits work against and the ladder cannot satisfy.
+            epp = self.entry_bytes_per_page
+            gap_low += self._side_drainable_hole_bytes("low") // epp
+            gap_high += self._side_drainable_hole_bytes("high") // epp
         gap_pages = max(gap_low, gap_high)  # a single alloc extends ONE side
-        gap_pages += extra_gap_bytes // self.entry_bytes_per_page
         pages_by_index_space = self.num_pages - self.min_page_index - self._live_pages()
         pages_extend = min(gap_pages, pages_by_index_space)
         return (pages_extend + self._hole_pages()) * self.page_size
@@ -2339,8 +2388,11 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             else:
                 free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
             freed_p_pages = self.virtual_to_physical[free_v_pages]
-            self.virtual_to_physical[free_v_pages] = -1
-            self.physical_to_virtual[freed_p_pages] = -1
+            # `index_fill_`, NOT `t[idx] = -1`: the scalar form materialises -1
+            # as a CPU tensor and issues a host-BLOCKING pageable H2D copy. Same
+            # contract as the END free path.
+            self.virtual_to_physical.index_fill_(0, free_v_pages, -1)
+            self.physical_to_virtual.index_fill_(0, freed_p_pages, -1)
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])
@@ -2417,9 +2469,20 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         < min_bytes iff impossible now — state is then unchanged).
 
         Cost model: moving k pages costs k page-copies; k <= min(L_live, G).
-        Scheduler-phase only — callers own write-set / stream safety.
+        Scheduler-phase only. Stream safety is owned HERE, not by the caller:
+        the entry settles the in-flight forward before the first copy.
         """
         assert side in ("low", "high"), f"side must be 'low'|'high'; got {side!r}"
+        # The relocation below MOVES live KV and then rebinds v2p. The in-flight
+        # forward may still be writing the pages about to be copied, so the copy
+        # would carry pre-write bytes and the rebind would point every later
+        # reader at a destination that never received those writes -- silently
+        # wrong KV, no crash. Order the copy after the forward first: a stream
+        # wait, not a host sync. Same discipline as the END pools'
+        # `_flush(urgent=True)`; one wait covers BOTH the write and the read
+        # hazard because the event is recorded after the WHOLE forward, which is
+        # why no write-set classification is needed here.
+        self._settle_inflight_forward()
         epp = self.entry_bytes_per_page
         lo, hi = self._region_bounds_pages()
         gap_low, gap_high = self._gap_pages()
@@ -2488,9 +2551,9 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
                 torch.tensor(srcs, dtype=torch.int64, device=self.device),
                 torch.tensor(dsts, dtype=torch.int64, device=self.device),
             )
-            self.physical_to_virtual[
-                torch.tensor(srcs, dtype=torch.int64, device=self.device)
-            ] = -1
+            self.physical_to_virtual.index_fill_(
+                0, torch.tensor(srcs, dtype=torch.int64, device=self.device), -1
+            )
 
         # Reconstruct the span from final live positions: everything between
         # the extremes is span; non-live pages inside are holes.
@@ -2532,16 +2595,25 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
                     [d for _, d in pairs], dtype=torch.int64, device=self.device
                 )
                 self._move_pages_and_rebind(src_t, dst_t)
-                self.physical_to_virtual[src_t] = -1
+                self.physical_to_virtual.index_fill_(0, src_t, -1)
             else:
                 # Overlapping shift: process toward the move direction so each
                 # destination is free by the time it is written.
                 ordered = pairs if final[0] <= live_sorted[0] else list(reversed(pairs))
-                for s, d in ordered:
-                    s_t = torch.tensor([s], dtype=torch.int64, device=self.device)
-                    d_t = torch.tensor([d], dtype=torch.int64, device=self.device)
+                # Build both id tensors ONCE. `torch.tensor(..., device=cuda)`
+                # inside the loop is a pageable H2D per page (two per page here),
+                # and a shift can be as long as the span; slicing a prebuilt
+                # tensor keeps the per-page ordering with 2 copies total.
+                src_all = torch.tensor(
+                    [s for s, _ in ordered], dtype=torch.int64, device=self.device
+                )
+                dst_all = torch.tensor(
+                    [d for _, d in ordered], dtype=torch.int64, device=self.device
+                )
+                for i in range(len(ordered)):
+                    s_t, d_t = src_all[i : i + 1], dst_all[i : i + 1]
                     self._move_pages_and_rebind(s_t, d_t)
-                    self.physical_to_virtual[s_t] = -1
+                    self.physical_to_virtual.index_fill_(0, s_t, -1)
         if final:
             self.low_wm_page = final[0]
             self.high_wm_page = final[-1] + 1
@@ -2636,6 +2708,16 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         assert retreat_side in ("low", "high")
         if self._hole_pages() == 0:
             return 0
+        # The relocation below MOVES live KV and then rebinds v2p. The in-flight
+        # forward may still be writing the pages about to be copied, so the copy
+        # would carry pre-write bytes and the rebind would point every later
+        # reader at a destination that never received those writes -- silently
+        # wrong KV, no crash. Order the copy after the forward first: a stream
+        # wait, not a host sync. Same discipline as the END pools'
+        # `_flush(urgent=True)`; one wait covers BOTH the write and the read
+        # hazard because the event is recorded after the WHOLE forward, which is
+        # why no write-set classification is needed here.
+        self._settle_inflight_forward()
         holes = set(int(x) for x in self._free_phys_pages.tolist())
         live_sorted = [
             p for p in range(self.low_wm_page, self.high_wm_page) if p not in holes
@@ -3804,7 +3886,26 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
             if ext_f * e_f > b_high:
                 return False
             ext_s = max(0, n - h_s)
-            return ext_s * e_s <= max(b_low, b_high - ext_f * e_f)
+            # Price the float's extension on its OWN page grid, never in raw
+            # bytes: the band's low edge rounds UP to the float's page size, so
+            # a byte budget credits up to one page `take_physical_pages` cannot
+            # yield -- and `alloc_with_virtual` then trips its backstop assert.
+            full_low_after = fa._byte_low_frontier() - ext_f * e_f
+            if sa._is_frontier_transparent():
+                room = sa.pages_in_band(
+                    low_byte=sa._chain_high_frontier_below_bytes(),
+                    high_byte=full_low_after,
+                )
+                return ext_s <= room
+            p_low = sa.pages_in_band(
+                low_byte=sa._chain_high_frontier_below_bytes(),
+                high_byte=sa._byte_low_frontier(),
+            )
+            p_high = sa.pages_in_band(
+                low_byte=sa._byte_high_frontier(),
+                high_byte=full_low_after,
+            )
+            return ext_s <= max(p_low, p_high)
 
         lo_n, hi_n = 0, min(h_f + r_f, h_s + r_s)
         while lo_n < hi_n:
@@ -3880,14 +3981,6 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
     def clear(self) -> None:
         super().clear()
         self.mamba_allocator.clear()
-
-    def backup_state(self):
-        return super().backup_state() + [self.mamba_allocator.backup_state()]
-
-    def restore_state(self, state):
-        assert len(state) == 3
-        rollback = UnifiedSWATokenToKVPoolAllocator.restore_state(self, state[:2])
-        return rollback + self.mamba_allocator.restore_state(state[2])
 
     def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
         super().set_latest_forward_done_event(event)

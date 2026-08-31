@@ -704,7 +704,9 @@ class KVCacheConfigurator:
         if get_spec().speculative_num_draft_tokens is not None:
             extra_max_context_len += get_spec().speculative_num_draft_tokens
 
-        head_num = self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+        head_num = self.model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
         head_dim = self.model_config.head_dim
         if self.is_hybrid_swa_compress:
             # Asymmetric full/SWA head geometry (Inkling): SWA dims from the

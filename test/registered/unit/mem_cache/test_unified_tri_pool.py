@@ -34,10 +34,12 @@ Pure CPU; fakes stand in for the KV pools (data markers verify moves).
     python -m pytest test/registered/unit/mem_cache/test_unified_tri_pool.py -v
 """
 
+import inspect
 import unittest
 
 import torch
 
+import sglang.srt.mem_cache.multi_ended_allocator as mea
 from sglang.srt.mem_cache.multi_ended_allocator import (
     FloatMultiEndedAllocator,
     UnifiedMambaSWATokenToKVPoolAllocator,
@@ -1113,6 +1115,289 @@ class TestTriPoolHardening(unittest.TestCase):
         self.assertFalse(
             allocator.check_decode_capacity(num_tokens=big, tree_cache=None)
         )
+
+
+class TestJointCapacityIsHonoured(unittest.TestCase):
+    """`alloc(available_size())` must never fail.
+
+    REGRESSION: the joint predicate priced the swa float's extension in RAW
+    BYTES while `take_physical_pages` can only use whole pages on the float's
+    OWN grid -- `_region_bounds_pages` rounds the band's low edge UP. The
+    bounding frontier is a multiple of the NEIGHBOUR's entry size, which is
+    unrelated to the float's, so the byte budget credited a page the grid could
+    not yield and the very first alloc tripped `alloc_with_virtual`'s backstop
+    assert. Swept over geometries rather than pinned to one, so a symmetric
+    mistake on the FULL side would surface here too.
+    """
+
+    def _build(self, *, page_size, n_full, n_swa, n_state, lazy, specs):
+        full, swa, mamba = specs
+        total = (
+            n_full * full.entry_bytes()
+            + n_swa * swa.entry_bytes()
+            + n_state * mamba.entry_bytes()
+        )
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full, swa, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=page_size,
+        )
+        kvcache = _FakeUnifiedSWAKVPool(pool)
+        return pool, UnifiedMambaSWATokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=kvcache,
+            mamba_kvcache=_FakeKVCache(pool.max_slots("mamba")),
+            device=_DEV,
+            full_max_total_num_tokens=n_full,
+            swa_max_total_num_tokens=n_swa,
+            need_sort=False,
+            forward_stream=None,
+            lazy_compaction=lazy,
+        )
+
+    def test_fresh_boot_alloc_of_available_size_succeeds(self):
+        # Geometries chosen so the mamba end's frontier (a multiple of the
+        # STATE entry size) lands off the swa float's page grid -- the
+        # misalignment the byte budget used to ignore.
+        for page_size in (1, 2, 4):
+            for fl, sl, ml in ((4, 3, 1), (4, 2, 2), (6, 3, 1), (3, 5, 2)):
+                for n_full, n_swa, n_state in ((24, 16, 4), (32, 16, 8), (20, 12, 6)):
+                    for lazy in (False, True):
+                        specs = _tri_specs(
+                            full_layer_num=fl,
+                            swa_layer_num=sl,
+                            state_layer_num=ml,
+                            head_num=1,
+                            head_dim=8,
+                        )
+                        with self.subTest(
+                            ps=page_size,
+                            layers=(fl, sl, ml),
+                            n=(n_full, n_swa, n_state),
+                            lazy=lazy,
+                        ):
+                            _pool, alloc = self._build(
+                                page_size=page_size,
+                                n_full=n_full * page_size,
+                                n_swa=n_swa * page_size,
+                                n_state=n_state,
+                                lazy=lazy,
+                                specs=specs,
+                            )
+                            n = alloc.available_size()
+                            if n <= 0:
+                                continue
+                            # The whole point: the number the scheduler reads
+                            # must be allocatable, with no backstop assert.
+                            out = alloc.alloc(n)
+                            self.assertIsNotNone(
+                                out,
+                                f"alloc(available_size()={n}) returned None",
+                            )
+                            self.assertEqual(out.numel(), n)
+
+    def test_available_size_never_exceeds_the_float_page_grid(self):
+        """Direct form: the joint answer, converted to float pages, must fit
+        inside what `_region_bounds_pages` actually offers."""
+        for page_size in (1, 4):
+            specs = _tri_specs(
+                full_layer_num=4,
+                swa_layer_num=3,
+                state_layer_num=1,
+                head_num=1,
+                head_dim=8,
+            )
+            _pool, alloc = self._build(
+                page_size=page_size,
+                n_full=24 * page_size,
+                n_swa=16 * page_size,
+                n_state=4,
+                lazy=False,
+                specs=specs,
+            )
+            sa = alloc.swa_attn_allocator
+            n_pages = alloc.available_size() // page_size
+            lo, hi = sa._region_bounds_pages()
+            with self.subTest(ps=page_size):
+                self.assertLessEqual(
+                    n_pages - sa._hole_pages(),
+                    max(0, hi - lo),
+                    "joint available_size() promises more float pages than the "
+                    "float's own page grid can yield",
+                )
+
+
+class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
+    """Float relocation must settle the in-flight forward BEFORE its first copy.
+
+    REGRESSION: `make_room` / `compact_holes` issued `move_kv_cache` and rebound
+    `virtual_to_physical` with no ordering against the running forward, so the
+    copy could carry pre-write bytes and the rebind then pointed every later
+    reader at a destination that never received those writes -- silently wrong
+    KV, no crash. The END pools guard exactly this hazard in
+    `_flush(urgent=True)` via `_settle_inflight_forward`; the float had no
+    `forward_stream` / `wait_event` / settle call anywhere in its body.
+    """
+
+    def _tri(self, lazy=True):
+        full, swa, mamba = _tri_specs(head_num=1, head_dim=8)
+        total = (
+            48 * full.entry_bytes() + 32 * swa.entry_bytes() + 8 * mamba.entry_bytes()
+        )
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full, swa, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        kvcache = _FakeUnifiedSWAKVPool(pool)
+        alloc = UnifiedMambaSWATokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=kvcache,
+            mamba_kvcache=_FakeKVCache(pool.max_slots("mamba")),
+            device=_DEV,
+            full_max_total_num_tokens=48,
+            swa_max_total_num_tokens=32,
+            need_sort=False,
+            forward_stream=None,
+            lazy_compaction=lazy,
+        )
+        return pool, alloc, kvcache
+
+    def _trace(self, flt):
+        """Record the order of (settle, move) on the float."""
+        order = []
+        real_settle = flt._settle_inflight_forward
+        real_move = flt._move_pages_and_rebind
+
+        def settle():
+            order.append("settle")
+            return real_settle()
+
+        def move(src, dst):
+            order.append("move")
+            return real_move(src, dst)
+
+        flt._settle_inflight_forward = settle
+        flt._move_pages_and_rebind = move
+        return order
+
+    def test_make_room_settles_before_the_first_move(self):
+        _pool, alloc, _kv = self._tri()
+        flt = alloc.swa_attn_allocator
+        # Occupy the float, then free an interior page so a relocation has
+        # something to move and somewhere to move it.
+        v = alloc.alloc(12)
+        self.assertIsNotNone(v)
+        alloc.free(v[:4])
+        order = self._trace(flt)
+        flt.make_room(side="low", min_bytes=flt.entry_bytes_per_page)
+        self.assertIn("settle", order, "make_room never settled the forward")
+        if "move" in order:
+            self.assertLess(
+                order.index("settle"),
+                order.index("move"),
+                f"a copy was issued before the settle: {order}",
+            )
+
+    def test_compact_holes_settles_before_the_first_move(self):
+        _pool, alloc, _kv = self._tri()
+        flt = alloc.swa_attn_allocator
+        v = alloc.alloc(12)
+        self.assertIsNotNone(v)
+        alloc.free(v[2:6])  # interior holes, so compact_holes has work
+        order = self._trace(flt)
+        flt.compact_holes(retreat_side="high")
+        if not order:
+            self.skipTest("no holes reached compact_holes in this geometry")
+        self.assertEqual(order[0], "settle", f"first action was not a settle: {order}")
+
+    def test_the_settle_is_a_stream_wait_not_a_host_sync(self):
+        """Pin the mechanism: `_settle_inflight_forward` must stream-wait, so
+        the fix costs no host sync on the shortfall path."""
+        src = inspect.getsource(
+            mea.MultiEndedAllocator._settle_inflight_forward  # noqa: SLF001
+        )
+        self.assertIn("wait_event", src)
+        self.assertNotIn(".item()", src)
+        self.assertNotIn("synchronize()", src)
+
+
+class TestFloatHoleCreditIsPerSide(unittest.TestCase):
+    """A float's schedulable credit must follow the side the holes are on.
+
+    REGRESSION: the base `_peer_drainable_hole_bytes` asks
+    `_growth_side_neighbor()`, which reads `grow_direction`. A float's is
+    "float", so the base fell through to `low_peer` -- it never saw the HIGH
+    neighbour, and the single scalar it returned was then added to
+    `max(gap_low, gap_high)`, landing a LOW neighbour's holes on the HIGH gap.
+    Over-reporting `schedulable_available_size` makes the scheduler admit work
+    the shortfall ladder cannot satisfy, which the caller treats as a
+    memory-estimation bug.
+    """
+
+    def _float(self):
+        full, swa, mamba = _tri_specs(head_num=1, head_dim=8)
+        total = (
+            48 * full.entry_bytes() + 32 * swa.entry_bytes() + 8 * mamba.entry_bytes()
+        )
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full, swa, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        alloc = UnifiedMambaSWATokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=_FakeUnifiedSWAKVPool(pool),
+            mamba_kvcache=_FakeKVCache(pool.max_slots("mamba")),
+            device=_DEV,
+            full_max_total_num_tokens=48,
+            swa_max_total_num_tokens=32,
+            need_sort=False,
+            forward_stream=None,
+            lazy_compaction=True,
+        )
+        return alloc, alloc.swa_attn_allocator
+
+    def test_credit_sees_both_neighbours(self):
+        _alloc, flt = self._float()
+        self.assertIsInstance(flt, FloatMultiEndedAllocator)
+        low = flt._side_drainable_hole_bytes("low")
+        high = flt._side_drainable_hole_bytes("high")
+        self.assertEqual(flt._peer_drainable_hole_bytes(), max(low, high))
+        # The base would have answered with the LOW side alone.
+        self.assertGreaterEqual(flt._peer_drainable_hole_bytes(), high)
+
+    def test_schedulable_never_exceeds_the_sum_of_the_two_sides(self):
+        """Upper bound that the undirected scalar could violate: no side may be
+        credited with the other side's holes on top of its own gap."""
+        alloc, flt = self._float()
+        v = alloc.alloc(10)
+        self.assertIsNotNone(v)
+        alloc.free(v[:3])
+        epp = flt.entry_bytes_per_page
+        gap_low, gap_high = flt._gap_pages()
+        c_low = flt._side_drainable_hole_bytes("low") // epp
+        c_high = flt._side_drainable_hole_bytes("high") // epp
+        bound = (
+            min(
+                max(gap_low + c_low, gap_high + c_high),
+                flt.num_pages - flt.min_page_index - flt._live_pages(),
+            )
+            + flt._hole_pages()
+        ) * flt.page_size
+        self.assertLessEqual(flt.schedulable_available_size(), bound)
+
+    def test_memo_verifier_agrees_with_the_per_side_formula(self):
+        """The staleness verifier recomputes through the same entry, so the
+        override must not make the memo look stale."""
+        _alloc, flt = self._float()
+        flt.available_size()
+        flt.schedulable_available_size()
+        self.assertEqual(flt._byte_accounting_violations(), [])
 
 
 if __name__ == "__main__":
