@@ -179,5 +179,14 @@ class DeepseekV4ForCausalLM(nn.Module):
     def pp_group(self):
         return self.language_model.pp_group
 
+    @property
+    def lm_head(self):
+        # DSpark's draft worker attaches the target's lm_head to the draft.
+        return self.language_model.lm_head
+
+    def set_dspark_layers_to_capture(self, layer_ids) -> None:
+        # DSPARK aux-hidden capture is configured on the text model.
+        self.language_model.set_dspark_layers_to_capture(layer_ids)
+
 
 EntryClass = [DeepseekV4ForCausalLM]
