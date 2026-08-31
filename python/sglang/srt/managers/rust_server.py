@@ -29,7 +29,9 @@ from sglang.srt.managers.utils import (
     msgpack_decode_explained,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_mm,
+    get_model,
     get_observability,
     get_parallel,
     get_serving,
@@ -179,7 +181,7 @@ class NativeMmHost:
         self.server_args = server_args
         self.model_config = model_config
         # Worker threads == max concurrently-processed mm requests.
-        self.mm_workers = server_args.mm_processor_worker_num or self.AUTO_MM_WORKERS
+        self.mm_workers = get_mm().mm_processor_worker_num or self.AUTO_MM_WORKERS
 
         # The mapping the Python TokenizerManager builds in
         # init_tokenizer_and_processor. The caller's already-loaded HF
@@ -277,7 +279,7 @@ class NativeMmHost:
         return (
             get_parallel().tp_size > 1
             and determine_tensor_transport_mode() != "default"
-            and not self.server_args.skip_tokenizer_init
+            and not get_serving().skip_tokenizer_init
         )
 
     @staticmethod
@@ -398,17 +400,17 @@ class RustServer:
                 "ingress has no equivalent). Launch without SGLANG_RUST_SERVER, or "
                 "drop --preferred-sampling-params and send those values per request."
             )
-        http_addr = f"{get_serving().host}:{server_args.port}"
+        http_addr = f"{get_serving().host}:{get_serving().port}"
 
         # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
         # so the rank is not conflated with rank 0 of a one-rank group.
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
         if dp_rank is not None:
-            http_addr = f"{get_serving().host}:{server_args.port + dp_rank}"
+            http_addr = f"{get_serving().host}:{get_serving().port + dp_rank}"
 
         launch_cores, server_cores = cls._partition_cores(
             mm_workers=(
-                (server_args.mm_processor_worker_num or NativeMmHost.AUTO_MM_WORKERS)
+                (get_mm().mm_processor_worker_num or NativeMmHost.AUTO_MM_WORKERS)
                 if scheduler.model_config.is_multimodal
                 else 0
             )
@@ -763,26 +765,26 @@ class RustServer:
             "null": ext.DisaggregationMode.Null,
             "prefill": ext.DisaggregationMode.Prefill,
             "decode": ext.DisaggregationMode.Decode,
-        }[sa.disaggregation_mode]
+        }[get_disagg().disaggregation_mode]
         return ext.ServerArgs(
-            model_path=sa.model_path,
-            served_model_name=sa.served_model_name,
-            tokenizer_path=sa.tokenizer_path,
-            revision=sa.revision,
-            load_format=sa.load_format,
-            weight_version=sa.weight_version,
+            model_path=get_model().model_path,
+            served_model_name=get_serving().served_model_name,
+            tokenizer_path=get_serving().tokenizer_path,
+            revision=get_model().revision,
+            load_format=get_model().load_format,
+            weight_version=get_serving().weight_version,
             host=get_serving().host,
-            port=sa.port,
+            port=get_serving().port,
             log_level=get_observability().log_level,
-            log_level_http=sa.log_level_http,
-            chat_template=sa.chat_template,
-            tool_call_parser=sa.tool_call_parser,
-            reasoning_parser=sa.reasoning_parser,
-            stream_response_default_include_usage=sa.stream_response_default_include_usage,
-            tokenizer_worker_num=sa.tokenizer_worker_num,
-            detokenizer_worker_num=sa.detokenizer_worker_num,
-            skip_tokenizer_init=sa.skip_tokenizer_init,
-            incremental_streaming_output=sa.incremental_streaming_output,
+            log_level_http=get_observability().log_level_http,
+            chat_template=get_serving().chat_template,
+            tool_call_parser=get_serving().tool_call_parser,
+            reasoning_parser=get_serving().reasoning_parser,
+            stream_response_default_include_usage=get_serving().stream_response_default_include_usage,
+            tokenizer_worker_num=get_serving().tokenizer_worker_num,
+            detokenizer_worker_num=get_serving().detokenizer_worker_num,
+            skip_tokenizer_init=get_serving().skip_tokenizer_init,
+            incremental_streaming_output=get_serving().incremental_streaming_output,
             disaggregation_mode=disaggregation_mode,
             model_config=ext.ModelConfig(
                 context_len=mc.context_len,
@@ -800,11 +802,11 @@ class RustServer:
             # `preferred_sampling_params` is deliberately absent: `launch`
             # refuses to start when it is set, so the Rust server never needs it.
             preferred_sampling_params=(
-                json.dumps(sa.preferred_sampling_params)
-                if sa.preferred_sampling_params is not None
+                json.dumps(get_serving().preferred_sampling_params)
+                if get_serving().preferred_sampling_params is not None
                 else None
             ),
-            allow_auto_truncate=sa.allow_auto_truncate,
+            allow_auto_truncate=get_serving().allow_auto_truncate,
             enable_return_hidden_states=sa.enable_return_hidden_states,
             # Not a `server_args` field: `TokenizerManager` derives it, and the
             # rust ingress needs the same number for its total-token check.
