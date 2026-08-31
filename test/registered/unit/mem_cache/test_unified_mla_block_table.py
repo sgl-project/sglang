@@ -15,15 +15,15 @@
 memory pool (Kimi-Linear).
 
 `req_to_token` holds VIRTUAL token ids, while the per-layer MLA views are dense
-(`build_dense_mla_views`). The paged MLA backends therefore need their page-level
-block table filled with DENSE page ids:
+(`build_mla_views`). The paged MLA backends therefore need their page-level
+block table filled with kernel-facing page ids:
 
     dense_page(virtual_page) = v2p[virtual_page] * layer_num
 
 Three backend families reach that same formula by different routes:
   - `create_flashmla_kv_indices_triton` in-kernel via `v2p_ptr` / `PAGE_MULT`
     (trtllm_mla / cutedsl_mla / tokenspeed_mla);
-  - the flashinfer_mla updaters, post-gathering `translate_kv_loc_dense` over the
+  - the flashinfer_mla updaters, post-gathering `translate_kv_loc_for_kernel` over the
     token-level kv_indices;
   - `normal_decode_set_metadata` in-kernel, for fa3's captured-decode page table.
 
@@ -32,13 +32,13 @@ Covered here:
   - kernel dense mapping against the python reference, for several page sizes,
     ragged sequence lengths and a non-identity v2p permutation;
   - padded block-table lanes never index the v2p table out of bounds;
-  - the token-level dense translate the flashinfer updaters apply agrees with the
+  - the token-level kernel-facing translate the flashinfer updaters apply agrees with the
     page-level block table the trtllm path builds;
   - fa3's fused metadata kernels agree with the same reference, on both the
     page_size == 1 fast path (which is what Kimi-Linear takes: fa3 imposes no
     page-size constraint) and the general path.
 
-    python -m pytest test/registered/unit/mem_cache/test_unified_mla_dense_block_table.py -v
+    python -m pytest test/registered/unit/mem_cache/test_unified_mla_block_table.py -v
 """
 
 import unittest
@@ -145,7 +145,7 @@ class TestDenseBlockTable(unittest.TestCase):
     def test_single_full_attention_layer_still_maps_v2p(self):
         """A config with exactly ONE full-attention layer (e.g. a PP rank owning a
         single MLA layer) has `kernel_page_multiplier == 1`, but its req_to_token
-        still holds VIRTUAL ids. The dense id collapses onto the physical id, so
+        still holds VIRTUAL ids. The kernel-facing id collapses onto the physical id, so
         the v2p gather alone IS the whole translation -- it must not be skipped.
 
         Regression guard for detecting the unified pool via `multiplier > 1`:
@@ -180,7 +180,7 @@ class TestDenseBlockTable(unittest.TestCase):
 
     def test_agrees_with_token_level_dense_translate(self):
         """The flashinfer updaters translate TOKEN ids with
-        `translate_kv_loc_dense`; the trtllm path builds PAGE ids in-kernel. Both
+        `translate_kv_loc_for_kernel`; the trtllm path builds PAGE ids in-kernel. Both
         must address the same dense page block."""
         page_size = 64
         rt, rpi, sl, v2p = self._make_batch(page_size)
@@ -190,12 +190,12 @@ class TestDenseBlockTable(unittest.TestCase):
         for r in range(rt.shape[0]):
             n = int(sl[r].item())
             virt_tokens = rt[r, :n].long()
-            # translate_kv_loc_dense's formula, applied to token ids.
+            # translate_kv_loc_for_kernel's formula, applied to token ids.
             dense_tokens = (
                 v2p[virt_tokens // page_size] * (page_size * _LAYERS)
                 + virt_tokens % page_size
             )
-            # The block-table entry scaled by page_size must be the dense id of
+            # The block-table entry scaled by page_size must be the kernel-facing id of
             # each page's first token.
             first_of_page = dense_tokens[::page_size]
             n_pages = (n + page_size - 1) // page_size
@@ -330,19 +330,19 @@ class TestUnifiedMLAHookDetection(unittest.TestCase):
         hooks = self._probe()
         self.assertFalse(hooks.enabled)
         self.assertIsNone(hooks.v2p_page_table)
-        self.assertIsNone(hooks.translate_kv_loc_dense)
+        self.assertIsNone(hooks.translate_kv_loc_for_kernel)
         self.assertEqual(hooks.kernel_page_multiplier, 1)
 
     def test_multi_layer_unified_pool(self):
         table = torch.arange(8)
         hooks = self._probe(
             full_v2p_page_table=table,
-            translate_kv_loc_dense=lambda x, **kw: x,
+            translate_kv_loc_for_kernel=lambda x, **kw: x,
             kernel_page_multiplier=_LAYERS,
         )
         self.assertTrue(hooks.enabled)
         self.assertIs(hooks.v2p_page_table, table)
-        self.assertIsNotNone(hooks.translate_kv_loc_dense)
+        self.assertIsNotNone(hooks.translate_kv_loc_for_kernel)
         self.assertEqual(hooks.kernel_page_multiplier, _LAYERS)
 
     def test_single_full_attention_layer_pool_is_still_unified(self):
@@ -356,13 +356,13 @@ class TestUnifiedMLAHookDetection(unittest.TestCase):
         table = torch.arange(8)
         hooks = self._probe(
             full_v2p_page_table=table,
-            translate_kv_loc_dense=lambda x, **kw: x,
+            translate_kv_loc_for_kernel=lambda x, **kw: x,
             kernel_page_multiplier=1,
         )
         self.assertTrue(hooks.enabled, "single-layer unified pool read as static")
         self.assertIs(hooks.v2p_page_table, table)
-        self.assertIsNotNone(hooks.translate_kv_loc_dense)
-        # Multiplier stays 1: dense id == physical id, so the v2p gather alone is
+        self.assertIsNotNone(hooks.translate_kv_loc_for_kernel)
+        # Multiplier stays 1: kernel-facing id == physical id, so the v2p gather alone is
         # the whole translation and PAGE_MULT must not scale it.
         self.assertEqual(hooks.kernel_page_multiplier, 1)
 
@@ -409,7 +409,6 @@ class TestInPlaceKvIndicesTranslate(unittest.TestCase):
             device=_DEV,
             enable_memory_saver=False,
             page_size=page_size,
-            view_tail_pad_bytes=page_size * full.entry_bytes(),
         )
 
         class _Stub:
@@ -438,7 +437,7 @@ class TestInPlaceKvIndicesTranslate(unittest.TestCase):
 
     def test_int32_buffer_prefix_translated_tail_untouched(self):
         """Mirrors the updater: an int32 capture-stable buffer holding VIRTUAL
-        ids in [:n] gets the dense ids written back in place, narrowed to int32,
+        ids in [:n] gets the kernel-facing ids written back in place, narrowed to int32,
         with the stale tail left alone (it must never index the v2p table)."""
         alloc = self._allocator()
         virt = alloc.alloc(64)
@@ -452,13 +451,13 @@ class TestInPlaceKvIndicesTranslate(unittest.TestCase):
         tail_before = buf[n:].clone()
 
         valid = buf[:n]
-        valid.copy_(alloc.translate_kv_loc_dense(valid))
+        valid.copy_(alloc.translate_kv_loc_for_kernel(valid))
 
-        expected = alloc.translate_kv_loc_dense(virt)
+        expected = alloc.translate_kv_loc_for_kernel(virt)
         self.assertEqual(buf.dtype, torch.int32)
         self.assertTrue(
             torch.equal(buf[:n].long(), expected),
-            "in-place translate did not land dense ids in the stable buffer",
+            "in-place translate did not land kernel-facing ids in the stable buffer",
         )
         self.assertTrue(
             torch.equal(buf[n:], tail_before),
@@ -471,8 +470,8 @@ class TestInPlaceKvIndicesTranslate(unittest.TestCase):
         virt = alloc.alloc(64)
         self.assertIsNotNone(virt)
         self.assertFalse(
-            torch.equal(alloc.translate_kv_loc_dense(virt), virt),
-            "dense ids coincide with virtual ids; pick a different allocation",
+            torch.equal(alloc.translate_kv_loc_for_kernel(virt), virt),
+            "kernel-facing ids coincide with virtual ids; pick a different allocation",
         )
 
 

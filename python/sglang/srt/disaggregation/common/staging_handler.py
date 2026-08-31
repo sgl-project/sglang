@@ -411,7 +411,7 @@ class DecodeStagingHandler:
 
         staging_view = self.staging_allocator.buffer.buffer[staging_offset:]
 
-        req_pool_idx = decode_req.req.req_pool_idx
+        req_pool_idx = decode_req.req.kv.req_pool_idx
         # page_start is suffix-relative (pages after the decode-side cached
         # prefix); req_to_token rows are absolute.
         prefix_tokens = decode_req.req.kv.cache_protected_len

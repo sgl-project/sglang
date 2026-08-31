@@ -825,7 +825,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_len_to_handle
+                req.kv.req_pool_idx, :kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
             for comp in self._components_tuple:
@@ -834,7 +834,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_len_to_handle
+            req.kv.req_pool_idx, :kv_len_to_handle
         ]
 
         result = None
@@ -918,13 +918,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(token_ids)
+                req.kv.req_pool_idx, : len(token_ids)
             ]
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, : len(token_ids)
         ]
 
         # components prepare insert data + return effective cache_len
@@ -991,7 +991,7 @@ class UnifiedRadixCache(BasePrefixCache):
             new_indices
         ), f"{new_prefix_len=}, {len(new_indices)=}"
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
+            (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
         )
 
@@ -1160,7 +1160,7 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> tuple[torch.Tensor, list[PoolTransfer]]:
         num_tokens = req.seqlen - 1
         full_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :num_tokens
+            req.kv.req_pool_idx, :num_tokens
         ].to(torch.int64)
         full_indices = self._pad_retraction_indices(full_indices, self.page_size)
 
@@ -1171,7 +1171,7 @@ class UnifiedRadixCache(BasePrefixCache):
             window_start = max(0, num_tokens - self.sliding_window_size)
             window_start = window_start // self.page_size * self.page_size
             window_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, window_start:num_tokens
+                req.kv.req_pool_idx, window_start:num_tokens
             ].to(torch.int64)
             swa_indices = kv_cache.translate_loc_from_full_to_swa(window_indices)
             assert bool(

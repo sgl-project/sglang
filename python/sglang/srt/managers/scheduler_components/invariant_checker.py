@@ -252,7 +252,7 @@ class SchedulerInvariantChecker:
         swa_uncached = 0
         for batch in batches:
             for req in batch.reqs:
-                if not req.is_holding_kv:
+                if not req.kv.is_held:
                     continue
 
                 allocated_len = req.kv.kv_allocated_len
@@ -324,23 +324,23 @@ class SchedulerInvariantChecker:
         batch = self.get_last_batch()
         if batch is not None:
             for req in batch.reqs:
-                if not req.is_holding_kv:
+                if not req.kv.is_held:
                     continue
                 _add_owner(
                     req,
                     f"req {req.rid}",
-                    req.req_pool_idx,
+                    req.kv.req_pool_idx,
                     req.kv.kv_committed_len,
                     req.kv.kv_allocated_len,
                 )
         sess = getattr(self.tree_cache, "slots", None)
         if sess:
             for sid, slot in sess.items():
-                if getattr(slot, "is_holding_kv", False):
+                if slot.kv.is_held:
                     _add_owner(
                         slot,
                         f"slot {sid[:8]}",
-                        slot.req_pool_idx,
+                        slot.kv.req_pool_idx,
                         slot.kv.kv_committed_len,
                         slot.kv.kv_allocated_len,
                     )

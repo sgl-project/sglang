@@ -119,8 +119,8 @@ def _hybrid_stub_for_initialize(
 
 def _fake_req():
     return SimpleNamespace(
-        req_pool_idx=None,
         inflight_middle_chunks=0,
+        kv=SimpleNamespace(req_pool_idx=None),
         mamba_pool_idx=None,
         mamba_ping_pong_track_buffer=None,
     )

@@ -2157,7 +2157,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.17")
+        min_version: Minimum version required (e.g., "0.6.18")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
