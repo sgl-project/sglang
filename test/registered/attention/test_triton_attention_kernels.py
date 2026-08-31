@@ -326,22 +326,24 @@ class TestTritonAttention(CustomTestCase):
 
         if not ea._is_hip:
             self.skipTest("HIP-only block-size selection")
-        # head_dim <= 128 keeps the default config on all HIP archs
-        self.assertEqual(
-            ea._get_block_sizes_for_extend_attention(128, 128)[3:], (64, 64, 4)
-        )
-        # 128 < head_dim <= 256: tuned tile on gfx95, default elsewhere
+        # head_dim <= 256: tuned tile on gfx95, default elsewhere. 64 is gpt-oss,
+        # 128 is the llama/qwen family, 256 is gemma -- all measured on MI350X.
         expected = (128, 64, 8) if ea._is_gfx95 else (64, 64, 4)
-        self.assertEqual(
-            ea._get_block_sizes_for_extend_attention(256, 256)[3:], expected
-        )
+        for head_dim in (64, 128, 256):
+            self.assertEqual(
+                ea._get_block_sizes_for_extend_attention(head_dim, head_dim)[3:],
+                expected,
+            )
         # head_dim > 256 falls back to the default unless the automatic
         # Triton-3.7 gfx950 Lq=576/Lv=512 spill workaround applies.
+        self.assertEqual(
+            ea._get_block_sizes_for_extend_attention(576, 576)[3:], (64, 64, 4)
+        )
         with unittest.mock.patch.object(ea, "_is_triton_ge_37", True):
-            expected = (64, 32, 4) if ea._is_gfx95 else (64, 64, 4)
+            expected_spill = (64, 32, 4) if ea._is_gfx95 else (64, 64, 4)
             self.assertEqual(
                 ea._get_block_sizes_for_extend_attention(576, 512)[3:],
-                expected,
+                expected_spill,
             )
         with unittest.mock.patch.object(ea, "_is_triton_ge_37", False):
             self.assertEqual(

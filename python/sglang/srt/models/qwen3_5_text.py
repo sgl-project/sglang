@@ -107,8 +107,36 @@ class Qwen3_5ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        """Forward model-owned warmup to the text backbone."""
+        self.model.prepare_before_cuda_graph_capture(model_runner)
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if self.pp_group.world_size > 1:
+            raise NotImplementedError("DFLASH/DSPARK aux hidden capture requires PP=1.")
+        num_layers = len(self.model.layers)
+        if sorted(set(layer_ids)) != list(layer_ids) or not all(
+            0 <= layer_id < num_layers - 1 for layer_id in layer_ids
+        ):
+            raise ValueError(
+                "target_layer_ids must be unique, strictly increasing, and in "
+                f"[0, {num_layers - 1}); got {layer_ids}"
+            )
+        self.capture_aux_hidden_states = True
+        self.model.set_dflash_layers_to_capture(
+            [layer_id + 1 for layer_id in layer_ids]
+        )
+
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        # PP splits embedding and lm_head across first/last stages; the draft keeps
+        # its own copy of whichever half its stage cannot receive.
+        embed = (
+            None
+            if isinstance(self.model.embed_tokens, PPMissingLayer)
+            else self.model.embed_tokens.weight
+        )
+        head = None if isinstance(self.lm_head, PPMissingLayer) else self.lm_head.weight
+        return embed, head
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
@@ -164,21 +192,25 @@ class Qwen3_5ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
-        body_weights = []
-        for name, loaded_weight in weights:
-            if name.startswith(_MODEL_PREFIX):
-                body_weights.append((name[len(_MODEL_PREFIX) :], loaded_weight))
-            elif name == "lm_head.weight":
-                if self.config.tie_word_embeddings:
-                    continue
-                if "lm_head.weight" not in params_dict:
-                    continue
-                param = params_dict["lm_head.weight"]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add("lm_head.weight")
+        # Keep prefix stripping lazy: materializing mmap-backed checkpoint tensors
+        # across model processes can exceed host memory before GPU copies finish.
+        def body_weights():
+            for name, loaded_weight in weights:
+                if name.startswith(_MODEL_PREFIX):
+                    yield name[len(_MODEL_PREFIX) :], loaded_weight
+                elif name == "lm_head.weight":
+                    if self.config.tie_word_embeddings:
+                        continue
+                    if "lm_head.weight" not in params_dict:
+                        continue
+                    param = params_dict["lm_head.weight"]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add("lm_head.weight")
 
-        body_loaded = self.model.load_weights(body_weights)
+        body_loaded = self.model.load_weights(body_weights())
         loaded_params.update(f"{_MODEL_PREFIX}{n}" for n in body_loaded)
 
         if self.config.tie_word_embeddings and self.pp_group.is_last_rank:
