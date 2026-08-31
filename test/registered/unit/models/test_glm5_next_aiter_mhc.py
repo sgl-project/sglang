@@ -2,6 +2,7 @@ import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from torch import nn
 
@@ -236,3 +237,7 @@ def test_glm_aiter_mhc_boundary_preserves_communicator_shapes():
     assert norm_fused
     assert fused.call_args.kwargs["fn_transpose"] is True
     assert fused.call_args.kwargs["residual"].shape == (2, 4, 8)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
