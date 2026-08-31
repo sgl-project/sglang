@@ -850,7 +850,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         # Unified dense MLA pool: VIRTUAL -> DENSE kv_indices (see prefill updater).
         self._translate_kv_loc_dense = unified_mla_hooks(
             model_runner.token_to_kv_pool_allocator
-        ).translate_kv_loc_dense
+        ).translate_kv_loc_for_kernel
 
     def update(
         self,
@@ -918,7 +918,7 @@ class FlashInferMLAIndicesUpdaterDecode:
             # [:paged_kernel_lens_sum] prefix the index kernel just filled is
             # translated; the stale tail is left alone so it can never index the
             # v2p table out of bounds. The int64 translate result narrows back to
-            # the buffer's int32 on copy_ (flashinfer requires int32; dense ids
+            # the buffer's int32 on copy_ (flashinfer requires int32; kernel-facing ids
             # fit comfortably).
             if self._translate_kv_loc_dense is not None:
                 valid = kv_indices[:paged_kernel_lens_sum]
@@ -989,11 +989,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
         # Unified dense MLA pool: kv_indices built from req_to_token are VIRTUAL;
-        # the paged wrapper reads the dense per-layer view, so remap them to DENSE
+        # the paged wrapper reads the per-layer view, so remap them to kernel-facing
         # token ids. None (identity) unless the unified MLA pool is active.
         self._translate_kv_loc_dense = unified_mla_hooks(
             model_runner.token_to_kv_pool_allocator
-        ).translate_kv_loc_dense
+        ).translate_kv_loc_for_kernel
 
     def update(
         self,

@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.attention_hook import (
     handle_deterministic_inference,
 )
 from sglang.srt.arg_groups.cuda_graph_hook import (
+    apply_cuda_graph_compatibility,
     disable_tc_piecewise_cudagraph_if_incompatible,
     handle_cuda_graph_config,
 )
@@ -31,6 +32,7 @@ from sglang.srt.arg_groups.kv_cache_hook import (
     validate_prefill_only_disable_kv_cache_args,
 )
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
+from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
@@ -1850,6 +1852,58 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
 
         self.assertEqual(config.get_capture_sizes(), [32, 64])
         self.assertEqual(config.compiler, "eager")
+
+
+class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
+    def test_pp_prefill_graph_is_opt_in(self):
+        cases = (
+            (set(), Backend.DISABLED),
+            ({(Phase.PREFILL, "backend")}, Backend.BREAKABLE),
+        )
+        for locked, expected in cases:
+            with self.subTest(locked=locked):
+                args = ServerArgs(
+                    model_path="dummy",
+                    pp_size=4,
+                    cuda_graph_config=CudaGraphConfig(
+                        prefill=PhaseConfig(backend=Backend.BREAKABLE)
+                    ),
+                )
+                args._cuda_graph_config_locked = locked
+                apply_cuda_graph_compatibility(args)
+                self.assertEqual(
+                    resolution_result(args, "cuda_graph_config").prefill.backend,
+                    expected,
+                )
+
+    def test_pp_prefill_capture_limit_policy(self):
+        cases = (
+            (4096, None, 4096),
+            (32768, None, 8192),
+            (32768, 16384, 16384),
+        )
+        for chunked_prefill_size, max_bs, expected in cases:
+            with self.subTest(chunked_prefill_size=chunked_prefill_size, max_bs=max_bs):
+                args = ServerArgs(
+                    model_path="dummy",
+                    pp_size=4,
+                    chunked_prefill_size=chunked_prefill_size,
+                    mem_fraction_static=0.8,
+                    cuda_graph_config=CudaGraphConfig(
+                        decode=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
+                        prefill=PhaseConfig(backend=Backend.BREAKABLE, max_bs=max_bs),
+                    ),
+                )
+                args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")} | (
+                    {(Phase.PREFILL, "max_bs")} if max_bs is not None else set()
+                )
+                with patch(
+                    "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                    return_value=False,
+                ):
+                    handle_gpu_memory_settings(args, gpu_mem=None)
+                prefill = resolution_result(args, "cuda_graph_config").prefill
+                self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 
 
 class TestCudaGraphDisaggregationRoles(CustomTestCase):
