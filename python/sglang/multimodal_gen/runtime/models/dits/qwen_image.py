@@ -22,6 +22,7 @@ from sglang.kernels.ops.diffusion import (
     mark_fused_gelu_site,
     try_fused_bias_mul_add,
     try_fused_bias_scale_residual_norm_scale_shift,
+    try_fused_scale_residual_norm_scale_shift_nvfp4,
 )
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
@@ -69,6 +70,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
     is_nunchaku_available,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp4LinearMethod,
+    apply_nvfp4_gemm_prequantized,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
@@ -926,12 +931,23 @@ class QwenImageGELU(nn.Module):
         # epilogue. Off by default; mounted per batch by the denoising stage.
         mark_fused_gelu_site(self, "proj")
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
+    def forward(
+        self,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        if isinstance(hidden_states, tuple):
+            hidden_states = apply_nvfp4_gemm_prequantized(
+                self.proj,
+                *hidden_states,
+                output_dtype=self.proj.params_dtype,
+                bias=self.proj.bias,
+            )
+        elif fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
-        hidden_states, _ = self.proj(hidden_states)
+        else:
+            hidden_states, _ = self.proj(hidden_states)
         return F.gelu(hidden_states, approximate="tanh")
 
 
@@ -985,13 +1001,15 @@ class QwenImageFeedForward(nn.Module):
         )
 
     def forward_with_bias(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         hidden_states = self.net[0](hidden_states)
         hidden_states = self.net[1](hidden_states)
         return self.net[2](hidden_states)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
         hidden_states, bias = self.forward_with_bias(hidden_states)
         return hidden_states if bias is None else hidden_states + bias
 
@@ -1125,6 +1143,20 @@ class QwenImageTransformerBlock(nn.Module):
             self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
             self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
 
+        self._enable_nvfp4_resnorm_quant = False
+        capability = current_platform.get_device_capability()
+        if (
+            not nunchaku_enabled
+            and dim == 3072
+            and capability is not None
+            and capability.major == 10
+        ):
+            img_fc1 = self.img_mlp.net[0].proj
+            txt_fc1 = self.txt_mlp.net[0].proj
+            self._enable_nvfp4_resnorm_quant = isinstance(
+                img_fc1.quant_method, ModelOptFp4LinearMethod
+            ) and isinstance(txt_fc1.quant_method, ModelOptFp4LinearMethod)
+
     def _norm_scale_shift(
         self,
         norm_module: LayerNormScaleShift,
@@ -1199,6 +1231,52 @@ class QwenImageTransformerBlock(nn.Module):
             else None
         )
         return img_mod_params, txt_mod_params
+
+    def _try_nvfp4_resnorm_quant(
+        self,
+        norm_module: ScaleResidualLayerNormScaleShift,
+        mlp: QwenImageFeedForward,
+        *,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        x_bias: Optional[torch.Tensor],
+        residual_gate: torch.Tensor,
+        mod_params: torch.Tensor,
+        modulate_index: Optional[torch.Tensor],
+        use_bcg_helpers: bool,
+    ) -> Optional[
+        tuple[
+            tuple[torch.Tensor, torch.Tensor],
+            torch.Tensor,
+            torch.Tensor,
+        ]
+    ]:
+        if (
+            not self._enable_nvfp4_resnorm_quant
+            or modulate_index is not None
+            or use_bcg_helpers
+        ):
+            return None
+
+        shift, scale, gate = mod_params.chunk(3, dim=-1)
+        fc1 = mlp.net[0].proj
+        result = try_fused_scale_residual_norm_scale_shift_nvfp4(
+            residual,
+            x,
+            x_bias,
+            residual_gate,
+            getattr(norm_module.norm, "weight", None),
+            getattr(norm_module.norm, "bias", None),
+            scale.unsqueeze(1),
+            shift.unsqueeze(1),
+            fc1.input_scale_inv,
+            norm_module.norm_type,
+            norm_module.eps,
+        )
+        if result is None:
+            return None
+        packed, residual_out = result
+        return packed, residual_out, gate.unsqueeze(1)
 
     def _modulate(
         self,
@@ -1408,16 +1486,30 @@ class QwenImageTransformerBlock(nn.Module):
             txt_attn_bias,
         ) = attn_output
         # Process image stream - norm2 + MLP
-        img_modulated2, hidden_states, img_gate2 = self._modulate(
-            img_attn_output,
-            img_mod2,
+        img_nvfp4 = self._try_nvfp4_resnorm_quant(
             self.img_norm2,
-            modulate_index,
-            gate_x=img_gate1,
-            residual_x=hidden_states,
+            self.img_mlp,
+            residual=hidden_states,
+            x=img_attn_output,
             x_bias=img_attn_bias,
+            residual_gate=img_gate1,
+            mod_params=img_mod2,
+            modulate_index=modulate_index,
             use_bcg_helpers=use_bcg_helpers,
         )
+        if img_nvfp4 is None:
+            img_modulated2, hidden_states, img_gate2 = self._modulate(
+                img_attn_output,
+                img_mod2,
+                self.img_norm2,
+                modulate_index,
+                gate_x=img_gate1,
+                residual_x=hidden_states,
+                x_bias=img_attn_bias,
+                use_bcg_helpers=use_bcg_helpers,
+            )
+        else:
+            img_modulated2, hidden_states, img_gate2 = img_nvfp4
         if isinstance(self.img_mlp, QwenImageFeedForward):
             img_mlp_output, img_mlp_bias = self.img_mlp.forward_with_bias(
                 img_modulated2
@@ -1438,7 +1530,20 @@ class QwenImageTransformerBlock(nn.Module):
 
         # Process text stream - norm2 + MLP
         txt_shift2, txt_scale2, txt_gate2_raw = txt_mod2.chunk(3, dim=-1)
-        if use_bcg_helpers:
+        txt_nvfp4 = self._try_nvfp4_resnorm_quant(
+            self.txt_norm2,
+            self.txt_mlp,
+            residual=encoder_hidden_states,
+            x=txt_attn_output,
+            x_bias=txt_attn_bias,
+            residual_gate=txt_gate1,
+            mod_params=txt_mod2,
+            modulate_index=modulate_index,
+            use_bcg_helpers=use_bcg_helpers,
+        )
+        if txt_nvfp4 is not None:
+            txt_modulated2, encoder_hidden_states, txt_gate2 = txt_nvfp4
+        elif use_bcg_helpers:
             if txt_attn_bias is not None:
                 txt_attn_output = txt_attn_output + txt_attn_bias
             (
@@ -1469,7 +1574,8 @@ class QwenImageTransformerBlock(nn.Module):
                 shift=txt_shift2,
                 scale=txt_scale2,
             )
-        txt_gate2 = txt_gate2_raw.unsqueeze(1)
+        if txt_nvfp4 is None:
+            txt_gate2 = txt_gate2_raw.unsqueeze(1)
         if isinstance(self.txt_mlp, QwenImageFeedForward):
             txt_mlp_output, txt_mlp_bias = self.txt_mlp.forward_with_bias(
                 txt_modulated2
