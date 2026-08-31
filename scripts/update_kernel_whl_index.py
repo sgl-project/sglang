@@ -31,11 +31,26 @@ def check_wheel_cuda_version(path_name, target_cuda_version):
     return True
 
 
+def _write_index_entries(index_dir, entries):
+    index_path = index_dir / "index.html"
+    kept = [
+        line
+        for line in (index_path.read_text().splitlines() if index_path.exists() else [])
+        if not any(f">{name}</a>" in line for name in entries)
+    ]
+    with index_path.open("w") as f:
+        for line in kept:
+            f.write(f"{line}\n")
+        for name, url in entries.items():
+            f.write(f'<a href="{url}">{name}</a><br>\n')
+
+
 def update_wheel_index(cuda_version=DEFAULT_CUDA_VERSION, rocm_version=None):
     index_dir = pathlib.Path(f"sgl-whl/cu{cuda_version}/sglang-kernel")
     index_dir.mkdir(exist_ok=True, parents=True)
     base_url = "https://github.com/sgl-project/whl/releases/download"
 
+    entries = {}
     for path in sorted(pathlib.Path("python/sglang/kernels/aot/dist").glob("*.whl")):
         # Skip the wheel if mismatches the passed in cuda_version
         if not check_wheel_cuda_version(path.name, cuda_version):
@@ -45,9 +60,9 @@ def update_wheel_index(cuda_version=DEFAULT_CUDA_VERSION, rocm_version=None):
         ver = re.findall(
             r"sglang_kernel-([0-9.]+(?:\.post[0-9]+)?)(?:\+cu[0-9]+)?-", path.name
         )[0]
-        full_url = f"{base_url}/v{ver}/{path.name}#sha256={sha256}"
-        with (index_dir / "index.html").open("a") as f:
-            f.write(f'<a href="{full_url}">{path.name}</a><br>\n')
+        entries[path.name] = f"{base_url}/v{ver}/{path.name}#sha256={sha256}"
+
+    _write_index_entries(index_dir, entries)
 
 
 def _update_non_cuda_wheel_index(
@@ -62,6 +77,7 @@ def _update_non_cuda_wheel_index(
     index_dir.mkdir(exist_ok=True, parents=True)
     base_url = "https://github.com/sgl-project/whl/releases/download"
 
+    entries = {}
     for path in sorted(pathlib.Path("python/sglang/kernels/aot/dist").glob("*.whl")):
         # Skip the wheel if not for this backend
         if re.search(f"{backend}", path.name) is None:
@@ -72,9 +88,11 @@ def _update_non_cuda_wheel_index(
             rf"{re.escape(package_name)}-([0-9.]+(?:\.post[0-9]+)?)(?:\+{backend}[0-9]+)?-",
             path.name,
         )[0]
-        full_url = f"{base_url}/v{ver}{release_tag_suffix}/{path.name}#sha256={sha256}"
-        with (index_dir / "index.html").open("a") as f:
-            f.write(f'<a href="{full_url}">{path.name}</a><br>\n')
+        entries[path.name] = (
+            f"{base_url}/v{ver}{release_tag_suffix}/{path.name}#sha256={sha256}"
+        )
+
+    _write_index_entries(index_dir, entries)
 
 
 def update_wheel_index_xpu():
