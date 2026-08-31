@@ -27,6 +27,9 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     invoke_encoder_preprocessor,
 )
 from sglang.srt.multimodal.processors.qwen3_vl import (
+    QWEN3_VL_MODEL_TYPES,
+)
+from sglang.srt.multimodal.processors.qwen3_vl import (
     preprocess_video as qwen3_preprocess_video,
 )
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
@@ -223,7 +226,21 @@ class EncoderPreprocessor:
                 self.vision_config[modality_str]["device"] = self.device
 
             if modality_str == "video":
-                video_defaults = {"fps": 2.0, "max_frames": 768, "min_frames": 4}
+                if self.model_type in QWEN3_VL_MODEL_TYPES:
+                    video_defaults = {
+                        key: getattr(self.video_processor, key, fallback)
+                        for key, fallback in (
+                            ("fps", 2.0),
+                            ("max_frames", 768),
+                            ("min_frames", 4),
+                        )
+                    }
+                else:
+                    video_defaults = {
+                        "fps": 2.0,
+                        "max_frames": 768,
+                        "min_frames": 4,
+                    }
                 for k, v in video_defaults.items():
                     self.vision_config["video"].setdefault(k, v)
 
@@ -414,22 +431,19 @@ class EncoderPreprocessor:
 
         video_processor_kwargs = {}
         if "qwen" in self.model_type:
-            # Qwen3-VL/3.5 defer spatial resizing to the model processor; the
-            # legacy path pre-resizes and would double-resize them.
-            qwen3_model_types = ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
-            video_preprocess = (
-                qwen3_preprocess_video
-                if self.model_type in qwen3_model_types
-                else preprocess_video
-            )
+            is_qwen3 = self.model_type in QWEN3_VL_MODEL_TYPES
+            video_preprocess = qwen3_preprocess_video if is_qwen3 else preprocess_video
+            preprocess_kwargs = {"video_config": self.vision_config.get("video", {})}
+            if is_qwen3:
+                preprocess_kwargs["video_processor"] = self.video_processor
             video_processed = [
-                await video_preprocess(
-                    video, video_config=self.vision_config.get("video", {})
-                )
+                await video_preprocess(video, **preprocess_kwargs)
                 for video in video_items
             ]
             videos, video_metadata = map(list, zip(*video_processed))
             video_processor_kwargs["do_sample_frames"] = False
+            if is_qwen3 and all(metadata is not None for metadata in video_metadata):
+                video_processor_kwargs["do_resize"] = False
             if video_metadata:
                 video_processor_kwargs["video_metadata"] = video_metadata
             return videos, video_processor_kwargs

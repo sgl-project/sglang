@@ -52,6 +52,7 @@ class VideoDecoderWrapper:
         self._source_bytes = source if isinstance(source, bytes) else None
         self._source_path = source if isinstance(source, str) else None
         self._tmp_path = None
+        self._frame_shape = None
         if _BACKEND == "torchcodec":
             kwargs = {"dimension_order": "NHWC"}
             if device == "cuda" and _try_cuda_backend():
@@ -100,6 +101,12 @@ class VideoDecoderWrapper:
             return self._decoder.metadata.average_fps
         else:
             return self._decoder.get_avg_fps()
+
+    @property
+    def frame_shape(self) -> tuple[int, int, int]:
+        if self._frame_shape is None:
+            self._frame_shape = tuple(self._decoder[0].shape)
+        return self._frame_shape
 
     def get_frames_at(self, indices: list) -> np.ndarray:
         """Return frames at given indices as numpy array with shape (N, H, W, C)."""
