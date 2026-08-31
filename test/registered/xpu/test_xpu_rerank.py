@@ -23,7 +23,6 @@ from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
-
 register_xpu_ci(est_time=180, suite="nightly-xpu-1-gpu", nightly=True)
 
 MODEL_PATH = "Qwen/Qwen3-Reranker-0.6B"
