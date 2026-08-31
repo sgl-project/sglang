@@ -14,10 +14,10 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
-from sglang.srt.environ import envs
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
@@ -61,8 +61,7 @@ def check_server_args(server_args: Any):
             # The PP relay slices spec results with the configured
             # num_draft_tokens; adaptive spec changes it at runtime.
             assert not cfg.speculative_adaptive, (
-                "SGLANG_ENABLE_PP_SPEC is not compatible with "
-                "--speculative-adaptive"
+                "SGLANG_ENABLE_PP_SPEC is not compatible with " "--speculative-adaptive"
             )
             # Every stage rebuilds the same verify input from the relayed
             # per-request state, so all stages must see the same batch.

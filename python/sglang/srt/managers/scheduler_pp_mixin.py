@@ -1310,9 +1310,13 @@ class SchedulerPPMixin:
                 batch.req_pool_indices,
                 RelayPayload(
                     bonus_tokens=next_token_ids,
-                    topk_p=None if next_draft_input is None else next_draft_input.topk_p,
+                    topk_p=(
+                        None if next_draft_input is None else next_draft_input.topk_p
+                    ),
                     topk_index=(
-                        None if next_draft_input is None else next_draft_input.topk_index
+                        None
+                        if next_draft_input is None
+                        else next_draft_input.topk_index
                     ),
                     hidden_states=(
                         None
