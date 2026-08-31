@@ -173,6 +173,30 @@ def test_stale_handle_reads_raise_key_error_without_poisoning_the_core():
         assert core.is_root(live_root)
 
 
+def test_stale_handle_operations_raise_key_error_without_poisoning_the_core():
+    from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
+
+    core = _tree_core()
+    stale_root = core.root_node_handle()
+    core.reset()
+    live_root = core.root_node_handle()
+
+    operations = (
+        lambda: core.demote(stale_root),
+        lambda: core.build_hicache_transfers(
+            ComponentType.FULL, stale_root, CacheTransferPhase.BACKUP_STORAGE
+        ),
+        lambda: core.build_load_back_spec(stale_root),
+        lambda: core.get_hash_values(stale_root),
+        lambda: core.dfs_weight_order([stale_root]),
+    )
+    for operation in operations:
+        with pytest.raises(KeyError) as exc_info:
+            operation()
+        assert exc_info.value.args == (stale_root,)
+        assert core.is_root(live_root)
+
+
 def test_dfs_weight_order_groups_the_heaviest_subtree_first():
     core = _tree_core()
     _insert(core, [1, 10], [10, 11])

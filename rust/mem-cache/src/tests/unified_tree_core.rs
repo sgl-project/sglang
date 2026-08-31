@@ -3642,6 +3642,45 @@ fn try_demote_rejects_unbackuped_and_evicted_nodes() {
 }
 
 #[test]
+fn fallible_node_boundaries_reject_stale_handles() {
+    let mut tc = core();
+    let stale_root = tc.root_node_handle(/* extra_key = */ None);
+    tc.reset();
+
+    assert!(matches!(
+        tc.try_demote(stale_root),
+        Err(TreeCoreRuntimeError::NodeNotAllocated { node_id }) if node_id == stale_root
+    ));
+    assert!(matches!(
+        tc.try_build_hicache_transfers(
+            FULL,
+            stale_root,
+            CacheTransferPhase::BackupStorage,
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* last_hash = */ None,
+        ),
+        Err(TreeCoreRuntimeError::NodeNotAllocated { node_id }) if node_id == stale_root
+    ));
+    assert!(matches!(
+        tc.try_build_load_back_spec(stale_root, /* req = */ None),
+        Err(TreeCoreRuntimeError::NodeNotAllocated { node_id }) if node_id == stale_root
+    ));
+    assert!(matches!(
+        tc.try_get_hash_values(stale_root),
+        Err(TreeCoreRuntimeError::NodeNotAllocated { node_id }) if node_id == stale_root
+    ));
+    assert!(matches!(
+        tc.try_dfs_weight_order(&[stale_root]),
+        Err(TreeCoreRuntimeError::NodeNotAllocated { node_id }) if node_id == stale_root
+    ));
+
+    let live_root = tc.root_node_handle(/* extra_key = */ None);
+    assert!(tc.is_root(live_root));
+}
+
+#[test]
 fn match_prefix_with_hicache_splits_a_host_only_backuped_node() {
     let mut tc = core();
     tc.set_hicache_enabled();

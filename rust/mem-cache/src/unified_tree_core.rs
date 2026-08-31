@@ -2291,7 +2291,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         node_id: NodeId,
     ) -> Result<EvictionStepResult, TreeCoreRuntimeError> {
-        let node_id = self.arena.resolve(node_id);
+        let node_id = self.try_resolve_node_handle_(node_id)?;
         let mut result = EvictionStepResult::default();
         // Skip a deferred demote when a load-back now pins the device indices.
         if self.arena.node(node_id).is_load_back_pending() {
@@ -3150,7 +3150,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         prefetch_tokens: usize,
         last_hash: Option<&str>,
     ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
-        let node_id = self.arena.resolve(node_id);
+        let node_id = self.try_resolve_node_handle_(node_id)?;
         self.component_by_type_(component_type)
             .build_hicache_transfers(
                 self,
@@ -3180,7 +3180,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) -> Result<(PoolTransfer, HashMap<ComponentType, Vec<PoolTransfer>>), TreeCoreRuntimeError>
     {
         let anchor_id = node_id;
-        let node_id = self.arena.resolve(node_id);
+        let node_id = self.try_resolve_node_handle_(node_id)?;
         // Component hooks take primitives, not Req: extract its fields here.
         let mamba_pool_idx = req.and_then(|r| r.mamba_pool_idx.as_ref());
         let mut kv_transfers = self
@@ -3330,12 +3330,21 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// The hash values owned by this node, excluding its ancestors.
     pub fn get_hash_values(&self, node_id: NodeId) -> Vec<String> {
-        let node_id = self.arena.resolve(node_id);
-        self.arena
+        self.try_get_hash_values(node_id)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_get_hash_values(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Vec<String>, TreeCoreRuntimeError> {
+        let node_id = self.try_resolve_node_handle_(node_id)?;
+        Ok(self
+            .arena
             .node(node_id)
             .hash_value
             .clone()
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     pub fn snapshot_buffer_backup(
@@ -3409,9 +3418,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Return input indices in depth-first, subtree-weight order.
     pub fn dfs_weight_order(&self, node_ids: &[NodeId]) -> Vec<usize> {
+        self.try_dfs_weight_order(node_ids)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_dfs_weight_order(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<Vec<usize>, TreeCoreRuntimeError> {
         let mut node_to_indices: HashMap<NodeIdx_, Vec<usize>> = HashMap::new();
         for (index, &node_id) in node_ids.iter().enumerate() {
-            let node_id = self.arena.resolve(node_id);
+            let node_id = self.try_resolve_node_handle_(node_id)?;
             node_to_indices.entry(node_id).or_default().push(index);
         }
 
@@ -3458,7 +3475,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             });
             stack.extend(children.into_iter().rev().map(|child| (child, false)));
         }
-        order
+        Ok(order)
     }
 
     /// Build the backup action for a node and its unbacked ancestors.

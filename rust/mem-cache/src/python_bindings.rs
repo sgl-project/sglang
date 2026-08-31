@@ -73,6 +73,13 @@ fn tree_core_runtime_error(error: TreeCoreRuntimeError) -> PyErr {
     }
 }
 
+fn tree_core_assertion_error(error: TreeCoreRuntimeError) -> PyErr {
+    match error {
+        TreeCoreRuntimeError::NodeNotAllocated { node_id } => PyKeyError::new_err(node_id),
+        error => PyAssertionError::new_err(error.to_string()),
+    }
+}
+
 /// Map the Rust enum back onto the Python ComponentType value.
 fn component_type_to_u8(component_type: ComponentType) -> u8 {
     component_type as u8
@@ -1451,7 +1458,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                     last_hash.as_deref(),
                 )
             })
-            .map_err(|error| PyAssertionError::new_err(error.to_string()))?;
+            .map_err(tree_core_assertion_error)?;
         transfers
             .map(|transfers| {
                 transfers
@@ -1496,8 +1503,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .map_err(tree_core_runtime_error)
     }
 
-    fn get_hash_values(&self, py: Python<'_>, node_id: NodeId) -> Vec<String> {
-        py.allow_threads(|| self.core().get_hash_values(node_id))
+    fn get_hash_values(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<String>> {
+        py.allow_threads(|| self.core().try_get_hash_values(node_id))
+            .map_err(tree_core_runtime_error)
     }
 
     fn snapshot_buffer_backup(
@@ -1535,8 +1543,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| self.core().root_node_handle(extra_key.as_deref()))
     }
 
-    fn dfs_weight_order(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> Vec<usize> {
-        py.allow_threads(|| self.core().dfs_weight_order(&node_ids))
+    fn dfs_weight_order(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
+        py.allow_threads(|| self.core().try_dfs_weight_order(&node_ids))
+            .map_err(tree_core_runtime_error)
     }
 
     /// Commit each component's HiCache transfers; returns the new cache actions.
@@ -1616,7 +1625,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         };
         let (kv_xfer, comp_xfers) = py
             .allow_threads(move || self.core().try_build_load_back_spec(node_id, Some(&req)))
-            .map_err(|error| PyAssertionError::new_err(error.to_string()))?;
+            .map_err(tree_core_assertion_error)?;
         Ok((
             transfer_to_py(py, kv_xfer)?,
             comp_xfers_to_py(py, comp_xfers)?,
@@ -1646,7 +1655,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
         let result = py
             .allow_threads(move || self.core().try_demote(node_id))
-            .map_err(|error| PyAssertionError::new_err(error.to_string()))?;
+            .map_err(tree_core_assertion_error)?;
         Ok(DemoteResultBinding {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
@@ -2598,7 +2607,7 @@ macro_rules! tree_core_binding {
                 self.inner.get_prefix_hash_values(py, node_id)
             }
 
-            fn get_hash_values(&self, py: Python<'_>, node_id: NodeId) -> Vec<String> {
+            fn get_hash_values(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<String>> {
                 self.inner.get_hash_values(py, node_id)
             }
 
@@ -2632,7 +2641,11 @@ macro_rules! tree_core_binding {
                 self.inner.root_node_handle(py, extra_key)
             }
 
-            fn dfs_weight_order(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> Vec<usize> {
+            fn dfs_weight_order(
+                &self,
+                py: Python<'_>,
+                node_ids: Vec<NodeId>,
+            ) -> PyResult<Vec<usize>> {
                 self.inner.dfs_weight_order(py, node_ids)
             }
 
