@@ -19,8 +19,7 @@ class _FakeReq:
 
     def __init__(self, rid: str):
         self.rid = rid
-        self.req_pool_idx = 1
-        self.mamba_pool_idx = None
+        self.kv = SimpleNamespace(req_pool_idx=1)
         self.to_finish = None
         self._finished = False
 
