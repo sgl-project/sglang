@@ -1218,13 +1218,17 @@ def init_unified_mamba_pools(
             max_total_num_tokens * full_spec.entry_bytes()
             + max_mamba_cache_size * mamba_spec.entry_bytes()
         )
-    # bs=1 floor: full KV at max context + the state slots ONE running request
-    # locks (1 active + 2 radix checkpoints — the checkpoint slots are a
-    # per-request FLOOR, not headroom) + the reserved slot-0 sink page.
+    # bs=1 floor: the state slots ONE running request locks (1 active + 2 radix
+    # checkpoints -- the checkpoint slots are a per-request FLOOR, not headroom)
+    # + the reserved slot-0 sink page. The token side is NOT charged: the
+    # scheduler already clamps a request to the pool
+    # (TpModelWorker.get_worker_info: max_req_len = min(context_len,
+    # effective_max_total_num_tokens) - 1), so a too-long request is refused at
+    # admission rather than retract-livelocking, and charging the full context
+    # here would reject configs that serve fine today.
     _check_bs1_feasibility_floor(
         total_bytes=total_bytes,
         floor_terms=[
-            ("full_ctx_kv", model_context_len * full_spec.entry_bytes()),
             ("bs1_state_slots", 3 * mamba_spec.entry_bytes()),
             ("sink", _reserved_floor_bytes([full_spec, mamba_spec], page_size)),
         ],
@@ -1689,9 +1693,12 @@ def init_unified_swa_pools(
             + swa_max_total_num_tokens * swa_spec.entry_bytes()
         )
     if model_context_len is not None:
-        # bs=1 floor: full KV at max context + ONE sliding window of swa KV
-        # (+ a page of slack for the window's page-granular walk) + the
-        # reserved slot-0 sink page.
+        # bs=1 floor: ONE sliding window of swa KV (+ a page of slack for the
+        # window's page-granular walk) + the reserved slot-0 sink page. The
+        # full-attention token side is NOT charged -- max_req_len already
+        # clamps a request to the full pool, so it cannot livelock; the swa
+        # sub-pool is sized separately and that clamp says nothing about it,
+        # which is why the window term stays.
         swa_bs1_tokens = (
             min(model_context_len, sliding_window_size + page_size)
             if sliding_window_size is not None
@@ -1700,7 +1707,6 @@ def init_unified_swa_pools(
         _check_bs1_feasibility_floor(
             total_bytes=total_bytes,
             floor_terms=[
-                ("full_ctx_kv", model_context_len * full_spec.entry_bytes()),
                 ("swa_window_kv", swa_bs1_tokens * swa_spec.entry_bytes()),
                 ("sink", _reserved_floor_bytes([full_spec, swa_spec], page_size)),
             ],

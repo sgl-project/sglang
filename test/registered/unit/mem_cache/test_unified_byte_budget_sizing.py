@@ -176,16 +176,30 @@ class TestReservedFloorIsOneSourceOfTruth(unittest.TestCase):
 
 class TestBs1FeasibilityFloor(unittest.TestCase):
     def test_infeasible_budget_raises_before_construction(self):
-        """model_context_len is huge relative to the buffer: one request alone
-        cannot fit, so boot must fail loud instead of livelocking later."""
+        """The buffer cannot hold one sliding window plus the sink, so boot
+        must fail loud instead of livelocking later."""
         with self.assertRaises(RuntimeError) as ctx:
             _swa_factory(
-                unified_total_bytes=64 * _entry_bytes(),
+                unified_total_bytes=8 * _entry_bytes(),
                 model_context_len=4096,
-                sliding_window_size=64,
+                sliding_window_size=4096,
             )
         self.assertIn("bs=1 floor", str(ctx.exception))
-        self.assertIn("full_ctx_kv", str(ctx.exception))
+        self.assertIn("swa_window_kv", str(ctx.exception))
+
+    def test_context_longer_than_the_pool_is_not_rejected(self):
+        """REGRESSION: the floor must NOT charge the full-attention token side.
+        `TpModelWorker.get_worker_info` clamps max_req_len to the pool, so a
+        context far larger than the buffer is refused at admission, not a
+        livelock -- and it is an ordinary way to serve a long-context model on
+        one GPU. Charging it here made such configs fail at boot."""
+        e = _entry_bytes()
+        bundle = _swa_factory(
+            unified_total_bytes=200 * e,
+            model_context_len=1_000_000,  # far beyond what the buffer holds
+            sliding_window_size=16,
+        )
+        self.assertEqual(bundle.unified_memory_pool.total_bytes, 200 * e)
 
     def test_feasible_config_boots_with_floor_inputs_present(self):
         e = _entry_bytes()
