@@ -27,6 +27,7 @@ import inspect
 import textwrap
 import unittest
 from types import SimpleNamespace
+from unittest.mock import create_autospec
 
 import torch
 
@@ -175,6 +176,105 @@ class TestPadComposesWithDerivation(CustomTestCase):
         src.rebind_write_loc(fb)
         self.assertEqual(fb.out_cache_loc.numel(), 0)
         self.assertEqual(src._swa_write_loc_unified(fb.out_cache_loc).numel(), 0)
+
+
+class TestReadRailTranslatesAtProduction(CustomTestCase):
+    """The model-door READ indices (req_to_token-derived, VIRTUAL under the
+    unified pool) are translated at their PRODUCTION site -- the cache then
+    holds the kernel-facing result and the pool door never translates."""
+
+    def _fb_for_one_shot(self):
+        fb = _make_fb(torch.tensor([1, 2], dtype=torch.int64))
+        fb.batch_size = 2
+        fb.seq_lens = torch.tensor([2, 3], dtype=torch.int64)
+        fb.seq_lens_cpu = torch.tensor([2, 3], dtype=torch.int32)
+        fb.req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
+        return fb
+
+    def test_one_shot_indices_translated_once_and_cached(self):
+        from unittest.mock import patch
+
+        from sglang.srt.model_executor import forward_batch_deepseek_mha_mixin as mix
+
+        calls = []
+        sentinel = torch.arange(5, dtype=torch.int64) + 5000
+
+        def translate(t):
+            calls.append(t)
+            return sentinel
+
+        fb = self._fb_for_one_shot()
+        fake_pool = SimpleNamespace(
+            req_to_token=torch.zeros((4, 16), dtype=torch.int32)
+        )
+        # autospec, not a bare namespace: setting a name the translator does
+        # not have raises, so renaming the method breaks this test loudly.
+        fake_translator = create_autospec(KVIndexTranslator, instance=True)
+        fake_translator.translate_full_attn_ids = translate
+        fake_backend = SimpleNamespace(kv_index_translator=fake_translator)
+        with (
+            patch.object(mix, "get_req_to_token_pool", return_value=fake_pool),
+            patch.object(mix, "get_attn_backend", return_value=fake_backend),
+            patch.object(mix, "create_flashinfer_kv_indices_triton"),
+        ):
+            r1 = fb.fetch_mha_one_shot_kv_indices()
+            r2 = fb.fetch_mha_one_shot_kv_indices()
+
+        self.assertIs(r1, sentinel)  # production site translated
+        self.assertIs(r2, sentinel)  # cache holds the TRANSLATED result
+        self.assertEqual(len(calls), 1)  # translated exactly once
+        self.assertEqual(calls[0].dtype, torch.int32)  # raw producer output
+
+    def test_one_shot_indices_noop_on_unmigrated_backend(self):
+        from unittest.mock import patch
+
+        from sglang.srt.model_executor import forward_batch_deepseek_mha_mixin as mix
+
+        fb = self._fb_for_one_shot()
+        fake_pool = SimpleNamespace(
+            req_to_token=torch.zeros((4, 16), dtype=torch.int32)
+        )
+        # A backend that never set the attribute inherits the base-class None.
+        fake_backend = SimpleNamespace(kv_index_translator=None)
+        with (
+            patch.object(mix, "get_req_to_token_pool", return_value=fake_pool),
+            patch.object(mix, "get_attn_backend", return_value=fake_backend),
+            patch.object(mix, "create_flashinfer_kv_indices_triton"),
+        ):
+            r = fb.fetch_mha_one_shot_kv_indices()
+        # The raw int32 producer output passes through untouched.
+        self.assertEqual(r.dtype, torch.int32)
+
+    def test_get_mla_kv_buffer_door_passes_loc_untranslated(self):
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        recorded = {}
+
+        class _RecordingLeafPool:
+            def get_mla_kv_buffer(self, layer, loc, dst_dtype):
+                recorded["loc"] = loc
+                return None, None
+
+            def get_kv_size_bytes(self):
+                return 0
+
+        pool = HybridLinearKVPool(
+            size=16,
+            dtype=torch.float16,
+            page_size=1,
+            head_num=1,
+            head_dim=8,
+            full_attention_layer_ids=[0],
+            device=_DEV,
+            mamba_pool=SimpleNamespace(get_size_per_token=lambda: 0),
+            enable_memory_saver=False,
+            use_mla=True,
+            start_layer=0,
+            full_kv_pool=_RecordingLeafPool(),
+        )
+        loc = torch.tensor([9, 10], dtype=torch.int64)
+        pool.get_mla_kv_buffer(SimpleNamespace(layer_id=0), loc, torch.float16)
+        self.assertIs(recorded["loc"], loc)
 
 
 if __name__ == "__main__":

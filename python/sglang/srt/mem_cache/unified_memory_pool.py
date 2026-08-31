@@ -1244,8 +1244,9 @@ def init_unified_mamba_pools(
     # `_mamba_translate` feeds the HiCache offload path, GATED OFF here — wired but inert.
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
-    if use_mla_backend:
-        token_to_kv_pool._full_translate = allocator.translate_kv_loc_for_kernel
+    # No full-KV translate hook is wired: both MLA doors now receive
+    # KERNEL-FACING ids -- writes from the ForwardBatch rebind, reads
+    # translated at their production sites.
 
     logger.info(
         "[unified-memory-pool] ============================================================"
@@ -1466,7 +1467,7 @@ class UnifiedSWAKVPool(SWAKVPool):
         """Route to the right sub-pool. Both `swa_loc` and `full_loc` are PHYSICAL
         (pre-translated once per forward by the attention backend); never translates here.
         """
-        _, swa_loc, full_loc = unwrap_write_loc(loc_info)
+        loc, swa_loc, full_loc = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         pool_layer_id, is_swa = self.layers_mapping[layer_id]
         if is_swa:
@@ -1486,12 +1487,11 @@ class UnifiedSWAKVPool(SWAKVPool):
                 layer_id_override=pool_layer_id,
             )
             return
-        # Full layer: full_loc is full-physical, always precomputed (eager + cuda-graph).
-        assert full_loc is not None, (
-            "UnifiedSWAKVPool.set_kv_buffer: full layer received no full_loc; "
-            "ForwardMetadata.out_cache_loc_full_physical must be precomputed for "
-            "the unified memory pool."
-        )
+        # Full layer: `loc` is already the full-side kernel-facing id, so an
+        # explicit full_loc is a same-space alias -- only triton's captured path
+        # passes one (its capture-stable buffer).
+        if full_loc is None:
+            full_loc = loc
         self.full_kv_pool.set_kv_buffer(
             None,
             full_loc,
