@@ -286,7 +286,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return max(1, int(sequence_lengths.max()))
         spec_info = forward_batch.spec_info
-        draft_window = int(spec_info.draft_token_num) if spec_info is not None else 0
+        # EagleDraftExtendInput carries no draft_token_num; its seq_lens_cpu is
+        # already the post-write length (prepare_for_draft_extend adds
+        # num_draft_tokens).
+        draft_window = int(getattr(spec_info, "draft_token_num", 0) or 0)
         return max(1, int(seq_lens_cpu.max()) + draft_window)
 
     @staticmethod
@@ -1358,9 +1361,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         assert self.forward_metadata is not None
         return self.forward_metadata
 
-    @staticmethod
     def _logical_to_physical(
-        logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
+        self, logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
     ) -> torch.Tensor:
         sequence_ids = metadata.token_to_batch_idx.long()
         if sequence_ids.numel() != logical_indices.shape[0]:
@@ -1368,11 +1370,17 @@ class QwenSparseAttnBackend(AttentionBackend):
         row_lengths = metadata.sequence_lengths.to(torch.int32).index_select(
             0, sequence_ids
         )
+        if self.req_to_token is None or metadata.row_req_pool_indices is None:
+            raise RuntimeError(
+                "QSA logical-to-physical mapping requires req_to_token and "
+                "row_req_pool_indices to be initialized"
+            )
+        row_req_indices = metadata.row_req_pool_indices.long().index_select(
+            0, sequence_ids
+        )
         valid = (logical_indices >= 0) & (logical_indices < row_lengths.unsqueeze(1))
-        safe = logical_indices.clamp(
-            min=0, max=metadata.token_slot_table.shape[1] - 1
-        ).long()
-        slots = metadata.token_slot_table[sequence_ids[:, None], safe]
+        safe = logical_indices.clamp(min=0, max=self.req_to_token.shape[1] - 1).long()
+        slots = self.req_to_token[row_req_indices[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
     def forward_extend(

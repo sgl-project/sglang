@@ -12,6 +12,8 @@ non-NPU hosts.
 
 from __future__ import annotations
 
+import logging
+import re
 import threading
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
@@ -30,6 +32,15 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
 )
 from sglang.srt.utils import empty_context, get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+logger = logging.getLogger(__name__)
+
+# torch_npu raises this when the caller passes cpu_update_input entries but the
+# captured graph recorded no host-side operator inputs to rebind, e.g. hybrid
+# models whose attention backends (QSA) read seq_lens from device buffers that
+# are re-planned out-of-graph before each replay. Plain replay is already
+# correct for such graphs; the update call is a no-op at best.
+_ZERO_UPDATE_OPS_RE = re.compile(r"there are (\d+) operators that need to be updated")
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -165,15 +176,36 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             cpu_update_input = [{attr_name: seq_lens}]
 
         graph = self._graphs[shape_key]
+        update_error: list = []
 
         def _update():
             self._device_module.set_device(self._device_id)
-            graph.update(cpu_update_input=cpu_update_input)
+            try:
+                graph.update(cpu_update_input=cpu_update_input)
+            except RuntimeError as e:
+                update_error.append(e)
 
         thread = threading.Thread(target=_update)
         thread.start()
         graph.replay()
         thread.join()
+        if update_error:
+            e = update_error[0]
+            m = _ZERO_UPDATE_OPS_RE.search(str(e))
+            if m and int(m.group(1)) == 0:
+                # The graph recorded no host-side inputs to rebind: attention
+                # reads seq_lens from device buffers re-planned out-of-graph,
+                # so the replay above is already correct. Warn once.
+                if not getattr(self, "_warned_zero_update_ops", False):
+                    self._warned_zero_update_ops = True
+                    logger.warning(
+                        "NPU graph %s recorded no updatable host inputs; "
+                        "skipping cpu_update_input (seq_lens are consumed "
+                        "from device buffers).",
+                        shape_key,
+                    )
+            else:
+                raise e
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
