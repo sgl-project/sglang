@@ -273,18 +273,19 @@ def _local_decode_cuda_graph_vote(
 
 
 def _dsv4_batch_needs_visible_window(local_batch: ScheduleBatch, model_config) -> bool:
-    """True iff a DSV4 batch's extend chunk fully contains an image span, i.e.
-    it needs per-token visible-window overrides (eager-only)."""
+    """True iff a DSV4 batch's extend chunk contains an image span that needs
+    per-token visible-window overrides (eager-only)."""
     if not is_deepseek_v4(model_config.hf_config):
         return False
     from sglang.srt.layers.attention.dsv4.visible_window import (
-        has_fully_contained_image_span,
+        has_visible_window_span,
     )
 
-    return has_fully_contained_image_span(
+    return has_visible_window_span(
         local_batch.multimodal_inputs,
         local_batch.prefix_lens,
         local_batch.extend_lens,
+        getattr(model_config, "sliding_window_size", None) or 128,
     )
 
 

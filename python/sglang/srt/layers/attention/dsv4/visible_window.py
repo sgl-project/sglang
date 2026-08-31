@@ -11,10 +11,12 @@ where ``left_i`` is the distance of token ``i`` from the span start and ``W``
 is the SWA window (128). Tokens outside any span keep the causal window
 ``[max(0, i - (W-1)), i]``.
 
-A span that is not fully contained in the current extend chunk (chunked
-prefill split or radix-cache hit in the middle of the span) degrades to the
-causal window, with a one-time warning (the supported deployment disables
-both, so this should never fire there).
+A span that is not fully contained in the current extend chunk is still
+served when its early raw KV is guaranteed present (a radix match whose end
+is within ``swa_window`` of the span start — the match validator keeps the
+trailing ``swa_window`` of a matched prefix resident). Deeper cuts (a chunk
+split without span alignment, or a radix hit deeper into the span) degrade
+to the causal window with a one-time warning.
 
 This module is deliberately torch-free so scheduler-side code (dp_attn vote,
 prefill cuda graph runner) can import it without pulling in the attention
@@ -41,13 +43,28 @@ def _warn_degraded_span_once() -> None:
     _degraded_span_warned = True
 
 
-def _iter_fully_contained_image_spans(
+def _iter_visible_window_spans(
     mm_inputs,
     prefix_lens: Sequence[int],
     extend_lens: Sequence[int],
+    swa_window: int,
 ):
-    """Yield (req_idx, span_start, span_end_exclusive) for each image sentinel
-    span fully contained in that request's extend range."""
+    """Yield (req_idx, span_start, span_end_exclusive) for each image span the
+    current extend may apply the visible window to:
+
+    - spans fully contained in the extend; or
+    - spans partially covered by the cached prefix (span_start < prefix) whose
+      early raw KV is guaranteed present: ``span_start >= prefix - swa_window``.
+      The radix match validator guarantees the trailing ``swa_window`` tokens
+      of a matched prefix keep their raw SWA KV, so the extend's visible
+      window (which reaches back to span_start) can be served from the pool.
+
+    Spans partially overlapping the extend/prefix without that guarantee are
+    genuine cuts (a radix hit deeper than ``swa_window`` into the span, or a
+    chunk split without span alignment): they degrade to the causal window
+    with a one-time warning. Spans entirely before the prefix or entirely
+    after the chunk are irrelevant here and must not warn.
+    """
     for req_idx, mm_input in enumerate(mm_inputs or []):
         if mm_input is None:
             continue
@@ -59,26 +76,29 @@ def _iter_fully_contained_image_spans(
             for span_start, span_end_incl in item.offsets:
                 if span_start >= prefix and span_end_incl < extend_end:
                     yield req_idx, int(span_start), int(span_end_incl) + 1
+                elif (
+                    span_start < prefix <= span_end_incl
+                    and span_start >= prefix - swa_window
+                ):
+                    yield req_idx, int(span_start), int(span_end_incl) + 1
                 elif span_start < extend_end and span_end_incl >= prefix:
-                    # Genuine cut: the span overlaps this chunk (or the prefix)
-                    # but is not fully inside it — chunked prefill without
-                    # span alignment, or a radix hit mid-span. Spans that lie
-                    # entirely before the prefix or entirely after this chunk
-                    # are irrelevant here and must not warn.
                     _warn_degraded_span_once()
 
 
-def has_fully_contained_image_span(
+def has_visible_window_span(
     mm_inputs,
     prefix_lens: Sequence[int],
     extend_lens: Sequence[int],
+    swa_window: int,
 ) -> bool:
-    """True iff any request's extend chunk fully contains an image span, i.e.
-    the batch needs per-token visible-window overrides and is ineligible for
-    fixed-shape prefill cuda graphs."""
+    """True iff any request's extend chunk needs per-token visible-window
+    overrides (and is therefore ineligible for fixed-shape prefill cuda
+    graphs)."""
     return any(
         True
-        for _ in _iter_fully_contained_image_spans(mm_inputs, prefix_lens, extend_lens)
+        for _ in _iter_visible_window_spans(
+            mm_inputs, prefix_lens, extend_lens, swa_window
+        )
     )
 
 
@@ -101,8 +121,8 @@ def compute_visible_window_overrides(
     (``seq_lens_casual == 1``).
     """
     spans = list(
-        _iter_fully_contained_image_spans(
-            mm_inputs, extend_prefix_lens, extend_seq_lens
+        _iter_visible_window_spans(
+            mm_inputs, extend_prefix_lens, extend_seq_lens, swa_window
         )
     )
     if not spans:
@@ -111,16 +131,21 @@ def compute_visible_window_overrides(
     win_starts: List[int] = []
     win_lens: List[int] = []
     req_flat_base: List[int] = []
+    req_prefix: List[int] = []
     for prefix, extend_len in zip(extend_prefix_lens, extend_seq_lens):
         prefix, extend_len = int(prefix), int(extend_len)
         req_flat_base.append(len(win_starts) - prefix)
+        req_prefix.append(prefix)
         for pos in range(prefix, prefix + extend_len):
             win_starts.append(max(pos - (swa_window - 1), 0))
             win_lens.append(min(pos + 1, swa_window))
 
     for req_idx, span_start, span_end in spans:
         flat_base = req_flat_base[req_idx]
-        for pos in range(span_start, span_end):
+        # For a partially cached span only the tail is in this extend; the
+        # window's left edge may still point into the prefix (valid — those
+        # slots are guaranteed by the match validator).
+        for pos in range(max(span_start, req_prefix[req_idx]), span_end):
             left = pos - span_start
             win_start = max(0, pos - (swa_window - 1) - max(0, left - (swa_window - 1)))
             i = flat_base + pos
@@ -156,3 +181,26 @@ def image_span_aligned_extend_end(mm_input, extend_end: int) -> int:
             if span_start < extend_end < span_end:
                 extend_end = span_end
     return extend_end
+
+
+def image_span_cut_point(mm_input, position: int, swa_window: int) -> Optional[int]:
+    """Return the span start when a radix match of length ``position`` must be
+    truncated to that start, else None.
+
+    A match ending inside an image span is only a problem when it ends deeper
+    than ``swa_window`` into the span: the match validator guarantees the
+    trailing ``swa_window`` tokens of the prefix keep their raw SWA KV, so a
+    shallow mid-span match leaves the span's early KV readable and the
+    visible window can still be served (see _iter_visible_window_spans). A
+    deeper match must be re-issued capped to the span start, fully
+    re-prefilling the span.
+    """
+    if mm_input is None:
+        return None
+    for item in mm_input.mm_items:
+        if not item.is_image() or not item.offsets:
+            continue
+        for span_start, span_end_incl in item.offsets:
+            if span_start < position - swa_window and position <= span_end_incl:
+                return int(span_start)
+    return None
