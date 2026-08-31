@@ -3,22 +3,9 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
-
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_fp8,
-    sglang_per_token_group_quant_fp8_row_padded,
-)
-from sglang.srt.environ import envs
-from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils.common import torch_release
-
-if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
@@ -28,11 +15,21 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
+    sglang_per_token_group_quant_fp8,
+    sglang_per_token_group_quant_fp8_row_padded,
     sglang_per_token_quant_fp8,
     static_quant_fp8,
     triton_scaled_mm,
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
+)
+from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_platform,
 )
 from sglang.srt.utils import (
     ceil_align,
@@ -42,18 +39,15 @@ from sglang.srt.utils import (
     get_device_capability,
     get_device_sm,
     get_hip_version,
-    is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
     is_musa,
-    is_sm90_supported,
-    is_sm100_supported,
-    is_sm120_supported,
     is_xpu,
     offloader,
 )
+from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
@@ -62,9 +56,6 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
-_is_sm90_supported = is_sm90_supported()
-_is_sm100_supported = is_sm100_supported()
-_is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
 _is_musa = is_musa()
 
@@ -208,8 +199,7 @@ if _use_aiter:
 
 
 if _is_cuda:
-    from sgl_kernel import fp8_scaled_mm
-
+    from sglang.kernels.ops.gemm import fp8_scaled_mm
     from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
@@ -388,7 +378,7 @@ FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
 @lru_cache(maxsize=1)
 def flashinfer_per_tensor_fp8_supported() -> bool:
     return is_flashinfer_available() and (
-        is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
+        get_platform().is_sm90 or get_platform().is_sm100 or get_platform().is_sm120
     )
 
 
@@ -440,7 +430,7 @@ def _fake_flashinfer_mxfp8_quantize(
     return q_input, scale
 
 
-if is_blackwell_supported() and is_flashinfer_available():
+if get_platform().is_blackwell and is_flashinfer_available():
     from flashinfer import SfLayout
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
@@ -551,7 +541,7 @@ if is_blackwell_supported() and is_flashinfer_available():
         )
 
 
-if is_sm90_supported() and is_flashinfer_available():
+if get_platform().is_sm90 and is_flashinfer_available():
     # FlashInfer SM90 DeepGEMM with automatic swapAB optimization for small M
     from flashinfer.gemm import fp8_blockscale_gemm_sm90
 
@@ -580,7 +570,7 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     backend = get_fp8_gemm_runner_backend()
 
     if backend.is_flashinfer_trtllm():
-        if not (_is_sm100_supported and is_flashinfer_available()):
+        if not (get_platform().is_sm100 and is_flashinfer_available()):
             raise RuntimeError(
                 "MXFP8 dense GEMM requested via --fp8-gemm-backend=flashinfer_trtllm, "
                 "but that kernel requires SM100/SM103 GPUs and FlashInfer."
@@ -589,7 +579,7 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
 
     if backend.is_flashinfer_cutedsl():
         if not (
-            is_blackwell_supported()
+            get_platform().is_blackwell
             and is_flashinfer_available()
             and _raw_flashinfer_mm_mxfp8.is_backend_supported(
                 "cute-dsl", get_device_sm()
@@ -602,7 +592,7 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
         return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
 
     if backend.is_flashinfer_cutlass():
-        if not (is_blackwell_supported() and is_flashinfer_available()):
+        if not (get_platform().is_blackwell and is_flashinfer_available()):
             raise RuntimeError(
                 "MXFP8 dense GEMM requested via --fp8-gemm-backend=flashinfer_cutlass, "
                 "but that kernel requires Blackwell GPUs and FlashInfer."
@@ -621,7 +611,7 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     if _is_hip and _is_gfx95_supported:
         return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
 
-    if is_blackwell_supported() and is_flashinfer_available():
+    if get_platform().is_blackwell and is_flashinfer_available():
         if _raw_flashinfer_mm_mxfp8.is_backend_supported("cute-dsl", get_device_sm()):
             return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
         return Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
@@ -719,7 +709,7 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
 def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
     """Dispatch based on explicitly selected backend."""
     if backend.is_flashinfer_trtllm():
-        if not (is_sm100_supported() and is_flashinfer_available()):
+        if not (get_platform().is_sm100 and is_flashinfer_available()):
             raise RuntimeError(
                 "FlashInfer FP8 GEMM requested via --fp8-gemm-backend=flashinfer_trtllm, "
                 "but FlashInfer is not available or not supported on this hardware. "
@@ -728,7 +718,7 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
 
     elif backend.is_flashinfer_cutlass():
-        if not (is_blackwell_supported() and is_flashinfer_available()):
+        if not (get_platform().is_blackwell and is_flashinfer_available()):
             raise RuntimeError(
                 "FlashInfer FP8 GEMM requested via --fp8-gemm-backend=flashinfer_cutlass, "
                 "but FlashInfer is not available or not supported on this hardware. "
@@ -737,7 +727,7 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
 
     elif backend.is_flashinfer_deepgemm():
-        if not (is_sm90_supported() and is_flashinfer_available()):
+        if not (get_platform().is_sm90 and is_flashinfer_available()):
             raise RuntimeError(
                 "FlashInfer DeepGEMM with swapAB requested via --fp8-gemm-backend=flashinfer_deepgemm, "
                 "but it's not available. This backend requires Hopper (SM90) GPUs and FlashInfer "
@@ -746,7 +736,7 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         return flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback
 
     elif backend.is_cutlass():
-        if not is_sm120_supported():
+        if not get_platform().is_sm120:
             raise RuntimeError(
                 "--fp8-gemm-backend=cutlass is deprecated on this hardware. "
                 "Please switch to DeepGEMM or FlashInfer TRTLLM on SM90/SM100."
@@ -789,9 +779,9 @@ def _dispatch_auto_backend() -> Callable:
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
-    elif is_blackwell_supported() and is_flashinfer_available():
+    elif get_platform().is_blackwell and is_flashinfer_available():
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
-    elif is_sm120_supported():
+    elif get_platform().is_sm120:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
@@ -799,12 +789,12 @@ def _dispatch_auto_backend() -> Callable:
         return triton_w8a8_block_fp8_linear
 
 
-def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
+def initialize_fp8_gemm_config() -> None:
     """Initialize FP8 GEMM configuration."""
     global FP8_GEMM_RUNNER_BACKEND
 
-    backend = server_args.fp8_gemm_runner_backend
-    if backend == "auto" and is_sm120_supported():
+    backend = get_exec().kernel.fp8_gemm_runner_backend
+    if backend == "auto" and get_platform().is_sm120:
         backend = "cutlass"
 
     backend = Fp8GemmRunnerBackend(backend)
@@ -1846,7 +1836,7 @@ def apply_fp8_linear(
         use_cutlass_channelwise_gemm and envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.get()
     )
     native_scalar_a_scale = use_cutlass_channelwise_gemm and (
-        _is_sm90_supported or _is_sm100_supported or _is_sm120_supported
+        get_platform().is_sm90 or get_platform().is_sm100 or get_platform().is_sm120
     )
 
     if input_prequantized:
@@ -2126,7 +2116,9 @@ def validate_fp8_block_shape(
 ) -> None:
     """Validate block quantization shapes for tensor parallelism."""
 
-    tp_size = getattr(layer, "tp_size", get_parallel().tp_size)
+    # Lazy: a ``getattr`` default would read the published bag even for a
+    # layer that carries its own tp_size.
+    tp_size = layer.tp_size if hasattr(layer, "tp_size") else get_parallel().tp_size
     block_n, block_k = block_size[0], block_size[1]
 
     # Required by row parallel

@@ -133,7 +133,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 is_mhc = hc_hidden_size is not None
                 hs = hc_hidden_size if is_mhc else hidden_size
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+                    "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
                 }
                 if not is_mhc:
                     # Only Kimi K3 supplies num_blocks: its PP bank is token-major
@@ -141,7 +141,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     residual_shape = (
                         (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
                         if pp_proxy_residual_num_blocks is not None
-                        else (max_bs, hidden_size)
+                        else (max_num_token, hidden_size)
                     )
                     pp_proxy_tensors["residual"] = torch.zeros(
                         residual_shape, dtype=dtype
@@ -342,6 +342,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
+    pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
 
     @classmethod
     def create(
@@ -355,6 +356,10 @@ class PrefillInputBuffers(ForwardInputBuffers):
         hidden_size: int,
         dtype: torch.dtype,
         enable_mamba_track: bool,
+        pp_size: int = 1,
+        hc_hidden_size: Optional[int] = None,
+        pp_proxy_topk_size: Optional[int] = None,
+        pp_proxy_residual_num_blocks: Optional[int] = None,
     ) -> PrefillInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_tokens,), dtype=torch.int64)
@@ -382,6 +387,30 @@ class PrefillInputBuffers(ForwardInputBuffers):
                 input_embeds = None
                 mrope_positions = None
 
+            if pp_size > 1:
+                is_mhc = hc_hidden_size is not None
+                pp_hidden_size = hc_hidden_size if is_mhc else hidden_size
+                pp_proxy_tensors = {
+                    "hidden_states": torch.zeros(
+                        (max_num_tokens, pp_hidden_size), dtype=dtype
+                    )
+                }
+                if not is_mhc:
+                    residual_shape = (
+                        (max_num_tokens, pp_proxy_residual_num_blocks, hidden_size)
+                        if pp_proxy_residual_num_blocks is not None
+                        else (max_num_tokens, hidden_size)
+                    )
+                    pp_proxy_tensors["residual"] = torch.zeros(
+                        residual_shape, dtype=dtype
+                    )
+                if pp_proxy_topk_size is not None:
+                    pp_proxy_tensors["topk_indices"] = torch.zeros(
+                        (max_num_tokens, pp_proxy_topk_size), dtype=torch.int32
+                    )
+            else:
+                pp_proxy_tensors = None
+
         return cls(
             input_ids=input_ids,
             out_cache_loc=out_cache_loc,
@@ -392,6 +421,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
     def populate_from_forward_batch(

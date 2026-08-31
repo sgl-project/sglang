@@ -10,6 +10,7 @@ import torch
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
+    DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -26,7 +27,7 @@ DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 # IPC handoff is exercised on every PR. Since the CI runner executes the whole
 # file per suite, TestWeightCacheDaemonTP2 self-skips when fewer than 2 GPUs are
 # visible (i.e. on the 1-gpu runner).
-register_cuda_ci(est_time=100, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=280, stage="extra-a", runner_config="2-gpu-large")
 register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
 
 # Capture the client server's logs so test_loaded_via_ipc can assert the IPC
@@ -50,9 +51,13 @@ PROMPTS = [
 class TestWeightCacheDaemonTP2(CustomTestCase):
     """E2E test: start weight cache daemons, then launch server in client mode with TP2."""
 
+    model_override = None
+    daemon_args = []
+    server_args = []
+
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL
+        cls.model = cls.model_override or DEFAULT_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tp_size = 2
 
@@ -74,6 +79,7 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
                 cls.model,
                 "--tp-size",
                 str(cls.tp_size),
+                *cls.daemon_args,
             ]
         )
 
@@ -107,6 +113,7 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
                 str(cls.tp_size),
                 "--weight-cache-mode",
                 "client",
+                *cls.server_args,
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
@@ -332,6 +339,40 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
             "Expected the client server to load weights via IPC, but the IPC "
             "load log line was not found — the loader likely fell back to disk.",
         )
+
+
+class TestWeightCacheDaemonQwen3MoeDP(TestWeightCacheDaemonTP2):
+    """Qwen3 with static attention DP through the existing IPC fixture."""
+
+    daemon_args = [
+        "--dp",
+        "2",
+        "--ep-size",
+        "1",
+        "--enable-dp-attention",
+        "--enable-dp-lm-head",
+        "--random-seed",
+        "42",
+    ]
+    server_args = daemon_args[:]
+
+
+class TestWeightCacheDaemonQwen3MoeEP(TestWeightCacheDaemonTP2):
+    """Qwen3 MoE with static expert parallelism through the existing IPC fixture."""
+
+    model_override = DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN
+    daemon_args = [
+        "--dp",
+        "1",
+        "--ep-size",
+        "2",
+        "--enable-eplb",
+        "--ep-num-redundant-experts",
+        "2",
+        "--random-seed",
+        "42",
+    ]
+    server_args = daemon_args[:]
 
 
 if __name__ == "__main__":

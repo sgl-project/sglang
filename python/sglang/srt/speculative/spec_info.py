@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.runtime_context import get_spec as get_spec_config
 from sglang.srt.speculative.spec_registry import (
     CustomSpecAlgo,
@@ -254,6 +255,8 @@ class SpeculativeAlgorithm(Enum):
     def create_worker(
         self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
+
+        cfg = resolving_view(server_args)
         assert (
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
@@ -283,7 +286,7 @@ class SpeculativeAlgorithm(Enum):
 
         # EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER always use the V2 worker,
         # even with overlap disabled (scheduler drives it synchronously).
-        if self.is_eagle() and server_args.enable_multi_layer_eagle:
+        if self.is_eagle() and cfg.enable_multi_layer_eagle:
             from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
                 MultiLayerEagleWorkerV2,
             )
