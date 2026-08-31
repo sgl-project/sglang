@@ -1,7 +1,6 @@
-import contextlib
 import math
 from abc import ABC
-from typing import Iterator, Tuple
+from typing import Tuple
 
 import einops
 import torch
@@ -12,23 +11,9 @@ from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderC
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.utils.precision import temporary_module_dtype
 
 LRELU_SLOPE = 0.1
-
-
-# This function is from https://github.com/Lightricks/LTX-2/blob/400fd31054597515f47125691032c04b1c3ee24e/packages/ltx-core/src/ltx_core/model/audio_vae/vocoder.py#L20
-@contextlib.contextmanager
-def _module_in_fp32(module: nn.Module, *, enabled: bool) -> Iterator[None]:
-    """Temporarily cast *module* to float32, restoring original dtype on exit."""
-    if not enabled:
-        yield
-        return
-    module_dtype = next(module.parameters()).dtype
-    module.float()
-    try:
-        yield
-    finally:
-        module.to(module_dtype)
 
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
@@ -720,6 +705,7 @@ class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         """
         if hasattr(self, "bwe_generator"):
             input_dtype = hidden_states.dtype
+            # [Note] Use _module_in_fp32 for the upcast on CPU
             # On CPU, torch.autocast("cpu", dtype=torch.float32) emits a warning and silently disables autocast (enabled = False)
             # CPU takes the non-CUDA branch in autocast.__init__. That branch defines a device_supported_dtypes list containing only bfloat16 and float16.
             # Since float32 is not in the list, the code hits the "target dtype is not supported. Disabling autocast." branch, warns, and turns autocast off.
@@ -730,9 +716,10 @@ class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
                     device_type=hidden_states.device.type, dtype=torch.float32
                 )
                 if hidden_states.device.type != "cpu"
-                else _module_in_fp32(
+                else temporary_module_dtype(
                     self,
-                    enabled=next(self.parameters()).dtype != torch.float32,
+                    torch.float32,
+                    enabled=True,
                 )
             )
             with autocast_ctx:

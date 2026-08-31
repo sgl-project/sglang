@@ -1,10 +1,17 @@
 import threading
 from contextlib import contextmanager, nullcontext
+<<<<<<< HEAD
 from dataclasses import dataclass
 from typing import Iterator, Optional, Union
 
 import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
+=======
+from typing import Iterator, List, Optional, Union
+
+import torch
+import torch.nn as nn
+>>>>>>> 8d4af1f2ea (opt codes)
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
@@ -207,6 +214,7 @@ def temporary_module_dtype(
         module.to(dtype=original_dtype)
 
 
+<<<<<<< HEAD
 @dataclass
 class MixedPrecisionState:
     param_dtype: torch.dtype | None = None
@@ -257,3 +265,25 @@ def get_compute_dtype() -> torch.dtype:
     """Get the current compute dtype from mixed precision policy."""
     state = _mixed_precision_state.state
     return torch.get_default_dtype() if state is None else state.param_dtype
+=======
+@contextmanager
+def temporary_modules_dtype(
+    modules: List[nn.Module],
+    dtype: torch.dtype,
+    *,
+    enabled: bool = True,
+    restore_dtype: Optional[torch.dtype] = None,
+) -> Iterator[List[nn.Module]]:
+    """Temporarily cast multiple modules to the given dtype, restoring original dtype on exit."""
+    if not enabled:
+        yield modules
+        return
+
+    original_dtypes = [restore_dtype or get_module_dtype(m) for m in modules]
+    modules = [m.to(dtype=dtype) for m in modules]
+    try:
+        yield modules
+    finally:
+        for m, orig_dtype in zip(modules, original_dtypes):
+            m.to(dtype=orig_dtype)
+>>>>>>> 8d4af1f2ea (opt codes)
