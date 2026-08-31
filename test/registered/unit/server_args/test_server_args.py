@@ -61,7 +61,10 @@ from sglang.srt.arg_groups.serving_hook import (
     ssl_verify_of,
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-from sglang.srt.arg_groups.validation_hook import check_two_batch_overlap
+from sglang.srt.arg_groups.validation_hook import (
+    check_server_args,
+    check_two_batch_overlap,
+)
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
     Sidecar,
@@ -102,6 +105,27 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_pipeline_parallel_speculative_allows_synchronous_schedule(self):
+        args = ServerArgs(
+            model_path="dummy",
+            pp_size=2,
+            disable_overlap_schedule=True,
+            speculative_algorithm="EAGLE",
+        )
+
+        check_server_args(args)
+
+    def test_pipeline_parallel_speculative_rejects_overlap_schedule(self):
+        args = ServerArgs(
+            model_path="dummy",
+            pp_size=2,
+            disable_overlap_schedule=False,
+            speculative_algorithm="EAGLE",
+        )
+
+        with self.assertRaisesRegex(AssertionError, "overlap schedule"):
+            check_server_args(args)
+
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(
             model_path="dummy",
