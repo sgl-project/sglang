@@ -51,7 +51,9 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
+    derive_parallel_widths,
     get_global_dwdp_manager,
+    get_parallel,
     set_global_dwdp_manager,
 )
 from sglang.srt.utils import (
@@ -2050,6 +2052,12 @@ def get_moe_tp_group() -> GroupCoordinator:
 get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
+_SELF_PP: Optional[GroupCoordinator] = None
+
+
+def get_self_pp_group() -> GroupCoordinator:
+    assert _SELF_PP is not None, "self pipeline group is not initialized"
+    return _SELF_PP
 
 
 def get_pp_group() -> GroupCoordinator:
@@ -2504,7 +2512,18 @@ def initialize_model_parallel(
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
-    attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
+    # The groups below are built at these numbers, and the same dict is stamped
+    # once they exist.
+    derived_widths = derive_parallel_widths(
+        tp_size=tensor_model_parallel_size,
+        attn_cp_size=attn_cp_size,
+        attn_dp_size=attn_dp_size,
+        moe_ep_size=expert_model_parallel_size,
+        moe_dp_size=moe_data_model_parallel_size,
+        dcp_size=decode_context_parallel_size,
+        dcp_enabled=_DCP is not None,
+    )
+    attn_tp_size = derived_widths["attn_tp_size"]
 
     global _ATTN_CP
     assert (
@@ -2590,7 +2609,7 @@ def initialize_model_parallel(
 
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
-    moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
+    moe_tp_size = derived_widths["moe_tp_size"]
 
     global _MOE_DP
     assert _MOE_DP is None, "moe data parallel group is already initialized"
@@ -2703,6 +2722,20 @@ def initialize_model_parallel(
         max_world_size=max_world_size,
     )
 
+    # The one-layer draft uses a singleton PP group; every rank creates all groups
+    # because new_group is collective.
+    global _SELF_PP
+    if _SELF_PP is None:
+        _SELF_PP = init_model_parallel_group(
+            [[r] for r in range(world_size)],
+            get_world_group().local_rank,
+            backend,
+            use_custom_allreduce=False,
+            group_name="self_pp",
+        )
+
+    get_parallel().stamp_derived_widths(**derived_widths)
+
 
 def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
@@ -2799,6 +2832,28 @@ def model_parallel_is_initialized():
 
 
 _TP_STATE_PATCHED = False
+_PP_STATE_PATCHED = False
+
+
+@contextmanager
+def patch_pipeline_parallel_group(pp_group: GroupCoordinator):
+    """Patch the pp group temporarily until this function ends.
+
+    This method is for draft workers of speculative decoding, whose model does not
+    span pipeline stages and must not read the target's pp topology.
+    """
+    global _PP_STATE_PATCHED
+    assert not _PP_STATE_PATCHED, "Should not call when it's already patched"
+
+    _PP_STATE_PATCHED = True
+    old_pp_group = get_pp_group()
+    global _PP
+    _PP = pp_group
+    try:
+        yield
+    finally:
+        _PP_STATE_PATCHED = False
+        _PP = old_pp_group
 
 
 @contextmanager
@@ -2814,7 +2869,6 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     Args:
         tp_group (GroupCoordinator): the tp group coordinator
     """
-    from sglang.srt.runtime_context import get_parallel
 
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
@@ -2930,6 +2984,7 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    get_parallel().clear_derived_widths()
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:
         dwdp_mgr.cleanup()

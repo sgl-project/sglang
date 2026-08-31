@@ -6,7 +6,10 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from sglang.srt.models.nano_nemotron_vl import NemotronH_Omni_Reasoning_V3
+from sglang.srt.models.nano_nemotron_vl import (
+    NemotronH_Nano_VL_V2,
+    NemotronH_Omni_Reasoning_V3,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -14,6 +17,18 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestNemotronHOmniModel(CustomTestCase):
+    def test_existing_nano_model_keeps_ignoring_unrecognized_weights(self):
+        model = object.__new__(NemotronH_Nano_VL_V2)
+        nn.Module.__init__(model)
+        model.mlp1 = nn.Sequential()
+        model.language_model = SimpleNamespace(
+            load_weights=lambda weights: list(weights)
+        )
+        model.vision_model = SimpleNamespace(load_weights=lambda weights: None)
+        model.sound_encoder = None
+
+        model.load_weights([("unrecognized.weight", torch.ones(1))])
+
     def test_model_registry_resolves_new_architecture(self):
         from sglang.srt.models.registry import ModelRegistry
 

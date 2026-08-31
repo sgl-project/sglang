@@ -24,6 +24,33 @@ class _RecordingLayer(nn.Module):
 
 
 class TestNemotronHMultiTokenPredictor(CustomTestCase):
+    def test_text_only_forward_uses_model_embeddings(self):
+        model = object.__new__(NemotronHMultiTokenPredictor)
+        nn.Module.__init__(model)
+        model.embed_tokens = nn.Embedding(8, 2)
+        model.embed_tokens.weight.data.copy_(torch.arange(16).reshape(8, 2))
+        model.pattern_len = 1
+        layer = _RecordingLayer()
+        model.layers = nn.ModuleDict({"0": layer})
+        input_ids = torch.tensor([1, 2, 3])
+        forward_batch = SimpleNamespace(
+            mm_input_embeds=None,
+            forward_mode=SimpleNamespace(is_extend=lambda: False),
+            contains_mm_inputs=lambda: False,
+            spec_info=SimpleNamespace(hidden_states=torch.zeros(3, 2)),
+        )
+
+        model(
+            input_ids=input_ids,
+            positions=torch.arange(3),
+            forward_batch=forward_batch,
+        )
+
+        torch.testing.assert_close(
+            layer.inputs_embeds,
+            model.embed_tokens(input_ids),
+        )
+
     def test_multimodal_prefill_reuses_target_embeddings(self):
         model = object.__new__(NemotronHMultiTokenPredictor)
         nn.Module.__init__(model)
