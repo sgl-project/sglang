@@ -232,6 +232,28 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(backend.name, "TORCH_SDPA")
         self.assertEqual(matched_key, "text_encoder")
 
+    def test_ltx_automatic_text_encoder_backend_is_not_explicit(self):
+        args = _from_dict_without_model_resolution(
+            {"model_path": "Lightricks/LTX-2.3"},
+            pipeline_config=LTX2PipelineConfig(),
+        )
+
+        self.assertEqual(
+            args.component_attention_backends, {"text_encoder": "torch_sdpa"}
+        )
+        self.assertTrue(args.is_component_attention_backend_automatic("text_encoder"))
+
+    def test_ltx_explicit_text_encoder_backend_remains_explicit(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "Lightricks/LTX-2.3",
+                "component_attention_backends": {"text_encoder": "torch_sdpa"},
+            },
+            pipeline_config=LTX2PipelineConfig(),
+        )
+
+        self.assertFalse(args.is_component_attention_backend_automatic("text_encoder"))
+
     def test_invalid_component_attention_backend_raises(self):
         with self.assertRaises(ValueError):
             self._from_dict_without_model_resolution(
@@ -1643,6 +1665,20 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
+
+    def test_cache_dit_allows_explicit_dit_layerwise_offload(self):
+        with patch.dict(os.environ, {"SGLANG_CACHE_DIT_ENABLED": "true"}):
+            args = self._from_dict_with_pipeline_config(
+                QwenImagePipelineConfig(),
+                kwargs={
+                    "model_path": "/data/my-model",
+                    "performance_mode": "manual",
+                    "dit_layerwise_offload": True,
+                },
+            )
+
+        self.assertTrue(args.is_dit_layerwise_offload_selected)
+        self.assertEqual(args.layerwise_offload_components, ["dit"])
 
     def test_auto_multi_gpu_sana_wm_realtime_disables_cfg_parallel(self):
         args = self._from_dict_with_pipeline_config(
@@ -3162,6 +3198,7 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
     def _args(self) -> ServerArgs:
         args = ServerArgs.__new__(ServerArgs)
         args.direct_gpu_weight_loading = True
+        args.component_direct_gpu_weight_loading = {}
         args.component_residency = None
         args.cpu_offload_components = None
         args.dit_cpu_offload = False
@@ -3188,6 +3225,28 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
 
         self.assertFalse(default_args.direct_gpu_weight_loading)
         self.assertTrue(enabled_args.direct_gpu_weight_loading)
+
+    def test_component_direct_gpu_parser_is_exact_and_boolean(self):
+        values, remaining = ServerArgs._extract_component_direct_gpu_weight_loading(
+            [
+                "--component-direct-gpu-weight-loading.video-vae",
+                "--component-direct-gpu-weight-loading.audio_vae=false",
+                "--other-flag",
+            ]
+        )
+
+        self.assertEqual({"video_vae": True, "audio_vae": False}, values)
+        self.assertEqual(["--other-flag"], remaining)
+
+    def test_component_direct_gpu_rejects_nonresident_component(self):
+        args = self._args()
+        args.direct_gpu_weight_loading = False
+        args.component_direct_gpu_weight_loading = {"video_vae": True}
+        args.vae_cpu_offload = True
+
+        with patch.object(current_platform, "is_cuda", return_value=True):
+            with self.assertRaisesRegex(ValueError, "'video_vae' to be resident"):
+                args._validate_direct_gpu_weight_loading()
 
     def test_rejects_cpu_offload_fsdp_and_tp(self):
         cpu_offload_args = self._args()
