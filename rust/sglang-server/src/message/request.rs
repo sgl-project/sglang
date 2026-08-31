@@ -14,7 +14,7 @@ use super::sampling::{SamplingParams, SamplingParamsInput};
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
 use crate::message::ids::Rid;
 use crate::utils::fsm::RequestState;
-use crate::utils::{environ::env_u64, error::Error};
+use crate::utils::{environ::env_i64, error::Error};
 
 /// Hard cap on how many scheduler requests one `/generate` HTTP call may expand
 /// into. Every column below is allocated per item before anything is dispatched,
@@ -27,8 +27,12 @@ use crate::utils::{environ::env_u64, error::Error};
 /// `python/sglang/srt/environ.py`, which owns the default). Memoized because the
 /// value is process-static — Python sets it before launching this server — and a
 /// per-request `env::var` would take a lock on the hot path for a constant.
-static MAX_BATCH_REQS_PER_HTTP_REQ: LazyLock<usize> =
-    LazyLock::new(|| env_u64("SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ", 4096) as usize);
+static MAX_BATCH_REQS_PER_HTTP_REQ: LazyLock<i64> =
+    LazyLock::new(|| env_i64("SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ", 4096));
+
+fn batch_size_exceeds_limit(batch_size: usize, limit: i64) -> bool {
+    limit >= 0 && batch_size as u128 > limit as u128
+}
 
 /// Hard cap on the total bytes a broadcast value may clone into the batch (see
 /// the `One` arms of the fan-out).
@@ -170,7 +174,7 @@ impl GenerateBody {
             (None, Some(OneOrMany::Many(v))) => v.len(),
             _ => 1,
         };
-        if declared_n > *MAX_BATCH_REQS_PER_HTTP_REQ {
+        if batch_size_exceeds_limit(declared_n, *MAX_BATCH_REQS_PER_HTTP_REQ) {
             return Err(Error::Validation(format!(
                 "batch size {declared_n} exceeds the maximum of {}",
                 *MAX_BATCH_REQS_PER_HTTP_REQ
@@ -1115,19 +1119,16 @@ mod tests {
     /// capped before any column is built.
     #[test]
     fn oversized_batches_are_rejected_before_allocating() {
-        let texts: Vec<String> = (0..*MAX_BATCH_REQS_PER_HTTP_REQ + 1)
-            .map(|i| i.to_string())
-            .collect();
+        let cap = usize::try_from(*MAX_BATCH_REQS_PER_HTTP_REQ).unwrap();
+        let texts: Vec<String> = (0..cap + 1).map(|i| i.to_string()).collect();
         let body = serde_json::json!({ "text": texts }).to_string();
         let err = requests(&body).unwrap_err().to_string();
         assert!(err.contains("exceeds the maximum"), "{err}");
 
         // At the cap it is accepted.
-        let texts: Vec<String> = (0..*MAX_BATCH_REQS_PER_HTTP_REQ)
-            .map(|i| i.to_string())
-            .collect();
+        let texts: Vec<String> = (0..cap).map(|i| i.to_string()).collect();
         let (reqs, _) = requests(&serde_json::json!({ "text": texts }).to_string()).unwrap();
-        assert_eq!(reqs.len(), *MAX_BATCH_REQS_PER_HTTP_REQ);
+        assert_eq!(reqs.len(), cap);
 
         // A small batch with a huge broadcast `custom_params` is the quadratic case:
         // few items, but each clone carries the whole blob. The item count is a
@@ -1142,6 +1143,13 @@ mod tests {
         .to_string();
         let err = requests(&body).unwrap_err().to_string();
         assert!(err.contains("would allocate more than"), "{err}");
+    }
+
+    #[test]
+    fn negative_batch_limit_disables_the_item_cap() {
+        assert!(!batch_size_exceeds_limit(usize::MAX, -1));
+        assert!(batch_size_exceeds_limit(11, 10));
+        assert!(!batch_size_exceeds_limit(10, 10));
     }
 
     /// `token_ids_logprob` mirrors Python `_normalize_batch`'s nested-structure

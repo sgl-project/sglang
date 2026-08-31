@@ -17,8 +17,6 @@ mod multi_modality;
 mod tokenizer_manager;
 mod utils;
 
-use std::net::SocketAddr;
-
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
@@ -27,12 +25,8 @@ use crate::message::config::{
     DefaultSamplingParams, DisaggregationMode, MmFamily, MmResample, MmSpec, ModelConfig,
     RuntimeConfig, RustServerServerArgs, ServerArgs,
 };
+use crate::utils::startup::{listen_addr, value_error};
 use crate::utils::{logging, runtime};
-
-/// A `ValueError` for a boot-time failure, as `"{context}: {err}"`.
-fn value_error(context: &str, err: impl std::fmt::Display) -> PyErr {
-    pyo3::exceptions::PyValueError::new_err(format!("{context}: {err}"))
-}
 
 /// One drained MM result (see [`Server::take_mm_result`]), consumed by
 /// `RustMmProcessor.build_output` to build the scheduler's
@@ -93,7 +87,7 @@ impl Server {
     #[new]
     #[pyo3(signature = (
         server_args,
-        http_addr = None,
+        port_offset = None,
         to_scheduler_cap = 8192,
         from_scheduler_cap = 8192,
         stage_channel_cap = 8192,
@@ -104,7 +98,7 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     fn start(
         server_args: ServerArgs,
-        http_addr: Option<String>,
+        port_offset: Option<u16>, // DP rank; listen on server_args.port + offset
         to_scheduler_cap: usize,
         from_scheduler_cap: usize,
         stage_channel_cap: usize,
@@ -115,14 +109,10 @@ impl Server {
         server_args
             .validate()
             .map_err(|e| value_error("server_args", e))?;
-        // The HTTP listen address, tokenizer source/threads/shards all live in
-        // `server_args`; resolve them from there so the scheduler doesn't re-pass
-        // them. The explicit params stay as optional overrides (per-DP-rank port,
-        // pinning) and for standalone callers.
-        let http_addr: SocketAddr = http_addr
-            .unwrap_or_else(|| server_args.bind())
-            .parse()
-            .map_err(|e| value_error("bad http_addr", e))?;
+        // The host and base port come from `server_args`; DP ranks only supply
+        // their offset so this boundary has one source of truth for the address.
+        let http_addr = listen_addr(&server_args, port_offset)
+            .map_err(|e| value_error("bad listen address", e))?;
 
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
