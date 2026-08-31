@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -46,10 +47,18 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         backend.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.zeros((1, 16), dtype=torch.int32)
         )
+        # A real source over the stub pool: the probe disables it, giving the
+        # backend the strict passthrough view it now reads its tables from.
+        backend.kv_index_translator = KVIndexTranslator(
+            req_to_token=backend.req_to_token_pool.req_to_token,
+            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(),
+            page_size=1,
+            device="cpu",
+        )
         backend.is_prefill_aware_swa = False
         backend.has_swa = False
         backend.use_sliding_window_kv_pool = False
-        backend._unified_dense = False
         backend.page_size = 1
         backend._compute_scheduler_metadata = lambda *_: None
         backend._maybe_init_local_attn_metadata = lambda *_: None

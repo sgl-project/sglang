@@ -160,7 +160,10 @@ def test_action_metadata_reports_policy_shape_and_capabilities():
         action_horizon=10,
         action_dim=32,
         output_action_dim=7,
+        prompt_token_buckets=[32, 64, 128, 200],
+        prefix_cuda_graph_max_entries=4,
         enable_action_cuda_graph=True,
+        action_cuda_graph_max_entries=6,
     )
 
     metadata = action_metadata(_server_args(config))
@@ -176,6 +179,13 @@ def test_action_metadata_reports_policy_shape_and_capabilities():
     assert metadata["output"]["padded_action_dim"] == 32
     assert metadata["runtime"]["materialize_dtype"] == "bf16"
     assert metadata["runtime"]["enable_autocast"] is True
+    assert metadata["runtime"]["cuda_graph"] == {
+        "prefix_enabled": True,
+        "prefix_max_entries": 4,
+        "action_enabled": True,
+        "action_max_entries": 6,
+        "prompt_token_buckets": [32, 64, 128, 200],
+    }
     assert metadata["runtime"]["parallelism"]["num_gpus"] == 1
     assert metadata["runtime"]["parallelism"]["kv_gather_degree"] == 1
     assert metadata["runtime"]["parallelism"]["prefix_strategy"] == "tp"
@@ -183,6 +193,20 @@ def test_action_metadata_reports_policy_shape_and_capabilities():
     assert metadata["defaults"]["prefix_cache"] is False
     assert metadata["capabilities"]["realtime_websocket"]
     assert metadata["capabilities"]["openpi_websocket"]
+
+
+def test_action_metadata_reports_effective_graph_availability():
+    config = Pi05PipelineConfig(
+        prefix_cuda_graph_max_entries=0,
+        offload_action_expert_after_denoise=True,
+    )
+
+    metadata = action_metadata(_server_args(config))
+
+    assert metadata["runtime"]["cuda_graph"]["prefix_enabled"] is False
+    assert metadata["runtime"]["cuda_graph"]["action_enabled"] is False
+    assert metadata["defaults"]["cuda_graph"] is False
+    assert metadata["capabilities"]["cuda_graph"] is False
 
 
 def test_action_generation_response_uses_actual_output_parameters():
