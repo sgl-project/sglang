@@ -479,8 +479,7 @@ def handle_elastic_ep(server_args: Any):
             f"'full' or 'disabled' (got {decode_backend!r})."
         )
         assert cfg.cuda_graph_config.prefill.backend == Backend.DISABLED, (
-            "Elastic EP runtime scale-up requires prefill CUDA graph to be "
-            "disabled."
+            "Elastic EP runtime scale-up requires prefill CUDA graph to be " "disabled."
         )
         if decode_backend == Backend.FULL:
             assert cfg.device == "cuda", (
@@ -492,12 +491,10 @@ def handle_elastic_ep(server_args: Any):
                 "speculative decoding."
             )
             assert not cfg.is_embedding, (
-                "Elastic EP CUDA graph recapture does not support "
-                "embedding models."
+                "Elastic EP CUDA graph recapture does not support " "embedding models."
             )
             assert cfg.dllm_algorithm is None, (
-                "Elastic EP CUDA graph recapture does not support "
-                "diffusion models."
+                "Elastic EP CUDA graph recapture does not support " "diffusion models."
             )
             assert not cfg.encoder_only, (
                 "Elastic EP CUDA graph recapture does not support "
