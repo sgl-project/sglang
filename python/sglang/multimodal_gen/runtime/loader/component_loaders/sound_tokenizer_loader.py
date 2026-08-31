@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import torch
+
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PlainStateDictComponentLoader,
 )
@@ -11,6 +13,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -34,18 +37,19 @@ class SoundTokenizerLoader(PlainStateDictComponentLoader):
 
         server_args.model_paths[component_name] = component_model_path
 
-        try:
-            precision = server_args.pipeline_config.vae_precision
-        except AttributeError:
-            precision = "bf16"
-        dtype = PRECISION_TO_TYPE[precision]
+        dtype = resolve_component_precision(server_args, component_name)
+        if dtype is None:
+            try:
+                dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            except AttributeError:
+                dtype = torch.bfloat16
         target_device = self.target_device(
             server_args.should_start_component_on_cpu(component_name)
         )
 
         with set_default_torch_dtype(dtype), skip_init_modules():
             model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-            model = model_cls(config).to(target_device)
+            model = model_cls(config).to(device=target_device, dtype=dtype)
 
         loaded = load_safetensors_state_dict(component_weights_path)
         incompatible = model.load_state_dict(loaded, strict=False)

@@ -282,7 +282,13 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         return pixel_values
 
     def process_mm_data(
-        self, input_text, images=None, videos=None, audios=None, **kwargs
+        self,
+        input_text,
+        images=None,
+        videos=None,
+        audios=None,
+        processor=None,
+        **kwargs,
     ) -> dict:
         """
         process multimodal data with transformers AutoProcessor
@@ -296,7 +302,9 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             if self.video_config:
                 kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
 
-        processor = self._processor
+        # Take the worker pool's per-thread clone when it hands one over; falling
+        # back to self._processor would put every worker on one shared object.
+        processor, _ = self._resolve_processor(processor)
         if (
             hasattr(processor, "image_processor")
             and isinstance(processor.image_processor, BaseImageProcessor)
@@ -404,7 +412,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             ]
             base_output.videos, _ = map(list, zip(*videos_processed))
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 

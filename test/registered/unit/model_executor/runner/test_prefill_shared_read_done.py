@@ -60,6 +60,17 @@ def test_disabled_when_flag_is_false():
     assert runner.shared_read_done_event is None
 
 
+@pytest.mark.parametrize(
+    "algorithm", (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK)
+)
+def test_dflash_family_target_prefill_publishes(algorithm):
+    runner = _model_runner(spec_algorithm=algorithm)
+    with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
+        maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
+    published = runner.shared_read_done_event
+    assert isinstance(published, _Event) and published.recorded
+
+
 def test_gates_exclude_non_prefill_unsupported_algorithm_and_noncompliant_backend():
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
         for runner, batch in (
