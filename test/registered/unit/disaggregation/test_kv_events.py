@@ -200,17 +200,20 @@ class TestBlockStoredWireFormat(CustomTestCase):
             kwargs["metadata"] = metadata
         return event_type(**kwargs)
 
-    def test_unsalted_event_keeps_legacy_array_shape(self):
+    def test_unsalted_event_uses_tagged_map(self):
         decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(self._event()))
-        self.assertEqual(len(decoded), 7)
+        self.assertIsInstance(decoded, dict)
+        self.assertEqual(decoded["type"], "BlockStored")
+        self.assertEqual(decoded["block_hashes"], [123])
+        self.assertNotIn("metadata", decoded)
 
-    def test_salted_event_appends_typed_metadata(self):
+    def test_salted_event_adds_named_typed_metadata(self):
         event = self._event(BlockStoredMetadata(cache_salt="tenant-a"))
         encoded = msgspec.msgpack.encode(event)
         decoded = msgspec.msgpack.decode(encoded)
         round_tripped = msgspec.msgpack.decode(encoded, type=BlockStoredWithMetadata)
-        self.assertEqual(len(decoded), 8)
-        self.assertEqual(decoded[7], {"cache_salt": "tenant-a"})
+        self.assertEqual(decoded["type"], "BlockStored")
+        self.assertEqual(decoded["metadata"], {"cache_salt": "tenant-a"})
         self.assertEqual(round_tripped.metadata.cache_salt, "tenant-a")
 
     def test_salted_event_remains_compatible_with_typed_batch_consumers(self):
@@ -222,6 +225,11 @@ class TestBlockStoredWireFormat(CustomTestCase):
             msgspec.msgpack.encode(batch), type=KVEventBatch
         )
         self.assertEqual(round_tripped.events[0].block_hashes, [123])
+
+    def test_legacy_positional_event_is_rejected(self):
+        legacy = ["BlockStored", [123], None, [1, 2], 2, None, "GPU"]
+        with self.assertRaises(msgspec.ValidationError):
+            msgspec.msgpack.decode(msgspec.msgpack.encode(legacy), type=BlockStored)
 
 
 if __name__ == "__main__":
