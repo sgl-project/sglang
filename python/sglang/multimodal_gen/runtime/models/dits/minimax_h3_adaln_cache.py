@@ -139,10 +139,17 @@ class MiniMaxH3AdalnCache(nn.Module):
         ):
             raise ValueError("MiniMax H3 AdaLN cache has invalid final_params")
 
-        self.register_buffer("plan_timesteps", plan_timesteps.to(device))
-        self.register_buffer("plan_lengths", plan_lengths.to(device))
-        self.register_buffer("block_params", block_params.to(device))
-        self.register_buffer("final_params", final_params.to(device))
+        for slot in range(plan_timesteps.shape[0]):
+            length = int(plan_lengths[slot])
+            self._slots[_plan_key(plan_timesteps[slot, :length])] = slot
+
+        # The 0.9-2.3 GiB slabs are derived data; keep them out of state_dict.
+        self.register_buffer(
+            "plan_timesteps", plan_timesteps.to(device), persistent=False
+        )
+        self.register_buffer("plan_lengths", plan_lengths.to(device), persistent=False)
+        self.register_buffer("block_params", block_params.to(device), persistent=False)
+        self.register_buffer("final_params", final_params.to(device), persistent=False)
 
     def _allocate(self, device: torch.device) -> None:
         """Empty slab for the rebuild path; its pointers must never move.
@@ -156,10 +163,12 @@ class MiniMaxH3AdalnCache(nn.Module):
         self.register_buffer(
             "plan_timesteps",
             torch.zeros((self.max_plans, width), dtype=_FP32_DTYPE, device=device),
+            persistent=False,
         )
         self.register_buffer(
             "plan_lengths",
             torch.zeros((self.max_plans,), dtype=torch.int64, device=device),
+            persistent=False,
         )
         self.register_buffer(
             "block_params",
@@ -168,6 +177,7 @@ class MiniMaxH3AdalnCache(nn.Module):
                 dtype=_BF16_DTYPE,
                 device=device,
             ),
+            persistent=False,
         )
         self.register_buffer(
             "final_params",
@@ -176,6 +186,7 @@ class MiniMaxH3AdalnCache(nn.Module):
                 dtype=_BF16_DTYPE,
                 device=device,
             ),
+            persistent=False,
         )
         logger.info(
             "MiniMax H3 AdaLN rebuild slab: %d plans x %d timesteps = %.2f GiB",
@@ -296,6 +307,24 @@ class MiniMaxH3AdalnCache(nn.Module):
             self.rebuilds,
         )
 
+    def resolve_slots(self, step_timesteps: list[torch.Tensor]) -> torch.Tensor:
+        """Per-step slab slots as one device tensor, resolved on the host.
+
+        Forward receives one scalar view per step. Keeping it a device tensor
+        matters twice over: a Python int would enter the breakable-CUDA-graph
+        replay signature (one graph per slot value), and an int baked into a
+        captured gather would read the wrong slab row after slot reuse.
+        """
+        slots = []
+        for timesteps in step_timesteps:
+            slot = self._slots.get(_plan_key(timesteps))
+            if slot is None:
+                raise ValueError(
+                    "MiniMax H3 AdaLN cache does not cover the request timestep plan"
+                )
+            slots.append(slot)
+        return torch.tensor(slots, dtype=torch.int64, device=self.block_params.device)
+
     def lookup(self, unique_timesteps: torch.Tensor) -> torch.Tensor:
         num_timesteps = unique_timesteps.shape[0]
         matches = self.plan_lengths.eq(num_timesteps) & self.plan_timesteps[
@@ -316,6 +345,22 @@ class MiniMaxH3AdalnCache(nn.Module):
         params = self.block_params[cache_plan_index, :num_timesteps, index]
         params = params.reshape(-1, 6, self.hidden_size)
         return tuple(params.unbind(dim=1))
+
+    def block_all(
+        self,
+        cache_plan_index: torch.Tensor,
+        num_timesteps: int,
+    ) -> tuple[tuple[torch.Tensor, ...], ...]:
+        """Every block's tuple via one slab gather instead of one per layer.
+
+        Same elements and per-tensor strides as 50 block() calls; the single
+        layer-major gather replaces 50 latency-bound indexing kernels.
+        """
+        stacked = self.block_params.permute(2, 0, 1, 3)[
+            :, cache_plan_index, :num_timesteps
+        ]
+        stacked = stacked.reshape(self.num_layers, -1, 6, self.hidden_size)
+        return tuple(tuple(layer.unbind(dim=1)) for layer in stacked)
 
     def final(
         self,

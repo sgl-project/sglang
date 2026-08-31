@@ -175,6 +175,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "img_position_ids",
         "rope_cache",
         "unique_timesteps",
+        "adaln_cache_slot",
         "inverse_indices",
         "update_mask",
         "update_audio_mask",
@@ -1518,20 +1519,27 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         )
         return projected
 
-    def prepare_adaln_plans(self, step_timesteps: list[torch.Tensor]) -> None:
+    def prepare_adaln_plans(
+        self, step_timesteps: list[torch.Tensor]
+    ) -> torch.Tensor | None:
         """Fill the AdaLN cache for this request before denoising starts.
 
-        No-op for a prebuilt sidecar; the rebuild path needs the model's own
-        timestep embedding so a filled plan is bit-identical to what resident
-        adaln_proj weights would have produced.
+        Returns the per-step slab slots as a device tensor (None without a
+        cache); forward consumes one scalar view per step so it never has to
+        match timesteps on device. A prebuilt sidecar only resolves slots; the
+        rebuild path needs the model's own timestep embedding so a filled plan
+        is bit-identical to what resident adaln_proj weights would have
+        produced.
         """
-        if self.adaln_cache is None or self.adaln_cache.weight_files is None:
-            return
+        if self.adaln_cache is None:
+            return None
+        if self.adaln_cache.weight_files is not None:
 
-        def embed(timesteps: torch.Tensor) -> torch.Tensor:
-            return nn.functional.silu(self.time_embedder(timesteps)).to(_BF16_DTYPE)
+            def embed(timesteps: torch.Tensor) -> torch.Tensor:
+                return nn.functional.silu(self.time_embedder(timesteps)).to(_BF16_DTYPE)
 
-        self.adaln_cache.build(step_timesteps, embed=embed)
+            self.adaln_cache.build(step_timesteps, embed=embed)
+        return self.adaln_cache.resolve_slots(step_timesteps)
 
     def _can_batch_block_adaln(self) -> bool:
         return (
@@ -2302,16 +2310,16 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         block_adaln_params = None
         adaln_cache_plan_index = None
         if self.adaln_cache is not None:
-            adaln_cache_plan_index = self.adaln_cache.lookup(
-                unique_timesteps.view(-1).to(device)
-            )
-            block_adaln_params = tuple(
-                self.adaln_cache.block(
-                    index,
-                    adaln_cache_plan_index,
-                    adaln_input.shape[0],
+            # prepare_adaln_plans resolved the slot on the host; the device
+            # lookup remains for callers that drive forward() directly.
+            adaln_cache_plan_index = kwargs.get("adaln_cache_slot")
+            if adaln_cache_plan_index is None:
+                adaln_cache_plan_index = self.adaln_cache.lookup(
+                    unique_timesteps.view(-1).to(device)
                 )
-                for index in range(len(self.blocks))
+            block_adaln_params = self.adaln_cache.block_all(
+                adaln_cache_plan_index,
+                adaln_input.shape[0],
             )
         elif self._can_batch_block_adaln():
             local_adaln = torch.stack(

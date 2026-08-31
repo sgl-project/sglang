@@ -127,6 +127,63 @@ def test_minimax_h3_adaln_cache_matches_bf16_embedding(tmp_path):
     assert torch.equal(torch.cat(final, dim=-1), final_params[1])
 
 
+def test_sidecar_resolve_slots_and_block_all_match_per_step_paths(tmp_path):
+    """Host-resolved slots and the batched gather must mirror lookup/block."""
+    cache_path = tmp_path / "adaln.safetensors"
+    plan_timesteps = torch.tensor([[0.5, 0.0], [1.0, 2.0]])
+    plan_lengths = torch.tensor([1, 2], dtype=torch.int64)
+    block_params = (
+        torch.arange(2 * 2 * 2 * _BLOCK_WIDTH, dtype=torch.float32)
+        .reshape(2, 2, 2, _BLOCK_WIDTH)
+        .bfloat16()
+    )
+    final_params = torch.zeros(2, 2, _FINAL_WIDTH, dtype=torch.bfloat16)
+    save_file(
+        {
+            "plan_timesteps": plan_timesteps,
+            "plan_lengths": plan_lengths,
+            "block_params": block_params,
+            "final_params": final_params,
+        },
+        cache_path,
+        metadata={"format_version": "2", "model_variant": "fl2va"},
+    )
+    cache = MiniMaxH3AdalnCache(_ARCH, path=str(cache_path), model_variant="fl2va")
+    cache.load(torch.device("cpu"))
+
+    slots = cache.resolve_slots([torch.tensor([0.5]), torch.tensor([1.0, 2.0])])
+    assert slots.dtype == torch.int64
+    assert slots.tolist() == [0, 1]
+    assert int(cache.lookup(torch.tensor([1.0, 2.0]))) == int(slots[1])
+
+    stacked = cache.block_all(slots[1], 2)
+    assert len(stacked) == _ARCH.num_layers
+    for index in range(_ARCH.num_layers):
+        expected = cache.block(index, slots[1], 2)
+        for got, want in zip(stacked[index], expected):
+            assert torch.equal(got, want)
+            assert got.stride() == want.stride()
+
+    with pytest.raises(ValueError, match="does not cover"):
+        cache.resolve_slots([torch.tensor([9.0])])
+
+
+def test_online_cache_resolve_slots_after_build(tmp_path):
+    cache = _online_cache(tmp_path, max_plan_width=2)
+    plan_a = torch.tensor([1.0])
+    plan_b = torch.tensor([2.0, 3.0])
+
+    cache.build([plan_a, plan_b, plan_a], embed=_embed)
+    slots = cache.resolve_slots([plan_a, plan_b, plan_a])
+    assert slots.tolist()[0] == slots.tolist()[2]
+    assert int(cache.lookup(plan_b)) == int(slots[1])
+
+
+def test_slab_buffers_stay_out_of_state_dict(tmp_path):
+    cache = _online_cache(tmp_path)
+    assert not any("params" in key or "plan" in key for key in cache.state_dict())
+
+
 def test_online_cache_reset_rebuilds_previously_resident_request_plans(tmp_path):
     """A capacity reset must not drop plans reused by the current request."""
     cache = _online_cache(tmp_path, max_plan_width=1)
