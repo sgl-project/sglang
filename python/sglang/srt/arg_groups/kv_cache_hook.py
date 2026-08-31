@@ -262,11 +262,21 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     # Only monolithic decode cuda-graph capture is wired; piecewise prefill
     # capture is not. Guard when the user opts into it.
     _cg_cfg = cfg.cuda_graph_config
-    if _cg_cfg is not None and _cg_cfg.prefill.backend == Backend.TC_PIECEWISE:
-        raise ValueError(
-            "--enable-unified-memory supports monolithic (decode) "
-            "cuda-graph capture only; disable piecewise prefill capture "
-            "(e.g. --cuda-graph-backend-prefill=disabled)."
+    if _cg_cfg is not None and _cg_cfg.prefill.backend != Backend.DISABLED:
+        if cfg.cuda_graph_backend_prefill is not None:
+            raise ValueError(
+                "--enable-unified-memory supports decode cuda-graph "
+                "capture only; prefill capture is not wired (the prefill "
+                "graph runner bypasses the unified virtual->physical loc "
+                "rebind). Got --cuda-graph-backend-prefill="
+                f"{cfg.cuda_graph_backend_prefill!r}; pass "
+                "--cuda-graph-backend-prefill=disabled."
+            )
+        _cg_cfg.prefill.backend = Backend.DISABLED
+        logger.warning(
+            "--enable-unified-memory: disabling prefill cuda-graph "
+            "capture (not wired for the unified pool's loc rebind); "
+            "decode capture is unaffected."
         )
 
 
@@ -308,18 +318,14 @@ def handle_page_major_kv_layout(server_args: Any):
         "pool's per-layer views require a uniform row width; run "
         "this model without --enable-unified-memory."
     )
-    # Only the Triton attention kernels read the strided 4-D envelope K/V
-    # views; FA3 / FlashInfer do not. EXCEPTION: the unified-memory MLA pool
-    # exposes each layer as a contiguous per-layer view
-    # (build_mla_views), which the paged MLA kernels consume directly,
-    # with their kv_indices / block tables remapped to kernel-facing ids. Names below
-    # are the RESOLVED ids from attention_backends_of: "flashinfer" is
-    # FlashInferMLAAttnBackend for an MLA model, "trtllm_mla" the trtllm
-    # decode kernel; "cutedsl_mla" and "tokenspeed_mla" subclass
-    # TRTLLMMLABackend and inherit its read/write path; "fa3" remaps its
-    # page_table (in-kernel for captured decode, one funnel for eager).
-    # flashmla / cutlass_mla share the create_flashmla block-table path and
-    # can be added the same way once exercised.
+    # Allow-list. Every backend below reads through the translator, so what
+    # gates one is only whether its kernels can address the per-layer views:
+    #   * MLA models: the full paged MLA family, incl. flashmla (ps=64
+    #     snap). cutlass_mla stays rejected (never exercised).
+    #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside
+    #     Triton. fa4 is the fa3 class.
+    #   * Without the unified pool, plain page-major stays Triton-only.
+    # Names are the RESOLVED ids from attention_backends_of.
     if cfg.enable_unified_memory and use_mla_backend(server_args):
         allowed_full = {
             "triton",
@@ -328,16 +334,27 @@ def handle_page_major_kv_layout(server_args: Any):
             "flashinfer",
             "cutedsl_mla",
             "tokenspeed_mla",
+            "flashmla",
+        }
+    elif cfg.enable_unified_memory:
+        allowed_full = {
+            "triton",
+            "fa3",
+            "fa4",
+            "flashinfer",
+            "trtllm_mha",
         }
     else:
         allowed_full = {"triton"}
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed_full, (
-        "--enable-page-major-kv-layout requires the Triton attention backend "
-        "for the full-attention layers (unified-memory MLA also allows the "
-        f"paged MLA backends); got {sorted(backends)}, allowed "
-        f"{sorted(allowed_full)}. Pass a compatible --attention-backend."
+        "--enable-page-major-kv-layout: the resolved attention backends "
+        f"{sorted(backends)} are not in the allowed set "
+        f"{sorted(allowed_full)} for this configuration (unified memory "
+        "allows the per-layer-view families; plain page-major keeps the "
+        "envelope-strided views only Triton reads). Pass a compatible "
+        "--attention-backend."
     )
     # The Mamba/KDA state is stored in envelope-strided views; only
     # stride-audited kernels may read it (Stage 4 audit, per slot):

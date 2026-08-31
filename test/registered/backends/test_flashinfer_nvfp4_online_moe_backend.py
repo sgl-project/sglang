@@ -77,14 +77,6 @@ class FlashinferNvFp4OnlineMoeBackendBase:
             )
 
 
-# Only this class is affected, but the file runs with failfast, so leaving it
-# enabled also cuts off the class that sorts after it.
-@unittest.skip(
-    "flashinfer-ai/flashinfer#4486: on SM100/SM103 the TRTLLM_GEN tile-192 BMM "
-    "path returns non-finite MoE output from FlashInfer 0.6.16.post4 on, so the "
-    "first real prefill trips the sampler NaN assert and gsm8k scores 0.0. "
-    "See #34629 for the package bisect."
-)
 class TestFlashinferTrtllmGenMoeBackendNvFp4Online(
     FlashinferNvFp4OnlineMoeBackendBase, CustomTestCase
 ):

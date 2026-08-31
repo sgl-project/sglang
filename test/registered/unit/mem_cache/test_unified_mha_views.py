@@ -483,8 +483,9 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
 
 
 class TestFactoryDenseViews(unittest.TestCase):
-    """The real SWA factory builds both sub-pools and wires the matching
-    kernel-facing multipliers into the composite allocator."""
+    """The real SWA factory builds dense sub-pools and wires the matching
+    kernel-facing multipliers into the composite allocator. End-to-end over
+    that factory, the rebind must emit BOTH kernel-facing write locs."""
 
     # _swa_factory geometry: L_full = L_swa = 2, uniform 8/8 dims, ps = 1.
     FULL_MULT = 4  # 2 * L_full
@@ -525,6 +526,42 @@ class TestFactoryDenseViews(unittest.TestCase):
         self.assertEqual(b.token_to_kv_pool.full_kv_pool.k_buffer[0].dim(), 3)
         self.assertEqual(b.token_to_kv_pool.swa_kv_pool.k_buffer[0].dim(), 3)
         self.assertGreater(pool.view_tail_pad_bytes, 0)
+
+    def test_rebind_emits_dense_full_and_build_derives_swa(self):
+        """End-to-end over the real factory: rebind_write_loc rebinds
+        out_cache_loc to FULL-kernel-facing ids (phase 1), and the per-batch build
+        derives the SWA-DENSE write loc pointwise from those kernel-facing values
+        (phase 2) — both checked against the formulas over the VIRTUAL
+        ids."""
+        from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+
+        b = self._bundle()
+        alloc = b.token_to_kv_pool_allocator
+        v = alloc.alloc(4)
+        self.assertIsNotNone(v)
+        expected_full = alloc.full_v2p_page_table[v] * self.FULL_MULT  # ps=1
+        expected_swa = alloc.swa_v2p_page_table[v] * self.SWA_MULT
+
+        class _FB:
+            pass
+
+        fb = _FB()
+        fb.out_cache_loc = v.clone()
+        source = KVIndexTranslator(
+            req_to_token=torch.zeros((2, 8), dtype=torch.int64),
+            token_to_kv_pool_allocator=alloc,
+            token_to_kv_pool=b.token_to_kv_pool,
+            page_size=1,
+            device="cpu",
+        )
+        self.assertTrue(source.is_translating)
+        source.rebind_write_loc(fb)
+        self.assertTrue(torch.equal(fb.out_cache_loc, expected_full))
+        self.assertTrue(
+            torch.equal(
+                source.sliding_window_write_loc_for(fb.out_cache_loc), expected_swa
+            )
+        )
 
 
 if __name__ == "__main__":
