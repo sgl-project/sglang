@@ -288,8 +288,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         else:
             self.free_virtual_ids = None
         self.free_group = None
-        # Segment frees buffer page REPRESENTATIVES here (mirrors
-        # `PagedTokenToKVPoolAllocator`), keeping their shape across the merge.
+        # Segment frees buffer page REPRESENTATIVES here, not whole token
+        # ranges: `torch.cat` of the ranges destroys the per-segment shape the
+        # stride derivation needs, forcing the position-less dedup back on.
         self.free_page_reps_group: Optional[List[torch.Tensor]] = None
         self._inverse_history.clear()
         self._free_phys_pages = torch.empty(0, dtype=torch.int64, device=self.device)
@@ -1038,9 +1039,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             reps = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
             self.free(reps, _pages=reps // self.page_size)
         else:
-            # Buffer the REPRESENTATIVES, not the raw tokens: `free_group_end`
-            # concatenates page ids, so the group merge keeps the shape it
-            # would otherwise lose to `torch.cat` of whole segments.
             self.free_page_reps_group.extend(pieces)
 
     def _free_lazy(
@@ -1748,10 +1746,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         pending, self.free_page_reps_group = self.free_page_reps_group, None
         super().free_group_end()
         if pending:
-            # Segment frees buffered REPRESENTATIVES, so the merge concatenates
-            # page ids rather than whole token ranges -- `torch.cat` of the
-            # ranges is what would have destroyed the per-segment shape and
-            # forced the position-less dedup.
             reps = torch.cat(pending)
             self.free(reps, _pages=reps // self.page_size)
 
