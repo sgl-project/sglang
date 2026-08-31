@@ -1352,13 +1352,10 @@ class SWAComponent(TreeComponent):
             # freeing only the incoming full, then store the swa on the node.
             unified = self._unified_allocator()
             if unified is not None:
-                # The unified composite has no `full_to_swa_index_mapping`
-                # tensor — the swa sub-pool's v2p IS the mapping (and its
-                # `set_full_to_swa_mapping` is a no-op stub). Express the same
-                # move as a page-ownership rebind, then free the incoming ids
-                # through the composite: its `swa_v2p_pages > 0` filter skips
-                # the just-tombstoned swa side, so ONLY the full side is
-                # released -- what the static path below spells as `free_full`.
+                # No `full_to_swa_index_mapping` here: the swa sub-pool's v2p IS
+                # the mapping. Rebind page ownership, then free through the
+                # composite -- its `swa_v2p_pages > 0` filter skips the
+                # just-tombstoned swa side, releasing only the full one.
                 self._transfer_swa_pages(
                     unified, action.kept_full, action.incoming_full
                 )
