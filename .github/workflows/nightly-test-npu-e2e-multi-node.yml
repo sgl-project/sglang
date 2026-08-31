@@ -115,7 +115,7 @@ jobs:
 
           pod_name_prefix="${KUBE_JOB_NAME}-"
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
-                    while true; do
+          while true; do
             if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
               echo "Found exist sglang job, sleeping for 30 seconds..."
               sleep 30
