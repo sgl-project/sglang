@@ -335,6 +335,7 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
         class _Args:
             component_precisions = {}
             component_quantizations = {}
+            component_weights_paths = {}
 
             @staticmethod
             def requested_component_attention_backend(_component_name):
@@ -414,6 +415,7 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
         class _Args:
             component_precisions = {}
             component_quantizations = {}
+            component_weights_paths = {}
 
             @staticmethod
             def requested_component_attention_backend(_component_name):
@@ -479,6 +481,7 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
         class _Args:
             component_precisions = {}
             component_quantizations = {}
+            component_weights_paths = {}
             pipeline_config = SimpleNamespace(native_only_components=())
 
             @staticmethod
@@ -530,6 +533,7 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
         class _Args:
             component_precisions = {}
             component_quantizations = {}
+            component_weights_paths = {}
             pipeline_config = SimpleNamespace(native_only_components=())
 
             @staticmethod

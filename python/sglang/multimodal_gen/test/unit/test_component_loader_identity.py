@@ -90,6 +90,7 @@ class TestComponentLoaderIdentity(unittest.TestCase):
         }
         server_args = SimpleNamespace(
             component_paths={},
+            component_precisions={},
             component_weights_paths={},
             component_direct_gpu_weight_loading=set(),
             resolve_component_attention_backend=lambda *_names: (None, None),
