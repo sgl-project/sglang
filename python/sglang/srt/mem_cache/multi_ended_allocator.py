@@ -1063,6 +1063,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         virt_tokens: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
+        multiplier: Optional[int] = None,
     ) -> torch.Tensor:
         """Virtual token ids -> kernel-facing ids:
 
@@ -1073,8 +1074,16 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         clamp to kernel-facing id 0, the page-0 sink. int64 out; a consumer whose
         kernel ABI wants int32 narrows where it fills that buffer.
         """
+        # `pool_page_size`, NOT `page_size`: upstream now scales the latter by
+        # dcp_size, while translation is over PHYSICAL pages.
         ps = self.pool_page_size
-        stride = ps * self.kernel_page_multiplier
+        # `multiplier` overrides for a SECOND kernel-facing family over the same
+        # pages and v2p table -- the fused draft-KV region, whose rows have their
+        # own width and therefore their own page stride (see
+        # MHASubPoolSpec.draft_kernel_page_multiplier).
+        stride = ps * (
+            self.kernel_page_multiplier if multiplier is None else multiplier
+        )
         with record_function("MultiEndedAlloc.translate_kv_loc_for_kernel"):
             pages = virt_tokens if ps == 1 else virt_tokens // ps
             offsets = None if ps == 1 else virt_tokens % ps
@@ -1106,6 +1115,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         widened_loc: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
+        multiplier: Optional[int] = None,
     ) -> torch.Tensor:
         """Widened virtual WRITE loc (`out_cache_loc`) -> kernel-facing id.
 
@@ -1118,10 +1128,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         parallel = get_parallel()
         dcp_size = parallel.attn_dcp_size if self.shards_under_dcp else 1
         if dcp_size == 1:
-            return self.translate_kv_loc_for_kernel(widened_loc, out=out)
+            return self.translate_kv_loc_for_kernel(
+                widened_loc, out=out, multiplier=multiplier
+            )
         with record_function("MultiEndedAlloc.translate_write_loc_for_kernel"):
             owned = (widened_loc % dcp_size) == parallel.attn_dcp_rank
-            dense = self.translate_kv_loc_for_kernel(widened_loc // dcp_size)
+            dense = self.translate_kv_loc_for_kernel(
+                widened_loc // dcp_size, multiplier=multiplier
+            )
             dense = torch.where(owned, dense, torch.zeros_like(dense))
             if out is not None:
                 out.copy_(dense)

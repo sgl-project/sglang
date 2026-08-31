@@ -51,6 +51,7 @@ read table, into the same index table.
 
 from __future__ import annotations
 
+import functools
 import weakref
 from typing import Optional, Tuple
 
@@ -63,7 +64,14 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedDraftKVPool
 from sglang.srt.runtime_context import get_parallel
+
+
+def _same_loc(loc: torch.Tensor) -> torch.Tensor:
+    """Single id space: window layers write the SAME slots as full layers, so
+    the sliding-window write loc IS the full one (the fused draft region)."""
+    return loc
 
 
 class KVReadTables(msgspec.Struct, frozen=True):
@@ -90,8 +98,14 @@ class KVIndexTable(msgspec.Struct, frozen=True):
     def sliding_window_read_ids(self) -> torch.Tensor:
         """Which array a sliding-window gather reads: the parallel swa array
         when translated, else the full-attention array, which the caller maps
-        through the pool's own full->swa map."""
-        return self.sliding_window_ids if self.is_translated else self.ids
+        through the pool's own full->swa map. A fused draft region keeps no
+        separate swa id space, so its window reads come from the one array
+        too."""
+        if not self.is_translated:
+            return self.ids
+        return (
+            self.sliding_window_ids if self.sliding_window_ids is not None else self.ids
+        )
 
     @classmethod
     def passthrough(
@@ -134,14 +148,53 @@ class KVIndexTranslator:
         self.page_size = page_size
         self.device = device
 
-        self.is_translating = (
+        is_unified_target = (
             isinstance(
                 token_to_kv_pool_allocator,
                 (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWATokenToKVPoolAllocator),
             )
             and token_to_kv_pool_allocator.get_kvcache() is token_to_kv_pool
         )
-        if self.is_translating:
+        # Fused draft KV: the draft runner reads/writes the DRAFT region fused
+        # into the target's pages — same v2p table, its own dense stride. The
+        # host_allocator identity replaces the target's get_kvcache() identity
+        # (the draft pool is deliberately NOT the allocator's kvcache).
+        # Private-pool drafts (DSPARK / DFLASH) match NEITHER branch and keep
+        # the strict passthrough — their virtual-indexed buffers must never be
+        # translated (see the class docstring).
+        is_fused_draft = (
+            isinstance(token_to_kv_pool, UnifiedDraftKVPool)
+            and token_to_kv_pool.host_allocator is token_to_kv_pool_allocator
+        )
+        self.is_translating = is_unified_target or is_fused_draft
+        if is_fused_draft:
+            alloc = token_to_kv_pool_allocator
+            draft_mult = token_to_kv_pool.draft_kernel_page_multiplier
+            self._full_v2p_table = alloc.full_v2p_page_table
+            self._full_page_multiplier = draft_mult
+            self._translate_full = functools.partial(
+                alloc.full_attn_allocator.translate_kv_loc_for_kernel,
+                multiplier=draft_mult,
+            )
+            # Same two attributes the target dispositions below carry: the write
+            # loc arrives DCP-widened where the read indices do not, and a DCP
+            # read stays widened to its consumer. The draft rides the target's
+            # v2p table and virtual id space, so the DCP rule is the target's --
+            # only the multiplier differs.
+            self._translate_write_full = functools.partial(
+                alloc.full_attn_allocator.translate_write_loc_for_kernel,
+                multiplier=draft_mult,
+            )
+            self.defer_read_translate = get_parallel().attn_dcp_size > 1
+            # The draft family is dense-only: window layers read and write
+            # the SAME fused slots as full layers, so there is no separate swa
+            # id space — the sliding-window write loc aliases the dense loc at
+            # the per-batch build instead.
+            self._full_p2v_table = None
+            self._swa_v2p_table = None
+            self._swa_page_multiplier = 1
+            self._swa_write_loc_from_full = _same_loc
+        elif self.is_translating:
             alloc = token_to_kv_pool_allocator
             self._full_v2p_table = alloc.full_v2p_page_table
             self._full_p2v_table = alloc.full_p2v_page_table
