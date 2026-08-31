@@ -24,7 +24,7 @@ on:
   workflow_call:
     inputs:
       runs_on:
-        description: 'Runner label for the compile job. Must be self-hosted: its glibc has to satisfy max_glibc, and the cargo build cache needs a persistent ~/.cache.'
+        description: 'Runner label for the compile job. Its glibc has to satisfy max_glibc.'
         type: string
         required: true
       restore_runs_on:
@@ -182,14 +182,10 @@ jobs:
           export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
           # Per-interpreter subdirs (set in the loop): PyO3's fingerprint tracks
           # the interpreter, so a shared dir rebuilds on every ABI switch.
-          cargo_target_root="${HOME}/.cache/sglang-cargo-target"
+          # A hosted runner is fresh per job, so there is no shared tree to reuse or
+          # to guard against a concurrent dropper.
+          cargo_target_root="${RUNNER_TEMP:-/tmp}/sglang-cargo-target-${GITHUB_RUN_ID:-norun}-$$"
           mkdir -p "${cargo_target_root}"
-          used="$(df --output=pcent "${cargo_target_root}" 2>/dev/null | tr -dc '0-9')"
-          if [ "${used:-0}" -ge 85 ]; then
-              echo "cargo target dir filesystem at ${used}%; dropping ${cargo_target_root}"
-              rm -rf "${cargo_target_root}"
-              mkdir -p "${cargo_target_root}"
-          fi
           python3 -m pip install --upgrade pip
           command -v uv >/dev/null 2>&1 || pip install uv
           # build_rust needs only the build backend, not sglang's ~294 runtime deps.
@@ -198,7 +194,7 @@ jobs:
           venv_root="${RUNNER_TEMP:-/tmp}/sglang-ci-rust-ext-${GITHUB_RUN_ID:-norun}-$$"
           # Best-effort, like ci_cleanup_venv.sh: under set -e a failing EXIT trap
           # would fail the step, and nothing here is worth keeping for a postmortem.
-          trap 'rm -rf "${venv_root}" || true' EXIT
+          trap 'rm -rf "${venv_root}" "${cargo_target_root}" || true' EXIT
           for python_bin in "${{ steps.py310.outputs.python-path }}" "${{ steps.py312.outputs.python-path }}"; do
               minor="$("${python_bin}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
               export CARGO_TARGET_DIR="${cargo_target_root}/py${minor}"
