@@ -58,7 +58,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
     LoRAPipeline,
     stack_or_compose_fused_lora,
 )

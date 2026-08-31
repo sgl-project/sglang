@@ -467,16 +467,16 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             # The protected prefix is not this req's to free.
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
+                req.kv.req_pool_idx, req.kv.cache_protected_len : kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free_segment(
-                kv_indices, start_pos=req.cache_protected_len
+                kv_indices, start_pos=req.kv.cache_protected_len
             )
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, : len(token_ids)
         ]
 
         radix_key = RadixKey(
@@ -502,8 +502,8 @@ class RadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free_segments(
             [
                 (
-                    kv_indices[req.cache_protected_len : freed_end],
-                    req.cache_protected_len,
+                    kv_indices[req.kv.cache_protected_len : freed_end],
+                    req.kv.cache_protected_len,
                 ),
                 (kv_indices[key_len:], key_len),
             ]
@@ -520,7 +520,7 @@ class RadixCache(BasePrefixCache):
 
         token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, : len(token_ids)
         ]
 
         radix_key = RadixKey(
@@ -543,8 +543,8 @@ class RadixCache(BasePrefixCache):
         new_prefix_len = result.prefix_len
 
         self.token_to_kv_pool_allocator.free_segment(
-            kv_indices[req.cache_protected_len : new_prefix_len],
-            start_pos=req.cache_protected_len,
+            kv_indices[req.kv.cache_protected_len : new_prefix_len],
+            start_pos=req.kv.cache_protected_len,
         )
 
         # The prefix indices could be updated, reuse it
@@ -558,15 +558,15 @@ class RadixCache(BasePrefixCache):
         ), f"{len(new_indices)=}, {len(radix_key)=}"
 
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
+            (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
+            new_indices[req.kv.cache_protected_len :],
         )
 
         # The cache_protected_len is not always equal to len(req.prefix_indices)
         # since for page_size > 1, the partial part is added to req.prefix_indices, but that part of kv indices is not added to the tree.
         # It should be freed in the next cache_unfinished_req and final cache_finished_req to avoid memory leak.
         # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
-        req.cache_protected_len = len(new_indices)
+        req.kv.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)

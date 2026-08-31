@@ -7,6 +7,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.runtime_context import get_parallel
+
 logger = logging.getLogger(__name__)
 
 CONTROL_WORD_BYTES = 4
@@ -21,7 +23,7 @@ def align_up(value: int, alignment: int) -> int:
 def _driver_modules():
     from cuda.bindings import driver as cuda
 
-    from sglang.srt.cuda_vmm_utils import check_drv
+    from sglang.srt.utils.cuda_vmm_utils import check_drv
 
     return cuda, check_drv
 
@@ -57,7 +59,6 @@ def resolve_consumer_rank(
         return 0
     if consumer_rank is None:
         try:
-            from sglang.srt.runtime_context import get_parallel
 
             # Use the global TP rank. An attention/DCP subgroup rank can alias
             # another consumer's acknowledgement slot.

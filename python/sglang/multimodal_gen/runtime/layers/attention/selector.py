@@ -69,6 +69,12 @@ class ComponentAttnBackendContext(NamedTuple):
     backend: AttentionBackendEnum | None
     component_name: str | None
     selected_backends: dict[str, str | None]
+    allow_global_backend_fallback: bool = False
+    require_backend_selection: bool = False
+
+
+class ComponentAttentionBackendNotAppliedError(ValueError):
+    """An explicit component backend did not control its attention layers."""
 
 
 component_attn_backend_context: ContextVar[ComponentAttnBackendContext | None] = (
@@ -108,9 +114,25 @@ def get_component_forced_attn_backend() -> AttentionBackendEnum | None:
     return context.backend if context is not None else None
 
 
+def claim_deferred_component_attn_backend() -> AttentionBackendEnum | None:
+    """Capture an override whose compatible backend is resolved on first use."""
+    context = get_component_attn_backend_context()
+    if context is None or context.backend is None:
+        return None
+    _record_component_attn_backend(
+        context.backend.name.lower(), "deferred first-use selection"
+    )
+    return context.backend
+
+
 def get_component_attn_backend_name() -> str | None:
     context = get_component_attn_backend_context()
     return context.component_name if context is not None else None
+
+
+def _component_allows_global_backend_fallback() -> bool:
+    context = get_component_attn_backend_context()
+    return context is not None and context.allow_global_backend_fallback
 
 
 def _record_component_attn_backend(backend_name: str, reason: str | None) -> bool:
@@ -118,10 +140,19 @@ def _record_component_attn_backend(backend_name: str, reason: str | None) -> boo
     if context is None or context.component_name is None:
         return False
 
-    existing_reason = context.selected_backends.get(backend_name)
-    if backend_name not in context.selected_backends or existing_reason is None:
+    if backend_name not in context.selected_backends:
         context.selected_backends[backend_name] = reason
+    elif reason is None:
+        # unrestricted selection must not be hidden by a later valid fallback
+        context.selected_backends[backend_name] = None
     return True
+
+
+def record_component_attn_backend(
+    backend: AttentionBackendEnum, reason: str | None = None
+) -> bool:
+    """Record a component backend selected outside layer construction."""
+    return _record_component_attn_backend(backend.name.lower(), reason)
 
 
 def _log_component_attn_backend_summary(
@@ -147,6 +178,40 @@ def _log_component_attn_backend_summary(
     )
 
 
+def _validate_component_attn_backend_selection(
+    context: ComponentAttnBackendContext,
+) -> None:
+    if not context.require_backend_selection:
+        return
+
+    requested_backend = context.backend
+    assert requested_backend is not None
+    requested_name = requested_backend.name.lower()
+    component_name = context.component_name or "component"
+    if requested_name not in context.selected_backends:
+        detail = (
+            "did not construct any SGLang-selectable attention layers"
+            if not context.selected_backends
+            else f"selected {', '.join(sorted(context.selected_backends))} instead"
+        )
+        raise ComponentAttentionBackendNotAppliedError(
+            f"Attention backend '{requested_name}' was requested for component "
+            f"'{component_name}', but it {detail}"
+        )
+
+    unexplained = sorted(
+        backend_name
+        for backend_name, reason in context.selected_backends.items()
+        if backend_name != requested_name and reason is None
+    )
+    if unexplained:
+        raise ComponentAttentionBackendNotAppliedError(
+            f"Attention backend '{requested_name}' was requested for component "
+            f"'{component_name}', but it also selected "
+            f"{', '.join(unexplained)} without an allowed fallback"
+        )
+
+
 def get_attn_backend(
     head_size: int,
     dtype: torch.dtype,
@@ -166,6 +231,7 @@ def get_attn_backend(
         )
 
     selected_backend = selected_attention_backend
+    selected_from_global_cli = False
     selection_is_explicit = selected_backend is not None
     if selected_backend is None:
         selected_backend = get_global_forced_attn_backend()
@@ -188,6 +254,7 @@ def get_attn_backend(
             selection_is_explicit = isinstance(
                 server_args, ServerArgs
             ) and server_args.is_arg_explicitly_set("attention_backend")
+            selected_from_global_cli = selection_is_explicit
 
     if selected_backend is None:
         selected_backend = default_attention_backend
@@ -197,6 +264,14 @@ def get_attn_backend(
         allowed_fallback_reason = "platform default fallback"
     elif is_cross_attention and selected_backend.is_sparse:
         allowed_fallback_reason = "dense cross-attention fallback"
+    elif selected_from_global_cli and (
+        default_attention_backend is not None
+        or _component_allows_global_backend_fallback()
+    ):
+        # The global CLI backend is strict for DiT components. Auxiliary
+        # components may instead use a declared default or platform-compatible
+        # backend. A component-specific CLI override otherwise remains strict.
+        allowed_fallback_reason = "global backend fallback"
     elif not selection_is_explicit:
         allowed_fallback_reason = "platform default fallback"
 
@@ -206,7 +281,7 @@ def get_attn_backend(
 
     candidate_backends = [selected_backend]
     if allowed_fallback_reason is not None:
-        for candidate in (None, *be_tuple):
+        for candidate in (default_attention_backend, None, *be_tuple):
             if candidate not in candidate_backends:
                 candidate_backends.append(candidate)
 
@@ -229,9 +304,17 @@ def get_attn_backend(
                 selection_error = error
             continue
 
-        candidate_name = candidate_cls.get_enum().name.lower()
+        candidate_backend = candidate_cls.get_enum()
+        candidate_name = candidate_backend.name.lower()
+        if is_cross_attention and candidate_backend.is_sparse:
+            if selection_error is None:
+                selection_error = ValueError(
+                    f"Sparse attention backend '{candidate_name}' cannot serve "
+                    "cross-attention"
+                )
+            continue
         if supported_backends and not _is_backend_supported(
-            candidate_cls.get_enum(), supported_backends
+            candidate_backend, supported_backends
         ):
             if selection_error is None:
                 selection_error = ValueError(
@@ -254,14 +337,22 @@ def get_attn_backend(
         break
 
     if attention_backend_cls is None:
+        component_name = get_component_attn_backend_name()
+        component_suffix = (
+            f" for component '{component_name}'" if component_name is not None else ""
+        )
         if unsupported_requirements:
             raise ValueError(
                 f"Attention backend '{unsupported_backend_name}' does not implement "
-                f"{', '.join(unsupported_requirements)}"
+                f"{', '.join(unsupported_requirements)}{component_suffix}"
             )
         if selection_error is not None:
-            raise selection_error
-        raise ValueError("No compatible attention backend is available")
+            raise ValueError(
+                f"{selection_error}{component_suffix}"
+            ) from selection_error
+        raise ValueError(
+            f"No compatible attention backend is available{component_suffix}"
+        )
 
     backend_name = attention_backend_cls.get_enum().name.lower()
     reason = fallback_reason
@@ -332,19 +423,38 @@ def _is_backend_supported(
 def component_attn_backend_context_manager(
     attn_backend: AttentionBackendEnum | None,
     component_name: str | None = None,
+    allow_global_backend_fallback: bool = False,
+    require_backend_selection: bool | None = None,
+    require_component_backend_selection: bool | None = None,
 ) -> Generator[None, None, None]:
     if attn_backend is None and component_name is None:
         yield
         return
 
+    if require_backend_selection is None:
+        require_backend_selection = (
+            require_component_backend_selection
+            if require_component_backend_selection is not None
+            else attn_backend is not None
+        )
+    elif require_component_backend_selection is not None:
+        raise ValueError("Specify only one component backend selection requirement")
+
     token = component_attn_backend_context.set(
-        ComponentAttnBackendContext(attn_backend, component_name, {})
+        ComponentAttnBackendContext(
+            attn_backend,
+            component_name,
+            {},
+            allow_global_backend_fallback,
+            require_backend_selection,
+        )
     )
     try:
         yield
-    finally:
         context = component_attn_backend_context.get()
+        _validate_component_attn_backend_selection(context)
         _log_component_attn_backend_summary(context)
+    finally:
         component_attn_backend_context.reset(token)
 
 
