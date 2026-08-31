@@ -249,7 +249,8 @@ void extend_attention_cpu(
     int64_t sliding_window_size,
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks,
-    std::optional<at::Tensor> tree_mask);
+    std::optional<at::Tensor> tree_mask,
+    bool is_causal = true);
 
 // flash attention
 at::Tensor flash_attn_varlen_func(
@@ -724,7 +725,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "seq_lens, Tensor extend_seq_lens, Tensor "
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
       "sliding_window_size, Tensor? "
-      "encoder_lens, Tensor? sinks, Tensor? tree_mask=None) -> ()");
+      "encoder_lens, Tensor? sinks, Tensor? tree_mask=None, bool is_causal=True) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
   // flash attn
