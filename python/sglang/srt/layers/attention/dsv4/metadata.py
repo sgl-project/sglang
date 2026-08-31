@@ -152,9 +152,9 @@ class PagedIndexerMetadata:
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)
 
-        from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
+        if envs.SGLANG_OPT_USE_TOPK_V2.get() and not is_xpu():
+            from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
 
-        if envs.SGLANG_OPT_USE_TOPK_V2.get():
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
         else:
             self.topk_metadata = torch.empty((0,))

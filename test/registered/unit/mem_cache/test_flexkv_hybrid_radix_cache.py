@@ -150,8 +150,7 @@ def test_restore_lease_blocks_duplicate_lookup_until_cache_commit():
         rid="request",
         prefix_indices=inner_match.device_indices,
         last_node=node,
-        cache_protected_len=4,
-        kv=None,
+        kv=SimpleNamespace(cache_protected_len=4, swa_evicted_seqlen=0),
         pending_restore_generation=None,
         pending_restore_slots=None,
     )
@@ -267,7 +266,7 @@ def test_finished_release_commits_restore_lease_after_inner_cache():
         pending_restore_generation=3,
         pending_restore_slots=restored,
         _flexkv_uncached_restore=True,
-        kv_committed_len=4,
+        kv=SimpleNamespace(kv_committed_len=4),
         origin_input_ids=array("q", range(4)),
         output_ids=array("q"),
     )

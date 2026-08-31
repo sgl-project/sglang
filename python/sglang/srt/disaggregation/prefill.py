@@ -43,6 +43,8 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    build_kv_layer_ids,
+    build_staging_slot_metadata,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -68,6 +70,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -97,6 +100,16 @@ def should_force_retry(req: Req) -> bool:
 
     digest = hashlib.sha256(str(req.rid).encode()).digest()
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
+
+
+def _transfer_start_layer(*, pool, hf_text_config) -> int:
+    # Hybrid pools count all layers in start_layer, but peer KV lists contain only
+    # full-attention layers, so translate to a full-attention-relative offset.
+    if not isinstance(pool, HybridLinearKVPool):
+        return pool.start_layer
+    return sum(
+        1 for lid in hf_text_config.full_attention_layer_ids if lid < pool.start_layer
+    )
 
 
 def maybe_release_metadata_buffer(
@@ -212,7 +225,10 @@ class PrefillBootstrapQueue:
                 self.token_to_kv_pool.start_layer,
             )
             if layer_shard_enabled
-            else self.token_to_kv_pool.start_layer
+            else _transfer_start_layer(
+                pool=self.token_to_kv_pool,
+                hf_text_config=self.scheduler.model_config.hf_text_config,
+            )
         )
         kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
@@ -224,24 +240,27 @@ class PrefillBootstrapQueue:
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
 
-        if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
+        draft_kv_pool = self.draft_token_to_kv_pool if transfer_draft_cache else None
+        num_draft_entries = 0
+        if draft_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                draft_kv_pool.get_contiguous_buf_infos()
             )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+            num_draft_entries = len(draft_kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
-            self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
-            else []
+        kv_args.kv_layer_ids = build_kv_layer_ids(
+            token_to_kv_pool=self.token_to_kv_pool,
+            draft_token_to_kv_pool=draft_kv_pool,
+            num_draft_entries=num_draft_entries,
+            num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
@@ -253,7 +272,7 @@ class PrefillBootstrapQueue:
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
-        kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
+        kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
 
         req_to_token_pool = getattr(self.scheduler, "req_to_token_pool", None)
@@ -288,11 +307,19 @@ class PrefillBootstrapQueue:
             kv_pool = self.token_to_kv_pool
             if hasattr(kv_pool, "full_kv_pool"):
                 kv_pool = kv_pool.full_kv_pool
-            if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
+            staging_slots = build_staging_slot_metadata(
+                kv_layer_ids=kv_args.kv_layer_ids,
+                num_draft_entries=num_draft_entries,
+                kv_pool=kv_pool,
+                draft_kv_pool=draft_kv_pool,
+            )
+            if staging_slots is not None:
+                k_buffers, v_buffers, slot_layer_ids = staging_slots
                 kv_manager.set_kv_buffer_tensors(
-                    kv_pool.k_buffer,
-                    kv_pool.v_buffer,
+                    k_buffers,
+                    v_buffers,
                     kv_pool.page_size,
+                    slot_layer_ids=slot_layer_ids,
                 )
         return kv_manager
 
@@ -438,8 +465,7 @@ class PrefillBootstrapQueue:
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
                 if (
-                    req.prefill_attempt_count
-                    < self.scheduler.server_args.optimistic_prefill_attempts
+                    req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
                     and not req.is_retracted  # engine paused
                 ):
                     if not self.ensure_metadata_buffer(req):
@@ -680,6 +706,10 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        auxiliary_output_starts = (
+            self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
+        )
+        auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
@@ -690,6 +720,16 @@ class SchedulerDisaggregationPrefillMixin:
         logprob_pt = 0
         assert batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
+        draft_hidden_states_cpu = None
+        draft_dsa_topk_indices_cpu = None
+        if self.spec_algorithm.is_eagle() and draft_input is not None:
+            draft_hidden_states_cpu = draft_input.hidden_states.to(
+                "cpu", non_blocking=False
+            )
+            if batch.spec_info.dsa_topk_indices is not None:
+                draft_dsa_topk_indices_cpu = batch.spec_info.dsa_topk_indices.to(
+                    "cpu", non_blocking=False
+                )
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
         self.batch_result_processor.move_logprobs_to_cpu(
@@ -724,12 +764,11 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
                     req.output_topk_index = draft_input.topk_index[i]
-                    req.hidden_states_tensor = (
-                        draft_input.hidden_states[i].cpu().clone()
-                    )
-                    dsa_topk_indices = batch.spec_info.dsa_topk_indices
-                    if dsa_topk_indices is not None:
-                        req.output_dsa_topk_indices = dsa_topk_indices[i].cpu().clone()
+                    req.hidden_states_tensor = draft_hidden_states_cpu[i].clone()
+                    if draft_dsa_topk_indices_cpu is not None:
+                        req.output_dsa_topk_indices = draft_dsa_topk_indices_cpu[
+                            i
+                        ].clone()
                     else:
                         req.output_dsa_topk_indices = None
                 else:
@@ -818,6 +857,13 @@ class SchedulerDisaggregationPrefillMixin:
                     ), f"Req {req.rid} does not have metadata buffer allocated"
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
+
+        if auxiliary_output is not None:
+            self.batch_result_processor.consume_auxiliary_output(
+                batch,
+                auxiliary_output,
+                auxiliary_output_starts,
+            )
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
@@ -963,24 +1009,6 @@ class SchedulerDisaggregationPrefillMixin:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
 
-    def get_transferred_rids(self: Scheduler) -> List[str]:
-        """
-        Used by PP, get the transferred rids but **do not pop**
-        """
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-        )
-
-        transferred_rids: List[str] = []
-
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if poll == KVPoll.Success or poll == KVPoll.Failed:
-                transferred_rids.append(req.rid)
-
-        return transferred_rids
-
     def clear_pending_chunk_send(self: Scheduler, req: Req) -> None:
         """Drop `req` from the sent-but-unconcluded chunk set.
 
@@ -1008,11 +1036,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        if (
-            req.req_pool_idx is not None
-            or req.kv is not None
-            or req.mamba_pool_idx is not None
-        ):
+        if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
@@ -1191,7 +1215,7 @@ class SchedulerDisaggregationPrefillMixin:
                 return [
                     self.req_to_token_pool.translate_mamba_indices(
                         self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            req.req_pool_idx
+                            req.kv.req_pool_idx
                         ]
                     )
                     .cpu()
@@ -1203,7 +1227,7 @@ class SchedulerDisaggregationPrefillMixin:
                 window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, window_start:seq_len
+                    req.kv.req_pool_idx, window_start:seq_len
                 ]
                 window_kv_indices_swa = (
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -1212,9 +1236,9 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
-            def _dsa_payload():
+            def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :seq_len
+                    req.kv.req_pool_idx, :seq_len
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
 
@@ -1227,7 +1251,7 @@ class SchedulerDisaggregationPrefillMixin:
                 window_size = _pool.unified_swa_window
                 window_start = max(0, seq_len - window_size)
                 positions = np.arange(window_start, seq_len, dtype=np.int64)
-                state_slot = int(req.req_pool_idx)
+                state_slot = int(req.kv.req_pool_idx)
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
@@ -1241,7 +1265,7 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 )
                 return get_dsv4_c128_state_indices(
-                    int(req.req_pool_idx),
+                    int(req.kv.req_pool_idx),
                     c128_seq_len,
                     online=online,
                     ring_size=ring_size,
@@ -1250,15 +1274,15 @@ class SchedulerDisaggregationPrefillMixin:
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
-            # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
-            # as main KV on the same page_size.
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _dsa_payload,
-                StateType.MINIMAX_INDEX_K: _dsa_payload,
+                StateType.DSA: _full_kv_pages_payload,
+                StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
+                StateType.BLOCK_SCALE: _full_kv_pages_payload,
+                StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
             if _is_npu and isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(),
@@ -1271,7 +1295,7 @@ class SchedulerDisaggregationPrefillMixin:
                 payloads.update(
                     dsv4_state_payloads(
                         self.req_to_token_pool,
-                        req.req_pool_idx,
+                        req.kv.req_pool_idx,
                         seq_len,
                         page_size,
                         prefix_len=req.disagg_decode_prefix_len,
@@ -1297,7 +1321,7 @@ class SchedulerDisaggregationPrefillMixin:
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, seg_start:seg_end
+                req.kv.req_pool_idx, seg_start:seg_end
             ]
             # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
             # physical ones. Per segment, since each is its own gather.

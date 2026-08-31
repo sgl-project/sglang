@@ -181,9 +181,7 @@ class FlexKVRadixCache(RadixCache):
             )
         )
         self._async_store_slot_mapping = (
-            async_store_requested
-            and self._defer_store_launch
-            and async_store_supported
+            async_store_requested and self._defer_store_launch and async_store_supported
         )
         if async_store_requested and not self._async_store_slot_mapping:
             logger.warning(
@@ -483,7 +481,7 @@ class FlexKVRadixCache(RadixCache):
         if request_owned_req is not None:
             # Normal request completion inserts these slots into the radix tree.
             # Until then they have exactly one owner: the request cleanup path.
-            request_owned_req.cache_protected_len = value_numel
+            request_owned_req.kv.cache_protected_len = value_numel
             request_owned_req._flexkv_uncached_restore = True
             # SchedulePolicy sets cache_protected_len to the complete restored
             # prefix after init_load_back.  That is correct for accounting while
@@ -532,8 +530,8 @@ class FlexKVRadixCache(RadixCache):
             # Restored IP/layerwise slots are request-owned until this insertion.
             # SchedulePolicy temporarily counts them as protected, so restore the
             # pre-load tree-owned boundary before RadixCache handles duplicates.
-            req.cache_protected_len = getattr(
-                req, "_flexkv_restore_tree_owned_len", req.cache_protected_len
+            req.kv.cache_protected_len = getattr(
+                req, "_flexkv_restore_tree_owned_len", req.kv.cache_protected_len
             )
         super().cache_finished_req(
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
@@ -549,7 +547,7 @@ class FlexKVRadixCache(RadixCache):
         topk = get_spec().speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
-            kv_committed_len = req.kv_committed_len
+            kv_committed_len = req.kv.kv_committed_len
         else:
             kv_committed_len = len(req.origin_input_ids) + max(
                 len(req.output_ids) - 1, 0
@@ -596,9 +594,7 @@ class FlexKVRadixCache(RadixCache):
                     or req.rid in self._inflight_store_nodes
                 ):
                     self.dec_lock_ref(new_last_node)
-                    raise RuntimeError(
-                        f"FlexKV duplicate pending store rid={req.rid}"
-                    )
+                    raise RuntimeError(f"FlexKV duplicate pending store rid={req.rid}")
                 self._pending_store_launches[req.rid] = _PendingStoreLaunch(
                     node=new_last_node,
                     token_ids=list(token_ids),
@@ -607,9 +603,7 @@ class FlexKVRadixCache(RadixCache):
             return
 
         try:
-            fkv_task_id = self._launch_store(
-                req.rid, list(token_ids), kv_indices
-            )
+            fkv_task_id = self._launch_store(req.rid, list(token_ids), kv_indices)
         except Exception:  # noqa: BLE001
             self.dec_lock_ref(new_last_node)
             raise
@@ -781,8 +775,8 @@ class FlexKVRadixCache(RadixCache):
         self, req: Req, chunked=False
     ) -> None:
         if getattr(req, "_flexkv_uncached_restore", False):
-            req.cache_protected_len = getattr(
-                req, "_flexkv_restore_tree_owned_len", req.cache_protected_len
+            req.kv.cache_protected_len = getattr(
+                req, "_flexkv_restore_tree_owned_len", req.kv.cache_protected_len
             )
         super().cache_unfinished_req(req, chunked=chunked)
         req._flexkv_uncached_restore = False

@@ -181,7 +181,10 @@ def test_ip_match_is_lookup_only_until_request_admission():
 def test_request_owned_restore_is_not_attached_before_cache_completion():
     cache, _allocator = _make_cache()
     key = RadixKey(array("q", range(4)))
-    req = SimpleNamespace(cache_protected_len=0, _flexkv_uncached_restore=False)
+    req = SimpleNamespace(
+        kv=SimpleNamespace(cache_protected_len=0),
+        _flexkv_uncached_restore=False,
+    )
     load_fn = MagicMock(side_effect=lambda slots: int(slots.numel()))
 
     result = cache._allocate_and_load(
@@ -199,7 +202,7 @@ def test_request_owned_restore_is_not_attached_before_cache_completion():
     restored, last_node = result
     assert restored.numel() == 4
     assert last_node is cache.root_node
-    assert req.cache_protected_len == 0
+    assert req.kv.cache_protected_len == 0
     assert req._flexkv_uncached_restore is True
     assert req._flexkv_restore_tree_owned_len == 0
     assert cache.root_node.children == {}
@@ -212,15 +215,14 @@ def test_finished_request_restores_tree_owned_boundary_before_duplicate_cleanup(
         rid="concurrent-restore",
         origin_input_ids=[],
         output_ids=[],
-        kv_committed_len=0,
-        cache_protected_len=4,
+        kv=SimpleNamespace(kv_committed_len=0, cache_protected_len=4),
         _flexkv_uncached_restore=True,
         _flexkv_restore_tree_owned_len=0,
     )
     observed_protected_lengths = []
 
     def record_base_cleanup(_self, base_req, **_kwargs):
-        observed_protected_lengths.append(base_req.cache_protected_len)
+        observed_protected_lengths.append(base_req.kv.cache_protected_len)
 
     with (
         patch.object(RadixCache, "cache_finished_req", record_base_cleanup),
@@ -250,11 +252,13 @@ def test_finished_store_uses_radix_owned_slots_after_request_row_is_cleared():
         rid="finished-request",
         origin_input_ids=[1, 2, 3, 4],
         output_ids=[],
-        kv_committed_len=4,
-        req_pool_idx=0,
+        kv=SimpleNamespace(
+            kv_committed_len=4,
+            req_pool_idx=0,
+            cache_protected_len=0,
+        ),
         extra_key=None,
         cache_salt=None,
-        cache_protected_len=0,
         last_node=cache.root_node,
         _flexkv_uncached_restore=False,
     )
@@ -266,7 +270,9 @@ def test_finished_store_uses_radix_owned_slots_after_request_row_is_cleared():
             {"get_spec": lambda: SimpleNamespace(speculative_eagle_topk=None)},
         ),
         patch("torch.cuda.current_stream", return_value=producer_stream),
-        patch("torch.cuda.stream", side_effect=lambda _stream: contextlib.nullcontext()),
+        patch(
+            "torch.cuda.stream", side_effect=lambda _stream: contextlib.nullcontext()
+        ),
     ):
         cache.cache_finished_req(req, kv_len_to_handle=4)
 
@@ -275,6 +281,7 @@ def test_finished_store_uses_radix_owned_slots_after_request_row_is_cleared():
     assert stored["token_ids"] == [1, 2, 3, 4]
     assert stored["kv_indices"].tolist() == [4, 5, 6, 7]
     cache.store_stream.wait_stream.assert_called_once_with(producer_stream)
+
 
 def test_deferred_store_retains_node_and_launches_on_hicache_tick():
     cache, allocator = _make_cache(page_size=4)
@@ -287,11 +294,13 @@ def test_deferred_store_retains_node_and_launches_on_hicache_tick():
         rid="deferred-store",
         origin_input_ids=[1, 2, 3, 4],
         output_ids=[],
-        kv_committed_len=4,
-        req_pool_idx=0,
+        kv=SimpleNamespace(
+            kv_committed_len=4,
+            req_pool_idx=0,
+            cache_protected_len=0,
+        ),
         extra_key=None,
         cache_salt=None,
-        cache_protected_len=0,
         last_node=cache.root_node,
         _flexkv_uncached_restore=False,
     )
@@ -303,7 +312,9 @@ def test_deferred_store_retains_node_and_launches_on_hicache_tick():
             {"get_spec": lambda: SimpleNamespace(speculative_eagle_topk=None)},
         ),
         patch("torch.cuda.current_stream", return_value=producer_stream),
-        patch("torch.cuda.stream", side_effect=lambda _stream: contextlib.nullcontext()),
+        patch(
+            "torch.cuda.stream", side_effect=lambda _stream: contextlib.nullcontext()
+        ),
     ):
         cache.cache_finished_req(req, kv_len_to_handle=4)
 
@@ -346,11 +357,13 @@ def test_async_store_waits_for_event_then_uses_pinned_cpu_mapping():
         rid="async-store",
         origin_input_ids=[1, 2, 3, 4],
         output_ids=[],
-        kv_committed_len=4,
-        req_pool_idx=0,
+        kv=SimpleNamespace(
+            kv_committed_len=4,
+            req_pool_idx=0,
+            cache_protected_len=0,
+        ),
         extra_key=None,
         cache_salt=None,
-        cache_protected_len=0,
         last_node=cache.root_node,
         _flexkv_uncached_restore=False,
     )
@@ -361,7 +374,9 @@ def test_async_store_waits_for_event_then_uses_pinned_cpu_mapping():
             {"get_spec": lambda: SimpleNamespace(speculative_eagle_topk=None)},
         ),
         patch.object(cache, "_stage_store_copy", side_effect=fake_stage),
-        patch("torch.cuda.stream", side_effect=lambda _stream: contextlib.nullcontext()),
+        patch(
+            "torch.cuda.stream", side_effect=lambda _stream: contextlib.nullcontext()
+        ),
     ):
         cache.cache_finished_req(req, kv_len_to_handle=4)
         cache.check_hicache_events()

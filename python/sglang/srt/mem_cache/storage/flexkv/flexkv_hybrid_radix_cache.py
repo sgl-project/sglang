@@ -297,7 +297,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         # The restored tail is request-owned until the normal cache completion
         # path inserts it. Preserve the pre-restore protection boundary so the
         # inner cache can deduplicate or free every restored slot correctly.
-        req.cache_protected_len = marker.device_length
+        req.kv.cache_protected_len = marker.device_length
         req._flexkv_uncached_restore = True
         return device_indices, req.last_node
 
@@ -452,7 +452,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
         self._apply_restore_swa_boundary(req)
-        kv_length = int(kwargs.get("kv_len_to_handle", req.kv_committed_len))
+        kv_length = int(kwargs.get("kv_len_to_handle", req.kv.kv_committed_len))
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_length]
         self._inner_cache.cache_finished_req(req, is_insert=is_insert, **kwargs)
         self._commit_restore(req)
