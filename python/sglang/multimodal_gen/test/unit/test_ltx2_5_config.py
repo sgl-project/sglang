@@ -478,6 +478,66 @@ class TestLTX25DiffusionDecoder(unittest.TestCase):
         cls, _ = ModelRegistry.resolve_model_cls("LTX2VideoDiffusionDecoderModel")
         self.assertEqual(cls.__name__, "LTX2VideoDiffusionDecoderModel")
 
+    def test_rotary_pair_cpu_fallback_matches_original_expression(self):
+        import torch
+
+        from sglang.multimodal_gen.runtime.models.decoders.ltx_2_5_diffusion_decoder import (
+            LTX2VideoVaeRotaryPosEmbed3D,
+        )
+
+        def reference(module, hidden_states):
+            outputs = []
+            offset = 0
+            for axis, (length, dim) in enumerate(
+                zip(hidden_states.shape[1:4], module.rope_dim_split, strict=True),
+                1,
+            ):
+                chunk = hidden_states[..., offset : offset + dim]
+                pairs = chunk.reshape(*chunk.shape[:-1], dim // 2, 2)
+                even = pairs[..., 0].float()
+                odd = pairs[..., 1].float()
+                exponents = torch.arange(0, dim, 2, dtype=torch.float64) / dim
+                inv_freqs = (1.0 / module.base**exponents).to(torch.float32)
+                positions = torch.arange(length, dtype=torch.float32)
+                angles = positions[:, None] * inv_freqs[None, :]
+                shape = [1, 1, 1, 1, 1, dim // 2]
+                shape[axis] = length
+                cos = angles.cos().reshape(shape)
+                sin = angles.sin().reshape(shape)
+                rotated = torch.stack(
+                    [even * cos - odd * sin, even * sin + odd * cos], dim=-1
+                )
+                outputs.append(rotated.reshape(chunk.shape).to(hidden_states.dtype))
+                offset += dim
+            return torch.cat(outputs, dim=-1)
+
+        torch.manual_seed(42)
+        rope = LTX2VideoVaeRotaryPosEmbed3D(64)
+        query = torch.randn(1, 3, 7, 7, 2, 64, dtype=torch.bfloat16)
+        key = torch.randn_like(query)
+
+        query_out, key_out = rope.forward_pair(query, key)
+
+        self.assertTrue(torch.equal(query_out, reference(rope, query)))
+        self.assertTrue(torch.equal(key_out, reference(rope, key)))
+
+    def test_rotary_tables_are_shared_across_decoder_blocks(self):
+        import torch
+
+        from sglang.multimodal_gen.runtime.models.decoders.ltx_2_5_diffusion_decoder import (
+            _ROPE_TABLE_CACHE,
+            LTX2VideoVaeRotaryPosEmbed3D,
+        )
+
+        _ROPE_TABLE_CACHE.clear()
+        hidden_states = torch.empty(1, 3, 7, 7, 2, 64, dtype=torch.bfloat16)
+        first = LTX2VideoVaeRotaryPosEmbed3D(64)._tables(hidden_states)
+        second = LTX2VideoVaeRotaryPosEmbed3D(64)._tables(hidden_states)
+
+        self.assertIs(first, second)
+        self.assertEqual(len(_ROPE_TABLE_CACHE), 1)
+        _ROPE_TABLE_CACHE.clear()
+
 
 class TestLTX25OptionalDecoderLoading(unittest.TestCase):
     @staticmethod
@@ -504,7 +564,7 @@ class TestLTX25OptionalDecoderLoading(unittest.TestCase):
 
     def test_decoder_is_not_loaded_by_default(self):
         from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import LTX2Pipeline
-        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+        from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
             LoRAPipeline,
         )
 
@@ -518,7 +578,7 @@ class TestLTX25OptionalDecoderLoading(unittest.TestCase):
 
     def test_decoder_load_is_explicit_and_validated(self):
         from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import LTX2Pipeline
-        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+        from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
             LoRAPipeline,
         )
 

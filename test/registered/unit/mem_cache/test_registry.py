@@ -236,46 +236,43 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             )
             self.assertIs(result, fake_module.RadixCacheCpp.return_value)
 
-    def test_unified_radix_cache_when_env_flag_set(self):
+    def test_unified_radix_cache_is_the_default(self):
         ctx = _make_ctx(
             self,
         )
         # Shim both factory imports — each transitively loads sgl_kernel.
         fake_components = MagicMock()
         fake_radix = MagicMock()
-        with (
-            patch(
-                "sglang.srt.mem_cache.registry.envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get",
-                return_value=True,
-            ),
-            patch.dict(
-                "sys.modules",
-                {
-                    "sglang.srt.mem_cache.unified_cache.components": fake_components,
-                    "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
-                },
-            ),
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+            },
         ):
             result = default_radix_cache_factory(ctx)
             fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
             self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
-    def test_hi_radix_cache_when_hierarchical(self):
+    def test_unified_radix_cache_when_hierarchical(self):
         ctx = _make_ctx(self, enable_hierarchical_cache=True)
-        # `hiradix_cache` imports `hicache_storage` and
-        # `memory_pool_host`, both of which transitively load
-        # `sgl_kernel`; inject a stand-in module.
-        fake_module = MagicMock()
+        # Full attention with hierarchical cache also uses UnifiedRadixCache.
+        fake_components = MagicMock()
+        fake_radix = MagicMock()
         with patch.dict(
             "sys.modules",
-            {"sglang.srt.mem_cache.hiradix_cache": fake_module},
+            {
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+            },
         ):
             result = default_radix_cache_factory(ctx)
-            fake_module.HiRadixCache.assert_called_once_with(
-                params=ctx.params, server_args=ctx.server_args
+            fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
+            fake_radix.UnifiedRadixCache.return_value.init_hicache.assert_called_once_with(
+                ctx.server_args, ctx.params
             )
             ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
-            self.assertIs(result, fake_module.HiRadixCache.return_value)
+            self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
     def test_unified_radix_cache_when_hierarchical_and_hybrid_ssm(self):
         ctx = _make_ctx(self, enable_hierarchical_cache=True, is_hybrid_ssm=True)
@@ -399,16 +396,6 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
                 tp_group=ctx.tp_group,
             )
             self.assertIs(result, fake_module.LMCRadixCache.return_value)
-
-    def test_fallback_to_radix_cache(self):
-        ctx = _make_ctx(
-            self,
-        )
-        with patch("sglang.srt.mem_cache.radix_cache.RadixCache") as RadixCache:
-            RadixCache.return_value = MagicMock()
-            result = default_radix_cache_factory(ctx)
-            RadixCache.assert_called_once_with(ctx.params)
-            self.assertIs(result, RadixCache.return_value)
 
 
 if __name__ == "__main__":

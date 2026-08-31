@@ -136,7 +136,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: diffusion-report-1gpu-${{ matrix.part }}
-          path: python/sglang/multimodal_gen/test/execution_report_*.json
+          path: |
+            python/sglang/multimodal_gen/test/execution_report_*.json
+            python/diffusion-results.json
           retention-days: 1
 
       - name: Upload diffusion failure artifacts
@@ -203,7 +205,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: diffusion-5090-report-${{ github.run_attempt }}
-          path: python/sglang/multimodal_gen/test/execution_report_*.json
+          path: |
+            python/sglang/multimodal_gen/test/execution_report_*.json
+            python/diffusion-results.json
           retention-days: 7
 
       - name: Upload diffusion failure artifacts
@@ -342,7 +346,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: diffusion-report-2gpu-${{ matrix.part }}
-          path: python/sglang/multimodal_gen/test/execution_report_*.json
+          path: |
+            python/sglang/multimodal_gen/test/execution_report_*.json
+            python/diffusion-results.json
           retention-days: 1
 
       - name: Upload diffusion failure artifacts
@@ -462,6 +468,17 @@ jobs:
           name: diffusion-failures-${{ github.job }}-${{ github.run_attempt }}
           path: diffusion-failures/
           if-no-files-found: ignore
+
+      - name: Upload execution report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-report-1gpu-b200-${{ github.run_attempt }}
+          path: |
+            python/sglang/multimodal_gen/test/execution_report_*.json
+            python/diffusion-results.json
+          if-no-files-found: ignore
+          retention-days: 7
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()

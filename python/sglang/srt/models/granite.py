@@ -24,7 +24,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import GraniteConfig
+from transformers import GraniteConfig, PretrainedConfig
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -43,12 +43,44 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    sharded_weight_loader,
+)
+from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.utils import add_prefix, set_weight_attrs
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+SWA_MODEL_TYPES = frozenset({"granite_swa", "granitemoe_swa"})
+
+
+def granite_layer_attn_params(
+    config: PretrainedConfig, layer_id: int
+) -> Tuple[int, float, bool]:
+    """Extract flags for sliding window, rope theta, attention sink."""
+    if config.model_type not in SWA_MODEL_TYPES:
+        return -1, config.rope_parameters["rope_theta"], False
+
+    # SGLang's window bound is exclusive, hence `- 1` (matching gpt_oss).
+    sliding_window_size = (
+        config.sliding_window - 1
+        if config.layer_types[layer_id] == "sliding_attention"
+        else -1
+    )
+    return sliding_window_size, config.layer_rope_theta[layer_id], True
+
+
+def build_attention_sinks(num_heads: int) -> nn.Parameter:
+    # TODO(kpham-sgl): one parameter cannot serve a split launch -- trtllm_mha
+    # wants float32 sinks, FA4 wants bfloat16. Pick the dtype at init instead,
+    # once the serving backends are known. Checkpoint dtype also unverified.
+    attn_backend = get_exec().kernel.attention_backend
+    sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
+    sinks = nn.Parameter(torch.empty(num_heads, dtype=sinks_dtype), requires_grad=False)
+    set_weight_attrs(sinks, {"weight_loader": sharded_weight_loader(0)})
+    return sinks
 
 
 class GraniteMLP(nn.Module):
@@ -97,7 +129,6 @@ class GraniteAttention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         layer_id: int = 0,
-        rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         rope_is_neox_style: bool = True,
         max_position_embeddings: int = 8192,
@@ -127,7 +158,9 @@ class GraniteAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = config.attention_multiplier
-        self.rope_theta = rope_theta
+        sliding_window_size, self.rope_theta, has_sink = granite_layer_attn_params(
+            config, layer_id
+        )
         self.max_position_embeddings = max_position_embeddings
 
         self.qkv_proj = QKVParallelLinear(
@@ -147,14 +180,19 @@ class GraniteAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-            is_neox_style=rope_is_neox_style,
+        self.rotary_emb = (
+            get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=max_position_embeddings,
+                base=self.rope_theta,
+                rope_scaling=rope_scaling,
+                is_neox_style=rope_is_neox_style,
+            )
+            if self.rope_theta
+            else None
         )
+        self.sinks = build_attention_sinks(self.num_heads) if has_sink else None
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -163,6 +201,7 @@ class GraniteAttention(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
+            sliding_window_size=sliding_window_size,
         )
 
     def forward(
@@ -173,8 +212,12 @@ class GraniteAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        if self.rotary_emb is not None:
+            q, k = self.rotary_emb(positions, q, k)
+        if self.sinks is None:
+            attn_output = self.attn(q, k, v, forward_batch)
+        else:
+            attn_output = self.attn(q, k, v, forward_batch, sinks=self.sinks)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -190,7 +233,6 @@ class GraniteDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.residual_multiplier = config.residual_multiplier
-        rope_theta = config.rope_parameters["rope_theta"]
         rope_scaling = config.rope_parameters
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
@@ -206,7 +248,6 @@ class GraniteDecoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
-            rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             rope_is_neox_style=rope_is_neox_style,
             max_position_embeddings=max_position_embeddings,
@@ -505,4 +546,8 @@ class GraniteForCausalLM(nn.Module):
             return None
 
 
-EntryClass = [GraniteForCausalLM]
+class GraniteSWAForCausalLM(GraniteForCausalLM):
+    pass
+
+
+EntryClass = [GraniteForCausalLM, GraniteSWAForCausalLM]
