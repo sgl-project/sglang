@@ -95,6 +95,10 @@ class Session:
         self.req_nodes: Dict[str, SessionReqNode] = {}
         self.close_on_finish: bool = False
         self._inflight: bool = False
+        # True while the reaper observes an unfinished request; lets the
+        # tick after the request finishes restart the idle clock from
+        # (approximately) completion time instead of the previous tick.
+        self._busy_at_last_reap: bool = False
         # Token-array lengths of last_req as of its finish_req. The share path
         # appends speculatively beyond these; only finish_req confirms them, so
         # _share_token_arrays trims back first (heals aborted turns).
@@ -464,6 +468,12 @@ class SessionController:
                     # The session is busy decoding, not idle: keep the idle
                     # timeout clock from expiring underneath an active request.
                     session.last_active_time = now
+                    session._busy_at_last_reap = True
+                elif session._busy_at_last_reap:
+                    # The last request finished between reap ticks: restart
+                    # the idle clock from completion, not the previous tick.
+                    session.last_active_time = now
+                    session._busy_at_last_reap = False
                 elif session.is_timed_out():
                     timed_out.append(sid)
             for sid in timed_out:

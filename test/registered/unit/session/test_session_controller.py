@@ -29,6 +29,9 @@ class _FakeTreeCache:
     def release_session(self, session_id):
         self.released.append(session_id)
 
+    def release_radix_session(self, session_id):
+        pass
+
 
 class _FakeReq:
     """Mimics the bits of Req that SessionController touches."""
@@ -103,7 +106,18 @@ class TestSessionControllerReaper(CustomTestCase):
         self.controller.maybe_reap(time.monotonic())
         self.assertIn("s1", self.controller)
 
+        # The request finished between reap ticks with a stale idle clock:
+        # the first idle tick must restart the clock from completion, not
+        # reap based on the previous tick's timestamp.
         req.is_finished = True
+        self._expire_timeout(session)
+        now = time.monotonic()
+        self.controller.maybe_reap(now)
+        self.assertIn("s1", self.controller)
+        self.assertEqual(self.tree_cache.released, [])
+        self.assertEqual(session.last_active_time, now)
+
+        # Only a full idle timeout after that reaps the session.
         self._expire_timeout(session)
         self.controller.maybe_reap(time.monotonic())
 
