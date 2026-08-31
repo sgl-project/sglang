@@ -264,6 +264,10 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
+                    # The abort may have arrived while this final prefill chunk
+                    # was in flight (abort_request could only set to_finish).
+                    abort_pending = req.to_finish is not None
+
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
 
@@ -275,6 +279,14 @@ class SchedulerBatchResultProcessor:
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
+                        if abort_pending:
+                            # Drop the token from the visible output so it never
+                            # streams ahead of the abort finish. This must happen
+                            # only after release_kv_cache: under overlap the next
+                            # decode step may already have committed a KV slot for
+                            # this token, and the release accounting derives the
+                            # handled length from len(output_ids).
+                            req.output_ids.pop()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:

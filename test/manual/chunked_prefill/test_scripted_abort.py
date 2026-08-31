@@ -11,6 +11,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     SMALL_KV_POOL_BALLAST_PROMPT_LEN,
     SMALL_KV_POOL_MAX_TOTAL_TOKENS,
     VERY_LONG_PROMPT_LEN,
+    advance_to_nth_chunk,
     base_engine_kwargs,
     run_until,
     run_until_all_finished,
@@ -251,6 +252,31 @@ class TestAbortBasic(ScriptedTestCase):
         yield from _drain_until_released(t, r)
         assert r.kv_pages == 0
         assert r.req is None or r.req.inflight_middle_chunks == 0
+
+    def test_abort_last_chunk_in_flight_drops_token(self):
+        self.server.execute_script(self._script_abort_last_chunk_in_flight_drops_token)
+
+    @staticmethod
+    def _script_abort_last_chunk_in_flight_drops_token(t: ScriptedContext):
+        # Overlap-only window: the final chunk has been launched (the request
+        # already left the chunked slot) but its result is still in flight, so
+        # the abort can only mark to_finish. The token computed by that chunk
+        # must be dropped, not appended and streamed ahead of the abort.
+        r = t.start_req(
+            prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4, prompt_token=310
+        )
+        yield from advance_to_nth_chunk(r, 2)
+        assert not r.is_chunking, "final chunk scheduled; req left the chunked slot"
+
+        t.abort(r)
+        yield from _drain_until_released(t, r)
+
+        assert r.kv_pages == 0
+        req = r.req
+        assert req is None or len(req.output_ids) == 0, (
+            f"abort with final chunk in flight must drop the computed token; "
+            f"output_ids={list(req.output_ids) if req is not None else None}"
+        )
 
     def test_abort_penultimate_chunk(self):
         self.server.execute_script(self._script_abort_penultimate_chunk)
