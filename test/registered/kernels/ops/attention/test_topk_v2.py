@@ -34,9 +34,10 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_512_v2,
     topk_transform_ragged_v2,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 PAGE_SIZE = 64  # c4 page size = 256 // 4
 PAGE_BITS = PAGE_SIZE.bit_length() - 1

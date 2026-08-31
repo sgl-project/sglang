@@ -73,9 +73,9 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
             )
         )
         for capability in (
-            "_is_sm90_supported",
-            "_is_sm100_supported",
-            "_is_sm120_supported",
+            "is_sm90",
+            "is_sm100",
+            "is_sm120",
         ):
             with self.subTest(capability=capability):
                 input, qinput, weight, input_scale, weight_scale = self._make_inputs()
@@ -92,14 +92,20 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
                     )
 
                 capabilities = {
-                    "_is_sm90_supported": False,
-                    "_is_sm100_supported": False,
-                    "_is_sm120_supported": False,
+                    "is_sm90": False,
+                    "is_sm100": False,
+                    "is_sm120": False,
                 }
                 capabilities[capability] = True
-                with patch.multiple(fp8_utils, **capabilities), patch.object(
+                with patch.object(
+                    fp8_utils,
+                    "get_platform",
+                    return_value=SimpleNamespace(**capabilities),
+                ), patch.object(
                     fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm
-                ), patch.object(fp8_utils, "get_exec", return_value=exec_config):
+                ), patch.object(
+                    fp8_utils, "get_exec", return_value=exec_config
+                ):
                     fp8_utils.apply_fp8_linear(
                         input,
                         weight,
@@ -151,11 +157,14 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
                 (mat_a.shape[0], mat_b.shape[1]), dtype=out_dtype, device=mat_a.device
             )
 
-        with patch.multiple(
+        with patch.object(
             fp8_utils,
-            _is_sm90_supported=False,
-            _is_sm100_supported=False,
-            _is_sm120_supported=False,
+            "get_platform",
+            return_value=SimpleNamespace(
+                is_sm90=False,
+                is_sm100=False,
+                is_sm120=False,
+            ),
         ), patch.object(fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm):
             fp8_utils.apply_fp8_linear(
                 input,

@@ -1,4 +1,4 @@
-"""ModelSlim MXFP4 scheme for pre-quantized weight inference on Ascend NPU.
+"""ModelSlim MXFP4 scheme for pre-quantized weight inference on NPU.
 
 Loads weights pre-quantized by msmodelslim and runs MXFP4 dual-level
 matmul at inference via npu_dual_level_quant_matmul.
@@ -8,9 +8,6 @@ Checkpoint tensor formats (verified from msmodelslim export):
   weight_scale:     [out, in/32]        uint8          (L1 block scales, e8m0+127)
   weight_dual_scale:[out, in/512, 1]    float32        (L0 coarse scales)
   mul_scale:        [in]                float32        (smooth quant activation scale)
-
-Reference: MindIE-SD W4A4MXFP4DualQuantLinear
-(MindIE-SD/mindiesd/quantization/layer.py)
 """
 
 from typing import List, Optional
@@ -98,7 +95,6 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         # After repack, it becomes `<prefix>.mul_scale`.
         # This is CRITICAL: the offline-quantized weights were calibrated with
         # x * mul_scale applied to the activation. Omitting it causes mosaic output.
-        # Ref: MindIE-SD W4A4MXFP4DualQuantLinear.quant_matmul lines 385-386.
         mul_scale = BasevLLMParameter(
             data=torch.empty(
                 (input_size_per_partition,),
@@ -119,7 +115,6 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
             weight = weight.to(f"npu:{torch.npu.current_device()}")
         weight = torch_npu.npu_dtype_cast(weight, torch_npu.float4_e2m1fn_x2)
         # npu_dual_level_quant_matmul requires x2 in FRACTAL_NZ format (format 29).
-        # Reference: MindIE-SD W4A4MXFP4DualQuantLinear._init_dynamic_quant_param
         weight = torch_npu.npu_format_cast(
             weight.view(torch.int8), 29, customize_dtype=torch.int8
         )
@@ -170,7 +165,6 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         # Apply smooth quant scale before activation quantization.
         # The offline-quantized weights were calibrated under x * mul_scale,
         # so we MUST apply it here for scale alignment.
-        # Reference: MindIE-SD W4A4MXFP4DualQuantLinear.quant_matmul
         mul_scale = layer.mul_scale
         if getattr(layer, "use_mul_scale", True):
             x_2d = x_2d * mul_scale.to(x_2d.dtype)

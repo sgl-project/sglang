@@ -42,7 +42,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     flashinfer_per_tensor_fp8_supported,
-    is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
@@ -63,10 +62,10 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
-    is_sm120_supported,
     round_up,
     set_weight_attrs,
 )
@@ -151,7 +150,7 @@ def fp4_gemm(
     )
 
 
-if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
+if is_cuda() and (not get_platform().is_sm120) and (fp4_quantize is not None):
 
     @register_fake_if_exists("sgl_kernel::scaled_fp4_quant")
     def _sgl_kernel_scaled_fp4_quant_fake(
@@ -1796,7 +1795,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer.weights_padding_cols = 0
             return
 
-        if not is_blackwell_supported():
+        if not get_platform().is_blackwell:
             raise ValueError(
                 "ModelOpt NVFP4 native dense GEMM backends require SM100+. "
                 "Use --fp4-gemm-backend marlin on SM80-SM90."
@@ -2196,7 +2195,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
             use_marlin_fallback = moe_runner_backend.is_marlin()
-        if not is_blackwell_supported() and not use_marlin_fallback:
+        if not get_platform().is_blackwell and not use_marlin_fallback:
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization with the selected MoE backend. Please use "
