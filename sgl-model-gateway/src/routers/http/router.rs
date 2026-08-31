@@ -321,7 +321,7 @@ impl Router {
         // mask "200-then-broken" workers — every request would tick a
         // success before the stream had a chance to error out.
         if !is_stream {
-            worker.record_outcome(status.is_success());
+            worker.record_outcome(status.is_success() || status.is_client_error());
         }
 
         // Record worker errors for server errors (5xx)
@@ -632,7 +632,7 @@ impl Router {
                 worker.clone(),
                 worker_url.to_string(),
             );
-            if !status.is_success() {
+            if !status.is_success() && !status.is_client_error() {
                 tracked.mark_errored();
             }
             let body = Body::from_stream(tracked);
