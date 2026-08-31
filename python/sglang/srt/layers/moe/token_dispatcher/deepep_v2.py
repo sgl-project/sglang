@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_resources,
 )
 
@@ -116,8 +117,9 @@ def _ensure_fp8_quant_available() -> None:
 
 
 def _get_allow_hybrid_mode() -> bool:
-
-    return get_exec().moe.deepep_v2_mode == "hybrid"
+    # Multi-node needs scale-out (hybrid); direct is NVLink-only and hangs across
+    # nodes. Honor an explicit "hybrid" too so a single node can opt in.
+    return get_exec().moe.deepep_v2_mode == "hybrid" or get_parallel().nnodes > 1
 
 
 def _quantize_for_deepep_v2_dispatch(
@@ -182,6 +184,12 @@ class DeepEPv2Buffer:
 
         # Communicator reuse requires a device-bound process group.
         os.environ.setdefault("EP_REUSE_NCCL_COMM", "0")
+        # Raise the GPU barrier timeout so idle ranks tolerate the first-request
+        # JIT compile on the token-owning rank; 0 keeps DeepEP's default.
+        gpu_timeout_secs = envs.SGLANG_DEEPEP_V2_GPU_TIMEOUT_SECS.get()
+        extra_kwargs = (
+            {"num_gpu_timeout_secs": gpu_timeout_secs} if gpu_timeout_secs > 0 else {}
+        )
         buffer = ElasticBuffer(
             group,
             num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
@@ -191,6 +199,7 @@ class DeepEPv2Buffer:
             allow_hybrid_mode=allow_hybrid_mode,
             sl_idx=0,
             prefer_overlap_with_compute=False,
+            **extra_kwargs,
         )
         # Publish only after collective construction succeeds.
         state.buffer = buffer
@@ -239,6 +248,8 @@ class _DeepEPv2Impl:
         self.rank = dist.get_rank(group)
         self._handle = None
         self._pad_empty_combine = False
+        # Read once so a mid-run env change cannot desync dispatch and combine.
+        self._prefill_expand_enabled = envs.SGLANG_DEEPEP_V2_PREFILL_DO_EXPAND.get()
 
     def _destroy_handle(self) -> None:
         self._handle = None
@@ -251,6 +262,15 @@ class _DeepEPv2Impl:
             self.num_max_dispatch_tokens_per_rank,
             self.use_fp8_dispatch,
         )
+
+    def prebuild_buffer(self) -> None:
+        """Build the ElasticBuffer now instead of lazily on the first dispatch.
+
+        Avoids the ~2GB alloc + cross-rank NCCL barrier stalling the first request
+        on pure-prefill nodes (no decode CUDA-graph warmup to build it). Needs only
+        host-known config already on this impl; key-cached so dispatch reuses it.
+        """
+        self._get_buffer()
 
     def _validate_common(
         self, hidden_states: torch.Tensor, topk_ids: torch.Tensor
@@ -290,9 +310,11 @@ class _DeepEPv2Impl:
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
-        # Decode uses expanded/masked layout; extend uses contiguous in both modes.
-        use_expand_layout = not get_is_extend_in_batch()
-        use_masked = use_expand_layout
+        # Decode: expand+masked slab. Prefill: expanded non-masked when the env
+        # flag is set (skips ep_scatter), else non-expand; never masked.
+        is_decode = not get_is_extend_in_batch()
+        use_masked = is_decode
+        use_expand_layout = is_decode or self._prefill_expand_enabled
 
         # CPU-synced dispatch needs a dummy token to notify from an idle rank.
         self._pad_empty_combine = (not use_masked) and hidden_states.shape[0] == 0
@@ -307,7 +329,7 @@ class _DeepEPv2Impl:
         if not self.use_fp8_dispatch:
             dispatch_x = hidden_states
             use_tma_aligned_col_major_sf = False
-        elif use_masked:
+        elif use_expand_layout:
             _ensure_fp8_quant_available()
             _ue8m0 = self.scale_format.ue8m0
             dispatch_x = sglang_per_token_group_quant_fp8(
@@ -332,6 +354,11 @@ class _DeepEPv2Impl:
             do_cpu_sync_val = False
 
         buffer = self._get_buffer()
+        # dispatch has no num_sms=0 fallback (unlike combine), so 0 launches the
+        # comm kernel with zero SMs and hangs; derive the theoretical count.
+        num_sms = envs.SGLANG_DEEPEP_V2_NUM_SMS.get()
+        if num_sms <= 0:
+            num_sms = buffer.get_theoretical_num_sms(self.num_experts, self.router_topk)
         recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
             dispatch_x,
             topk_idx=topk_ids,
@@ -339,7 +366,7 @@ class _DeepEPv2Impl:
             num_experts=self.num_experts,
             num_max_tokens_per_rank=num_max_tokens,
             expert_alignment=_EXPERT_ALIGNMENT,
-            num_sms=envs.SGLANG_DEEPEP_V2_NUM_SMS.get(),
+            num_sms=num_sms,
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
             do_cpu_sync=do_cpu_sync_val,
             do_expand=use_expand_layout,
@@ -467,3 +494,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
                 f"Expected DeepEP v2 combine input, got {combine_input.format}"
             )
         return self._impl.combine(combine_input)
+
+    def prebuild(self) -> None:
+        """Build the ElasticBuffer eagerly at deployment time (no forward needed)."""
+        self._impl.prebuild_buffer()
