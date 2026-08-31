@@ -273,13 +273,25 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "audited for the unified pool's virtual/kernel-facing loc translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
+    # Tree-shaped drafting is refused for EVERY algorithm, in one place.
+    # A tree finalizes a batch through `move_accept_tokens_to_target_kvcache`,
+    # which relocates INDIVIDUAL accepted tokens inside the TARGET pool. The
+    # unified pool's `move_kv_cache` is compaction-only: it moves whole page
+    # envelopes, which is what lets one move carry a whole page's contents, so
+    # a per-token relocation either reshapes past the end
+    # (`view(-1, page_size)` over a handful of tokens) or hits the SWA
+    # composite's explicit refusal. NGRAM is absent from the allow-list above
+    # for exactly this reason -- it is inherently a BFS drafter and calls that
+    # helper unconditionally, where a chain drafter never reaches it. Both
+    # become admissible once the pool grows a per-token move.
+    assert cfg.speculative_eagle_topk in (None, 1), (
+        "--enable-unified-memory supports a linear draft chain only "
+        "(--speculative-eagle-topk in {None, 1}); tree verify relocates "
+        "accepted tokens one at a time inside the target pool, which the "
+        "unified pool's page-granular move_kv_cache cannot express. Got "
+        f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+    )
     if cfg.speculative_algorithm == "DSPARK":
-        assert cfg.speculative_eagle_topk in (None, 1), (
-            "--enable-unified-memory + DSPARK supports a linear draft "
-            "chain only (--speculative-eagle-topk in {None, 1}); tree "
-            "verify is not audited for the unified pool. Got "
-            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
-        )
         _assert_spec_verify_backends(server_args, algorithm="DSPARK")
     assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
         "--enable-unified-memory is not yet compatible with hierarchical / "

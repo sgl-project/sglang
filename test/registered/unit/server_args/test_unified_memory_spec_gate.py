@@ -108,11 +108,16 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         for backend in ("fa4", "trtllm_mha"):
             self.assertFalse(_accepts("DSPARK", backend=backend))
 
-    def test_dspark_refused_tree_topk(self):
-        """Tree verify needs a per-token move inside the target pool, which
-        the unified pool's page-granular `move_kv_cache` cannot express."""
+    def test_tree_drafting_refused(self):
+        """Tree verify needs a per-token move inside the TARGET pool, which
+        the unified pool's page-granular `move_kv_cache` cannot express.
+        DSPARK is the only admitted algorithm today, so it is the only one
+        that can demonstrate the rule; the check itself is unconditional, so
+        it keeps holding as further arms are admitted."""
         for topk in (2, 4, 8):
             self.assertFalse(_accepts("DSPARK", topk=topk))
+        # The shape knob must not disturb spec-off.
+        self.assertTrue(_accepts(None, topk=None))
 
     def test_draft_backend_is_audited_too(self):
         """The draft worker runs its OWN forward on its OWN backend, resolved
