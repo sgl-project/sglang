@@ -230,6 +230,7 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     c128_state_pool_size: int
     c4_state_dtype: Optional[torch.dtype]
     c128_state_dtype: Optional[torch.dtype]
+    unified_total_bytes: Optional[int] = None
 
 
 @dataclass(slots=True, kw_only=True)
@@ -390,6 +391,7 @@ class KVCacheConfigurator:
             c128_state_pool_size=c128_state_pool_size,
             c4_state_dtype=c4_state_dtype,
             c128_state_dtype=c128_state_dtype,
+            unified_total_bytes=config.unified_total_bytes,
         )
 
     def _init_pools(
@@ -419,6 +421,7 @@ class KVCacheConfigurator:
                 bundle = self._init_unified_mamba_pools(
                     max_num_reqs=sizes.max_running_requests,
                     max_total_num_tokens=sizes.max_total_num_tokens,
+                    unified_total_bytes=sizes.unified_total_bytes,
                 )
             elif self.is_hybrid_swa and not is_deepseek_v4(self.model_config.hf_config):
                 if pd_enabled:
@@ -432,6 +435,7 @@ class KVCacheConfigurator:
                     max_num_reqs=sizes.max_running_requests,
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                    unified_total_bytes=sizes.unified_total_bytes,
                 )
             else:
                 # Fail loud, not silently fall through to the normal pools (which would
@@ -568,7 +572,11 @@ class KVCacheConfigurator:
         )
 
     def _init_unified_mamba_pools(
-        self, *, max_num_reqs: int, max_total_num_tokens: int
+        self,
+        *,
+        max_num_reqs: int,
+        max_total_num_tokens: int,
+        unified_total_bytes: Optional[int] = None,
     ) -> UnifiedPoolBundle:
         """Build the shared-KV-pool stack for a hybrid-Mamba model:
         one byte buffer split between the full-attn MHA KV pool and the
@@ -640,6 +648,9 @@ class KVCacheConfigurator:
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, env-var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
+            # Draft workers keep the token-count byte sum (spec is asserted
+            # off under unified; belt only).
+            unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
         )
         return bundle
 
@@ -649,6 +660,7 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         full_max_total_num_tokens: Optional[int],
         swa_max_total_num_tokens: Optional[int],
+        unified_total_bytes: Optional[int] = None,
     ) -> UnifiedPoolBundle:
         """Build the unified-pool stack for a hybrid-SWA model (Triton): one byte
         buffer split between the full-attention and SWA KV pools."""
@@ -731,6 +743,14 @@ class KVCacheConfigurator:
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
+            # Draft workers keep the token-count byte sum (spec is asserted
+            # off under unified; belt only).
+            unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
+            # bs=1 feasibility floor inputs. `model_context_len` bounds the
+            # sliding window term only -- the full-attention side is not
+            # charged, see `_check_bs1_feasibility_floor`.
+            model_context_len=self.model_config.context_len,
+            sliding_window_size=self.model_config.sliding_window_size,
         )
         return UnifiedPoolBundle(
             unified_memory_pool=bundle.unified_memory_pool,
@@ -2034,10 +2054,18 @@ class KVCacheConfigurator:
         config = configurator.calculate_pool_sizes(
             budget_bytes, get_schedule().page_size
         )
+        if get_memory().enable_unified_memory:
+            # Floor-align to 4096 B: the factories `.view()` the whole uint8
+            # buffer as the KV/state dtype, so the total must be a dtype-size
+            # multiple and a profiled budget is not. Flooring never overcommits.
+            config.unified_total_bytes = budget_bytes - (budget_bytes % 4096)
         max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
         if cap_tokens is not None:
             max_tokens = min(max_tokens, cap_tokens)
         if max_tokens != config.max_total_num_tokens:
+            # Token-capped re-derivation: the profiled budget no longer
+            # applies; the recalced config's unified_total_bytes stays None
+            # and the factories fall back to the token-count byte sum.
             config = configurator.calculate_pool_sizes_from_max_tokens(
                 max_tokens, get_schedule().page_size
             )

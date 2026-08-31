@@ -4383,6 +4383,13 @@ class Scheduler(
             if has_leak:
                 self.invariant_checker._report_leak("pool", "\n".join(messages))
             self.invariant_checker._check_req_pool()
+            # Byte-conservation diagnostic (allocator-owned; static pools
+            # return [] — the token identity above can't see byte leaks).
+            byte_violations = self.token_to_kv_pool_allocator.verify_byte_accounting()
+            if byte_violations:
+                self.invariant_checker._report_leak(
+                    "pool-bytes", "\n".join(byte_violations)
+                )
 
         # tree cache sanity check
         self.invariant_checker._check_tree_cache()
