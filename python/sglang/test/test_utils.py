@@ -2088,23 +2088,44 @@ def _wait_for_gpu_idle_in_ci(
             pass
 
 
+# Names the runner kits stamp onto a record that are not members of it.
+# `ModelRunner` computes `use_mla_backend` on itself; the kits copy that bool
+# onto the record they hand the runner, and `hasattr` cannot see it.
+_RUNNER_WRITTEN_NAMES = frozenset({"use_mla_backend"})
+
+
 def server_args_variant(server_args, **fields):
     """A modified deep copy of a config, for a test double whose fixture
     differs from the (possibly published, read-only) config it starts from.
     The receiver is untouched; the copy keeps its read-only guard.
 
-    A name may also shadow a method with a fixture value (the runner kits set
-    ``use_mla_backend``, a method ModelRunner itself overwrites at init);
-    names that exist nowhere on the class fail loudly."""
+    A name may also be one the kits stamp on rather than a field (see
+    ``_RUNNER_WRITTEN_NAMES``); names that exist nowhere fail loudly."""
     variant = copy.deepcopy(server_args)
     cls = type(variant)
     unknown = {
         name
         for name in fields
-        if name not in cls.__dataclass_fields__ and not hasattr(cls, name)
+        if name not in cls.__dataclass_fields__
+        and not hasattr(cls, name)
+        and name not in _RUNNER_WRITTEN_NAMES
     }
     if unknown:
         raise ValueError(f"unknown ServerArgs field(s): {sorted(unknown)}")
+    # Reach the stash as well as the fields (the bags project from raw input
+    # + declarations); through `object` because the copy keeps its read-only
+    # guard.
+    stash = getattr(variant, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        object.__setattr__(variant, "_resolved_overrides", stash)
+    declared = {
+        name: value
+        for name, value in fields.items()
+        if name in cls.__dataclass_fields__
+    }
+    if declared:
+        stash.append(("server_args_variant", dict(declared)))
     for name, value in fields.items():
         object.__setattr__(variant, name, value)
     return variant
