@@ -472,6 +472,41 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                 result["missing_artifacts"], ["perf dump", "generated output"]
             )
 
+    def test_mesh_artifacts_are_accepted_and_hashed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_root = Path(tmpdir)
+            module = _load_benchmark_module(temp_root)
+            output_dir = temp_root / "outputs"
+            output_dir.mkdir()
+
+            def finish_run():
+                (output_dir / "hunyuan3d-shape_mesh-output.json").write_text(
+                    json.dumps({"total_duration_ms": 1000, "steps": []}),
+                    encoding="utf-8",
+                )
+                (output_dir / "hunyuan3d-shape-mesh-output.obj").write_bytes(
+                    b"v 0 0 0\n"
+                )
+                return 0
+
+            with patch.object(module.subprocess, "Popen") as popen:
+                popen.return_value.stdout = iter(())
+                popen.return_value.wait.side_effect = finish_run
+                result = module._run_benchmark_once_impl(
+                    "hunyuan3d-shape",
+                    "mesh-output",
+                    output_dir,
+                    warmup=False,
+                    cuda_visible_devices="0",
+                )
+
+            self.assertFalse(result["error"])
+            self.assertEqual(
+                result["output_artifacts"],
+                [str(output_dir / "hunyuan3d-shape-mesh-output.obj")],
+            )
+            self.assertEqual(len(result["output_sha256"]), 1)
+
     def test_high_bcg_rejects_quality_fusion_mounted_after_capture(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             temp_root = Path(tmpdir)

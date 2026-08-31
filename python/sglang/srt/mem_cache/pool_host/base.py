@@ -45,7 +45,7 @@ def ranks_per_host() -> int:
         return 1
     if world_group.world_size == 1:
         return 1
-    return max(world_group.world_size // get_parallel().config.nnodes, 1)
+    return max(world_group.world_size // get_parallel().nnodes, 1)
 
 
 def host_memory_budget_bytes() -> int:

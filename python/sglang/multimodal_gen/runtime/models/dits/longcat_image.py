@@ -39,6 +39,7 @@ from sglang.kernels.ops.diffusion import (
     fused_gelu_active,
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
+    residual_gate_add,
     tensors_equal,
 )
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
@@ -597,8 +598,7 @@ class _SingleTransformerBlock(nn.Module):
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
         gate = gate.unsqueeze(1)
         hidden_states, _ = self.proj_out(hidden_states)
-        hidden_states = gate * hidden_states
-        hidden_states = residual + hidden_states
+        hidden_states = residual_gate_add(residual, hidden_states, gate)
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
 
@@ -662,19 +662,22 @@ class _TransformerBlock(nn.Module):
             positions=positions,
         )
 
-        attn_output = gate_msa.unsqueeze(1) * attn_output
-        hidden_states = hidden_states + attn_output
+        hidden_states = residual_gate_add(
+            hidden_states, attn_output, gate_msa.unsqueeze(1)
+        )
 
         norm_hidden_states = self.norm2(hidden_states)
         norm_hidden_states = (
             norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
         )
         ff_output = self.ff(norm_hidden_states)
-        ff_output = gate_mlp.unsqueeze(1) * ff_output
-        hidden_states = hidden_states + ff_output
+        hidden_states = residual_gate_add(
+            hidden_states, ff_output, gate_mlp.unsqueeze(1)
+        )
 
-        context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
-        encoder_hidden_states = encoder_hidden_states + context_attn_output
+        encoder_hidden_states = residual_gate_add(
+            encoder_hidden_states, context_attn_output, c_gate_msa.unsqueeze(1)
+        )
 
         norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
         norm_encoder_hidden_states = (
@@ -682,8 +685,10 @@ class _TransformerBlock(nn.Module):
             + c_shift_mlp[:, None]
         )
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
-        encoder_hidden_states = (
-            encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+        encoder_hidden_states = residual_gate_add(
+            encoder_hidden_states,
+            context_ff_output,
+            c_gate_mlp.unsqueeze(1),
         )
         if encoder_hidden_states.dtype == torch.float16:
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)

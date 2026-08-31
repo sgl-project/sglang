@@ -121,7 +121,16 @@ MODEL_WEIGHT_SUFFIXES = {
     ".pth",
     ".safetensors",
 }
-GENERATED_OUTPUT_SUFFIXES = {".jpeg", ".jpg", ".mp4", ".png", ".wav", ".webp"}
+GENERATED_OUTPUT_SUFFIXES = {
+    ".glb",
+    ".jpeg",
+    ".jpg",
+    ".mp4",
+    ".obj",
+    ".png",
+    ".wav",
+    ".webp",
+}
 NIGHTLY_PRESET_ORDER = (
     "flux",
     "flux2",

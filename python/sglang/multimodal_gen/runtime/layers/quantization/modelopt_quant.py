@@ -678,18 +678,12 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
 
-        _, flashinfer_backend = _get_fp4_gemm_op()
-        uses_flux1_scale_layout = not getattr(
-            self.quant_config, "checkpoint_uses_packed_qkv", False
-        ) and getattr(layer, "prefix", "").startswith(
-            ("transformer_blocks.", "single_transformer_blocks.")
+        # Every FP4 GEMM reachable here reads block scales in the 128x4 TMA layout;
+        # trtllm, the one backend wanting its own shuffled layout, returned above.
+        padded_scales = padded_scales.reshape(
+            B, M_padded // 128, 4, 32, K_padded // 4, 4
         )
-        if flashinfer_backend is None or uses_flux1_scale_layout:
-            # CUTLASS and FLUX.1 CUDNN paths need the TMA scale layout.
-            padded_scales = padded_scales.reshape(
-                B, M_padded // 128, 4, 32, K_padded // 4, 4
-            )
-            padded_scales = padded_scales.permute(0, 1, 4, 3, 2, 5)
+        padded_scales = padded_scales.permute(0, 1, 4, 3, 2, 5)
 
         padded_scales = padded_scales.contiguous().cuda()
         padded_scales = (
@@ -747,3 +741,37 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)
+
+
+def apply_nvfp4_gemm_prequantized(
+    layer: torch.nn.Module,
+    x_fp4: torch.Tensor,
+    x_scale_interleaved: torch.Tensor,
+    output_dtype: torch.dtype,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run a ModelOpt NVFP4 GEMM from already packed activations and scales."""
+    weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
+    x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
+
+    w = layer.weight
+    w_scale_interleaved = layer.weight_scale_interleaved
+    if x_scale_interleaved.dtype == torch.uint8:
+        x_scale_interleaved = x_scale_interleaved.view(torch.float8_e4m3fn)
+    if w_scale_interleaved.dtype == torch.uint8:
+        w_scale_interleaved = w_scale_interleaved.view(torch.float8_e4m3fn)
+
+    fp4_gemm, flashinfer_backend = _get_fp4_gemm_op()
+    if fp4_gemm is None:
+        raise RuntimeError("No FP4 GEMM kernel available. Install flashinfer.")
+    out = fp4_gemm(
+        x_fp4,
+        w.T,
+        x_scale_interleaved,
+        w_scale_interleaved.T,
+        layer.alpha,
+        output_dtype,
+        backend=flashinfer_backend,
+    )
+    out = slice_nvfp4_output(out, layer.output_size_per_partition)
+    return out + bias if bias is not None else out

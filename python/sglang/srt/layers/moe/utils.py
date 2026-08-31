@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import NamedTuple
 
@@ -18,13 +19,13 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_model,
     get_parallel,
+    get_server_args,
     get_spec,
 )
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
 
-from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.common import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -100,7 +101,73 @@ class MoeA2ABackend(Enum):
         )
 
 
-class MoeRunnerBackend(Enum):
+class _MoeRunnerBackendPredicates:
+    value: str
+
+    def is_auto(self):
+        return self.value == MoeRunnerBackend.AUTO.value
+
+    def is_hpc_ops(self):
+        return self.value == MoeRunnerBackend.HPC_OPS.value
+
+    def is_deep_gemm(self):
+        return self.value == MoeRunnerBackend.DEEP_GEMM.value
+
+    def is_triton(self):
+        return self.value == MoeRunnerBackend.TRITON.value
+
+    def is_ascend(self):
+        return self.value == MoeRunnerBackend.ASCEND.value
+
+    def is_triton_kernels(self):
+        return self.value == MoeRunnerBackend.TRITON_KERNELS.value
+
+    def is_flashinfer_trtllm(self):
+        # experimental_sgl_trtllm shares the TRT-LLM FP8 kernels + layout, so it inherits
+        # trtllm weight-prep here; divergent sites check is_experimental_sgl_trtllm() first.
+        return self.value in (
+            MoeRunnerBackend.FLASHINFER_TRTLLM.value,
+            MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM.value,
+        )
+
+    def is_experimental_sgl_trtllm(self):
+        return self.value == MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM.value
+
+    def is_flashinfer_trtllm_routed(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED.value
+
+    def is_flashinfer_cutlass(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_CUTLASS.value
+
+    def is_flashinfer_cutedsl(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_CUTEDSL.value
+
+    def is_flashinfer_mxfp4(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_MXFP4.value
+
+    def is_cutlass(self):
+        return self.value == MoeRunnerBackend.CUTLASS.value
+
+    def is_marlin(self):
+        # experimental_sgl_marlin shares the marlin weight repack, quant-method
+        # selection, and base fused path; divergent sites (the LoRA MoE dispatch)
+        # check is_experimental_sgl_marlin() first.
+        return self.value in (
+            MoeRunnerBackend.MARLIN.value,
+            MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN.value,
+        )
+
+    def is_experimental_sgl_marlin(self):
+        return self.value == MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN.value
+
+    def is_humming(self):
+        return self.value == MoeRunnerBackend.HUMMING.value
+
+    def is_aiter(self):
+        return self.value == MoeRunnerBackend.AITER.value
+
+
+class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
 
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
@@ -121,67 +188,46 @@ class MoeRunnerBackend(Enum):
     HPC_OPS = "hpc_ops"
     INTEL_XPU = "intel_xpu"
 
-    def is_auto(self):
-        return self == MoeRunnerBackend.AUTO
 
-    def is_hpc_ops(self):
-        return self == MoeRunnerBackend.HPC_OPS
+@dataclass(frozen=True)
+class RegisteredMoeRunnerBackend(_MoeRunnerBackendPredicates):
+    """Identifier for an MoE runner backend supplied by an extension."""
 
-    def is_deep_gemm(self):
-        return self == MoeRunnerBackend.DEEP_GEMM
+    value: str
 
-    def is_triton(self):
-        return self == MoeRunnerBackend.TRITON
 
-    def is_ascend(self):
-        return self == MoeRunnerBackend.ASCEND
+MoeRunnerBackendLike = MoeRunnerBackend | RegisteredMoeRunnerBackend
+_REGISTERED_MOE_RUNNER_BACKEND_NAMES: set[str] = set()
 
-    def is_triton_kernels(self):
-        return self == MoeRunnerBackend.TRITON_KERNELS
 
-    def is_flashinfer_trtllm(self):
-        # experimental_sgl_trtllm shares the TRT-LLM FP8 kernels + layout, so it inherits
-        # trtllm weight-prep here; divergent sites check is_experimental_sgl_trtllm() first.
-        return self in (
-            MoeRunnerBackend.FLASHINFER_TRTLLM,
-            MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM,
-        )
+def register_moe_runner_backend_name(name: str) -> None:
+    """Register a backend name supplied by an out-of-tree extension."""
 
-    def is_experimental_sgl_trtllm(self):
-        return self == MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM
+    if not name:
+        raise ValueError("MoE runner backend name must not be empty")
+    try:
+        MoeRunnerBackend(name)
+    except ValueError:
+        _REGISTERED_MOE_RUNNER_BACKEND_NAMES.add(name)
+    else:
+        raise ValueError(f"MoE runner backend {name!r} is already built in")
 
-    def is_flashinfer_trtllm_routed(self):
-        return self == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
 
-    def is_flashinfer_cutlass(self):
-        return self == MoeRunnerBackend.FLASHINFER_CUTLASS
+def resolve_moe_runner_backend(
+    backend: str | MoeRunnerBackendLike,
+) -> MoeRunnerBackendLike:
+    """Resolve a built-in or registered backend identifier."""
 
-    def is_flashinfer_cutedsl(self):
-        return self == MoeRunnerBackend.FLASHINFER_CUTEDSL
-
-    def is_flashinfer_mxfp4(self):
-        return self == MoeRunnerBackend.FLASHINFER_MXFP4
-
-    def is_cutlass(self):
-        return self == MoeRunnerBackend.CUTLASS
-
-    def is_marlin(self):
-        # experimental_sgl_marlin shares the marlin weight repack, quant-method
-        # selection, and base fused path; divergent sites (the LoRA MoE dispatch)
-        # check is_experimental_sgl_marlin() first.
-        return self in (
-            MoeRunnerBackend.MARLIN,
-            MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN,
-        )
-
-    def is_experimental_sgl_marlin(self):
-        return self == MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN
-
-    def is_humming(self):
-        return self == MoeRunnerBackend.HUMMING
-
-    def is_aiter(self):
-        return self == MoeRunnerBackend.AITER
+    if isinstance(backend, (MoeRunnerBackend, RegisteredMoeRunnerBackend)):
+        return backend
+    try:
+        return MoeRunnerBackend(backend)
+    except ValueError:
+        if backend in _REGISTERED_MOE_RUNNER_BACKEND_NAMES:
+            return RegisteredMoeRunnerBackend(backend)
+        raise ValueError(
+            f"MoE runner backend {backend!r} is neither built in nor registered"
+        ) from None
 
     def is_intel_xpu(self):
         return self == MoeRunnerBackend.INTEL_XPU
@@ -353,9 +399,9 @@ def initialize_moe_config():
     spec = get_spec()
     moe = get_flags().moe
     moe.a2a_backend = MoeA2ABackend(exec_moe.moe_a2a_backend)
-    moe.runner_backend = MoeRunnerBackend(exec_moe.moe_runner_backend)
+    moe.runner_backend = resolve_moe_runner_backend(exec_moe.moe_runner_backend)
     moe.speculative_runner_backend = (
-        MoeRunnerBackend(spec.speculative_moe_runner_backend)
+        resolve_moe_runner_backend(spec.speculative_moe_runner_backend)
         if spec.speculative_moe_runner_backend is not None
         else moe.runner_backend
     )
@@ -391,14 +437,14 @@ def get_moe_a2a_backend() -> MoeA2ABackend:
     return moe.a2a_backend
 
 
-def get_moe_runner_backend() -> MoeRunnerBackend:
+def get_moe_runner_backend() -> MoeRunnerBackendLike:
     moe = get_flags().moe
     if moe.runner_backend is None:
         moe.runner_backend = MoeRunnerBackend.AUTO
     return moe.runner_backend
 
 
-def get_speculative_moe_runner_backend() -> MoeRunnerBackend:
+def get_speculative_moe_runner_backend() -> MoeRunnerBackendLike:
     moe = get_flags().moe
     if moe.speculative_runner_backend is None:
         logger.warning(
@@ -440,7 +486,6 @@ def is_shared_experts_fusion_disabled() -> bool:
         )
     moe = get_flags().moe
     if moe.disable_shared_experts_fusion is None:
-        from sglang.srt.runtime_context import get_exec
 
         return get_exec().moe.disable_shared_experts_fusion
     return moe.disable_shared_experts_fusion
@@ -483,7 +528,6 @@ def install_shared_experts_fusion_decision(
     Inside ``draft_model_build_scope`` the answer also lands on the speculative
     leaf, so a flags dump afterwards shows both runners' decisions.
     """
-    from sglang.srt.runtime_context import get_exec
 
     disabled = get_exec().moe.disable_shared_experts_fusion
     if not disabled:
@@ -595,6 +639,15 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
     )
 
 
+def is_moe_input_scattered_across_dp_ranks() -> bool:
+    """Whether sparse MoE routing runs on a DP-local token shard."""
+    return (
+        not get_moe_a2a_backend().is_none()
+        or should_use_flashinfer_cutlass_moe_fp4_allgather()
+        or get_parallel().dwdp_size > 1
+    )
+
+
 def should_use_dp_reduce_scatterv():
     """
     Use reduce_scatterv in the standard dispatcher's combine() for DP attention
@@ -655,7 +708,7 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     """
     if should_skip_mlp_all_reduce():
         return True
-    if get_parallel().config.dwdp_size > 1:
+    if get_parallel().dwdp_size > 1:
         return True
     if should_use_dp_reduce_scatterv():
         return True
@@ -695,14 +748,17 @@ def speculative_moe_a2a_backend_context():
     moe = get_flags().moe
     original_backend = moe.a2a_backend
     original_disable_fp4_allgather = moe.disable_fp4_allgather
+    original_speculative_context = moe.speculative_context
     try:
         moe.a2a_backend = get_speculative_moe_a2a_backend()
         # Disable FP4 allgather for spec decode since MTP layers are unquantized
         moe.disable_fp4_allgather = True
+        moe.speculative_context = True
         yield
     finally:
         moe.a2a_backend = original_backend
         moe.disable_fp4_allgather = original_disable_fp4_allgather
+        moe.speculative_context = original_speculative_context
 
 
 # The type of method in top-K routing, for use in torch custom op

@@ -432,9 +432,9 @@ def prepare_extend_inputs_for_correctness_test(
         req: Req = reqs[i]
         req.full_untruncated_fill_ids.extend(input_ids[i][bench_args.cut_len :])
         if model_runner is not None:
-            # Use req.req_pool_idx instead of i to handle slot 0 padding correctly
+            # Use req.kv.req_pool_idx instead of i to handle slot 0 padding correctly
             req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : bench_args.cut_len
+                req.kv.req_pool_idx, : bench_args.cut_len
             ].to(req.prefix_indices.dtype)
             req.logprob_start_len = -1
         req.set_extend_range(
@@ -548,7 +548,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
         prepare_mlp_sync_batch_raw(
             batch,
             model_runner=model_runner,
-            dp_size=get_parallel().config.dp_size,
+            dp_size=get_parallel().dp_size,
             attn_tp_size=get_parallel().attn_tp_size,
             attn_cp_size=model_runner.ps.attn_cp_size,
             tp_group=model_runner.tp_group,
@@ -899,9 +899,12 @@ def latency_test(
     initialize_fp4_gemm_config()
 
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        parallel = get_parallel().config
+        parallel = get_parallel()
         set_gpu_proc_affinity(
-            parallel.pp_size, parallel.tp_size, parallel.nnodes, tp_rank
+            parallel.pp_size,
+            parallel.tp_size,
+            parallel.nnodes,
+            tp_rank,
         )
 
     # Configure the logger
