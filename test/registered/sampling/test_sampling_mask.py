@@ -1,8 +1,12 @@
 import math
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import requests
+import torch
 
+from sglang.srt.layers.sampler import Sampler
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -28,6 +32,69 @@ _SERVER_ARGS = (
 _INVALID_SAMPLING_MASK_ERROR = (
     "top_p-only sampling is valid but can return huge masks in the tail"
 )
+
+
+class TestSamplingMaskCapture(CustomTestCase):
+    def setUp(self):
+        self.sampler = Sampler.__new__(Sampler)
+        torch.nn.Module.__init__(self.sampler)
+
+    def test_flashinfer_joint_cutoff_ties_match_capture(self):
+        batch_size = 256
+        top_k = 2
+        top_p = 0.45
+        base_probs = torch.tensor(
+            [[0.4, 0.2, 0.2, 0.1, 0.1]], device="cuda"
+        )
+        probs = base_probs.repeat(batch_size, 1)
+
+        # Derive the threshold-based joint support independently. Both filters
+        # cut at 0.2, so the tied entries must survive even though this yields
+        # more support entries than top_k.
+        sorted_probs = base_probs[0].sort(descending=True).values
+        top_k_cutoff = sorted_probs[top_k - 1]
+        mass_before = sorted_probs.cumsum(dim=-1) - sorted_probs
+        top_p_cutoff = sorted_probs[mass_before <= top_p][-1]
+        expected_support = (base_probs[0] >= top_k_cutoff) & (
+            base_probs[0] >= top_p_cutoff
+        )
+        expected_ids = expected_support.nonzero(as_tuple=True)[0].tolist()
+        self.assertEqual(expected_ids, [0, 1, 2])
+
+        sampling_info = SimpleNamespace(
+            sampling_seed=None,
+            need_top_k_sampling=True,
+            need_top_p_sampling=True,
+            need_min_p_sampling=False,
+            top_ks=torch.full(
+                (batch_size,), top_k, dtype=torch.int32, device="cuda"
+            ),
+            top_ps=torch.full((batch_size,), top_p, device="cuda"),
+            min_ps=torch.zeros(batch_size, device="cuda"),
+        )
+        with patch(
+            "sglang.srt.layers.sampler.get_exec",
+            return_value=SimpleNamespace(
+                kernel=SimpleNamespace(sampling_backend="flashinfer")
+            ),
+        ):
+            sampled, capture = self.sampler._sample_from_probs(
+                probs,
+                sampling_info,
+                positions=torch.zeros(batch_size, dtype=torch.int64, device="cuda"),
+                simple_sampling_case=False,
+                return_sampling_mask=True,
+            )
+
+        self.assertIsNotNone(capture)
+        actual_support = capture.weights > 0
+        self.assertTrue(
+            torch.equal(actual_support, expected_support.expand_as(actual_support))
+        )
+        self.assertGreater(int(actual_support[0].sum().item()), top_k)
+        self.assertTrue(
+            bool(actual_support.gather(1, sampled.view(-1, 1)).all().item())
+        )
 
 
 class SamplingMaskTestMixin:
