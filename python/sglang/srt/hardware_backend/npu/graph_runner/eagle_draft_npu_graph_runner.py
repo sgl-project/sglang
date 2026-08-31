@@ -63,6 +63,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         return self.attr_type[AttentionArch.MLA]
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        return True  # FIXME: now just use graph mode
         can_run_graph = super().can_run_graph(forward_batch)
         if (
             not self.eagle_worker.seed_dsa_topk_from_draft_extend
@@ -83,12 +84,12 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         decision = torch.tensor(
             int(can_run_graph and seed_ready),
             dtype=torch.int32,
-            device=self.device,
+            device="cpu",
         )
         torch.distributed.all_reduce(
             decision,
             op=torch.distributed.ReduceOp.MIN,
-            group=self.model_runner.tp_group.device_group,
+            group=self.model_runner.tp_group.cpu_group,
         )
         return bool(decision.item())
 
