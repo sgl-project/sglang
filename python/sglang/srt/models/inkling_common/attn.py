@@ -767,7 +767,13 @@ class InklingAttention(nn.Module):
         # The kwargs below must describe the backend `self.attn` dispatches
         # this forward to.
         attention_backend = serving_attention_backend(forward_batch)
-        assert attention_backend in ("fa4", "triton")
+        # intel_xpu is deliberately absent: XPUAttentionBackend.forward_extend takes
+        # no score_mod/aux_tensors (and no **kwargs), so it cannot carry the relative
+        # logit bias below. On XPU, serve Inkling with --attention-backend triton.
+        assert attention_backend in ("fa4", "triton"), (
+            f"Inkling attention has no path for backend {attention_backend!r}; "
+            "on XPU use --attention-backend triton"
+        )
         # The overlap threads a CUDA event into the FA4 sheared-bias kernel, so it
         # is FA4-only for now.
         # TODO(triton): plumb rel_bias_event through the triton attn path too.
