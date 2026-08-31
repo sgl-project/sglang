@@ -61,7 +61,9 @@ from sglang.srt.arg_groups.serving_hook import (
     ssl_verify_of,
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-from sglang.srt.arg_groups.validation_hook import check_two_batch_overlap
+from sglang.srt.arg_groups.validation_hook import (
+    check_two_batch_overlap,
+)
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
     Sidecar,
@@ -789,6 +791,19 @@ class TestLoadBalanceMethod(unittest.TestCase):
             "mooncake",
         )
 
+    def test_pd_decode_hicache_allows_rust_tree_core(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            enable_hierarchical_cache=True,
+        )
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
+            handle_pd_disaggregation(server_args)
+
+        self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
+
 
 class TestSkipTokenizerInit(unittest.TestCase):
     def test_skip_tokenizer_worker_counts(self):
@@ -1474,6 +1489,16 @@ class TestHiCacheArgs(unittest.TestCase):
                 resolution_result(args, "decode_attention_backend"),
                 expected_decode_backend,
             )
+
+    def test_buffer_only_accepts_both_tree_cores(self):
+        for backend in ("python", "rust"):
+            args = self._make_args(
+                enable_hierarchical_cache=True,
+                hicache_host_memory_mode="buffer_only",
+                hicache_storage_backend="file",
+            )
+            with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
+                handle_hicache(args)
 
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [
