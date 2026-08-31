@@ -2,7 +2,7 @@
 """Immutable heterogeneous weight transfer between daemons.
 
 Source daemons collectively publish one address-bearing runtime manifest over
-a lightweight HTTP registry. Target daemons construct their requested parallel
+a lightweight TCP registry. Target daemons construct their requested parallel
 layout with the dummy loader, reject overlapping physical GPUs on the same node,
 then use Mooncake's manifest planner and Transfer Engine reader to pull exactly
 the ranges needed by each target rank. No Engine control-plane participation is
@@ -36,6 +36,7 @@ from .mooncake_weight_adapter import (
     build_mooncake_weight_manifests,
     immutable_weight_allocation_guards,
 )
+from .protocol import recv_msg, send_msg
 from .weight_runtime_manifest import (
     WeightParallelTopology,
     create_weight_runtime_manifest_builder,
@@ -731,6 +732,35 @@ class SourceWeightsManifest:
         )
 
 
+def _request_weight_manifest_registry(
+    registry_url: str,
+    request: dict[str, Any],
+    *,
+    timeout: float,
+) -> dict[str, Any]:
+    prefix = "tcp://"
+    if not registry_url.startswith(prefix):
+        raise WeightHeterogeneousTransferError(
+            f"manifest registry address must use tcp://, got {registry_url!r}"
+        )
+    try:
+        address = NetworkAddress.parse(registry_url[len(prefix) :])
+    except ValueError as error:
+        raise WeightHeterogeneousTransferError(
+            f"invalid manifest registry address: {registry_url!r}"
+        ) from error
+
+    with socket.create_connection(address.to_bind_tuple(), timeout=timeout) as conn:
+        conn.settimeout(timeout)
+        send_msg(conn, request)
+        response = recv_msg(conn)
+    if not isinstance(response, dict):
+        raise WeightHeterogeneousTransferError(
+            "manifest registry returned a non-dict response"
+        )
+    return response
+
+
 def register_source_weights_manifest(
     registry_url: str,
     *,
@@ -744,8 +774,6 @@ def register_source_weights_manifest(
     timeout: float = 30.0,
 ) -> None:
     """Register one immutable source rank with the manifest server."""
-    import requests
-
     payload = {
         "node_id": get_local_ip_auto(fallback=socket.gethostname()),
         "global_rank": global_rank,
@@ -759,20 +787,24 @@ def register_source_weights_manifest(
         "runtime_inventory": manifest_state.runtime_inventory_for_wire(),
         "content_checksums": manifest_state.source_content_checksums,
     }
-    url = registry_url.rstrip("/") + "/register_weight_manifest"
     deadline = time.monotonic() + timeout
     last_error: Optional[Exception] = None
     while time.monotonic() < deadline:
         try:
-            response = requests.put(url, json=payload, timeout=5)
-            if response.status_code == 200:
+            response = _request_weight_manifest_registry(
+                registry_url,
+                {"type": "register_weight_manifest", "manifest": payload},
+                timeout=min(5.0, max(deadline - time.monotonic(), 0.1)),
+            )
+            if response.get("status") == "ok":
                 return
-            if response.status_code == 409:
+            if response.get("status") == "conflict":
                 raise WeightHeterogeneousTransferError(
-                    f"manifest server rejected source rank: {response.text}"
+                    "manifest server rejected source rank: "
+                    f"{response.get('message', response)}"
                 )
             last_error = RuntimeError(
-                f"manifest server returned {response.status_code}: {response.text}"
+                f"manifest server returned an error: {response}"
             )
         except WeightHeterogeneousTransferError:
             raise
@@ -780,7 +812,7 @@ def register_source_weights_manifest(
             last_error = error
         time.sleep(0.2)
     raise WeightHeterogeneousTransferError(
-        f"failed to register source manifest at {url}: {last_error}"
+        f"failed to register source manifest at {registry_url}: {last_error}"
     )
 
 
@@ -790,29 +822,27 @@ def fetch_source_weights_manifest(
     timeout: float = 30.0,
 ) -> SourceWeightsManifest:
     """Wait for and fetch one complete source manifest from the registry."""
-    import requests
-
-    url = registry_url.rstrip("/") + "/get_source_weights_manifest"
     deadline = time.monotonic() + timeout
     last_error: Optional[Exception] = None
     while time.monotonic() < deadline:
         try:
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
+            response = _request_weight_manifest_registry(
+                registry_url,
+                {"type": "get_source_weights_manifest"},
+                timeout=min(5.0, max(deadline - time.monotonic(), 0.1)),
+            )
+            if response.get("status") == "ok":
                 return SourceWeightsManifest.from_wire(
-                    response.json()["source_weights_manifest"]
+                    response["source_weights_manifest"]
                 )
-            if response.status_code == 409:
-                last_error = RuntimeError(response.text)
-            else:
-                last_error = RuntimeError(
-                    f"manifest server returned {response.status_code}: {response.text}"
-                )
+            last_error = RuntimeError(
+                f"manifest server returned an error: {response}"
+            )
         except Exception as error:
             last_error = error
         time.sleep(0.2)
     raise WeightHeterogeneousTransferError(
-        f"failed to fetch source manifest from {url}: {last_error}"
+        f"failed to fetch source manifest from {registry_url}: {last_error}"
     )
 
 

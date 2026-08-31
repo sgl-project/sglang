@@ -25,6 +25,7 @@ from sglang.srt.weight_cache.weight_heterogeneous_transfer import (
     WeightParallelLayout,
     _initialize_weight_transfer_engine,
     fetch_source_weights_manifest,
+    register_source_weights_manifest,
     transfer_weights_from_source_daemons,
     validate_weight_heterogeneous_transfer_configuration,
 )
@@ -725,25 +726,41 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             tuple(item["rank"] for item in source.runtime_inventories), (0, 1)
         )
 
-    def test_target_reads_complete_source_weights_manifest(self):
-        expected = SourceWeightsManifest(
-            node_id="source-node",
-            parallel_layout=WeightParallelLayout(
-                tp_size=2, dp_size=2, pp_size=1, ep_size=1
-            ),
-            gpu_ids=(0, 1),
-            runtime_inventories=({"rank": 0}, {"rank": 1}),
-            content_checksum_groups=(({"rank": 0},), ({"rank": 1},)),
+    def test_tcp_manifest_registry_round_trip(self):
+        server = WeightManifestServer(
+            host="127.0.0.1", port=0, expected_rank_count=1
         )
-        response = MagicMock(status_code=200)
-        response.json.return_value = {"source_weights_manifest": expected.to_wire()}
-        with patch("requests.get", return_value=response) as get:
-            actual = fetch_source_weights_manifest("http://source:31999")
+        registry_url = f"tcp://127.0.0.1:{server.port}"
+        manifest_state = MagicMock()
+        manifest_state.runtime_inventory_for_wire.return_value = {
+            "model_id": "model",
+            "revision": "revision",
+            "rank": 0,
+        }
+        manifest_state.source_content_checksums = ({"rank": 0},)
+        try:
+            register_source_weights_manifest(
+                registry_url,
+                global_rank=0,
+                gpu_id=2,
+                tp_size=1,
+                dp_size=1,
+                pp_size=1,
+                ep_size=1,
+                manifest_state=manifest_state,
+                timeout=2,
+            )
+            actual = fetch_source_weights_manifest(registry_url, timeout=2)
+        finally:
+            server.close()
 
-        get.assert_called_once_with(
-            "http://source:31999/get_source_weights_manifest", timeout=5
+        self.assertEqual(actual.gpu_ids, (2,))
+        self.assertEqual(actual.parallel_layout, WeightParallelLayout(tp_size=1))
+        self.assertEqual(
+            actual.runtime_inventories,
+            ({"model_id": "model", "revision": "revision", "rank": 0},),
         )
-        self.assertEqual(actual, expected)
+        self.assertEqual(actual.content_checksum_groups, (({"rank": 0},),))
 
     def test_target_rejects_overlap_after_fetching_source_manifest(self):
         source = SourceWeightsManifest(
@@ -781,10 +798,10 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                     target_manifest_state=MagicMock(),
                     model=MagicMock(),
                     gpu_id=0,
-                    registry_url="http://source:31999",
+                    registry_url="tcp://source:31999",
                 )
 
-        fetch.assert_called_once_with("http://source:31999")
+        fetch.assert_called_once_with("tcp://source:31999")
         pull.assert_not_called()
 
     def test_target_allows_same_gpu_id_on_another_node(self):
@@ -828,7 +845,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 target_manifest_state=MagicMock(),
                 model=MagicMock(),
                 gpu_id=0,
-                registry_url="http://source:31999",
+                registry_url="tcp://source:31999",
             )
 
         pull.assert_called_once()
@@ -841,7 +858,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             pp_rank=0,
             daemon_args=WeightCacheDaemonArgs(
                 enable_weight_heterogeneous_copy=True,
-                weight_heterogeneous_transfer_registry_url="http://source:31999",
+                weight_heterogeneous_transfer_registry_url="tcp://source:31999",
                 weight_cache_socket_rank=4,
             ),
         )
@@ -889,7 +906,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 daemon_args=WeightCacheDaemonArgs(
                     enable_weight_heterogeneous_copy=True,
                     weight_heterogeneous_copy=True,
-                    weight_heterogeneous_transfer_registry_url="http://source:31999",
+                    weight_heterogeneous_transfer_registry_url="tcp://source:31999",
                 ),
             )
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
@@ -960,7 +977,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         self.assertTrue(child_args.weight_heterogeneous_copy)
         self.assertEqual(
             child_args.weight_heterogeneous_transfer_registry_url,
-            "http://source:31999",
+            "tcp://source:31999",
         )
 
 

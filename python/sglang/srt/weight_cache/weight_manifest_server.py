@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Lightweight HTTP registry for source weight manifests."""
+"""Lightweight TCP registry for source weight manifests."""
 
 import logging
+import socket
 import threading
 from typing import Any, Dict, Optional
 
-import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
+from sglang.srt.utils.network import NetworkAddress
+
+from .protocol import recv_msg, send_msg
 
 logger = logging.getLogger(__name__)
+
+CLIENT_CONNECTION_TIMEOUT = 5.0
 
 
 class WeightManifestServer:
@@ -28,39 +31,92 @@ class WeightManifestServer:
         self._rank_manifests: Dict[int, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
-        app = FastAPI()
-
-        @app.get("/health")
-        def health():
-            return PlainTextResponse("OK")
-
-        @app.put("/register_weight_manifest")
-        def register_weight_manifest(data: dict):
-            try:
-                self.register_weight_manifest(data)
-                return PlainTextResponse("OK")
-            except ValueError as error:
-                raise HTTPException(status_code=409, detail=str(error)) from error
-            except Exception as error:
-                logger.exception("Failed to register source weight manifest")
-                raise HTTPException(status_code=400, detail=str(error)) from error
-
-        @app.get("/get_source_weights_manifest")
-        def get_source_weights_manifest():
-            try:
-                return {"source_weights_manifest": self.get_source_weights_manifest()}
-            except RuntimeError as error:
-                raise HTTPException(status_code=409, detail=str(error)) from error
-
-        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
-        self._server = uvicorn.Server(config)
-        self._thread = threading.Thread(target=self._server.run, daemon=True)
+        address = NetworkAddress(host, port)
+        self._listener = socket.socket(address.family, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(address.to_bind_tuple())
+        self.port = self._listener.getsockname()[1]
+        self._listener.listen(8)
+        self._listener.settimeout(0.2)
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(
+            target=self._serve,
+            name="weight-manifest-server",
+            daemon=True,
+        )
         self._thread.start()
         logger.info(
             "WeightManifestServer started on %s:%s, expected_ranks=%s",
             host,
-            port,
+            self.port,
             expected_rank_count,
+        )
+
+    def _serve(self) -> None:
+        while not self._stopped.is_set():
+            try:
+                conn, peer = self._listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._stopped.is_set():
+                    return
+                raise
+
+            conn.settimeout(CLIENT_CONNECTION_TIMEOUT)
+            try:
+                self._handle_connection(conn)
+            except Exception:
+                logger.exception(
+                    "Failed to handle weight manifest request from %s", peer
+                )
+            finally:
+                conn.close()
+
+    def _handle_connection(self, conn: socket.socket) -> None:
+        request = recv_msg(conn)
+        if not isinstance(request, dict):
+            send_msg(
+                conn,
+                {"status": "error", "message": "manifest request must be a dict"},
+            )
+            return
+
+        request_type = request.get("type")
+        if request_type == "register_weight_manifest":
+            try:
+                self.register_weight_manifest(request["manifest"])
+            except ValueError as error:
+                send_msg(
+                    conn,
+                    {"status": "conflict", "message": str(error)},
+                )
+                return
+            except Exception as error:
+                logger.exception("Failed to register source weight manifest")
+                send_msg(conn, {"status": "error", "message": str(error)})
+                return
+            send_msg(conn, {"status": "ok"})
+            return
+
+        if request_type == "get_source_weights_manifest":
+            try:
+                manifest = self.get_source_weights_manifest()
+            except RuntimeError as error:
+                send_msg(conn, {"status": "retry", "message": str(error)})
+                return
+            send_msg(
+                conn,
+                {"status": "ok", "source_weights_manifest": manifest},
+            )
+            return
+
+        send_msg(
+            conn,
+            {
+                "status": "error",
+                "message": f"unknown manifest request type: {request_type!r}",
+            },
         )
 
     def register_weight_manifest(self, data: dict[str, Any]) -> None:
@@ -146,5 +202,6 @@ class WeightManifestServer:
         }
 
     def close(self) -> None:
-        self._server.should_exit = True
+        self._stopped.set()
+        self._listener.close()
         self._thread.join(timeout=5)

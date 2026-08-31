@@ -146,24 +146,24 @@ class WeightCacheDaemonArgs:
         parser.add_argument(
             "--weight-heterogeneous-transfer-server-host",
             default="0.0.0.0",
-            help="Source manifest server bind host.",
+            help="Source manifest TCP registry bind host.",
         )
         parser.add_argument(
             "--weight-heterogeneous-transfer-server-port",
             type=int,
             default=31999,
-            help="Source manifest server port.",
+            help="Source manifest TCP registry port.",
         )
         parser.add_argument(
             "--weight-heterogeneous-transfer-source-ip",
             default=None,
-            help="Source manifest server IP for a target daemon launcher.",
+            help="Source manifest TCP registry IP for a target daemon launcher.",
         )
         parser.add_argument(
             "--weight-heterogeneous-transfer-source-port",
             type=int,
             default=None,
-            help="Source manifest server port for a target daemon launcher.",
+            help="Source manifest TCP registry port for a target daemon launcher.",
         )
         parser.add_argument(
             "--weight-heterogeneous-transfer-registry-url",
@@ -931,7 +931,7 @@ def _prepare_weight_heterogeneous_transfer(
         )
         return (
             manifest_server,
-            f"http://127.0.0.1:"
+            f"tcp://127.0.0.1:"
             f"{daemon_args.weight_heterogeneous_transfer_server_port}",
         )
     if (
@@ -943,7 +943,7 @@ def _prepare_weight_heterogeneous_transfer(
         )
     return (
         None,
-        f"http://{daemon_args.weight_heterogeneous_transfer_source_ip}:"
+        f"tcp://{daemon_args.weight_heterogeneous_transfer_source_ip}:"
         f"{daemon_args.weight_heterogeneous_transfer_source_port}",
     )
 
