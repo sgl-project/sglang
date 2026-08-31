@@ -1,6 +1,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
@@ -26,6 +27,30 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
+
+
+class TestSWAKVPoolVHeadDim(CustomTestCase):
+    def test_all_swa_pool_uses_swa_value_head_dim(self):
+        """An all-SWA model must not read its empty full-attention sub-pool."""
+        pool = object.__new__(SWAKVPool)
+        pool.full_layer_nums = 0
+        pool.full_kv_pool = Mock()
+        pool.swa_kv_pool = Mock()
+        pool.swa_kv_pool.get_v_head_dim.return_value = 96
+
+        self.assertEqual(pool.get_v_head_dim(), 96)
+        pool.full_kv_pool.get_v_head_dim.assert_not_called()
+
+    def test_mixed_pool_uses_full_value_head_dim(self):
+        """A mixed SWA model keeps the full-attention value-head contract."""
+        pool = object.__new__(SWAKVPool)
+        pool.full_layer_nums = 1
+        pool.full_kv_pool = Mock()
+        pool.swa_kv_pool = Mock()
+        pool.full_kv_pool.get_v_head_dim.return_value = 128
+
+        self.assertEqual(pool.get_v_head_dim(), 128)
+        pool.swa_kv_pool.get_v_head_dim.assert_not_called()
 
 
 def _event_hashes(events):
