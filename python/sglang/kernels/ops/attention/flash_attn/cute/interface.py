@@ -12,7 +12,7 @@ from cutlass import Float32, Int32
 from quack.compile_utils import make_fake_tensor as fake_tensor
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+from sglang.kernels.ops.attention.flash_attn.batch_invariance import (
     is_batch_invariant,
 )
 from sglang.kernels.ops.attention.flash_attn.cute.cache_utils import get_jit_cache

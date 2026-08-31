@@ -6,7 +6,7 @@ from functools import cache
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+from sglang.kernels.ops.attention.flash_attn.batch_invariance import (
     is_batch_invariant,
 )
 from sglang.kernels.ops.attention.inkling_rel_proj import rel_proj_small_t
