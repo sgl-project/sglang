@@ -122,7 +122,8 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(
-            ComponentCheckpointUnsupportedError, "does not support direct GPU"
+            ComponentCheckpointUnsupportedError,
+            "Direct GPU loading is not implemented",
         ):
             VAELoader().load("/model/audio_vae", server_args, "audio_vae", "diffusers")
 

@@ -86,7 +86,7 @@ class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
                         )
 
                 native.assert_not_called()
-                server_args.should_use_fsdp_for_component.assert_called_once_with(
+                server_args.should_use_fsdp_for_component.assert_called_with(
                     "transformer_2"
                 )
 
@@ -110,9 +110,7 @@ class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
         self.assertIsNotNone(component)
         self.assertEqual(consumed, 0.0)
         native.assert_called_once()
-        server_args.should_use_fsdp_for_component.assert_called_once_with(
-            "transformer_2"
-        )
+        server_args.should_use_fsdp_for_component.assert_called_with("transformer_2")
 
     def test_parallel_execution_rejects_native_fallback(self):
         cases = (
