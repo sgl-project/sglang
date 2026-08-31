@@ -7,7 +7,9 @@ register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
 import copy
+import re
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import msgspec
@@ -25,7 +27,6 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class TestSamplingParamsInit(CustomTestCase):
-
     def test_zero_temperature_becomes_greedy(self):
         """Test greedy conversion when temperature is 0."""
         sp = SamplingParams(temperature=0.0)
@@ -88,7 +89,6 @@ class TestSamplingParamsInit(CustomTestCase):
 
 
 class TestSamplingParamsVerify(CustomTestCase):
-
     VOCAB_SIZE = 32000
     GRAMMAR_VALUES = {
         "json_schema": '{"type":"object"}',
@@ -314,13 +314,12 @@ class TestSamplingParamsVerify(CustomTestCase):
 
 
 class TestSamplingParamsNormalize(CustomTestCase):
-
     def _mock_tokenizer(self, encode_map=None):
         """Create a mock tokenizer that returns predetermined token lists."""
         tokenizer = MagicMock()
         if encode_map:
-            tokenizer.encode.side_effect = (
-                lambda s, add_special_tokens=False: encode_map.get(s, [1])
+            tokenizer.encode.side_effect = lambda s, add_special_tokens=False: (
+                encode_map.get(s, [1])
             )
         else:
             tokenizer.encode.return_value = [1]  # Default: 1 token
@@ -428,6 +427,24 @@ class TestSamplingParamsNormalize(CustomTestCase):
 
 
 class TestSamplingParamsMsgspecStruct(CustomTestCase):
+    def test_rust_sampling_schema_stays_in_lockstep(self):
+        """Compare Rust fields with the imported Python wire schema."""
+        rust_path = (
+            Path(__file__).resolve().parents[4]
+            / "rust/sglang-server/src/message/sampling.rs"
+        )
+        source = rust_path.read_text()
+        start = source.index("pub struct SamplingParams {")
+        end = source.index("\n}\n\n/// The `/generate`", start)
+        rust_fields = tuple(
+            re.findall(
+                r"^\s*pub ([a-z][a-z0-9_]*):",
+                source[start:end],
+                re.MULTILINE,
+            )
+        )
+
+        self.assertEqual(SamplingParams.__struct_fields__, rust_fields)
 
     def test_copy_remains_mutable_and_independent(self):
         sp = SamplingParams(max_new_tokens=8, custom_params={"a": 1})
@@ -501,7 +518,6 @@ class TestSamplingParamsMsgspecStruct(CustomTestCase):
 
 
 class TestRegexMaxLength(CustomTestCase):
-
     def test_literal_string(self):
         """Test that plain string 'abc' gives max length 3."""
         self.assertEqual(get_max_seq_length("abc"), 3)
