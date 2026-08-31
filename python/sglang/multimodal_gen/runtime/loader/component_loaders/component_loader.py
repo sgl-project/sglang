@@ -156,7 +156,16 @@ class ComponentLoader(ABC):
     def __init__(self, device=None) -> None:
         self.device = device
         self.component_architecture: str | None = None
+        self.component_type: str | None = None
         self._native_load_manages_placement = False
+
+    def structural_component_name(self, component_name: str) -> str:
+        """Return the config slot without changing the exact policy key."""
+        return self.component_type or component_name
+
+    def structural_component_type(self, component_name: str) -> str:
+        """Return the normalized loader role for an exact component key."""
+        return _normalize_component_type(self.structural_component_name(component_name))
 
     @staticmethod
     def target_device(component_starts_on_cpu: bool) -> torch.device:
@@ -190,10 +199,23 @@ class ComponentLoader(ABC):
     ) -> bool:
         return self.supports_direct_gpu_weight_loading
 
+    def is_native_only_component(
+        self, server_args: ServerArgs, component_name: str
+    ) -> bool:
+        native_only_components = server_args.pipeline_config.native_only_components
+        return any(
+            name in native_only_components
+            for name in (
+                component_name,
+                self.structural_component_name(component_name),
+                self.structural_component_type(component_name),
+            )
+        )
+
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
-        return component_name in server_args.pipeline_config.native_only_components
+        return self.is_native_only_component(server_args, component_name)
 
     def validate_native_fallback(
         self, _server_args: ServerArgs, _component_name: str
@@ -429,11 +451,19 @@ class ComponentLoader(ABC):
         """
         Load the component using the native library (transformers/diffusers).
         """
-        precision = (
-            resolve_component_precision(server_args, component_name)
-            if component_name is not None
-            else None
-        )
+        precision = None
+        if component_name is not None:
+            precision_names = dict.fromkeys(
+                (
+                    component_name,
+                    self.structural_component_name(component_name),
+                    self.structural_component_type(component_name),
+                )
+            )
+            for precision_name in precision_names:
+                precision = resolve_component_precision(server_args, precision_name)
+                if precision is not None:
+                    break
         load_kwargs = {}
         if precision is not None:
             load_kwargs["torch_dtype"] = precision
@@ -571,7 +601,7 @@ class ComponentLoader(ABC):
     @classmethod
     def for_component_type(
         cls,
-        component_name: str,
+        component_type: str,
         transformers_or_diffusers: str,
         component_architecture: str | None = None,
     ) -> "ComponentLoader":
@@ -579,37 +609,43 @@ class ComponentLoader(ABC):
         Factory method to create a component loader for a specific component type.
 
         Args:
-            component_name: Type of component (e.g., "vae", "text_encoder", "transformer", "scheduler")
+            component_type: Structural role (e.g. "vae" or "text_encoder")
             transformers_or_diffusers: Whether the component is from transformers or diffusers
         """
         cls._ensure_loaders_registered()
 
         # Map of component types to their loader classes and expected library
-        component_name = _normalize_component_type(component_name)
+        structural_component_name = component_type
+        loader_type = _normalize_component_type(component_type)
 
         transformers_or_diffusers = cls.resolve_transformers_or_diffusers(
-            transformers_or_diffusers, component_name
+            transformers_or_diffusers, loader_type
         )
 
-        if component_name in component_name_to_loader_cls:
+        if loader_type in component_name_to_loader_cls:
             loader_cls: Type[ComponentLoader] = component_name_to_loader_cls[
-                component_name
+                loader_type
             ]
             expected_library = loader_cls.expected_library
             # Assert that the library matches what's expected for this component type
             assert (
                 transformers_or_diffusers == expected_library
-            ), f"{component_name} must be loaded from {expected_library}, got {transformers_or_diffusers}"
+            ), f"{loader_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
             loader = loader_cls()
+            loader.component_type = structural_component_name
             loader.component_architecture = component_architecture
             return loader
 
         # For unknown component types, use a generic loader
         logger.warning(
             "No specific loader found for component type: %s. Using generic loader.",
-            component_name,
+            loader_type,
         )
-        return GenericComponentLoader(transformers_or_diffusers, component_architecture)
+        loader = GenericComponentLoader(
+            transformers_or_diffusers, component_architecture
+        )
+        loader.component_type = structural_component_name
+        return loader
 
 
 class PlainStateDictComponentLoader(ComponentLoader):
@@ -759,6 +795,7 @@ class PipelineComponentLoader:
         component_architecture: str | None = None,
         component_attn_backend: Any = None,
         component_attn_name: str | None = None,
+        component_type: str | None = None,
     ):
         """
         Load a pipeline component.
@@ -768,11 +805,14 @@ class PipelineComponentLoader:
             component_model_path: Path to the component model
             transformers_or_diffusers: Whether the component is from transformers or diffusers
             component_architecture: the class name of the module
+            component_type: structural config slot when it differs from the exact key
         """
 
         # Get the appropriate loader for this component type
         loader = ComponentLoader.for_component_type(
-            component_name, transformers_or_diffusers, component_architecture
+            component_type or component_name,
+            transformers_or_diffusers,
+            component_architecture,
         )
 
         try:
