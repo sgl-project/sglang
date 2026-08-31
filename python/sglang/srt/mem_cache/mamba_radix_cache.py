@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.runtime_context import (
+    get_parallel,
     mamba_cache_chunk_size,
 )
 
@@ -59,8 +60,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 import logging
-
-from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -549,7 +548,7 @@ class MambaRadixCache(BasePrefixCache):
         """Cache request when it finishes."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_len_to_handle
+                req.kv.req_pool_idx, :kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
             self.req_to_token_pool.free_mamba_cache(req)
@@ -557,7 +556,7 @@ class MambaRadixCache(BasePrefixCache):
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_len_to_handle
+            req.kv.req_pool_idx, :kv_len_to_handle
         ]
 
         if is_insert:
@@ -577,7 +576,7 @@ class MambaRadixCache(BasePrefixCache):
             if cache_len is None:
                 cache_len = 0
             if cache_len != len(token_ids):
-                cache_end_idx = max(cache_len, req.cache_protected_len)
+                cache_end_idx = max(cache_len, req.kv.cache_protected_len)
                 self.token_to_kv_pool_allocator.free_segment(
                     kv_indices[cache_end_idx:], start_pos=cache_end_idx
                 )
@@ -639,7 +638,7 @@ class MambaRadixCache(BasePrefixCache):
                     ),
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
-                    prev_prefix_len=req.cache_protected_len,
+                    prev_prefix_len=req.kv.cache_protected_len,
                 )
             )
             mamba_exist = result.mamba_exist
@@ -648,8 +647,8 @@ class MambaRadixCache(BasePrefixCache):
                 self.int8_ckpt_pool.free(mamba_value)
         else:
             self.token_to_kv_pool_allocator.free_segment(
-                kv_indices[req.cache_protected_len :],
-                start_pos=req.cache_protected_len,
+                kv_indices[req.kv.cache_protected_len :],
+                start_pos=req.kv.cache_protected_len,
             )
             mamba_exist = True
 
@@ -677,7 +676,7 @@ class MambaRadixCache(BasePrefixCache):
 
         def _skip_cache_unfinished_req(req: Req) -> None:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.extend_range.end
+                req.kv.req_pool_idx, : req.extend_range.end
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
@@ -694,7 +693,7 @@ class MambaRadixCache(BasePrefixCache):
             return _skip_cache_unfinished_req(req)
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, : len(token_ids)
         ]
         # kv_indices is the kv indices to be cached
         kv_indices = kv_indices_orig[:cache_len]
@@ -753,7 +752,7 @@ class MambaRadixCache(BasePrefixCache):
                 ),
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_donated,
-                prev_prefix_len=req.cache_protected_len,
+                prev_prefix_len=req.kv.cache_protected_len,
                 chunked=chunked,
             )
         )
@@ -780,15 +779,15 @@ class MambaRadixCache(BasePrefixCache):
             assert torch.equal(new_last_node.mamba_value, mamba_value_donated)
 
         assert (
-            req.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {len(page_aligned_token_ids)=}, {mamba_exist=}"
+            req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1
+        ), f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {len(page_aligned_token_ids)=}, {mamba_exist=}"
         assert new_prefix_len <= len(
             new_indices
         ), f"{new_prefix_len=}, {len(new_indices)=}"
 
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
+            (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
+            new_indices[req.kv.cache_protected_len :],
         )
 
         self.dec_lock_ref(req.last_node)
@@ -799,7 +798,7 @@ class MambaRadixCache(BasePrefixCache):
         req.prefix_indices = torch.cat(
             [new_indices, kv_indices_orig[len(new_indices) :]]
         )
-        req.cache_protected_len = len(new_indices)
+        req.kv.cache_protected_len = len(new_indices)
         req.mamba_last_track_seqlen = None
         req.last_node = new_last_node
 

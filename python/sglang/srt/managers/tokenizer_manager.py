@@ -717,7 +717,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if get_observability().extra_metric_labels:
                 labels.update(get_observability().extra_metric_labels)
             tokenizer_collector_cls = resolve_collector_class(
-                self.server_args,
                 STAT_LOGGER_ROLE_TOKENIZER,
                 TokenizerMetricsCollector,
             )

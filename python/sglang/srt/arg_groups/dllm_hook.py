@@ -7,11 +7,15 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    _dllm_attention_backend,
+    _dllm_overlap_disable,
+    _dllm_page_size,
     declare_resolution,
     resolving_view,
+    run_post_process_pass,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.utils.common import is_hip
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +27,7 @@ def handle_dllm_inference(server_args: Any):
     # On AMD/HIP, disable cuda graph for DLLM (the attention_backend
     # resolution moved to the pipeline: arg_groups/overrides.py
     # _dllm_attention_backend, invoked below at its legacy slot).
-    if is_hip():
+    if get_platform().is_hip:
         if (
             cfg.cuda_graph_config.decode.backend != Backend.DISABLED
             or cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
@@ -46,12 +50,6 @@ def handle_dllm_inference(server_args: Any):
                 ),
             )
 
-    from sglang.srt.arg_groups.overrides import (
-        _dllm_attention_backend,
-        _dllm_overlap_disable,
-        run_post_process_pass,
-    )
-
     run_post_process_pass(server_args, _dllm_attention_backend)
     run_post_process_pass(server_args, _dllm_overlap_disable)
 
@@ -60,7 +58,6 @@ def handle_dllm_inference(server_args: Any):
     # Invoked outside the radix gate: the alignment fill keeps its radix
     # gate inside the pass, the block-size cap applies regardless (it
     # replaces the unconditional scheduler-init fallback).
-    from sglang.srt.arg_groups.overrides import _dllm_page_size
 
     run_post_process_pass(server_args, _dllm_page_size)
 
