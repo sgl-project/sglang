@@ -185,6 +185,14 @@ class KVIndexTranslator:
             return self._full_v2p_table.numel() * self._capture_page_size
         return max_token_pool_size + self.page_size
 
+    def full_flat_v2p(self) -> Optional[torch.Tensor]:
+        """The full-side v2p page table for a kernel that translates flat ids
+        itself, or ``None`` when this runner does not translate (pass-through
+        and static pools)."""
+        if not self.is_translating:
+            return None
+        return self._full_v2p_table
+
     # -- per-batch view --------------------------------------------------------
 
     @property
