@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 from sglang.srt.environ import DsparkFoldedSampling, envs
 from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_draft import (
+    cap_step_logits,
     select_draft_hidden_without_anchor,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
@@ -50,10 +51,14 @@ class DsparkDraftSampler:
         confidence_fn=None,
         out=None,
         folded_sampling: bool = True,
+        sample_vocab_size: Optional[int] = None,
     ):
         self.model = model
         self.markov_head = model.markov_head
         self.gamma = int(gamma)
+        self.sample_vocab_size = (
+            int(sample_vocab_size) if sample_vocab_size is not None else None
+        )
         self.sample_from_anchor = bool(model.sample_from_anchor)
         self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         max_bs = int(max_bs)
@@ -81,15 +86,16 @@ class DsparkDraftSampler:
         self.corrected_out = None
         if folded_sampling:
             vocab = int(model.lm_head.org_vocab_size)
+            capped_vocab = min(vocab, self.sample_vocab_size or vocab)
             self.temperatures = torch.ones(
                 (max_bs,), dtype=torch.float32, device=device
             )
             self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
             self.exp_noise = torch.empty(
-                (max_bs, vocab), dtype=torch.float32, device=device
+                (max_bs, capped_vocab), dtype=torch.float32, device=device
             )
             self.corrected_out = torch.empty(
-                (max_bs * self.gamma, vocab),
+                (max_bs * self.gamma, capped_vocab),
                 dtype=_base_logits_dtype(model),
                 device=device,
             )
@@ -135,7 +141,9 @@ class DsparkDraftSampler:
             and isinstance(self.markov_head, VanillaMarkov)
         ):
             draft_tokens = self.markov_head.sample_block_greedy_fused(
-                base_logits, first_prev_tokens=anchor
+                base_logits,
+                first_prev_tokens=anchor,
+                vocab_limit=self.sample_vocab_size,
             )
 
         if draft_tokens is None:
@@ -143,6 +151,7 @@ class DsparkDraftSampler:
 
                 def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
                     del step_idx
+                    step_logits = cap_step_logits(step_logits, self.sample_vocab_size)
                     # In-graph philox noise: each replay advances the generator
                     # and redraws.
                     noise = self.exp_noise[:bs].exponential_()
@@ -161,7 +170,10 @@ class DsparkDraftSampler:
                 def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
                     return self._tp_sync.sync(
                         SpecTpSyncSite.DSPARK_GRAPH_GREEDY,
-                        greedy_step_sampler(step_logits, step_idx),
+                        greedy_step_sampler(
+                            cap_step_logits(step_logits, self.sample_vocab_size),
+                            step_idx,
+                        ),
                     )
 
             draft_tokens, corrected_logits = self.markov_head.sample_block(
@@ -172,8 +184,12 @@ class DsparkDraftSampler:
                 collect_corrected=self.folded_sampling,
             )
             if self.folded_sampling:
+                # Verify softmaxes these as the proposal q; crop to the sampled vocabulary.
                 self.corrected_out[: bs * self.gamma].copy_(
-                    corrected_logits.reshape(bs * self.gamma, -1)
+                    cap_step_logits(
+                        corrected_logits.reshape(bs * self.gamma, -1),
+                        self.sample_vocab_size,
+                    )
                 )
 
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
@@ -188,7 +204,14 @@ class DsparkDraftSampler:
 
 
 def _resolve_folded_sampling(
-    *, model, gamma, max_bs, device, tp_rank, available_memory_gb: float
+    *,
+    model,
+    gamma,
+    max_bs,
+    device,
+    tp_rank,
+    available_memory_gb: float,
+    sample_vocab_size: Optional[int] = None,
 ) -> bool:
     """The sampling buffers are baked into the captured draft graph, so AUTO
     must decide before capture from a free-memory probe. ``available_memory_gb``
@@ -199,7 +222,8 @@ def _resolve_folded_sampling(
     if mode == DsparkFoldedSampling.FORCE:
         return True
     vocab = int(model.lm_head.org_vocab_size)
-    noise_bytes = max_bs * vocab * 4
+    capped_vocab = min(vocab, sample_vocab_size or vocab)
+    noise_bytes = max_bs * capped_vocab * 4
     logits_bytes = max_bs * gamma * vocab * _base_logits_dtype(model).itemsize
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
     if available_memory_gb - need_gb >= _CAPTURE_HEADROOM_GB:
@@ -228,6 +252,7 @@ def maybe_build_draft_sampler(
     available_memory_gb: float,
     confidence_fn=None,
     out=None,
+    sample_vocab_size: Optional[int] = None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
     proposal must stay eager."""
@@ -250,6 +275,7 @@ def maybe_build_draft_sampler(
         device=device,
         tp_rank=tp_rank,
         available_memory_gb=available_memory_gb,
+        sample_vocab_size=sample_vocab_size,
     )
     if tp_rank == 0:
         logger.info(
@@ -265,4 +291,5 @@ def maybe_build_draft_sampler(
         confidence_fn=confidence_fn,
         out=out,
         folded_sampling=folded_sampling,
+        sample_vocab_size=sample_vocab_size,
     )
