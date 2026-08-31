@@ -20,6 +20,7 @@ import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.constrained.base_grammar_backend import (
     GRAMMAR_BACKEND_REGISTRY,
     BaseGrammarBackend,
@@ -355,7 +356,10 @@ class TestCreateGrammarBackend(unittest.TestCase):
         self.assertEqual(
             get_context().resolved_server_args_dict()["grammar_backend"], "none"
         )
-        self.assertEqual(server_args.grammar_backend, "xgrammar")
+        # The record is not written any more: what the caller asked for is a
+        # declaration on it, and the runtime fallback to "none" lives in the bag
+        # (asserted above). The two are meant to differ here.
+        self.assertEqual(resolution_result(server_args, "grammar_backend"), "xgrammar")
 
     @patch("sglang.srt.constrained.llguidance_backend.GuidanceBackend")
     def test_llguidance_backend(self, mock_guidance_cls):

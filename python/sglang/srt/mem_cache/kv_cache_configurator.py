@@ -1342,9 +1342,9 @@ class KVCacheConfigurator:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
-                self.server_args
-            ).host_to_device_ratio
+            pool_kwargs["host_to_device_ratio"] = (
+                parse_hisparse_config().host_to_device_ratio
+            )
         elif dsa_cp_layer_shard_rank is not None:
             # DSA cache layer split: shard KV/indexer layers across CP ranks.
             from sglang.srt.mem_cache.dsa_cache_layer_split import (
@@ -1759,7 +1759,7 @@ class KVCacheConfigurator:
                             parse_hisparse_config,
                         )
 
-                        hisparse_cfg = parse_hisparse_config(self.server_args)
+                        hisparse_cfg = parse_hisparse_config()
                         token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
                             sizes.max_total_num_tokens,
                             page_size=get_schedule().page_size,

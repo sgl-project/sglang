@@ -195,53 +195,18 @@ def _mla_launch_plan(
 
 
 def _extract_kv_strides(buf, page_size: int):
-    """Extract (slot_stride, head_stride, page_stride, tok_stride) for a
-    KV buffer that may be:
-      - 3-D ``[max_slots, head_num, head_dim]`` (legacy / non-shared) — the
-        contiguous layout most callers use. page/tok strides are synthesized
-        so the kernel's PAGE_SIZE>1 math collapses to ``kv_loc * stride(0)``.
-      - 4-D ``[num_pages, page_size, head_num, head_dim]`` (shared
-        pool). page/tok strides come from stride(0)/stride(1) directly;
-        legacy ``stride_bs`` is set to 0 (unused at PAGE_SIZE>1).
+    """Extract (slot_stride, head_stride, page_stride, tok_stride) for a 3-D
+    ``[max_slots, head_num, head_dim]`` KV buffer.
 
     Returns a 4-tuple of ints suitable for passing as ``stride_buf_*bs``,
     ``stride_buf_*h``, ``stride_buf_*page``, ``stride_buf_*tok``.
     """
-    if buf.ndim == 4:
-        # 4-D view ``[num_pages, page_size, head_num, head_dim]``.
-        #   stride(0) = per-PAGE stride (page_bytes/itemsize)
-        #   stride(1) = within-page per-TOKEN stride (k_row/v_row bytes/itemsize)
-        # The PAGE_SIZE>1 kernel branch uses page_stride/tok_stride and does
-        # NOT read slot_stride. slot_stride is consumed ONLY by the
-        # PAGE_SIZE==1 branch (``offs = kv_loc * stride_buf_*bs``), where one
-        # page holds exactly one slot, so the per-slot stride is the per-page
-        # stride — NOT the within-page token stride. Concretely the per-slot
-        # stride is ``page_stride // page_size`` (= entry_bytes/itemsize),
-        # which at ps=1 equals page_stride. Using ``tok_stride`` here (one
-        # layer's k_row) would make the ps=1 read address ``kv_loc * k_row``
-        # instead of ``kv_loc * entry_bytes`` and read the wrong slot.
-        page_stride = buf.stride(0)
-        tok_stride = buf.stride(1)
-        head_stride = buf.stride(2)
-        slot_stride = (
-            page_stride // page_size
-        )  # per-slot stride; == page_stride at ps=1
-        assert buf.shape[1] == page_size, (
-            f"4-D KV buffer's dim-1 must equal page_size; got "
-            f"shape[1]={buf.shape[1]}, page_size={page_size}"
-        )
-    elif buf.ndim == 3:
-        # Legacy 3-D ``[N, head, dim]``. Synthesize page/tok strides such
-        # that ``(kv_loc // ps) * page_stride + (kv_loc % ps) * tok_stride
-        # == kv_loc * slot_stride`` for the page-aware branch — this lets
-        # the same kernel handle non-shared paged-allocator buffers without
-        # any caller adjustment.
-        slot_stride = buf.stride(0)
-        head_stride = buf.stride(1)
-        page_stride = slot_stride * page_size
-        tok_stride = slot_stride
-    else:  # pragma: no cover
+    if buf.ndim != 3:
         raise ValueError(f"unexpected KV buffer ndim={buf.ndim}, shape={buf.shape}")
+    slot_stride = buf.stride(0)
+    head_stride = buf.stride(1)
+    page_stride = slot_stride * page_size
+    tok_stride = slot_stride
     return slot_stride, head_stride, page_stride, tok_stride
 
 
@@ -464,9 +429,6 @@ def _decode_att_m_fwd(
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
-    # head_num lives in the dim immediately before the head_dim. For 3-D
-    # ``[N, head_num, head_dim]`` that's dim 1; for 4-D
-    # ``[num_pages, page_size, head_num, head_dim]`` that's dim 2.
     kv_head_num = k_buffer.shape[-2]
 
     batch, head_num = q.shape[0], q.shape[1]
@@ -1204,8 +1166,7 @@ def decode_attention_fwd(
     # schedule from kv_indptr on-device, so this path involves no host sync and is safe to
     # capture in a CUDA graph. Whether Lean pays off for a given shape is decided cheaply by
     # the backend's host-side seqlen gate (lean_decode_seqlen_gate) before we get here.
-    # Lean supports both the contiguous 3-D [N, head, dim] and paged 4-D
-    # [num_pages, page_size, head, dim] KV layouts (page-aware address math in the kernel).
+    # Lean handles both page sizes: the kernel does page-aware address math.
     # ROCm/AMD only: Lean is validated on MI300X/MI355X; CUDA/NVIDIA uses the standard kernel.
     if (
         _is_hip
@@ -1587,8 +1548,8 @@ def _lean_attention_decode_kernel(
 
             # Load K transposed: [BLOCK_DMODEL, BLOCK_N] so qk = q @ k directly.
             # Page-aware KV address math (mirrors the standard grouped kernel): at
-            # PAGE_SIZE==1 the slot index addresses directly; otherwise it splits into
-            # (page_id, tok_in_p) for a [num_pages, page_size, head, dim] paged buffer.
+            # PAGE_SIZE==1 the slot index addresses directly; otherwise it splits
+            # into (page_id, tok_in_p).
             if PAGE_SIZE == 1:
                 offs_buf_k = (
                     kv_loc[None, :] * stride_buf_kbs
@@ -1968,13 +1929,11 @@ def _decode_lean_attention_fwd(
     ``total_programs`` is the fixed persistent-grid size (2× device CU count). The kernel
     derives its own tile schedule from ``kv_indptr`` on-device, so no host sync is needed and
     the launch is CUDA-graph capturable. ``Mp``, ``Lp``, ``Op``, ``locks`` are pre-allocated
-    persistent-grid partial-result buffers reused across decode steps. ``page_size`` selects
-    the KV address math: 1 for a contiguous ``[N, head, dim]`` buffer, >1 for a paged
-    ``[num_pages, page_size, head, dim]`` buffer (strides via ``_extract_kv_strides``).
+    persistent-grid partial-result buffers reused across decode steps. ``page_size``
+    selects the KV address math over the ``[N, head, dim]`` buffer (strides via
+    ``_extract_kv_strides``).
     """
     batch, head_num = q.shape[0], q.shape[1]
-    # head_num lives at dim -2 for both the 3-D [N, head, dim] and 4-D paged
-    # [num_pages, page_size, head, dim] layouts.
     num_kv_heads = k_buffer.shape[-2]
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
