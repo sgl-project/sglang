@@ -230,10 +230,14 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         static_batch = runner.load_batch(forward_batch)
 
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
+
     def test_eagle_target_full_reaches_graph_construction(self):
         override = get_context().override_server_args(
             enable_return_hidden_states=True,
             return_hidden_states_mode="last",
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.FULL)
+            ),
         )
         override.install()
         self.addCleanup(override.restore)
@@ -242,12 +246,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             lora_manager=None,
             model=object(),
             spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
-            server_args=SimpleNamespace(
-                enable_lora=False,
-                cuda_graph_config=SimpleNamespace(
-                    prefill=SimpleNamespace(backend=Backend.FULL)
-                ),
-            ),
         )
 
         with (
