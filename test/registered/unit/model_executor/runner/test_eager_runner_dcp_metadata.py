@@ -1,5 +1,8 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import pytest
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
@@ -72,3 +75,7 @@ def test_cp_v2_metadata_is_prepared_once(_is_cp_v2_active, prepare_cp_forward):
     prepare_cp_forward.assert_called_once_with(batch)
     model_runner.attn_backend.init_forward_metadata.assert_called_once_with(batch)
     runner._execute_extend_cp_v2.assert_called_once()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
