@@ -33,7 +33,7 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
         vocab_size=128,
     )
     req.output_ids.append(3)
-    req.kv_committed_len = 2
+    req.kv.kv_committed_len = 2
 
     batch = ScheduleBatch(reqs=[req])
     batch.tree_cache = SimpleNamespace(page_size=TRACK_INTERVAL)
