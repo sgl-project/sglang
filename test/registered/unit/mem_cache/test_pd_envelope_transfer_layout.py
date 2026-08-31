@@ -18,7 +18,7 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.layout.page_major import (
-    build_dense_mla_views,
+    build_mla_views,
     build_page_major_mamba_views,
     mamba_entry_bytes,
     mla_entry_bytes,
@@ -31,7 +31,7 @@ register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
 class TestMLAEnvelopeTransferAddressing(CustomTestCase):
     def test_page_envelope_matches_dense_views(self):
-        """Every (page, layer, slot) row written through the dense MLA views
+        """Every (page, layer, slot) row written through the MLA views
         must land at raw_ptr + page * page_envelope_bytes + layer-block offset,
         i.e. inside the page's transfer envelope."""
         layer_num, page_size, kv_dim, num_pages = 3, 4, 8, 6
@@ -49,7 +49,7 @@ class TestMLAEnvelopeTransferAddressing(CustomTestCase):
         )
         # +1 page envelope of tail pad, as UnifiedKVPool allocates for MLA.
         raw = torch.zeros((num_pages + 1) * page_bytes, dtype=torch.uint8)
-        views = build_dense_mla_views(
+        views = build_mla_views(
             raw,
             layer_num=layer_num,
             kv_cache_dim=kv_dim,
