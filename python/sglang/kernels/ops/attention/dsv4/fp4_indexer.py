@@ -207,6 +207,129 @@ def store_fp4_index_k_cache(
     )
 
 
+# ---------------------------------------------------------------------------
+# FlyDSL path (gfx950): store index-K in aiter's tuned paged-MQA-logits
+# preshuffle layout and score with aiter.ops.flydsl.flydsl_pa_mqa_logits_fp4,
+# ~1.32x faster than the fp8 gluon kernel at the DSV4 indexer geometry.
+# Layout (K_TILES=1 for head_dim 128, kv_block=64=indexer page_size):
+#   kv_cache[page, 1, 4, 64, 16] uint8   fp4 e2m1, chunk-major within a page
+#   kv_scale[page, 1, 4, 64]     uint8   ue8m0, NTPW=4 interleaved along token
+# ---------------------------------------------------------------------------
+@triton.jit
+def _store_fp4_index_k_flydsl_kernel(
+    x,            # [n_tokens, 128] bf16 index-K
+    kv_cache,     # [num_pages * 4096] uint8, page-major 1x4x64x16
+    kv_scale,     # [num_pages * 256]  uint8, page-major 1x4x64
+    loc,          # [n_tokens] int64, page * 64 + p
+    BLOCK_N: tl.constexpr,   # 128
+    GROUP_N: tl.constexpr,   # 32
+):
+    # Mapping proven bit-exact vs aiter's create_paged_preshuffle_kv_fp4:
+    #   fp4:   kv_cache[page, byte//16, p, byte%16]   byte in 0..63
+    #   scale: kv_scale[page, c, (p%16)*4 + (p//16)]  c in 0..3 (NTPW=4 interleave)
+    token_id = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    abs_values = tl.abs(tl.load(x + token_id * BLOCK_N + offs).to(tl.float32))
+    amax0 = tl.max(tl.where(offs < GROUP_N, abs_values, 0.0), axis=0)
+    amax1 = tl.max(tl.where((GROUP_N <= offs) & (offs < 2 * GROUP_N), abs_values, 0.0), axis=0)
+    amax2 = tl.max(tl.where((2 * GROUP_N <= offs) & (offs < 3 * GROUP_N), abs_values, 0.0), axis=0)
+    amax3 = tl.max(tl.where(3 * GROUP_N <= offs, abs_values, 0.0), axis=0)
+    exp0 = _ceil_ue8m0_exp(tl.maximum(amax0 / 6.0, 1.0e-4))
+    exp1 = _ceil_ue8m0_exp(tl.maximum(amax1 / 6.0, 1.0e-4))
+    exp2 = _ceil_ue8m0_exp(tl.maximum(amax2 / 6.0, 1.0e-4))
+    exp3 = _ceil_ue8m0_exp(tl.maximum(amax3 / 6.0, 1.0e-4))
+
+    cache_loc = tl.load(loc + token_id)
+    page = cache_loc // 64
+    p = cache_loc % 64
+
+    b = tl.arange(0, 16)
+    for c in tl.static_range(4):
+        exp_c = _select_group_value(c, exp0, exp1, exp2, exp3)
+        s = (exp_c << 23).to(tl.float32, bitcast=True)
+        lo = _fp4_e2m1_code(tl.load(x + token_id * BLOCK_N + (c * 32 + 2 * b)).to(tl.float32) / s)
+        hi = _fp4_e2m1_code(tl.load(x + token_id * BLOCK_N + (c * 32 + 2 * b + 1)).to(tl.float32) / s)
+        packed = (lo & 0x0F) | ((hi & 0x0F) << 4)
+        tl.store(kv_cache + page * 4096 + c * (64 * 16) + p * 16 + b, packed)
+        sslot = (p % 16) * 4 + (p // 16)
+        tl.store(kv_scale + page * 256 + c * 64 + sslot, exp_c)
+
+
+def store_fp4_index_k_flydsl(
+    input: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    loc: torch.Tensor,
+) -> None:
+    """Fused quant + preshuffle store of bf16 index-K into the FlyDSL buffers."""
+    assert input.shape[-1] == 128
+    x = input.contiguous().view(-1, 128)
+    n_tokens = x.shape[0]
+    if n_tokens == 0:
+        return
+    _store_fp4_index_k_flydsl_kernel[(n_tokens,)](
+        x, kv_cache.view(-1), kv_scale.view(-1), loc, BLOCK_N=128, GROUP_N=32
+    )
+
+
+def flydsl_fp4_paged_mqa_logits(
+    q_fp4: torch.Tensor,       # [B, NEXT_N, H, 64] uint8, fp4 e2m1
+    q_scale: torch.Tensor,     # [B, NEXT_N, H, 4]  uint8, ue8m0
+    kv_cache: torch.Tensor,    # [num_pages, 1, 4, 64, 16] uint8
+    kv_scale: torch.Tensor,    # [num_pages, 1, 4, 64]     uint8
+    weights: torch.Tensor,     # [B, NEXT_N, H]
+    seq_lens: torch.Tensor,    # [B] int32
+    page_table: torch.Tensor,  # [B, max_pages] int32; page_size == kv_block == 64
+    max_seq_len: int,
+) -> torch.Tensor:
+    """Score the indexer via aiter's tuned flydsl_pa_mqa_logits_fp4.
+
+    The indexer pages at 64 tokens == FlyDSL's kv_block_size, so page_table is the
+    block_table directly. Q scales are pre-shuffled to the kernel layout; weights
+    must be bf16 (fp32 reinterprets to NaN)."""
+    from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+        compute_varctx_schedule,
+    )
+
+    B, next_n, H, _ = q_fp4.shape
+    m_tiles = (H + 15) // 16
+    qs_pad = ((m_tiles + 3) // 4) * 4
+    qe = torch.nn.functional.pad(
+        q_scale.view(torch.uint8)
+        .reshape(B, next_n, m_tiles, 16, 1, 4)
+        .permute(0, 1, 4, 5, 3, 2)
+        .contiguous(),
+        (0, qs_pad - m_tiles),
+    ).contiguous()
+
+    block_k = 256
+    _, cta_info, total_ctas = compute_varctx_schedule(
+        seq_lens, block_k, None, max_seq_len, next_n=next_n
+    )
+    out = torch.full(
+        (B * next_n, max_seq_len), float("-inf"), dtype=torch.float32, device=q_fp4.device
+    )
+    flydsl_pa_mqa_logits_fp4(
+        q_fp4,
+        qe,
+        kv_cache,
+        kv_scale,
+        page_table,
+        weights.reshape(B * next_n, H).to(torch.bfloat16),
+        seq_lens,
+        max_seq_len,
+        weight_scale=1.0,
+        next_n=next_n,
+        block_k=block_k,
+        kv_block_size=64,
+        out=out,
+        cta_info=cta_info,
+        total_ctas=total_ctas,
+    )
+    return out
+
+
 @triton.jit
 def _fp4_paged_mqa_logits_kernel(
     q_fp8,        # [B, H, HEAD] fp8_e4m3 (q kept fp8; only KV is fp4)

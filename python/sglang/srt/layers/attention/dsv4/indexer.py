@@ -792,14 +792,22 @@ class C4IndexerBackendMixin:
 
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
+        use_flydsl = False
+        fn = None
         if use_fp4_indexer:
             weights = weights.float()
             if is_hip():
-                # ROCm has no DeepGEMM fp4 kernel; use the fused Triton paged
-                # MQA-logits (fp4 dequant on the fly, no KV materialization).
-                from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
-                    fp4_paged_mqa_logits_triton as fn,
-                )
+                if (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                ):
+                    # gfx950 decode / MTP verify: aiter's tuned flydsl fp4 score
+                    # (call site below). Prefill keeps the fused Triton fp4 score.
+                    use_flydsl = True
+                else:
+                    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                        fp4_paged_mqa_logits_triton as fn,
+                    )
             else:
                 if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
                     raise RuntimeError(
@@ -856,6 +864,10 @@ class C4IndexerBackendMixin:
             c4_seq_lens=c4_seq_lens,
             query_rows=query_rows,
         )
+        if use_flydsl:
+            # The tuned flydsl kernel is paged-only; the nonpaged fast path has
+            # no fp4 variant.
+            nonpaged_plan = None
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             logits = self._forward_nonpaged_indexer(
@@ -864,6 +876,31 @@ class C4IndexerBackendMixin:
                 c4_indexer=c4_indexer,
                 token_to_kv_pool=token_to_kv_pool,
                 plan=nonpaged_plan,
+            )
+        elif use_flydsl:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                flydsl_fp4_paged_mqa_logits,
+                quantize_fp4_indexer_tensor,
+            )
+
+            kv_cache, kv_scale = token_to_kv_pool.get_index_k_flydsl_buffers(
+                layer_id=c4_indexer.layer_id,
+            )
+            # q arrives fp8 [B, NEXT_N, H, 128]; the tuned kernel wants fp4 q.
+            b_q, nn_q, h_q, _ = q.shape
+            q_fp4_flat, q_sf_flat = quantize_fp4_indexer_tensor(q.reshape(-1, 128))
+            sfo = torch.arange(4, device=q.device, dtype=torch.int32)
+            logits = flydsl_fp4_paged_mqa_logits(
+                q_fp4=q_fp4_flat.view(b_q, nn_q, h_q, 64).to(torch.uint8),
+                q_scale=((q_sf_flat.view(b_q, nn_q, h_q, 1) >> (sfo * 8)) & 0xFF).to(
+                    torch.uint8
+                ),
+                kv_cache=kv_cache,
+                kv_scale=kv_scale,
+                weights=weights,
+                seq_lens=_c4sl.reshape(-1).to(torch.int32),
+                page_table=page_table.to(torch.int32),
+                max_seq_len=indexer_metadata.max_c4_seq_len,
             )
         else:
             c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(

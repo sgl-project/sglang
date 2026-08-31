@@ -285,6 +285,10 @@ class DeepSeekV4IndexerPool(KVCache):
         )
         self.index_head_dim = index_head_dim
         self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
+        # gfx950 scores the fp4 indexer with aiter's tuned flydsl kernel, which
+        # needs the index-K in a preshuffle layout split across two page-major
+        # buffers (see fp4_indexer.store_fp4_index_k_flydsl).
+        self.use_flydsl_fp4 = self.use_fp4_indexer and _is_hip
 
         self._create_buffer()
 
@@ -294,7 +298,7 @@ class DeepSeekV4IndexerPool(KVCache):
         return self.index_head_dim + 4
 
     def _create_buffer(self):
-        page_bytes = self.page_size * self.get_bytes_per_token()
+        num_pages = (self.size + self.page_size + 1) // self.page_size
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -303,13 +307,68 @@ class DeepSeekV4IndexerPool(KVCache):
             ):
                 self.index_k_with_scale_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size + 1) // self.page_size,
-                        page_bytes,
+                        num_pages,
+                        self.page_size * self.get_bytes_per_token(),
                         dtype=self.index_k_with_scale_buffer_dtype,
                         device=self.device,
                     )
                     for _ in range(self.layer_num)
                 ]
+                if self.use_flydsl_fp4:
+                    # Mirror of the index-K in aiter's flydsl preshuffle layout
+                    # (fp4 + ue8m0 in separate page-major buffers), written on
+                    # every store (prefill and decode) and read by the flydsl
+                    # score on decode/verify. The primary buffer above still
+                    # feeds the C++ fused store and the prefill Triton score.
+                    # The flydsl store kernel hardcodes the K_TILES=1 / kv_block
+                    # layout, so it requires exactly these dims.
+                    assert self.page_size == 64 and self.index_head_dim == 128, (
+                        "flydsl fp4 indexer requires page_size==64 and "
+                        f"index_head_dim==128, got {self.page_size=} {self.index_head_dim=}"
+                    )
+                    self.index_k_flydsl_fp4 = [
+                        torch.zeros(
+                            num_pages,
+                            self.page_size * (self.index_head_dim // 2),
+                            dtype=self.index_k_with_scale_buffer_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.index_k_flydsl_scale = [
+                        torch.zeros(
+                            num_pages,
+                            self.page_size * 4,
+                            dtype=self.index_k_with_scale_buffer_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+
+    def get_index_k_flydsl_buffers(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        idx = layer_id
+        num_pages = self.index_k_flydsl_fp4[idx].shape[0]
+        kv_cache = self.index_k_flydsl_fp4[idx].view(num_pages, 1, 4, self.page_size, 16)
+        kv_scale = self.index_k_flydsl_scale[idx].view(num_pages, 1, 4, self.page_size)
+        return kv_cache, kv_scale
+
+    def store_index_k_flydsl(
+        self, layer_id: int, loc: torch.Tensor, cache_k: torch.Tensor
+    ) -> None:
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            store_fp4_index_k_flydsl,
+        )
+
+        # Index raw (not layer_id - start_layer) to match get_index_k_flydsl_buffers
+        # and get_index_k_with_scale_buffer, so the mirror read and write agree.
+        store_fp4_index_k_flydsl(
+            input=cache_k,
+            kv_cache=self.index_k_flydsl_fp4[layer_id],
+            kv_scale=self.index_k_flydsl_scale[layer_id],
+            loc=loc,
+        )
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError()
@@ -1109,6 +1168,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.get_index_k_with_scale_buffer(compress_layer_id)
 
+    def get_index_k_flydsl_buffers(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
+        return self.c4_indexer_kv_pool.get_index_k_flydsl_buffers(compress_layer_id)
+
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
@@ -1244,7 +1310,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     ) -> None:
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
-        return self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, cache_k)
+        self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, cache_k)
+        if self.c4_indexer_kv_pool.use_flydsl_fp4:
+            self.c4_indexer_kv_pool.store_index_k_flydsl(compress_layer_id, loc, cache_k)
 
     def set_index_k_fp4(
         self,
@@ -1254,4 +1322,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     ) -> None:
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
-        return self.c4_indexer_kv_pool.set_index_fp4(compress_layer_id, loc, cache_k)
+        self.c4_indexer_kv_pool.set_index_fp4(compress_layer_id, loc, cache_k)
+        if self.c4_indexer_kv_pool.use_flydsl_fp4:
+            self.c4_indexer_kv_pool.store_index_k_flydsl(compress_layer_id, loc, cache_k)
