@@ -1697,8 +1697,8 @@ class KVCache(abc.ABC):
         self.size = size
         self.page_size = page_size
         # Row-blocks one page holds in this pool's kernel-facing id space; >1
-        # only where the per-layer views are dense (the unified pool), and then
-        # a write loc must have been translated into that space first.
+        # only for the unified pool's per-layer views, and then a write loc must
+        # have been translated into that space first.
         self.kernel_page_blocks = 1
         self.dtype = dtype
         self.device = device
@@ -2790,7 +2790,7 @@ class MHATokenToKVPool(KVCache):
         num_rows = int(loc_2d.numel())
         if cache_k.shape[0] != num_rows or cache_v.shape[0] != num_rows:
             raise ValueError(
-                "dense KV rows must match loc_2d size: "
+                "KV rows must match loc_2d size: "
                 f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
             )
 
