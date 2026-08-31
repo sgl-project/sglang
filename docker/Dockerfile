@@ -671,6 +671,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
     && ( find /opt/sglang/lib/python3.12/site-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
 
+ENV SGLANG_RUST_BUILD_MODE=never
+
 
 # Install pre-built gateway artifacts from parallel builder
 COPY --from=gateway_builder /build/sgl-model-gateway-bin /opt/sglang/bin/sgl-model-gateway
@@ -723,7 +725,8 @@ ARG GDRCOPY_VERSION=2.5.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
-    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/
+    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
+    SGLANG_RUST_BUILD_MODE=never
 
 # Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT
 ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \

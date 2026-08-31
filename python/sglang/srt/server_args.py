@@ -3619,7 +3619,8 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="Unix socket path for weight cache daemon (client mode)."
-            "If not set, uses /tmp/sglang_weight_cache_rank{global_rank}.sock",
+            "If not set, derives the path from SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE "
+            "using the caller's physical GPU UUID.",
         ),
         NS("model"),
     ] = None
@@ -3762,7 +3763,7 @@ class ServerArgs:
 
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
 
-    # The strided-layout Triton requirement is enforced via
+    # The attention-backend allow-list is enforced via
     # --enable-page-major-kv-layout (implied by the unified pool in
     # _handle_page_major_kv_layout); the model-family gate is enforced at pool
     # construction in model_runner_kv_cache_mixin._init_pools.

@@ -1,17 +1,14 @@
-"""
-End-to-end accuracy test for the unified memory pool on a GDN-hybrid model.
+"""Unified memory pool on a GDN-hybrid model, across the backend matrix.
 
-Launches Qwen3.5-4B (a gated-delta-net / linear-attention hybrid) with
-``--enable-unified-memory`` on the Triton attention + linear-attn + Mamba
-backends and checks that GSM8K accuracy holds. This exercises the unified
-envelope's most bug-prone path: the Mamba conv/SSM state stored as a strided
-envelope view, plus the full-attention KV stored as per-layer views,
-both read/written by the GDN prefill and decode kernels.
+Qwen3.5-4B is a gated-delta-net / linear-attention hybrid, which exercises the
+path most prone to subtle bugs: the Mamba conv/SSM state stays a strided
+envelope view (its kernels are stride-aware by design) while the
+full-attention KV is per-layer views, which the fa3 / flashinfer cells read
+through the translator's read tables. The resolved-default cell pins the
+no-pin path, since a pinned backend hides default-resolution breakage by
+construction.
 
 Registered to the label-gated ``run-ci-extra`` suite (opt-in, not per-commit).
-
-Usage:
-    python3 -m unittest test_page_major_qwen_hybrid
 """
 
 import unittest
@@ -22,7 +19,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=1600, stage="extra-a", runner_config="1-gpu-large")
 
 _UNIFIED_COMMON_ARGS = [
     "--trust-remote-code",
@@ -37,7 +34,7 @@ _UNIFIED_COMMON_ARGS = [
 
 
 class TestUnifiedQwenHybridTriton(DefaultServerBase):
-    """Unified pool on Qwen3.5-4B (GDN-hybrid), Triton pinned: dense
+    """Unified pool on Qwen3.5-4B (GDN-hybrid), Triton pinned: contiguous
     full-attention views + strided conv/SSM state through the reference
     backends."""
 
@@ -72,6 +69,26 @@ class TestUnifiedQwenHybridTriton(DefaultServerBase):
             f"(threshold: {self.gsm8k_threshold})"
         )
         self.assertGreaterEqual(metrics["accuracy"], self.gsm8k_threshold)
+
+
+class TestUnifiedQwenHybridFa3(TestUnifiedQwenHybridTriton):
+    """fa3 pinned: read tables, eager direct-bind + captured fused copy."""
+
+    other_args = _UNIFIED_COMMON_ARGS + ["--attention-backend", "fa3"]
+
+
+class TestUnifiedQwenHybridFlashinfer(TestUnifiedQwenHybridTriton):
+    """flashinfer pinned: token ids reconstructed from the read table by the
+    ENTRY_PAGE_SIZE CSR builder."""
+
+    other_args = _UNIFIED_COMMON_ARGS + ["--attention-backend", "flashinfer"]
+
+
+class TestUnifiedQwenHybridResolvedDefault(TestUnifiedQwenHybridTriton):
+    """No backend pin: whatever the host resolves must be in the allow-list,
+    or the server fails to boot under its own defaults."""
+
+    other_args = _UNIFIED_COMMON_ARGS
 
 
 if __name__ == "__main__":
