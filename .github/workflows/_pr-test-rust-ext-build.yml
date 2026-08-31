@@ -77,10 +77,12 @@ jobs:
           ref: ${{ inputs.git_ref || github.sha }}
           # Just what the cache key hashes, plus the action and script this job
           # runs: the workspace is cold here and the rest of the tree is mostly
-          # docs. Both jobs must hash the same rust/** set, which this preserves.
+          # docs. Both jobs must hash the same Rust extension inputs, which this
+          # preserves.
           # Cone mode off is what allows naming a single file.
           sparse-checkout: |
             rust
+            proto
             python/setup.py
             python/pyproject.toml
             python/sglang/srt/rust_extensions/torch_build.py
@@ -104,7 +106,7 @@ jobs:
           path: |
             python/sglang/srt/rust_extensions/_*.so
             python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'proto/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
 
       # On a miss: different hash = rust/setup.py moved; no entries = evicted.
       - name: Report cache lookup
@@ -311,7 +313,7 @@ jobs:
           path: |
             python/sglang/srt/rust_extensions/_*.so
             python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'proto/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
 
       - name: Upload extension modules
         uses: actions/upload-artifact@v4
