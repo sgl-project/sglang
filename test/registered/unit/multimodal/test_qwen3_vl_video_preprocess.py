@@ -248,6 +248,55 @@ class TestQwen3VLVideoPreprocess(CustomTestCase):
             {"do_normalize": False, "do_resize": False},
         )
 
+    def test_qwen3_rejects_legacy_qwen2_size_fields(self):
+        for key in (
+            "min_pixels",
+            "max_pixels",
+            "total_pixels",
+            "resized_height",
+            "resized_width",
+        ):
+            with (
+                self.subTest(key=key),
+                self.assertRaisesRegex(ValueError, "legacy Qwen2 sizing fields"),
+            ):
+                qwen3_vl.validate_qwen3_video_config({key: 1})
+
+    def test_qwen3_rejects_processor_geometry_overrides(self):
+        for key in ("patch_size", "merge_size", "temporal_patch_size"):
+            with (
+                self.subTest(key=key),
+                self.assertRaisesRegex(ValueError, "loaded from the Hugging Face"),
+            ):
+                qwen3_vl.validate_qwen3_video_config({key: 1})
+
+        with self.assertRaisesRegex(ValueError, "do_resize.*managed by SGLang"):
+            qwen3_vl.validate_qwen3_video_config({"do_resize": False})
+
+    def test_qwen3_validates_native_size(self):
+        qwen3_vl.validate_qwen3_video_config(
+            {"size": {"shortest_edge": 4096, "longest_edge": 8192}}
+        )
+
+        invalid_sizes = (
+            {"height": 64, "width": 96},
+            {"shortest_edge": 8192, "longest_edge": 4096},
+            {"shortest_edge": 0, "longest_edge": 8192},
+        )
+        for size in invalid_sizes:
+            with self.subTest(size=size), self.assertRaises((TypeError, ValueError)):
+                qwen3_vl.validate_qwen3_video_config({"size": size})
+
+    def test_qwen3_rejects_legacy_size_during_processor_initialization(self):
+        def fake_base_init(processor, *_args, **_kwargs):
+            processor.video_config = {"max_pixels": 8192}
+
+        with (
+            patch.object(qwen3_vl.QwenVLImageProcessor, "__init__", fake_base_init),
+            self.assertRaisesRegex(ValueError, "legacy Qwen2 sizing fields"),
+        ):
+            qwen3_vl.Qwen3VLImageProcessor(None, None, None)
+
     def test_qwen2_keeps_legacy_factor_28_resize(self):
         decoder = _FakeVideoDecoder(total_frames=10, fps=2.0, height=56, width=84)
         resized = _FakeTensor((4, 3, 56, 84))

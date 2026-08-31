@@ -32,6 +32,9 @@ from sglang.srt.multimodal.processors.qwen3_vl import (
 from sglang.srt.multimodal.processors.qwen3_vl import (
     preprocess_video as qwen3_preprocess_video,
 )
+from sglang.srt.multimodal.processors.qwen3_vl import (
+    validate_qwen3_video_config,
+)
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.runtime_context import (
     get_device,
@@ -227,6 +230,7 @@ class EncoderPreprocessor:
 
             if modality_str == "video":
                 if self.model_type in QWEN3_VL_MODEL_TYPES:
+                    validate_qwen3_video_config(self.vision_config["video"])
                     video_defaults = {
                         key: getattr(self.video_processor, key, fallback)
                         for key, fallback in (

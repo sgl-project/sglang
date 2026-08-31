@@ -1,6 +1,7 @@
 """Multimodal preprocessing for Qwen3-VL and Qwen3.5."""
 
 import time
+from collections.abc import Mapping
 
 import numpy as np
 from transformers.image_utils import SizeDict
@@ -31,13 +32,80 @@ QWEN3_VL_MODEL_TYPES = frozenset(
         "qwen3_5_moe",
     }
 )
+QWEN3_LEGACY_VIDEO_SIZE_KEYS = frozenset(
+    {
+        "max_pixels",
+        "min_pixels",
+        "resized_height",
+        "resized_width",
+        "total_pixels",
+    }
+)
+QWEN3_PROCESSOR_GEOMETRY_KEYS = frozenset(
+    {"merge_size", "patch_size", "temporal_patch_size"}
+)
 QWEN3_EARLY_VIDEO_CONFIG_KEYS = frozenset(
     {"fps", "max_frames", "min_frames", "nframes", "resample", "size"}
 )
 
 
-def _as_size_dict(size) -> SizeDict:
-    return size if isinstance(size, SizeDict) else SizeDict(**size)
+def _native_size(size) -> SizeDict:
+    if isinstance(size, SizeDict):
+        shortest_edge = size.shortest_edge
+        longest_edge = size.longest_edge
+    elif isinstance(size, Mapping):
+        expected = {"longest_edge", "shortest_edge"}
+        actual = set(size)
+        if actual != expected:
+            raise ValueError(
+                "Qwen3 video `size` must contain exactly `shortest_edge` and "
+                f"`longest_edge`; got {sorted(actual)}."
+            )
+        shortest_edge = size["shortest_edge"]
+        longest_edge = size["longest_edge"]
+    else:
+        raise TypeError(
+            "Qwen3 video `size` must be a mapping with `shortest_edge` and "
+            f"`longest_edge`, not {type(size).__name__}."
+        )
+
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in (shortest_edge, longest_edge)
+    ):
+        raise ValueError(
+            "Qwen3 video `size.shortest_edge` and `size.longest_edge` must be "
+            "positive integers."
+        )
+    if shortest_edge > longest_edge:
+        raise ValueError(
+            "Qwen3 video `size.shortest_edge` cannot exceed `size.longest_edge`."
+        )
+    return SizeDict(shortest_edge=shortest_edge, longest_edge=longest_edge)
+
+
+def validate_qwen3_video_config(video_config) -> None:
+    legacy_keys = sorted(QWEN3_LEGACY_VIDEO_SIZE_KEYS.intersection(video_config))
+    if legacy_keys:
+        raise ValueError(
+            "Qwen3 video preprocessing does not support the legacy Qwen2 sizing "
+            f"fields {legacy_keys}. Use `video.size` with `shortest_edge` and "
+            "`longest_edge` instead."
+        )
+
+    geometry_keys = sorted(QWEN3_PROCESSOR_GEOMETRY_KEYS.intersection(video_config))
+    if geometry_keys:
+        raise ValueError(
+            "Qwen3 video processor geometry is loaded from the Hugging Face "
+            f"processor and cannot be overridden via mm-process-config: {geometry_keys}."
+        )
+    if "do_resize" in video_config:
+        raise ValueError(
+            "Qwen3 video `do_resize` is managed by SGLang's bounded preprocessing; "
+            "configure the target with `video.size` instead."
+        )
+    if "size" in video_config:
+        _native_size(video_config["size"])
 
 
 def _sampling_config(video_processor, video_config):
@@ -51,18 +119,13 @@ def _sampling_config(video_processor, video_config):
 
 
 def _resize_geometry(video_processor, video_config, *, num_frames, height, width):
-    size = _as_size_dict(video_config.get("size", video_processor.size))
-    patch_size = video_config.get("patch_size", video_processor.patch_size)
-    merge_size = video_config.get("merge_size", video_processor.merge_size)
-    temporal_patch_size = video_config.get(
-        "temporal_patch_size", video_processor.temporal_patch_size
-    )
+    size = _native_size(video_config.get("size", video_processor.size))
     resized_height, resized_width = smart_resize_video(
         num_frames=num_frames,
         height=height,
         width=width,
-        temporal_factor=temporal_patch_size,
-        factor=patch_size * merge_size,
+        temporal_factor=video_processor.temporal_patch_size,
+        factor=video_processor.patch_size * video_processor.merge_size,
         min_pixels=size.shortest_edge,
         max_pixels=size.longest_edge,
     )
@@ -119,16 +182,14 @@ async def preprocess_video(
         return vr, None
 
     video_config = video_config or {}
+    validate_qwen3_video_config(video_config)
     entry_time = time.perf_counter()
     total_frames, video_fps = len(vr), vr.avg_fps
-    temporal_patch_size = video_config.get(
-        "temporal_patch_size", video_processor.temporal_patch_size
-    )
     nframes = smart_nframes(
         _sampling_config(video_processor, video_config),
         total_frames=total_frames,
         video_fps=video_fps,
-        frame_factor=temporal_patch_size,
+        frame_factor=video_processor.temporal_patch_size,
     )
     indices = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     indices = np.unique(indices)
@@ -163,6 +224,10 @@ class Qwen3VLImageProcessor(QwenVLImageProcessor):
         Qwen3_5MoeForConditionalGeneration,
         Qwen3_5ForCausalLMMTP,
     ]
+
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+        validate_qwen3_video_config(self.video_config)
 
     async def _preprocess_video(self, video):
         return await preprocess_video(
