@@ -646,7 +646,7 @@ def bench_cache_finished(
         req.kv.kv_committed_len = len(seq)
         if hasattr(lr, "swa_uuid_for_lock"):
             req.swa_uuid_for_lock = lr.swa_uuid_for_lock
-        env.rtp.req_to_token[req.req_pool_idx, : len(kv_indices)] = kv_indices
+        env.rtp.req_to_token[req.kv.req_pool_idx, : len(kv_indices)] = kv_indices
         req_items.append(req)
 
     if not req_items:
