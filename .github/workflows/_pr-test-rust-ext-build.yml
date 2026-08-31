@@ -190,14 +190,8 @@ jobs:
           cargo_target_root="${HOME}/.cache/sglang-cargo-target"
           mkdir -p "${cargo_target_root}"
           used="$(df --output=pcent "${cargo_target_root}" 2>/dev/null | tr -dc '0-9')"
-          # These runners are shared, so an unguarded drop deletes the target dir out
-          # from under a concurrent job mid-compile: its build scripts then fail with
-          # "can't create .../out/*.o: No such file or directory" (reproduced locally,
-          # and it takes down whatever crate that job was on, not just torch-sys).
-          # Take the drop only under an exclusive lock nobody else holds, and hold a
-          # shared lock while compiling so a concurrent dropper backs off instead.
-          # Shared locks stack, so this does not serialize the builds themselves, and
-          # the fd closing on exit releases the lock even if the job dies.
+          # Shared runners: an unguarded drop yanks the target dir out from under a
+          # concurrent compile. Drop only when uncontended, hold shared while building.
           exec 9>"${cargo_target_root}.lock"
           if [ "${used:-0}" -ge 85 ] && flock -x -n 9; then
               echo "cargo target dir filesystem at ${used}%; dropping ${cargo_target_root}"
