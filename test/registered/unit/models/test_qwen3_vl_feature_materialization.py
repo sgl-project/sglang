@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+from sglang.srt.multimodal.processors.qwen3_vl import Qwen3VLImageProcessor
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
@@ -44,7 +44,7 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
     def test_processor_defers_gpu_transport_for_encoder_dp(self):
         for transport in ("cuda_ipc", "cuda_vmm"):
             with self.subTest(transport=transport):
-                processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
+                processor = Qwen3VLImageProcessor.__new__(Qwen3VLImageProcessor)
                 processor.mm_feature_transport = transport
                 processor.server_args = SimpleNamespace(mm_enable_dp_encoder=True)
                 processor.model_type = "qwen3_vl"
@@ -72,7 +72,7 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                 )
 
     def test_processor_does_not_defer_cpu_transport(self):
-        processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
+        processor = Qwen3VLImageProcessor.__new__(Qwen3VLImageProcessor)
         processor.mm_feature_transport = "cpu"
         processor.server_args = SimpleNamespace(mm_enable_dp_encoder=True)
         processor.model_type = "qwen3_vl"

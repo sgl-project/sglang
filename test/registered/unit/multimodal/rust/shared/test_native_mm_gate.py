@@ -41,6 +41,13 @@ class TestNativeMmGate(CustomTestCase):
         family = native_mm_family_for(cls, "qwen2_5_vl")
         self.assertEqual(family and family.name, "qwen_vl")
 
+    def test_qwen3_vl_resolves_its_family(self):
+        # The Qwen3 processor is a separate class from QwenVLImageProcessor;
+        # the gate must still match it or launch hard-errors.
+        cls = processor_cls_for("Qwen3VLForConditionalGeneration", "qwen3_vl")
+        family = native_mm_family_for(cls, "qwen3_vl")
+        self.assertEqual(family and family.name, "qwen_vl")
+
     def test_inkling_keeps_its_python_processor(self):
         from sglang.srt.multimodal.processors.inkling import InklingMultimodalProcessor
 

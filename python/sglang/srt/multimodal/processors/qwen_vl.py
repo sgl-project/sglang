@@ -23,14 +23,7 @@ from sglang.srt.models.interns2_mobius import (
 from sglang.srt.models.interns2preview import InternS2PreviewForConditionalGeneration
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
-from sglang.srt.models.qwen3_5 import (
-    Qwen3_5ForConditionalGeneration,
-    Qwen3_5MoeForConditionalGeneration,
-)
-from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
-from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -159,6 +152,7 @@ def smart_nframes(
     ele: dict,
     total_frames: int,
     video_fps: int | float,
+    frame_factor: int = FRAME_FACTOR,
 ) -> int:
     """calculate the number of frames for video used for model inputs.
 
@@ -171,9 +165,10 @@ def smart_nframes(
                     - max_frames: the maximum number of frames of the video, only used when fps is provided.
         total_frames (int): the original total number of frames of the video.
         video_fps (int | float): the original fps of the video.
+        frame_factor (int): temporal patch-size multiple required by the processor.
 
     Raises:
-        ValueError: nframes should in interval [FRAME_FACTOR, total_frames].
+        ValueError: nframes should be in [frame_factor, total_frames].
 
     Returns:
         int: the number of frames for video used for model inputs.
@@ -182,12 +177,12 @@ def smart_nframes(
         "fps" in ele and "nframes" in ele
     ), "Only accept either `fps` or `nframes`"
     if "nframes" in ele:
-        nframes = round_by_factor(ele["nframes"], FRAME_FACTOR)
+        nframes = round_by_factor(ele["nframes"], frame_factor)
     else:
         fps = ele.get("fps", FPS)
-        min_frames = ceil_by_factor(ele.get("min_frames", FPS_MIN_FRAMES), FRAME_FACTOR)
+        min_frames = ceil_by_factor(ele.get("min_frames", FPS_MIN_FRAMES), frame_factor)
         max_frames = floor_by_factor(
-            ele.get("max_frames", min(FPS_MAX_FRAMES, total_frames)), FRAME_FACTOR
+            ele.get("max_frames", min(FPS_MAX_FRAMES, total_frames)), frame_factor
         )
         nframes = total_frames / video_fps * fps
         if nframes > total_frames:
@@ -195,10 +190,10 @@ def smart_nframes(
                 f"smart_nframes: nframes[{nframes}] > total_frames[{total_frames}]"
             )
         nframes = min(min(max(nframes, min_frames), max_frames), total_frames)
-        nframes = floor_by_factor(nframes, FRAME_FACTOR)
-    if not (FRAME_FACTOR <= nframes and nframes <= total_frames):
+        nframes = floor_by_factor(nframes, frame_factor)
+    if not (frame_factor <= nframes and nframes <= total_frames):
         raise ValueError(
-            f"nframes should in interval [{FRAME_FACTOR}, {total_frames}], but got {nframes}."
+            f"nframes should in interval [{frame_factor}, {total_frames}], but got {nframes}."
         )
     return nframes
 
@@ -292,11 +287,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
     models = [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
-        Qwen3VLForConditionalGeneration,
-        Qwen3VLMoeForConditionalGeneration,
-        Qwen3_5ForConditionalGeneration,
-        Qwen3_5MoeForConditionalGeneration,
-        Qwen3_5ForCausalLMMTP,
         InternS2PreviewForConditionalGeneration,
         InternS2MobiusForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
@@ -356,6 +346,12 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
     @property
     def spatial_merge_size(self):
         return self._spatial_merge_size
+
+    async def _preprocess_video(self, video):
+        return await preprocess_video(video, video_config=self.video_config)
+
+    def _processor_video_config(self, video_metadata):
+        return _get_processor_video_config(self.video_config, video_metadata)
 
     def build_input_ids_with_timestamps(
         self, prompt, embeddings, img_grid_thw, video_grid_thw, video_timestamps
@@ -745,17 +741,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         video_metadata = None
         if base_output.videos and not isinstance(base_output.videos[0], dict):
             videos_processed = [
-                await preprocess_video(video, video_config=self.video_config)
-                for video in base_output.videos
+                await self._preprocess_video(video) for video in base_output.videos
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
         preprocess_time = time.perf_counter()
 
         processor_kwargs = {}
-        processor_video_config = _get_processor_video_config(
-            self.video_config, video_metadata
-        )
+        processor_video_config = self._processor_video_config(video_metadata)
         if processor_video_config is not None:
             processor_kwargs["processor_video_config"] = processor_video_config
 
