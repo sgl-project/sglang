@@ -83,11 +83,11 @@ ALL_MODELS = [
     ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
     ModelCase("ibm-granite/granite-3.0-2b-instruct", skip_long_prompt=True),
     ModelCase(
-        "tiiuae/falcon7b",
+        "tiiuae/falcon-7b",
         attention_backend="triton",
     ),
     ModelCase(
-        "tiiuae/falcon1b",
+        "tiiuae/falcon-rw-1b",
         attention_backend="triton",
     ),
     ModelCase(
