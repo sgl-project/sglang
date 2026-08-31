@@ -31,6 +31,7 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -724,14 +725,7 @@ class SchedulerPPMixin:
 
                 # Release KV and Mamba cache
                 if req.kv.holds_kv:
-                    kv_indices = self.req_to_token_pool.req_to_token[
-                        req.kv.req_pool_idx, : req.extend_range.end
-                    ]
-                    self.token_to_kv_pool_allocator.free(kv_indices)
-                    if req.kv.holds_mamba:
-                        self.req_to_token_pool.free_mamba_cache(req)
-                    self.req_to_token_pool.free(req)
-                    req.kv.mark_kv_released()
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
 
             logger.info(
                 f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
