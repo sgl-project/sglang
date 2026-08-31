@@ -1,6 +1,6 @@
 ---
 title: GLM-5.3-Flash
-description: "Deploy GLM-5.3-Flash with SGLang using NVIDIA CUDA and AMD ROCm recipes, with MTP and multimodal serving where validated."
+description: "Deploy GLM-5.3-Flash with SGLang using NVIDIA CUDA and AMD ROCm recipes, including the AMD Quark MXFP4 checkpoint on gfx950."
 tag: NEW
 ---
 
@@ -10,22 +10,23 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Use an SGLang build that includes GLM-5.3-Flash support. The AMD ROCm recipes also require [the ROCm engine changes in PR #36607](https://github.com/sgl-project/sglang/pull/36607) until they are available in a published SGLang image.
+Use an SGLang build that includes GLM-5.3-Flash support. The AMD changes from [PR #36607](https://github.com/sgl-project/sglang/pull/36607) are merged into the open [GLM-5.3-Flash support PR #36507](https://github.com/sgl-project/sglang/pull/36507), but are not yet on `main` or in a published ROCm image. Use that support branch for the AMD recipes. It includes the mixed MXFP4/block-FP8 loader fix first validated at commit [`654df43cbee1`](https://github.com/sgl-project/sglang/pull/36607/commits/654df43cbee108a81fa1736c34ba8c701f199285).
 
 ```bash Command
 docker pull lmsysorg/sglang:glm-5.3-flash
 ```
 
-The deployment panel can render a complete `docker run` command for the selected hardware and options. See [Install SGLang with Docker](/docs/get-started/install#method-3-using-docker) for host setup.
+The deployment panel renders Python commands for AMD until a published ROCm image contains the support stack. NVIDIA selections can also render a complete `docker run` command. See [Install SGLang with Docker](/docs/get-started/install#method-3-using-docker) for host setup.
 
 </Accordion>
 
-Choose your hardware, then choose the operating point that matches your workload:
+Choose your hardware and checkpoint, then choose the recipe that matches your workload or topology:
 
 - **Low Latency** starts with adaptive MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
 - **High Throughput** starts with speculative decoding off, which avoids draft-and-verify overhead under sustained batches.
+- **Quark MXFP4** on MI350X and MI355X exposes TP1, TP2, TP4, and TP8 + EP8 (TEP8) recipes with full decode graphs.
 
-NVIDIA platforms expose both strategies. AMD ROCm currently exposes only the non-speculative High Throughput recipe because MTP has not been validated there. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
+NVIDIA FP8 recipes expose both strategies. AMD FP8 currently exposes only the non-speculative High Throughput recipe because MTP has not been validated there. A **Verified** badge means that exact command was tested on the listed GPU or carried to an explicitly documented architecture-equivalent SKU. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
 
 The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, and HiCache tiers. Changing an option that was not part of the measured command changes the badge to **Not Verified** without hiding the option.
 
@@ -69,7 +70,7 @@ GLM-5.3-Flash is a natively multimodal Mixture-of-Experts model built around a h
     </tr>
     <tr>
       <td style={{padding: "9px 12px"}}>Precision</td>
-      <td style={{padding: "9px 12px"}}>FP8 weights; FP8 KV cache by default on Blackwell, BF16 KV cache on H100, H200, and the AMD ROCm recipes</td>
+      <td style={{padding: "9px 12px"}}>FP8 reference weights; AMD Quark MXFP4 weights with explicit block-FP8 layers; FP8 KV cache by default on Blackwell and BF16 KV cache on H100, H200, and AMD ROCm</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Context</td>
@@ -87,6 +88,8 @@ GLM-5.3-Flash is a natively multimodal Mixture-of-Experts model built around a h
 </table>
 
 The deployment recipes use the checkpoint's generation configuration. Override sampling only when your application has its own evaluated settings.
+
+Checkpoint resources: [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash) (FP8) and [`amd/GLM-5.3-Flash-Quark-MXFP4`](https://huggingface.co/amd/GLM-5.3-Flash-Quark-MXFP4) (Quark MXFP4 for gfx950).
 
 ## 2. Configuration tips
 
@@ -110,7 +113,7 @@ Neither algorithm runs with DP-Attention, and neither is available on the AMD RO
 
 GLM-5.3-Flash maintains a paged KV pool for attention and a separate KDA state pool. The KDA state pool can limit concurrency before the KV pool is full. If startup reduces `max_running_requests` because of KDA state capacity, increase `--mamba-full-memory-ratio` or set `--max-mamba-cache-size` for the expected concurrency, then tune `--max-running-requests` to the workload.
 
-Keep the prefix cache enabled for every strategy.
+Keep the prefix cache enabled for the FP8 production recipe. The MXFP4 commands retain `--disable-radix-cache` because that is the exact validated configuration; revalidate accuracy and graph execution before changing it.
 
 Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not override `linear_lower_bound` through `--json-model-override-args`.
 
@@ -118,7 +121,30 @@ Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not o
 
 On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination.
 
-On AMD ROCm, use BF16 KV cache with TileLang DSA, set `SGLANG_USE_AITER=1`, keep the MoE runner on Triton, and disable CUDA graphs. The ROCm recipe uses TP8 on a single eight-GPU node. MI300X and MI325X both use gfx942, but the MI325X entry remains explicitly unverified because it is inferred from MI300X rather than measured directly. AMD validation covers text generation and GSM8K only; multimodal serving remains unverified.
+On AMD ROCm, use TP8 + EP8 on an eight-GPU node rather than TP8 alone. All AMD recipes use BF16 KV cache, TileLang DSA, Triton linear attention, `SGLANG_USE_AITER=1`, and full decode graphs. The gfx942 FP8 path uses the Triton MoE runner and captures decode batch sizes 1 and 32. The gfx950 FP8 path uses the AITER MoE runner with the same captured FP8 batch sizes. MI300X and MI325X share gfx942; MI350X and MI355X share gfx950.
+
+The MI300X FP8 cell is verified with the exact TP8 + EP8 command above. On SGLang PR #36507 commit `aa8c950a3df62b6642c4ea60a93a5e3eb1a1450e` and model revision `3f1971b7b5f7a528c9c4ef6212c8785298a8c24a`, full GSM8K scored 1,280/1,319 (97.04%). All 1,319 examples were unique and finished with `stop`, with zero missing records, duplicate IDs, empty generations, evaluator errors, truncations, server faults, or graph-false decode entries. All eight ranks captured full decode graphs for batch sizes 1 and 32, and the run logged 512 graph-backed decode entries.
+
+MI325X carries the **Verified** status from this MI300X result because it uses the same gfx942 runtime path with greater HBM capacity. The benchmark note preserves the provenance that the physical measurement ran on MI300X rather than implying a separate MI325X run. The MI350X and MI355X FP8 cells remain **Not Verified**: their TP8 + EP8 pilots completed graph capture and graph-backed runtime decode with the AITER MoE runner, but still need full accuracy runs. AMD multimodal serving remains unverified.
+
+### Use Quark MXFP4 on gfx950
+
+Select **MI350X or MI355X → Quark MXFP4**, then choose TP1, TP2, TP4, or TP8 + EP8. These recipes use the AITER MoE runner, disable shared-expert fusion and radix caching, and capture full decode graphs through batch size 64. The validated configuration uses a 65,536-token server context and up to 64 running requests.
+
+<Note>
+The recorded validation node was named MI350X. The cookbook covers MI350X and MI355X with the same verified recipes because both expose the same CDNA4 `gfx950` target, 288 GB per GPU, and `mi35x` ROCm image path.
+</Note>
+
+Validation used model revision `fc676278b68ba33f6b4724be286af9d7f6c814c2`, SGLang PR #36607 at commit `654df43cbee108a81fa1736c34ba8c701f199285`, and image digest `sha256:6d68cd19206716cb3f1e31e2ad89cd0852d7ae614a792773c30a4277f8955c72`.
+
+| Topology | Result | Decode graph | GSM8K |
+| --- | --- | --- | ---: |
+| TP1 | Smoke passed (`2 + 3 = 5`) | Full | — |
+| TP2 | Smoke passed (`2 + 3 = 5`) | Full | — |
+| TP4 | Passed | Full | 1,282/1,319 (97.19%) |
+| TP8 + EP8 (TEP8) | Passed | Full | 1,281/1,319 (97.12%) |
+
+Both GSM8K runs completed all 1,319 unique examples with thinking enabled, temperature 1.0, top-p 0.95, a 32,768-token output limit, and 64 evaluator threads. They had zero duplicate IDs, empty generations, evaluator errors, truncated or length finishes, and server faults; every finish reason was `stop`. The TP8 + EP8 run recorded 415 graph-backed decode entries.
 
 ### Decode context parallelism
 
