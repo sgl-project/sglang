@@ -79,20 +79,17 @@ def _run_negotiate_test(rank, test_cases):
 
     for case in test_cases:
         # The DP-attention gate is a published config leaf.
-        override = get_context().override_server_args(enable_dp_attention=True)
+        override = get_context().override_server_args(
+            enable_dp_attention=True,
+            prefill_delayer_queue_min_ratio=case.queue_min_ratio,
+            prefill_delayer_max_delay_ms=case.max_delay_ms,
+            prefill_max_requests=case.prefill_max_requests,
+        )
         override.install()
         delayer = PrefillDelayer(
             dp_size=world_size,
             attn_tp_size=1,
             cpu_group=cpu_group,
-            server_args=SimpleNamespace(
-                enable_dp_attention=True,
-                disaggregation_mode="null",
-                disable_overlap_schedule=False,
-                prefill_delayer_queue_min_ratio=case.queue_min_ratio,
-                prefill_delayer_max_delay_ms=case.max_delay_ms,
-                prefill_max_requests=case.prefill_max_requests,
-            ),
             max_delay_passes=case.max_delay_passes,
             token_usage_low_watermark=case.token_usage_low_watermark,
         )
