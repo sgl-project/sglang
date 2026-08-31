@@ -23,6 +23,9 @@ license = "Apache-2.0"
 [workspace.dependencies]
 async-stream = "0.3"
 bytes = "1"
+# Path dependency during development; switches to the crates.io release like
+# the other dynamo-* deps once published (see sglang-server/Cargo.toml).
+dynamo-mm-preprocessor = { path = "../../frontend-crates/mm-preprocessor", default-features = false }
 futures = "0.3"
 pyo3 = { version = "0.29.0", features = ["extension-module"] }
 serde = { version = "1", features = ["derive"] }

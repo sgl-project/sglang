@@ -981,6 +981,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
+name = "dynamo-mm-preprocessor"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "image",
+ "rayon",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "dynamo-parsers"
 version = "7.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3685,15 +3698,10 @@ name = "sglang-mm"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "blake3",
+ "dynamo-mm-preprocessor",
  "half",
- "image",
  "numpy",
  "pyo3",
- "rayon",
- "serde",
- "serde_json",
- "ureq",
 ]
 
 [[package]]
@@ -3706,6 +3714,7 @@ dependencies = [
  "bytemuck",
  "bytes",
  "core_affinity",
+ "dynamo-mm-preprocessor",
  "dynamo-parsers",
  "dynamo-protocols",
  "dynamo-renderer",

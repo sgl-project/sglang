@@ -416,7 +416,7 @@ pub struct MmSpec {
     /// broadcasts across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
     /// The family pipeline and its resolved processor parameters.
-    pub pipeline: sglang_mm::registry::PipelineSpec,
+    pub pipeline: dynamo_mm_preprocessor::registry::PipelineSpec,
 }
 
 #[pyo3::pymethods]
@@ -452,9 +452,9 @@ impl MmSpec {
         image_std: [f32; 3],
         resample: MmResample,
     ) -> Self {
-        use sglang_mm::registry::PipelineSpec;
+        use dynamo_mm_preprocessor::registry::PipelineSpec;
         let pipeline = match family {
-            MmFamily::QwenVl => PipelineSpec::QwenVl(sglang_mm::qwen_vl::QwenVlSpec {
+            MmFamily::QwenVl => PipelineSpec::QwenVl(dynamo_mm_preprocessor::qwen_vl::QwenVlSpec {
                 image_token_id,
                 patch_size,
                 merge_size,
@@ -473,9 +473,10 @@ impl MmSpec {
     }
 }
 
-/// Which `sglang_mm` family pipeline serves the model — one variant per
-/// [`sglang_mm::registry::PipelineSpec`] arm. Exposed to Python as an enum
-/// (`MmFamily.QwenVl`); `RustMmFamily.name` maps onto it at handoff.
+/// Which `dynamo_mm_preprocessor` family pipeline serves the model — one
+/// variant per [`dynamo_mm_preprocessor::registry::PipelineSpec`] arm. Exposed
+/// to Python as an enum (`MmFamily.QwenVl`); `RustMmFamily.name` maps onto it
+/// at handoff.
 #[pyo3::pyclass(
     eq,
     frozen,
@@ -488,8 +489,8 @@ pub enum MmFamily {
 }
 
 /// The HF image processor the Rust resize must reproduce bit-exactly (see
-/// [`sglang_mm::qwen_vl::Resampler`]). Exposed to Python as an enum
-/// (`MmResample.AtenU8` / `.Pil`); `RustMmFamily.image_processors` maps each
+/// [`dynamo_mm_preprocessor::qwen_vl::Resampler`]). Exposed to Python as an
+/// enum (`MmResample.AtenU8` / `.Pil`); `RustMmFamily.image_processors` maps each
 /// processor class onto it.
 #[pyo3::pyclass(
     eq,
@@ -505,7 +506,7 @@ pub enum MmResample {
     Pil,
 }
 
-impl From<MmResample> for sglang_mm::qwen_vl::Resampler {
+impl From<MmResample> for dynamo_mm_preprocessor::qwen_vl::Resampler {
     fn from(r: MmResample) -> Self {
         match r {
             MmResample::AtenU8 => Self::AtenU8,

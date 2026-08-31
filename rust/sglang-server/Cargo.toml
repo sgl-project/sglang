@@ -59,9 +59,12 @@ numpy = "0.29.0"
 regex-syntax = "=0.8.11"
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
-# The pure-Rust core of the MM pipeline. `default-features = false` drops the
-# pyo3 bindings so it links as a plain rlib; renamed so `use sglang_mm::…` reads
-# naturally while the crate keeps its own artifact name in the shared target/.
+# The MM preprocessing pipeline (families, driver, fetch).
+dynamo-mm-preprocessor = { workspace = true, features = ["fetch"] }
+# The SGLang adapter over it (scheduler-drain packing, env shims).
+# `default-features = false` drops the pyo3 bindings so it links as a plain
+# rlib; renamed so `use sglang_mm::…` reads naturally while the crate keeps its
+# own artifact name in the shared target/.
 sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
 
 [dev-dependencies]

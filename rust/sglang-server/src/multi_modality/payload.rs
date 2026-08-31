@@ -1,13 +1,13 @@
 //! Convert a parked request's [`MmWorkItem`] into the typed [`MmInput`] the
-//! `sglang-mm` driver consumes — an in-process handoff, nothing serialized.
+//! dynamo MM driver consumes — an in-process handoff, nothing serialized.
 //!
 //! Every `Err` rejects the request back to the client; the message says whether
 //! the input is malformed or merely outside the pipeline's scope (video/audio,
 //! precomputed features, …).
 
 use bytes::Bytes;
+use dynamo_mm_preprocessor::driver::{ImageSource, MmInput};
 use rmpv::Value;
-use sglang_mm::driver::{ImageSource, MmInput};
 
 use crate::message::request::MmWorkItem;
 

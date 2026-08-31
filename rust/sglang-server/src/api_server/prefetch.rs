@@ -3,7 +3,7 @@
 //! The MM worker pool is fixed, core-pinned CPU capacity: a slow image host — or
 //! a file on a hanging network mount — must never occupy it, and a request's
 //! images must download concurrently, not in `n * REQUEST_TIMEOUT`. URLs and
-//! file paths resolve here through `sglang-mm`'s `fetch_bytes_budgeted` (one
+//! file paths resolve here through the dynamo crate's budgeted fetch (one
 //! owner for proxy/timeout/cap semantics) and ride out-of-band as
 //! [`crate::message::request::MmData::prefetched`], which
 //! [`crate::multi_modality::payload::to_mm_input`] swaps back in.
@@ -11,8 +11,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted};
-use sglang_mm::driver::{MAX_ITEMS_PER_REQUEST, MAX_REQUEST_BYTES};
+use dynamo_mm_preprocessor::driver::{MAX_ITEMS_PER_REQUEST, MAX_REQUEST_BYTES};
+use dynamo_mm_preprocessor::fetch::{ByteBudget, fetch_bytes_budgeted_with};
+use sglang_mm::common::fetch_options_from_env;
 use tokio::sync::Semaphore;
 
 use crate::message::request::{GenerateRequest, MmData};
@@ -26,9 +27,9 @@ static PERMITS: Semaphore = Semaphore::const_new(32);
 /// concurrent. Any failure rejects the call (a 400, as on the Python path).
 ///
 /// The driver's budgets ([`MAX_ITEMS_PER_REQUEST`], [`MAX_REQUEST_BYTES`]) are
-/// enforced *here* rather than in `sglang_mm::driver::process`, where 64 sources
-/// of 64 MiB would already be resident. The driver keeps its own checks as the
-/// backstop for callers without a prefetch layer.
+/// enforced *here* rather than in the dynamo driver's `process`, where 64
+/// sources of 64 MiB would already be resident. The driver keeps its own
+/// checks as the backstop for callers without a prefetch layer.
 pub async fn prefetch_all(requests: &mut [GenerateRequest]) -> Result<(), String> {
     // The item budget rejects before a single byte is fetched.
     let plan = |mm: &Option<Box<MmData>>| -> Result<Vec<String>, String> {
@@ -71,10 +72,12 @@ async fn fetch_ordered(sources: Vec<String>, total_bytes: u64) -> Result<Vec<Byt
             // an API worker. Those threads are pinned round-robin over the api
             // core set (see `on_thread_start` in `runtime::start`) — off the
             // CPU-bound stages, and mostly I/O-parked, so sharing is fine.
-            tokio::task::spawn_blocking(move || fetch_bytes_budgeted(&src, &budget))
-                .await
-                .map_err(|e| format!("media prefetch: {e}"))?
-                .map(Bytes::from)
+            tokio::task::spawn_blocking(move || {
+                fetch_bytes_budgeted_with(&src, &budget, &fetch_options_from_env())
+            })
+            .await
+            .map_err(|e| format!("media prefetch: {e}"))?
+            .map(Bytes::from)
         }
     }))
     .await

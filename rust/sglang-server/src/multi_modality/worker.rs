@@ -1,4 +1,4 @@
-//! The worker pool: drain MM requests, run the `sglang-mm` pipeline, park
+//! The worker pool: drain MM requests, run the dynamo MM pipeline, park
 //! the result buffers.
 
 use std::sync::Arc;
@@ -47,7 +47,7 @@ fn parse_caller_hash(entry: &str) -> Option<u64> {
 
 /// Shared state of the mm path, built once at `start_mm_workers`.
 pub struct MmContext {
-    pub family: Box<dyn sglang_mm::pipeline::MmFamilyProcessor>,
+    pub family: Box<dyn dynamo_mm_preprocessor::pipeline::MmFamilyProcessor>,
     /// `None` under `skip_tokenizer_init` (requests must carry `input_ids`).
     pub tokenizer: Option<Arc<dyn TextTokenizer>>,
     pub results: MmResultStore,
@@ -64,7 +64,7 @@ impl MmContext {
         results: MmResultStore,
     ) -> Result<Self, String> {
         Ok(Self {
-            family: sglang_mm::registry::build_pipeline(spec.pipeline)?,
+            family: dynamo_mm_preprocessor::registry::build_pipeline(spec.pipeline)?,
             tokenizer,
             results,
             feature_shm: spec.feature_shm,
@@ -81,12 +81,17 @@ fn process(
 ) -> Result<Vec<i32>, String> {
     let caller_hashes = std::mem::take(&mut work.mm_hashes);
     let input = super::payload::to_mm_input(work)?;
-    let output = sglang_mm::driver::process(ctx.family.as_ref(), input, |text| {
-        let tokenizer = ctx.tokenizer.as_ref().ok_or_else(|| {
-            "skip_tokenizer_init is set: multimodal text prompts require input_ids".to_string()
-        })?;
-        tokenizer.encode(text).map_err(|error| error.to_string())
-    })?;
+    let output = dynamo_mm_preprocessor::driver::process_with(
+        ctx.family.as_ref(),
+        input,
+        |text| {
+            let tokenizer = ctx.tokenizer.as_ref().ok_or_else(|| {
+                "skip_tokenizer_init is set: multimodal text prompts require input_ids".to_string()
+            })?;
+            tokenizer.encode(text).map_err(|error| error.to_string())
+        },
+        &sglang_mm::common::fetch_options_from_env().into(),
+    )?;
     // TODO(mm-families): the one family-specific call in this worker — dispatch
     // on the spec's `family` (as `registry::build_pipeline` does) once a
     // second family lands.
