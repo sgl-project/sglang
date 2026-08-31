@@ -388,6 +388,7 @@ def maybe_fuse_routed_scale_and_shared_add(
     # in-place. Otherwise `routed` is already scale-final and we just add
     # `shared` (or pass through if there is none).
     from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
+    from sglang.srt.layers.quantization.mxfp4_b12x_moe import Mxfp4B12xMoEMethod
     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
         Mxfp4FlashinferCutlassMoEMethod,
     )
@@ -402,6 +403,7 @@ def maybe_fuse_routed_scale_and_shared_add(
             Mxfp4FlashinferCutlassMoEMethod,
             Mxfp4MarlinMoEMethod,
             ExpertPackMoEMethod,
+            Mxfp4B12xMoEMethod,
         ),
     )
     if fused:

@@ -166,6 +166,12 @@ class _MoeRunnerBackendPredicates:
     def is_aiter(self):
         return self.value == MoeRunnerBackend.AITER.value
 
+    def is_b12x(self):
+        return self.value == MoeRunnerBackend.B12X.value
+
+    def is_cutlass(self):
+        return self.value == MoeRunnerBackend.CUTLASS.value
+
 
 class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
 
@@ -180,6 +186,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    B12X = "b12x"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
     HUMMING = "humming"
