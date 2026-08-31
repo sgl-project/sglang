@@ -230,6 +230,7 @@ def test_component_weight_inventory_distinguishes_config_only_and_unknown(tmp_pa
 
 def test_preload_inventory_uses_the_actual_weight_override():
     server_args = SimpleNamespace(
+        component_precisions={},
         component_weights_paths={"text_encoder": "/weights/text.safetensors"},
         transformer_weights_path="/weights/dit.gguf",
         pipeline_config=SimpleNamespace(
@@ -264,6 +265,7 @@ def test_preload_inventory_uses_selected_transformer_safetensors(tmp_path):
     mixed_path = tmp_path / "flux2-dev-nvfp4-mixed.safetensors"
     _write_safetensors(mixed_path, 64)
     server_args = SimpleNamespace(
+        component_precisions={},
         component_weights_paths={},
         transformer_weights_path="owner/flux2-nvfp4",
         revision=None,
@@ -291,12 +293,13 @@ def test_preload_inventory_uses_selected_transformer_safetensors(tmp_path):
 
 def test_preload_inventory_resolves_group_precision_fallbacks():
     server_args = SimpleNamespace(
+        component_precisions={},
         pipeline_config=SimpleNamespace(
             dit_precision="bf16",
             vae_precision="fp32",
             image_encoder_precision="fp16",
             text_encoder_precisions=("bf16",),
-        )
+        ),
     )
 
     assert (

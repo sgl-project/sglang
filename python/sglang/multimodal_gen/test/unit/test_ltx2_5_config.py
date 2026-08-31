@@ -46,6 +46,7 @@ class TestLTX2TwoStageComponentInventory(unittest.TestCase):
             pipeline.model_path = model_path
             server_args = SimpleNamespace(
                 component_paths={},
+                component_precisions={},
                 ltx2_two_stage_device_mode="resident",
                 lora_path=None,
                 pipeline_config=SimpleNamespace(
