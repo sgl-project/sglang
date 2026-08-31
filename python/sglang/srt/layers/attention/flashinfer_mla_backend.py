@@ -370,6 +370,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 self.indices_updater_decode.update(
                     seq_lens,
                     seq_lens_sum,
+                    req_pool_indices=req_pool_indices,
                     decode_wrapper=decode_wrapper,
                     init_metadata_replay=False,
                     spec_info=spec_info,
@@ -432,6 +433,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             self.indices_updater_decode.update(
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
+                req_pool_indices=forward_batch.req_pool_indices,
                 decode_wrapper=self.decode_wrapper,
                 init_metadata_replay=False,
                 kv_view=kv_view,
@@ -578,6 +580,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             self.indices_updater_decode.update(
                 seq_lens[:bs],
                 seq_lens_sum,
+                req_pool_indices=req_pool_indices[:bs],
                 decode_wrapper=self.decode_cuda_graph_metadata[bs],
                 init_metadata_replay=True,
                 spec_info=spec_info,
@@ -876,6 +879,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         spec_info: Optional[SpecInput] = None,
         *,
         kv_view: KVIndexTable,
+        req_pool_indices: torch.Tensor,
         **fast_decode_kwargs,
     ):
         decode_wrapper = decode_wrapper or self.decode_wrapper
@@ -888,6 +892,7 @@ class FlashInferMLAIndicesUpdaterDecode:
             init_metadata_replay,
             spec_info,
             kv_view=kv_view,
+            req_pool_indices=req_pool_indices,
             **fast_decode_kwargs,
         )
 
@@ -902,6 +907,10 @@ class FlashInferMLAIndicesUpdaterDecode:
         spec_info: Optional[SpecInput] = None,
         *,
         kv_view: KVIndexTable,
+        # Pool ROWS, needed only by the DCP branch: it shards on virtual ids and
+        # so gathers from `req_to_token` rather than the (already kernel-facing)
+        # read table, whose `row_ids` are read-table rows, not pool rows.
+        req_pool_indices: torch.Tensor,
         **fast_decode_kwargs,
     ):
         bs = len(paged_kernel_lens)
