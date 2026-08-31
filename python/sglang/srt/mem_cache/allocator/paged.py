@@ -262,7 +262,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-        if self.is_not_in_free_group:
+        if self.free_group is None:
             self._release_page_ids(torch.unique(free_index // self.page_size))
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
@@ -293,7 +293,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 torch.unique(free_index.cpu() // ps),
             )
 
-        if self.is_not_in_free_group:
+        if self.free_group is None:
             self._release_page_ids(*(p // ps for p in pieces))
             if self.debug_mode:
                 self._debug_check_no_duplicate_pages()
@@ -333,8 +333,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int64, device=self.device
         )
-        self.is_not_in_free_group = True
-        self.free_group = []
+        self.free_group = None
         self.free_page_reps_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 

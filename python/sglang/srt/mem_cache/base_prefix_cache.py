@@ -17,7 +17,9 @@ from typing import (
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
     RadixCacheMetricsCollector,
@@ -26,14 +28,12 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import get_observability
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import HiCacheController
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
-    )
-    from sglang.srt.mem_cache.unified_cache.components.tree_component import (
-        ComponentType,
     )
 
 
@@ -66,6 +66,9 @@ class InsertParams:
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
 
+    # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
+    c128_value: Optional[torch.Tensor] = None
+
     # SWA specific
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
@@ -73,6 +76,7 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    track_adopted_ranges: bool = False
 
 
 @dataclasses.dataclass
@@ -85,10 +89,23 @@ class InsertResult:
     mamba_exist: bool = False
     inserted_host_node: Any = None
     host_insert_dropped: bool = False
+    adopted_ranges: Optional[dict[ComponentType, list[tuple[int, int]]]] = None
     # Controller-applied actions from the non-stepped channels (e.g. insert_host); the stepped insert emits via InsertStepResult.actions.
     cache_actions: list[CacheAction | ComponentAction] = dataclasses.field(
         default_factory=list
     )
+
+    def record_adopted_range(
+        self, component_type: ComponentType, start: int, end: int
+    ) -> None:
+        if self.adopted_ranges is None or start >= end:
+            return
+        ranges = self.adopted_ranges.setdefault(component_type, [])
+        if ranges and start <= ranges[-1][1]:
+            prev_start, prev_end = ranges[-1]
+            ranges[-1] = (min(prev_start, start), max(prev_end, end))
+        else:
+            ranges.append((start, end))
 
 
 @dataclasses.dataclass
@@ -233,16 +250,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     metrics_collector: Optional[RadixCacheMetricsCollector] = (
         None  # metrics collector for the cache
     )
+    cache_controller: Optional[HiCacheController] = None
+    # Set by caches that publish KV placement events; None means they don't.
+    kv_events: Optional[KVCacheEventRecorder] = None
 
     def init_metrics_collector(self):
-        from sglang.srt.runtime_context import get_server_args
-
-        server_args = get_server_args()
         labels = {"cache_type": self.__class__.__name__}
         if get_observability().extra_metric_labels:
             labels.update(get_observability().extra_metric_labels)
         radix_cache_cls = resolve_collector_class(
-            server_args,
             STAT_LOGGER_ROLE_RADIX_CACHE,
             RadixCacheMetricsCollector,
         )
@@ -316,6 +332,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def evict(self, params: EvictParams) -> EvictResult:
         pass
 
+    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+        """Evict cache entries to cover allocator shortfalls.
+
+        The default implementation preserves the component-count semantics of
+        :meth:`evict`. Multi-component caches backed by shared memory can
+        override this entry point to stop once collateral frees make the
+        requested allocation feasible.
+        """
+        return self.evict(params)
+
     @abstractmethod
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         pass
@@ -372,10 +398,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         raise NotImplementedError()
 
     def take_events(self):
-        return []
+        return [] if self.kv_events is None else self.kv_events.take()
 
     def supports_swa(self) -> bool:
         return False
+
+    def swa_retain_floor(self, req) -> int | None:
+        # A match lands on a state checkpoint rather than on the tail, so a cache
+        # that pairs SWA with mamba/conv checkpoints has to keep the window behind
+        # the last checkpoint. Those caches override this. Everyone else has
+        # nothing deeper than the tail to protect.
+        return None
 
     def swa_reprefill_tail_tokens(self) -> int:
         # Only the unified_kv compress-only HiCache layout needs to hold back a

@@ -36,7 +36,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=["--model-impl", "transformers"],
         )
-        cls.mmlu_lower_bound = 0.63
+        cls.mmlu_lower_bound = 0.64
         cls.gsm8k_lower_bound = 0.65
 
     @classmethod
@@ -48,7 +48,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=64,
+            num_examples=256,
             num_threads=32,
         )
         metrics = run_eval(args)

@@ -326,6 +326,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "page_size) -> ()");
   m.impl("transfer_kv_direct", torch::kCUDA, &transfer_kv_direct);
   m.def(
+      "transfer_embedding_ranges_direct(Tensor src, Tensor! dst, int[] src_starts, int[] dst_starts, int[] "
+      "lengths) -> ()");
+  m.impl("transfer_embedding_ranges_direct", torch::kCUDA, &transfer_embedding_ranges_direct);
+  m.def(
       "transfer_kv_per_layer_direct_pf_lf(Tensor[] src_ptrs, Tensor[] dst_ptrs, Tensor src_indices, "
       "Tensor dst_indices, int layer_id, int page_size)->() ");
   m.impl("transfer_kv_per_layer_direct_pf_lf", torch::kCUDA, &transfer_kv_per_layer_direct_pf_lf);
@@ -434,6 +438,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/mamba
    */
+  // Compatibility API: SGLang dispatches to the JIT implementation, but external
+  // sgl_kernel consumers still rely on these exported CUDA ops.
   m.def(
       "causal_conv1d_update(Tensor! x,"
       "Tensor! conv_state,"
