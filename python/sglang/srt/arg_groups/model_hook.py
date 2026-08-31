@@ -335,7 +335,8 @@ def handle_model_specific_adjustments(server_args: Any):
         if get_platform().is_sm120:
             # SM120 lacks tcgen05/TMEM: disable features that depend on
             # DeepGEMM or require >99KB SMEM (topk_v2).
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            if not envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
             envs.SGLANG_OPT_USE_TOPK_V2.set(False)
             envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
             if not envs.SGLANG_OPT_FUSE_MHC_POST_PRE.is_set():
