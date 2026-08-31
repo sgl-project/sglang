@@ -53,9 +53,13 @@ from sglang.benchmark.serving import (
     _BACKEND_API_PATHS,
     _EMBEDDING_BACKENDS,
     ASYNC_REQUEST_FUNCS,
+    RequestFuncOutput,
     _finite_positive_float,
+    _positive_int,
     async_request_openai_embeddings,
+    collect_gsp_cache_prefix_requests,
     flush_server_cache,
+    prewarm_gsp_prefix_cache,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -88,6 +92,48 @@ _BENCH_SERVING_CLI_CASES = {
         "uniform",
         "--gsp-zipf-alpha",
         "1.0",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+    "prewarm_wrong_dataset": [
+        "--dataset-name",
+        "random",
+        "--gsp-prewarm-prefixes",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+    "prewarm_wrong_backend": [
+        "--backend",
+        "vllm",
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-prewarm-prefixes",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+    "prewarm_bad_concurrency": [
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-prewarm-prefixes",
+        "--gsp-prewarm-concurrency",
+        "0",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+    "prewarm_fast_prepare": [
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-prewarm-prefixes",
+        "--gsp-fast-prepare",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+    "prewarm_multi_turn": [
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-prewarm-prefixes",
+        "--gsp-num-turns",
+        "2",
         "--ready-check-timeout-sec",
         "0",
     ],
@@ -324,6 +370,8 @@ def make_args(**overrides):
         "gsp_send_routing_key": False,
         "gsp_num_turns": 1,
         "gsp_ordered": False,
+        "gsp_prewarm_prefixes": False,
+        "gsp_prewarm_concurrency": 1,
         "gsp_group_distribution": "uniform",
         "gsp_zipf_alpha": None,
         "seed": 1,
@@ -1097,6 +1145,140 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows_a), 3 * 4)
         self.assertEqual(self._row_fields(rows_a), self._row_fields(rows_b))
 
+    def test_gsp_prewarm_metadata_and_deduplication(self):
+        args = make_args(
+            dataset_name="generated-shared-prefix",
+            gsp_num_groups=3,
+            gsp_prompts_per_group=4,
+            gsp_system_prompt_len=8,
+            gsp_question_len=4,
+            gsp_output_len=2,
+            gsp_range_ratio=1.0,
+            gsp_ordered=True,
+            gsp_prewarm_prefixes=True,
+            seed=17,
+        )
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        rows = get_dataset(args, self.tokenizer, model_id="dummy-model")
+
+        self.assertEqual(len(rows), 12)
+        self.assertTrue(all(row.cache_prefix for row in rows))
+        self.assertTrue(all(row.cache_prefix_len > 0 for row in rows))
+        prefix_requests = collect_gsp_cache_prefix_requests(rows)
+        self.assertEqual(len(prefix_requests), 3)
+        self.assertTrue(all(row.output_len == 1 for row in prefix_requests))
+
+    def test_gsp_prewarm_regenerates_legacy_cache_without_metadata(self):
+        from sglang.benchmark.datasets import generated_shared_prefix as gsp_mod
+
+        args = make_args(
+            dataset_name="generated-shared-prefix",
+            gsp_num_groups=2,
+            gsp_prompts_per_group=2,
+            gsp_system_prompt_len=8,
+            gsp_question_len=4,
+            gsp_output_len=2,
+            gsp_range_ratio=1.0,
+            gsp_ordered=True,
+            gsp_prewarm_prefixes=True,
+            seed=18,
+        )
+        cache_path = get_gen_prefix_cache_path(
+            seed=args.seed,
+            num_groups=args.gsp_num_groups,
+            prompts_per_group=args.gsp_prompts_per_group,
+            system_prompt_len=args.gsp_system_prompt_len,
+            question_len=args.gsp_question_len,
+            output_len=args.gsp_output_len,
+            tokenizer=self.tokenizer,
+        )
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump([DatasetRow(prompt="legacy", prompt_len=1, output_len=1)], f)
+
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        with patch.object(gsp_mod, "gen_prompt", wraps=gsp_mod.gen_prompt) as gen:
+            rows = get_dataset(args, self.tokenizer, model_id="dummy-model")
+
+        self.assertGreater(gen.call_count, 0)
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row.cache_prefix for row in rows))
+
+    def test_gsp_prefix_prewarm_requests_and_stats(self):
+        rows = [
+            DatasetRow(
+                prompt=f"prefix-a question-{i}",
+                prompt_len=10,
+                output_len=2,
+                cache_prefix="prefix-a ",
+                cache_prefix_len=6,
+            )
+            for i in range(2)
+        ] + [
+            DatasetRow(
+                prompt="prefix-b question",
+                prompt_len=20,
+                output_len=2,
+                cache_prefix="prefix-b ",
+                cache_prefix_len=8,
+            )
+        ]
+        seen = []
+
+        async def request_func(request_func_input, pbar=None):
+            seen.append(request_func_input)
+            return RequestFuncOutput(success=True)
+
+        stats = asyncio.run(
+            prewarm_gsp_prefix_cache(
+                request_func=request_func,
+                api_url="http://127.0.0.1:30000/generate",
+                model_id="test-model",
+                input_requests=rows,
+                extra_request_body={},
+                max_concurrency=2,
+            )
+        )
+
+        self.assertEqual(
+            [request.prompt for request in seen], ["prefix-a ", "prefix-b "]
+        )
+        self.assertTrue(all(request.output_len == 1 for request in seen))
+        self.assertEqual(stats["num_prefixes"], 2)
+        self.assertEqual(stats["prewarm_requests"], 2)
+        self.assertEqual(stats["primed_prefix_tokens"], 14)
+        self.assertEqual(stats["expected_cached_tokens"], 20)
+        self.assertEqual(stats["expected_prompt_tokens"], 40)
+        self.assertEqual(stats["expected_hit_rate_pct"], 50.0)
+
+    def test_gsp_prefix_prewarm_failure_is_fatal(self):
+        rows = [
+            DatasetRow(
+                prompt="prefix question",
+                prompt_len=10,
+                output_len=2,
+                cache_prefix="prefix ",
+                cache_prefix_len=6,
+            )
+        ]
+
+        async def request_func(request_func_input, pbar=None):
+            return RequestFuncOutput(success=False, error="intentional failure")
+
+        with self.assertRaisesRegex(ValueError, "intentional failure"):
+            asyncio.run(
+                prewarm_gsp_prefix_cache(
+                    request_func=request_func,
+                    api_url="http://127.0.0.1:30000/generate",
+                    model_id="test-model",
+                    input_requests=rows,
+                    extra_request_body={},
+                    max_concurrency=1,
+                )
+            )
+
     def test_gsp_uniform_cache_path_format_unchanged(self):
         # The uniform-mode cache filename keeps its existing
         # gen_shared_prefix_<seed>_<N>_<P>_<sysL>_<qL>_<outL>_<TokenizerCls>.pkl
@@ -1418,6 +1600,8 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         # Both new flags appear.
         self.assertIn("--gsp-group-distribution", out)
         self.assertIn("--gsp-zipf-alpha", out)
+        self.assertIn("--gsp-prewarm-prefixes", out)
+        self.assertIn("--gsp-prewarm-concurrency", out)
         # Rank-based Zipf formula and alpha constraint are documented.
         self.assertIn("1/rank**alpha", out)
         self.assertIn("rank starts at 1", out)
@@ -1438,6 +1622,24 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             with self.subTest(value=value):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     _finite_positive_float(value)
+
+        for value in ("0", "-1", "not-an-int"):
+            with self.subTest(value=value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    _positive_int(value)
+
+    def test_bench_serving_cli_rejects_invalid_prewarm_options(self):
+        for case in (
+            "prewarm_wrong_dataset",
+            "prewarm_wrong_backend",
+            "prewarm_bad_concurrency",
+            "prewarm_fast_prepare",
+            "prewarm_multi_turn",
+        ):
+            with self.subTest(case=case):
+                res = _bench_serving_cli_results()[case]
+                self.assertEqual(res.returncode, 2, res.stderr)
+                self.assertIn("gsp-prewarm", res.stderr + res.stdout)
 
     def test_bench_serving_cli_rejects_zipf_without_alpha_before_server(self):
         # Malformed CLI combinations (zipf with no alpha) must fail at

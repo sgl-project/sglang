@@ -117,6 +117,8 @@ Generated Shared Prefix flags (for `generated-shared-prefix`):
 - `--gsp-system-prompt-len`
 - `--gsp-question-len`
 - `--gsp-output-len`
+- `--gsp-prewarm-prefixes`: populate every generated prefix group after the optional cache flush and before measured traffic. Priming requests are excluded from benchmark metrics. Use an SGLang backend.
+- `--gsp-prewarm-concurrency`: maximum concurrent priming requests (default: `1`).
 - `--gsp-group-distribution {uniform,zipf}`: per-request prefix-group sampling distribution (default: `uniform`). With `zipf`, each request's group is sampled by rank with `p(rank) = (1/rank**alpha) / sum_k(1/k**alpha)`; rank starts at 1 and group index 0 is the hottest. The on-disk dataset cache uses a distinct key per `(group_distribution, zipf_alpha)`, so uniform-mode caches are never mixed with zipf-mode caches.
 - `--gsp-zipf-alpha FLOAT`: Zipf exponent for `--gsp-group-distribution=zipf`. Must be a finite float strictly greater than 0; larger values concentrate requests on lower-ranked (hotter) groups. Required when the distribution is `zipf`; must be omitted otherwise.
 
@@ -360,6 +362,34 @@ python3 -m sglang.bench_serving \
   --gsp-system-prompt-len 2048 --gsp-question-len 128 --gsp-output-len 256 \
   --num-prompts 1024
 ```
+
+To measure a controlled warm-cache point, flush cache state left by engine warmup and
+then prewarm each generated prefix group before the benchmark timer starts:
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 --port 30000 \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --dataset-name generated-shared-prefix \
+  --gsp-num-groups 8 --gsp-prompts-per-group 8 \
+  --gsp-system-prompt-len 7168 --gsp-question-len 1024 \
+  --gsp-output-len 256 \
+  --warmup-requests 1 \
+  --flush-cache \
+  --gsp-prewarm-prefixes \
+  --gsp-prewarm-concurrency 1 \
+  --cache-report \
+  --output-details
+```
+
+The example targets an approximately 87.5% shared prefix before cache-page rounding.
+Use the reported `cache_report.cache_hit_rate_pct` as the achieved rate. The JSONL
+output also includes `prefix_cache_config`; its priming token count and expected hit
+rate describe the generated workload. If an older on-disk GSP dataset does not contain
+prefix metadata, the benchmark regenerates and replaces that cache entry automatically.
+Prefix prewarming requires accurate prompt lengths and a single-turn GSP workload, so
+it cannot be combined with `--gsp-fast-prepare` or `--gsp-num-turns` greater than one.
 
 Zipfian / power-law prefix popularity (opt-in via `--gsp-group-distribution=zipf`):
 
