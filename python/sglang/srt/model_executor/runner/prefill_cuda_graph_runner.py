@@ -292,7 +292,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.max_num_tokens = max(self.capture_num_tokens)
         self.max_bs = model_runner.req_to_token_pool.size
         self.capture_context_sizes = self._resolve_context_buckets(
-            model_runner, getattr(prefill_config, "context_buckets", None)
+            model_runner, prefill_config.context_buckets
         )
 
         # --- capture modes --------------------------------------------

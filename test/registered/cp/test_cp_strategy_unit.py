@@ -115,6 +115,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         runner.has_mha_companion_layers = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [2048, 2304]
+        runner.capture_context_sizes = ()
         runner.max_num_tokens = 2304
         runner.enable_cp_v2_bcg_capture = True
         return runner

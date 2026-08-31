@@ -43,6 +43,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner.has_mha_companion_layers = backend == Backend.BREAKABLE
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
+        runner.capture_context_sizes = ()
         runner.max_num_tokens = 16
         return runner
 
