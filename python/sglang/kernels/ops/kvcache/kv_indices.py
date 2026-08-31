@@ -105,11 +105,11 @@ def create_flashmla_kv_indices_triton(
     req_to_token_ptr_stride: tl.constexpr,
     kv_indices_ptr_stride: tl.constexpr,
     PAGED_SIZE: tl.constexpr = 64,
-    # Unified-memory dense-view path (page-major envelope shared with the mamba
+    # Unified-memory per-layer-view path (page-major envelope shared with the mamba
     # sub-pool). req_to_token holds VIRTUAL token ids; the block table the MLA
-    # kernel consumes must hold DENSE page ids. When v2p_ptr is given, map each
+    # kernel consumes must hold kernel-facing page ids. When v2p_ptr is given, map each
     # virtual page through it to the physical page, then scale by PAGE_MULT
-    # (= num MLA layers) so the entry addresses the layer's dense per-page block
+    # (= num MLA layers) so the entry addresses the layer's per-page block
     # in the (num_pages*L, page_size, kv_cache_dim) reshaped view. Both default
     # to the identity (v2p_ptr None, PAGE_MULT 1) for the static pool.
     v2p_ptr=None,

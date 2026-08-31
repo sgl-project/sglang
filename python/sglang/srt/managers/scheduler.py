@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, 
 
 from sglang.srt.runtime_context import (
     attention_backends,
+    get_context,
     get_device,
     get_disagg,
     get_exec,
@@ -41,6 +42,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
+    publish,
 )
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
@@ -292,7 +294,6 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import get_context, get_spec, publish
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
@@ -3123,7 +3124,7 @@ class Scheduler(
         if self.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
             # it. Drop the marker once the request is actually gone.
-            if req.finished() or req.req_pool_idx is None:
+            if req.finished() or req.kv.req_pool_idx is None:
                 self._pending_chunked_abort_req = None
             return
 
@@ -3160,7 +3161,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
         )
 
-        req_pool_indices = [r.req_pool_idx for r in reqs]
+        req_pool_indices = [r.kv.req_pool_idx for r in reqs]
         batch.req_pool_indices = torch.tensor(
             req_pool_indices, dtype=torch.int64, device=device
         )
@@ -3526,7 +3527,7 @@ class Scheduler(
             if running_batch.batch_is_full:
                 if (
                     not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                    or not adder.preempt_to_schedule(req)
                 ):
                     break
 
@@ -3647,7 +3648,7 @@ class Scheduler(
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.swa_evict_floor = req.extend_range.end
+                req.kv.swa_evict_floor = req.extend_range.end
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -4867,7 +4868,7 @@ class Scheduler(
                     _make_abort_req(req), req
                 )
                 if (
-                    req.req_pool_idx is not None
+                    req.kv.req_pool_idx is not None
                     or getattr(req, "mamba_pool_idx", None) is not None
                 ):
                     release_kv_cache(req, self.tree_cache, is_insert=False)

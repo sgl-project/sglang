@@ -164,6 +164,36 @@ class TestAttentionBackendFallback(unittest.TestCase):
         self.assertIs(backend, _FakeFABackend)
         self.assertIsNone(_FakePlatform.selected_backend)
 
+    def test_component_override_requires_an_sglang_attention_layer(self):
+        with self.assertRaisesRegex(
+            ValueError, "did not construct an SGLang attention layer"
+        ):
+            with component_attn_backend_context_manager(
+                AttentionBackendEnum.FA, component_name="vae"
+            ):
+                pass
+
+        self.assertIsNone(get_component_attn_backend_context())
+
+    def test_component_override_preserves_load_error_and_resets_context(self):
+        with self.assertRaisesRegex(RuntimeError, "component failed"):
+            with component_attn_backend_context_manager(
+                AttentionBackendEnum.FA, component_name="vae"
+            ):
+                raise RuntimeError("component failed")
+
+        self.assertIsNone(get_component_attn_backend_context())
+
+    def test_automatic_component_backend_may_skip_sglang_attention_layer(self):
+        with component_attn_backend_context_manager(
+            AttentionBackendEnum.TORCH_SDPA,
+            component_name="text_encoder",
+            require_component_backend_selection=False,
+        ):
+            pass
+
+        self.assertIsNone(get_component_attn_backend_context())
+
     def test_implicit_preference_falls_back_for_missing_capability(self):
         backend = self._resolve(
             AttentionBackendEnum.AITER,

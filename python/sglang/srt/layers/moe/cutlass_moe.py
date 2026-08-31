@@ -4,7 +4,8 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_sm90_supported, is_sm100_supported
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -145,7 +146,7 @@ def cutlass_fused_experts_fp8(
 
     if use_mxfp8:
         assert es_up and es_down, "MXFP8 requires expert-specialization for both GEMMs"
-        assert is_sm100_supported(), "MXFP8 requires SM100"
+        assert get_platform().is_sm100, "MXFP8 requires SM100"
         assert k % 32 == 0, "MXFP8 requires hidden size to be divisible by 32"
         assert n % 32 == 0, "MXFP8 requires intermediate size to be divisible by 32"
         assert w1_scale.dtype == torch.uint8, "MXFP8 w1_scale must be uint8"
@@ -222,7 +223,7 @@ def cutlass_fused_experts_fp8(
     a_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
     w_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
 
-    if is_sm90_supported() and es_up:
+    if get_platform().is_sm90 and es_up:
         es_fp8_blockwise_scaled_grouped_mm(
             c1,
             rep_a_q,
@@ -288,7 +289,7 @@ def cutlass_fused_experts_fp8(
     else:
         intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
 
-    if is_sm90_supported() and es_down:
+    if get_platform().is_sm90 and es_down:
         es_fp8_blockwise_scaled_grouped_mm(
             c2,
             intemediate_q,
