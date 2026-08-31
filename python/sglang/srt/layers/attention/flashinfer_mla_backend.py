@@ -919,7 +919,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 if not init_metadata_replay
                 else fast_decode_kwargs["kv_indices"]
             )
-            translator = self.kv_index_translator
+            translator = self.attn_backend.kv_index_translator
             if get_parallel().dcp_enabled:
                 # SHARD BEFORE TRANSLATE. `plan_dcp_decode_metadata` applies the
                 # owner rule and collapses `loc // dcp_size`, so it must see
