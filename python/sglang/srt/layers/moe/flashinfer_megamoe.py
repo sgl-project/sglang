@@ -222,6 +222,12 @@ def _init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> None:
     layer._flashinfer_megamoe_layer = None
 
 
+def _get_or_init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> Any:
+    if "_flashinfer_megamoe_layer" not in vars(layer):
+        _init_flashinfer_megamoe_layer_state(layer)
+    return layer._flashinfer_megamoe_layer
+
+
 def _ensure_flashinfer_megamoe_layer(
     layer: FusedMoE,
     *,
@@ -229,7 +235,7 @@ def _ensure_flashinfer_megamoe_layer(
     w13_scale: torch.Tensor,
     w2_scale: torch.Tensor,
 ) -> Any:
-    mega = layer._flashinfer_megamoe_layer
+    mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if mega is not None:
         return mega
 
@@ -279,7 +285,7 @@ def _ensure_flashinfer_megamoe_layer(
 
 
 def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
-    mega = layer._flashinfer_megamoe_layer
+    mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if mega is not None:
         return mega
 
@@ -298,7 +304,7 @@ def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
 
 
 def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
-    mega = layer._flashinfer_megamoe_layer
+    mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if mega is not None:
         return mega
 
@@ -324,7 +330,7 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
 
 
 def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
-    mega = layer._flashinfer_megamoe_layer
+    mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if mega is not None:
         return mega
 
@@ -382,6 +388,8 @@ def prepare_fp4_moe_weights_for_flashinfer_megamoe(
 def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
     layer: FusedMoE,
 ) -> None:
+    _init_flashinfer_megamoe_layer_state(layer)
+
     from flashinfer.moe_ep import (
         MoEWeightPack,
         preprocess_nvfp4_cutedsl_mega_weights,
