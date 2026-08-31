@@ -12,8 +12,6 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 [SenseNova-U1.5-8B-MoT](https://huggingface.co/sensenova/SenseNova-U1.5-8B-MoT) is a text-to-image model in the SenseNova-U1 family. It is useful for high-resolution poster, infographic, and enterprise visual-generation workloads where prompt following, layout structure, and Chinese text rendering are important.
 
-SGLang supports this checkpoint through the native `multimodal_gen` runtime. The integration is an offline generation pipeline invoked with `sglang generate`; it does not use the autoregressive LLM serving engine, token streaming, or KV-cache based decoding path.
-
 ## 2. SGLang-diffusion Installation
 
 SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
