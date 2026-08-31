@@ -419,7 +419,7 @@ def test_flash_decode_jit_topk_trivial_rows_skip_score_writes():
 
 @pytest.mark.skipif(
     is_xpu(),
-    reason="XPU doesnt support trtllm_mha/fa3 dense backend",
+    reason="XPU does not support trtllm_mha/fa3 dense backend",
 )
 def test_flash_decode_dense_page_table_trivial_rows_skip_score_writes():
     torch.manual_seed(321)

@@ -1006,9 +1006,11 @@ def flash_decode_with_topk_idx(
         # -1 padded); ~2-16x faster for long context. See
         # sglang/kernels/ops/attention/minimax_decode_topk.py.
         if is_xpu():
-            from sgl_kernel.jit.minimax import minimax_decode_topk
+            from sgl_kernel import minimax_decode_topk
         else:
-            from sglang.kernels.ops.attention.minimax_decode_topk import minimax_decode_topk
+            from sglang.kernels.ops.attention.minimax_decode_topk import (
+                minimax_decode_topk,
+            )
 
         minimax_decode_topk(score, seq_lens, block_size, topk, out=topk_idx)
     else:
