@@ -261,7 +261,10 @@ def fused_moe_mxfp8_native(
 ) -> torch.Tensor:
     # Lazy import: the jit_kernel package pulls in Triton at first use; importing
     # at call time avoids any import-time cycle with the moe runner package.
-    from sglang.jit_kernel.minimax_m3 import swiglu_oai_mxfp8_quant, swiglu_oai_split
+    from sglang.kernels.ops.moe.minimax_m3_swiglu import (
+        swiglu_oai_mxfp8_quant,
+        swiglu_oai_split,
+    )
 
     T, H = hidden_states.shape
     top_k = topk_ids.shape[1]

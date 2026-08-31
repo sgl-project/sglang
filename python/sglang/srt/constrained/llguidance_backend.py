@@ -15,26 +15,76 @@
 
 import json
 import logging
-import os
-from typing import Iterable, List, Optional, Tuple, Union
+from functools import cache
+from typing import Iterable, List, NamedTuple, Optional, Tuple, Union
 
 import torch
-from llguidance import LLMatcher, LLTokenizer, StructTag, grammar_from
+from llguidance import LLExecutor, LLMatcher, LLTokenizer, StructTag, grammar_from
 from llguidance.hf import from_tokenizer
 from llguidance.torch import (
     allocate_token_bitmask,
     apply_token_bitmask_inplace,
     fill_next_token_bitmask,
+    fill_next_token_bitmask_par,
+    fill_next_token_bitmask_par_with_draft_tokens,
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
+    GrammarRow,
     InvalidGrammarObject,
+    register_vocab_mask_buffer,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
+from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
+_LLGUIDANCE_LOG_LEVEL = get_int_env_var("LLGUIDANCE_LOG_LEVEL", 1)
+
+
+class GrammarDraftRow(NamedTuple):
+    """Grammar, destination block, and tokens for a draft-chain mask fill."""
+
+    base_row: int
+    grammar: "GuidanceGrammar"
+    draft_tokens: List[int]
+
+
+@cache
+def _get_or_init_mask_executor() -> LLExecutor:
+    return LLExecutor()
+
+
+def fill_token_bitmask_with_draft_tokens(
+    entries: List[GrammarDraftRow],
+    vocab_mask: torch.Tensor,
+) -> None:
+    """Fill speculative draft-chain masks with llguidance's native kernel.
+
+    Each matcher is advanced over its legal draft prefix and rolled back by the
+    number of consumed parser tokens before returning. Rows after the first
+    illegal token retain the caller's all-allow value. Correctness requires
+    matcher rollback to restore parser-token state exactly. Matcher errors retain
+    the native executor's behavior; this wrapper adds no per-matcher Python probe.
+    """
+    if not entries:
+        return
+    matchers = [(e.grammar.ll_matcher, e.base_row, e.draft_tokens) for e in entries]
+    fill_next_token_bitmask_par_with_draft_tokens(
+        _get_or_init_mask_executor(), matchers, vocab_mask
+    )
+
+
+def fill_token_bitmask_batched(
+    entries: List[GrammarRow],
+    vocab_mask: torch.Tensor,
+) -> None:
+    """Fill regular-decode mask rows with llguidance's native kernel."""
+    if not entries:
+        return
+    matchers = [(e.grammar.ll_matcher, e.row) for e in entries]
+    fill_next_token_bitmask_par(_get_or_init_mask_executor(), matchers, vocab_mask)
 
 
 def _normalize_eos_token_ids(
@@ -47,15 +97,26 @@ def _normalize_eos_token_ids(
 
 class GuidanceGrammar(BaseGrammarObject):
 
-    def __init__(self, llguidance_tokenizer: LLTokenizer, serialized_grammar: str):
+    def __init__(
+        self,
+        llguidance_tokenizer: LLTokenizer,
+        serialized_grammar: str,
+        *,
+        ll_matcher: Optional[LLMatcher] = None,
+    ):
         super().__init__()
         self.llguidance_tokenizer = llguidance_tokenizer
         self.serialized_grammar = serialized_grammar
 
-        self.ll_matcher = LLMatcher(
-            self.llguidance_tokenizer,
-            self.serialized_grammar,
-            log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
+        # A request copy reuses the cached template's compiled matcher.
+        self.ll_matcher = (
+            ll_matcher
+            if ll_matcher is not None
+            else LLMatcher(
+                self.llguidance_tokenizer,
+                self.serialized_grammar,
+                log_level=_LLGUIDANCE_LOG_LEVEL,
+            )
         )
         self._check_err()
 
@@ -87,6 +148,24 @@ class GuidanceGrammar(BaseGrammarObject):
         fill_next_token_bitmask(self.ll_matcher, vocab_mask, idx)
         self._check_err()
 
+    @staticmethod
+    def fill_vocab_mask_batched(
+        entries: List[GrammarRow], vocab_mask: torch.Tensor
+    ) -> None:
+        """Use the native fill when every entry is a plain llguidance grammar."""
+        if all(isinstance(entry.grammar, GuidanceGrammar) for entry in entries):
+            fill_token_bitmask_batched(entries, vocab_mask)
+            return
+        BaseGrammarObject.fill_vocab_mask_batched(entries, vocab_mask)
+
+    @staticmethod
+    def reset_vocab_mask(vocab_mask: torch.Tensor) -> None:
+        if vocab_mask.dtype != torch.int32:
+            raise TypeError(
+                f"llguidance requires a packed int32 mask, got {vocab_mask.dtype}"
+            )
+        vocab_mask.fill_(-1)
+
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
@@ -101,9 +180,12 @@ class GuidanceGrammar(BaseGrammarObject):
         apply_token_bitmask_inplace(logits, vocab_mask)
 
     def copy(self):
+        # Cache templates are pristine, so cloning their matcher creates a fresh
+        # request grammar without recompiling the serialized grammar.
         return GuidanceGrammar(
             llguidance_tokenizer=self.llguidance_tokenizer,
             serialized_grammar=self.serialized_grammar,
+            ll_matcher=self.ll_matcher.deep_copy(),
         )
 
     def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
@@ -146,6 +228,21 @@ class GuidanceBackend(BaseGrammarBackend):
             n_vocab,
             eos_token=_normalize_eos_token_ids(eos_token_ids),
         )
+        # Initialize the shared executor here so the first batched mask fill
+        # does not pay its one-time setup cost on the request path.
+        _get_or_init_mask_executor()
+
+    def initialize_vocab_mask_buffer(
+        self,
+        name: str,
+        vocab_size: int,
+        max_rows: int,
+        device,
+    ) -> torch.Tensor:
+        vocab_mask = allocate_token_bitmask(
+            max_rows, self.llguidance_tokenizer.vocab_size
+        )
+        return register_vocab_mask_buffer(name, vocab_mask, max_rows)
 
     def _from_serialized(self, serialized_grammar) -> BaseGrammarObject:
         try:

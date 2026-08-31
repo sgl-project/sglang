@@ -44,8 +44,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
         self.free_pages = None
         self.release_pages = None
-        self.is_not_in_free_group = True
-        self.free_group = []
+        # None: free right away. A list: hold frees until free_group_end().
+        self.free_group: list[torch.Tensor] | None = None
 
     @property
     def size_full(self):
@@ -60,20 +60,18 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def get_kvcache(self):
         return self._kvcache
 
-    def restore_state(self, state):
-        self.free_pages, self.release_pages = state
-
-    def backup_state(self):
-        return (self.free_pages, self.release_pages)
-
     def free_group_begin(self):
-        self.is_not_in_free_group = False
         self.free_group = []
 
     def free_group_end(self):
-        self.is_not_in_free_group = True
-        if self.free_group:
-            self.free(torch.cat(self.free_group))
+        pending, self.free_group = self.free_group, None
+        if pending:
+            self.free(torch.cat(pending))
+
+    @staticmethod
+    def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
+        """Take ownership before a caller can mutate a deferred tensor view."""
+        return free_index.clone()
 
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
@@ -82,6 +80,16 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             self.release_pages = torch.empty(
                 (0,), dtype=self.release_pages.dtype, device=self.device
             )
+
+    def translate_kv_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Token ids as the PD-disaggregation transfer engine addresses them.
+
+        Identity here: a static pool's token ids index its registered buffers
+        directly. Virtual-id pools must override.
+        """
+        return kv_indices
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         # FIXME: reuse the get_cpu_copy after paged allocator is implemented
@@ -114,3 +122,35 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
     def free(self, free_index: torch.Tensor):
         raise NotImplementedError()
+
+    def free_full(self, free_index: torch.Tensor):
+        """Free slots whose SWA peers the caller already released.
+
+        A hybrid SWA allocator pairs each full-attention slot with an SWA slot
+        that can die first; this releases the full side alone. A single pool has
+        no peer, so it is a plain free()."""
+        self.free(free_index)
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Free ``kv_row[start_pos : start_pos + n]`` of one request (or a
+        page-aligned copy); subclasses may use ``start_pos`` to skip the
+        data-dependent dedup. Default: plain free()."""
+        self.free(free_index)
+
+    def free_segments(self, segments):
+        """Free disjoint ascending ``(free_index, start_pos)`` segments of one
+        request's kv row; a boundary page shared by consecutive segments is
+        emitted once (the later segment's head is trimmed)."""
+        ps = self.page_size
+        prev_end = None
+        for free_index, start_pos in segments:
+            n = free_index.numel()
+            if n == 0:
+                continue
+            seg_end = start_pos + n
+            if prev_end is not None and start_pos // ps == (prev_end - 1) // ps:
+                boundary = (start_pos // ps + 1) * ps
+                free_index = free_index[boundary - start_pos :]
+                start_pos = boundary
+            prev_end = seg_end
+            self.free_segment(free_index, start_pos=start_pos)

@@ -10,7 +10,7 @@ a fair comparison — the reshape/contiguous cost is included.
 import torch
 import triton
 
-from sglang.kernels.ops.layernorm.elementwise import fused_sigmoid_mul
+from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
 NUM_HEADS = 32
 HEAD_DIM = 256

@@ -21,10 +21,7 @@ from sglang.test.test_utils import (
 )
 
 # EAGLE3 with DP attention (tp=2, dp=2, requires 4 GPUs).
-# Per-commit EAGLE + DP-attn coverage on CUDA is provided by
-# test_eagle_infer_beta_dp_attention.py (B200 4-gpu), so this H100 variant
-# is gated to extra-b only.
-register_cuda_ci(est_time=99, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=99, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=200, suite="stage-c-test-4-gpu-amd")
 
 

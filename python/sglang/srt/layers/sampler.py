@@ -1,4 +1,5 @@
 import logging
+from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -7,6 +8,7 @@ from torch import nn
 
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -14,13 +16,14 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -44,6 +47,7 @@ if is_musa():
         top_p_renorm_prob,
     )
 
+_is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 if _use_aiter:
     from aiter import greedy_sample as _aiter_greedy_sample
@@ -53,7 +57,9 @@ if _use_aiter:
 # to an empty string and breaks downstream consumers. Set this to 1 to fall back to
 # torch.argmax (which always returns a valid index). Default off so behavior is
 # unchanged elsewhere.
-_disable_aiter_greedy_sample = get_bool_env_var("SGLANG_DISABLE_AITER_GREEDY_SAMPLE")
+_disable_aiter_greedy_sample = (
+    get_bool_env_var("SGLANG_DISABLE_AITER_GREEDY_SAMPLE") or is_gfx1250_supported()
+)
 
 if is_npu():
     import torch_npu
@@ -66,6 +72,18 @@ _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
+def _trace_e2e_sampler(stage: str, **fields) -> None:
+    if not envs.SGLANG_TRACE_SAMPLER_E2E.get():
+        return
+    try:
+        parallel = get_parallel()
+        rank = f"dp={parallel.attn_dp_rank} tp={parallel.tp_rank}"
+    except Exception:
+        rank = "rank=unknown"
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"SGLANG_TRACE_SAMPLER_E2E {rank} stage={stage} {details}", flush=True)
+
+
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
@@ -73,12 +91,14 @@ class Sampler(nn.Module):
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
 
-        self.rl_on_policy_target = get_server_args().rl_on_policy_target
+        self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
-        self.enable_deterministic = get_server_args().enable_deterministic_inference
+        self.enable_deterministic = (
+            get_exec().deterministic.enable_deterministic_inference
+        )
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
-        self.use_ascend_backend = get_server_args().sampling_backend == "ascend"
+        self.use_ascend_backend = get_exec().kernel.sampling_backend == "ascend"
 
         self.output_logprob_processor = OutputLogprobProcessor()
 
@@ -115,12 +135,23 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
+        _trace_e2e_sampler(
+            "forward_enter",
+            logits_shape=tuple(logits.shape),
+            all_greedy=sampling_info.is_all_greedy,
+        )
+
+        if _is_hip and logits.shape[0] == 0:
+            return torch.empty((0,), dtype=torch.int64, device=logits.device)
 
         # Preprocess logits (custom processors and NaN handling)
+        _trace_e2e_sampler("preprocess_enter")
         logits = self._preprocess_logits(logits, sampling_info)
+        _trace_e2e_sampler("preprocess_returned")
         return_sampling_mask = any(sampling_info.return_sampling_masks or [])
 
         if sampling_info.is_all_greedy:
+            _trace_e2e_sampler("greedy_enter")
             if _use_aiter and not _disable_aiter_greedy_sample:
                 batch_next_token_ids = torch.empty(
                     logits.shape[0], device=logits.device, dtype=torch.int32
@@ -128,6 +159,9 @@ class Sampler(nn.Module):
                 _aiter_greedy_sample(batch_next_token_ids, logits)
             else:
                 batch_next_token_ids = torch.argmax(logits, -1)
+            _trace_e2e_sampler(
+                "greedy_returned", output_shape=tuple(batch_next_token_ids.shape)
+            )
             if return_sampling_mask:
                 self._attach_greedy_sampling_mask_to_output(
                     logits_output, sampling_info, batch_next_token_ids
@@ -185,6 +219,21 @@ class Sampler(nn.Module):
                 # Standard path: do softmax and sample from probs.
                 logits.div_(sampling_info.temperatures)
 
+                # Deterministic inference must derive the returned logprobs
+                # from F.log_softmax — the same kernel prefill rescoring uses —
+                # not log(softmax(x)) below: the two disagree at ~1e-6 despite
+                # being mathematically equivalent, which breaks bitwise
+                # prefill/decode logprob alignment.
+                if (
+                    return_logprob
+                    and self.enable_deterministic
+                    and logprobs_via_logsoftmax_kernel is None
+                    and not SGLANG_RETURN_ORIGINAL_LOGPROB
+                ):
+                    logprobs_via_logsoftmax_kernel = torch.nn.functional.log_softmax(
+                        logits, dim=-1
+                    )
+
                 # In-place op to save memory
                 logits[:] = torch.softmax(logits, dim=-1)
                 probs = logits
@@ -210,20 +259,22 @@ class Sampler(nn.Module):
                     )
                 del probs
 
-        # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
             if SGLANG_RETURN_ORIGINAL_LOGPROB:
                 logprobs = original_logprobs
-            self.output_logprob_processor.attach_logprobs_to_output(
-                logits_output,
+            logprob_result = self.output_logprob_processor.compute_logprobs(
                 logprobs,
                 top_logprobs_nums,
                 token_ids_logprobs,
                 batch_next_token_ids,
             )
+            logprob_result.write_output_to(logits_output)
 
+        _trace_e2e_sampler("token_sync_enter")
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+        _trace_e2e_sampler("token_sync_returned")
 
+        _trace_e2e_sampler("forward_returned")
         return batch_next_token_ids
 
     def _sample_from_probs(
@@ -245,7 +296,7 @@ class Sampler(nn.Module):
                 positions=positions,
             )
         else:
-            backend = get_server_args().sampling_backend
+            backend = get_exec().kernel.sampling_backend
             if backend == "flashinfer":
                 assert (
                     sampling_info.sampling_seed is None
@@ -494,17 +545,17 @@ class Sampler(nn.Module):
         self,
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
-        return_logprob: bool,
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
     ) -> None:
-        self.output_logprob_processor.compute_logprobs_only(
-            logits_output=logits_output,
-            sampling_info=sampling_info,
+        logprob_result = self.output_logprob_processor.compute_logprobs_only(
+            next_token_logits=logits_output.next_token_logits,
             top_logprobs_nums=top_logprobs_nums,
             token_ids_logprobs=token_ids_logprobs,
-            preprocess_fn=self._preprocess_logits,
+            preprocess_fn=partial(self._preprocess_logits, sampling_info=sampling_info),
         )
+        if logprob_result is not None:
+            logprob_result.write_output_to(logits_output)
 
 
 def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> None:
@@ -525,7 +576,7 @@ def create_sampler(backend: Optional[str] = None) -> "Sampler":
     """Create a sampler honoring custom backend registrations."""
 
     server_args = get_server_args()
-    backend = backend or (server_args.sampling_backend if server_args else None)
+    backend = backend or (get_exec().kernel.sampling_backend if server_args else None)
 
     if backend in _CUSTOM_SAMPLER_FACTORIES:
         sampler = _CUSTOM_SAMPLER_FACTORIES[backend]()
@@ -697,7 +748,9 @@ def multinomial_with_seed(
     # x is a uniform sample in [0, 1]. get gumbel noise from it.
     # which is equivalent to -log(-log(x))
     # keep everything in in-place operations to avoid unnecessary memory allocations.
-    x.log_().clamp_(min=torch.finfo(x.dtype).min).neg_()  # -log(x)
+    # clamp both ends: x == 1 gives gumbel +inf (NaN at -inf logprobs); the cap is
+    # the hash spacing so that bucket matches its neighbor instead of dominating
+    x.log_().clamp_(min=torch.finfo(x.dtype).min, max=-(2.0**-32)).neg_()
     x.log_().neg_()  # -log(-log(x)) == gumbel noise
 
     # add gumbel noise to logprobs

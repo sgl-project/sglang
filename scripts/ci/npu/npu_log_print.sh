@@ -8,7 +8,7 @@ get_version() {
     [ -f "$1" ] && python3 -c 'import re, sys; print(sys.argv[2] + " version: v" + re.search(r"__version__\s*=\s*[\"'"'"'](.*?)[\"'"'"']", open(sys.argv[1]).read()).group(1))' "$1" "$2" 2>/dev/null || echo "$2 version: unknown"
 }
 get_version "./python/sglang/version.py" "sglang"
-get_version "./sgl-kernel/python/sgl_kernel/version.py" "sgl_kernel"
+get_version "./python/sglang/kernels/aot/python/sgl_kernel/version.py" "sgl_kernel"
 SGLANG_URL="https://github.com/sgl-project/sglang.git"
 SGL_KERNEL_URL="https://github.com/sgl-project/sgl-kernel-npu.git"
 SGLANG_BRANCH="main"

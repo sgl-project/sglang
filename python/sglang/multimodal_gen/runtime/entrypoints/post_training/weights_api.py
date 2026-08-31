@@ -70,6 +70,7 @@ async def update_weights_from_tensor(request: Request):
 
     req = UpdateWeightFromTensorReqInput(
         serialized_named_tensors=serialized_named_tensors,
+        payload_gpu_uuids=body.get("payload_gpu_uuids"),
         load_format=body.get("load_format"),
         target_modules=body.get("target_modules"),
         weight_update_mode=body.get("weight_update_mode"),

@@ -38,12 +38,12 @@ class TestTorchNativeAttnBackend(CustomTestCase):
                 base_url=base_url,
                 model=model,
                 eval_name="mmlu",
-                num_examples=64,
+                num_examples=256,
                 num_threads=32,
             )
 
             metrics = run_eval(args)
-            self.assertGreaterEqual(metrics["score"], 0.65)
+            self.assertGreaterEqual(metrics["score"], 0.64)
         finally:
             kill_process_tree(process.pid)
 

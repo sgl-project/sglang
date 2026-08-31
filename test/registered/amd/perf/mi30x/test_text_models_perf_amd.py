@@ -25,11 +25,11 @@ from sglang.test.test_utils import (
 # Register for AMD CI - Text models benchmark (~60 min)
 register_amd_ci(est_time=3600, suite="nightly-amd-perf-text-2-gpu", nightly=True)
 
-PROFILE_DIR = "performance_profiles_text_models_amd"
+RESULT_DIR = "performance_results_text_models_amd"
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Generate a simplified markdown report without traces and cost columns.
+    """Generate a simplified markdown report without cost columns.
 
     Skips the first result if it's a warmup run (duplicate batch_size).
     """
@@ -89,8 +89,8 @@ class TestNightlyTextModelsPerfAMD(unittest.TestCase):
         cls.batch_sizes = [1, 1, 8, 16, 64]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_one_batch(self):
@@ -110,7 +110,6 @@ class TestNightlyTextModelsPerfAMD(unittest.TestCase):
                         input_lens=self.input_lens,
                         output_lens=self.output_lens,
                         other_args=other_args,
-                        enable_profile=False,  # Disable profiling for AMD tests
                     )
                     results = result_tuple[0]
                     success = result_tuple[1]

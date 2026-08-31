@@ -4,6 +4,9 @@ import unittest
 
 import torch
 
+from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
+    schedule_verify_lens_topk_from_survival,
+)
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
     HostConfidenceBudgetPlanner,
@@ -14,9 +17,6 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
-)
-from sglang.srt.speculative.dspark_components.kernels.dspark_schedule import (
-    schedule_verify_lens_topk_from_survival,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cpu_ci

@@ -71,7 +71,7 @@ class Qwen2ForSequenceClassification(nn.Module):
         filtered_weights = [
             (name, w) for name, w in weights if not name.startswith("lm_head")
         ]
-        return Qwen2ForCausalLM.load_weights(self, filtered_weights)
+        return Qwen2ForCausalLM._legacy_load_weights(self, filtered_weights)
 
 
 EntryClass = [

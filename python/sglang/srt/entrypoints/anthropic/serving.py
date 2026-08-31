@@ -297,7 +297,7 @@ class AnthropicServing:
 
         def _convert_tool_result_content(
             content: Any,
-        ) -> tuple[Union[str, list[dict]], str]:
+        ) -> tuple[list[Union[str, list[dict]]], str]:
             if isinstance(content, list):
                 tool_content_parts = []
                 tool_text_parts = []
@@ -342,22 +342,38 @@ class AnthropicServing:
                             )
 
                 tool_text = "\n".join(tool_text_parts)
-                if (
-                    len(tool_content_parts) == 1
-                    and tool_content_parts[0]["type"] == "text"
-                ):
-                    return tool_content_parts[0]["text"], tool_text
-                if tool_content_parts:
-                    return tool_content_parts, tool_text
-                return "", tool_text
+                # GLM templates expand references only at the start of a tool
+                # message, so isolate reference runs without changing part order.
+                tool_content_groups: list[list[dict]] = []
+                for part in tool_content_parts:
+                    is_reference = part["type"] == "tool_reference"
+                    if (
+                        not tool_content_groups
+                        or (tool_content_groups[-1][0]["type"] == "tool_reference")
+                        != is_reference
+                    ):
+                        tool_content_groups.append([])
+                    tool_content_groups[-1].append(part)
+
+                tool_contents: list[Union[str, list[dict]]] = []
+                for group in tool_content_groups:
+                    if len(group) == 1 and group[0]["type"] == "text":
+                        tool_contents.append(group[0]["text"])
+                    else:
+                        tool_contents.append(group)
+                return tool_contents or [""], tool_text
 
             tool_text = str(content) if content else ""
-            return tool_text, tool_text
+            return [tool_text], tool_text
 
         def _convert_assistant_thinking_blocks(
             blocks: list[AnthropicContentBlock],
-        ) -> Optional[str]:
-            """Re-wrap prior-turn thinking blocks in the parser's own tokens.
+        ) -> tuple[Optional[str], Optional[str]]:
+            """Reconstruct prior-turn thinking as ``(reasoning_content, text)``.
+
+            At most one is set: encoders that frame the reasoning channel take
+            it as ``reasoning_content``, everything else gets it re-wrapped and
+            spliced into content.
 
             ``redacted_thinking`` carries encrypted bytes that no local
             parser can interpret, so we raise rather than silently drop it.
@@ -375,11 +391,15 @@ class AnthropicServing:
                 if block.type == "thinking" and block.thinking
             ]
             if not thinking_parts:
-                return None
+                return None, None
+
+            reasoning_text = "\n".join(thinking_parts)
+            if self.openai_serving_chat.supports_native_reasoning_history():
+                return reasoning_text, None
 
             try:
-                return self.openai_serving_chat.wrap_reasoning_history(
-                    "\n".join(thinking_parts)
+                return None, self.openai_serving_chat.wrap_reasoning_history(
+                    reasoning_text
                 )
             except ValueError as e:
                 logger.warning(
@@ -387,7 +407,7 @@ class AnthropicServing:
                     len(thinking_parts),
                     e,
                 )
-                return None
+                return None, None
 
         system_parts: list[str] = []
         if anthropic_request.system:
@@ -442,7 +462,11 @@ class AnthropicServing:
             tool_calls: list[dict] = []
 
             if msg.role == "assistant":
-                reasoning_history = _convert_assistant_thinking_blocks(msg.content)
+                reasoning_content, reasoning_history = (
+                    _convert_assistant_thinking_blocks(msg.content)
+                )
+                if reasoning_content is not None:
+                    openai_msg["reasoning_content"] = reasoning_content
                 if reasoning_history is not None:
                     content_parts.append({"type": "text", "text": reasoning_history})
 
@@ -484,7 +508,7 @@ class AnthropicServing:
                     tool_calls.append(tool_call)
 
                 elif block.type == "tool_result":
-                    tool_content, tool_text = _convert_tool_result_content(
+                    tool_contents, tool_text = _convert_tool_result_content(
                         block.content
                     )
 
@@ -497,13 +521,14 @@ class AnthropicServing:
                     # block must come AFTER that text in OpenAI form too).
                     if msg.role == "user":
                         _emit_user_message(content_parts)
-                        openai_messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "content": tool_content,
-                            }
-                        )
+                        for tool_content in tool_contents:
+                            openai_messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call_id,
+                                    "content": tool_content,
+                                }
+                            )
                     else:
                         content_parts.append(
                             {
