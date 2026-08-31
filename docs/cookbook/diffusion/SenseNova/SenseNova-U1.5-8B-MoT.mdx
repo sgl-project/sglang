@@ -84,52 +84,55 @@ with open("output_sensenova_u15.png", "wb") as f:
 
 #### 5.1.1 Generate an image
 
-NVIDIA GeForce RTX 4090 49140 MiB
+<Tabs>
+  <Tab title="NVIDIA A800">
 
-**Server Command**:
+    **Server Command**:
 
-```shell Command
-sglang serve \
-  --model-path sensenova/SenseNova-U1.5-8B-MoT \
-  --port 30000
-```
+    ```shell Command
+    sglang serve \
+      --model-path sensenova/SenseNova-U1.5-8B-MoT \
+      --port 30000
+    ```
 
-**Benchmark Command**:
+    **Benchmark Command**:
 
-```shell Command
-python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-  --dataset vbench \
-  --task text-to-image \
-  --num-prompts 1 \
-  --max-concurrency 1 \
-  --port 30000
-```
+    ```shell Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+      --dataset vbench \
+      --task text-to-image \
+      --num-prompts 1 \
+      --max-concurrency 1 \
+      --port 30000
+    ```
 
-**Result**:
+    **Result**:
 
-```text Output
-================= Serving Benchmark Result =================
-Task:                                         text-to-image
-Model:                                        /workspace/models/ModelScope/SenseNova/SenseNova-U1.5-8B-MoT
-Dataset:                                      vbench
---------------------------------------------------
-Benchmark duration (s):                       13.84
-Request rate:                                 inf
-Max request concurrency:                      1
-Successful requests:                          1/1
-Completed outputs:                            1
-Outputs per prompt:                           1
---------------------------------------------------
-Request throughput (req/s):                   0.07
-Output throughput (outputs/s):                0.07
-Latency Mean (s):                             13.84
-Latency Median (s):                           13.84
-Latency P90 (s):                              13.84
-Latency P95 (s):                              13.84
-Latency P99 (s):                              13.84
---------------------------------------------------
-Peak Memory Max (MB):                         34326.00
-Peak Memory Mean (MB):                        34326.00
-Peak Memory Median (MB):                      34326.00
-------------------------------------------------------------
-```
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                         text-to-image
+    Model:                                        /workspace/models/ModelScope/SenseNova/SenseNova-U1.5-8B-MoT
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       13.10
+    Request rate:                                 inf
+    Max request concurrency:                      1
+    Successful requests:                          1/1
+    Completed outputs:                            1
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.08
+    Output throughput (outputs/s):                0.08
+    Latency Mean (s):                             13.10
+    Latency Median (s):                           13.10
+    Latency P90 (s):                              13.10
+    Latency P95 (s):                              13.10
+    Latency P99 (s):                              13.10
+    --------------------------------------------------
+    Peak Memory Max (MB):                         34326.00
+    Peak Memory Mean (MB):                        34326.00
+    Peak Memory Median (MB):                      34326.00
+    ------------------------------------------------------------
+    ```
+  </Tab>
+</Tabs>

@@ -9,6 +9,7 @@ information based on model paths or other identifiers.
 
 import dataclasses
 import importlib
+import json
 import os
 import pkgutil
 from functools import lru_cache
@@ -348,8 +349,33 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
-    "sensenova/sensenova-u1.5-8b-mot": "SenseNovaU1Pipeline",
 }
+
+SENSENOVA_U1_MODEL_IDS = {
+    "sensenova/sensenova-u1.5-8b-mot",
+}
+
+
+def _is_sensenova_u1_model(model_path: str) -> bool:
+    """Identify SenseNova U1 Hub IDs and local checkpoints."""
+    if os.path.isdir(model_path):
+        config_path = os.path.join(model_path, "config.json")
+        try:
+            with open(config_path) as config_file:
+                config = json.load(config_file)
+        except (OSError, json.JSONDecodeError):
+            return False
+
+        if not isinstance(config, dict):
+            return False
+        architectures = config.get("architectures", [])
+        return (
+            config.get("model_type") == "neo_chat"
+            and isinstance(architectures, list)
+            and "NEOChatModel" in architectures
+        )
+
+    return model_path.rstrip("/").lower() in SENSENOVA_U1_MODEL_IDS
 
 
 def register_configs(
@@ -460,17 +486,24 @@ def has_registered_diffusion_model_path(model_path: str) -> bool:
     _ensure_registry_initialized()
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
+    if _is_sensenova_u1_model(model_path):
+        return True
+
     if model_path in _MODEL_HF_PATH_TO_NAME:
         return True
 
     model_short_name = get_model_short_name(model_path.lower())
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+            continue
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
         if registered_model_name in model_short_name:
             return True
 
     normalized_model_path = _normalize_hf_cache_path(model_path)
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+            continue
         cache_repo_fragment = (
             f"models--{registered_model_hf_id.lower().replace('/', '--')}"
         )
@@ -504,6 +537,13 @@ def _get_config_info(
             "falling back to automatic detection."
         )
 
+    # SenseNova Hub IDs require an exact match, while local checkpoints are
+    # identified from their config metadata rather than their directory name.
+    if _is_sensenova_u1_model(model_path):
+        for registered_hf_id in all_model_hf_paths:
+            if registered_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+                return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[registered_hf_id])
+
     # 1. Exact match
     if model_path in _MODEL_HF_PATH_TO_NAME:
         model_id = _MODEL_HF_PATH_TO_NAME[model_path]
@@ -513,6 +553,8 @@ def _get_config_info(
     # 2. Partial match: find the best (longest) match against all registered model hf paths.
     model_short_name = get_model_short_name(model_path.lower())
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+            continue
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
 
         if registered_model_name in model_short_name:
@@ -531,6 +573,8 @@ def _get_config_info(
     # -> models--black-forest-labs--flux.2-dev-nvfp4 (to match with cache_repo_fragment)
     normalized_model_path = _normalize_hf_cache_path(model_path)
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+            continue
         cache_repo_fragment = (
             f"models--{registered_model_hf_id.lower().replace('/', '--')}"
         )
@@ -985,11 +1029,6 @@ def _register_configs():
         hf_model_paths=[
             "sensenova/SenseNova-U1.5-8B-MoT",
         ],
-        model_detectors=[
-            # codespell:ignore mot
-            lambda model_id: get_model_short_name(model_id.lower())
-            == "sensenova-u1.5-8b-mot",
-        ],
     )
     # FLUX
     register_configs(
@@ -1387,6 +1426,9 @@ def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
 
 def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     """Get the pipeline name for a known non-diffusers model."""
+    if _is_sensenova_u1_model(model_path):
+        return "SenseNovaU1Pipeline"
+
     normalized_model_path = _normalize_hf_cache_path(model_path)
     model_short_name = get_model_short_name(normalized_model_path)
     for pattern, pipeline_name in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS.items():

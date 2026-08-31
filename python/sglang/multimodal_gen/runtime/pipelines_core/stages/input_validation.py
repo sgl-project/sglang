@@ -5,8 +5,6 @@
 Input validation stage for diffusion pipelines.
 """
 
-import os
-from copy import copy
 from typing import Iterator
 
 import numpy as np
@@ -17,6 +15,9 @@ from PIL import Image
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -28,7 +29,6 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import load_image, load_video
 from sglang.multimodal_gen.utils import best_output_size
-from sglang.srt.observability.trace import TraceReqContext
 
 logger = init_logger(__name__)
 
@@ -53,37 +53,6 @@ class InputValidationStage(PipelineStage):
         super().__init__()
         self.vae_image_processor = vae_image_processor
 
-    @staticmethod
-    def _seed_for_output(seed, output_idx: int):
-        if seed is None:
-            return None
-        if isinstance(seed, list):
-            if not seed:
-                return None
-            if output_idx < len(seed):
-                return int(seed[output_idx])
-            return int(seed[0]) + output_idx
-        return int(seed) + output_idx
-
-    @staticmethod
-    def _copy_trace_ctx_for_output(batch: Req, request_id: str | None, output_idx: int):
-        trace_ctx = batch.trace_ctx
-        if output_idx == 0 or not trace_ctx.tracing_enable:
-            return trace_ctx
-
-        output_trace_ctx = TraceReqContext(
-            rid=request_id,
-            module_name=trace_ctx.module_name,
-            external_trace_header=trace_ctx.external_trace_header,
-        )
-        output_trace_ctx.trace_req_start()
-        return output_trace_ctx
-
-    @staticmethod
-    def _with_output_index_suffix(output_file_name: str, output_idx: int) -> str:
-        base, ext = os.path.splitext(output_file_name)
-        return f"{base}_{output_idx}{ext}"
-
     def iter_sequential_requests(
         self, batch: Req, server_args: ServerArgs
     ) -> Iterator[Req]:
@@ -94,40 +63,13 @@ class InputValidationStage(PipelineStage):
         if num_outputs == 1:
             return iter((batch,))
 
-        def _iter_outputs():
-            for output_idx in range(num_outputs):
-                output_request_id = (
-                    f"{batch.request_id}:{output_idx}"
-                    if batch.request_id is not None
-                    else None
-                )
-                output_req = copy(batch)
-                output_req.sampling_params = copy(batch.sampling_params)
-                output_req.extra = dict(batch.extra)
-                output_req.condition_inputs = dict(batch.condition_inputs)
-                output_req.trace_ctx = self._copy_trace_ctx_for_output(
-                    batch, output_request_id, output_idx
-                )
-                output_req.seed = self._seed_for_output(batch.seed, output_idx)
-                output_req.num_outputs_per_prompt = 1
-                output_req.seeds = None
-                output_req.generator = None
-                output_req.extra["parent_request_id"] = batch.request_id
-                output_req.extra["output_index"] = output_idx
-                if output_request_id is not None:
-                    output_req.request_id = output_request_id
-                if batch.output_file_name:
-                    output_req.output_file_name = self._with_output_index_suffix(
-                        batch.output_file_name, output_idx
-                    )
-                if output_req.sampling_params is not None:
-                    output_req.sampling_params.refresh_request_extra_after_output_expansion(
-                        output_req
-                    )
-                output_req.validate()
-                yield output_req
-
-        return _iter_outputs()
+        return iter(
+            expand_request_outputs(
+                batch,
+                reuse_parent_trace_ctx=True,
+                preserve_parent_metrics=True,
+            )
+        )
 
     @staticmethod
     def _calculate_dimensions_from_area(

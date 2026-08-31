@@ -1,5 +1,6 @@
 # Modified for SGLang; see this directory's README.md for upstream source.
 
+import contextlib
 import math
 from typing import List, Optional, Tuple, Union
 
@@ -130,12 +131,22 @@ def _randn_with_seed(shape, *, device, dtype, seed: int) -> torch.Tensor:
     try:
         generator = torch.Generator(device)
     except (RuntimeError, TypeError):
-        rng_state = torch.get_rng_state()
-        try:
-            torch.manual_seed(seed)
+        device = torch.device(device)
+        if device.type == "cpu":
+            with torch.random.fork_rng(devices=[]):
+                torch.default_generator.manual_seed(seed)
+                return torch.randn(shape, device=device, dtype=dtype)
+
+        device_module = torch.get_device_module(device)
+        with torch.random.fork_rng(devices=[device], device_type=device.type):
+            device_context = (
+                device_module.device(device)
+                if hasattr(device_module, "device")
+                else contextlib.nullcontext()
+            )
+            with device_context:
+                device_module.manual_seed(seed)
             return torch.randn(shape, device=device, dtype=dtype)
-        finally:
-            torch.set_rng_state(rng_state)
     generator.manual_seed(seed)
     return torch.randn(shape, device=device, dtype=dtype, generator=generator)
 
