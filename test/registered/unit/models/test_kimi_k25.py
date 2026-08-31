@@ -67,7 +67,6 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
 )
 from sglang.srt.runtime_context import (
-    ParallelContext,
     get_context,
     get_parallel,
     publish,
@@ -648,6 +647,14 @@ def _k3_preprocess_config(
 )
 def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls):
     server_args = SimpleNamespace(
+        base_gpu_id=0,
+        rl_on_policy_target=None,
+        tp_size=1,
+    )
+    with get_context().override_server_args(
+        mm_feature_transport="cpu",
+        mm_process_config={},
+        allowed_media_domains=[],
         image_processor_backend="auto",
         disable_fast_image_processor=False,
         skip_tokenizer_init=False,
@@ -656,13 +663,7 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
         tokenizer_worker_num=1,
         mm_preprocess_cache_size_mb=0,
         trust_mm_content_hashes=False,
-        base_gpu_id=0,
-        rl_on_policy_target=None,
         media_url_max_file_size_mb=64,
-    )
-    # The multimodal config comes from the bags.
-    with get_context().override_server_args(
-        mm_feature_transport="cpu", mm_process_config={}, allowed_media_domains=[]
     ):
         processor = processor_cls(
             hf_config=SimpleNamespace(media_placeholder_token_id=42),
@@ -909,7 +910,7 @@ def test_kimi_k3_normal_cache_path_connects_real_producer_to_model_consumer():
             hot_items = pickle.loads(pickle.dumps(hot.mm_items))
 
             with (
-                patch.object(ParallelContext, "config", SimpleNamespace(tp_size=1)),
+                get_parallel().override(tp_size=1),
                 patch(
                     "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
                     return_value=(
@@ -973,7 +974,7 @@ def test_kimi_k3_model_accepts_mixed_cached_eager_and_deferred_artifacts():
     )
 
     with (
-        patch.object(ParallelContext, "config", SimpleNamespace(tp_size=1)),
+        get_parallel().override(tp_size=1),
         patch(
             "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
             return_value=(torch.full((1, 3), 2.0), torch.tensor([[1, 1, 1]])),
