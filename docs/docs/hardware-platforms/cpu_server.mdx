@@ -223,13 +223,112 @@ Notes:
     the available memory amounts of the ranks may not be determined in prior.
     You may need to set proper `--max-total-tokens` to avoid the out-of-memory error.
 
-3. For optimizing decoding with torch.compile, please add the flag `--enable-torch-compile`.
-    To specify the maximum batch size when using `torch.compile`, set the flag `--torch-compile-max-bs`.
-    For example, `--enable-torch-compile --torch-compile-max-bs 4` means using `torch.compile`
-    and setting the maximum batch size to 4.
-
-4. A warmup step is automatically triggered when the service is started.
+3. A warmup step is automatically triggered when the service is started.
     The server is ready when you see the log `The server is fired up and ready to roll!`.
+
+### CPU Graph for Decode and Prefill
+
+On Intel AMX systems, `torch.compile` can reduce Python overhead for CPU graph
+execution. Use the following command to enable both decode and prefill graphs:
+
+```bash Command
+sglang serve \
+    --model-path <MODEL_ID_OR_PATH> \
+    --trust-remote-code \
+    --device cpu \
+    --attention-backend intel_amx \
+    --enable-torch-compile
+```
+
+`--enable-torch-compile` is the only CPU graph enable switch. On CPU, both
+phase backends default to `full`, so backend flags are optional. CPU decode
+graphs use batch-size buckets; CPU prefill graphs use total-token buckets.
+Custom phase settings can be provided with the shared JSON format:
+
+```bash Command
+sglang serve \
+    --model-path <MODEL_ID_OR_PATH> \
+    --trust-remote-code \
+    --device cpu \
+    --attention-backend intel_amx \
+    --enable-torch-compile \
+    --cuda-graph-config \
+    '{"decode":{"backend":"full", "max_bs": 4},"prefill":{"backend":"full", "max_bs": 512}}'
+```
+
+The JSON format works on CPU as well as CUDA. On CPU, the fields mean:
+
+- `decode.max_bs`: maximum decode batch size.
+- `decode.bs`: explicit decode batch-size buckets.
+- `prefill.max_bs`: maximum prefill total-token count.
+- `prefill.bs`: explicit prefill total-token buckets.
+
+For decode, `decode.bs` takes precedence over `decode.max_bs`; if both are
+omitted, the legacy `--torch-compile-max-bs` value is used. `decode.max_bs` or
+the legacy value then generates the default decode bucket list. For prefill,
+`prefill.bs` is generated from `prefill.max_bs` when it is omitted.
+
+To use custom buckets, set `bs` explicitly for each phase. In this example,
+decode captures batch sizes 1, 2, 4, and 8, while prefill captures total-token
+counts 128, 256, and 512:
+
+```bash Command
+sglang serve \
+    --model-path <MODEL_ID_OR_PATH> \
+    --trust-remote-code \
+    --device cpu \
+    --attention-backend intel_amx \
+    --enable-torch-compile \
+    --cuda-graph-config \
+    '{"decode":{"backend":"full", "bs": [1, 2, 4, 8]},"prefill":{"backend":"full", "bs": [128, 256, 512]}}'
+```
+
+When `bs` is provided, SGLang uses those buckets instead of generating them
+from `max_bs`.
+
+For workloads with batch sizes or prefill token counts that do not match the
+configured buckets, an optional dynamic fallback graph can be enabled with
+`SGLANG_TORCH_DYNAMIC_SHAPE=true`:
+
+```bash Command
+SGLANG_TORCH_DYNAMIC_SHAPE=true \
+sglang serve \
+    --model-path <MODEL_ID_OR_PATH> \
+    --trust-remote-code \
+    --device cpu \
+    --attention-backend intel_amx \
+    --enable-torch-compile
+```
+
+Dynamic graph compilation requires `--enable-torch-compile` and is available
+for both CPU decode and prefill. Exact configured buckets are used first;
+dynamic graphs are compiled as a fallback when no exact or padded bucket can
+serve the request. CPU prefill graphs currently target text-only requests;
+multimodal prefill requests fall back to eager execution. Dynamic graphs may
+increase startup compilation time.
+
+`full` is optional in the JSON for CPU because it is the default. Set a phase
+to `disabled` to turn off that phase, for example:
+
+```bash Command
+--enable-torch-compile \
+--cuda-graph-config '{"decode":{"backend":"disabled"},"prefill":{"backend":"full"}}'
+```
+
+Unsupported phase backends such as `breakable` and `tc_piecewise` are rejected
+on CPU. Set a phase backend to `disabled` to keep that phase on the eager path.
+
+Legacy convenience parameters remain supported:
+
+- `--torch-compile-max-bs`: decode-only maximum batch size. It is used only
+    when explicit `decode.max_bs` and `decode.bs` are not provided.
+- `--cuda-graph-bs-decode`: explicit decode batch-size buckets.
+- `--cuda-graph-bs`: deprecated alias for `--cuda-graph-bs-decode`.
+- `--cuda-graph-max-bs-decode`: maximum decode batch size.
+- `--cuda-graph-max-bs`: deprecated alias for `--cuda-graph-max-bs-decode`.
+- `--cuda-graph-bs-prefill`: explicit prefill total-token buckets.
+- `--cuda-graph-max-bs-prefill`: maximum prefill total-token count on the CPU
+    graph path. The name is shared with other devices for compatibility.
 
 ## Benchmarking with Requests
 

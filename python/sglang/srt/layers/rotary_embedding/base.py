@@ -13,7 +13,6 @@ from sglang.srt.layers.rotary_embedding.utils import (
     apply_rotary_emb,
     rotary_embedding_cpu,
 )
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, publish_role
 from sglang.srt.utils import (

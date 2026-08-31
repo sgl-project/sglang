@@ -32,6 +32,7 @@ import torch.nn.functional as F
 import tqdm
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -50,10 +51,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.srt.model_loader.utils import resolve_language_model
-from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_flags, get_lora, get_parallel, get_spec
 from sglang.srt.utils import (
     empty_context,
-    get_bool_env_var,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -74,6 +74,9 @@ logger = logging.getLogger(__name__)
 
 _capture_skip_cross_attention: Optional[bool] = None
 _compile_wrapper_counter = itertools.count()
+# Dynamo requires an explicit upper bound for marked dynamic dimensions. Use a
+# practical sentinel rather than a capture-bucket size so one graph can serve
+# arbitrary request sizes within the model/runtime limits.
 _DYNAMIC_DIM_MAX = 2**31 - 1
 
 
@@ -105,6 +108,48 @@ def _make_compile_wrapper(
     wrapper.model = model
     wrapper.model_forward = model_forward
     return wrapper
+
+
+class _PrefillForwardDispatcher:
+    """Keep the model's ``forward`` attribute stable across graph replays.
+
+    Different prefill buckets need different compiled callables, so the
+    callable changes through ``active_forward`` instead of replacing
+    ``module.forward`` for every request. This avoids Dynamo guards on the
+    module instance dictionary changing during serving.
+    """
+
+    def __init__(self, original_forward: Callable):
+        self.original_forward = original_forward
+        self.active_forward: Optional[Callable] = None
+
+    def __call__(self, *args, **kwargs):
+        if self.active_forward is None:
+            return self.original_forward(*args, **kwargs)
+        return self.active_forward(*args, **kwargs)
+
+
+def _install_prefill_forward_dispatcher(
+    model: torch.nn.Module,
+) -> _PrefillForwardDispatcher:
+    dispatcher = getattr(model, "_sglang_prefill_forward_dispatcher", None)
+    if not isinstance(dispatcher, _PrefillForwardDispatcher):
+        dispatcher = _PrefillForwardDispatcher(model.forward)
+        model._sglang_prefill_forward_dispatcher = dispatcher
+    model.forward = dispatcher
+    return dispatcher
+
+
+@contextmanager
+def _use_prefill_forward(
+    dispatcher: _PrefillForwardDispatcher, compiled_forward: Callable
+):
+    previous = dispatcher.active_forward
+    dispatcher.active_forward = compiled_forward
+    try:
+        yield
+    finally:
+        dispatcher.active_forward = previous
 
 
 @contextmanager
@@ -157,7 +202,7 @@ def capture_with_skip_cross_attention(skip: bool):
 
 
 def _mark_dynamic(*tensors: Optional[torch.Tensor]) -> None:
-    """Mark dim 0 of each tensor dynamic."""
+    """Mark dim 0 dynamic with a broad runtime-compatible range."""
     for t in tensors:
         if t is not None:
             if t.ndim > 0 and t.shape[0] == 1:
@@ -182,7 +227,6 @@ if TYPE_CHECKING:
 def patch_model(
     model: torch.nn.Module,
     enable_compile: bool,
-    num_tokens: int,
     tp_group: GroupCoordinator,
     dynamic: bool = False,
     model_forward: Optional[Callable] = None,
@@ -247,15 +291,11 @@ def set_torch_compile_config():
 
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
-    # torch compile speeds up decoding by reducing python overhead on CPU
-    server_args = model_runner.server_args
-    # Reuse cuda_graph_config[decode].bs here.
-    # Users can customize the batch sizes supported by cpu_graph, such as:
-    # --cuda-graph-bs-decode 1 2 4 8 16
-    capture_bs = server_args.cuda_graph_config.decode.bs
-    assert (
-        max(capture_bs) <= server_args.torch_compile_max_bs
-    ), f"{capture_bs=}, {server_args.torch_compile_max_bs=}"
+    # CPU decode graph buckets are normalized into decode.bs by ServerArgs.
+    # Users can customize them with --cuda-graph-bs-decode or its legacy alias
+    # --cuda-graph-bs.
+    capture_bs = get_exec().graph.cuda_graph_config.decode.bs
+    assert capture_bs and min(capture_bs) > 0, f"{capture_bs=}"
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
@@ -263,6 +303,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 
 
 _CPU_COMPILE_FAKE_OPS: set[str] = set()
+_CPU_COMPILE_FAKE_OPS_REGISTERED = False
 
 
 def register_cpu_compile_fake(op_name: str):
@@ -288,12 +329,15 @@ def register_fake_ops(tp_size: int):
     Registers fake/meta implementations for all custom sgl_kernel CPU operators
     using torch.library.register_fake to support torch.compile
     """
+    global _CPU_COMPILE_FAKE_OPS_REGISTERED
+    if _CPU_COMPILE_FAKE_OPS_REGISTERED:
+        return
 
     def add_position_dependency(output, positions):
         position_zero = positions.to(output.dtype).sum() * 0
         return output + position_zero
 
-    none_return_ops = {
+    none_return_ops = [
         "shm_allreduce",
         "shm_allgather_into_tensor",
         "shm_reduce_scatter_tensor",
@@ -303,8 +347,12 @@ def register_fake_ops(tp_size: int):
         "extend_attention_cpu",
         "gemma_fused_add_rmsnorm_cpu",
         "fused_sigmoid_mul_cpu",
+        "rotary_embedding_cpu",
+        "apply_rotary_pos_emb_cpu",
+        "multimodal_rotary_embedding_cpu",
+        "apply_multidimensional_rope_cpu",
         "store_cache_cpu",
-    }
+    ]
     for op in none_return_ops:
 
         @register_cpu_compile_fake(op)
@@ -316,9 +364,10 @@ def register_fake_ops(tp_size: int):
         "layernorm_cpu",
         "fused_add_layernorm_cpu",
         "l2norm_cpu",
-        "fused_experts_cpu",
         "fused_rmsnorm_gated_cpu",
         "shared_expert_cpu",
+        "causal_conv1d_update_cpu",
+        "causal_conv1d_fwd_cpu",
         "gemma_rmsnorm_cpu",
         "gemma3_rmsnorm_cpu",
         "gemma4_rmsnorm_cpu",
@@ -340,46 +389,48 @@ def register_fake_ops(tp_size: int):
     def _(q, k, *args, **kwargs):
         return torch.empty_like(q), torch.empty_like(k)
 
-    @register_cpu_compile_fake("causal_conv1d_fwd_cpu")
-    def _(
-        input,
-        weight,
-        bias,
-        conv_states,
-        query_start_loc,
-        cache_indices,
-        has_initial_state,
-        silu_activation,
-        pad_slot_id,
-        is_vnni,
-    ):
-        return torch.empty_like(input)
+    @register_cpu_compile_fake("fused_qk_gemma_rmsnorm_cpu")
+    def _(q, k, q_weight, k_weight, eps, head_dim):
+        return torch.empty_like(q), torch.empty_like(k)
 
-    @register_cpu_compile_fake("causal_conv1d_update_cpu")
-    def _(
-        input,
-        conv_states,
-        weight,
-        bias,
-        silu_activation,
-        cache_seqlens,
-        conv_state_indices,
-        pad_slot_id,
-        is_vnni,
-    ):
-        return torch.empty_like(input)
-
-    @register_cpu_compile_fake("rotary_embedding_cpu")
-    def _(positions, query, key, head_size, cos_sin_cache, is_neox):
-        return None
-
-    @register_cpu_compile_fake("apply_rotary_pos_emb_cpu")
-    def _(query, key, cos, sin):
-        return None
+    @register_cpu_compile_fake("fused_qk_gemma_rmsnorm_with_gate_cpu")
+    def _(q_gate, k, q_weight, k_weight, eps, head_dim, num_head):
+        seq_len = q_gate.shape[0]
+        num_head_kv = k.shape[1] // head_dim
+        q_out = q_gate.new_empty((seq_len * num_head, head_dim))
+        k_out = k.new_empty((seq_len * num_head_kv, head_dim))
+        gate_out = q_gate.new_empty((seq_len * num_head, head_dim))
+        return q_out, k_out, gate_out
 
     @register_cpu_compile_fake("shm_allgather")
     def _(data, dim):
         return torch.cat([data] * tp_size, dim=dim)
+
+    @torch.library.register_fake(f"sgl_kernel::fused_experts_cpu")
+    def _(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        inplace,
+        moe_comp_method,
+        w1_scale,
+        w2_scale,
+        w1_zero,
+        w2_zero,
+        a1_scale,
+        block_size,
+        w1_bias,
+        w2_bias,
+        alpha,
+        limit,
+        is_vnni,
+        activation=None,
+    ):
+        if inplace:
+            return hidden_states
+        return torch.empty_like(hidden_states, dtype=torch.bfloat16)
 
     @register_cpu_compile_fake("qkv_proj_with_rope")
     def _(
@@ -398,6 +449,7 @@ def register_fake_ops(tp_size: int):
         q_a_proj_scale,
         q_b_proj_scale,
         kv_a_proj_scale,
+        w_scale,
         is_vnni,
         block_size,
     ):
@@ -423,21 +475,6 @@ def register_fake_ops(tp_size: int):
         k_input = add_position_dependency(k_input, positions)
         v_input = k_input.narrow(-1, 0, kv_lora_rank)
         return q_input, k_input, v_input
-
-    @register_cpu_compile_fake("multimodal_rotary_embedding_cpu")
-    def _(
-        positions,
-        query,
-        key,
-        head_size,
-        cos_sin_cache,
-        mrope_section,
-        mrope_interleaved,
-        is_neox,
-    ):
-        position_zero = positions.to(query.dtype).sum() * 0
-        query.add_(position_zero)
-        key.add_(position_zero)
 
     @register_cpu_compile_fake("qkv_proj_with_rope_fused_weight")
     def _(
@@ -497,15 +534,20 @@ def register_fake_ops(tp_size: int):
 
     @register_cpu_compile_fake("weight_packed_linear")
     def _(mat1, mat2, bias, is_vnni):
-        M = mat1.shape[0]
         N = get_n_size(mat2, is_vnni)
-        return mat1.new_empty(M, N)
+        # The non-FMA kernel flattens leading dimensions for GEMM and restores
+        # them before returning. The FP32/FMA path only accepts a 2D mat1.
+        output_shape = (
+            list(mat1.shape) if mat2.dtype != torch.float32 else [mat1.shape[0], N]
+        )
+        output_shape[-1] = N
+        return mat1.new_empty(output_shape)
 
     @register_cpu_compile_fake("per_token_quant_int8_cpu")
     def _(input):
         M = input.shape[0]
-        K = input.shape[1]
-        Aq = input.new_empty(M, K, dtype=torch.int8)
+        # The C++ kernel stores quantized values as uint8, not signed int8.
+        Aq = input.new_empty(input.shape, dtype=torch.uint8)
         As = input.new_empty(M, dtype=torch.float32)
         return Aq, As
 
@@ -724,42 +766,61 @@ def register_fake_ops(tp_size: int):
         assert initial_state is not None
         return output
 
-    @register_cpu_compile_fake("fused_qk_gemma_rmsnorm_cpu")
-    def _(q, k, q_norm_weight, k_norm_weight, eps, head_dim):
-        return torch.empty_like(q), torch.empty_like(k)
-
-    @register_cpu_compile_fake("fused_qk_gemma_rmsnorm_with_gate_cpu")
-    def _(q_gate, k, q_norm_weight, k_norm_weight, eps, head_dim, num_head):
-        q_flat = q_gate.new_empty(q_gate.shape[0] * num_head, head_dim)
-        k_flat = k.new_empty(k.shape[0] * (k.shape[1] // head_dim), head_dim)
-        gate_flat = q_gate.new_empty(q_gate.shape[0] * num_head, head_dim)
-        return q_flat, k_flat, gate_flat
-
-    # @register_cpu_compile_fake("hc_pre_fused_cpu")
-    # def _(x, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, rms_norm_eps, hc_eps):
-    #     T = x.shape[0]
-    #     hc = x.shape[1] if x.ndim == 3 else hc_base.shape[0]
-    #     d = x.shape[2] if x.ndim == 3 else x.shape[1] // hc
-    #     y = x.new_empty(T, d)
-    #     post = x.new_empty(T, hc, dtype=torch.float32)
-    #     comb = x.new_empty(T, hc, hc, dtype=torch.float32)
-    #     return y, post, comb
-
-    # @register_cpu_compile_fake("hc_post_fused_cpu")
-    # def _(x, residual, post, comb):
-    #     return torch.empty_like(residual)
-
-    # @register_cpu_compile_fake("hc_head_fused_cpu")
-    # def _(x, hc_fn, hc_scale, hc_base, hc_eps, norm_eps):
-    #     T = x.shape[0]
-    #     d = x.shape[2] if x.ndim == 3 else x.shape[1]
-    #     return x.new_empty(T, d)
-
     @register_cpu_compile_fake("conv3d_embed_cpu")
     def _(x, weight, bias=None, is_vnni=False):
         c_out = bias.shape[0] if bias is not None else weight.shape[0]
-        out_shape = (x.shape[0], c_out) + x.shape[2:]
-        return x.new_empty(out_shape)
+        # CPU conv3d is a patch-embedding GEMM whose D/H/W output is one.
+        return x.new_empty((x.shape[0], c_out))
+
+    @register_cpu_compile_fake("float8_linear_cpu")
+    def _(
+        input,
+        input_scales,
+        weight,
+        weight_scales,
+        bias,
+        output_dtype,
+    ):
+        # Quantizers preserve every input dimension and replace only dtype.
+        if weight.dim() == 4:
+            N = weight.size(0) * weight.size(-1)
+        else:
+            N = weight.size(0)
+        output_shape = list(input.shape)
+        output_shape[-1] = N
+        return input.new_empty(output_shape, dtype=output_dtype)
+
+    @register_cpu_compile_fake("_quantize_fp8e4m3_vec")
+    def _(
+        input,
+        channelwise,
+        input_scales,
+    ):
+        act_quant = input.new_empty(input.shape, dtype=torch.float8_e4m3fn)
+        M = input.shape[0]
+        scale = (
+            input.new_empty(M, dtype=torch.float)
+            if channelwise
+            else input.new_empty(1, dtype=torch.float)
+        )
+        return act_quant, scale
+
+    @register_cpu_compile_fake("quantize_fp8e4m3")
+    def _(
+        input,
+        channelwise,
+        input_scales,
+    ):
+        act_quant = input.new_empty(input.shape, dtype=torch.float8_e4m3fn)
+        M = input.shape[0]
+        scale = (
+            input.new_empty(M, dtype=torch.float)
+            if channelwise
+            else input.new_empty(1, dtype=torch.float)
+        )
+        return act_quant, scale
+
+    _CPU_COMPILE_FAKE_OPS_REGISTERED = True
 
 
 class CPUGraphRunner:
@@ -783,9 +844,8 @@ class CPUGraphRunner:
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker
-            else get_server_return_hidden_states_mode(model_runner.server_args)
+            else get_server_return_hidden_states_mode()
         )
-        self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         # bs -> compiled fn (text-only / skip_cross_attention=True)
         self.graphs = {}
         # bs -> compiled fn (cross-attention / skip_cross_attention=False, enc-dec only)
@@ -797,25 +857,18 @@ class CPUGraphRunner:
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         if self.enable_torch_compile:
             _install_cpu_compile_layer_caches(self.model_runner)
-        self.enable_dynamic_graph = get_bool_env_var(
-            "SGLANG_TORCH_DYNAMIC_SHAPE", "false"
-        )
-        self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
+        self.enable_dynamic_graph = envs.SGLANG_TORCH_DYNAMIC_SHAPE.get()
+        self.disable_padding = get_exec().graph.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
-        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
-        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
-        self.enable_two_batch_overlap = (
-            model_runner.server_args.enable_two_batch_overlap
-        )
-        self.speculative_algorithm = model_runner.server_args.speculative_algorithm
-        self.enable_profile_cuda_graph = (
-            model_runner.server_args.enable_profile_cuda_graph
-        )
-        self.tp_size = model_runner.server_args.tp_size
-        self.dp_size = get_parallel().dp_size
-        self.pp_size = model_runner.server_args.pp_size
+        self.require_gathered_buffer = require_gathered_buffer()
+        self.require_mlp_tp_gather = require_mlp_tp_gather()
+        self.require_mlp_sync = require_mlp_sync()
+        self.require_attn_tp_gather = require_attn_tp_gather()
+        self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
+        self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
+        self.tp_size = get_parallel().tp_size
+        self.dp_size = get_parallel().num_dp_ranks
+        self.pp_size = get_parallel().pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = self.return_hidden_states_mode
@@ -823,11 +876,32 @@ class CPUGraphRunner:
         self._prefill_uses_eager_logits_tail = (
             self._prefill_graph_model is not self.model_runner.model
         )
+        self._prefill_forward_dispatcher = None
+        existing_dispatcher = getattr(
+            self._prefill_graph_model, "_sglang_prefill_forward_dispatcher", None
+        )
+        # Compile the real bound method, not the dispatcher. The dispatcher is
+        # only the stable bridge used when outer model.forward calls this module.
+        self._prefill_original_forward = (
+            (
+                existing_dispatcher.original_forward
+                if isinstance(existing_dispatcher, _PrefillForwardDispatcher)
+                else self._prefill_graph_model.forward
+            )
+            if self._prefill_uses_eager_logits_tail
+            else None
+        )
+        if self._prefill_uses_eager_logits_tail:
+            # Install before decode capture so every decode graph sees the same
+            # instance-level forward shape; prefill only changes active_forward.
+            self._prefill_forward_dispatcher = _install_prefill_forward_dispatcher(
+                self._prefill_graph_model
+            )
         # Static capture width: CPU graphs are decode-only.
         self.captured_req_width = 1
 
         assert (
-            not self.model_runner.server_args.enable_lora
+            not get_lora().enable_lora
         ), "CPUGraphRunner does not support LoRA yet."
         assert (
             not self.enable_two_batch_overlap
@@ -858,7 +932,6 @@ class CPUGraphRunner:
             self.captured_forward_batches_cross = {}
             # Attention backend
             self.max_bs = max(self.capture_bs)
-            self.max_num_token = self.max_bs * self.captured_req_width
             if self.enable_dynamic_graph:
                 self.dynamic_capture_bs = min(
                     self.max_bs + 1, model_runner.req_to_token_pool.size
@@ -885,7 +958,6 @@ class CPUGraphRunner:
             self.captured_forward_batches = {}
             self.captured_forward_batches_cross = {}
             self.max_bs = 0
-            self.max_num_token = 0
             self.encoder_len_fill_value = 0
             self.seq_len_fill_value = 0
 
@@ -949,12 +1021,12 @@ class CPUGraphRunner:
         # back to eager, exactly like today.
         prefill_disabled = check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
         self.capture_num_tokens = (
-            sorted(model_runner.server_args.cuda_graph_config.prefill.bs or [])
+            sorted(get_exec().graph.cuda_graph_config.prefill.bs or [])
             if not self.is_encoder_decoder and not prefill_disabled
             else []
         )
         if (
-            model_runner.server_args.cuda_graph_config.prefill.bs
+            get_exec().graph.cuda_graph_config.prefill.bs
             and self.is_encoder_decoder
         ):
             log_info_on_rank0(
@@ -1048,7 +1120,6 @@ class CPUGraphRunner:
             with patch_model(
                 self.model_runner.model,
                 bs in self.capture_bs,
-                num_tokens=bs * self.captured_req_width,
                 tp_group=self.model_runner.tp_group,
             ) as forward:
                 graph, output_buffers = self.capture_one_batch_size(
@@ -1128,9 +1199,11 @@ class CPUGraphRunner:
         # Runtime mRoPE positions are [3, token_count] contiguous tensors.
         # Do not trace a view with the parent buffer's max-batch stride, and do
         # not introduce a Tensor input for models that never use mRoPE.
+        # Use model config here because this is capture-time model metadata,
+        # not a runtime model-specific forward branch.
         mrope_positions = (
             self.mrope_positions[:, :num_tokens].contiguous()
-            if self.model_runner.model_config.model_is_mrope
+            if getattr(self.model_runner.model_config, "model_is_mrope", False)
             else None
         )
         self.num_token_non_padded[...] = num_tokens
@@ -1264,7 +1337,6 @@ class CPUGraphRunner:
         with patch_model(
             self.model_runner.model,
             self.enable_torch_compile,
-            num_tokens=self.capture_buffer_num_token,
             tp_group=self.model_runner.tp_group,
             dynamic=True,
         ) as forward:
@@ -1489,11 +1561,11 @@ class CPUGraphRunner:
                         dynamic_forward_batch,
                     )
                 prepared_forward_batch = self.prepare_replay(forward_batch, skip=skip)
-                output = graphs[prepared_forward_batch.batch_size](
-                    prepared_forward_batch.input_ids,
-                    prepared_forward_batch.positions,
-                    prepared_forward_batch,
-                )
+                    output = graphs[prepared_forward_batch.batch_size](
+                        prepared_forward_batch.input_ids,
+                        prepared_forward_batch.positions,
+                        prepared_forward_batch,
+                    )
         if forward_batch.batch_size in graphs:
             return output
 
@@ -1510,8 +1582,8 @@ class CPUGraphRunner:
     def get_spec_info(self, num_tokens: int):
         spec_info = None
         if (
-            self.model_runner.spec_algorithm.is_eagle()
-            or self.model_runner.spec_algorithm.is_standalone()
+            get_spec().speculative_algorithm.is_eagle()
+            or get_spec().speculative_algorithm.is_standalone()
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -1527,7 +1599,7 @@ class CPUGraphRunner:
                     retrieve_next_sibling=None,
                     retrieve_cum_len=None,
                     spec_steps=get_spec().speculative_num_steps,
-                    topk=self.model_runner.server_args.speculative_eagle_topk,
+                    topk=get_spec().speculative_eagle_topk,
                     draft_token_num=get_spec().speculative_num_draft_tokens,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                     seq_lens_sum=None,
@@ -1571,7 +1643,7 @@ class CPUGraphRunner:
             )
             mrope_positions = (
                 positions.unsqueeze(0).repeat(3, 1)
-                if getattr(self.model_runner.model, "is_mrope_enabled", False)
+                if getattr(self.model_runner.model_config, "model_is_mrope", False)
                 else None
             )
             num_token_non_padded = torch.tensor([num_tokens], dtype=torch.int64)
@@ -1633,6 +1705,9 @@ class CPUGraphRunner:
     # ------------------------------------------------------------------
 
     def _get_prefill_graph_model(self) -> torch.nn.Module:
+        # Keep the model's outer forward eager so it owns embeddings, optional
+        # multimodal preprocessing, and output handling. Compile the resolved
+        # language-model body that the outer forward invokes.
         model = self.model_runner.model
         if (
             self.is_generation
@@ -1669,20 +1744,16 @@ class CPUGraphRunner:
             with torch.no_grad():
                 self.model_runner.tp_group.barrier()
                 if self._prefill_uses_eager_logits_tail:
-                    original_forward = self._prefill_graph_model.forward
-
-                    def replay_forward(*args, **kwargs):
-                        return compiled_fn(*args, **kwargs)
-
-                    self._prefill_graph_model.forward = replay_forward
-                    try:
+                    # The outer model retains its normal forward contract; the
+                    # dispatcher redirects only its inner LM call for this graph.
+                    with _use_prefill_forward(
+                        self._prefill_forward_dispatcher, compiled_fn
+                    ):
                         return self.model_runner.model.forward(
                             forward_batch.input_ids,
                             forward_batch.positions,
                             forward_batch,
                         )
-                    finally:
-                        self._prefill_graph_model.forward = original_forward
                 return compiled_fn(
                     forward_batch.input_ids,
                     forward_batch.positions,
@@ -1718,11 +1789,10 @@ class CPUGraphRunner:
         with patch_model(
             self._prefill_graph_model,
             self.enable_torch_compile,
-            num_tokens=num_tokens,
             tp_group=self.model_runner.tp_group,
             dynamic=True,
             model_forward=(
-                self._prefill_graph_model.forward
+                self._prefill_original_forward
                 if self._prefill_uses_eager_logits_tail
                 else None
             ),
@@ -1742,11 +1812,10 @@ class CPUGraphRunner:
         with patch_model(
             self._prefill_graph_model,
             self.enable_torch_compile,
-            num_tokens=num_tokens,
             tp_group=self.model_runner.tp_group,
             dynamic=False,
             model_forward=(
-                self._prefill_graph_model.forward
+                self._prefill_original_forward
                 if self._prefill_uses_eager_logits_tail
                 else None
             ),
@@ -1768,6 +1837,8 @@ class CPUGraphRunner:
             return forward_batch
 
         dynamic_forward_batch = template
+        # Reuse the capture-time ForwardBatch structure for Dynamo stability;
+        # only tensor fields and request metadata are refreshed per request.
         for name, value in vars(forward_batch).items():
             if isinstance(value, torch.Tensor):
                 setattr(dynamic_forward_batch, name, value)
@@ -1787,11 +1858,10 @@ class CPUGraphRunner:
         with patch_model(
             self._prefill_graph_model,
             self.enable_torch_compile,
-            num_tokens=self.prefill_max_num_tokens,
             tp_group=self.model_runner.tp_group,
             dynamic=True,
             model_forward=(
-                self._prefill_graph_model.forward
+                self._prefill_original_forward
                 if self._prefill_uses_eager_logits_tail
                 else None
             ),
@@ -1816,11 +1886,10 @@ class CPUGraphRunner:
         with patch_model(
             self._prefill_graph_model,
             self.enable_torch_compile,
-            num_tokens=self.prefill_max_num_tokens,
             tp_group=self.model_runner.tp_group,
             dynamic=True,
             model_forward=(
-                self._prefill_graph_model.forward
+                self._prefill_original_forward
                 if self._prefill_uses_eager_logits_tail
                 else None
             ),
@@ -1917,12 +1986,14 @@ class CPUGraphRunner:
             return False
         if getattr(forward_batch, "replace_embeds", None) is not None:
             return False
-        if forward_batch.contains_mm_inputs():
-            return False
         if forward_batch.batch_size > self.prefill_max_bs:
             return False
 
         raw_num_tokens = forward_batch.input_ids.shape[0]
+        if forward_batch.contains_mm_inputs():
+            # Vision preprocessing depends on Python-side multimodal objects;
+            # keep that path eager until it has a tensor-only graph contract.
+            return False
         if raw_num_tokens > self.prefill_max_num_tokens:
             return self.prefill_dynamic_graph is not None
         if raw_num_tokens in self.prefill_graphs:
@@ -2005,7 +2076,13 @@ class CPUGraphRunner:
         if self.enable_torch_compile and using_dynamic_fallback:
             self._mark_dynamic_token_axis(forward_batch)
 
-        return self._run_prefill_once(compiled_fn, forward_batch)
+        output = self._run_prefill_once(compiled_fn, forward_batch)
+        if (
+            isinstance(output, LogitsProcessorOutput)
+            and output.hidden_states is not None
+        ):
+            output.hidden_states = output.hidden_states[:raw_num_tokens]
+        return output
 
 
 CPU_GRAPH_CAPTURE_FAILED_MSG = (
