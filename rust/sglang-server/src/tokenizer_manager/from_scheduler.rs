@@ -9,7 +9,8 @@ use bytes::Bytes;
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
 use crate::message::response::{
-    ChunkEvent, DISPATCH_TAG_BATCH, DISPATCH_TAG_ERROR, DISPATCH_TAG_RESULT, for_each_chunk,
+    ChunkEvent, DISPATCH_TAG_BATCH, DISPATCH_TAG_EMBEDDING, DISPATCH_TAG_ERROR,
+    DISPATCH_TAG_RESULT, EmbeddingEvent, for_each_chunk, for_each_embedding,
 };
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::FromSchedulerRx;
@@ -51,6 +52,8 @@ impl Runnable for Dispatcher {
         // Reused across frames (`clear` keeps capacity) — steady state allocates nothing.
         let shards = self.senders.detokenizer_tx.len();
         let mut buckets: Vec<Vec<ChunkEvent>> = (0..shards).map(|_| Vec::new()).collect();
+        let mut embedding_buckets: Vec<Vec<EmbeddingEvent>> =
+            (0..shards).map(|_| Vec::new()).collect();
 
         while let Some(bytes) = recv(self.from_scheduler_rx.receiver(), &self.shutdown) {
             let Some((&tag, body)) = bytes.split_first() else {
@@ -123,6 +126,41 @@ impl Runnable for Dispatcher {
                         }
                     }
                     // Any frame off the ring = the scheduler produced output → alive.
+                    self.activity.fetch_add(1, Ordering::Relaxed);
+                }
+                DISPATCH_TAG_EMBEDDING => {
+                    for bucket in &mut embedding_buckets {
+                        bucket.clear();
+                    }
+                    let decoded = for_each_embedding(body, |event| {
+                        embedding_buckets[event.rid.shard(shards)].push(event);
+                    });
+                    if !decoded.ok {
+                        for bucket in &mut embedding_buckets {
+                            bucket.clear();
+                        }
+                        if decoded.rids.is_empty() {
+                            tracing::error!("egress: malformed embedding frame named no requests");
+                        }
+                        for rid in decoded.rids {
+                            let shard = rid.shard(shards);
+                            let _ = self.senders.detokenizer_tx[shard].send(DetokMsg::Fail {
+                                rid,
+                                message: "internal error: malformed scheduler embedding frame"
+                                    .into(),
+                            });
+                        }
+                        continue;
+                    }
+                    for (shard, bucket) in embedding_buckets.iter_mut().enumerate() {
+                        if !bucket.is_empty()
+                            && self.senders.detokenizer_tx[shard]
+                                .send(DetokMsg::Embeddings(std::mem::take(bucket)))
+                                .is_err()
+                        {
+                            tracing::error!("egress: detok shard closed");
+                        }
+                    }
                     self.activity.fetch_add(1, Ordering::Relaxed);
                 }
                 DISPATCH_TAG_RESULT => {

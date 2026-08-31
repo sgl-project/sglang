@@ -31,7 +31,7 @@ use super::frame::{
 use super::guard::AbortGuard;
 use super::submit::submit;
 use crate::message::ids::Rid;
-use crate::message::request::{GenerateBody, GenerateRequest, RequestKind};
+use crate::message::request::{EmbeddingRequest, GenerateBody, GenerateRequest, RequestKind};
 use crate::message::response::{ChunkEvent, ResponseItem};
 use crate::message::sampling::SamplingParams;
 use crate::utils::{
@@ -141,27 +141,36 @@ async fn health_generate(
     // On a PD node the scheduler 400-aborts room-less requests, so inject the
     // same fake bootstrap pair Python uses (`FAKE_BOOTSTRAP_HOST` / room 0).
     let pd = state.server_args.is_disaggregation();
-    let probe = GenerateRequest {
-        // The `HEALTH_CHECK_<uuid>` rid form
-        rid: Rid::new_health_check(),
-        input_ids: Some(vec![0]),
-        // One greedy token: the cheapest round-trip that still produces a frame.
-        sampling_params: SamplingParams {
-            max_new_tokens: Some(1),
-            temperature: 0.0,
+    let rid = Rid::new_health_check();
+    let probe = if state.server_args.model_config.is_generation {
+        RequestKind::Generate(Box::new(GenerateRequest {
+            rid,
+            input_ids: Some(vec![0]),
+            // One greedy token: the cheapest round-trip that still produces a frame.
+            sampling_params: SamplingParams {
+                max_new_tokens: Some(1),
+                temperature: 0.0,
+                ..Default::default()
+            },
+            stream: false,
+            bootstrap_host: pd.then(|| FAKE_BOOTSTRAP_HOST.into()),
+            bootstrap_room: pd.then_some(0),
             ..Default::default()
-        },
-        stream: false,
-        bootstrap_host: pd.then(|| FAKE_BOOTSTRAP_HOST.into()),
-        bootstrap_room: pd.then_some(0),
-        ..Default::default()
+        }))
+    } else {
+        RequestKind::Embedding(Box::new(EmbeddingRequest::new(
+            rid,
+            None,
+            Some(vec![0]),
+            None,
+            None,
+        )))
     };
-    let (rid, _keepalive) =
-        match submit(&state, RequestKind::Generate(Box::new(probe)), false).await {
-            // Hold the receiver so the probe's sink stays open until it completes.
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
+    let (rid, _keepalive) = match submit(&state, probe, false).await {
+        // Hold the receiver so the probe's sink stays open until it completes.
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     // Deregister on drop (never disarmed): a busy-skipped probe has no terminal
     // frame, so without this abort it leaks one detok entry per call.
     let _abort_guard = AbortGuard::new(state.senders.clone(), rid);
@@ -320,7 +329,9 @@ async fn drain_unary(
                     StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return (status, error_value(code, &e.to_string()), true);
             }
-            ResponseItem::Control(_) | ResponseItem::Data(_) => continue, // never on `/generate`
+            ResponseItem::Control(_) | ResponseItem::Data(_) | ResponseItem::Embedding(_) => {
+                continue;
+            } // never on `/generate`
         }
     }
     // Sender dropped without a terminal item: the shard dropped this request (a
@@ -478,7 +489,9 @@ fn generation_event_stream(
                         timings[i].finish();
                         failed = Some(e);
                     }
-                    ResponseItem::Control(_) | ResponseItem::Data(_) => {} // never on /generate
+                    ResponseItem::Control(_)
+                    | ResponseItem::Data(_)
+                    | ResponseItem::Embedding(_) => {} // never on /generate
                 }
             }
 

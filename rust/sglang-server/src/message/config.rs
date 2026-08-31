@@ -325,6 +325,14 @@ pub struct ModelConfig {
     /// in to-scheduler; `false` silently ignores mm fields, as the Python
     /// `TokenizerManager` does with `mm_processor is None`.
     pub is_multimodal: bool,
+    /// False for embedding/pooling models launched with `--is-embedding`.
+    pub is_generation: bool,
+    /// Whether the model supports truncating its embedding dimension.
+    pub is_matryoshka: bool,
+    /// Explicit dimensions accepted by the model, when configured.
+    pub matryoshka_dimensions: Vec<i64>,
+    /// Full dense embedding width, when exposed by the model config.
+    pub hidden_size: Option<u64>,
     /// Resolved default sampling parameters, from Python's
     /// `ModelConfig.get_default_sampling_params()`. Already gated on
     /// `--sampling-defaults`: holds the model's generation_config.json values
@@ -337,17 +345,25 @@ pub struct ModelConfig {
 #[pyo3::pymethods]
 impl ModelConfig {
     #[new]
-    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params))]
+    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, is_generation, is_matryoshka, matryoshka_dimensions, hidden_size, default_sampling_params))]
     fn py_new(
         context_len: u64,
         vocab_size: u64,
         is_multimodal: bool,
+        is_generation: bool,
+        is_matryoshka: bool,
+        matryoshka_dimensions: Vec<i64>,
+        hidden_size: Option<u64>,
         default_sampling_params: DefaultSamplingParams,
     ) -> Self {
         Self {
             context_len,
             vocab_size,
             is_multimodal,
+            is_generation,
+            is_matryoshka,
+            matryoshka_dimensions,
+            hidden_size,
             default_sampling_params,
         }
     }
@@ -360,6 +376,10 @@ impl Default for ModelConfig {
             context_len: 2048,
             vocab_size: 1000,
             is_multimodal: false,
+            is_generation: true,
+            is_matryoshka: false,
+            matryoshka_dimensions: Vec::new(),
+            hidden_size: None,
             default_sampling_params: DefaultSamplingParams::default(),
         }
     }

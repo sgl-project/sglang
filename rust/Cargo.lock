@@ -3703,6 +3703,7 @@ dependencies = [
  "arc-swap",
  "async-stream",
  "axum 0.8.9",
+ "base64 0.22.1",
  "bytemuck",
  "bytes",
  "core_affinity",

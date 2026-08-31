@@ -72,6 +72,10 @@ pub struct Limits {
     pub allow_auto_truncate: bool,
     /// Whether the server can produce hidden states at all.
     pub enable_return_hidden_states: bool,
+    pub is_generation: bool,
+    pub is_matryoshka: bool,
+    pub matryoshka_dimensions: Vec<i64>,
+    pub hidden_size: Option<u64>,
 }
 
 impl From<&ServerArgs> for Limits {
@@ -83,6 +87,10 @@ impl From<&ServerArgs> for Limits {
             num_reserved_tokens: sa.num_reserved_tokens,
             allow_auto_truncate: sa.allow_auto_truncate,
             enable_return_hidden_states: sa.enable_return_hidden_states,
+            is_generation: sa.model_config.is_generation,
+            is_matryoshka: sa.model_config.is_matryoshka,
+            matryoshka_dimensions: sa.model_config.matryoshka_dimensions.clone(),
+            hidden_size: sa.model_config.hidden_size,
         }
     }
 }
@@ -218,6 +226,14 @@ impl Intake {
                     RequestKind::Generate(_) => {
                         let _ = req.state.apply(Event::NeedsNormalize);
                     }
+                    RequestKind::Embedding(e) => {
+                        let outcome = if e.already_tokenized() {
+                            ValidationOutcome::AlreadyTokenized
+                        } else {
+                            ValidationOutcome::NeedsTokenize
+                        };
+                        let _ = req.state.apply(Event::Validated(outcome));
+                    }
                 },
                 // Normalize + verify sampling params (off the scheduler loop), then
                 // pick the branch; a bad param becomes `Failed`.
@@ -324,6 +340,12 @@ impl Intake {
                         let _ = req.state.apply(Event::Error(e)); // → Failed
                         continue;
                     }
+                    if let RequestKind::Embedding(e) = &mut req.kind
+                        && let Err(error) = check_embedding_tokens(e, &self.limits)
+                    {
+                        let _ = req.state.apply(Event::Error(error));
+                        continue;
+                    }
                     let _ = req.state.apply(Event::PreSendValidated); // → Queued
                 }
                 // Hand the request to the stage that answers it: the scheduler
@@ -334,6 +356,7 @@ impl Intake {
                     // discriminant and `req` can be moved into each push.
                     match req.kind {
                         RequestKind::Generate(_) => self.push_to_ring(req),
+                        RequestKind::Embedding(_) => self.push_to_ring(req),
                         RequestKind::Control(_) => self.push_control_to_ring(req),
                         RequestKind::Detokenize { .. } => self.push_detokenize_to_shard(req),
                     }
@@ -369,7 +392,9 @@ impl Intake {
                 g.return_text_in_logprobs.unwrap_or(false),
                 g.sampling_params.no_stop_trim,
             ),
-            RequestKind::Control(_) | RequestKind::Detokenize { .. } => (false, false),
+            RequestKind::Embedding(_)
+            | RequestKind::Control(_)
+            | RequestKind::Detokenize { .. } => (false, false),
         };
         self.senders
             .detok_for(&req.rid)
@@ -516,8 +541,12 @@ impl Intake {
                 .encode_header()
                 .map(|header| (header, g.encode_data_buf())),
             RequestKind::Generate(_) => Err(Error::Tokenize("empty input_ids".into())),
+            RequestKind::Embedding(e) if e.already_tokenized() => e
+                .encode_header()
+                .map(|header| (header, e.encode_data_buf())),
+            RequestKind::Embedding(_) => Err(Error::Tokenize("empty input_ids".into())),
             _ => Err(Error::Internal(
-                "non-generate request reached push_to_ring".into(),
+                "non-scheduler request reached push_to_ring".into(),
             )),
         };
         let (header, ids) = match serialized {
@@ -561,9 +590,12 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
             "rid is {client_rid_len} bytes, over the {MAX_RID_LEN}-byte limit"
         )));
     }
-    if skip_tokenizer_init
-        && matches!(&req.kind, RequestKind::Generate(g) if !g.already_tokenized())
-    {
+    let needs_tokenizer = match &req.kind {
+        RequestKind::Generate(g) => !g.already_tokenized(),
+        RequestKind::Embedding(e) => !e.already_tokenized(),
+        _ => false,
+    };
+    if skip_tokenizer_init && needs_tokenizer {
         // `Validation` (400), not `Tokenize` (500): the client sent a request this
         // server cannot serve, which is their error to fix — Python 400s it too.
         return Err(Error::Validation(
@@ -593,6 +625,53 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
                          {id}; valid range is [0, {vocab_size})"
                     )));
                 }
+            }
+        }
+    }
+
+    if let RequestKind::Embedding(e) = &req.kind {
+        if limits.is_generation {
+            return Err(Error::Validation(
+                "This is a generation model. Launch with `--is-embedding` to serve embedding requests."
+                    .into(),
+            ));
+        }
+        if let Some(ids) = &e.input_ids {
+            for &id in ids {
+                if id < 0 || id as u64 >= vocab_size {
+                    return Err(Error::Validation(format!(
+                        "input contains out-of-vocabulary token id {id}; valid range is [0, {vocab_size})"
+                    )));
+                }
+            }
+        }
+        if let Some(dimensions) = e.dimensions {
+            if dimensions <= 0 {
+                return Err(Error::Validation(
+                    "dimensions must be greater than 0".into(),
+                ));
+            }
+            if !limits.is_matryoshka {
+                return Err(Error::Validation(
+                    "dimensions is only supported for Matryoshka embedding models".into(),
+                ));
+            }
+            if !limits.matryoshka_dimensions.is_empty()
+                && !limits.matryoshka_dimensions.contains(&dimensions)
+            {
+                return Err(Error::Validation(format!(
+                    "dimensions must be one of {:?}",
+                    limits.matryoshka_dimensions
+                )));
+            }
+            if limits
+                .hidden_size
+                .is_some_and(|hidden| dimensions as u64 > hidden)
+            {
+                return Err(Error::Validation(format!(
+                    "dimensions ({dimensions}) cannot exceed hidden_size ({})",
+                    limits.hidden_size.unwrap()
+                )));
             }
         }
     }
@@ -689,10 +768,45 @@ fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Er
     Ok(())
 }
 
+fn check_embedding_tokens(
+    e: &mut crate::message::request::EmbeddingRequest,
+    limits: &Limits,
+) -> Result<(), Error> {
+    let ids = e
+        .input_ids
+        .as_mut()
+        .ok_or_else(|| Error::Tokenize("empty input_ids".into()))?;
+    if ids.is_empty() {
+        return Err(Error::Validation(
+            "input cannot tokenize to an empty sequence".into(),
+        ));
+    }
+    let input_len = ids.len() as u64 + limits.num_reserved_tokens;
+    if input_len >= limits.context_len {
+        if limits.allow_auto_truncate {
+            // Match Python's `_validate_one_request`: reserved tokens decide
+            // whether truncation runs, but the input itself is sliced only at
+            // `context_len` (`del input_ids[context_len:]`).
+            ids.truncate(limits.context_len as usize);
+            if ids.is_empty() {
+                return Err(Error::Validation(
+                    "input cannot fit the model context".into(),
+                ));
+            }
+        } else {
+            return Err(Error::Validation(format!(
+                "The input ({input_len} tokens) is longer than the model's context length ({} tokens).",
+                limits.context_len
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::request::GenerateRequest;
+    use crate::message::request::{EmbeddingRequest, GenerateRequest};
     use crate::message::response::ResponseSink;
     use crate::message::sampling::SamplingParams;
     use crate::tokenizer_manager::channel::{ToSchedulerRx, to_scheduler};
@@ -851,6 +965,10 @@ mod tests {
             num_reserved_tokens: 0,
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
+            is_generation: true,
+            is_matryoshka: false,
+            matryoshka_dimensions: Vec::new(),
+            hidden_size: None,
         }
     }
 
@@ -866,6 +984,101 @@ mod tests {
                 sampling_params,
                 ..Default::default()
             })),
+        }
+    }
+
+    fn embedding_req(ids: Option<Vec<i32>>, dimensions: Option<i64>) -> Request {
+        let (tx, _rx) = mpsc::channel(8);
+        let rid = Rid::from("embedding-test");
+        Request {
+            rid: rid.clone(),
+            state: RequestState::Received,
+            sink: ResponseSink::Local(tx),
+            kind: RequestKind::Embedding(Box::new(EmbeddingRequest::new(
+                rid,
+                ids.is_none().then(|| "hello world".into()),
+                ids,
+                dimensions,
+                None,
+            ))),
+        }
+    }
+
+    #[test]
+    fn embedding_model_vocab_context_and_dimensions_are_validated() {
+        let mut embedding_limits = Limits {
+            is_generation: false,
+            is_matryoshka: true,
+            matryoshka_dimensions: vec![64, 128],
+            hidden_size: Some(128),
+            context_len: 8,
+            ..test_limits()
+        };
+        let mut valid = embedding_req(Some(vec![1, 2, 3]), Some(64));
+        validate(&mut valid, &embedding_limits).unwrap();
+        let RequestKind::Embedding(request) = &mut valid.kind else {
+            unreachable!()
+        };
+        check_embedding_tokens(request, &embedding_limits).unwrap();
+        let header = request.encode_header().unwrap();
+        let value = rmpv::decode::read_value(&mut &header[..]).unwrap();
+        assert_eq!(
+            value.as_array().unwrap()[0].as_str(),
+            Some("TokenizedEmbeddingReqInput")
+        );
+
+        let mut generation_model = embedding_req(Some(vec![1]), None);
+        assert!(validate(&mut generation_model, &test_limits()).is_err());
+
+        let mut bad_id = embedding_req(Some(vec![1000]), None);
+        embedding_limits.is_matryoshka = false;
+        assert!(validate(&mut bad_id, &embedding_limits).is_err());
+
+        for dimensions in [Some(0), Some(32), Some(256)] {
+            let mut request = embedding_req(Some(vec![1]), dimensions);
+            assert!(validate(&mut request, &embedding_limits).is_err());
+        }
+
+        let mut too_long = embedding_req(Some(vec![1; 8]), None);
+        validate(&mut too_long, &embedding_limits).unwrap();
+        let RequestKind::Embedding(request) = &mut too_long.kind else {
+            unreachable!()
+        };
+        assert!(check_embedding_tokens(request, &embedding_limits).is_err());
+    }
+
+    /// Embeddings request zero generated tokens, so auto-truncation must not
+    /// reserve an extra generation slot. This matches Python's
+    /// `TokenizerManager._validate_one_request`, which keeps an input already at
+    /// the context boundary when `allow_auto_truncate` is enabled.
+    #[test]
+    fn embedding_auto_truncate_keeps_the_full_context_window() {
+        for (input_len, reserved_tokens, expected_len) in [
+            (8, 0, 8), // exact context boundary remains intact
+            (9, 0, 8), // only tokens beyond context_len are removed
+            (7, 2, 7), // reserved tokens trigger the branch but do not shrink input
+            (9, 2, 8), // reserved tokens do not move the truncation boundary
+        ] {
+            let limits = Limits {
+                context_len: 8,
+                num_reserved_tokens: reserved_tokens,
+                allow_auto_truncate: true,
+                is_generation: false,
+                ..test_limits()
+            };
+            let mut request = embedding_req(Some((1..=input_len).collect()), None);
+            validate(&mut request, &limits).unwrap();
+            let RequestKind::Embedding(embedding) = &mut request.kind else {
+                unreachable!()
+            };
+
+            check_embedding_tokens(embedding, &limits).unwrap();
+
+            assert_eq!(
+                embedding.input_ids.as_ref().map(Vec::len),
+                Some(expected_len),
+                "input_len={input_len}, reserved_tokens={reserved_tokens}"
+            );
         }
     }
 

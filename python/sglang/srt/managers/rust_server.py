@@ -14,6 +14,7 @@ import importlib
 import json
 import logging
 import os
+import sys
 from array import array
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Optional, Tuple
@@ -45,7 +46,7 @@ from sglang.version import __version__
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.managers.io_struct import BatchTokenIDOutput
+    from sglang.srt.managers.io_struct import BatchEmbeddingOutput, BatchTokenIDOutput
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import MmSpec, Server, ServerArgs
     from sglang.srt.server_args import ServerArgs
@@ -718,6 +719,82 @@ class RustServer:
                 len(rids),
             )
 
+    def push_embedding(self, payload: BatchEmbeddingOutput) -> None:
+        """Push one finished dense-embedding batch using msgpack metadata plus
+        contiguous little-endian f32 values.
+
+        Unsupported sparse/scalar/nested outputs fail their own RIDs explicitly;
+        they are never coerced into a plausible but incorrect dense vector.
+        """
+        columns = (
+            payload.rids or [],
+            payload.finished_reasons or [],
+            payload.embeddings or [],
+            payload.prompt_tokens or [],
+        )
+        sizes = [len(column) for column in columns]
+        if len(set(sizes)) != 1:
+            message = f"malformed BatchEmbeddingOutput column lengths: {sizes}"
+            for rid in columns[0]:
+                self.server.push_error(rid, message)
+            logger.error(message)
+            return
+
+        rids = []
+        reasons = []
+        prompt_tokens = []
+        lengths = []
+        values = array("f")
+        for rid, reason, embedding, tokens in zip(*columns):
+            # Scheduler validation failures carry no numeric result but do carry
+            # an abort reason/status. Preserve that terminal metadata so Rust can
+            # return the original client-facing error instead of replacing it.
+            if (
+                embedding is None
+                and isinstance(reason, dict)
+                and reason.get("type") == "abort"
+            ):
+                rids.append(rid)
+                reasons.append(reason)
+                prompt_tokens.append(tokens)
+                lengths.append(0)
+                continue
+            if not isinstance(embedding, (list, tuple, array)):
+                self.server.push_error(
+                    rid,
+                    "Rust OpenAI embeddings support dense 1-D float vectors only",
+                )
+                continue
+            if any(
+                isinstance(value, (list, tuple, dict, array)) for value in embedding
+            ):
+                self.server.push_error(
+                    rid,
+                    "Rust OpenAI embeddings do not support nested or sparse outputs",
+                )
+                continue
+            try:
+                dense = array("f", embedding)
+            except (TypeError, ValueError, OverflowError) as error:
+                self.server.push_error(rid, f"invalid dense embedding output: {error}")
+                continue
+            rids.append(rid)
+            reasons.append(reason)
+            prompt_tokens.append(tokens)
+            lengths.append(len(dense))
+            values.extend(dense)
+
+        if not rids:
+            return
+        if sys.byteorder != "little":
+            values.byteswap()
+        header = msgspec.msgpack.encode([rids, reasons, prompt_tokens, lengths])
+        if not self.server.push_embedding(header, values.tobytes()):
+            logger.warning(
+                "Rust egress closed; dropped embedding batch of %d requests during shutdown",
+                len(rids),
+            )
+
     @staticmethod
     def _build_mm_spec(spec: NativeMmSpec) -> MmSpec:
         """The typed MM handoff for ``Server.start_mm_workers``: the
@@ -790,6 +867,10 @@ class RustServer:
                 context_len=mc.context_len,
                 vocab_size=mc.vocab_size,
                 is_multimodal=mc.is_multimodal,
+                is_generation=mc.is_generation,
+                is_matryoshka=bool(mc.is_matryoshka),
+                matryoshka_dimensions=mc.matryoshka_dimensions or [],
+                hidden_size=mc.hidden_size,
                 # Resolved default sampling params (generation_config.json when
                 # `--sampling-defaults model`, {} otherwise). The rust server
                 # consumes these for omitted temperature/top_p in chat

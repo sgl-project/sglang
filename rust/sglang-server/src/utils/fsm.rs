@@ -118,6 +118,7 @@ impl RequestState {
             // Generate requests pass through Normalizing (sampling-param
             // normalize/verify); control requests skip it, having none.
             (Validating, NeedsNormalize) => Normalizing,
+            (Validating, Validated(NeedsTokenize)) => Tokenizing,
             (Validating, Validated(AlreadyTokenized)) => PreSendValidating,
             (Normalizing, Validated(HasMultimodal)) => Encoding,
             (Normalizing, Validated(NeedsTokenize)) => Tokenizing,

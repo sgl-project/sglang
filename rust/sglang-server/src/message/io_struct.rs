@@ -6,7 +6,7 @@
 use bytes::Bytes;
 use serde::Serialize;
 
-use super::request::GenerateRequest;
+use super::request::{EmbeddingRequest, GenerateRequest};
 use super::sampling::SamplingParams;
 use super::types::TokenIds;
 use super::types::{Tagged, control_messages, wire_struct};
@@ -53,6 +53,48 @@ wire_struct! {
         decode_tp_size: Option<i64>,
         routed_dp_rank: Option<i64>,
         disagg_prefill_dp_rank: Option<i64>,
+    }
+}
+
+wire_struct! {
+    /// Exact positional mirror of Python's array-like
+    /// `TokenizedEmbeddingReqInput`. Do not reorder: this is a wire ABI.
+    pub(super) TokenizedEmbeddingReqInput<'a> {
+        input_text: Option<&'a str>,
+        /// Nil in msgpack; ids use the ring's raw int64 column.
+        input_ids: (),
+        mm_inputs: (),
+        token_type_ids: (),
+        sampling_params: &'a SamplingParams,
+        lora_id: (),
+        positional_embed_overrides: (),
+        routed_dp_rank: (),
+        priority: Option<i64>,
+        dimensions: Option<i64>,
+        return_pooled_hidden_states: bool,
+        multi_item_delimiter_indices: (),
+        time_stats: (),
+    }
+}
+
+impl<'a> From<&'a EmbeddingRequest> for TokenizedEmbeddingReqInput<'a> {
+    fn from(req: &'a EmbeddingRequest) -> Self {
+        Self {
+            rid: &req.rid,
+            input_text: req.text.as_deref(),
+            input_ids: (),
+            mm_inputs: (),
+            token_type_ids: (),
+            sampling_params: &req.sampling_params,
+            lora_id: (),
+            positional_embed_overrides: (),
+            routed_dp_rank: (),
+            priority: req.priority,
+            dimensions: req.dimensions,
+            return_pooled_hidden_states: false,
+            multi_item_delimiter_indices: (),
+            time_stats: (),
+        }
     }
 }
 
@@ -138,6 +180,36 @@ impl AbortReq {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::ids::Rid;
+
+    #[test]
+    fn embedding_header_matches_python_positional_abi() {
+        let req = EmbeddingRequest::new(
+            Rid::from_client("embd-r1"),
+            Some("hello".into()),
+            Some(vec![1, 2]),
+            Some(128),
+            Some(7),
+        );
+        let bytes = TokenizedEmbeddingReqInput::from(&req).encode().unwrap();
+        let value = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        let a = value.as_array().unwrap();
+        assert_eq!(a.len(), 16);
+        assert_eq!(a[0].as_str(), Some("TokenizedEmbeddingReqInput"));
+        assert_eq!(a[1].as_str(), Some(req.rid.as_str()));
+        assert!(a[2].is_nil());
+        assert_eq!(a[3].as_str(), Some("hello"));
+        assert!(a[4].is_nil(), "input_ids must remain columnar");
+        assert!(a[5].is_nil());
+        assert!(a[6].is_nil());
+        let sampling = a[7].as_array().unwrap();
+        assert_eq!(sampling.last().and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(a[11].as_i64(), Some(7));
+        assert_eq!(a[12].as_i64(), Some(128));
+        assert_eq!(a[13].as_bool(), Some(false));
+        assert!(a[14].is_nil());
+        assert!(a[15].is_nil());
+    }
 
     #[test]
     fn abort_req_msgpack_shape() {

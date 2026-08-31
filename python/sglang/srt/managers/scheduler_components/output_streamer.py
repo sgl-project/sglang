@@ -292,22 +292,24 @@ class SchedulerOutputStreamer:
                 # Non-stacked: some requests don't have PHS (None entries).
                 stacked_phs = phs_list
 
-        self.send_to_detokenizer.send_output(
-            BatchEmbeddingOutput(
-                rids=rids,
-                http_worker_ipcs=http_worker_ipcs,
-                time_stats=wrap_as_pickle(time_stats),
-                finished_reasons=finished_reasons,
-                embeddings=embeddings,
-                prompt_tokens=prompt_tokens,
-                cached_tokens=cached_tokens,
-                cached_tokens_details=cached_tokens_details,
-                placeholder_tokens_idx=None,
-                placeholder_tokens_val=None,
-                retraction_counts=retraction_counts,
-                pooled_hidden_states=stacked_phs,
-            )
+        payload = BatchEmbeddingOutput(
+            rids=rids,
+            http_worker_ipcs=http_worker_ipcs,
+            time_stats=wrap_as_pickle(time_stats),
+            finished_reasons=finished_reasons,
+            embeddings=embeddings,
+            prompt_tokens=prompt_tokens,
+            cached_tokens=cached_tokens,
+            cached_tokens_details=cached_tokens_details,
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
+            retraction_counts=retraction_counts,
+            pooled_hidden_states=stacked_phs,
         )
+        if self.rust_server is not None:
+            self.rust_server.push_embedding(payload)
+        else:
+            self.send_to_detokenizer.send_output(payload)
 
 
 @dataclass(slots=True, kw_only=True)

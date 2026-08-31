@@ -20,6 +20,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 async-stream = { workspace = true }
 bytes = { workspace = true }
+base64 = { workspace = true }
 futures = { workspace = true }
 pyo3 = { workspace = true }
 serde = { workspace = true }

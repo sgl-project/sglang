@@ -92,6 +92,7 @@ pub(super) fn chat_submitted(
 
 pub(super) fn server_args() -> Arc<ServerArgs> {
     Arc::new(ServerArgs {
+        model_path: "model".into(),
         served_model_name: "model".into(),
         ..Default::default()
     })

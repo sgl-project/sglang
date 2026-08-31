@@ -596,7 +596,9 @@ pub(super) fn chat_event_stream(
                     };
                     continue;
                 }
-                ResponseItem::Control(_) | ResponseItem::Data(_) => continue,
+                ResponseItem::Control(_)
+                | ResponseItem::Data(_)
+                | ResponseItem::Embedding(_) => continue,
             };
             if let Some((code, message)) = output
                 .finish_reason

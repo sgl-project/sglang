@@ -212,6 +212,11 @@ impl Runnable for DetokenizerWorker {
                         handle_chunk(&mut table, ev, &self.backend, &self.abort);
                     }
                 }
+                DetokMsg::Embeddings(events) => {
+                    for event in events {
+                        handle_embedding(&mut table, event);
+                    }
+                }
                 DetokMsg::Decode { rid, token_ids } => {
                     handle_decode(&mut table, &rid, &token_ids, &self.backend)
                 }
@@ -224,6 +229,18 @@ impl Runnable for DetokenizerWorker {
                 }
             }
         }
+    }
+}
+
+/// Embeddings are already final numeric results. Route through the shard only
+/// because it owns the RID table/sink, then remove the state immediately.
+fn handle_embedding(
+    table: &mut HashMap<Rid, DetokState>,
+    event: crate::message::response::EmbeddingEvent,
+) {
+    if let Some(mut state) = table.remove(&event.rid) {
+        let _ = state.sink.try_send(ResponseItem::Embedding(event));
+        state.fsm = RequestState::Completed;
     }
 }
 
@@ -437,6 +454,36 @@ fn trim_stop_str(text: &mut String, stop: &str, no_stop_trim: bool) {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn embedding_bypasses_decode_and_consumes_rid_state() {
+        let (tx, mut rx) = mpsc::channel::<ResponseItem>(1);
+        let mut table = HashMap::new();
+        table.insert(
+            Rid::from("embedding"),
+            DetokState {
+                sink: ResponseSink::Local(tx),
+                decode_logprob_text: false,
+                no_stop_trim: false,
+                decoder: None,
+                fsm: RequestState::Queued,
+            },
+        );
+        handle_embedding(
+            &mut table,
+            crate::message::response::EmbeddingEvent {
+                rid: Rid::from("embedding"),
+                embedding: vec![0.5, -1.0],
+                prompt_tokens: 3,
+                finish_reason: None,
+            },
+        );
+        assert!(!table.contains_key(&Rid::from("embedding")));
+        let ResponseItem::Embedding(event) = rx.try_recv().unwrap() else {
+            panic!("expected embedding output")
+        };
+        assert_eq!(event.embedding, vec![0.5, -1.0]);
+    }
 
     /// A non-terminal chunk that can't be delivered (sink full → client
     /// backpressure) drops the request AND aborts scheduler work — it does not

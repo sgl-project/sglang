@@ -557,7 +557,9 @@ pub(super) fn completion_event_stream(
                     yield error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string();
                     continue;
                 }
-                ResponseItem::Control(_) | ResponseItem::Data(_) => continue,
+                ResponseItem::Control(_)
+                | ResponseItem::Data(_)
+                | ResponseItem::Embedding(_) => continue,
             };
 
             if let Some((code, message)) = output
