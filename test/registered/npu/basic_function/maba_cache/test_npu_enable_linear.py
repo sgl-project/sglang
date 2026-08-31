@@ -23,7 +23,6 @@ from sglang.test.test_utils import (
     kill_process_tree,
 )
 
-
 register_npu_ci(
     est_time=400,
     suite="full-4-npu-a3",
