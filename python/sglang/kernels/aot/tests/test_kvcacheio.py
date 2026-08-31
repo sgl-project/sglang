@@ -12,6 +12,8 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer,
     transfer_kv_per_layer_direct_pf_lf,
     transfer_kv_per_layer_mla,
+    transfer_kv_per_layer_mla_lf_pf,
+    transfer_kv_per_layer_mla_pf_lf,
 )
 
 from sglang.srt.utils import get_cuda_version, is_hip
@@ -364,6 +366,64 @@ def test_transfer_kv(
         torch.testing.assert_close(dst_v_pool_direct, dst_v_pool_ref)
 
     torch.set_default_dtype(original_dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_transfer_kv_per_layer_mla_page_first_roundtrip(dtype):
+    """Cover layer-sharded GLM MLA write-back when JIT rejects 656 bytes."""
+    device = "cuda"
+    page_size = 64
+    num_layers = 3
+    total_items = page_size * 6
+    element_dim = 328
+    layer_id = 1
+
+    src = torch.arange(total_items * element_dim, device=device, dtype=dtype).reshape(
+        total_items, 1, element_dim
+    )
+    dst = torch.zeros(total_items, num_layers, 1, element_dim, dtype=dtype).pin_memory()
+
+    src_pages = torch.tensor([4, 1], dtype=torch.int64)
+    dst_pages = torch.tensor([0, 3], dtype=torch.int64)
+    src_indices_host = torch.cat(
+        [torch.arange(page * page_size, (page + 1) * page_size) for page in src_pages]
+    )
+    dst_indices_host = torch.cat(
+        [torch.arange(page * page_size, (page + 1) * page_size) for page in dst_pages]
+    )
+    src_indices = src_indices_host.to(device)
+    dst_indices = dst_indices_host.to(device)
+
+    item_size = element_dim * dtype.itemsize
+    assert item_size == 656
+    transfer_kv_per_layer_mla_lf_pf(
+        src=src,
+        dst=dst,
+        src_indices=src_indices,
+        dst_indices=dst_indices,
+        layer_id=layer_id,
+        item_size=item_size,
+        dst_layout_dim=num_layers * item_size,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(dst[dst_indices_host, layer_id], src[src_indices].cpu())
+    assert torch.count_nonzero(dst[:, 0]) == 0
+    assert torch.count_nonzero(dst[:, 2]) == 0
+
+    roundtrip = torch.zeros_like(src)
+    load_indices = torch.arange(src_indices.numel(), device=device)
+    transfer_kv_per_layer_mla_pf_lf(
+        src=dst,
+        dst=roundtrip,
+        src_indices=dst_indices,
+        dst_indices=load_indices,
+        layer_id=layer_id,
+        item_size=item_size,
+        src_layout_dim=num_layers * item_size,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(roundtrip[load_indices], src[src_indices])
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
