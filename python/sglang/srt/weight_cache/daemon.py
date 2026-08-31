@@ -173,12 +173,9 @@ class WeightCacheDaemon:
         self.revision = cfg.revision
         self.dist_init_method = dist_init_method
 
-        self.socket_path = get_socket_path(
-            compute_global_rank(self.tp_size, pp_rank, tp_rank)
-        )
-        self.ready_path = get_ready_path(
-            compute_global_rank(self.tp_size, pp_rank, tp_rank)
-        )
+        device_uuid = current_platform.get_device_uuid(gpu_id)
+        self.socket_path = get_socket_path(device_uuid)
+        self.ready_path = get_ready_path(device_uuid)
 
         self.model = None
         self.config: Optional[CacheConfig] = None
@@ -735,8 +732,17 @@ def launch_weight_cache_daemons(
     # Validate and clean up stale .ready/.sock files from prior runs.
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(cfg.tp_size, pp_rank, tp_rank)
-            cleanup_stale_daemon_files(global_rank, force=force)
+            gpu_id = compute_local_gpu_id(
+                pp_rank,
+                tp_rank,
+                pp_size_per_node,
+                tp_size_per_node,
+                base_gpu_id=cfg.base_gpu_id,
+                gpu_id_step=cfg.gpu_id_step,
+            )
+            cleanup_stale_daemon_files(
+                current_platform.get_device_uuid(gpu_id), force=force
+            )
 
     procs = []
     for pp_rank in pp_rank_range:
@@ -768,8 +774,15 @@ def launch_weight_cache_daemons(
     start_time = time.time()
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(cfg.tp_size, pp_rank, tp_rank)
-            ready_path = get_ready_path(global_rank)
+            gpu_id = compute_local_gpu_id(
+                pp_rank,
+                tp_rank,
+                pp_size_per_node,
+                tp_size_per_node,
+                base_gpu_id=cfg.base_gpu_id,
+                gpu_id_step=cfg.gpu_id_step,
+            )
+            ready_path = get_ready_path(current_platform.get_device_uuid(gpu_id))
             while not os.path.exists(ready_path):
                 time.sleep(check_interval)
                 if time.time() - start_time > timeout:
@@ -863,7 +876,7 @@ if __name__ == "__main__":
             else daemon_args.gpu_id
         )
         cleanup_stale_daemon_files(
-            compute_global_rank(server_args.tp_size, daemon_args.pp_rank, tp_rank),
+            current_platform.get_device_uuid(gpu_id),
             force=daemon_args.force,
         )
         run_weight_cache_daemon(
