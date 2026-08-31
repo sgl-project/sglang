@@ -310,6 +310,7 @@ class MockMLAModelRunner(ModelRunner):
             enable_memory_saver=False,
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.init_kv_index_translator()
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
