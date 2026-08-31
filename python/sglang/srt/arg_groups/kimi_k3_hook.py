@@ -22,10 +22,14 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
     if cfg.speculative_algorithm is None:
         return
 
-    # Use the fused Kimi-K3/DSPARK CuTeDSL kernel for KDA target verification.
+    # Use the fused Kimi-K3/DSPARK CuTeDSL kernel for KDA target verification
+    # only on CUDA. Ascend/NPU uses its existing verify implementation; the
+    # CUDA-only backend otherwise gets selected before the NPU workers start.
     # Decode is left free (its bf16-ssm SM100+ flashinfer default is fine -- the
-    # target only verifies under spec); the verify backend is pinned directly.
-    if cfg.linear_attn_verify_backend is None:
+    # target only verifies under spec); the CUDA verify backend is pinned
+    # directly. Use the requested runtime device instead of probing torch.cuda:
+    # torch_npu may redirect torch.cuda APIs and initialize device state early.
+    if cfg.linear_attn_verify_backend is None and cfg.device == "cuda":
         declare_resolution(
             server_args,
             "apply_kimi_k3_spec_backend_defaults",
