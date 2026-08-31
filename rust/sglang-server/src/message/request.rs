@@ -59,73 +59,52 @@ const JSON_TO_HEAP_FACTOR: usize = 8;
 pub struct GenerateBody {
     /// Optional client-supplied request id(s): a single string (a batch fans it
     /// out as `{rid}_{i}`, mirroring Python `_normalize_batch`) or one per item.
-    #[serde(default)]
     pub rid: Option<OneOrMany<String>>,
-    #[serde(default)]
     pub text: Option<OneOrMany<String>>,
-    #[serde(default)]
     pub input_ids: Option<OneOrMany<TokenIds>>,
     #[serde(default)]
     pub stream: bool,
     /// One params object (broadcast) or a list of them (per item); see
     /// [`SamplingParamsInput`].
-    #[serde(default)]
     pub sampling_params: Option<SamplingParamsInput>,
     /// Logprob / hidden-state options: a scalar broadcasts to every prompt, a
     /// list is per-prompt (Python `_normalize_logprob_params`).
-    #[serde(default)]
     pub return_logprob: Option<OneOrMany<bool>>,
-    #[serde(default)]
     pub logprob_start_len: Option<OneOrMany<i64>>,
-    #[serde(default)]
     pub top_logprobs_num: Option<OneOrMany<i64>>,
     /// Token ids to report logprobs for: one list (broadcast to every prompt) or
     /// one list per prompt, mirroring Python's
     /// `Union[List[int], List[List[int]]]` fan-out in `_normalize_batch`.
-    #[serde(default)]
     pub token_ids_logprob: Option<OneOrMany<TokenIds>>,
-    #[serde(default)]
     pub return_hidden_states: Option<OneOrMany<bool>>,
     /// Scalar-only in Python too (`return_text_in_logprobs: bool`).
-    #[serde(default)]
     pub return_text_in_logprobs: Option<bool>,
     // PD-disaggregation routing, injected per request by the PD router
     // (mini_lb / sgl-model-gateway): a scalar for a single prompt, one-per-item
     // lists for a batch. Elements are nullable (`List[Optional[...]]` in
     // Python) — the router sends `bootstrap_port: [null, …]` when deferring to
     // the scheduler's `--disaggregation-bootstrap-port` default.
-    #[serde(default)]
     pub bootstrap_host: Option<OneOrMany<Option<String>>>,
-    #[serde(default)]
     pub bootstrap_port: Option<OneOrMany<Option<i64>>>,
     /// `bootstrap_room` fits in i64: the PD routers draw it from `[0, 2^63)`.
-    #[serde(default)]
     pub bootstrap_room: Option<OneOrMany<Option<i64>>>,
-    #[serde(default)]
     pub bootstrap_pair_key: Option<OneOrMany<Option<String>>>,
-    #[serde(default)]
     pub decode_tp_size: Option<OneOrMany<Option<i64>>>,
     /// DP routing hints — per-request scalars even for batches, as in Python.
-    #[serde(default)]
     pub routed_dp_rank: Option<i64>,
-    #[serde(default)]
     pub disagg_prefill_dp_rank: Option<i64>,
     // Multimodal inputs, permissive `Value` so any shape Python's
     // `GenerateReqInput` accepts (URL / base64 / list / list-of-lists) parses.
     // `into_requests` fans them out per the Python
     // `_normalize_{image,video,audio}_data` batch rules.
-    #[serde(default)]
     pub image_data: Option<rmpv::Value>,
     /// Caller-supplied per-item content hashes (hex) overriding the computed
     /// ones, so an external router's keys align with the prefix cache. Single
     /// requests only: Python declares the batched shapes but `__getitem__` never
     /// forwards them, so a batch is rejected here rather than answered with
     /// hashes it did not ask for.
-    #[serde(default)]
     pub mm_hashes: Option<rmpv::Value>,
-    #[serde(default)]
     pub video_data: Option<rmpv::Value>,
-    #[serde(default)]
     pub audio_data: Option<rmpv::Value>,
 }
 
