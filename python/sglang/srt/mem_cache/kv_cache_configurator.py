@@ -683,6 +683,7 @@ class KVCacheConfigurator:
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
             head_dim=self.model_config.head_dim,
+            draft_kv_geometry=self._resolve_fused_draft_kv_geometry(),
             page_size=self.page_size,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
@@ -838,14 +839,34 @@ class KVCacheConfigurator:
             sliding_window_size=self.model_config.sliding_window_size,
         )
 
+    def _resolve_fused_draft_kv_geometry(self):
+        """Resolve ONCE per factory call (not inline) so the boot log reports
+        exactly the region the factory is handed: a silently-declined fusion
+        and an engaged one otherwise look identical from outside."""
+        draft_kv_geometry = self.fused_draft_kv_region()
+        if draft_kv_geometry is not None:
+            logger.info(
+                "[unified-memory-pool] fused draft region: %d layer(s) x %d kv "
+                "head(s) x %d head_dim @ %s = %d B/token, carried inside the "
+                "full-side page envelope",
+                draft_kv_geometry.layer_num,
+                draft_kv_geometry.head_num,
+                draft_kv_geometry.head_dim,
+                draft_kv_geometry.store_dtype,
+                draft_kv_geometry.entry_bytes(),
+            )
+        return draft_kv_geometry
+
     def fused_draft_kv_region(self):
         """The EAGLE draft's KV geometry when it fuses into the target's pages.
 
-        Fusion engages only for: unified memory ON, a hybrid-SWA target (the
-        draft is dense per token, so it fuses into the FULL sub-pool), an
-        EAGLE-family algorithm whose draft config was loaded at target boot,
-        and a uniform-row draft (dense views need equal K/V widths). None
-        otherwise; callers keep their non-fused arrangement.
+        Fusion engages only for: unified memory ON, a target whose FULL
+        sub-pool is MHA-shaped (hybrid-SWA, or a mamba hybrid off the MLA
+        backend — the draft is dense per token, so it fuses into the full
+        sub-pool's pages), an EAGLE-family algorithm whose draft config was
+        loaded at target boot, and a uniform-row draft (dense views need
+        equal K/V widths). None otherwise; callers keep their non-fused
+        arrangement.
         """
         from sglang.srt.mem_cache.unified_memory_pool import (
             DenseDraftRegion,
@@ -853,9 +874,20 @@ class KVCacheConfigurator:
         )
 
         aux = self.spec_aux_config
+        # EXACTLY ONE of the two hybrid kinds. A model that is BOTH mambaish
+        # and hybrid-SWA (Inkling-class) routes to the tri-pool factory, which
+        # takes no `draft_kv_geometry` -- it would allocate UNFUSED while the
+        # boot solve, seeing a region here, had already priced the fused entry
+        # and dropped the separate draft reservation, under-budgeting the
+        # private draft pool. Decline instead: the draft falls back and is
+        # charged normally.
+        host_has_mha_full_pool = (
+            self.is_hybrid_swa
+            or (self.mambaish_config is not None and not self.use_mla_backend)
+        ) and not (self.is_hybrid_swa and self.mambaish_config is not None)
         if not (
             get_memory().enable_unified_memory
-            and self.is_hybrid_swa
+            and host_has_mha_full_pool
             and not self.is_draft_worker
             and self.spec_algorithm.is_eagle()
             and aux.eagle_draft_num_layers
@@ -900,9 +932,14 @@ class KVCacheConfigurator:
         region = self.fused_draft_kv_region()
         if region is None:
             return None
+        full_attention_layer_ids = (
+            self.mambaish_config.full_attention_layer_ids
+            if self.mambaish_config is not None
+            else self.model_config.full_attention_layer_ids
+        )
         spec = MHASubPoolSpec(
             name="full",
-            layer_num=len(self.model_config.full_attention_layer_ids),
+            layer_num=len(full_attention_layer_ids),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
@@ -979,21 +1016,7 @@ class KVCacheConfigurator:
             if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
 
-        # Resolve ONCE here (not inline below) so the boot log reports exactly
-        # the region the factory is handed: a silently-declined fusion and an
-        # engaged one otherwise look identical from outside.
-        draft_kv_geometry = self.fused_draft_kv_region()
-        if draft_kv_geometry is not None:
-            logger.info(
-                "[unified-memory-pool] fused draft region: %d layer(s) x %d kv "
-                "head(s) x %d head_dim @ %s = %d B/token, carried inside the "
-                "full-side page envelope",
-                draft_kv_geometry.layer_num,
-                draft_kv_geometry.head_num,
-                draft_kv_geometry.head_dim,
-                draft_kv_geometry.store_dtype,
-                draft_kv_geometry.entry_bytes(),
-            )
+        draft_kv_geometry = self._resolve_fused_draft_kv_geometry()
 
         bundle = init_unified_swa_pools(
             device=self.device,

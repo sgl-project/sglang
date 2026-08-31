@@ -188,7 +188,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
             eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
-            if (
+            fused_full_entry = kvc.fused_full_entry_bytes()
+            if fused_full_entry is not None:
+                # Fused draft KV (unified mamba-MHA host): the draft rides
+                # inside every full-side page, so the cell is the EXACT fused
+                # entry (host + draft + lcm pad, priced through the same spec
+                # the pool factory builds) - the per-draft-layer ratio below
+                # under-reserves the pad.
+                self._cell_size = int(fused_full_entry)
+            elif (
                 eagle_draft_num_layers is not None
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0

@@ -293,11 +293,17 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
     )
     if cfg.speculative_algorithm in ("EAGLE", "EAGLE3"):
-        assert model_config_of(server_args).is_hybrid_swa, (
-            "--enable-unified-memory + EAGLE/EAGLE3 requires a hybrid-SWA "
-            "target: the draft's KV lives fused inside the full-attention "
-            "page envelope, which only the hybrid-SWA unified composite "
-            "provisions today."
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+
+        _mc = model_config_of(server_args)
+        assert _mc.is_hybrid_swa or (
+            mambaish_config(_mc) is not None and not use_mla_backend(server_args)
+        ), (
+            "--enable-unified-memory + EAGLE/EAGLE3 requires a target whose "
+            "full-attention sub-pool is MHA-shaped (hybrid-SWA, or a mamba "
+            "hybrid off the MLA backend): the draft's KV lives fused inside "
+            "the full-attention page envelope. MLA hosts do not carry a "
+            "fused draft region yet; run them without --enable-unified-memory."
         )
         # None refuses EXPLICITLY: an unset backend resolves to a default
         # later in the pipeline, which would silently leave the audited set.

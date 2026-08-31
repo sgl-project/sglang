@@ -296,6 +296,28 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertEqual(packed_configurator._cell_size, (656 + 132) * num_layers)
         self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
 
+    def test_fused_draft_entry_overrides_the_layer_ratio(self):
+        """Unified mamba-MHA fusion prices the EXACT fused entry (host +
+        draft + lcm pad): the per-draft-layer ratio under-reserves the pad,
+        so a solve over it hands out more tokens than the fused pages hold.
+        The control pins that path-only drafts keep the ratio arm."""
+        mr = _make_model_runner(self, speculative_algorithm="EAGLE")
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+        mr.fused_full_entry_bytes.return_value = 77777
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            fused = create_memory_pool_configurator(mr)
+            mr.fused_full_entry_bytes.return_value = None
+            unfused = create_memory_pool_configurator(mr)
+        self.assertEqual(fused._cell_size, 77777)
+        base = _full_per_token(mr) * 32
+        self.assertEqual(unfused._cell_size, int(base * (1 + 1 / 32)))
+
 
 class TestHybridSWAConfigurator(CustomTestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""

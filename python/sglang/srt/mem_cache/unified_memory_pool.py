@@ -1410,6 +1410,7 @@ def init_unified_mamba_pools(
     use_mla_backend: bool,
     kv_lora_rank: Optional[int] = None,
     qk_rope_head_dim: Optional[int] = None,
+    draft_kv_geometry: Optional[DenseDraftRegion] = None,
     mamba_layer_ids: List[int],
     full_attention_layer_ids: List[int],
     mamba2_cache_params,
@@ -1448,6 +1449,10 @@ def init_unified_mamba_pools(
             "init_unified_mamba_pools: draft workers (speculative decoding) are "
             "not supported with the MLA unified pool"
         )
+        assert draft_kv_geometry is None, (
+            "init_unified_mamba_pools: the MLA full sub-pool does not carry a "
+            "fused draft region yet"
+        )
         full_spec = MLASubPoolSpec(
             name="full",
             layer_num=len(full_attention_layer_ids),
@@ -1464,6 +1469,7 @@ def init_unified_mamba_pools(
             head_dim=head_dim,
             store_dtype=store_dtype,
             grow_direction="down",
+            draft_region=draft_kv_geometry,
         )
     cp = mamba2_cache_params
     mamba_spec = MambaSubPoolSpec(
