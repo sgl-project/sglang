@@ -99,6 +99,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _Flux2Nvfp4FallbackAdapter,
     _needs_device_weight_postprocess,
     _resolve_quant_config,
+    _resolve_weight_override_quantization,
     resolve_transformer_checkpoint_files,
     resolve_transformer_quant_load_spec,
 )
@@ -148,6 +149,132 @@ def _make_quant_config(name: str, **attrs):
 
 
 class TestTransformerQuantHelpers(unittest.TestCase):
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
+        return_value=None,
+    )
+    def test_weight_override_uses_adjacent_quantization_config(self, _build_nvfp4):
+        with tempfile.TemporaryDirectory() as directory:
+            weights = f"{directory}/model.safetensors"
+            save_file({"block.weight": torch.ones((2, 2))}, weights)
+            with open(f"{directory}/config.json", "w", encoding="utf-8") as stream:
+                json.dump(
+                    {
+                        "quantization_config": {
+                            "quant_method": "fp8",
+                            "activation_scheme": "dynamic",
+                        }
+                    },
+                    stream,
+                )
+            server_args = self._make_server_args(transformer_weights_path=weights)
+
+            quant_config = _resolve_quant_config(
+                hf_config={
+                    "quantization_config": {
+                        "quant_method": "fp8",
+                        "activation_scheme": "static",
+                    }
+                },
+                server_args=server_args,
+                safetensors_list=[weights],
+                component_model_path="/base",
+            )
+
+        self.assertIsInstance(quant_config, Fp8Config)
+        self.assertEqual(quant_config.activation_scheme, "dynamic")
+        self.assertTrue(quant_config.is_checkpoint_fp8_serialized)
+
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
+        return_value=None,
+    )
+    def test_unquantized_weight_override_does_not_inherit_base_config(
+        self, _build_nvfp4
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            weights = f"{directory}/model.safetensors"
+            save_file({"block.weight": torch.ones((2, 2))}, weights)
+            server_args = self._make_server_args(transformer_weights_path=weights)
+
+            quant_config = _resolve_quant_config(
+                hf_config={"quantization_config": {"quant_method": "fp8"}},
+                server_args=server_args,
+                safetensors_list=[weights],
+                component_model_path="/base",
+            )
+
+        self.assertIsNone(quant_config)
+
+    def test_weight_override_defers_header_without_quant_method_to_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            weights = f"{directory}/model.safetensors"
+            save_file(
+                {"block.weight": torch.ones((2, 2))},
+                weights,
+                metadata={"quantization_config": json.dumps({"quant_algo": "NVFP4"})},
+            )
+
+            quant_config, declared = _resolve_weight_override_quantization(
+                [weights], {}, {}
+            )
+
+        self.assertIsNone(quant_config)
+        self.assertTrue(declared)
+
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
+        return_value=None,
+    )
+    def test_declared_weight_override_rejects_online_quantization(self, _build_nvfp4):
+        with tempfile.TemporaryDirectory() as directory:
+            weights = f"{directory}/model.safetensors"
+            save_file(
+                {"block.weight": torch.ones((2, 2))},
+                weights,
+                metadata={
+                    "quantization_config": json.dumps(
+                        {"quant_method": "fp8", "activation_scheme": "dynamic"}
+                    )
+                },
+            )
+            server_args = self._make_server_args(
+                transformer_weights_path=weights,
+                quantization="fp8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "online --quantization"):
+                _resolve_quant_config(
+                    hf_config={},
+                    server_args=server_args,
+                    safetensors_list=[weights],
+                    component_model_path="/base",
+                )
+
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
+        return_value=None,
+    )
+    def test_undeclared_quantized_weight_override_fails_closed(self, _build_nvfp4):
+        with tempfile.TemporaryDirectory() as directory:
+            weights = f"{directory}/model.safetensors"
+            save_file(
+                {
+                    "block.weight": torch.ones((2, 2)),
+                    "block.weight_scale": torch.ones(2),
+                },
+                weights,
+            )
+            server_args = self._make_server_args(transformer_weights_path=weights)
+
+            with self.assertRaisesRegex(ValueError, "no supported native"):
+                _resolve_quant_config(
+                    hf_config={},
+                    server_args=server_args,
+                    safetensors_list=[weights],
+                    component_model_path="/base",
+                )
+
     def test_autoround_config_is_inferred_and_remapped_to_native_prefixes(self):
         layer_config = {
             "bits": 4,
@@ -212,7 +339,11 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             pipeline_config=SimpleNamespace(
                 dit_precision="bf16",
                 dit_config=SimpleNamespace(
-                    arch_config=SimpleNamespace(param_names_mapping={})
+                    arch_config=SimpleNamespace(
+                        param_names_mapping={},
+                        reverse_param_names_mapping={},
+                        quant_ignore_remap={},
+                    )
                 ),
             ),
             nunchaku_config=None,
@@ -968,6 +1099,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             "config": json.dumps({"_class_name": _FakeFluxTransformer.__name__})
         }
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
+            save_file({"block.weight": torch.ones((2, 2))}, f.name)
             nunchaku_config = NunchakuConfig(transformer_weights_path=f.name)
             server_args = self._make_server_args(
                 transformer_weights_path=nunchaku_config.transformer_weights_path,

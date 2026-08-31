@@ -48,7 +48,11 @@ import torch
 import uvloop
 import zmq
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.engine_info_bootstrap_server import (
     EngineInfoBootstrapServer,
@@ -1627,6 +1631,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
 
 def _set_envs_and_config(server_args: ServerArgs):
+
     cfg = resolving_view(server_args)
     # Set global environments
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
@@ -1678,10 +1683,10 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Check flashinfer version
     if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
-        if "flashinfer" in cfg.get_attention_backends():
+        if "flashinfer" in attention_backends_of(resolved_view(cfg)):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.17",
+                "0.6.18",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
