@@ -251,6 +251,12 @@ def _get_or_init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> Any:
     return layer._flashinfer_megamoe_layer
 
 
+def _get_or_init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> Any:
+    if "_flashinfer_megamoe_layer" not in vars(layer):
+        _init_flashinfer_megamoe_layer_state(layer)
+    return layer._flashinfer_megamoe_layer
+
+
 def _ensure_flashinfer_megamoe_layer(
     layer: FusedMoE,
     *,
