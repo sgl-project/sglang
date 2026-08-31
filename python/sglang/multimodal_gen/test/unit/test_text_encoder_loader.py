@@ -150,6 +150,7 @@ class TestTextEncoderClassResolution(unittest.TestCase):
             from_pretrained=mock.Mock(return_value=loaded_encoder)
         )
         server_args = SimpleNamespace(
+            component_precisions={},
             pipeline_config=SimpleNamespace(text_encoder_precisions=["bf16"]),
             explicit_residency_mode=mock.Mock(return_value=None),
             require_component_resident=mock.Mock(),

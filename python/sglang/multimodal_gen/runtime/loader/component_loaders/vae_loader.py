@@ -420,6 +420,11 @@ class VAELoader(ComponentLoader):
             vae_precision=vae_precision,
         )
 
+    def component_load_precision(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return server_args.component_precisions.get(component_name)
+
     @staticmethod
     def resolve_model_weights_path(
         component_model_path: str,

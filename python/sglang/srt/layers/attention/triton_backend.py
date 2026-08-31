@@ -210,11 +210,11 @@ class TritonAttnBackend(AttentionBackend):
         self.page_size = getattr(model_runner, "page_size", 1) or 1
         # Unified pool v2p hook (None = no-op): req_to_token holds VIRTUAL ids but
         # kernels need the kernel-facing id space — PHYSICAL for MHA, DENSE for the
-        # dense-view MLA pool (translate_kv_loc_dense falls back to the physical
+        # per-layer-view MLA pool (translate_kv_loc_for_kernel falls back to the physical
         # translate when kernel_page_multiplier == 1, so preferring it is exact for
         # both). Applied eagerly so the captured graph has no translate.
         self._translate_kv_loc = getattr(
-            self.token_to_kv_pool_allocator, "translate_kv_loc_dense", None
+            self.token_to_kv_pool_allocator, "translate_kv_loc_for_kernel", None
         ) or getattr(self.token_to_kv_pool_allocator, "translate_kv_loc", None)
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_num_steps = get_spec().speculative_num_steps
