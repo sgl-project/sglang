@@ -169,7 +169,7 @@ class _FakeReq:
         self.rid = rid
         self.prefix_indices = torch.empty(0, dtype=torch.long)
         self.fill_ids = [0]
-        self.req_pool_idx = req_pool_idx
+        self.kv = SimpleNamespace(req_pool_idx=req_pool_idx)
         # Mirrors Req's chunk-finality contract read by
         # MlxTpModelWorker._chunk_needs_logits: extend_range=None means
         # "not truncated" (final chunk / plain prefill).

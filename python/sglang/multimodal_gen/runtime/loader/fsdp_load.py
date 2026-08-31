@@ -98,14 +98,12 @@ def _make_param_like(
     return new_param
 
 
-def _can_assign_cpu_tensor_without_copy(
+def _can_assign_tensor_without_copy(
     actual_param: torch.nn.Parameter,
     full_tensor: torch.Tensor,
     target_param: torch.Tensor,
 ) -> bool:
-    """Return whether a TP=1 linear loader would only copy this CPU tensor."""
-    if full_tensor.device.type != "cpu":
-        return False
+    """Return whether a TP=1 linear loader would only copy this tensor."""
     weight_loader = actual_param.__dict__.get("weight_loader")
     if not isinstance(weight_loader, MethodType):
         return False
@@ -134,6 +132,8 @@ def _can_assign_cpu_tensor_without_copy(
     return (
         full_tensor.shape == target_param.shape
         and full_tensor.dtype == target_param.dtype
+        and full_tensor.layout == target_param.layout
+        and full_tensor.stride() == target_param.stride()
     )
 
 
@@ -432,6 +432,9 @@ def maybe_load_fsdp_model(
         cpu_offload=load_on_cpu,
         param_names_mapping=param_names_mapping_fn,
         keep_checkpoint_mapping=keep_checkpoint_mapping,
+        allow_device_tensor_assignment=(
+            weight_load_plan.load_full_state_dict_on_device
+        ),
         preconverted_state_dict=preconverted_state_dict,
     )
     if bnb_quant_states:
@@ -568,6 +571,7 @@ def load_model_from_full_model_state_dict(
         ]
         | None
     ) = None,
+    allow_device_tensor_assignment: bool = False,
 ) -> _IncompatibleKeys:
     """
     Converting full state dict into a sharded state dict
@@ -581,6 +585,10 @@ def load_model_from_full_model_state_dict(
         cpu_offload (bool): flag to check if FSDP offload is enabled
         param_names_mapping (Optional[Callable[[str], str]]): a function that maps full param name to sharded param name
         keep_checkpoint_mapping (bool): retain compatible CPU checkpoint tensors instead of copying them
+        allow_device_tensor_assignment (bool): adopt compatible checkpoint tensors
+            already materialized on the target device. This is reserved for an
+            explicit full-state direct-device load; ordinary loading keeps its
+            established parameter materialization path.
     Returns:
         ``NamedTuple`` with ``missing_keys`` and ``unexpected_keys`` fields:
             * **missing_keys** is a list of str containing the missing keys
@@ -734,10 +742,10 @@ def load_model_from_full_model_state_dict(
                 sharded_tensor = full_tensor
             elif weight_loader is not None:
                 assert actual_param is not None
-                if _can_assign_cpu_tensor_without_copy(
-                    actual_param,
-                    full_tensor,
-                    meta_sharded_param,
+                if (
+                    full_tensor.device.type == "cpu" or allow_device_tensor_assignment
+                ) and _can_assign_tensor_without_copy(
+                    actual_param, full_tensor, meta_sharded_param
                 ):
                     sharded_tensor = full_tensor
                 else:
