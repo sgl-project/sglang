@@ -193,16 +193,21 @@ class TestDraftBindingDispatch(CustomTestCase):
         self.assertIsInstance(pools.token_to_kv_pool, UnifiedDraftKVPool)
         self.assertIs(pools.token_to_kv_pool_allocator, alloc)
 
-    def test_eagle_draft_without_a_region_fails_loud(self):
-        """A gate-admitted EAGLE draft with no resolved region is a boot-order
-        bug; falling back to the private arm would hide it."""
+    def test_eagle_draft_without_a_region_falls_back_to_the_private_arm(self):
+        """Target boot declines a region for legitimate geometry (asymmetric
+        draft rows), so a region-less EAGLE draft binds the private pool -
+        sized by the id space like any other private draft - instead of
+        failing the boot."""
         alloc = self._swa_allocator(with_draft_region=False)
-        with self.assertRaisesRegex(ValueError, "fused draft-KV region"):
+        id_space = alloc.full_attn_allocator.max_slots - 1
+        with self.assertRaises(_CapturedSizes) as caught:
             self._run(
                 algorithm=SpeculativeAlgorithm.EAGLE3,
                 alloc=alloc,
                 max_total_num_tokens=alloc.size_full,
             )
+        sized = caught.exception.sizes.max_total_num_tokens
+        self.assertEqual(sized, (id_space + _PS - 1) // _PS * _PS)
 
 
 if __name__ == "__main__":

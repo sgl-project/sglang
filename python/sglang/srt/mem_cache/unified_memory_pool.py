@@ -303,29 +303,59 @@ class MLASubPoolSpec(SubPoolSpec):
         assert (
             self.qk_rope_head_dim > 0
         ), f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
-        assert (
-            self.draft_region is None
-        ), "MLA sub-pools do not carry a fused draft region yet"
+        if self.draft_region is not None:
+            self.draft_region.validate()
+            # Same contract as the MHA host: the draft's flat view
+            # storage_offset is expressed in DRAFT elements, so the host
+            # region must land on a draft element boundary.
+            assert (
+                self.host_entry_bytes() % self.draft_region.store_dtype.itemsize == 0
+            ), (
+                f"sub-pool {self.name!r}: host region ({self.host_entry_bytes()} B "
+                f"per slot) does not align to the draft dtype "
+                f"({self.draft_region.store_dtype.itemsize} B)"
+            )
 
     @property
     def kv_cache_dim(self) -> int:
         return self.kv_lora_rank + self.qk_rope_head_dim
 
+    def row_bytes(self) -> int:
+        return self.kv_cache_dim * self.store_dtype.itemsize
+
+    def host_entry_bytes(self) -> int:
+        """Host (target-only) bytes for one slot — the pre-fusion entry."""
+        return self.layer_num * self.row_bytes()
+
     def entry_bytes(self) -> int:
-        return self.layer_num * self.kv_cache_dim * self.store_dtype.itemsize
+        if self.draft_region is None:
+            return self.host_entry_bytes()
+        raw = self.host_entry_bytes() + self.draft_region.entry_bytes()
+        # lcm padding: both families' page strides must be integral in their
+        # own row units (dense ids scale by rows of one width).
+        quantum = math.lcm(self.row_bytes(), self.draft_region.row_bytes())
+        return -(-raw // quantum) * quantum
 
     def blocks_per_page(self) -> int:
         """Page stride in latent-row units — this sub-pool's
-        `kernel_page_multiplier`. One latent row per layer per token."""
-        return self.layer_num
+        `kernel_page_multiplier`. Unfused: exactly `layer_num` (one latent
+        row per layer). Fused: grows by the draft region + lcm pad,
+        integral by the `entry_bytes` padding."""
+        return self.entry_bytes() // self.row_bytes()
+
+    def draft_kernel_page_multiplier(self) -> int:
+        """Page stride in DRAFT row units — the fused draft family's
+        `kernel_page_multiplier` over the same pages and v2p table."""
+        assert self.draft_region is not None
+        return self.entry_bytes() // self.draft_region.row_bytes()
+
+    def draft_region_offset_in_page(self, page_size: int) -> int:
+        """Byte offset of the draft block region within one page."""
+        assert self.draft_region is not None
+        return page_size * self.host_entry_bytes()
 
     def view_tail_pad_bytes(self, page_size: int) -> int:
         return page_size * self.entry_bytes()
-
-    def blocks_per_page(self) -> int:
-        """One latent row per layer, so L blocks per page (MHA has 2L: a K
-        block and a V block per layer)."""
-        return self.layer_num
 
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
@@ -686,6 +716,9 @@ class UnifiedKVPool:
             page_size=page_size,
             num_pages=num_pages,
             anchor_bytes=anchor_bytes,
+            # Fused-draft pages stride past the host rows; identical to the
+            # default (layer_num) when no draft region is fused.
+            page_stride_rows=spec.blocks_per_page(),
         )
 
     def _build_mamba_views(
@@ -1465,12 +1498,8 @@ def init_unified_mamba_pools(
             f"qk_rope_head_dim; got {kv_lora_rank} / {qk_rope_head_dim}"
         )
         assert not is_draft_worker, (
-            "init_unified_mamba_pools: draft workers (speculative decoding) are "
-            "not supported with the MLA unified pool"
-        )
-        assert draft_kv_geometry is None, (
-            "init_unified_mamba_pools: the MLA full sub-pool does not carry a "
-            "fused draft region yet"
+            "init_unified_mamba_pools: a draft worker binds views over the "
+            "target's buffer instead of building one of its own"
         )
         full_spec = MLASubPoolSpec(
             name="full",
@@ -1479,6 +1508,7 @@ def init_unified_mamba_pools(
             qk_rope_head_dim=qk_rope_head_dim,
             store_dtype=store_dtype,
             grow_direction="down",
+            draft_region=draft_kv_geometry,
         )
     else:
         full_spec = MHASubPoolSpec(

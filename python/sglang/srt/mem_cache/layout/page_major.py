@@ -150,6 +150,7 @@ def build_mla_views(
     page_size: int,
     num_pages: int,
     anchor_bytes: int = 0,
+    page_stride_rows: Optional[int] = None,
 ) -> List[torch.Tensor]:
     """Per-layer views over ``raw`` for MLA in the page-major layout.
 
@@ -160,7 +161,11 @@ def build_mla_views(
     every per-layer view a plain CONTIGUOUS ``(num_pages * layer_num * ps, 1,
     kv_cache_dim)`` tensor, addressed by the layer-independent kernel-facing id
 
-        kernel_id(t) = (t // ps) * (ps * layer_num) + t % ps      (t = physical token)
+        kernel_id(t) = (t // ps) * (ps * page_stride_rows) + t % ps
+
+    (``t`` = physical token; ``page_stride_rows`` defaults to ``layer_num``
+    and grows past it when the page envelope fuses a draft region after the
+    host rows).
 
     so one shared block table (entry = page * layer_num) serves every layer, and
     kernels that require ``.view(-1, page_size, kv_cache_dim)`` (trtllm/cutlass/
@@ -175,8 +180,11 @@ def build_mla_views(
     """
     itemsize = store_dtype.itemsize
     row_bytes = kv_cache_dim * itemsize
-    page_bytes = page_size * layer_num * row_bytes
-    n_rows = num_pages * layer_num * page_size
+    if page_stride_rows is None:
+        # Unfused envelope: exactly the host's latent rows per page.
+        page_stride_rows = layer_num
+    page_bytes = page_size * page_stride_rows * row_bytes
+    n_rows = num_pages * page_stride_rows * page_size
     assert anchor_bytes % itemsize == 0
     last_view_end = (
         anchor_bytes + (layer_num - 1) * page_size * row_bytes + (n_rows * row_bytes)

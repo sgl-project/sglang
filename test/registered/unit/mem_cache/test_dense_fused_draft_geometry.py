@@ -31,6 +31,7 @@ fused move).
 
 import math
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -95,17 +96,8 @@ class TestFusedSpecMath(unittest.TestCase):
     def test_only_page_envelope_kinds_accept_a_draft_region(self):
         """`draft_region` is a universal spec field (None = unfused), but a
         kind without the fused page math must refuse one at construction —
-        a silently-carried region would never reach the layout."""
-        with self.assertRaises(AssertionError):
-            MLASubPoolSpec(
-                name="full",
-                layer_num=2,
-                kv_lora_rank=8,
-                qk_rope_head_dim=4,
-                store_dtype=torch.bfloat16,
-                grow_direction="down",
-                draft_region=_draft_region(),
-            )
+        a silently-carried region would never reach the layout. MHA and MLA
+        pages carry regions; mamba state pages never do."""
         with self.assertRaises(AssertionError):
             MambaSubPoolSpec(
                 name="mamba",
@@ -318,6 +310,158 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
             dp.get_contiguous_buf_infos()
         with self.assertRaises(NotImplementedError):
             dp.get_cpu_copy(one)
+
+
+def _mla_host_spec(draft_region=None):
+    # w_h = (8+4)*2 = 24 B latent row; with the 6 B draft row: lcm = 24,
+    # raw = 48 + 12 = 60 -> padded entry 72 B — real padding again.
+    return MLASubPoolSpec(
+        name="full",
+        layer_num=2,
+        kv_lora_rank=8,
+        qk_rope_head_dim=4,
+        store_dtype=torch.bfloat16,
+        grow_direction="down",
+        draft_region=draft_region,
+    )
+
+
+def _mamba_spec():
+    return MambaSubPoolSpec(
+        name="mamba",
+        layer_num=1,
+        conv_state_shapes=((2, 2),),
+        conv_dtype=torch.float32,
+        temporal_state_shape=(2,),
+        temporal_dtype=torch.float32,
+        grow_direction="up",
+    )
+
+
+class TestFusedMLAHost(unittest.TestCase):
+    """MLA pages carry the fused draft region exactly like MHA pages: the
+    same lcm-padded envelope, integral strides for both families, and
+    byte-disjoint host/draft regions within every page. The unfused spec
+    stays byte-identical — that identity guards every existing MLA deploy."""
+
+    PS = 2
+    PAGES = 8
+
+    def test_unfused_spec_is_byte_identical_to_before(self):
+        s = _mla_host_spec()
+        self.assertEqual(s.row_bytes(), 24)
+        self.assertEqual(s.entry_bytes(), 48)
+        self.assertEqual(s.blocks_per_page(), 2)
+        self.assertEqual(s.view_tail_pad_bytes(4), 4 * s.entry_bytes())
+
+    def test_fused_entry_is_lcm_padded_and_both_strides_integral(self):
+        f = _mla_host_spec(_draft_region())
+        w_h, w_d = f.row_bytes(), f.draft_region.row_bytes()
+        raw = f.host_entry_bytes() + f.draft_region.entry_bytes()
+        quantum = math.lcm(w_h, w_d)
+        self.assertEqual(f.entry_bytes(), -(-raw // quantum) * quantum)
+        self.assertGreater(f.entry_bytes(), raw)  # padding genuinely forced
+        self.assertEqual(f.entry_bytes() % w_h, 0)
+        self.assertEqual(f.entry_bytes() % w_d, 0)
+        self.assertEqual(f.blocks_per_page(), f.entry_bytes() // w_h)
+        self.assertEqual(f.draft_kernel_page_multiplier(), f.entry_bytes() // w_d)
+        ps = 4
+        self.assertEqual(f.draft_region_offset_in_page(ps), ps * f.host_entry_bytes())
+
+    def _pool(self):
+        full = _mla_host_spec(_draft_region())
+        mamba = _mamba_spec()
+        total = self.PAGES * self.PS * full.entry_bytes() + 4 * mamba.entry_bytes()
+        return UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=self.PS,
+        )
+
+    def test_host_and_draft_writes_stay_byte_disjoint_within_a_page(self):
+        pool = self._pool()
+        full = pool.mla_spec("full")
+        host_views = pool.mla_views_for("full")
+        dk, dv = pool.build_dense_draft_views("full")
+        raw = pool._raw
+        page = 2
+        host_lo = page * self.PS * full.entry_bytes()
+        split = host_lo + full.draft_region_offset_in_page(self.PS)
+        page_hi = host_lo + self.PS * full.entry_bytes()
+        for layer_view in host_views:
+            raw.zero_()
+            layer_view[page * self.PS * full.blocks_per_page()] = 1.0
+            nz = raw.nonzero()
+            self.assertGreater(nz.numel(), 0)
+            self.assertTrue(bool((nz >= host_lo).all() and (nz < split).all()))
+        for family in (dk, dv):
+            for layer_view in family:
+                raw.zero_()
+                layer_view[page * self.PS * full.draft_kernel_page_multiplier()] = 1.0
+                nz = raw.nonzero()
+                self.assertGreater(nz.numel(), 0)
+                self.assertTrue(bool((nz >= split).all() and (nz < page_hi).all()))
+
+    def test_translator_takes_the_fused_disposition_on_the_mla_host(self):
+        """A draft runner bound over the MLA host's pages must translate at
+        the DRAFT multiplier through the mamba allocator's full-side v2p —
+        the same contract the SWA host pins in the disposition tests. A
+        kind-specific probe regression here silently reverts the draft to
+        passthrough (raw virtual ids into dense views)."""
+        from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            UnifiedMambaTokenToKVPoolAllocator,
+        )
+
+        pool = self._pool()
+
+        class _FakeKV:
+            def attach_allocator(self, allocator):
+                self.allocator = allocator
+
+        kvcache = SimpleNamespace(full_kv_pool=_FakeKV(), mamba_pool=_FakeKV())
+        alloc = UnifiedMambaTokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=kvcache,
+            device=_DEV,
+            page_size=self.PS,
+            need_sort=False,
+            forward_stream=None,
+            lazy_compaction=False,
+        )
+        dp = UnifiedDraftKVPool(
+            unified_buffer=pool,
+            host_sub_pool_name="full",
+            host_allocator=alloc,
+            page_size=self.PS,
+        )
+        translator = KVIndexTranslator(
+            req_to_token=torch.zeros((2, 8), dtype=torch.int32),
+            token_to_kv_pool_allocator=alloc,
+            token_to_kv_pool=dp,
+            page_size=self.PS,
+            device=_DEV,
+        )
+        self.assertTrue(translator.is_translating)
+        v2p, mult = translator.full_flat_translate_args()
+        self.assertEqual(mult, pool.mla_spec("full").draft_kernel_page_multiplier())
+        self.assertIs(v2p, alloc.full_attn_allocator.virtual_to_physical)
+
+    def test_draft_pool_binds_over_the_mla_host(self):
+        pool = self._pool()
+        dp = UnifiedDraftKVPool(
+            unified_buffer=pool,
+            host_sub_pool_name="full",
+            host_allocator=object(),
+            page_size=self.PS,
+        )
+        self.assertEqual(
+            dp.draft_kernel_page_multiplier,
+            pool.mla_spec("full").draft_kernel_page_multiplier(),
+        )
+        self.assertEqual(dp.k_buffer[0].shape[1:], (1, 3))
 
 
 if __name__ == "__main__":

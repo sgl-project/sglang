@@ -188,15 +188,30 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
             for algorithm in ("EAGLE", "EAGLE3"):
                 self.assertTrue(_accepts(algorithm, is_hybrid_swa=False))
 
-    def test_eagle_refused_on_mla_mamba(self):
-        """MLA hosts carry no fused draft region yet: an MLA mamba hybrid must
-        refuse at the gate, not fail at boot."""
+    def test_eagle_on_mla_mamba_verifies_on_the_mla_family(self):
+        """An MLA mamba hybrid fuses into MLA pages, so it verifies on the MLA
+        backend family; the MHA-only rails and an unset backend still refuse.
+        The host kind, not the algorithm, picks the set."""
         with patch.object(hybrid_arch, "mambaish_config", return_value=object()):
-            self.assertFalse(
-                _accepts(
-                    "EAGLE", is_hybrid_swa=False, attention_arch=AttentionArch.MLA
+            for backend in self.AUDITED_BACKENDS:
+                self.assertTrue(
+                    _accepts(
+                        "EAGLE",
+                        is_hybrid_swa=False,
+                        attention_arch=AttentionArch.MLA,
+                        backend=backend,
+                    ),
+                    f"EAGLE on an MLA host should pass on {backend}",
                 )
-            )
+            for backend in (None, "fa4"):
+                self.assertFalse(
+                    _accepts(
+                        "EAGLE",
+                        is_hybrid_swa=False,
+                        attention_arch=AttentionArch.MLA,
+                        backend=backend,
+                    )
+                )
 
     def test_eagle_refused_unaudited_and_unset_backends(self):
         """The MLA verify family must not leak into the MHA-shaped arm, and an

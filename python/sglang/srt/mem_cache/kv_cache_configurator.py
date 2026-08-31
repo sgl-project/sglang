@@ -628,18 +628,19 @@ class KVCacheConfigurator:
     def _fused_draft_host_spec(self, alloc):
         """The host sub-pool spec this draft's KV fuses into, or None for the
         private-pool fallback (the draft then owns a raw-virtual-indexed pool
-        of its own)."""
+        of its own). Fallback is automatic: target boot declines a region for
+        legitimate geometry (asymmetric draft rows), and the private arm is
+        the rollback lever."""
         if not self.spec_algorithm.is_eagle():
             return None
         spec = alloc.unified_buffer.spec("full")
         if spec.draft_region is None:
-            # The gate admitted an EAGLE-family draft, so target boot must
-            # have resolved the region; missing means a boot-order bug.
-            raise ValueError(
-                "Speculative decoding on a unified target requires the fused "
-                "draft-KV region, which was not resolved at target boot "
-                "(EAGLE-family with a uniform-row draft checkpoint required)."
+            logger.info(
+                "[unified-memory-pool] no fused draft region on the target's "
+                "full sub-pool; the draft binds a private pool over the "
+                "virtual id space."
             )
+            return None
         return spec
 
     def _init_unified_mamba_pools(
@@ -860,13 +861,12 @@ class KVCacheConfigurator:
     def fused_draft_kv_region(self):
         """The EAGLE draft's KV geometry when it fuses into the target's pages.
 
-        Fusion engages only for: unified memory ON, a target whose FULL
-        sub-pool is MHA-shaped (hybrid-SWA, or a mamba hybrid off the MLA
-        backend — the draft is dense per token, so it fuses into the full
-        sub-pool's pages), an EAGLE-family algorithm whose draft config was
-        loaded at target boot, and a uniform-row draft (dense views need
-        equal K/V widths). None otherwise; callers keep their non-fused
-        arrangement.
+        Fusion engages only for: unified memory ON, a unified target
+        (hybrid-SWA or mamba hybrid, either full-pool kind — the draft is
+        dense per token, so it fuses into the full sub-pool's pages), an
+        EAGLE-family algorithm whose draft config was loaded at target boot,
+        and a uniform-row draft (dense views need equal K/V widths). None
+        otherwise; callers fall back to the private draft pool.
         """
         from sglang.srt.mem_cache.unified_memory_pool import (
             DenseDraftRegion,
@@ -881,13 +881,12 @@ class KVCacheConfigurator:
         # and dropped the separate draft reservation, under-budgeting the
         # private draft pool. Decline instead: the draft falls back and is
         # charged normally.
-        host_has_mha_full_pool = (
-            self.is_hybrid_swa
-            or (self.mambaish_config is not None and not self.use_mla_backend)
+        host_has_fusable_full_pool = (
+            self.is_hybrid_swa or self.mambaish_config is not None
         ) and not (self.is_hybrid_swa and self.mambaish_config is not None)
         if not (
             get_memory().enable_unified_memory
-            and host_has_mha_full_pool
+            and host_has_fusable_full_pool
             and not self.is_draft_worker
             and self.spec_algorithm.is_eagle()
             and aux.eagle_draft_num_layers
@@ -926,6 +925,7 @@ class KVCacheConfigurator:
         is off."""
         from sglang.srt.mem_cache.unified_memory_pool import (
             MHASubPoolSpec,
+            MLASubPoolSpec,
             _store_dtype_for,
         )
 
@@ -937,17 +937,28 @@ class KVCacheConfigurator:
             if self.mambaish_config is not None
             else self.model_config.full_attention_layer_ids
         )
-        spec = MHASubPoolSpec(
-            name="full",
-            layer_num=len(full_attention_layer_ids),
-            head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-            ),
-            head_dim=self.model_config.head_dim,
-            store_dtype=_store_dtype_for(self.kv_cache_dtype),
-            grow_direction="down",
-            draft_region=region,
-        )
+        if self.use_mla_backend:
+            spec = MLASubPoolSpec(
+                name="full",
+                layer_num=len(full_attention_layer_ids),
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                store_dtype=_store_dtype_for(self.kv_cache_dtype),
+                grow_direction="down",
+                draft_region=region,
+            )
+        else:
+            spec = MHASubPoolSpec(
+                name="full",
+                layer_num=len(full_attention_layer_ids),
+                head_num=self.model_config.get_num_kv_heads(
+                    get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                ),
+                head_dim=self.model_config.head_dim,
+                store_dtype=_store_dtype_for(self.kv_cache_dtype),
+                grow_direction="down",
+                draft_region=region,
+            )
         return spec.entry_bytes()
 
     def _init_unified_swa_pools(
