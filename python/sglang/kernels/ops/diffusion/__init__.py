@@ -333,6 +333,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         _CUDA,
         "Wan causal VAE main + DupUp3D(src).",
     ),
+    (
+        "diffusion.flux2_token_cat_nvfp4",
+        KernelBackend.JIT,
+        "layout.flux2_token_cat_nvfp4_jit:try_flux2_token_cat_nvfp4",
+        _CUDA,
+        "FLUX.2 single-block token concatenation + NVFP4 quantization.",
+    ),
 )
 
 for _op, _backend, _target, _caps, _description in _SPECS:
@@ -453,6 +460,7 @@ _EXPORTS: dict[str, str] = {
     "fused_scatter_to_padded": "layout.varlen_pack_pad_triton",
     "cat_pad_channels_last_3d": "layout.wan_causal_cache_triton",
     "dup_up3d_add": "layout.wan_causal_cache_triton",
+    "try_flux2_token_cat_nvfp4": "layout.flux2_token_cat_nvfp4_jit",
     # Fusion-site policy: quality gate, first-sight verification, mount
     "BitExactFusionGate": "sites.bitexact_gate",
     "flashinfer_rmsnorm_diagnostic_hint": "sites.bitexact_gate",
