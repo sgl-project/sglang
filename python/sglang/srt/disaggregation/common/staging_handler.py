@@ -108,8 +108,17 @@ class DecodeStagingHandler:
         if receiver is None or not receiver.bootstrap_infos:
             return
         key = tuple(str(bi) for bi in receiver.bootstrap_infos)
-        if key not in self._wm_subscribers:
-            self._wm_subscribers[key] = (receiver, session_id)
+        if key in self._wm_subscribers:
+            return
+
+        self._wm_subscribers[key] = (receiver, session_id)
+        # Watermark state is per prefill session. Send the current value so a
+        # new session's first allocation cannot wait on a missed update.
+        self._send_watermark(
+            receiver,
+            session_id,
+            self.staging_allocator.get_watermark(),
+        )
 
     def num_writers_for(self, receiver) -> int:
         """Compute all TP and PP writers expected for a staging chunk."""
@@ -443,26 +452,28 @@ class DecodeStagingHandler:
         return True
 
     def _free_and_send_watermark(
-        self, alloc_id: int, decode_req: DecodeRequest
+        self, alloc_id: int, _decode_req: DecodeRequest
     ) -> None:
         """Free a staging allocation and broadcast watermark to all prefills."""
         self.staging_allocator.free(alloc_id)
         post_wm = self.staging_allocator.get_watermark()
-        room = decode_req.req.bootstrap_room
-        wm_round, wm_tail = post_wm
+        for receiver, session_id in list(self._wm_subscribers.values()):
+            self._send_watermark(receiver, session_id, post_wm)
+
+    @staticmethod
+    def _send_watermark(receiver, session_id: str, watermark) -> None:
+        """Send one allocator watermark to a registered prefill session."""
+        wm_round, wm_tail = watermark
         wm_round_b = str(wm_round).encode("ascii")
         wm_tail_b = str(wm_tail).encode("ascii")
-        for _key, (receiver, session_id) in list(self._wm_subscribers.items()):
-            sid_b = session_id.encode("ascii")
-            for bootstrap_info in receiver.bootstrap_infos:
-                try:
-                    sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
-                    with lock:
-                        sock.send_multipart(
-                            [b"WATERMARK", wm_round_b, wm_tail_b, sid_b]
-                        )
-                except Exception:
-                    pass
+        sid_b = session_id.encode("ascii")
+        for bootstrap_info in receiver.bootstrap_infos:
+            try:
+                sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart([b"WATERMARK", wm_round_b, wm_tail_b, sid_b])
+            except Exception:
+                pass
 
 
 def is_watermark_ready(

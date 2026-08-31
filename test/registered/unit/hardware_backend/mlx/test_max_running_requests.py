@@ -21,6 +21,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
@@ -120,9 +121,7 @@ def _hybrid_stub_for_initialize(
 def _fake_req():
     return SimpleNamespace(
         inflight_middle_chunks=0,
-        kv=SimpleNamespace(req_pool_idx=None),
-        mamba_pool_idx=None,
-        mamba_ping_pong_track_buffer=None,
+        kv=ReqKvInfo(),
     )
 
 
@@ -284,13 +283,13 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
             req = _fake_req()
             self.assertIsNotNone(pool.alloc([req]))
             pool.free(req)  # as release_kv_cache does after ChunkCache
-            self.assertIsNone(req.mamba_pool_idx)
+            self.assertIsNone(req.kv.mamba_pool_idx)
             self.assertEqual(pool.auxiliary_state_pool.available_size(), aux_capacity)
 
     def test_radix_enabled_free_does_not_touch_aux_slot(self):
         # Retention contract: with the radix cache enabled the tree component
         # owns auxiliary release (it frees or adopts the slot and nulls
-        # req.mamba_pool_idx BEFORE the row is freed). pool.free(req) must
+        # req.kv.mamba_pool_idx BEFORE the row is freed). pool.free(req) must
         # therefore never release auxiliary slots itself -- even if called
         # while mamba_pool_idx is still set -- or a tree-owned snapshot slot
         # could be recycled under a live radix node.
@@ -306,7 +305,7 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         req = _fake_req()
         pool.alloc([req])
         pool.free(req)
-        self.assertIsNotNone(req.mamba_pool_idx)  # slot NOT released by free()
+        self.assertIsNotNone(req.kv.mamba_pool_idx)  # slot NOT released by free()
         self.assertEqual(pool.auxiliary_state_pool.available_size(), free_before - 1)
 
     def test_default_aux_sizing_uses_shared_ratio(self):
