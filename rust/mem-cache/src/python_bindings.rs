@@ -12,7 +12,7 @@ use tch::{Device, Kind, Tensor};
 
 use crate::components::{ComponentType, FULL, MAMBA, SWA};
 use crate::node::ChildKeyType;
-use crate::node::{NodeId, RadixNamespaceRef, TreeCoreRuntimeError};
+use crate::node::{KeyNamespaceRef, NodeId, TreeCoreRuntimeError};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
     BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams, CacheTransferPhase,
@@ -964,7 +964,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let key = key.as_ref();
         let params = MatchPrefixParams {
             key,
-            namespace: RadixNamespaceRef::new(
+            namespace: KeyNamespaceRef::new(
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
@@ -996,7 +996,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         };
         let params = InsertParams {
             key,
-            namespace: RadixNamespaceRef::new(
+            namespace: KeyNamespaceRef::new(
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
@@ -1031,7 +1031,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         };
         let params = InsertParams {
             key,
-            namespace: RadixNamespaceRef::new(
+            namespace: KeyNamespaceRef::new(
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
@@ -1382,7 +1382,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .allow_threads(move || {
                 self.core().try_insert_host_in_namespace(
                     node_id,
-                    RadixNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref()),
+                    KeyNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref()),
                     key,
                     host_value,
                     hash_value,
@@ -2188,7 +2188,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let result = py.allow_threads(move || {
             let params = MatchPrefixParams {
                 key: &key,
-                namespace: RadixNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref()),
+                namespace: KeyNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref()),
             };
             self.core().inspect_finalize_component_match_result(
                 component_type,

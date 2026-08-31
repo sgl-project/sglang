@@ -116,7 +116,7 @@ fn attach_child_links_both_sides() {
         /* key = */ vec![7],
         /* priority = */ 0,
     );
-    child.namespace = RadixNamespace::new(Some("ns"), None);
+    child.namespace = KeyNamespace::new(Some("ns"), None);
     parent
         .attach_child(&mut child, /* page_size = */ 1)
         .unwrap();
@@ -125,7 +125,7 @@ fn attach_child_links_both_sides() {
     assert_eq!(
         parent
             .children
-            .get(&(RadixNamespace::new(Some("ns"), None), vec![7])),
+            .get(&(KeyNamespace::new(Some("ns"), None), vec![7])),
         Some(&NodeIdx_(1))
     );
 }
@@ -190,7 +190,7 @@ fn attach_child_rejects_duplicate_key() {
     ));
     // b was rejected without mutation; a still holds key 7.
     assert_eq!(
-        parent.children.get(&(RadixNamespace::default(), vec![7])),
+        parent.children.get(&(KeyNamespace::default(), vec![7])),
         Some(&NodeIdx_(1))
     );
     assert_eq!(b.parent, None);
@@ -1082,8 +1082,8 @@ fn salted_children_file_under_their_namespace() -> Result<(), TreeCoreRuntimeErr
 fn cache_salt_is_a_distinct_child_namespace_dimension() -> Result<(), TreeCoreRuntimeError> {
     let mut arena = arena();
     let root = arena.root();
-    let first_namespace = RadixNamespaceRef::new(Some("bc"), Some("a"));
-    let second_namespace = RadixNamespaceRef::new(Some("c"), Some("ab"));
+    let first_namespace = KeyNamespaceRef::new(Some("bc"), Some("a"));
+    let second_namespace = KeyNamespaceRef::new(Some("c"), Some("ab"));
     let first = arena.alloc_child_in_namespace(root, vec![7], 0, first_namespace)?;
     let second = arena.alloc_child_in_namespace(root, vec![7], 0, second_namespace)?;
 
@@ -1099,8 +1099,8 @@ fn cache_salt_is_a_distinct_child_namespace_dimension() -> Result<(), TreeCoreRu
     assert_eq!(arena.node(first).namespace.as_ref(), first_namespace);
     assert_eq!(arena.node(second).namespace.as_ref(), second_namespace);
     assert_eq!(
-        RadixNamespaceRef::new(None, Some("")).to_owned(),
-        RadixNamespace::default()
+        KeyNamespaceRef::new(None, Some("")).to_owned(),
+        KeyNamespace::default()
     );
     Ok(())
 }
@@ -1109,7 +1109,7 @@ fn cache_salt_is_a_distinct_child_namespace_dimension() -> Result<(), TreeCoreRu
 fn namespace_hashing_uses_the_cached_digest_but_equality_checks_strings() {
     let long_extra_key = "x".repeat(64 * 1024);
     let long_cache_salt = "y".repeat(64 * 1024);
-    let namespace = RadixNamespace::new(Some(&long_extra_key), Some(&long_cache_salt));
+    let namespace = KeyNamespace::new(Some(&long_extra_key), Some(&long_cache_salt));
 
     let mut owned_hasher = ByteCountingHasher::default();
     std::hash::Hash::hash(&namespace, &mut owned_hasher);
@@ -1119,12 +1119,12 @@ fn namespace_hashing_uses_the_cached_digest_but_equality_checks_strings() {
     std::hash::Hash::hash(&namespace.as_ref(), &mut borrowed_hasher);
     assert_eq!(borrowed_hasher.bytes_written, size_of::<u64>());
 
-    let first = RadixNamespaceRef {
+    let first = KeyNamespaceRef {
         extra_key: Some("adapter-a"),
         cache_salt: Some("tenant-a"),
         hash: 7,
     };
-    let second = RadixNamespaceRef {
+    let second = KeyNamespaceRef {
         extra_key: Some("adapter-b"),
         cache_salt: Some("tenant-b"),
         hash: 7,

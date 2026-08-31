@@ -15,7 +15,7 @@ use crate::components::{
 use crate::node::EvictableNodeSet;
 use crate::node::Node;
 use crate::node::NodeArena;
-use crate::node::{ChildKeyType, HashDigest, RadixNamespace, RadixNamespaceRef};
+use crate::node::{ChildKeyType, HashDigest, KeyNamespace, KeyNamespaceRef};
 use crate::node::{NUM_VALUE_SLOTS, NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
 use crate::unified_lru_list::UnifiedLRUList;
 use crate::unified_lru_list::{EvictionStrategy, PriorityKey, get_eviction_strategy};
@@ -91,7 +91,7 @@ pub struct MatchPrefixParams<'k, K: ChildKeyType> {
     /// The query key (already page-typed; bigram conversion happens at the boundary).
     pub key: &'k K,
     /// Namespace of the query; picks the matching subtree root.
-    pub namespace: RadixNamespaceRef<'k>,
+    pub namespace: KeyNamespaceRef<'k>,
 }
 
 /// Params for an insert; the key is borrowed from the caller.
@@ -99,7 +99,7 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     /// The insert key (already page-typed; bigram conversion happens at the boundary).
     pub key: &'k K,
     /// Namespace of the insert; picks the matching subtree root.
-    pub namespace: RadixNamespaceRef<'k>,
+    pub namespace: KeyNamespaceRef<'k>,
     /// Device KV indices covering the key, one row per atom.
     pub value: Tensor,
     /// Tokens of this request already cached before the insert (the duplicate
@@ -187,7 +187,7 @@ pub struct InsertWalkState<K: ChildKeyType> {
     key: K,
     aligned_key_len: usize,
     value: Tensor,
-    namespace: RadixNamespace,
+    namespace: KeyNamespace,
     prev_prefix_len: usize,
     swa_evicted_seqlen: usize,
     mamba_value: Option<Tensor>,
@@ -752,7 +752,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             priority,
             hit_count,
             creation_counter,
-            RadixNamespaceRef::new(extra_key, /* cache_salt = */ None),
+            KeyNamespaceRef::new(extra_key, /* cache_salt = */ None),
         )
     }
 
@@ -763,7 +763,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         priority: i64,
         hit_count: i64,
         creation_counter: Option<i64>,
-        namespace: RadixNamespaceRef<'_>,
+        namespace: KeyNamespaceRef<'_>,
     ) -> NodeIdx_ {
         let new_node_id = self.arena.alloc_detached(priority);
         // Root children adopt the op namespace; deeper nodes inherit the parent's.
@@ -977,7 +977,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn match_prefix_helper_(
         &mut self,
         root_id: NodeIdx_,
-        namespace: RadixNamespaceRef<'_>,
+        namespace: KeyNamespaceRef<'_>,
         key: &K,
         aligned_key_len: usize,
     ) -> (
@@ -1804,7 +1804,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             key,
             value,
             priority,
-            RadixNamespaceRef::new(extra_key, /* cache_salt = */ None),
+            KeyNamespaceRef::new(extra_key, /* cache_salt = */ None),
         )
     }
 
@@ -1814,7 +1814,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         key: K,
         value: &Tensor,
         priority: i64,
-        namespace: RadixNamespaceRef<'_>,
+        namespace: KeyNamespaceRef<'_>,
     ) -> NodeIdx_ {
         let page_size = self.page_size;
         let child_map_key = key.child_key(page_size);
@@ -2882,7 +2882,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) -> InsertResult {
         self.insert_host_in_namespace(
             node_id,
-            RadixNamespaceRef::new(extra_key, /* cache_salt = */ None),
+            KeyNamespaceRef::new(extra_key, /* cache_salt = */ None),
             key,
             host_value,
             hash_value,
@@ -2892,7 +2892,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn insert_host_in_namespace(
         &mut self,
         node_id: NodeId,
-        namespace: RadixNamespaceRef<'_>,
+        namespace: KeyNamespaceRef<'_>,
         key: K,
         host_value: Tensor,
         hash_value: Vec<String>,
@@ -2904,7 +2904,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn try_insert_host_in_namespace(
         &mut self,
         node_id: NodeId,
-        namespace: RadixNamespaceRef<'_>,
+        namespace: KeyNamespaceRef<'_>,
         key: K,
         host_value: Tensor,
         hash_value: Vec<String>,

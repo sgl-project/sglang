@@ -902,7 +902,7 @@ fn split_wires_the_new_node_between_parent_and_child() {
         tc.arena
             .node(new_node)
             .children
-            .get(&(RadixNamespace::default(), vec![3])),
+            .get(&(KeyNamespace::default(), vec![3])),
         Some(&c)
     );
     assert_eq!(tc.arena.node(new_node).parent(), root);
@@ -1172,7 +1172,7 @@ fn match_params_in_namespace<'a>(
 ) -> MatchPrefixParams<'a, Vec<i64>> {
     MatchPrefixParams {
         key,
-        namespace: RadixNamespaceRef::new(extra_key, cache_salt),
+        namespace: KeyNamespaceRef::new(extra_key, cache_salt),
     }
 }
 
@@ -1316,14 +1316,14 @@ fn insert_first_write_creates_the_namespace() {
     let mut tc = core();
     matched_chain(&mut tc);
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("lora-1"), None),
+        namespace: KeyNamespaceRef::new(Some("lora-1"), None),
         ..insert_params(&vec![7, 8], &[40, 41])
     });
     // The namespace is isolated under its own root edges, created by the write.
     assert!(tc.arena.namespace_exists(Some("lora-1")));
     let result = tc.match_prefix(&MatchPrefixParams {
         key: &vec![1, 2],
-        namespace: RadixNamespaceRef::new(Some("lora-1"), None),
+        namespace: KeyNamespaceRef::new(Some("lora-1"), None),
     });
     assert_eq!(result.device_indices.numel(), 0);
     assert_eq!(result.best_match_node_id, tc.root_node_handle(None));
@@ -1336,7 +1336,7 @@ fn match_prefix_empty_query_anchors_at_the_root() {
     for extra_key in [Some("lora-1"), None] {
         let result = tc.match_prefix(&MatchPrefixParams {
             key: &vec![],
-            namespace: RadixNamespaceRef::new(extra_key, None),
+            namespace: KeyNamespaceRef::new(extra_key, None),
         });
         assert_eq!(result.best_match_node_id, root_handle);
         assert_eq!(result.last_device_node_id, root_handle);
@@ -1882,7 +1882,7 @@ fn insert_params_in_namespace<'a>(
     cache_salt: Option<&'a str>,
 ) -> InsertParams<'a, Vec<i64>> {
     InsertParams {
-        namespace: RadixNamespaceRef::new(extra_key, cache_salt),
+        namespace: KeyNamespaceRef::new(extra_key, cache_salt),
         ..insert_params(key, value)
     }
 }
@@ -2433,7 +2433,7 @@ fn salted_event_hash_walk_is_iterative_and_on_demand() {
                 parent,
                 vec![token],
                 0,
-                RadixNamespaceRef::new(None, Some("tenant-a")),
+                KeyNamespaceRef::new(None, Some("tenant-a")),
             )
             .unwrap();
     }
@@ -2874,7 +2874,7 @@ fn prefetch_anchor_info_maps_the_namespace() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("chat"), Some("tenant-a")),
+        namespace: KeyNamespaceRef::new(Some("chat"), Some("tenant-a")),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
     let plain = tc
@@ -2884,7 +2884,7 @@ fn prefetch_anchor_info_maps_the_namespace() {
     let salted = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![7, 8],
-            namespace: RadixNamespaceRef::new(Some("chat"), Some("tenant-a")),
+            namespace: KeyNamespaceRef::new(Some("chat"), Some("tenant-a")),
         })
         .best_match_node_id;
     assert_eq!(
@@ -2899,13 +2899,13 @@ fn prefetch_anchor_info_maps_the_namespace() {
     );
     // A node minted by a split inherits the namespace.
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("chat"), Some("tenant-a")),
+        namespace: KeyNamespaceRef::new(Some("chat"), Some("tenant-a")),
         ..insert_params(&vec![7], &[30])
     });
     let split_mid = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![7],
-            namespace: RadixNamespaceRef::new(Some("chat"), Some("tenant-a")),
+            namespace: KeyNamespaceRef::new(Some("chat"), Some("tenant-a")),
         })
         .best_match_node_id;
     assert_ne!(split_mid, salted);
@@ -3702,7 +3702,7 @@ fn match_prefix_with_hicache_splits_a_host_only_backuped_node() {
     assert_eq!(result.host_hit_length, 2);
     assert_eq!(result.best_match_node_id, result.last_host_node_id);
     let parent = tc.arena.resolve(result.best_match_node_id);
-    let child = tc.arena.node(parent).children[&(RadixNamespace::default(), vec![3])];
+    let child = tc.arena.node(parent).children[&(KeyNamespace::default(), vec![3])];
     {
         let parent_node = tc.arena.node(parent);
         assert_eq!(parent_node.key, vec![1, 2]);
@@ -3956,7 +3956,7 @@ fn insert_empty_key_is_a_noop_and_mints_no_namespace_root() {
     assert_eq!(tc.arena.len(), 1);
     // A namespaced empty insert never creates the namespace root.
     let result = tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("ghost"), None),
+        namespace: KeyNamespaceRef::new(Some("ghost"), None),
         ..insert_params(&vec![], &[])
     });
     assert!(result.mamba_exist);
@@ -3973,7 +3973,7 @@ fn root_node_handle_is_namespace_independent() {
     assert_eq!(tc.root_node_handle(Some("ghost")), root_handle);
     assert!(!tc.arena.namespace_exists(Some("ghost")));
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("chat"), None),
+        namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![1], &[10])
     });
     assert_eq!(tc.root_node_handle(Some("chat")), root_handle);
@@ -3989,25 +3989,25 @@ fn dfs_weight_order_groups_the_heaviest_subtree_first() {
     let branch_a = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![1, 99],
-            namespace: RadixNamespaceRef::default(),
+            namespace: KeyNamespaceRef::default(),
         })
         .last_device_node_id;
     let leaf_a1 = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![1, 10],
-            namespace: RadixNamespaceRef::default(),
+            namespace: KeyNamespaceRef::default(),
         })
         .last_device_node_id;
     let leaf_a2 = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![1, 11],
-            namespace: RadixNamespaceRef::default(),
+            namespace: KeyNamespaceRef::default(),
         })
         .last_device_node_id;
     let leaf_b = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![2, 20],
-            namespace: RadixNamespaceRef::default(),
+            namespace: KeyNamespaceRef::default(),
         })
         .last_device_node_id;
 
@@ -4043,7 +4043,7 @@ fn insert_empty_key_still_touches_the_existing_root() {
     assert_eq!(tc.arena.node(tc.arena.root()).priority, 7);
     // A namespaced empty insert touches the same single root.
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("chat"), None),
+        namespace: KeyNamespaceRef::new(Some("chat"), None),
         priority: 9,
         ..insert_params(&vec![], &[])
     });
@@ -4054,7 +4054,7 @@ fn insert_empty_key_still_touches_the_existing_root() {
 fn insert_into_a_named_namespace_is_isolated() {
     let mut tc = core();
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("lora-1"), None),
+        namespace: KeyNamespaceRef::new(Some("lora-1"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });
     // The default namespace stays empty; the named namespace hits.
@@ -4062,7 +4062,7 @@ fn insert_into_a_named_namespace_is_isolated() {
     assert_eq!(miss.device_indices.numel(), 0);
     let hit = tc.match_prefix(&MatchPrefixParams {
         key: &vec![1, 2],
-        namespace: RadixNamespaceRef::new(Some("lora-1"), None),
+        namespace: KeyNamespaceRef::new(Some("lora-1"), None),
     });
     assert!(hit.device_indices.equal(&Tensor::from_slice(&[10i64, 11])));
 }
@@ -4085,7 +4085,7 @@ fn insert_sub_page_key_is_a_noop_and_mints_no_namespace_root() {
     assert!(result.mamba_exist);
     assert_eq!(tc.arena.len(), 1);
     let result = tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("ghost"), None),
+        namespace: KeyNamespaceRef::new(Some("ghost"), None),
         ..insert_params(&vec![1], &[10])
     });
     assert!(result.mamba_exist);
@@ -5813,7 +5813,7 @@ fn reset_restores_a_fresh_tree() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("chat"), None),
+        namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3]));
@@ -5891,7 +5891,7 @@ fn total_size_spans_namespaces_and_aux_values() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("chat"), None),
+        namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
     assert_eq!(tc.total_size(), (5, 0));
@@ -5938,7 +5938,7 @@ fn walk_for_kv_canary_chains_slots_across_namespaces() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("chat"), None),
+        namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
     assert_eq!(
@@ -6214,7 +6214,7 @@ fn all_values_flatten_spans_namespaces() {
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("chat"), None),
+        namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
     let (sorted, _) = tc.all_values_flatten().sort(0, /* descending = */ false);
@@ -6226,7 +6226,7 @@ fn collect_all_nodes_visits_every_root_subtree() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("chat"), None),
+        namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
     let mut nodes = tc.collect_all_nodes_();
@@ -6241,7 +6241,7 @@ fn pretty_format_renders_every_namespace_and_component() {
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("chat"), None),
+        namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7], &[30])
     });
     let leaf = tc
@@ -6272,7 +6272,7 @@ fn sane_tree() -> UnifiedTreeCore<Vec<i64>> {
     tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     tc.insert(&insert_params(&vec![1, 2, 9], &[30, 31, 39]));
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("chat"), None),
+        namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[40, 41])
     });
     tc
@@ -6754,7 +6754,7 @@ fn match_prefix_on_an_unknown_namespace_allocates_nothing() {
     let arena_len = tc.arena.len();
     let result = tc.match_prefix(&MatchPrefixParams {
         key: &vec![1, 2, 3],
-        namespace: RadixNamespaceRef::new(Some("ghost"), None),
+        namespace: KeyNamespaceRef::new(Some("ghost"), None),
     });
     assert_eq!(result.device_indices.numel(), 0);
     assert_eq!(tc.arena.len(), arena_len);
@@ -6769,18 +6769,18 @@ fn refresh_dispatches_fire_per_walk_phase_in_a_namespace() {
     let recorder = Arc::new(RecordingComponentForTest::default());
     tc.register_component_(recorder.clone());
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("chat"), None),
+        namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[40, 41])
     });
     // The deeper insert walks down through the existing [7,8] node.
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("chat"), None),
+        namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8, 9], &[40, 41, 42])
     });
     let leaf = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![7, 8],
-            namespace: RadixNamespaceRef::new(Some("chat"), None),
+            namespace: KeyNamespaceRef::new(Some("chat"), None),
         })
         .best_match_node_id;
     let refreshes = recorder.refreshes.lock().unwrap();
@@ -6830,12 +6830,10 @@ fn sanity_check_detects_a_reverse_map_mismatch() {
     let parent = tc.arena.node(leaf_idx3).parent();
     let key = tc.arena.node(leaf_idx3).key.child_key(1);
     let parent_node = tc.arena.node_mut(parent);
+    parent_node.children.remove(&(KeyNamespace::default(), key));
     parent_node
         .children
-        .remove(&(RadixNamespace::default(), key));
-    parent_node
-        .children
-        .insert((RadixNamespace::default(), vec![99]), leaf_idx3);
+        .insert((KeyNamespace::default(), vec![99]), leaf_idx3);
     tc.sanity_check(&[], &[]);
 }
 
@@ -6903,7 +6901,7 @@ fn cyclic_child_map_tree() -> UnifiedTreeCore<Vec<i64>> {
     tc.arena
         .node_mut(tc.arena.resolve(leaf))
         .children
-        .insert((RadixNamespace::default(), vec![50]), parent);
+        .insert((KeyNamespace::default(), vec![50]), parent);
     tc
 }
 
@@ -7676,12 +7674,12 @@ fn drain_full_device(tc: &mut UnifiedTreeCore<Vec<i64>>) {
 fn an_emptied_namespace_leaves_nothing_behind() {
     let mut tc = core();
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("salted"), None),
+        namespace: KeyNamespaceRef::new(Some("salted"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });
     let top = tc
         .match_prefix(&MatchPrefixParams {
-            namespace: RadixNamespaceRef::new(Some("salted"), None),
+            namespace: KeyNamespaceRef::new(Some("salted"), None),
             ..match_params(&vec![1, 2])
         })
         .best_match_node_id;
@@ -7693,7 +7691,7 @@ fn an_emptied_namespace_leaves_nothing_behind() {
     tc.sanity_check(&[], &[]);
     // A later insert respins the namespace from scratch.
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("salted"), None),
+        namespace: KeyNamespaceRef::new(Some("salted"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });
     assert!(tc.arena.namespace_exists(Some("salted")));
@@ -7706,7 +7704,7 @@ fn namespaces_do_not_accumulate_across_salts() {
     for salt in 0..64 {
         let salt = format!("session-{salt}");
         tc.insert(&InsertParams {
-            namespace: RadixNamespaceRef::new(Some(&salt), None),
+            namespace: KeyNamespaceRef::new(Some(&salt), None),
             ..insert_params(&vec![1, 2], &[10, 11])
         });
         drain_full_device(&mut tc);
@@ -7720,12 +7718,12 @@ fn namespaces_do_not_accumulate_across_salts() {
 fn a_zero_length_match_anchors_at_the_root() {
     let mut tc = core();
     tc.insert(&InsertParams {
-        namespace: RadixNamespaceRef::new(Some("salted"), None),
+        namespace: KeyNamespaceRef::new(Some("salted"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });
     let anchor = tc
         .match_prefix(&MatchPrefixParams {
-            namespace: RadixNamespaceRef::new(Some("salted"), None),
+            namespace: KeyNamespaceRef::new(Some("salted"), None),
             ..match_params(&vec![9])
         })
         .best_match_node_id;
