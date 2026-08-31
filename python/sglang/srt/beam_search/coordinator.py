@@ -308,7 +308,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if final:
             # Prefill-terminated (max_new_tokens == 1): no spawn, but the relay
             # slot still needs a token so an overshoot step has a valid input.
-            self._stash_next_tokens([req.req_pool_idx], next_tokens[:1])
+            self._stash_next_tokens([req.kv.req_pool_idx], next_tokens[:1])
             return
         self._spawn_member_rows(group, req)
         req.output_ids.append(0)  # length placeholder; DAG owns history
@@ -339,13 +339,13 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         alias_members_prompt_kv(
             self.req_to_token_pool.req_to_token,
             member_rows,
-            leader.req_pool_idx,
+            leader.kv.req_pool_idx,
             group.prompt_len,
         )
         group.member_rows = member_rows
         group.member_rows_cpu = torch.tensor(rows, dtype=torch.int64)
         leader_row = torch.tensor(
-            [leader.req_pool_idx], dtype=torch.int64, device=device
+            [leader.kv.req_pool_idx], dtype=torch.int64, device=device
         )
         group.all_rows = torch.cat([leader_row, member_rows])
 
