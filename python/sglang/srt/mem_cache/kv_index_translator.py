@@ -127,6 +127,11 @@ class KVIndexTranslator:
             # carries the owner rule in `loc % dcp_size`. Identity with the read
             # translate when dcp_size == 1.
             self._translate_write_full = alloc.translate_write_loc_for_kernel
+            # DCP: every DCP index kernel collapses `loc // dcp_size` itself, so
+            # the read tables must hand it VIRTUAL ids and the consumer
+            # translates AFTER sharding. `is_translated=False` on the table it
+            # gets back is the contract; the write loc is unaffected.
+            self.defer_read_translate = alloc.dcp_size > 1
             if isinstance(alloc, UnifiedSWATokenToKVPoolAllocator):
                 self._swa_v2p_table = alloc.swa_v2p_page_table
                 self._swa_page_multiplier = alloc.swa_kernel_page_multiplier
@@ -141,6 +146,7 @@ class KVIndexTranslator:
             self._full_page_multiplier = 1
             self._translate_full = None
             self._translate_write_full = None
+            self.defer_read_translate = False
             self._swa_v2p_table = None
             self._swa_page_multiplier = 1
             self._swa_write_loc_from_full = (
@@ -198,7 +204,7 @@ class KVIndexTranslator:
         captured graph bakes it) passes its own tables in ``into``;
         ``into=None`` allocates of width ``max_pages`` instead.
         """
-        if not self.is_translating:
+        if not self.is_translating or self.defer_read_translate:
             return KVIndexTable(
                 ids=self.req_to_token,
                 row_ids=req_pool_indices,
