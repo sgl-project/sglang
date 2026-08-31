@@ -792,7 +792,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId, req: Optional[Req] = None
     ) -> tuple[PoolTransfer, dict[ComponentType, list[PoolTransfer]]]:
         # Component hooks take primitives, not Req: extract its fields here.
-        mamba_pool_idx = req.mamba_pool_idx if req is not None else None
+        mamba_pool_idx = req.kv.mamba_pool_idx if req is not None else None
         kv_xfer, comp_xfers = self._binding.build_load_back_spec(
             node_id, mamba_pool_idx
         )

@@ -7269,7 +7269,7 @@ class TestMambaCheckpointGrid(CustomTestCase):
                 InsertParams(
                     key=RadixKey(array("q", sequence)),
                     value=value,
-                    mamba_value=req.mamba_pool_idx.unsqueeze(0),
+                    mamba_value=req.kv.mamba_pool_idx.unsqueeze(0),
                 )
             )
 
