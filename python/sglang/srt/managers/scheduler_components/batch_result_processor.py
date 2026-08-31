@@ -1125,14 +1125,14 @@ class SchedulerBatchResultProcessor:
                 known_mamba_boundary = bool(batch.mamba_track_mask_next_cpu[i])
 
             if completed_mamba_boundary and not lazy:
-                req.mamba_last_track_idx = batch.mamba_track_buffer_indices[i]
-                req.mamba_last_track_seqlen = req.kv.kv_committed_len - lookahead
+                req.kv.mamba_last_track_idx = batch.mamba_track_buffer_indices[i]
+                req.kv.mamba_last_track_seqlen = req.kv.kv_committed_len - lookahead
             elif (
                 req.finished()
                 and lazy
                 and lookahead == 1
                 and known_mamba_boundary
-                and req.mamba_next_track_idx == req.mamba_last_track_idx
+                and req.kv.mamba_next_track_idx == req.kv.mamba_last_track_idx
             ):
                 req.mamba_lazy_is_insert = False
 
@@ -1216,7 +1216,7 @@ class SchedulerBatchResultProcessor:
         Lazy: keep the same index (prealloc handles the swap) and run
         post-decode cleanup to free the temporary second slot.
         """
-        if req.mamba_ping_pong_track_buffer is None:
+        if req.kv.mamba_ping_pong_track_buffer is None:
             return
 
         lazy = mamba_extra_buffer_lazy_enabled()
@@ -1238,17 +1238,17 @@ class SchedulerBatchResultProcessor:
         if not at_boundary:
             return
 
-        track_idx = req.mamba_next_track_idx
+        track_idx = req.kv.mamba_next_track_idx
         if not known_boundary and batch.mamba_track_buffer_indices is not None:
             track_idx = batch.mamba_track_buffer_indices[i]
         if not known_boundary:
-            req.mamba_last_track_seqlen = track_seqlen
+            req.kv.mamba_last_track_seqlen = track_seqlen
         if lazy:
             self.mamba_lazy_post_decode_at_boundary(req, batch, track_idx)
         else:
             if not known_boundary:
-                req.mamba_last_track_idx = track_idx
-            req.mamba_next_track_idx = (
+                req.kv.mamba_last_track_idx = track_idx
+            req.kv.mamba_next_track_idx = (
                 batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
             )
 
@@ -1274,12 +1274,12 @@ class SchedulerBatchResultProcessor:
         if req.finished():
             # Skip the donation if a scatter wrote or may still write the keep slot.
             keep_written_by_this_step = (
-                crossed and planned_pos == req.mamba_next_track_idx
+                crossed and planned_pos == req.kv.mamba_next_track_idx
             )
-            other_idx = 1 - req.mamba_next_track_idx
+            other_idx = 1 - req.kv.mamba_next_track_idx
             # Recompute the in-flight verify's plan (kv_committed_len is
             # frozen since its prepare, so the recompute is exact).
-            keep_may_be_written_in_flight = req.mamba_ping_pong_track_buffer[
+            keep_may_be_written_in_flight = req.kv.mamba_ping_pong_track_buffer[
                 other_idx
             ].item() == -1 and mamba_lazy_spec_in_window(
                 req,
@@ -1296,18 +1296,18 @@ class SchedulerBatchResultProcessor:
 
         if not crossed or planned_pos is None:
             return
-        if planned_pos != req.mamba_next_track_idx:
+        if planned_pos != req.kv.mamba_next_track_idx:
             # Promote pending -> keep: free the old checkpoint, repoint.
             pool = batch.req_to_token_pool
-            keep_idx = req.mamba_next_track_idx
-            keep_val = req.mamba_ping_pong_track_buffer[keep_idx]
+            keep_idx = req.kv.mamba_next_track_idx
+            keep_val = req.kv.mamba_ping_pong_track_buffer[keep_idx]
             pool.mamba_allocator.free(keep_val.unsqueeze(0))
             pool.set_mamba_ping_pong_slot(req, keep_idx, -1)
-            req.mamba_next_track_idx = planned_pos
+            req.kv.mamba_next_track_idx = planned_pos
         # else: in-place fallback, or promoted by an earlier confirmation —
         # keep holds the track_seqlen state either way.
-        req.mamba_last_track_idx = planned_pos
-        req.mamba_last_track_seqlen = track_seqlen
+        req.kv.mamba_last_track_idx = planned_pos
+        req.kv.mamba_last_track_seqlen = track_seqlen
 
     @staticmethod
     def _mamba_assert_committed_len_lookahead(req: Req) -> None:
@@ -1355,13 +1355,13 @@ class SchedulerBatchResultProcessor:
         self, req: Req, batch: ScheduleBatch, track_idx: int
     ):
         """Commit a completed lazy-mode boundary and free its old slot."""
-        req.mamba_last_track_idx = track_idx
-        req.mamba_next_track_idx = track_idx
+        req.kv.mamba_last_track_idx = track_idx
+        req.kv.mamba_next_track_idx = track_idx
         other_idx = 1 - track_idx
-        other_val = req.mamba_ping_pong_track_buffer[other_idx].item()
+        other_val = req.kv.mamba_ping_pong_track_buffer[other_idx].item()
         if other_val != -1:
             pool = batch.req_to_token_pool
             pool.mamba_allocator.free(
-                req.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
+                req.kv.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
             )
             pool.set_mamba_ping_pong_slot(req, other_idx, -1)
