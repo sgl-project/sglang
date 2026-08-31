@@ -326,16 +326,6 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    if cfg.enable_mixed_chunk:
-        declare_resolution(
-            server_args,
-            "_handle_dflash",
-            enable_mixed_chunk=False,
-        )
-        logger.warning(
-            "Mixed chunked prefill is disabled because of using dflash speculative decoding."
-        )
-
 
 def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     from sglang.srt.speculative.dspark_components.dspark_config import (
@@ -524,16 +514,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    if cfg.enable_mixed_chunk:
-        declare_resolution(
-            server_args,
-            "_handle_dspark",
-            enable_mixed_chunk=False,
-        )
-        logger.warning(
-            "Mixed chunked prefill is disabled because of using dspark speculative decoding."
-        )
-
     from sglang.srt.speculative.ragged_verify import (
         RaggedVerifyMode,
         read_ragged_verify_mode,
@@ -688,15 +668,20 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "speculative decoding."
         )
 
-    if cfg.enable_mixed_chunk:
+    # Mixed steps degrade running requests to a plain 1-token decode.
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    algo = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+    if cfg.enable_mixed_chunk and not algo.supports_mixed_chunk():
         declare_resolution(
             server_args,
             "_handle_eagle_family",
             enable_mixed_chunk=False,
         )
         logger.warning(
-            "Mixed chunked prefill is disabled because of using "
-            "eagle speculative decoding."
+            "Mixed chunked prefill is disabled: %s speculative decoding does "
+            "not support it.",
+            cfg.speculative_algorithm,
         )
 
     model_arch = model_config_of(server_args).hf_config.architectures[0]

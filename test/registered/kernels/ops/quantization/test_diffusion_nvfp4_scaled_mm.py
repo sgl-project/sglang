@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.layers.quantization import (
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
+    apply_nvfp4_gemm_prequantized,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.quantization.modelopt_quant import pad_nvfp4_weight
@@ -361,6 +362,40 @@ def test_flux2_shape_correctness_flashinfer_trtllm(
 
     diff = _calc_diff(actual, expected.to(dtype=DTYPE))
     assert diff < DEEPGEMM_FP4_MAX_DIFF, f"{m=}, {n=}, {k=}, {diff=:.6f}"
+
+
+@pytest.mark.skipif(
+    not _nvfp4_supported(),
+    reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
+)
+@pytest.mark.parametrize(
+    "backend", [None, "flashinfer_trtllm"], ids=["default", "flashinfer_trtllm"]
+)
+def test_prequantized_input_matches_regular_apply(
+    monkeypatch: pytest.MonkeyPatch, backend: str | None
+) -> None:
+    _set_diffusion_fp4_backend(monkeypatch, backend)
+    m, n, k = 19, 150, 80
+    generator = torch.Generator(device=DEVICE)
+    generator.manual_seed(20260831)
+    x = torch.randn((m, k), device=DEVICE, dtype=DTYPE, generator=generator)
+    weight = torch.randn((n, k), device=DEVICE, dtype=DTYPE, generator=generator)
+    input_global_scale = _make_global_scale(x)
+    weight_global_scale = _make_global_scale(weight)
+    weight_fp4, weight_scale_linear = _quantize_weight_for_checkpoint(
+        weight, weight_global_scale
+    )
+    method, layer = _build_layer(
+        weight_fp4, weight_scale_linear, input_global_scale, weight_global_scale
+    )
+
+    expected = method.apply(layer, x)
+    x_fp4, x_scale_interleaved = flashinfer.fp4_quantize(x, input_global_scale)
+    actual = apply_nvfp4_gemm_prequantized(
+        layer, x_fp4, x_scale_interleaved, output_dtype=x.dtype
+    )
+
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.skipif(

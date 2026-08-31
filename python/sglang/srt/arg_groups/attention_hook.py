@@ -176,11 +176,29 @@ def handle_attention_backend_compatibility(server_args: Any):
     # AMD platforms backends
     if resolved_view(server_args).attention_backend == "aiter":
         if model_config.context_len > 8192:
-            declare_resolution(
-                server_args,
-                "_handle_attention_backend_compatibility",
-                mem_fraction_static=cfg.mem_fraction_static * 0.85,
-            )
+            # The 0.85 covers the extra non-static workspace aiter reserves for
+            # long contexts, but it is a heuristic for the auto-derived default
+            # only. Shrinking a value the user picked can push the static budget
+            # below the model-weight footprint on a nearly full GPU and break
+            # KV-cache allocation outright, so an explicit value is honored.
+            if (getattr(server_args, "_raw_input", None) or {}).get(
+                "mem_fraction_static"
+            ) is not None:
+                logger.warning(
+                    "attention_backend=aiter with context_len=%d (>8192) "
+                    "normally scales mem_fraction_static by 0.85, but "
+                    "mem_fraction_static=%.3f was set explicitly and will be "
+                    "used as-is. Ensure enough non-static memory is left for "
+                    "attention workspace and CUDA graphs.",
+                    model_config.context_len,
+                    cfg.mem_fraction_static,
+                )
+            else:
+                declare_resolution(
+                    server_args,
+                    "_handle_attention_backend_compatibility",
+                    mem_fraction_static=cfg.mem_fraction_static * 0.85,
+                )
 
     # Other platforms backends
     run_post_process_pass(server_args, _attention_backend_platform_fallbacks)

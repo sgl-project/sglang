@@ -70,6 +70,9 @@ class CustomSpecAlgo:
     def is_eagle(self) -> bool:
         return False
 
+    def supports_mixed_chunk(self) -> bool:
+        return False
+
     def is_eagle3(self) -> bool:
         return False
 
