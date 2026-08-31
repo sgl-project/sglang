@@ -81,18 +81,32 @@ class _FakeReq:
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.skip_lock_node_ids = {}
-        self.mamba_pool_idx = None
-        self.mamba_ping_pong_track_buffer = None
+        self.to_finish = None
+        self.finished_reason = None
+        self.finished_len = None
 
     def detach_kv(self):
         kv, self.kv = self.kv, ReqKvInfo()
         return kv
-        self.mamba_next_track_idx = None
-        self.mamba_last_track_seqlen = None
-        self.mamba_branching_seqlen = None
-        self.to_finish = None
-        self.finished_reason = None
-        self.finished_len = None
+
+
+def test_session_slot_round_trip_preserves_mamba_state():
+    # The mamba state rides in the shared ReqKvInfo record. mamba_branching_seqlen
+    # is a per-turn match observation on the Req and is not preserved by the slot.
+    req = _FakeReq("session-a", req_pool_idx=0, committed=4, allocated=4)
+    req.kv.mamba_next_track_idx = 1
+    req.kv.mamba_last_track_idx = 0
+    req.kv.mamba_last_track_seqlen = 3
+
+    slot = SessionSlot()
+    slot.save_from_req(req, is_first=True)
+
+    next_req = _FakeReq("session-a", req_pool_idx=1, committed=0, allocated=0)
+    slot.restore_to_req(next_req)
+
+    assert next_req.kv.mamba_next_track_idx == 1
+    assert next_req.kv.mamba_last_track_idx == 0
+    assert next_req.kv.mamba_last_track_seqlen == 3
 
 
 def test_preabort_detaches_session_and_preserves_slot():

@@ -6,7 +6,6 @@ their GSM8K accuracy gates.
 
 import unittest
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
@@ -14,6 +13,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     _wait_for_gpu_idle_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=1200, stage="base-c", runner_config="8-gpu-b300")
@@ -31,7 +31,7 @@ GPU_IDLE_TIMEOUT = 120
 
 def _stop_server(process):
     if process:
-        kill_process_tree(process.pid)
+        terminate_and_kill_process_tree(process)
         _wait_for_gpu_idle_in_ci(timeout=GPU_IDLE_TIMEOUT)
 
 
