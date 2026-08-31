@@ -14,10 +14,11 @@
 
 """Inference-only DeepSeek NextN Speculative Decoding."""
 
+import copy
 import logging
 import os
+from collections.abc import Iterable
 from contextlib import ExitStack
-from typing import Iterable, Optional, Tuple
 
 import torch
 from safetensors.torch import load_file
@@ -103,7 +104,7 @@ class DeepseekModelNextN(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -115,12 +116,6 @@ class DeepseekModelNextN(nn.Module):
             )
         else:
             moe_quant_config_override = None
-
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-            logger.warning(
-                "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
-            )
-            quant_config = None
 
         self.vocab_size = config.vocab_size
 
@@ -321,22 +316,124 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         },
     )
 
+    _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
+
+    @classmethod
+    def _is_mtp_module(cls, name: str, layer_prefix: str) -> bool:
+        short_layer_prefix = f"layers.{layer_prefix.split('.')[-1]}"
+        mtp_prefixes = (layer_prefix, short_layer_prefix, "model.decoder", "decoder")
+        for pfx in mtp_prefixes:
+            if (
+                name == pfx
+                or name == f"{pfx}*"
+                or name == f"{pfx}.*"
+                or name.startswith(f"{pfx}.")
+            ):
+                return True
+        for spec in cls._NEXTN_SPEC_WEIGHT_NAMES:
+            if name == f"model.{spec}" or name.startswith(f"model.{spec}."):
+                return True
+        return False
+
+    @classmethod
+    def _map_mtp_ckpt_name(cls, name: str, layer_prefix: str) -> str:
+        is_spec = any(part in name for part in cls._NEXTN_SPEC_WEIGHT_NAMES)
+        target_prefix = "model" if is_spec else "model.decoder"
+        short_layer_prefix = f"layers.{layer_prefix.split('.')[-1]}"
+        prefixes = (layer_prefix, short_layer_prefix, "model.decoder", "decoder")
+
+        for pfx in prefixes:
+            if name.startswith(f"{pfx}."):
+                remainder = name[len(pfx) + 1 :]
+                return f"{target_prefix}.{remainder}"
+            if name in (pfx, f"{pfx}*", f"{pfx}.*"):
+                if is_spec:
+                    return target_prefix
+                return f"{target_prefix}.*" if name.endswith("*") else target_prefix
+
+        return name
+
     def _resolve_nextn_quant_config(self, config, quant_config):
-        if quant_config is None or quant_config.get_name() != "quark":
+        if quant_config is None:
+            return None
+
+        quant_name = (
+            quant_config.get_name() if hasattr(quant_config, "get_name") else None
+        )
+
+        if quant_name == "quark":
+            from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
+
+            ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
+            mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
+            if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
+                return None
             return quant_config
 
-        from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
+        if quant_name == "modelopt_fp4" or (
+            hasattr(quant_config, "exclude_modules")
+            and isinstance(quant_config.exclude_modules, list)
+        ):
+            # Supported Checkpoint Contract:
+            # 1. If an MTP draft layer/module is explicitly listed in `exclude_modules`
+            #    (using checkpoint prefixes like `model.layers.<N>.*`, `layers.<N>.*`,
+            #    or already-remapped runtime names like `model.decoder.*`), the draft
+            #    decoder modules (linear and/or FusedMoE) will be excluded from quantization.
+            # 2. If no MTP layer/module exclusion is present in `exclude_modules`, the MTP
+            #    draft layer is treated as quantized (ModelOpt FP4), retaining `quant_config`
+            #    for models with quantized draft weights (e.g. GLM-5.3-Flash / GLM NextN).
+            layer_prefix = f"model.layers.{config.num_hidden_layers}"
+            short_layer_prefix = f"layers.{config.num_hidden_layers}"
+            whole_layer_prefixes = (
+                layer_prefix,
+                short_layer_prefix,
+                "model.decoder",
+                "decoder",
+            )
 
-        ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
-        mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
-        if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
-            return None
+            exclude_modules = quant_config.exclude_modules or []
+            mtp_excluded = [
+                name
+                for name in exclude_modules
+                if self._is_mtp_module(name, layer_prefix)
+            ]
+            if not mtp_excluded:
+                return quant_config
+
+            names = set(exclude_modules)
+            has_whole_mtp_excluded = False
+            has_expert_excluded = False
+
+            for name in mtp_excluded:
+                mapped = self._map_mtp_ckpt_name(name, layer_prefix)
+                names.add(mapped)
+
+                for pfx in whole_layer_prefixes:
+                    if name in (pfx, f"{pfx}*", f"{pfx}.*"):
+                        has_whole_mtp_excluded = True
+                        break
+
+                if ".mlp.experts" in name or ".mlp.experts" in mapped:
+                    has_expert_excluded = True
+
+            if has_whole_mtp_excluded:
+                names.add("model.decoder")
+                names.add("model.decoder.*")
+                names.add("model.decoder.mlp.experts")
+                for spec in self._NEXTN_SPEC_WEIGHT_NAMES:
+                    names.add(f"model.{spec}")
+            elif has_expert_excluded:
+                names.add("model.decoder.mlp.experts")
+
+            quant_config = copy.copy(quant_config)
+            quant_config.exclude_modules = list(names)
+            return quant_config
         return quant_config
 
     def __init__(
         self,
         config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
@@ -404,7 +501,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
 
     def post_load_weights(self, is_nextn=True, weight_names=None):
