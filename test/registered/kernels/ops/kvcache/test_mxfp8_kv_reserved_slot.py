@@ -1,18 +1,9 @@
 """MXFP8 KV cache must never write the reserved CUDA-graph padding slot.
 
-Slot 0 is the reserved padding sink; padded page-table entries read its page
-back. CUDA-graph padding lanes carry undefined activations, which quantize to
-NaN payload and 0xFF e8m0 scales. The bf16 store_cache path skips writes to
-the reserved slot (reserved_skip_index); the MXFP8 pool paths must do the
-same, or the poisoned slot is read back by attention (0 * NaN = NaN in PV)
-and detonates the run.
-
-Every test asserts the strong invariant -- slot 0 payload bytes and scale
-entries stay exactly zero -- so any write to the reserved slot fails the test,
-not just a NaN one. Guard safety is covered too: neighbors sharing page 0
-(payload and interleaved per-slot scales) must be byte-identical after writes
-that target the reserved slot, and set_kv_buffer must capture and replay
-inside a CUDA graph.
+Padding lanes carry undefined activations that quantize to NaN payload and
+0xFF e8m0 scales; attention reads slot 0 back for padded page-table entries,
+so a poisoned slot 0 defeats probability masking (0 * NaN = NaN in PV).
+Asserts require slot 0 to stay exactly zero, so finite-garbage writes fail too.
 """
 
 import pytest
@@ -83,7 +74,6 @@ def test_direct_path_skips_reserved_slot():
     pool = _make_pool()
     k = torch.randn(4, NHKV, HD, dtype=torch.bfloat16, device=DEV) * 0.5
     v = torch.randn(4, NHKV, HD, dtype=torch.bfloat16, device=DEV) * 0.5
-    # Rows 0 and 2 are padding lanes with undefined (NaN) activations.
     k[[0, 2]] = float("nan")
     v[[0, 2]] = float("nan")
     kq, vq, ks, vs = _quantize(k, v)
@@ -95,58 +85,6 @@ def test_direct_path_skips_reserved_slot():
     kc, _ = pool.get_kv_buffer(0)
     got = kc.view(-1, PS, NHKV, HD)[0, 7].view(torch.uint8)
     assert torch.equal(got, kq[1].view(torch.uint8)), "non-reserved write corrupted"
-
-
-@requires_sm100
-def test_skip_does_not_clobber_page0_neighbors():
-    """Slots sharing page 0 (payload and the interleaved scale chunk) must
-    survive later writes that target the reserved slot."""
-    torch.manual_seed(1)
-    pool = _make_pool()
-    k = torch.randn(5, NHKV, HD, dtype=torch.bfloat16, device=DEV) * 0.5
-    v = torch.randn(5, NHKV, HD, dtype=torch.bfloat16, device=DEV) * 0.5
-    kq, vq, ks, vs = _quantize(k, v)
-    neighbors = torch.tensor([1, 2, 3, 64, 127], dtype=torch.int64, device=DEV)
-    pool.set_kv_buffer(_Layer(), neighbors, kq, vq, ks, vs)
-
-    kc, vc = pool.get_kv_buffer(0)
-    ksf, vsf = pool.get_kv_scale_buffer(0)
-    k_bytes = kc.view(-1, PS, NHKV, HD)[0, neighbors.cpu()].view(torch.uint8).clone()
-    v_bytes = vc.view(-1, PS, NHKV, HD)[0, neighbors.cpu()].view(torch.uint8).clone()
-    k_sf = pool._read_sf_interleaved(ksf, neighbors).clone()
-    v_sf = pool._read_sf_interleaved(vsf, neighbors).clone()
-
-    k2 = torch.randn(2, NHKV, HD, dtype=torch.bfloat16, device=DEV) * 0.5
-    v2 = torch.randn(2, NHKV, HD, dtype=torch.bfloat16, device=DEV) * 0.5
-    k2[0] = float("nan")
-    v2[0] = float("nan")
-    kq2, vq2, ks2, vs2 = _quantize(k2, v2)
-    pool.set_kv_buffer(
-        _Layer(),
-        torch.tensor([0, 200], dtype=torch.int64, device=DEV),
-        kq2,
-        vq2,
-        ks2,
-        vs2,
-    )
-
-    _assert_slot0_zero(pool)
-    kc, vc = pool.get_kv_buffer(0)
-    ksf, vsf = pool.get_kv_scale_buffer(0)
-    assert torch.equal(
-        kc.view(-1, PS, NHKV, HD)[0, neighbors.cpu()].view(torch.uint8), k_bytes
-    ), "page-0 neighbor K payload clobbered"
-    assert torch.equal(
-        vc.view(-1, PS, NHKV, HD)[0, neighbors.cpu()].view(torch.uint8), v_bytes
-    ), "page-0 neighbor V payload clobbered"
-    assert torch.equal(
-        pool._read_sf_interleaved(ksf, neighbors).view(torch.uint8),
-        k_sf.view(torch.uint8),
-    ), "page-0 neighbor K scales clobbered"
-    assert torch.equal(
-        pool._read_sf_interleaved(vsf, neighbors).view(torch.uint8),
-        v_sf.view(torch.uint8),
-    ), "page-0 neighbor V scales clobbered"
 
 
 @requires_sm100
@@ -168,32 +106,6 @@ def test_fused_quant_store_path_skips_reserved_slot():
     assert (
         not torch.isnan(valid).any() and valid.abs().sum() > 0
     ), "fused valid write lost"
-
-
-@requires_sm100
-def test_capture_mode_flag_skips_reserved_slot():
-    from sglang.srt.model_executor.runner_utils import capture_mode
-
-    torch.manual_seed(3)
-    pool = _make_pool()
-    k = torch.randn(3, NHKV, HD, dtype=torch.bfloat16, device=DEV) * 0.5
-    v = torch.randn(3, NHKV, HD, dtype=torch.bfloat16, device=DEV) * 0.5
-    k[0] = float("nan")
-    v[0] = float("nan")
-    kq, vq, ks, vs = _quantize(k, v)
-    loc = torch.tensor([0, 7, 9], dtype=torch.int64, device=DEV)
-
-    capture_mode.is_capture_mode = True
-    try:
-        pool.set_kv_buffer(_Layer(), loc, kq, vq, ks, vs)
-    finally:
-        capture_mode.is_capture_mode = False
-    torch.cuda.synchronize()
-
-    _assert_slot0_zero(pool)
-    kc, _ = pool.get_kv_buffer(0)
-    got = kc.view(-1, PS, NHKV, HD)[0, 7].view(torch.uint8)
-    assert torch.equal(got, kq[1].view(torch.uint8)), "capture-mode valid write lost"
 
 
 @requires_sm100

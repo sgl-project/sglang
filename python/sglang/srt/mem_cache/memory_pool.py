@@ -3486,7 +3486,6 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
                 raise ValueError("MXFP8 KV cache requires K and V scale tensors.")
             from sglang.kernels.ops.quantization.mxfp8_quant import quant_store_kv_mxfp8
 
-            # The kernel skips writes to the reserved padding slot 0.
             quant_store_kv_mxfp8(
                 cache_k,
                 cache_v,
@@ -3499,12 +3498,8 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             )
             return
 
-        # Single write path: the store_cache jit kernel scatters the fp8 K/V
-        # payload and skips the reserved CUDA-graph padding slot 0 in-kernel
-        # (reserved_skip_index default), matching the bf16 pool;
-        # store_sf_interleaved does the same for the scales. This pool is
-        # CUDA-only (e8m0 + triton + FA4) and head_dim % 32 == 0 guarantees
-        # store_cache-compatible row widths.
+        # store_cache and store_sf_interleaved skip the reserved CUDA-graph
+        # padding slot 0 in-kernel, matching the bf16 pool.
         row_bytes = self.head_num * self.head_dim * self.store_dtype.itemsize
         v_row_bytes = self.head_num * self.v_head_dim * self.store_dtype.itemsize
         assert _is_cuda and can_use_store_cache(row_bytes, v_row_bytes), (
