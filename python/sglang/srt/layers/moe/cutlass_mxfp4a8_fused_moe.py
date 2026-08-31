@@ -190,12 +190,13 @@ class CutlassMxfp4A8FusedMoeRunner:
     def _fused_configs(num_tokens: int) -> Tuple[int, int]:
         if num_tokens <= 64:
             return 100, 100
-        if num_tokens <= 2048:
+        if num_tokens == 2048:
             return 313, 313
-        if num_tokens <= 4096:
+        if num_tokens == 4096:
             return 320, 334
-        # Use the 8192-token bucket above 4096 and reuse it for M > 8192.
-        return 322, 334
+        if num_tokens >= 8192:
+            return 322, 334
+        return 101, 101
 
     def _apply_shuffle_mul_sum_fp32_factors(
         self,
