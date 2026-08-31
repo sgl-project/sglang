@@ -548,6 +548,7 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             enable_kv_cache_copy=False,
             kv_cache_layout="page_major",
         )
+        self.kernel_page_blocks = spec.blocks_per_page()
 
     def _create_buffers(self):
         self.k_buffer = self._k_views
@@ -641,7 +642,7 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         max_slots = unified_buffer.max_slots(sub_pool_name)
         self._num_pages = max_slots // page_size
         self._page_bytes = page_size * spec.entry_bytes()
-        self._view_rows = self._num_pages * spec.layer_num * page_size
+        self._view_rows = self._num_pages * spec.blocks_per_page() * page_size
 
         super().__init__(
             # OOB checks bound locs by `size + page_size`; kernel-facing ids run to
@@ -655,6 +656,7 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
             device=unified_buffer.device,
             enable_memory_saver=False,  # buffer owned by UnifiedKVPool
         )
+        self.kernel_page_blocks = spec.blocks_per_page()
 
     def _create_buffers(self):
         self.kv_buffer = self._kv_views
@@ -1190,7 +1192,7 @@ def init_unified_mamba_pools(
         pre_alloc_size=decode_pre_alloc_size,
     )
     if use_mla_backend:
-        # start_layer stays 0: HybridLinearKVPool patches layer ids to the dense
+        # start_layer stays 0: HybridLinearKVPool patches layer ids to the contiguous
         # 0..N-1 index via _transfer_id_context before every MLA pool call.
         unified_full_kv_pool = UnifiedMLATokenToKVPool(
             unified_buffer=shared_pool,
@@ -1242,11 +1244,9 @@ def init_unified_mamba_pools(
     # `_mamba_translate` feeds the HiCache offload path, GATED OFF here — wired but inert.
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
-    if use_mla_backend:
-        # Model-level MLA entry points (`set_mla_kv_buffer` / `get_mla_kv_buffer`)
-        # receive VIRTUAL locs and translate to the kernel-facing space internally
-        # (eager-prefill-only paths; never captured in a cuda graph).
-        token_to_kv_pool._full_translate = allocator.translate_kv_loc_for_kernel
+    # No full-KV translate hook is wired: both MLA doors now receive
+    # KERNEL-FACING ids -- writes from the ForwardBatch rebind, reads
+    # translated at their production sites.
 
     logger.info(
         "[unified-memory-pool] ============================================================"
@@ -1467,7 +1467,7 @@ class UnifiedSWAKVPool(SWAKVPool):
         """Route to the right sub-pool. Both `swa_loc` and `full_loc` are PHYSICAL
         (pre-translated once per forward by the attention backend); never translates here.
         """
-        _, swa_loc, full_loc = unwrap_write_loc(loc_info)
+        loc, swa_loc, full_loc = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         pool_layer_id, is_swa = self.layers_mapping[layer_id]
         if is_swa:
@@ -1487,12 +1487,11 @@ class UnifiedSWAKVPool(SWAKVPool):
                 layer_id_override=pool_layer_id,
             )
             return
-        # Full layer: full_loc is full-physical, always precomputed (eager + cuda-graph).
-        assert full_loc is not None, (
-            "UnifiedSWAKVPool.set_kv_buffer: full layer received no full_loc; "
-            "ForwardMetadata.out_cache_loc_full_physical must be precomputed for "
-            "the unified memory pool."
-        )
+        # Full layer: `loc` is already the full-side kernel-facing id, so an
+        # explicit full_loc is a same-space alias -- only triton's captured path
+        # passes one (its capture-stable buffer).
+        if full_loc is None:
+            full_loc = loc
         self.full_kv_pool.set_kv_buffer(
             None,
             full_loc,

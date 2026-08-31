@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Dense MHA K/V views for the unified memory pool (uniform-row hybrid models).
+"""MHA K/V views for the unified memory pool (uniform-row hybrid models).
 
 Covers, CPU-only (pure torch — no GPU / Triton kernels):
   - `build_mha_views` refuses an asymmetric-KV spec: its addressing
@@ -145,7 +145,7 @@ def _reference_strided_views(raw, *, page_size, num_pages, anchor_bytes=0):
     return k_views, v_views
 
 
-class TestMHADenseSpecSurface(unittest.TestCase):
+class TestMHASpecSurface(unittest.TestCase):
     def test_asymmetric_rows_refused_by_the_view_builder(self):
         """The row-block array exists only for uniform rows, so the builder
         whose addressing depends on it is the one that refuses (the MiMoV2
@@ -189,7 +189,7 @@ class TestMHADenseSpecSurface(unittest.TestCase):
         )
 
 
-class TestDenseMHAViews(unittest.TestCase):
+class TestMHAViews(unittest.TestCase):
     def test_view_shapes_are_stock_mha(self):
         ps, num_pages = 4, 6
         k_views, v_views = _build_views(_make_raw(ps, num_pages), ps, num_pages)
@@ -329,7 +329,7 @@ def _make_pool(ps=1, full_spec=None, device=_DEV):
     )
 
 
-class TestUnifiedKVPoolDenseViews(unittest.TestCase):
+class TestUnifiedKVPoolViews(unittest.TestCase):
     def test_every_mha_sub_pool_is_per_layer_contiguous(self):
         """The unified pool has ONE MHA layout: both sub-pools come back as
         stock 3-D per-layer views, whatever their page size."""
@@ -482,9 +482,10 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
             self.assertEqual(pool.kv_cache_layout, "page_major")
 
 
-class TestFactoryDenseViews(unittest.TestCase):
-    """The real SWA factory builds both sub-pools and wires the matching
-    kernel-facing multipliers into the composite allocator."""
+class TestFactoryViews(unittest.TestCase):
+    """The real SWA factory builds the sub-pools and wires the matching
+    kernel-facing multipliers into the composite allocator. End-to-end over
+    that factory, the rebind must emit BOTH kernel-facing write locs."""
 
     # _swa_factory geometry: L_full = L_swa = 2, uniform 8/8 dims, ps = 1.
     FULL_MULT = 4  # 2 * L_full
@@ -521,10 +522,46 @@ class TestFactoryDenseViews(unittest.TestCase):
         alloc = b.token_to_kv_pool_allocator
         self.assertEqual(alloc.kernel_page_multiplier, self.FULL_MULT)
         self.assertEqual(alloc.swa_kernel_page_multiplier, self.SWA_MULT)
-        # Sub-pools are the dense class exposing stock 3-D per-layer views.
+        # Sub-pools expose stock 3-D per-layer views.
         self.assertEqual(b.token_to_kv_pool.full_kv_pool.k_buffer[0].dim(), 3)
         self.assertEqual(b.token_to_kv_pool.swa_kv_pool.k_buffer[0].dim(), 3)
         self.assertGreater(pool.view_tail_pad_bytes, 0)
+
+    def test_rebind_emits_kernel_facing_full_and_build_derives_swa(self):
+        """End-to-end over the real factory: rebind_write_loc rebinds
+        out_cache_loc to FULL-kernel-facing ids (phase 1), and the per-batch build
+        derives the SWA write loc pointwise from those kernel-facing values
+        (phase 2) — both checked against the formulas over the VIRTUAL
+        ids."""
+        from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+
+        b = self._bundle()
+        alloc = b.token_to_kv_pool_allocator
+        v = alloc.alloc(4)
+        self.assertIsNotNone(v)
+        expected_full = alloc.full_v2p_page_table[v] * self.FULL_MULT  # ps=1
+        expected_swa = alloc.swa_v2p_page_table[v] * self.SWA_MULT
+
+        class _FB:
+            pass
+
+        fb = _FB()
+        fb.out_cache_loc = v.clone()
+        source = KVIndexTranslator(
+            req_to_token=torch.zeros((2, 8), dtype=torch.int64),
+            token_to_kv_pool_allocator=alloc,
+            token_to_kv_pool=b.token_to_kv_pool,
+            page_size=1,
+            device="cpu",
+        )
+        self.assertTrue(source.is_translating)
+        source.rebind_write_loc(fb)
+        self.assertTrue(torch.equal(fb.out_cache_loc, expected_full))
+        self.assertTrue(
+            torch.equal(
+                source.sliding_window_write_loc_for(fb.out_cache_loc), expected_swa
+            )
+        )
 
 
 if __name__ == "__main__":

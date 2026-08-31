@@ -1093,6 +1093,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             room = kv_chunk.room
             handles: List[Any] = []
             try:
+                if room not in self.request_status:
+                    logger.debug(
+                        "Skipping chunk for room %s because it has been cleared",
+                        room,
+                    )
+                    self._staging_outstanding.pop(room, None)
+                    continue
+
                 # Counted at dequeue, before the status check, so
                 # `outstanding == 0` means nothing is dequeued or in flight --
                 # the predicate the abort ack relies on. The flag survives
@@ -1108,7 +1116,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         self._maybe_ack_drained_abort(room)
                     continue
 
-                assert room in self.transfer_infos
+                room_transfer_infos = self.transfer_infos.get(room)
+                if room_transfer_infos is None:
+                    logger.debug(
+                        "Skipping chunk for room %s because its transfer metadata "
+                        "has been cleared",
+                        room,
+                    )
+                    self._staging_outstanding.pop(room, None)
+                    continue
 
                 # Lazily build a per-worker staging strategy bound to this
                 # worker's private staging buffer (matches mooncake).
@@ -1121,7 +1137,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                 self.update_status(room, KVPoll.Transferring)
 
-                reqs_to_be_processed = list(self.transfer_infos[room].values())
+                reqs_to_be_processed = list(room_transfer_infos.values())
                 # Note(kpham-sgl): Pack each DCP rank once into its fixed region.
                 # NIXL reads regions asynchronously; the chunk barrier prevents
                 # reuse until every transfer completes.

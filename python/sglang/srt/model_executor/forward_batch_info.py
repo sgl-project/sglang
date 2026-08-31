@@ -828,6 +828,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         device = model_runner.device
 
+        model_runner.kv_index_translator.rebind_write_loc(ret)
+
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_tensor(
                 rids=[req.rid for req in batch.reqs],

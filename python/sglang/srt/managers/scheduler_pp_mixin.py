@@ -723,15 +723,15 @@ class SchedulerPPMixin:
                 latencies.append(latency_ms)
 
                 # Release KV and Mamba cache
-                if req.kv.is_held:
+                if req.kv.holds_kv:
                     kv_indices = self.req_to_token_pool.req_to_token[
                         req.kv.req_pool_idx, : req.extend_range.end
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
-                    if req.mamba_pool_idx is not None:
+                    if req.kv.holds_mamba:
                         self.req_to_token_pool.free_mamba_cache(req)
                     self.req_to_token_pool.free(req)
-                    req.kv.mark_released()
+                    req.kv.mark_kv_released()
 
             logger.info(
                 f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "

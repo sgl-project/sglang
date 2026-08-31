@@ -1938,7 +1938,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> tuple[PoolTransfer, dict[ComponentType, list[PoolTransfer]]]:
         """Build the H->D load-back KV transfer plus per-component aux transfers."""
         # Component hooks take primitives, not Req: extract its fields here.
-        mamba_pool_idx = req.mamba_pool_idx if req is not None else None
+        mamba_pool_idx = req.kv.mamba_pool_idx if req is not None else None
         node = self.node_by_id(node_id)
         kv_xfer = self.components_by_type[BASE_COMPONENT_TYPE].build_hicache_transfers(
             node, CacheTransferPhase.LOAD_BACK
