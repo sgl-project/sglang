@@ -36,6 +36,7 @@ import sglang.multimodal_gen.runtime.models.dits.flux_2 as flux2
 import sglang.multimodal_gen.runtime.models.dits.glm_image as glm_image
 import sglang.multimodal_gen.runtime.models.dits.longcat_image as longcat_image
 import sglang.multimodal_gen.runtime.models.dits.ltx_2 as ltx2_module
+import sglang.multimodal_gen.runtime.models.dits.qwen_image as qwen_image
 import sglang.multimodal_gen.runtime.models.dits.sana as sana
 from sglang.kernels.ops.diffusion import (
     can_use_fused_layernorm_modulate,
@@ -50,6 +51,7 @@ from sglang.kernels.ops.diffusion import (
     mount_fused_ln_modulate,
     mount_hunyuan_qknorm,
     mount_ltx2_rms_norm_modulate,
+    try_flux2_token_cat_nvfp4,
     unmount_hunyuan_qknorm,
     unmount_ltx2_rms_norm_modulate,
     wan_rmsnorm_silu,
@@ -98,6 +100,7 @@ from sglang.multimodal_gen.runtime.models.dits.ltx_2 import _ltx2_rms_norm_modul
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformerBlock,
     _qwen_modulation_cache_key,
+    _qwen_norm_out,
 )
 from sglang.multimodal_gen.runtime.models.dits.sana import (
     _eager_ln_modulate as _sana_eager_ln_modulate,
@@ -149,6 +152,81 @@ def test_bitexact_norm_guards_follow_platform():
     assert can_use_fused_layernorm_modulate(x, row, row) is is_cuda()
     assert can_use_fused_qk_head_layernorm(q, q) is is_cuda()
     assert can_use_fused_rmsnorm_scale_shift(x, weight, vec, vec) is is_cuda()
+
+
+# -------------------------------------------------------------------------
+# Qwen-Image -- final LayerNorm + adaLN scale/shift
+# -------------------------------------------------------------------------
+
+
+@requires_inline_ptx
+def test_qwen_norm_out_matches_adaln_reference():
+    qwen_image._QWEN_NORM_OUT.disabled = False
+    qwen_image._QWEN_NORM_OUT.verified = False
+    qwen_image._QWEN_NORM_OUT_SIGS.clear()
+    torch.manual_seed(0)
+    norm_out = (
+        qwen_image.AdaLayerNormContinuous(
+            3072, 3072, elementwise_affine=False, eps=1e-6
+        )
+        .cuda()
+        .bfloat16()
+    )
+    hidden_states = torch.randn(1, 257, 3072, device="cuda", dtype=torch.bfloat16)
+    conditioning = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)
+
+    expected = norm_out(hidden_states, conditioning)
+    actual = _qwen_norm_out(norm_out, hidden_states, conditioning)
+
+    assert torch.equal(actual, expected)
+    assert qwen_image._QWEN_NORM_OUT.verified
+    assert not qwen_image._QWEN_NORM_OUT.disabled
+
+
+def test_qwen_norm_out_preserves_compile_path(monkeypatch):
+    norm_out = (
+        qwen_image.AdaLayerNormContinuous(16, 16, elementwise_affine=False, eps=1e-6)
+        .cuda()
+        .bfloat16()
+    )
+    hidden_states = torch.randn(1, 3, 16, device="cuda", dtype=torch.bfloat16)
+    conditioning = torch.randn(1, 16, device="cuda", dtype=torch.bfloat16)
+    expected = norm_out(hidden_states, conditioning)
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(
+        qwen_image,
+        "fused_layernorm_modulate_raw",
+        lambda *args, **kwargs: pytest.fail("compile path must not dispatch kernel"),
+    )
+
+    assert torch.equal(_qwen_norm_out(norm_out, hidden_states, conditioning), expected)
+
+
+def test_qwen_norm_out_does_not_verify_during_graph_capture(monkeypatch):
+    qwen_image._QWEN_NORM_OUT.disabled = False
+    qwen_image._QWEN_NORM_OUT.verified = False
+    qwen_image._QWEN_NORM_OUT_SIGS.clear()
+    norm_out = (
+        qwen_image.AdaLayerNormContinuous(
+            3072, 3072, elementwise_affine=False, eps=1e-6
+        )
+        .cuda()
+        .bfloat16()
+    )
+    hidden_states = torch.randn(1, 17, 3072, device="cuda", dtype=torch.bfloat16)
+    conditioning = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)
+    expected = norm_out(hidden_states, conditioning)
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        qwen_image,
+        "fused_layernorm_modulate_raw",
+        lambda *args, **kwargs: pytest.fail("capture must not verify a new layout"),
+    )
+
+    assert torch.equal(_qwen_norm_out(norm_out, hidden_states, conditioning), expected)
+    assert not qwen_image._QWEN_NORM_OUT_SIGS
 
 
 # -------------------------------------------------------------------------
@@ -293,6 +371,40 @@ class TestFlux2EagerFusions(CustomTestCase):
         expected = F.silu(second[..., :384]) * second[..., 384:]
         self.assertTrue(torch.equal(actual, expected))
         self.assertEqual(len(flux2._FLUX2_SWIGLU_SIGS), 1)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
+        reason="FLUX.2 token-cat NVFP4 requires Blackwell SM103",
+    )
+    def test_token_cat_nvfp4_matches_flashinfer(self):
+        import flashinfer
+
+        torch.manual_seed(20260830)
+        attention = torch.randn(1, 17, 6144, device="cuda", dtype=torch.bfloat16)
+        mlp = torch.randn(1, 17, 18432, device="cuda", dtype=torch.bfloat16)
+        global_scale = torch.tensor(0.625, device="cuda", dtype=torch.float32)
+
+        expected_fp4, expected_scales = flashinfer.fp4_quantize(
+            torch.cat([attention, mlp], dim=-1).view(-1, 24576), global_scale
+        )
+        actual = try_flux2_token_cat_nvfp4(attention, mlp, global_scale)
+
+        self.assertIsNotNone(actual)
+        actual_fp4, actual_scales = actual
+        self.assertTrue(torch.equal(actual_fp4, expected_fp4))
+        self.assertTrue(
+            torch.equal(
+                actual_scales.view(torch.uint8), expected_scales.view(torch.uint8)
+            )
+        )
+
+    def test_token_cat_nvfp4_falls_back_while_compiling(self):
+        attention = torch.empty(1, 1, 6144, device="cuda", dtype=torch.bfloat16)
+        mlp = torch.empty(1, 1, 18432, device="cuda", dtype=torch.bfloat16)
+        global_scale = torch.ones(1, device="cuda", dtype=torch.float32)
+
+        with patch("torch.compiler.is_compiling", return_value=True):
+            self.assertIsNone(try_flux2_token_cat_nvfp4(attention, mlp, global_scale))
 
 
 # -------------------------------------------------------------------------

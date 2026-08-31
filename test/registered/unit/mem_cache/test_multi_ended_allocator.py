@@ -1971,9 +1971,9 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         swa_mult = allocator.swa_kernel_page_multiplier
         self.assertEqual(swa_mult, 2 * swa_spec.layer_num)
         composite_out = allocator.translate_loc_from_full_to_swa(v_tokens)
-        expected_dense = swa_phys_pages_direct * (PS * swa_mult) + offsets_in
+        expected_kernel = swa_phys_pages_direct * (PS * swa_mult) + offsets_in
         self.assertTrue(
-            bool((composite_out.long() == expected_dense.long()).all().item()),
+            bool((composite_out.long() == expected_kernel.long()).all().item()),
             "REGRESSION: translate_loc_from_full_to_swa must emit the swa "
             "sub-pool's kernel-facing ids (phys_page * ps * blocks_per_page + offset).",
         )
@@ -2622,8 +2622,8 @@ class TestO3FusedAllocBind(unittest.TestCase):
             self.assertEqual(int(sa.physical_to_virtual[p].item()), v)
 
 
-class TestSWACompositeDenseSurface(unittest.TestCase):
-    """The SWA composite's dense (kernel-facing) id surface.
+class TestSWACompositeKernelIdSurface(unittest.TestCase):
+    """The SWA composite's kernel-facing id surface.
 
     Presence of `translate_kv_loc_for_kernel` / `full_v2p_page_table` is what flips
     the attention backends' kernel-facing-first probes, and the `page_stride` scale in
@@ -2678,7 +2678,7 @@ class TestSWACompositeDenseSurface(unittest.TestCase):
     def test_multipliers_come_from_the_specs(self):
         """Both sides scale by their OWN sub-pool's block count, and the
         composite exposes the raw v2p tables unwrapped. Nothing injects the
-        scale: a spec whose views are dense cannot be paired with a
+        scale: a spec whose views carry every layer cannot be paired with a
         physical-id multiplier, which is the state that writes physical ids
         into view rows."""
         a = self._build()
@@ -2687,7 +2687,7 @@ class TestSWACompositeDenseSurface(unittest.TestCase):
         self.assertIs(a.full_v2p_page_table, a.full_attn_allocator.virtual_to_physical)
         self.assertIs(a.swa_v2p_page_table, a.swa_attn_allocator.virtual_to_physical)
 
-    def test_full_dense_translate_matches_formula(self):
+    def test_full_kernel_translate_matches_formula(self):
         mult = 2 * self.FULL_L
         a = self._build()
         v = a.alloc(3 * self.PS)
@@ -2700,7 +2700,7 @@ class TestSWACompositeDenseSurface(unittest.TestCase):
         phys = v2p[v // self.PS] * self.PS + v % self.PS
         self.assertTrue(torch.equal(a.translate_kv_loc(v), phys))
 
-    def test_dense_translate_accepts_an_int32_page_table(self):
+    def test_kernel_translate_accepts_an_int32_page_table(self):
         """REGRESSION: fa3 translates its own page table, which is int32 and
         2-D. A gather that requires an int64 index (`torch.take`) crashes the
         scheduler there while every int64 caller stays green. Both page sizes:
@@ -2732,7 +2732,7 @@ class TestSWACompositeDenseSurface(unittest.TestCase):
         expected = v2p_swa[v // self.PS] * (self.PS * mult) + v % self.PS
         self.assertTrue(torch.equal(a.translate_loc_from_full_to_swa(v), expected))
 
-    def test_swa_dense_tombstone_still_lands_on_sink(self):
+    def test_swa_kernel_tombstone_still_lands_on_sink(self):
         """The scaled stride must not break the tombstone clamp: a tombstoned
         page's ids (v2p == -1 -> -stride + offset, negative for every in-page
         offset) still land on the sink, never negative."""
@@ -2753,7 +2753,7 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
     flashmla arg snap). Large pages stress every sizing derivation at once —
     the 64-token sink-page floor, the ps*entry_bytes per-layer-view tail pad, and
     the page-granular alloc — so this pins that the factory-shaped
-    construction stays FEASIBLE and the dense surface stays on-formula when
+    construction stays FEASIBLE and the kernel-facing surface stays on-formula when
     the page size jumps from the usual 1..4 to 64."""
 
     PS = 64
@@ -2805,7 +2805,7 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
             forward_stream=None,
         )
 
-    def test_construction_alloc_and_dense_formula(self):
+    def test_construction_alloc_and_kernel_formula(self):
         a = self._build()
         # MLA: one latent row per layer, so the spec reports LAYERS blocks.
         self.assertEqual(a.kernel_page_multiplier, self.LAYERS)
@@ -2813,7 +2813,7 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
         self.assertIsNotNone(v, "2-page alloc infeasible at ps=64")
         # Page-aligned virtual run (page-granular allocator invariant).
         self.assertEqual(int(v[0].item()) % self.PS, 0)
-        # Dense translate follows the affine formula at ps=64, and every id
+        # The kernel translate follows the affine formula at ps=64, and every id
         # fits int32 (the canonical narrows on store).
         v2p = a.full_v2p_page_table
         want = v2p[v // self.PS] * (self.PS * self.LAYERS) + v % self.PS

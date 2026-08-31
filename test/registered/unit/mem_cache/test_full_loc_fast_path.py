@@ -273,7 +273,7 @@ class TestHybridLinearMLARouting(unittest.TestCase):
 
     - `set_kv_buffer` (MLA branch) mirrors the MHA branch — write the
       pre-translated `KVWriteLoc.full_loc` when present (unified pool, where it
-      carries the DENSE loc), else the raw `loc` (static pool, already physical).
+      carries the kernel-facing loc), else the raw `loc` (static pool, already physical).
     - `set_mla_kv_buffer` / `get_mla_kv_buffer` forward `loc` untouched:
       writes are kernel-facing since the ForwardBatch rebind, and read
       indices are translated at their production sites."""
@@ -290,19 +290,19 @@ class TestHybridLinearMLARouting(unittest.TestCase):
     def test_mla_writes_full_loc_from_write_loc(self):
         pool = self._make_bare_pool()
         virtual_loc = torch.tensor([7, 8, 9], dtype=torch.int64)
-        dense_phys = torch.tensor([21, 24, 27], dtype=torch.int64)
+        kernel_phys = torch.tensor([21, 24, 27], dtype=torch.int64)
 
         layer = types.SimpleNamespace(layer_id=0)
         pool.set_kv_buffer(
             layer,
-            _loc_info(virtual_loc, full_phys=dense_phys),
+            _loc_info(virtual_loc, full_phys=kernel_phys),
             torch.zeros(3, 1, 8),
             None,
         )
 
         self.assertEqual(len(pool.full_kv_pool.calls), 1)
         forwarded, _ = pool.full_kv_pool.calls[0]
-        self.assertIs(forwarded, dense_phys)
+        self.assertIs(forwarded, kernel_phys)
         self.assertIsNot(forwarded, virtual_loc)
 
     def test_mla_falls_back_to_loc_when_absent(self):
