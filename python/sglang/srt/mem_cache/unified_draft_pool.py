@@ -2,10 +2,11 @@
 unified pool: same pages, same slot ids, same v2p table as the target -- one
 allocation, one free, one relocation."""
 
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import torch
 
+from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 
@@ -109,3 +110,50 @@ def fused_draft_host_allocator(token_to_kv_pool: Any) -> Optional[Any]:
     if isinstance(token_to_kv_pool, UnifiedDraftKVPool):
         return token_to_kv_pool.host_allocator
     return None
+
+
+def draft_kv_layer_ids(model) -> List[int]:
+    """Layer ids owning attention KV in the BUILT draft model, in layer order.
+    Window layers count -- a window is a parameter of the attention layer;
+    linear and recurrent layers have no attention module and are absent."""
+    from sglang.srt.layers.radix_attention import RadixAttention
+
+    return sorted(
+        {m.layer_id for m in model.modules() if isinstance(m, RadixAttention)}
+    )
+
+
+def bind_fused_draft(
+    *,
+    unified_buffer: UnifiedKVPool,
+    host_allocator,
+    placement: FusedDraftPlacement,
+    runner: int,
+    kv_layer_ids: Sequence[int],
+    swa_layer_ids: Sequence[int],
+    page_size: int,
+) -> UnifiedDraftKVPool:
+    """The KV pool draft runner ``runner`` binds over its fused slots.
+
+    The placement sized the lanes from the draft config; the model's real
+    layer ids fill them in layer order, so a count mismatch is a loud boot
+    failure, never a silent alias.
+    """
+    swa = set(swa_layer_ids)
+    full_ids = [layer_id for layer_id in kv_layer_ids if layer_id not in swa]
+    assert len(full_ids) == len(kv_layer_ids), (
+        f"draft layers {sorted(swa & set(kv_layer_ids))} are SWA-kind; fused "
+        "SWA KV is not supported yet"
+    )
+    full_lanes = placement.lanes_for(runner)
+    assert len(full_ids) == len(full_lanes), (
+        f"draft runner {runner}: {len(full_ids)} full-attention layer(s) "
+        f"{full_ids} vs {len(full_lanes)} placed lane(s) {list(full_lanes)}"
+    )
+    return UnifiedDraftKVPool(
+        unified_buffer=unified_buffer,
+        host_sub_pool_name="full",
+        host_allocator=host_allocator,
+        layer_lanes=dict(zip(full_ids, full_lanes)),
+        page_size=page_size,
+    )
