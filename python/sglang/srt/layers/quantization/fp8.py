@@ -80,11 +80,13 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
-    is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
@@ -92,15 +94,12 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
-    is_sm90_supported,
-    is_sm100_supported,
-    is_sm120_supported,
+    is_xpu,
     log_info_on_rank0,
     mxfp8_block_convert_required,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
-    use_intel_xpu_backend,
 )
 
 if TYPE_CHECKING:
@@ -402,7 +401,7 @@ class Fp8Config(QuantizationConfig):
 
             if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
                 # SM100 uses TRT-LLM; SM90 uses W4A16 and SM120 uses MXFP8xMXFP4.
-                if is_sm90_supported() or is_sm120_supported():
+                if get_platform().is_sm90 or get_platform().is_sm120:
                     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
                         Mxfp4FlashinferCutlassMoEMethod,
                     )
@@ -793,7 +792,7 @@ class Fp8LinearMethod(LinearMethodBase):
             scale_u8 = layer.weight_scale_inv.data
             layer.weight_scale_inv_swizzled = None
             if n % 64 != 0 or k % 128 != 0:
-                if not (is_blackwell_supported() and is_flashinfer_available()):
+                if not (get_platform().is_blackwell and is_flashinfer_available()):
                     raise RuntimeError(
                         f"--fp8-gemm-backend=deep_gemm cannot serve MXFP8 weight shape "
                         f"({n}, {k}) (needs N % 64 == 0 and K % 128 == 0), and this "
@@ -1085,13 +1084,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
+        # The MxFP4 wrapper methods borrow this instance for weight loading;
+        # they never call create_moe_runner, so moe_runner_config is unset.
+        self._owns_moe_runner = False
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
             ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert (
-                is_sm100_supported() or is_sm90_supported() or is_sm120_supported()
+                get_platform().is_sm100
+                or get_platform().is_sm90
+                or get_platform().is_sm120
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
 
     @staticmethod
@@ -1144,11 +1148,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
 
         tp_size = get_parallel().tp_size
+        w13_num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
         w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
             is_aiter_moe=_use_aiter,
-            is_concat=True,
+            is_concat=layer.moe_runner_config.is_gated,
             is_packed=False,
         )
 
@@ -1182,7 +1187,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
-                    2 * intermediate_size_per_partition,
+                    w13_num_shards * intermediate_size_per_partition,
                     hidden_size // 2,
                     dtype=torch.int8,
                 ),
@@ -1202,7 +1207,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
-                    2 * intermediate_size_per_partition,
+                    w13_num_shards * intermediate_size_per_partition,
                     hidden_size // 8,
                     dtype=params_dtype,
                 ),
@@ -1249,13 +1254,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # BIAS (optional, e.g. GPT-OSS)
         if with_bias:
-            w13_up_dim = (
-                2 * intermediate_size_per_partition
-                if layer.moe_runner_config.is_gated
-                else intermediate_size_per_partition
-            )
             w13_weight_bias = torch.nn.Parameter(
-                torch.empty(num_experts, w13_up_dim, dtype=torch.float32),
+                torch.empty(
+                    num_experts,
+                    w13_num_shards * intermediate_size_per_partition,
+                    dtype=torch.float32,
+                ),
                 requires_grad=False,
             )
             layer.register_parameter("w13_weight_bias", w13_weight_bias)
@@ -1276,7 +1280,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
-                    2 * intermediate_size_per_partition,
+                    w13_num_shards * intermediate_size_per_partition,
                     hidden_size // fp4_block_k,
                     dtype=fp4_scale_dtype,
                 ),
@@ -1299,7 +1303,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight_scale = torch.nn.Parameter(
                 scale_init(
                     num_experts,
-                    2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                    w13_num_shards
+                    * ((intermediate_size_per_partition + block_n - 1) // block_n),
                     (hidden_size + block_k - 1) // block_k,
                     dtype=scale_dtype,
                 ),
@@ -1323,10 +1328,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert quant_config.activation_scheme == "dynamic"
 
         else:
-            # Allocate 2 scales for w1 and w3 respectively.
-            # They will be combined to a single scale after weight loading.
+            # One scale per w13 shard; a gated layer combines its two into a
+            # single scale after weight loading.
             w13_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+                torch.ones(num_experts, w13_num_shards, dtype=torch.float32),
+                requires_grad=False,
             )
             w2_weight_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
@@ -1339,7 +1345,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_weight_scale1 = torch.nn.Parameter(
                     torch.ones(
                         num_experts,
-                        2 * intermediate_size_per_partition,
+                        w13_num_shards * intermediate_size_per_partition,
                         dtype=torch.float32,
                     ),
                     requires_grad=False,
@@ -1695,7 +1701,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w13_weight_scale_inv.format_ue8m0 = True
                     layer.w2_weight_scale_inv.format_ue8m0 = True
 
-            if get_moe_a2a_backend().is_megamoe() and is_sm90_supported():
+            if get_moe_a2a_backend().is_megamoe() and get_platform().is_sm90:
                 from sglang.srt.layers.moe.mega_moe_sm90 import (
                     build_sm90_mega_moe_experts_weights,
                 )
@@ -1748,7 +1754,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
         if not (
-            (_is_cuda and is_sm100_supported()) or (_is_hip and _is_gfx95_supported)
+            (_is_cuda and get_platform().is_sm100) or (_is_hip and _is_gfx95_supported)
         ):
             raise RuntimeError(
                 "MXFP8 MoE quantization requires SM100 or ROCm gfx95 "
@@ -2106,20 +2112,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # Fp8 moe kernel needs single weight scale for w13 per expert.
             # We take the max then dequant and requant each expert.
             assert layer.w13_weight_scale is not None
+            w13_num_shards = 2 if layer.moe_runner_config.is_gated else 1
             shard_size = layer.intermediate_size_per_partition
             max_w13_scales = layer.w13_weight_scale.max(dim=1).values
-            for expert_id in range(layer.num_local_experts):
-                start = 0
-                for shard_id in range(2):
-                    dq_weight = per_tensor_dequantize(
-                        layer.w13_weight[expert_id][start : start + shard_size, :],
-                        layer.w13_weight_scale[expert_id][shard_id],
-                    )
-                    (
-                        layer.w13_weight[expert_id][start : start + shard_size, :],
-                        _,
-                    ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
-                    start += shard_size
+            # A single shard already carries one scale per expert; nothing to fuse.
+            if w13_num_shards > 1:
+                for expert_id in range(layer.num_local_experts):
+                    start = 0
+                    for shard_id in range(w13_num_shards):
+                        dq_weight = per_tensor_dequantize(
+                            layer.w13_weight[expert_id][start : start + shard_size, :],
+                            layer.w13_weight_scale[expert_id][shard_id],
+                        )
+                        (
+                            layer.w13_weight[expert_id][start : start + shard_size, :],
+                            _,
+                        ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+                        start += shard_size
 
             layer.w13_weight_scale = torch.nn.Parameter(
                 max_w13_scales, requires_grad=False
@@ -2139,10 +2148,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
+        # The runner backend is global, so it is also true for a borrowed delegate,
+        # which has no moe_runner_config and whose kernel ignores these params.
         if (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
-        ):
+        ) and self._owns_moe_runner:
             self._prepare_flashinfer_trtllm_activation_params(layer)
 
         if get_moe_runner_backend().is_hpc_ops():
@@ -2263,12 +2274,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # We won't do requant each expert's fp8 weight (not direct available),
         # instead we adjust half of INT4 w13_weight_scale1 numbers
         assert layer.w13_weight_scale is not None
+        w13_num_shards = 2 if layer.moe_runner_config.is_gated else 1
         shard_size = layer.intermediate_size_per_partition
         max_w13_scales = layer.w13_weight_scale.max(dim=1).values
         for expert_id in range(layer.num_local_experts):
             start = 0
             max_w13_scale_fp8 = max_w13_scales[expert_id]
-            for shard_id in range(2):
+            for shard_id in range(w13_num_shards):
                 if layer.w13_weight_scale[expert_id][shard_id] != max_w13_scale_fp8:
                     int4_rescale = (
                         layer.w13_weight_scale[expert_id][shard_id] / max_w13_scale_fp8
@@ -2319,6 +2331,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        self._owns_moe_runner = False
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
@@ -2343,6 +2356,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_hpc_ops()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            self._owns_moe_runner = True
         else:
             # TODO(cwan): refactor other backends
             pass
@@ -2422,10 +2436,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if quant_info is not None:
                 return self.runner.run(dispatch_output, quant_info)
 
-        if use_intel_xpu_backend() and not (
-            getattr(self, "runner", None) is not None
-            and self.runner.runner_backend.is_triton()
-        ):
+        if is_xpu() and not get_moe_runner_backend().is_triton():
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
 
@@ -2624,13 +2635,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         num_experts = layer.w13_weight.shape[0]
         hidden_size = layer.w2_weight.shape[1]
         intermediate_size_per_partition = layer.intermediate_size_per_partition
+        w13_num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
         self.ab_strides1 = torch.full(
             (num_experts,), hidden_size, device=device, dtype=torch.int64
         )
         self.c_strides1 = torch.full(
             (num_experts,),
-            2 * intermediate_size_per_partition,
+            w13_num_shards * intermediate_size_per_partition,
             device=device,
             dtype=torch.int64,
         )

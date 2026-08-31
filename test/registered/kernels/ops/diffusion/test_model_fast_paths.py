@@ -95,11 +95,15 @@ from sglang.multimodal_gen.runtime.models.dits.longcat_image import (
     _apply_longcat_qknorm_rope,
 )
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import _ltx2_rms_norm_modulate
+from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+    QwenImageTransformerBlock,
+    _qwen_modulation_cache_key,
+)
 from sglang.multimodal_gen.runtime.models.dits.sana import (
     _eager_ln_modulate as _sana_eager_ln_modulate,
 )
 from sglang.multimodal_gen.runtime.models.dits.sana import (
-    _sana_ln_modulate,
+    sana_ln_modulate,
 )
 from sglang.multimodal_gen.runtime.models.vaes import flux2_vae_cuda_opt as vae_opt
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
@@ -292,6 +296,117 @@ class TestFlux2EagerFusions(CustomTestCase):
 
 
 # -------------------------------------------------------------------------
+# Qwen-Image -- reuse timestep-only modulation across serial CFG branches
+# -------------------------------------------------------------------------
+
+
+class _CountingProjection(nn.Module):
+    def __init__(self, offset: float):
+        super().__init__()
+        self.offset = offset
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        return x + self.offset, None
+
+
+class TestQwenImageModulationCache(CustomTestCase):
+    def _block(self):
+        block = QwenImageTransformerBlock.__new__(QwenImageTransformerBlock)
+        nn.Module.__init__(block)
+        block.img_mod = nn.ModuleList([nn.Identity(), _CountingProjection(1.0)])
+        block.txt_mod = nn.ModuleList([nn.Identity(), _CountingProjection(2.0)])
+        block._modulation_cache = None
+        return block
+
+    def _key(self, timestep, hidden, additional_t_cond=None):
+        with torch.no_grad():
+            return _qwen_modulation_cache_key(
+                timestep,
+                additional_t_cond,
+                hidden,
+            )
+
+    def test_matching_cfg_key_reuses_both_modulation_projections(self):
+        block = self._block()
+        timestep = torch.tensor([500.0], device="cuda")
+        hidden = torch.empty(1, 17, 32, device="cuda", dtype=torch.bfloat16)
+        img_temb = torch.randn(1, 32, device="cuda", dtype=torch.bfloat16)
+        txt_temb = torch.randn_like(img_temb)
+        key = self._key(timestep, hidden)
+
+        first = block._get_modulation_params(img_temb, txt_temb, key)
+        second = block._get_modulation_params(img_temb, txt_temb, key)
+
+        self.assertIs(first[0], second[0])
+        self.assertIs(first[1], second[1])
+        self.assertIsNone(block._modulation_cache)
+        self.assertEqual(block.img_mod[1].calls, 1)
+        self.assertEqual(block.txt_mod[1].calls, 1)
+
+    def test_tensor_identity_version_and_condition_invalidate_cache(self):
+        block = self._block()
+        timestep = torch.tensor([500.0], device="cuda")
+        hidden = torch.empty(1, 17, 32, device="cuda", dtype=torch.bfloat16)
+        temb = torch.randn(1, 32, device="cuda", dtype=torch.bfloat16)
+        key = self._key(timestep, hidden)
+        block._get_modulation_params(temb, temb, key)
+
+        with torch.no_grad():
+            timestep.add_(1)
+        mutated = self._key(timestep, hidden)
+        block._get_modulation_params(temb, temb, mutated)
+        self.assertEqual(block.img_mod[1].calls, 2)
+
+        same_value_new_tensor = self._key(timestep.clone(), hidden)
+        block._get_modulation_params(temb, temb, same_value_new_tensor)
+        self.assertEqual(block.img_mod[1].calls, 3)
+
+        condition = torch.tensor([1], device="cuda")
+        conditioned = self._key(timestep, hidden, condition)
+        block._get_modulation_params(temb, temb, conditioned)
+        self.assertEqual(block.img_mod[1].calls, 4)
+
+    def test_grad_enabled_path_disables_and_clears_cache(self):
+        block = self._block()
+        timestep = torch.tensor([500.0], device="cuda")
+        hidden = torch.empty(1, 17, 32, device="cuda", dtype=torch.bfloat16)
+        temb = torch.randn(1, 32, device="cuda", dtype=torch.bfloat16)
+        key = self._key(timestep, hidden)
+        block._get_modulation_params(temb, temb, key)
+
+        self.assertIsNone(_qwen_modulation_cache_key(timestep, None, hidden))
+        block._get_modulation_params(temb, temb, None)
+
+        self.assertIsNone(block._modulation_cache)
+        self.assertEqual(block.img_mod[1].calls, 2)
+
+    def test_inference_tensors_cache_and_graph_path_falls_back(self):
+        block = self._block()
+        with torch.inference_mode():
+            timestep = torch.tensor([500.0], device="cuda")
+            hidden = torch.empty(1, 17, 32, device="cuda", dtype=torch.bfloat16)
+            temb = torch.randn(1, 32, device="cuda", dtype=torch.bfloat16)
+            key = _qwen_modulation_cache_key(timestep, None, hidden)
+
+            first = block._get_modulation_params(temb, temb, key)
+            second = block._get_modulation_params(temb, temb, key)
+
+        self.assertIs(first[0], second[0])
+        self.assertEqual(block.img_mod[1].calls, 1)
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.qwen_image.is_in_breakable_cuda_graph",
+                return_value=True,
+            ),
+            torch.no_grad(),
+        ):
+            self.assertIsNone(_qwen_modulation_cache_key(timestep, None, hidden))
+
+
+# -------------------------------------------------------------------------
 # GLM-Image -- LayerNorm + modulate and per-head qk LayerNorm
 # -------------------------------------------------------------------------
 
@@ -361,7 +476,7 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
     shift, scale = emb.chunk(nmod, dim=1)[0], emb.chunk(nmod, dim=1)[-1]
     # default-stream eager serving must stay on the untouched eager chain
     n_sigs = len(sana._SANA_LN_MOD.verified_sigs)
-    _sana_ln_modulate(norm, x, scale, shift)
+    sana_ln_modulate(norm, x, scale, shift)
     assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs
     # The fusion engages on non-default streams (the BCG warmup/capture path).
     # x/scale/shift were filled on the default stream, so the side stream must
@@ -373,9 +488,9 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        out = _sana_ln_modulate(norm, x, scale, shift)
+        out = sana_ln_modulate(norm, x, scale, shift)
         assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs + 1  # verified
-        out2 = _sana_ln_modulate(norm, x, scale, shift)  # verified-sig lane
+        out2 = sana_ln_modulate(norm, x, scale, shift)  # verified-sig lane
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
     assert torch.equal(out, _sana_eager_ln_modulate(norm, x, scale, shift))

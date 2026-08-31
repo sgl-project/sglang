@@ -719,7 +719,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             full_token_ids=[11, 12, 13],
             prefix_slot_ids=[2, 3],
             new_slot_ids=[4],
-            req_pool_idx=req.req_pool_idx,
+            req_pool_idx=req.kv.req_pool_idx,
         )
         runner.eval_pending(pending)
         runner.prefill_finalize(pending)
@@ -775,7 +775,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             full_token_ids=token_ids,
             prefix_slot_ids=[],
             new_slot_ids=list(range(1, 71)),
-            req_pool_idx=req.req_pool_idx,
+            req_pool_idx=req.kv.req_pool_idx,
             req=req,
         )
         runner.eval_pending(pending)
@@ -837,7 +837,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             full_token_ids=token_ids,
             prefix_slot_ids=list(range(1, 65)),
             new_slot_ids=list(range(65, 258)),
-            req_pool_idx=req.req_pool_idx,
+            req_pool_idx=req.kv.req_pool_idx,
             req=req,
         )
         runner.eval_pending(pending)
@@ -877,6 +877,17 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(forked.tolist(), [3])
         self.assertEqual(restored[0].state[0].tolist(), [1.0])
         self.assertEqual(pool.available_size(), 3)
+        self.assertEqual(pool.schedulable_available_size(), 3)
+
+    def test_auxiliary_state_pool_returns_unused_group_slots(self):
+        pool = MlxAuxiliaryStatePool(size=4, device="cpu")
+
+        pool.alloc_group_begin(3)
+        allocated = pool.alloc(1)
+        pool.alloc_group_end()
+
+        self.assertEqual(allocated.tolist(), [1])
+        self.assertEqual(pool.available_size(), 3)
 
     def test_auxiliary_state_pool_restores_instance_meta_state(self):
         pool = MlxAuxiliaryStatePool(size=2, device="cpu")
@@ -906,7 +917,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req = FakeRequest()
 
         req_indices = pool.alloc([req])
-        auxiliary_state_idx = pool.get_auxiliary_state_indices(req.req_pool_idx)
+        auxiliary_state_idx = pool.get_auxiliary_state_indices(req.kv.req_pool_idx)
         pool.free(req)
 
         # Which free slot a fresh alloc gets is not semantically meaningful
@@ -914,8 +925,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(len(req_indices), 1)
         self.assertIn(req_indices[0], range(1, pool.size + 1))
         self.assertIsNotNone(auxiliary_state_idx)
-        self.assertIsNone(req.req_pool_idx)
+        self.assertIsNone(req.kv.req_pool_idx)
         self.assertIsNotNone(req.mamba_pool_idx)
+        self.assertIs(pool.mamba_allocator, pool.mamba_pool)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
         pool.free_auxiliary_state_cache(req)
         self.assertIsNone(req.mamba_pool_idx)
@@ -1188,10 +1200,6 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             disaggregation_mode=None,
             enable_overlap=False,
             enable_overlap_mlx=False,
-            server_args=SimpleNamespace(
-                disaggregation_decode_enable_offload_kvcache=False,
-                enable_hisparse=False,
-            ),
             model_config=None,
             token_to_kv_pool_allocator=None,
             tree_cache=tree_cache,
@@ -1208,6 +1216,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             ),
             logprob_result_processor=None,
             output_streamer=None,
+            beam_coordinator=None,
             abort_request=lambda req: None,
         )
         # Stub out the methods _handle_finish_state_updated_req calls that
@@ -1509,10 +1518,9 @@ if _HAS_MLX:
 
     class FakeRequest:
         def __init__(self):
-            self.req_pool_idx = None
+            self.kv = SimpleNamespace(req_pool_idx=None)
             self.mamba_pool_idx = None
             self.inflight_middle_chunks = 0
-            self.kv_committed_len = 0
 
     class FakeTpWorker:
         def __init__(self, next_token_ids):

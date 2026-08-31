@@ -10,13 +10,22 @@ from safetensors.torch import save_file
 from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.linear import LinearBase
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
+    ComfyFullPrecisionNvfp4LinearMethod,
+    ComfyNvfp4Config,
+    ComfyRowwiseInt8EmbeddingMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
+    KitchenW4A4Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
     KitchenW4A8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
     NativeComponentLoaderRequired,
@@ -24,16 +33,22 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
     TextEncoderLoader,
     _configure_encoder_quantization,
+    _get_encoder_quant_config,
     _process_quantized_encoder_weights,
     _require_quantized_encoder_layers,
     _resolve_and_configure_encoder_quantization,
 )
-from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.loader.gguf_weights import GGUFTensorMeta
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    EncoderTensorParallelMixin,
+    TextEncoder,
+)
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3ConditioningProjection,
     MiniMaxH3Qwen3VLEncoder,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextModel
+from sglang.srt.layers.linear import LinearBase as SrtLinearBase
 
 
 class TestTextEncoderClassResolution(unittest.TestCase):
@@ -122,6 +137,13 @@ class TestTextEncoderClassResolution(unittest.TestCase):
     def test_unknown_architecture_falls_back_to_automodel(self):
         self.assertIs(self._resolve(True, ["NotARealClass"]), transformers.AutoModel)
 
+    def test_tensor_parallel_encoder_keeps_checkpoint_weights_by_default(self):
+        self.assertTrue(
+            EncoderTensorParallelMixin.should_materialize_checkpoint_weight(
+                "model.layers.0.self_attn.q_proj.weight"
+            )
+        )
+
     def test_bitsandbytes_native_load_requires_resident_encoder(self):
         loaded_encoder = nn.Linear(1, 1)
         transformers_model_class = SimpleNamespace(
@@ -129,7 +151,9 @@ class TestTextEncoderClassResolution(unittest.TestCase):
         )
         server_args = SimpleNamespace(
             pipeline_config=SimpleNamespace(text_encoder_precisions=["bf16"]),
+            explicit_residency_mode=mock.Mock(return_value=None),
             require_component_resident=mock.Mock(),
+            should_use_fsdp_for_component=mock.Mock(return_value=False),
             revision=None,
             trust_remote_code=False,
         )
@@ -140,16 +164,21 @@ class TestTextEncoderClassResolution(unittest.TestCase):
             }
         }
 
+        loader = TextEncoderLoader()
         with mock.patch.object(
             TextEncoderLoader,
             "resolve_native_transformers_model_class",
             return_value=transformers_model_class,
+        ), mock.patch.object(
+            loader,
+            "target_device",
+            return_value=torch.device("cuda:0"),
         ), mock.patch(
             "sglang.multimodal_gen.runtime.loader.component_loaders."
             "component_loader.get_hf_config",
             return_value=component_config,
         ):
-            encoder = TextEncoderLoader().load_native(
+            encoder = loader.load_native(
                 "/model/text_encoder",
                 server_args,
                 "transformers",
@@ -159,7 +188,7 @@ class TestTextEncoderClassResolution(unittest.TestCase):
         self.assertIs(encoder, loaded_encoder)
         server_args.require_component_resident.assert_called_once_with(
             "text_encoder",
-            feature_name="Transformers bitsandbytes component",
+            feature_name="Transformers quantized component",
         )
         transformers_model_class.from_pretrained.assert_called_once_with(
             "/model/text_encoder",
@@ -167,6 +196,7 @@ class TestTextEncoderClassResolution(unittest.TestCase):
             trust_remote_code=False,
             revision=None,
             torch_dtype=torch.bfloat16,
+            device_map={"": torch.device("cuda:0")},
         )
 
 
@@ -186,7 +216,7 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
             "model.layers.49.self_attn.q_proj.weight": True,
             "model.layers.50.self_attn.q_proj.weight": False,
             "visual.blocks.0.attn.qkv.weight": True,
-            "language_model.layers.63.mlp.down_proj.weight": True,
+            "language_model.layers.63.mlp.down_proj.weight": False,
             "module.model.language_model.layers.63.mlp.down_proj.weight": True,
         }
         self.assertEqual(
@@ -334,6 +364,25 @@ class TestTextEncoderQuantization(unittest.TestCase):
         )
         self.assertIs(model_config.quant_config, self.serialized)
 
+    def test_explicit_online_quantization_configures_native_encoder(self):
+        model_config = SimpleNamespace(quant_config=None)
+        self.get_quant_config.return_value = None
+
+        _configure_encoder_quantization(
+            model_config,
+            TextEncoder,
+            {},
+            "/model/text_encoder",
+            "/model/text_encoder",
+            "text_encoder",
+            explicit_quantization="kitchen_int8",
+            ignored_layers=["lm_head"],
+        )
+
+        self.assertIsInstance(model_config.quant_config, KitchenInt8Config)
+        self.assertFalse(model_config.quant_config.is_checkpoint_int8_serialized)
+        self.assertEqual(model_config.quant_config.ignored_layers, ["lm_head"])
+
     def test_weight_file_metadata_configures_native_encoder(self):
         model_config = SimpleNamespace(quant_config=None)
         self.get_quant_config.return_value = None
@@ -366,11 +415,11 @@ class TestTextEncoderQuantization(unittest.TestCase):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
             save_file(
                 {
-                    "model.layers.0.self_attn.q_proj.weight": torch.ones(
+                    "visual.blocks.0.attn.qkv.weight": torch.ones(
                         (2, 256), dtype=torch.int8
                     ),
-                    "model.layers.0.self_attn.q_proj.weight_scale": torch.ones((2, 1)),
-                    "model.layers.0.self_attn.q_proj.comfy_quant": torch.tensor(
+                    "visual.blocks.0.attn.qkv.weight_scale": torch.ones((2, 1)),
+                    "visual.blocks.0.attn.qkv.comfy_quant": torch.tensor(
                         list(marker), dtype=torch.uint8
                     ),
                 },
@@ -392,6 +441,45 @@ class TestTextEncoderQuantization(unittest.TestCase):
                 )
 
         self.assertIsInstance(model_config.quant_config, KitchenInt8Config)
+        self.assertEqual(
+            set(model_config.quant_config.layer_markers),
+            {"model.visual.blocks.0.attn.qkv_proj"},
+        )
+
+    def test_comfy_w4a4_weight_file_configures_native_encoder(self):
+        self.get_quant_config.return_value = None
+        marker = json.dumps(
+            {"format": "convrot_w4a4", "convrot_groupsize": 256}
+        ).encode()
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            save_file(
+                {
+                    "model.layers.0.self_attn.q_proj.weight": torch.ones(
+                        (2, 128), dtype=torch.int8
+                    ),
+                    "model.layers.0.self_attn.q_proj.weight_scale": torch.ones(2),
+                    "model.layers.0.self_attn.q_proj.comfy_quant": torch.tensor(
+                        list(marker), dtype=torch.uint8
+                    ),
+                },
+                checkpoint.name,
+            )
+            model_config = SimpleNamespace(quant_config=None)
+            with mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "text_encoder_loader.get_quant_config_from_safetensors_metadata",
+                return_value=None,
+            ):
+                _configure_encoder_quantization(
+                    model_config,
+                    MiniMaxH3Qwen3VLEncoder,
+                    {},
+                    "/model/text_encoder",
+                    checkpoint.name,
+                    "text_encoder",
+                )
+
+        self.assertIsInstance(model_config.quant_config, KitchenW4A4Config)
         self.assertEqual(
             set(model_config.quant_config.layer_markers),
             {"model.language_model.layers.0.self_attn.q_proj"},
@@ -451,6 +539,158 @@ class TestTextEncoderQuantization(unittest.TestCase):
             model_config.quant_config.layer_markers,
         )
 
+    def test_nvfp4_awq_weight_file_maps_embedding_and_linear_markers(self):
+        self.get_quant_config.return_value = None
+        layers = {
+            "model.embed_tokens": {"format": "int8_tensorwise"},
+            "model.layers.0.self_attn.o_proj": {
+                "format": "nvfp4",
+                "full_precision_matrix_mult": True,
+            },
+        }
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            save_file(
+                {
+                    "model.embed_tokens.weight": torch.ones((4, 64), dtype=torch.int8),
+                    "model.embed_tokens.weight_scale": torch.ones(4, 1),
+                    "model.layers.0.self_attn.o_proj.weight": torch.full(
+                        (128, 32), 0x21, dtype=torch.uint8
+                    ),
+                    "model.layers.0.self_attn.o_proj.weight_scale": torch.ones(
+                        (128, 4), dtype=torch.float8_e4m3fn
+                    ),
+                    "model.layers.0.self_attn.o_proj.weight_scale_2": torch.tensor(0.5),
+                    "model.layers.0.self_attn.o_proj.pre_quant_scale": torch.ones(
+                        64, dtype=torch.bfloat16
+                    ),
+                },
+                checkpoint.name,
+                metadata={"_quantization_metadata": json.dumps({"layers": layers})},
+            )
+            model_config = SimpleNamespace(quant_config=None)
+            with mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "text_encoder_loader.get_quant_config_from_safetensors_metadata",
+                return_value=None,
+            ):
+                _configure_encoder_quantization(
+                    model_config,
+                    MiniMaxH3Qwen3VLEncoder,
+                    {},
+                    "/model/text_encoder",
+                    checkpoint.name,
+                    "text_encoder",
+                )
+
+        self.assertIsInstance(model_config.quant_config, ComfyNvfp4Config)
+        self.assertTrue(
+            model_config.quant_config.quantizes_embedding(
+                "model.language_model.embed_tokens"
+            )
+        )
+        marker = model_config.quant_config.layer_markers[
+            "model.language_model.layers.0.self_attn.o_proj"
+        ]
+        self.assertTrue(marker["_has_pre_quant_scale"])
+
+    def test_nvfp4_awq_portable_linear_and_rowwise_embedding(self):
+        config = ComfyNvfp4Config(
+            {
+                "proj": {
+                    "format": "nvfp4",
+                    "full_precision_matrix_mult": True,
+                    "_has_pre_quant_scale": True,
+                }
+            }
+        )
+        method = ComfyFullPrecisionNvfp4LinearMethod(config, has_pre_quant_scale=True)
+        layer = nn.Module()
+        layer.weight = nn.Parameter(
+            torch.full((128, 32), 0x21, dtype=torch.uint8), requires_grad=False
+        )
+        layer.weight_scale = nn.Parameter(
+            torch.ones((128, 4), dtype=torch.float8_e4m3fn), requires_grad=False
+        )
+        layer.weight_scale_2 = nn.Parameter(torch.tensor(0.5), requires_grad=False)
+        layer.pre_quant_scale = nn.Parameter(
+            torch.full((64,), 2.0), requires_grad=False
+        )
+        inputs = torch.zeros(1, 64)
+        inputs[:, 0::2] = 1
+
+        output = method.apply(layer, inputs)
+
+        torch.testing.assert_close(output, torch.full((1, 128), 32.0))
+
+        embedding_method = ComfyRowwiseInt8EmbeddingMethod()
+        embedding = nn.Module()
+        embedding_method.create_weights(
+            embedding,
+            input_size_per_partition=2,
+            output_partition_sizes=[3],
+            input_size=2,
+            output_size=3,
+            params_dtype=torch.bfloat16,
+        )
+        embedding.weight.data.copy_(torch.tensor([[1, 2], [3, 4], [5, 6]]))
+        embedding.weight_scale.data.copy_(torch.tensor([[0.5], [1.0], [2.0]]))
+        rows = embedding_method.embedding(embedding, torch.tensor([2, 0]))
+        torch.testing.assert_close(
+            rows,
+            torch.tensor([[10.0, 12.0], [0.5, 1.0]], dtype=torch.bfloat16),
+        )
+
+    def test_gguf_maps_h3_names_and_drops_unused_language_layers(self):
+        self.get_quant_config.return_value = None
+
+        def meta(name: str) -> GGUFTensorMeta:
+            return GGUFTensorMeta(
+                ggml_type=12,
+                logical_shape=(2, 256),
+                stored_shape=(2, 144),
+                stored_dtype=torch.uint8,
+                param_name=f"{name.removesuffix('.weight')}.qweight",
+            )
+
+        checkpoint_meta = {
+            name: meta(name)
+            for name in (
+                "model.layers.49.self_attn.q_proj.weight",
+                "model.layers.50.self_attn.q_proj.weight",
+                "visual.blocks.0.attn.qkv.weight",
+            )
+        }
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.loader.component_loaders."
+            "text_encoder_loader.read_gguf_tensor_meta",
+            return_value=checkpoint_meta,
+        ):
+            config = _get_encoder_quant_config(
+                {},
+                "/model/text_encoder",
+                "/weights/encoder.gguf",
+                MiniMaxH3Qwen3VLEncoder,
+            )
+
+        self.assertIsInstance(config, GGUFConfig)
+        encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
+        encoder.selected_lm_layer = 50
+        config.retain_tensor_meta(encoder.should_materialize_checkpoint_weight)
+        self.assertEqual(
+            config.quantized_prefixes,
+            {"model.language_model.layers.49.self_attn.q_proj"},
+        )
+        vision_meta = config.tensor_meta["model.visual.blocks.0.attn.qkv_proj.weight"]
+        self.assertTrue(vision_meta.dequantize_on_load)
+        self.assertEqual(
+            vision_meta.param_name,
+            "model.visual.blocks.0.attn.qkv_proj.weight",
+        )
+        self.assertNotIn(
+            "model.language_model.layers.50.self_attn.q_proj.weight",
+            config.tensor_meta,
+        )
+
     def test_encoder_must_use_native_loader(self):
         model_config = SimpleNamespace(quant_config=None)
         with self.assertRaisesRegex(
@@ -480,7 +720,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
         ):
             with self.subTest(architecture=architecture), self.assertRaisesRegex(
                 NativeComponentLoaderRequired,
-                "delegates serialized bitsandbytes checkpoint loading to Transformers",
+                "delegates serialized quant_method='bitsandbytes' checkpoint",
             ):
                 _resolve_and_configure_encoder_quantization(
                     SimpleNamespace(architectures=[architecture], quant_config=None),
@@ -510,10 +750,10 @@ class TestTextEncoderQuantization(unittest.TestCase):
                 "text_encoder",
             )
 
-    def test_rejects_bitsandbytes_8bit(self):
+    def test_bitsandbytes_8bit_delegates_to_transformers(self):
         with self.assertRaisesRegex(
-            ComponentCheckpointUnsupportedError,
-            "supports only serialized BitsAndBytes 4-bit checkpoints",
+            NativeComponentLoaderRequired,
+            "delegates serialized quant_method='bitsandbytes' checkpoint",
         ):
             _resolve_and_configure_encoder_quantization(
                 SimpleNamespace(
@@ -524,6 +764,26 @@ class TestTextEncoderQuantization(unittest.TestCase):
                         "load_in_4bit": False,
                         "load_in_8bit": True,
                         "quant_method": "bitsandbytes",
+                    }
+                },
+                "/model/text_encoder",
+                "/model/text_encoder",
+                "text_encoder",
+            )
+
+    def test_unknown_fp8_architecture_delegates_to_transformers(self):
+        with self.assertRaisesRegex(
+            NativeComponentLoaderRequired,
+            "delegates serialized quant_method='fp8' checkpoint",
+        ):
+            _resolve_and_configure_encoder_quantization(
+                SimpleNamespace(
+                    architectures=["ThirdPartyTextEncoder"], quant_config=None
+                ),
+                {
+                    "quantization_config": {
+                        "quant_method": "fp8",
+                        "activation_scheme": "dynamic",
                     }
                 },
                 "/model/text_encoder",
@@ -581,7 +841,27 @@ class _QuantizedEncoder(nn.Module):
         self.unquantized = nn.Linear(2, 2, bias=False)
 
 
+class _SRTQuantizedLinear(SrtLinearBase):
+    def __init__(self, quant_method):
+        nn.Module.__init__(self)
+        self.weight = nn.Parameter(torch.empty(2, 2), requires_grad=False)
+        self.quant_method = quant_method
+
+
 class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
+    def test_processes_srt_quantized_linear(self):
+        quant_method = _RecordingQuantMethod()
+        model = _SRTQuantizedLinear(quant_method)
+
+        processed = _process_quantized_encoder_weights(
+            model,
+            torch.device("cpu"),
+            "image_encoder",
+        )
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(quant_method.devices, [torch.device("cpu")])
+
     def test_rejects_native_encoder_without_quantized_layers(self):
         with self.assertRaisesRegex(
             ComponentCheckpointUnsupportedError,

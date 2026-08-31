@@ -19,6 +19,7 @@ from transformers import (
     AutoTokenizer,
     PretrainedConfig,
 )
+from transformers.quantizers import AutoHfQuantizer
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
@@ -32,6 +33,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     get_memory_usage_of_component,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    RESIDENT,
     ComponentResidencyError,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
@@ -65,15 +67,15 @@ class NativeComponentLoaderRequired(RuntimeError):
     """The customized loader must defer to the native library loader."""
 
 
-def uses_native_transformers_bnb4(config: object, component_name: str) -> bool:
-    """Validate a serialized BnB4 checkpoint owned by Transformers."""
+def uses_native_transformers_quantization(config: object, component_name: str) -> bool:
+    """Validate quantization metadata that Transformers can restore itself."""
     try:
         quant_spec = resolve_checkpoint_quant_spec(config)
     except (TypeError, ValueError) as error:
         raise ComponentCheckpointUnsupportedError(
             f"Cannot parse checkpoint quantization for {component_name!r}: {error}"
         ) from error
-    if quant_spec is None or quant_spec.declared_method != "bitsandbytes":
+    if quant_spec is None:
         return False
     if quant_spec.source != "quantization_config":
         raise ComponentCheckpointUnsupportedError(
@@ -82,16 +84,18 @@ def uses_native_transformers_bnb4(config: object, component_name: str) -> bool:
             f"got metadata from {quant_spec.source!r}"
         )
 
-    load_in_4bit = quant_spec.config.get(
-        "load_in_4bit", quant_spec.config.get("_load_in_4bit")
-    )
-    load_in_8bit = quant_spec.config.get(
-        "load_in_8bit", quant_spec.config.get("_load_in_8bit", False)
-    )
-    if load_in_4bit is not True or load_in_8bit is True:
+    try:
+        supported = AutoHfQuantizer.supports_quant_method(dict(quant_spec.config))
+    except (TypeError, ValueError) as error:
         raise ComponentCheckpointUnsupportedError(
-            f"Transformers-managed {component_name!r} quantization supports only "
-            "serialized BitsAndBytes 4-bit checkpoints"
+            f"Cannot configure Transformers-managed quantization for "
+            f"{component_name!r}: {error}"
+        ) from error
+    if not supported:
+        method = quant_spec.declared_method or "unspecified"
+        raise ComponentCheckpointUnsupportedError(
+            f"Transformers does not support quant_method={method!r} declared by "
+            f"{component_name!r}"
         )
     return True
 
@@ -130,6 +134,13 @@ class ComponentLoader(ABC):
     # components may fall back when that global choice is incompatible; an
     # explicit --component-attention-backends entry remains strict.
     allow_global_attention_backend_fallback = True
+    # Gates only --component-quantizations.<name>. Quantization declared by a
+    # checkpoint is discovered and admitted by the component's normal loader.
+    supports_online_quantization_override = False
+    # Gates only --component-direct-gpu-weight-loading.<name>. The checkpoint
+    # source stays component-specific because its streaming ABI is loader-owned.
+    supports_direct_gpu_weight_loading = False
+    supports_fsdp_inference = False
 
     _loaders_registered = False
 
@@ -144,6 +155,7 @@ class ComponentLoader(ABC):
     def __init__(self, device=None) -> None:
         self.device = device
         self.component_architecture: str | None = None
+        self._native_load_manages_placement = False
 
     @staticmethod
     def target_device(component_starts_on_cpu: bool) -> torch.device:
@@ -160,13 +172,30 @@ class ComponentLoader(ABC):
     ) -> dict[str, Any]:
         return {}
 
+    def supports_direct_gpu_weight_loading_for_component(
+        self, _component_name: str
+    ) -> bool:
+        return self.supports_direct_gpu_weight_loading
+
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
-        native_only_components = getattr(
-            server_args.pipeline_config, "native_only_components", ()
-        )
-        return component_name in native_only_components
+        return component_name in server_args.pipeline_config.native_only_components
+
+    def validate_native_fallback(
+        self, _server_args: ServerArgs, _component_name: str
+    ) -> None:
+        """Validate that fallback preserves the exact component's runtime contract."""
+        pass
+
+    def disable_unsupported_component_fsdp(
+        self, server_args: ServerArgs, component_name: str
+    ) -> None:
+        if (
+            not self.supports_fsdp_inference
+            and server_args.should_use_fsdp_for_component(component_name)
+        ):
+            server_args.disable_fsdp_for_component(component_name)
 
     def _load_customized_with_context(
         self,
@@ -181,6 +210,12 @@ class ComponentLoader(ABC):
             attn_backend,
             component_name=component_attn_name,
             allow_global_backend_fallback=allow_global_backend_fallback,
+            require_component_backend_selection=(
+                attn_backend is None
+                or not server_args.is_component_attention_backend_automatic(
+                    component_attn_name
+                )
+            ),
         ):
             load_kwargs = self.customized_load_kwargs_for_component(
                 server_args, component_name
@@ -203,6 +238,12 @@ class ComponentLoader(ABC):
             attn_backend,
             component_name=component_attn_name,
             allow_global_backend_fallback=allow_global_backend_fallback,
+            require_component_backend_selection=(
+                attn_backend is None
+                or not server_args.is_component_attention_backend_automatic(
+                    component_attn_name
+                )
+            ),
         ):
             component = self.load_native(
                 component_model_path,
@@ -227,6 +268,25 @@ class ComponentLoader(ABC):
         If all of the above methods failed, an error will be thrown
 
         """
+        self._native_load_manages_placement = False
+        if server_args.should_direct_gpu_weight_load_component(
+            component_name
+        ) and not self.supports_direct_gpu_weight_loading_for_component(component_name):
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} does not support direct GPU weight loading"
+            )
+        self.disable_unsupported_component_fsdp(server_args, component_name)
+        component_quantization = server_args.component_quantizations.get(component_name)
+        if (
+            component_quantization is not None
+            and not self.supports_online_quantization_override
+        ):
+            raise ValueError(
+                f"{component_name!r} does not support an explicit quantization "
+                "override; "
+                "use a self-describing quantized component checkpoint when supported"
+            )
+
         gpu_mem_before_loading = current_platform.get_available_gpu_memory()
         logger.info(
             "Loading %s from %s. avail mem: %.2f GB",
@@ -269,6 +329,7 @@ class ComponentLoader(ABC):
                     f"Failed to load customized {component_name}; native fallback "
                     "is disabled for this component configuration."
                 ) from e
+            self.validate_native_fallback(server_args, component_name)
             if native_loader_required:
                 logger.info("%s", e)
             elif "Unsupported model architecture" in str(e):
@@ -303,7 +364,10 @@ class ComponentLoader(ABC):
         else:
             if isinstance(component, nn.Module):
                 component = component.eval()
-                if not is_fsdp_managed_module(component):
+                if (
+                    not is_fsdp_managed_module(component)
+                    and not self._native_load_manages_placement
+                ):
                     component = component.to(
                         self.target_device(
                             server_args.should_start_component_on_cpu(component_name)
@@ -342,16 +406,38 @@ class ComponentLoader(ABC):
             load_kwargs["torch_dtype"] = precision
 
         if transformers_or_diffusers == "transformers":
+            self._native_load_manages_placement = False
             config = get_hf_config(
                 component_model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
-            if uses_native_transformers_bnb4(config, component_name or "component"):
-                server_args.require_component_resident(
-                    component_name or "component",
-                    feature_name="Transformers bitsandbytes component",
+            if uses_native_transformers_quantization(
+                config, component_name or "component"
+            ):
+                resolved_component_name = component_name or "component"
+                explicit_residency = server_args.explicit_residency_mode(
+                    resolved_component_name
                 )
+                if explicit_residency is not None and explicit_residency != RESIDENT:
+                    raise ComponentCheckpointUnsupportedError(
+                        "Transformers-managed quantized component "
+                        f"{resolved_component_name!r} requires resident placement; "
+                        f"got explicit mode {explicit_residency!r}"
+                    )
+                server_args.require_component_resident(
+                    resolved_component_name,
+                    feature_name="Transformers quantized component",
+                )
+                if server_args.should_use_fsdp_for_component(resolved_component_name):
+                    raise ComponentCheckpointUnsupportedError(
+                        "Transformers-managed quantized components do not support "
+                        "SGLang FSDP loading"
+                    )
+                load_kwargs["device_map"] = {
+                    "": self.target_device(component_starts_on_cpu=False)
+                }
+                self._native_load_manages_placement = True
             model_class = self.resolve_native_transformers_model_class(config)
             return model_class.from_pretrained(
                 component_model_path,
@@ -657,6 +743,12 @@ class PipelineComponentLoader:
                 component_name=component_attn_name,
                 allow_global_backend_fallback=(
                     loader.allow_global_attention_backend_fallback
+                ),
+                require_component_backend_selection=(
+                    component_attn_backend is None
+                    or not server_args.is_component_attention_backend_automatic(
+                        component_attn_name
+                    )
                 ),
             ):
                 return loader.load(

@@ -3,7 +3,6 @@ This unittest is introduced in #22360, preventing duplicate transformer safetens
 """
 
 import json
-import os
 import sys
 import tempfile
 import types
@@ -60,6 +59,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
+    KitchenW4A4Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
     KitchenW4A8Config,
 )
@@ -70,8 +72,12 @@ from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
     Fp8LinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8 import (
+    KitchenInt8LinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
     ModelOptFp8Config,
     _prepare_nvfp4_weight_bytes,
 )
@@ -93,8 +99,8 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _Flux2Nvfp4FallbackAdapter,
     _needs_device_weight_postprocess,
     _resolve_quant_config,
+    resolve_transformer_checkpoint_files,
     resolve_transformer_quant_load_spec,
-    resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
@@ -255,50 +261,79 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         self.assertIsNone(backend)
 
-    def test_resolve_transformer_safetensors_to_load_uses_single_override_file(self):
+    def test_resolve_transformer_checkpoint_files_uses_single_override_file(self):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
             server_args = self._make_server_args(transformer_weights_path=f.name)
-            resolved = resolve_transformer_safetensors_to_load(
-                server_args, "/unused/component/path"
-            )
+            with (
+                patch(
+                    "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info"
+                ) as model_info,
+                patch(
+                    "sglang.multimodal_gen.runtime.weights.source.hf_hub_download"
+                ) as download,
+            ):
+                resolved = resolve_transformer_checkpoint_files(
+                    server_args, "/unused/component/path"
+                )
 
-        self.assertEqual(resolved, [f.name])
+        self.assertEqual(resolved.safetensors, (f.name,))
+        self.assertIsNone(resolved.config_path)
+        model_info.assert_not_called()
+        download.assert_not_called()
 
-    @patch(
-        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.hf_hub_download",
-        return_value="/cache/model.safetensors",
-    )
-    def test_resolve_transformer_safetensors_to_load_uses_hf_file_reference(
-        self, mock_download
-    ):
-        filename = "diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors"
+    def test_resolve_transformer_checkpoint_files_uses_one_hf_revision(self):
+        filename = "weights/model.safetensors"
         references = (
             (
-                f"https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/{filename}",
+                f"https://huggingface.co/owner/repo/resolve/main/{filename}",
                 "main",
             ),
-            (f"Comfy-Org/MiniMax-H3/{filename}", "test-revision"),
+            (f"owner/repo/{filename}", "test-revision"),
         )
 
         for reference, revision in references:
             with self.subTest(reference=reference):
-                server_args = self._make_server_args(transformer_weights_path=reference)
-                with patch(
-                    "os.path.isfile",
-                    side_effect=lambda path: path == "/cache/model.safetensors",
-                ):
-                    self.assertEqual(
-                        resolve_transformer_safetensors_to_load(
-                            server_args, "/unused/component/path"
-                        ),
-                        ["/cache/model.safetensors"],
-                    )
-                mock_download.assert_called_once_with(
-                    repo_id="Comfy-Org/MiniMax-H3",
-                    filename=filename,
+                server_args = self._make_server_args(
+                    transformer_weights_path=reference,
                     revision=revision,
                 )
-                mock_download.reset_mock()
+                model_info = SimpleNamespace(
+                    sha="immutable-sha",
+                    siblings=[
+                        SimpleNamespace(rfilename=filename),
+                        SimpleNamespace(rfilename="weights/config.json"),
+                    ],
+                )
+
+                def download(*, filename, **_kwargs):
+                    return f"/cache/{filename.rsplit('/', 1)[-1]}"
+
+                with (
+                    patch(
+                        "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info",
+                        return_value=model_info,
+                    ) as model_info_call,
+                    patch(
+                        "sglang.multimodal_gen.runtime.weights.source.hf_hub_download",
+                        side_effect=download,
+                    ) as download,
+                ):
+                    resolved = resolve_transformer_checkpoint_files(
+                        server_args, "/unused/component/path"
+                    )
+                self.assertEqual(resolved.safetensors, ("/cache/model.safetensors",))
+                self.assertEqual(resolved.config_path, "/cache/config.json")
+                model_info_call.assert_called_once_with("owner/repo", revision=revision)
+                self.assertEqual(
+                    {call.kwargs["filename"] for call in download.call_args_list},
+                    {filename, "weights/config.json"},
+                )
+                self.assertTrue(
+                    all(
+                        call.kwargs["revision"] == "immutable-sha"
+                        for call in download.call_args_list
+                    )
+                )
 
     def test_inspect_minimax_h3_safetensors_detects_curve_and_comfy_format(self):
         marker = json.dumps(
@@ -459,6 +494,109 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(layer.weight_s_channel.shape, (3,))
         self.assertEqual(layer.weight_codebook.shape, (16,))
         self.assertIsNone(layer.weight_correction)
+
+    def test_minimax_h3_w4a4_marker_resolves_packed_kitchen(self):
+        marker = json.dumps(
+            {
+                "format": "convrot_w4a4",
+                "convrot_groupsize": 256,
+                "linear_dtype": "int8",
+            }
+        ).encode()
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            save_file(
+                {
+                    "blocks.0.mlp.fc1.weight": torch.ones((2, 128), dtype=torch.int8),
+                    "blocks.0.mlp.fc1.weight_scale": torch.ones(2),
+                    "blocks.0.mlp.fc1.comfy_quant": torch.tensor(
+                        list(marker), dtype=torch.uint8
+                    ),
+                },
+                checkpoint.name,
+            )
+
+            _, markers = inspect_minimax_h3_safetensors([checkpoint.name])
+
+        config = resolve_minimax_h3_checkpoint_quantization(markers)
+        self.assertIsInstance(config, KitchenW4A4Config)
+        self.assertTrue(config.supports_input_partition("blocks.0.mlp.fc1", 256))
+        self.assertFalse(config.supports_input_partition("blocks.0.mlp.fc1", 128))
+        self.assertFalse(_needs_device_weight_postprocess(config))
+
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.quantization.kitchen_w4a4."
+        "convrot_w4a4_linear",
+        new=object(),
+    )
+    def test_serialized_w4a4_constructs_packed_weight_and_row_scale(self):
+        config = KitchenW4A4Config(
+            {
+                "proj": {
+                    "format": "convrot_w4a4",
+                    "convrot_groupsize": 256,
+                }
+            }
+        )
+        layer = ReplicatedLinear(
+            256,
+            3,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=config,
+            prefix="proj",
+        )
+
+        self.assertEqual(layer.weight.shape, (3, 128))
+        self.assertEqual(layer.weight.dtype, torch.int8)
+        self.assertEqual(layer.weight_scale.shape, (3,))
+        self.assertEqual(layer.weight_scale.dtype, torch.float32)
+
+    def test_mixed_w4a4_int8_dispatches_each_serialized_layer(self):
+        markers = {
+            "w4a4": {
+                "format": "convrot_w4a4",
+                "convrot_groupsize": 256,
+                "linear_dtype": "int8",
+            },
+            "int8": {
+                "format": "int8_tensorwise",
+                "convrot": True,
+                "convrot_groupsize": 256,
+            },
+        }
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.layers.quantization.kitchen_w4a4."
+                "convrot_w4a4_linear",
+                new=object(),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
+                "_load_comfy_kitchen"
+            ),
+        ):
+            config = resolve_minimax_h3_checkpoint_quantization(markers)
+            w4a4 = ReplicatedLinear(
+                256,
+                3,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=config,
+                prefix="w4a4",
+            )
+            int8 = ReplicatedLinear(
+                256,
+                3,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=config,
+                prefix="int8",
+            )
+
+        self.assertIsInstance(config, KitchenW4A4Config)
+        self.assertEqual(w4a4.weight.shape, (3, 128))
+        self.assertEqual(int8.weight.shape, (3, 256))
+        self.assertEqual(set(config.selected), {"w4a4", "int8"})
 
     @patch(
         "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
@@ -629,13 +767,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 checkpoint_quant_config=ComfyFp8Config({}),
             )
 
-    @patch(
-        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model",
-        side_effect=lambda path, **kw: path,
-    )
-    def test_resolve_transformer_safetensors_to_load_prefers_mixed_export(
-        self, _mock_download
-    ):
+    def test_resolve_transformer_override_prefers_single_mixed_export(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             mixed = f"{tmpdir}/flux2-dev-nvfp4-mixed.safetensors"
             full = f"{tmpdir}/flux2-dev-nvfp4.safetensors"
@@ -643,39 +775,11 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             open(full, "a").close()
 
             server_args = self._make_server_args(transformer_weights_path=tmpdir)
-            resolved = resolve_transformer_safetensors_to_load(
+            resolved = resolve_transformer_checkpoint_files(
                 server_args, "/unused/component/path"
             )
 
-        self.assertEqual(resolved, [mixed])
-
-    @patch(
-        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.snapshot_download",
-    )
-    @patch(
-        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model",
-    )
-    def test_resolve_transformer_safetensors_to_load_refreshes_empty_cached_repo(
-        self, mock_download_model, mock_snapshot_download
-    ):
-        with tempfile.TemporaryDirectory() as cached_dir:
-            repo_id = "black-forest-labs/FLUX.2-dev-NVFP4"
-            mixed = os.path.join(cached_dir, "flux2-dev-nvfp4-mixed.safetensors")
-            mock_download_model.return_value = cached_dir
-
-            def _snapshot_download(**_kwargs):
-                open(mixed, "a").close()
-                return cached_dir
-
-            mock_snapshot_download.side_effect = _snapshot_download
-
-            server_args = self._make_server_args(transformer_weights_path=repo_id)
-            resolved = resolve_transformer_safetensors_to_load(
-                server_args, "/unused/component/path"
-            )
-
-        self.assertEqual(resolved, [mixed])
-        mock_snapshot_download.assert_called_once()
+        self.assertEqual(resolved.safetensors, (mixed,))
 
     def test_filter_transformer_precision_variants_prefers_canonical_file(self):
         files = [
@@ -785,10 +889,17 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         warning.assert_called_once()
 
-    def test_modelopt_fp8_serialized_checkpoint_needs_device_postprocess(self):
+    def test_modelopt_fp8_always_needs_device_weight_postprocess(self):
+        # Even a serialized checkpoint requantizes fused shards through
+        # scaled_fp8_quant(), which cannot process CPU tensors.
         self.assertTrue(
             _needs_device_weight_postprocess(
                 ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+            )
+        )
+        self.assertTrue(
+            _needs_device_weight_postprocess(
+                ModelOptFp8Config(is_checkpoint_fp8_serialized=False)
             )
         )
 
@@ -841,30 +952,18 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         return_value=None,
     )
     @patch(
-        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model"
-    )
-    @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.get_quant_config_from_safetensors_metadata",
         return_value=None,
     )
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.get_metadata_from_safetensors_file"
     )
-    @patch(
-        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model",
-        side_effect=lambda path, **kw: path,
-    )
     def test_resolve_transformer_quant_load_spec_keeps_nunchaku_hook(
         self,
-        _mock_download,
         mock_metadata,
         _mock_quant_metadata,
-        mock_maybe_download,
         _mock_nvfp4,
     ):
-        mock_maybe_download.side_effect = AssertionError(
-            "local safetensors path should not trigger maybe_download_model"
-        )
         mock_metadata.return_value = {
             "config": json.dumps({"_class_name": _FakeFluxTransformer.__name__})
         }
@@ -889,7 +988,6 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertIsNone(spec.param_dtype)
         self.assertEqual(len(spec.post_load_hooks), 1)
         self.assertIs(nunchaku_config.model_cls, _FakeFluxTransformer)
-        mock_maybe_download.assert_not_called()
 
     def test_flux2_mixed_nvfp4_fallback_disables_conflicting_offloads(self):
         server_args = self._make_server_args(
@@ -999,6 +1097,16 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertTrue(config.load_in_4bit)
 
     def test_nvfp4_safetensors_inference_ignores_fp8_fallback_scales(self):
+        metadata = {
+            "_quantization_metadata": json.dumps(
+                {
+                    "format_version": "1.0",
+                    "layers": {
+                        "layers.0.attention.qkv": {"format": "nvfp4"},
+                    },
+                }
+            )
+        }
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
             save_file(
                 {
@@ -1021,6 +1129,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                     ),
                 },
                 f.name,
+                metadata=metadata,
             )
 
             config = build_nvfp4_config_from_safetensors_list([f.name])
@@ -1031,6 +1140,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertNotIn("layers.0.attention.qkv", config.exclude_modules)
         self.assertEqual(config.checkpoint_weight_scale_layout, "linear")
         self.assertFalse(config.swap_weight_nibbles)
+        self.assertFalse(config.checkpoint_uses_comfy_quantization)
 
     def test_nvfp4_safetensors_inference_uses_comfy_checkpoint_layout(self):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
@@ -1073,6 +1183,139 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertNotIn("layers.0.attention.qkv", config.exclude_modules)
         self.assertEqual(config.checkpoint_weight_scale_layout, "swizzled")
         self.assertTrue(config.swap_weight_nibbles)
+        self.assertTrue(config.checkpoint_uses_comfy_quantization)
+        self.assertFalse(config.checkpoint_uses_native_qkv_layout)
+        spec = TransformerQuantLoadSpec(
+            safetensors_list=[f.name],
+            quant_config=config,
+            nunchaku_config=None,
+            param_dtype=None,
+        )
+        self.assertTrue(spec.uses_comfy_layer_markers)
+
+    def test_minimax_h3_comfy_nvfp4_resolves_modelopt_backend(self):
+        metadata = {
+            "_quantization_metadata": json.dumps(
+                {
+                    "format_version": "1.0",
+                    "layers": {
+                        "blocks.0.attn.qkv_proj": {"format": "nvfp4"},
+                    },
+                }
+            )
+        }
+        with (
+            tempfile.NamedTemporaryFile(suffix=".safetensors") as quantized,
+            tempfile.NamedTemporaryFile(suffix=".safetensors") as fallback,
+        ):
+            save_file(
+                {
+                    "blocks.0.attn.qkv_proj.weight": torch.zeros(
+                        (32, 8), dtype=torch.uint8
+                    ),
+                    "blocks.0.attn.qkv_proj.weight_scale": torch.ones(
+                        (32, 1), dtype=torch.float8_e4m3fn
+                    ),
+                    "blocks.0.attn.qkv_proj.weight_scale_2": torch.tensor(1.0),
+                },
+                quantized.name,
+                metadata=metadata,
+            )
+            save_file(
+                {"blocks.0.mlp.fc1.weight": torch.ones((2, 2))},
+                fallback.name,
+            )
+            checkpoint_files = [quantized.name, fallback.name]
+            _, markers = inspect_minimax_h3_safetensors(checkpoint_files)
+            config = resolve_minimax_h3_checkpoint_quantization(
+                markers,
+                checkpoint_files,
+            )
+
+        self.assertIsInstance(config, ModelOptFp4Config)
+        self.assertEqual(config.group_size, 16)
+        self.assertIn("blocks.0.mlp.fc1", config.exclude_modules)
+        self.assertTrue(config.checkpoint_uses_comfy_quantization)
+        self.assertTrue(config.checkpoint_uses_native_qkv_layout)
+        self.assertEqual(config.checkpoint_weight_scale_layout, "swizzled")
+        self.assertTrue(config.swap_weight_nibbles)
+
+    def test_minimax_h3_mixed_nvfp4_companions_dispatch_each_layer(self):
+        metadata = {
+            "_quantization_metadata": json.dumps(
+                {
+                    "format_version": "1.0",
+                    "layers": {
+                        "blocks.0.attn.qkv_proj": {"format": "nvfp4"},
+                        "blocks.0.attn.out_proj": {
+                            "format": "int8_tensorwise",
+                            "convrot": True,
+                            "convrot_groupsize": 256,
+                        },
+                        "blocks.0.mlp.fc1": {"format": "float8_e4m3fn"},
+                    },
+                }
+            )
+        }
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            save_file(
+                {
+                    "blocks.0.attn.qkv_proj.weight": torch.zeros(
+                        (32, 8), dtype=torch.uint8
+                    ),
+                    "blocks.0.attn.qkv_proj.weight_scale": torch.ones(
+                        (32, 1), dtype=torch.float8_e4m3fn
+                    ),
+                    "blocks.0.attn.qkv_proj.weight_scale_2": torch.tensor(1.0),
+                    "blocks.0.attn.out_proj.weight": torch.zeros(
+                        (32, 256), dtype=torch.int8
+                    ),
+                    "blocks.0.attn.out_proj.weight_scale": torch.ones((32, 1)),
+                    "blocks.0.mlp.fc1.weight": torch.ones(
+                        (32, 64), dtype=torch.float8_e4m3fn
+                    ),
+                    "blocks.0.mlp.fc1.weight_scale": torch.tensor(1.0),
+                },
+                checkpoint.name,
+                metadata=metadata,
+            )
+            _, markers = inspect_minimax_h3_safetensors([checkpoint.name])
+            config = resolve_minimax_h3_checkpoint_quantization(
+                markers,
+                [checkpoint.name],
+            )
+
+        self.assertIsInstance(config, ModelOptFp4Config)
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.quantization."
+            "modelopt_quant.current_platform.get_device_capability",
+            return_value=DeviceCapability(10, 0),
+        ):
+            self.assertIsInstance(
+                config.get_quant_method(
+                    LinearBase(input_size=16, output_size=32),
+                    "blocks.0.attn.qkv_proj",
+                ),
+                ModelOptFp4LinearMethod,
+            )
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.quantization."
+            "kitchen_int8._load_comfy_kitchen"
+        ):
+            self.assertIsInstance(
+                config.get_quant_method(
+                    LinearBase(input_size=256, output_size=32),
+                    "blocks.0.attn.out_proj",
+                ),
+                KitchenInt8LinearMethod,
+            )
+        self.assertIsInstance(
+            config.get_quant_method(
+                LinearBase(input_size=64, output_size=32),
+                "blocks.0.mlp.fc1",
+            ),
+            Fp8LinearMethod,
+        )
 
     def test_builder_adds_diffusers_quant_type_for_nvfp4(self):
         updated = _updated_quant_config(

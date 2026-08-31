@@ -86,14 +86,14 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--lora-merge-mode {auto|merge|dynamic}`: choose how LoRA is applied. `auto` statically merges regular weights and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather peaks.
 - `--num-gpus {N}`: number of GPUs to use
 - `--performance-mode {manual|auto|speed|memory}` / `--mode`: preset for latency/throughput and memory defaults. `auto` is the default and dispatches residency from selected-GPU headroom and workload type: image DiTs stay resident above the 45 GiB threshold, while video DiT placement remains model-specific. It uses FSDP only for validated DiT-offload replacement paths. `speed` keeps `torch.compile` disabled unless a model-specific deployment config opts in after validation; pass `--enable-torch-compile true` to enable it explicitly. Use `manual` to keep performance-related server args under explicit user control. Explicit offload, FSDP, and parallelism flags take precedence in all modes.
-- `--direct-gpu-weight-loading {true|false}`: opt into direct GPU loading for an unquantized, GPU-resident, TP=1 DiT by materializing its complete checkpoint state dict on GPU. Startup impact is model-dependent, so benchmark the target model before deployment. Disabled by default because checkpoint and model weights coexist temporarily, substantially increasing peak GPU memory. It is incompatible with DiT CPU/layerwise offload and FSDP.
+- `--direct-gpu-weight-loading {true|false}`: opt into direct GPU loading for an unquantized, GPU-resident, TP=1 DiT by materializing its complete checkpoint state dict on GPU. Compatible tensors become parameter storage without another GPU copy, while tensors requiring transforms can still need temporary allocations. It is disabled by default; startup time and peak GPU memory remain model-dependent, so benchmark the target model before deployment. It is incompatible with DiT CPU/layerwise offload and FSDP.
 - `--tp-size {N}`: tensor parallelism size. Depending on the pipeline, it can shard the DiT, one or more encoders, or both.
 - `--sp-degree {N}`: sequence parallelism size
 - `--dp-size {N}` (alias `--data-parallel-size`): number of data-parallel replicas. Each replica is a full copy of the engine on `num_gpus / N` GPUs with its own ingress; generation requests round-robin across replicas, realtime sessions stick to the replica holding their state, and control operations (weights, LoRA, memory occupation, shutdown) apply to every replica. Combines with the other parallelism axes (`num_gpus = dp × cfg × tp × sp`); monolithic serving only.
 - `--ulysses-degree {N}` and `--ring-degree {N}`: USP parallelism controls
 - `--kv-gather-degree {N}`: sequence-parallel degree that splits rows inside attention and exchanges with one K/V all-gather (queries stay local) instead of Ulysses all-to-all. Non-causal attention only; does not compose with `--ulysses-degree`/`--ring-degree` yet. When no SP degree is set explicitly, `sp_degree=2` defaults to `kv_gather_degree=2` (its measured-win zone) and higher degrees default to Ulysses; under that auto assignment, attention calls the gather path cannot take fall back to the Ulysses exchange, while an explicit degree fails instead of degrading.
 - `--enable-cfg-parallel {true|false}`: enable or explicitly disable CFG parallelism
-- `--encoder-parallel {auto|fold|dp|replicate}`: how text/image encoders use the GPUs in each DiT replica. `auto` TP-folds an encoder wide enough to benefit, selects batch DP when it can engage, and otherwise keeps the existing encoder TP layout; `fold` shards across the full replica whenever dimensions allow; `dp` splits a batched encode across encoder copies and composes with encoder TP; `replicate` disables folding and batch DP. Encoder collectives never cross `--dp-size` replicas. See [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel).
+- `--encoder-parallel {auto|fold|dp|replicate}`: how native encoders use the GPUs in each DiT replica. `auto` TP-folds a native text/image encoder wide enough to benefit, selects batch DP for an explicitly supported native text encoder when it can engage, and otherwise keeps the existing encoder TP layout; `fold` shards native text/image encoders across the full replica whenever dimensions allow; `dp` splits a batched encode across supported native text encoder copies and composes with encoder TP; `replicate` disables folding and batch DP. Encoder collectives never cross `--dp-size` replicas. See [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel).
 - `--warmup-mode {off|request|server}`: control startup warmup for `sglang serve`; `off` skips warmup, `request` primes the request path, and `server` runs a full synthetic server warmup before serving traffic
 - `--enable-torch-compile {true|false}`: compile native diffusion hot paths. When no warmup mode is configured, this also enables server warmup so first real requests do not pay compile latency.
 - `--offload-during-compile {true|false}`: when compile warmup is active, temporarily layerwise-offload DiT weights and move resident non-DiT components off-device so `max-autotune` fits on tighter-memory GPUs; the configured serving residency is restored before real traffic. Skipped under existing layerwise offload, Cache-DiT, or FSDP.
@@ -131,14 +131,16 @@ pipeline's registered module name:
 | --- | --- | --- | --- |
 | Replace a component | `--component-paths.<component> {MODEL}` | `--<component>-path {MODEL}` | Load the replacement component's configuration and weights |
 | Replace only its weights | `--component-weights-paths.<component> {WEIGHTS}` | `--<component>-weights-path {WEIGHTS}` | Retain the base component configuration and replace its weights |
+| Direct-load an eligible component | `--component-direct-gpu-weight-loading.<component>` | None | Use that component's audited direct-GPU loader; it must stay resident |
+| Quantize an unquantized component online | `--component-quantizations.<component> {METHOD}` | `--<component>-quantization {METHOD}` | Apply a method supported by that component's native loader |
+| Keep selected component layers unquantized | `--component-quantization-ignored-layers.<component> {PATTERN...}` | None | Pass component-local ignored-layer patterns to its online quantizer |
 
-For example, pair a replacement text-encoder configuration with a separate
+For example, pair any replacement text-encoder configuration with a separate
 single-file checkpoint as follows:
 
 ```bash
---component-paths.text_encoder Qwen/Qwen3-VL-4B-Instruct \
---component-weights-paths.text_encoder \
-  Comfy-Org/Krea-2/text_encoders/qwen3vl_4b_fp8_scaled.safetensors
+--component-paths.text_encoder COMPONENT_REPO_OR_DIRECTORY \
+--component-weights-paths.text_encoder WEIGHTS_FILE_OR_REPO_FILE
 ```
 
 The transformer-specific `--transformer-weights-path` spelling remains
@@ -152,6 +154,7 @@ unquantized during online quantization.
 For a native text encoder:
 
 - `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias
+- `--component-quantizations.text_encoder {METHOD}` applies supported online quantization to an unquantized native encoder; pair it with `--component-quantization-ignored-layers.text_encoder {PATTERN...}` when selected layers must remain unquantized
 - Quantization metadata is auto-detected from that checkpoint. The native loader accepts compatible serialized formats without a model-name allowlist and rejects implementations that do not construct the required quantized layers.
 
 The same contract applies to every weighted component: path routing is generic,
@@ -159,7 +162,18 @@ while quantized materialization is capability-based. Native auxiliary loaders
 whose current materializer expects plain state dicts reject unsupported
 quantization metadata before model construction. See
 [Quantized Component Repositories](../quantization#quantized-component-repositories)
-for the current component matrix.
+for the current component matrix. A model cookbook is the source of truth for
+published, model-specific checkpoint examples; for example, all H3 sources and
+their exact overlays are kept in one
+[MiniMax-H3 compatibility table](/cookbook/diffusion/MiniMax/MiniMax-H3#checkpoint-and-adapter-formats).
+
+Direct-GPU loading is also capability-based. The existing
+`--direct-gpu-weight-loading` remains the primary DiT path. The component form
+currently supports standard native `vae` and `video_vae` state dicts on CUDA:
+it streams each safetensors tensor directly to the resident
+module, rather than materializing a complete CPU state dict. It rejects custom
+Diffusers `auto_map` classes, quantized checkpoints, tied state entries, and
+any component-offload or layerwise-offload placement.
 
 Component overrides accept a local component directory, a standalone Hub
 repository, or a Hub component subfolder written as `owner/repo/subfolder`.
@@ -243,7 +257,7 @@ sglang generate \
 HTTP server-only arguments are ignored by `sglang generate`.
 </Note>
 
-For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Cache-DiT. For the diffusers backend, use `--backend diffusers --cache-dit-config ...`. See [Cache-DiT](../cache_dit).
+For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Cache-DiT. It can run with DiT layerwise offload; it cannot run with FSDP. For the diffusers backend, use `--backend diffusers --cache-dit-config ...`. See [Cache-DiT](../cache_dit).
 
 For supported image pipelines, breakable CUDA graph can be enabled with `--enable-breakable-cuda-graph`, but you must declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 
@@ -295,7 +309,7 @@ Selectors match exact loaded component keys from `model_index.json`, including n
 
 The existing `--dit-cpu-offload`, `--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`, `--vae-cpu-offload`, and `--cpu-offload-components` options remain supported. New and legacy options may be mixed: `--component-residency` wins only for components it matches, while unmatched legacy settings remain effective. Legacy layerwise selectors take precedence over legacy component-offload selectors for the same component. Explicit `--dit-layerwise-offload false` makes the DiT resident unless another explicit DiT selector, such as `--dit-cpu-offload true` or `--component-residency dit=component-offload`, selects a different mode.
 
-Layerwise selection is strict. A native weighted component selected for `layerwise-offload` must declare its layer structure; otherwise startup fails with the unsupported component name instead of silently changing modes. FSDP applies only to resident components. The Diffusers backend supports only pipeline-wide `all=resident` and `all=component-offload`.
+Layerwise selection is strict. A native weighted component selected for `layerwise-offload` must declare its layer structure; otherwise startup fails with the unsupported component name instead of silently changing modes. Explicit non-resident placement also requires a request-time component-use declaration, so it cannot silently select a module that the pipeline does not manage. FSDP applies only to resident components. The Diffusers backend supports only pipeline-wide `all=resident` and `all=component-offload`.
 
 ### Layerwise Offload Tuning
 
@@ -311,7 +325,7 @@ sglang generate \
 
 Values passed to the compatibility option `--layerwise-offload-components` must match loaded component keys, such as `transformer`, `text_encoder`, `image_encoder`, `vae`, `condition_image_encoder`, `spatial_upsampler`, or `vocoder`. Its `default` group selects text encoders, image encoders, and VAEs. Use `all` to select every layerwise-offloadable component.
 
-Layerwise tuning options such as `--dit-offload-prefetch-size`, `--dit-layerwise-resident-layers`, and `--dit-layerwise-residency-policy` continue to control the streamed layer working set. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency.
+Layerwise tuning options such as `--dit-offload-prefetch-size`, `--dit-layerwise-resident-layers`, and `--dit-layerwise-residency-policy` continue to control the streamed layer working set. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency. DiT layerwise offload can run with Cache-DiT: skipped blocks are not streamed, and the first layer after a skip may sync-load. Cache-DiT remains incompatible with FSDP.
 
 Those three set the default for every streamed component. To give one component its own values, use the `component=value` forms, which also accept JSON:
 
