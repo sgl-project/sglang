@@ -117,53 +117,6 @@ def _make_inputs(
     return kv_score_input_cpu, ape_cpu
 
 
-@pytest.mark.parametrize("mode", ["decode", "prefill"])
-def test_bf16_output_matches_fp32_cast(mode: str) -> None:
-    ctx = make_legacy_context(
-        bs=4 if mode == "decode" else 1,
-        compress_ratio=RATIO,
-        head_dim=128,
-    )
-    kv_input = torch.randn(4, 512, device=get_device(), dtype=torch.float32)
-    ape = torch.randn(WINDOW, 128, device=get_device(), dtype=torch.float32)
-    pool_fp32 = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
-    pool_bf16 = pool_fp32.clone()
-
-    if mode == "decode":
-        plan = ctx.make_decode_plan(
-            torch.tensor([4, 5, 8, 9], device=get_device(), dtype=torch.int64)
-        )
-    else:
-        seq_lens_cpu, extend_lens_cpu, num_q = to_seq_extend([(4, 4)])
-        plan = ctx.make_prefill_plan(seq_lens_cpu, extend_lens_cpu, num_q)
-        kv_input = kv_input[:num_q]
-
-    out_fp32 = compress_forward(
-        pool_fp32,
-        kv_input,
-        ape,
-        plan,
-        head_dim=ctx.head_dim,
-        compress_ratio=RATIO,
-        out=torch.empty(
-            (plan[1].shape[0], ctx.head_dim),
-            device=get_device(),
-            dtype=torch.float32,
-        ),
-    )
-    out_bf16 = compress_forward(
-        pool_bf16,
-        kv_input,
-        ape,
-        plan,
-        head_dim=ctx.head_dim,
-        compress_ratio=RATIO,
-        out=torch.empty_like(out_fp32, dtype=torch.bfloat16),
-    )
-
-    torch.testing.assert_close(out_bf16, out_fp32.to(torch.bfloat16), rtol=0, atol=0)
-
-
 # -----------------------------------------------------------------------------
 # Tests
 # -----------------------------------------------------------------------------

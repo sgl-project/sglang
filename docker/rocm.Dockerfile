@@ -106,7 +106,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="bf7ae4a80d0020f31d208f3d02dad58a353fea66"
+ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -116,7 +116,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="bf7ae4a80d0020f31d208f3d02dad58a353fea66"
+ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # ===============================
@@ -127,7 +127,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="bf7ae4a80d0020f31d208f3d02dad58a353fea66"
+ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.

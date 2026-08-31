@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.arg_groups.deepseek_v4_hook import (
     validate_deepseek_v4_fp4_indexer,
 )
+from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -21,57 +22,38 @@ class TestDeepseekV4Fp4IndexerValidation(unittest.TestCase):
         "sglang.srt.arg_groups.deepseek_v4_hook._deepseek_v4_fp4_indexer_aiter_error",
         side_effect=AssertionError("CUDA validation imported AITER"),
     )
-    @patch("sglang.srt.arg_groups.deepseek_v4_hook.is_hip", return_value=False)
-    def test_cuda_sm100_and_sm120_are_accepted(self, _mock_is_hip, mock_aiter_probe):
+    def test_cuda_sm100_and_sm120_are_accepted(self, mock_aiter_probe):
         for sm100, sm120 in ((True, False), (False, True)):
             with (
                 self.subTest(sm100=sm100, sm120=sm120),
-                patch(
-                    "sglang.srt.arg_groups.deepseek_v4_hook.is_sm100_supported",
-                    return_value=sm100,
-                ),
-                patch(
-                    "sglang.srt.arg_groups.deepseek_v4_hook.is_sm120_supported",
-                    return_value=sm120,
+                override_platform(
+                    is_hip=False,
+                    is_sm100=sm100,
+                    is_sm120=sm120,
                 ),
             ):
                 validate_deepseek_v4_fp4_indexer(self._server_args())
 
         mock_aiter_probe.assert_not_called()
 
-    @patch(
-        "sglang.srt.arg_groups.deepseek_v4_hook.is_sm120_supported",
-        return_value=False,
-    )
-    @patch(
-        "sglang.srt.arg_groups.deepseek_v4_hook.is_sm100_supported",
-        return_value=False,
-    )
-    @patch("sglang.srt.arg_groups.deepseek_v4_hook.is_hip", return_value=False)
-    def test_cuda_other_capabilities_are_rejected(
-        self, _mock_is_hip, _mock_sm100, _mock_sm120
-    ):
-        with self.assertRaisesRegex(ValueError, "requires SM100 or SM120"):
-            validate_deepseek_v4_fp4_indexer(self._server_args())
-
-    @patch(
-        "sglang.srt.arg_groups.deepseek_v4_hook.is_gfx950_supported",
-        return_value=True,
-    )
-    @patch("sglang.srt.arg_groups.deepseek_v4_hook.is_hip", return_value=True)
-    def test_hip_ordinary_single_node_with_required_aiter_is_accepted(
-        self, _mock_is_hip, _mock_gfx950
-    ):
-        with patch(
-            "sglang.srt.arg_groups.deepseek_v4_hook.importlib.import_module",
-            side_effect=self._import_complete_aiter_module,
+    def test_cuda_other_capabilities_are_rejected(self):
+        with (
+            override_platform(is_hip=False, is_sm100=False, is_sm120=False),
+            self.assertRaisesRegex(ValueError, "requires SM100 or SM120"),
         ):
             validate_deepseek_v4_fp4_indexer(self._server_args())
 
-    @patch("sglang.srt.arg_groups.deepseek_v4_hook.is_hip", return_value=True)
-    def test_hip_unsupported_config_or_arch_is_rejected_before_aiter_probe(
-        self, _mock_is_hip
-    ):
+    def test_hip_ordinary_single_node_with_required_aiter_is_accepted(self):
+        with (
+            override_platform(is_hip=True, is_gfx950=True),
+            patch(
+                "sglang.srt.arg_groups.deepseek_v4_hook.importlib.import_module",
+                side_effect=self._import_complete_aiter_module,
+            ),
+        ):
+            validate_deepseek_v4_fp4_indexer(self._server_args())
+
+    def test_hip_unsupported_config_or_arch_is_rejected_before_aiter_probe(self):
         cases = (
             (
                 {"nnodes": 2},
@@ -101,10 +83,7 @@ class TestDeepseekV4Fp4IndexerValidation(unittest.TestCase):
                     server_args_kwargs=server_args_kwargs,
                     gfx950_supported=gfx950_supported,
                 ),
-                patch(
-                    "sglang.srt.arg_groups.deepseek_v4_hook.is_gfx950_supported",
-                    return_value=gfx950_supported,
-                ),
+                override_platform(is_hip=True, is_gfx950=gfx950_supported),
                 patch(
                     "sglang.srt.arg_groups.deepseek_v4_hook.importlib.import_module",
                     side_effect=AssertionError(
@@ -119,12 +98,7 @@ class TestDeepseekV4Fp4IndexerValidation(unittest.TestCase):
 
             mock_import.assert_not_called()
 
-    @patch(
-        "sglang.srt.arg_groups.deepseek_v4_hook.is_gfx950_supported",
-        return_value=True,
-    )
-    @patch("sglang.srt.arg_groups.deepseek_v4_hook.is_hip", return_value=True)
-    def test_hip_invalid_aiter_dependency_is_rejected(self, _mock_is_hip, _mock_gfx950):
+    def test_hip_invalid_aiter_dependency_is_rejected(self):
         cases = tuple(
             (
                 {"missing": missing_api},
@@ -140,6 +114,7 @@ class TestDeepseekV4Fp4IndexerValidation(unittest.TestCase):
         for module_kwargs, error_pattern in cases:
             with (
                 self.subTest(module_kwargs=module_kwargs),
+                override_platform(is_hip=True, is_gfx950=True),
                 patch(
                     "sglang.srt.arg_groups.deepseek_v4_hook.importlib.import_module",
                     side_effect=lambda module_name, module_kwargs=module_kwargs: self._import_complete_aiter_module(
@@ -150,13 +125,9 @@ class TestDeepseekV4Fp4IndexerValidation(unittest.TestCase):
             ):
                 validate_deepseek_v4_fp4_indexer(self._server_args())
 
-    @patch(
-        "sglang.srt.arg_groups.deepseek_v4_hook.is_gfx950_supported",
-        return_value=True,
-    )
-    @patch("sglang.srt.arg_groups.deepseek_v4_hook.is_hip", return_value=True)
-    def test_hip_aiter_import_failure_is_rejected(self, _mock_is_hip, _mock_gfx950):
+    def test_hip_aiter_import_failure_is_rejected(self):
         with (
+            override_platform(is_hip=True, is_gfx950=True),
             patch(
                 "sglang.srt.arg_groups.deepseek_v4_hook.importlib.import_module",
                 side_effect=RuntimeError("AITER initialization failed"),

@@ -890,6 +890,7 @@ class DeepseekV4HipRadixBackend(
         ):
             from sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer import (
                 prepare_aiter_fp4_paged_mqa_decode_metadata,
+                prepare_aiter_fp4_paged_mqa_prefill_metadata,
                 prepare_aiter_k_indexer_fp4_cache_write_metadata,
             )
 
@@ -907,11 +908,18 @@ class DeepseekV4HipRadixBackend(
                     device=self.device,
                 )
             )
+            indexer_metadata = metadata.indexer_metadata
+            assert indexer_metadata is not None
             if forward_batch.forward_mode.is_decode():
-                indexer_metadata = metadata.indexer_metadata
-                assert indexer_metadata is not None
                 metadata.aiter_fp4_logits_decode_metadata = (
                     prepare_aiter_fp4_paged_mqa_decode_metadata(
+                        page_table=indexer_metadata.page_table,
+                        c4_seq_lens=indexer_metadata.c4_seq_lens,
+                    )
+                )
+            elif forward_batch.forward_mode.is_target_verify():
+                metadata.aiter_fp4_logits_prefill_metadata = (
+                    prepare_aiter_fp4_paged_mqa_prefill_metadata(
                         page_table=indexer_metadata.page_table,
                         c4_seq_lens=indexer_metadata.c4_seq_lens,
                     )

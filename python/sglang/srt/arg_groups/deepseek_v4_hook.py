@@ -12,12 +12,6 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import (
-    is_gfx950_supported,
-    is_hip,
-    is_sm100_supported,
-    is_sm120_supported,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -60,7 +54,8 @@ def validate_deepseek_v4_fp4_indexer(server_args: ServerArgs) -> None:
     if not cfg.enable_deepseek_v4_fp4_indexer:
         return
 
-    if is_hip():
+    platform = get_platform()
+    if platform.is_hip:
         if cfg.nnodes != 1:
             raise ValueError(
                 "--enable-deepseek-v4-fp4-indexer on HIP supports "
@@ -80,7 +75,7 @@ def validate_deepseek_v4_fp4_indexer(server_args: ServerArgs) -> None:
                 "remove the FP4 indexer flag. Got "
                 f"--disaggregation-mode={cfg.disaggregation_mode!r}."
             )
-        if not is_gfx950_supported():
+        if not platform.is_gfx950:
             raise ValueError(
                 "--enable-deepseek-v4-fp4-indexer on HIP requires an AMD "
                 "gfx950 GPU; remove the flag or run on gfx950."
@@ -93,7 +88,7 @@ def validate_deepseek_v4_fp4_indexer(server_args: ServerArgs) -> None:
             )
         return
 
-    if not (is_sm100_supported() or is_sm120_supported()):
+    if not (platform.is_sm100 or platform.is_sm120):
         raise ValueError(
             "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
             "DeepGEMM FP4 indexer support."

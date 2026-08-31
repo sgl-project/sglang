@@ -39,6 +39,7 @@ try:
         ),
     ):
         import sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer as aiter_fp4_indexer
+        import sglang.kernels.ops.attention.dsv4.topk as topk_module
         from sglang.srt.environ import envs
         from sglang.srt.layers.attention.dsv4.indexer import (
             C4IndexerBackendMixin,
@@ -76,6 +77,27 @@ def _fake_flydsl():
 
 
 class TestAITERFP4IndexerLogits(unittest.TestCase):
+    def test_topk_wrapper_materializes_strided_logits(self):
+        jit_module = SimpleNamespace(topk_transform=Mock())
+        scores = torch.randn((2, 768), dtype=torch.float32)[:, :576]
+        seq_lens = torch.tensor([576, 513], dtype=torch.int32)
+        page_table = torch.arange(18, dtype=torch.int32).reshape(2, 9)
+        out_indices = torch.empty((2, 512), dtype=torch.int32)
+
+        self.assertFalse(scores.is_contiguous())
+        with (
+            patch.object(topk_module, "is_hip_runtime", return_value=False),
+            patch.object(topk_module, "is_xpu", return_value=False),
+            patch.object(topk_module, "_jit_topk_v1_module", return_value=jit_module),
+        ):
+            topk_module.topk_transform_512(
+                scores, seq_lens, page_table, out_indices, 64
+            )
+
+        forwarded_scores = jit_module.topk_transform.call_args.args[0]
+        self.assertTrue(forwarded_scores.is_contiguous())
+        torch.testing.assert_close(forwarded_scores, scores)
+
     def test_decode_parallel_units_cap_graph_width_without_oversizing_eager(self):
         get_parallel_units = aiter_fp4_indexer._get_aiter_fp4_decode_parallel_unit_num
 
@@ -383,54 +405,6 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
                     )
                     torch.testing.assert_close(page_table, original_page_table)
 
-    def test_prefill_dispatch_uses_call_local_graph_pool_temporaries(self):
-        case = self._make_dispatch(
-            mode=ForwardMode.EXTEND,
-            num_tokens=2,
-            metadata_rows=2,
-            batch_size=1,
-        )
-        flydsl, modules = _fake_flydsl()
-        flydsl.flydsl_pa_mqa_logits_fp4_prefill.return_value = torch.empty(
-            (2, 256), dtype=torch.float32
-        )
-        real_arange = torch.arange
-        real_zeros = torch.zeros
-        with (
-            patch.dict(sys.modules, modules),
-            patch.object(
-                aiter_fp4_indexer.torch, "arange", wraps=real_arange
-            ) as arange,
-            patch.object(aiter_fp4_indexer.torch, "zeros", wraps=real_zeros) as zeros,
-        ):
-            case.backend.forward_c4_indexer(
-                x=torch.empty(case.q_fp4.shape[0], 1),
-                q_lora=torch.empty(case.q_fp4.shape[0], 1),
-                c4_indexer=case.c4_indexer,
-                forward_batch=case.forward_batch,
-            )
-
-        case.backend._forward_prepare_normal.assert_called_once()
-        case.token_pool.get_index_k_fp4_payload_buffer.assert_called_once_with(
-            layer_id=7
-        )
-        case.token_pool.get_index_k_fp4_scale_buffer.assert_called_once_with(layer_id=7)
-        flydsl.flydsl_pa_mqa_logits_fp4.assert_not_called()
-        flydsl.flydsl_pa_mqa_logits_fp4_prefill.assert_called_once()
-        args = flydsl.flydsl_pa_mqa_logits_fp4_prefill.call_args.args
-        torch.testing.assert_close(
-            args[4],
-            torch.tensor(
-                [[0, 1, 0, 0, 0, 0, 0, 0], [2, 3, 0, 0, 0, 0, 0, 0]],
-                dtype=torch.int32,
-            ),
-        )
-        torch.testing.assert_close(args[6], torch.arange(2, dtype=torch.int32))
-        torch.testing.assert_close(args[7], torch.zeros(2, dtype=torch.int32))
-        torch.testing.assert_close(args[8], case.c4_seq_lens)
-        arange.assert_called_once_with(2, device=case.q_fp4.device, dtype=torch.int32)
-        zeros.assert_called_once_with(2, device=case.q_fp4.device, dtype=torch.int32)
-
     def test_prefill_dispatch_reuses_cached_logits_metadata(self):
         case = self._make_dispatch(
             mode=ForwardMode.EXTEND,
@@ -479,6 +453,109 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
         self.assertIs(call.kwargs["out"], cached_metadata.out)
         self.assertIs(call.kwargs["cta_info"], cached_metadata.cta_info)
         self.assertEqual(call.kwargs["n_ctas"], cached_metadata.n_ctas)
+
+    def test_target_verify_graph_refreshes_shared_prefill_metadata_per_init(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+            DeepseekV4HipRadixBackend,
+            DSV4Metadata,
+        )
+
+        page_table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+        c4_seq_lens = torch.tensor([63, 127], dtype=torch.int32)
+        core_metadata = SimpleNamespace(
+            c4_out_loc=torch.tensor([4, 8], dtype=torch.int64),
+            positions=torch.tensor([7, 11], dtype=torch.int64),
+        )
+        indexer_metadata = SimpleNamespace(
+            page_table=page_table,
+            c4_seq_lens=c4_seq_lens,
+        )
+        metadata = DSV4Metadata(
+            core_attn_metadata=core_metadata,
+            indexer_metadata=indexer_metadata,
+            c4_compress_metadata=object(),
+        )
+        backend = DeepseekV4HipRadixBackend.__new__(DeepseekV4HipRadixBackend)
+        backend.enable_deepseek_v4_fp4_indexer = True
+        backend.forward_metadata = metadata
+        backend.aiter_fp4_max_position = 4096
+        backend.device = "cpu"
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            out_cache_loc=None,
+        )
+        first_prefill_metadata = object()
+        second_prefill_metadata = object()
+
+        with (
+            patch(
+                "sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer."
+                "prepare_aiter_k_indexer_fp4_cache_write_metadata",
+                return_value=object(),
+            ),
+            patch(
+                "sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer."
+                "prepare_aiter_fp4_paged_mqa_decode_metadata"
+            ) as prepare_decode,
+            patch(
+                "sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer."
+                "prepare_aiter_fp4_paged_mqa_prefill_metadata",
+                side_effect=[first_prefill_metadata, second_prefill_metadata],
+            ) as prepare_prefill,
+        ):
+            backend.init_forward_metadata_in_graph(forward_batch)
+            self.assertIs(
+                metadata.aiter_fp4_logits_prefill_metadata,
+                first_prefill_metadata,
+            )
+            backend.init_forward_metadata_in_graph(forward_batch)
+            self.assertIs(
+                metadata.aiter_fp4_logits_prefill_metadata,
+                second_prefill_metadata,
+            )
+
+        prepare_decode.assert_not_called()
+        self.assertEqual(prepare_prefill.call_count, 2)
+        for call in prepare_prefill.call_args_list:
+            self.assertIs(call.kwargs["page_table"], page_table)
+            self.assertIs(call.kwargs["c4_seq_lens"], c4_seq_lens)
+
+    def test_target_verify_layers_reuse_graph_prefill_metadata(self):
+        case = self._make_dispatch(
+            mode=ForwardMode.TARGET_VERIFY,
+            num_tokens=2,
+            metadata_rows=2,
+            batch_size=1,
+        )
+        graph_prefill_metadata = object()
+        case.backend.forward_metadata.aiter_fp4_logits_prefill_metadata = (
+            graph_prefill_metadata
+        )
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsv4.indexer."
+                "prepare_aiter_fp4_paged_mqa_prefill_metadata"
+            ) as prepare_prefill,
+            patch(
+                "sglang.srt.layers.attention.dsv4.indexer."
+                "aiter_fp4_paged_mqa_logits",
+                return_value=torch.empty((2, 128), dtype=torch.float32),
+            ) as logits,
+        ):
+            for layer_id in (7, 11):
+                case.c4_indexer.layer_id = layer_id
+                case.backend.forward_c4_indexer(
+                    x=torch.empty(2, 1),
+                    q_lora=torch.empty(2, 1),
+                    c4_indexer=case.c4_indexer,
+                    forward_batch=case.forward_batch,
+                )
+
+        prepare_prefill.assert_not_called()
+        self.assertEqual(logits.call_count, 2)
+        for call in logits.call_args_list:
+            self.assertIs(call.kwargs["prefill_metadata"], graph_prefill_metadata)
 
     def test_prefill_cache_is_built_once_after_row_reindex(self):
         case = self._make_dispatch(

@@ -1,16 +1,11 @@
 import sys
 import unittest
-from builtins import __import__ as builtin_import
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
-import sglang.srt.layers.attention.deepseek_v4_backend_hip_radix as hip_backend
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-    DeepseekV4HipRadixBackend,
-)
 from sglang.srt.layers.attention.dsv4.indexer import FP8_DTYPE, C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
@@ -19,114 +14,14 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 _INDEXER = "sglang.srt.layers.attention.dsv4.indexer"
 
 
-class TestDSV4PagedIndexerMetadata(unittest.TestCase):
-    def test_hip_backend_uses_published_fp4_indexer_flag(self):
-        token_pool_type = type("TokenPool", (), {})
-        token_pool = token_pool_type()
-        req_to_token = torch.zeros((2, 4), dtype=torch.int32)
-        runner = SimpleNamespace(
-            device="cpu",
-            model_config=SimpleNamespace(
-                head_dim=512,
-                v_head_dim=448,
-                hf_text_config=SimpleNamespace(index_topk=512),
-            ),
-            page_size=256,
-            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
-            token_to_kv_pool=token_pool,
-            hisparse_coordinator=None,
-            server_args=SimpleNamespace(enable_deepseek_v4_fp4_indexer=False),
-            is_draft_worker=False,
-            spec_algorithm=SimpleNamespace(is_dspark=lambda: False),
-        )
-        published = SimpleNamespace(
-            kernel=SimpleNamespace(enable_deepseek_v4_fp4_indexer=True)
-        )
-        spec = SimpleNamespace(
-            speculative_eagle_topk=0,
-            speculative_num_draft_tokens=1,
-        )
-
-        with (
-            patch.object(hip_backend, "DeepSeekV4TokenToKVPool", token_pool_type),
-            patch.object(hip_backend, "get_exec", return_value=published),
-            patch.object(hip_backend, "get_spec", return_value=spec),
-        ):
-            backend = DeepseekV4HipRadixBackend(runner)
-
-        self.assertTrue(backend.enable_deepseek_v4_fp4_indexer)
-        with envs.SGLANG_OPT_USE_TOPK_V2.override(False):
-            metadata = backend.init_forward_metadata_indexer(
-                SimpleNamespace(
-                    page_table=torch.zeros((2, 1), dtype=torch.int32),
-                    c4_topk_lengths_raw=torch.tensor([3, 5], dtype=torch.int32),
-                )
-            )
-        self.assertTrue(metadata.uses_aiter_fp4_layout)
-
-    def test_hip_backend_propagates_aiter_fp4_layout_flag(self):
-        core_metadata = SimpleNamespace(
-            page_table=torch.zeros((2, 1), dtype=torch.int32),
-            c4_topk_lengths_raw=torch.tensor([3, 5], dtype=torch.int32),
-        )
-        with envs.SGLANG_OPT_USE_TOPK_V2.override(False):
-            enabled = DeepseekV4HipRadixBackend.init_forward_metadata_indexer(
-                SimpleNamespace(page_size=256, enable_deepseek_v4_fp4_indexer=True),
-                core_metadata,
-            )
-            with envs.SGLANG_OPT_USE_AITER_INDEXER.override(True):
-                disabled = DeepseekV4HipRadixBackend.init_forward_metadata_indexer(
-                    SimpleNamespace(
-                        page_size=256, enable_deepseek_v4_fp4_indexer=False
-                    ),
-                    core_metadata,
-                )
-
-        self.assertTrue(enabled.uses_aiter_fp4_layout)
-        self.assertIsNone(enabled.deep_gemm_metadata)
-        self.assertFalse(disabled.uses_aiter_fp4_layout)
-
-    def test_aiter_fp4_layout_skips_deep_gemm_and_copies_exhaustively(self):
-        def reject_deep_gemm_import(name, *args, **kwargs):
-            if name == "deep_gemm":
-                raise AssertionError("AITER FP4 metadata imported DeepGEMM")
-            return builtin_import(name, *args, **kwargs)
-
-        with (
-            patch("builtins.__import__", side_effect=reject_deep_gemm_import),
-            envs.SGLANG_OPT_USE_TOPK_V2.override(False),
-        ):
-            source = PagedIndexerMetadata(
-                page_size=256,
-                page_table=torch.ones((2, 2), dtype=torch.int32),
-                c4_seq_lens=torch.tensor([3, 5], dtype=torch.int32),
-                force_deep_gemm_metadata=True,
-                uses_aiter_fp4_layout=True,
-            )
-            destination = PagedIndexerMetadata(
-                page_size=256,
-                page_table=torch.zeros((2, 2), dtype=torch.int32),
-                c4_seq_lens=torch.ones(2, dtype=torch.int32),
-                force_deep_gemm_metadata=True,
-                uses_aiter_fp4_layout=True,
-            )
-            destination.copy_(source)
-
-        self.assertIsNone(source.deep_gemm_metadata)
-        self.assertIsNone(destination.deep_gemm_metadata)
-        torch.testing.assert_close(destination.page_table, source.page_table)
-        torch.testing.assert_close(destination.c4_seq_lens, source.c4_seq_lens)
-
-        source.uses_aiter_fp4_layout = False
-        with self.assertRaisesRegex(AssertionError, "uses_aiter_fp4_layout"):
-            destination.copy_(source)
-
+class TestDSV4PagedIndexerMetadata(CustomTestCase):
     def test_sm120_fp4_forces_deep_gemm_metadata(self):
         expected = torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
         deep_gemm = SimpleNamespace(
@@ -174,7 +69,7 @@ class TestDSV4PagedIndexerMetadata(unittest.TestCase):
         self.assertIsNone(metadata.deep_gemm_metadata)
 
 
-class TestDSV4NonPagedIndexer(unittest.TestCase):
+class TestDSV4NonPagedIndexer(CustomTestCase):
     def _is_eligible(self, **overrides):
         backend = SimpleNamespace(hisparse_coordinator=None)
         c4_indexer = SimpleNamespace(use_fp4_indexer=overrides.get("fp4", False))

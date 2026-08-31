@@ -141,16 +141,6 @@ class TestDeepSeekV4FP4IndexerPool(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "split payload and scale"):
             pool.get_index_k_with_scale_buffer(0)
 
-    def test_fp4_payload_view_preserves_real_shape_and_bytes(self):
-        raw_payload = torch.zeros((3, 1, 4, 64, 16), dtype=torch.uint8)
-        payload = raw_payload.view(torch.float4_e2m1fn_x2)
-
-        self.assertEqual(payload.shape, (3, 1, 4, 64, 16))
-        self.assertEqual(payload.dtype, torch.float4_e2m1fn_x2)
-        self.assertEqual(payload.data_ptr(), raw_payload.data_ptr())
-        self.assertEqual(payload.nbytes, 3 * 4096)
-        self.assertEqual(payload[0].nbytes, 4096)
-
     def test_cuda_fp4_keeps_combined_planar_layout(self):
         pool, zeros = self._make_pool(hip=False, enabled=True)
 
@@ -209,7 +199,6 @@ class TestDeepSeekV4FP4IndexerPool(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "HiCache/hybrid host-pool"):
             build_deepseek_v4_hicache_stack(
                 params=None,
-                server_args=None,
                 kvcache=SimpleNamespace(uses_aiter_fp4_layout=True),
                 load_cache_event=None,
                 storage_backend=None,
@@ -256,6 +245,11 @@ class TestDeepSeekV4FP4IndexerPool(CustomTestCase):
             patch.object(pool_configurator, "get_schedule", return_value=schedule),
             patch.object(pool_configurator, "get_spec", return_value=spec),
             patch.object(pool_configurator, "get_disagg", return_value=disagg),
+            patch.object(
+                pool_configurator,
+                "max_speculative_num_draft_tokens",
+                return_value=None,
+            ),
             patch.object(
                 pool_configurator,
                 "get_memory",

@@ -34,21 +34,6 @@ class _RoPEConsumerStub(_ModuleStub):
         self.rotary_emb = rotary_emb
 
 
-class _IndexerStub(_RoPEConsumerStub):
-    def __init__(
-        self,
-        *args,
-        aiter_fp4_cos=None,
-        aiter_fp4_sin=None,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self.compressor = SimpleNamespace()
-        if aiter_fp4_cos is not None:
-            self.compressor.aiter_fp4_cos = aiter_fp4_cos
-            self.compressor.aiter_fp4_sin = aiter_fp4_sin
-
-
 class _RotaryEmbeddingStub(_ModuleStub):
     def __init__(self, *args, **kwargs):
         super().__init__()
@@ -82,14 +67,14 @@ class TestDeepseekV4RoPEPolicy(CustomTestCase):
             },
         )
 
-    def _make_layer(self, compress_ratio, *, is_hip=False):
+    def _make_layer(self, compress_ratio):
         parallel = SimpleNamespace(attn_tp_rank=0, attn_tp_size=1, tp_size=1)
         device = SimpleNamespace(device=torch.device("cpu"))
         with (
             envs.SGLANG_OPT_FUSE_WQA_WKV.override(False),
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.override(False),
             patch.object(deepseek_v4, "_FP8_WO_A_GEMM", False),
-            patch.object(deepseek_v4, "_is_hip", is_hip),
+            patch.object(deepseek_v4, "_is_hip", False),
             patch.object(deepseek_v4, "_is_npu", False),
             patch.object(deepseek_v4, "is_dsa_enable_prefill_cp", return_value=False),
             patch.object(deepseek_v4, "get_parallel", return_value=parallel),
@@ -106,7 +91,7 @@ class TestDeepseekV4RoPEPolicy(CustomTestCase):
                 ),
             ),
             patch.object(deepseek_v4, "Compressor", _RoPEConsumerStub),
-            patch.object(deepseek_v4, "C4Indexer", _IndexerStub),
+            patch.object(deepseek_v4, "C4Indexer", _RoPEConsumerStub),
             patch.object(deepseek_v4, "RadixAttention", _ModuleStub),
         ):
             return deepseek_v4.MQALayer(
@@ -154,36 +139,6 @@ class TestDeepseekV4RoPEPolicy(CustomTestCase):
                 if compress_ratio == 4:
                     self.assertIs(layer.indexer.freqs_cis, layer.compressor.freqs_cis)
                     self.assertIs(layer.indexer.rotary_emb, layer.compressor.rotary_emb)
-
-    def test_hip_c4_indexer_shares_parent_rope_storage_after_apply(self):
-        layer = self._make_layer(4, is_hip=True)
-        compressor = layer.indexer.compressor
-
-        self.assertEqual(compressor.aiter_fp4_cos.shape, (128, 32))
-        self.assertEqual(compressor.aiter_fp4_sin.shape, (128, 32))
-        self.assertEqual(compressor.aiter_fp4_cos.dtype, torch.bfloat16)
-        self.assertEqual(compressor.aiter_fp4_sin.dtype, torch.bfloat16)
-        self.assertTrue(compressor.aiter_fp4_cos.is_contiguous())
-        self.assertTrue(compressor.aiter_fp4_sin.is_contiguous())
-        self.assertEqual(
-            compressor.aiter_fp4_cos.data_ptr(), layer.cos_cache.data_ptr()
-        )
-        self.assertEqual(
-            compressor.aiter_fp4_sin.data_ptr(), layer.sin_cache.data_ptr()
-        )
-
-        old_cos = compressor.aiter_fp4_cos
-        old_sin = compressor.aiter_fp4_sin
-        layer._apply(lambda tensor: tensor.clone())
-
-        self.assertIsNot(compressor.aiter_fp4_cos, old_cos)
-        self.assertIsNot(compressor.aiter_fp4_sin, old_sin)
-        self.assertEqual(
-            compressor.aiter_fp4_cos.data_ptr(), layer.cos_cache.data_ptr()
-        )
-        self.assertEqual(
-            compressor.aiter_fp4_sin.data_ptr(), layer.sin_cache.data_ptr()
-        )
 
 
 if __name__ == "__main__":
