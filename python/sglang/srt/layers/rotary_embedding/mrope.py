@@ -100,39 +100,41 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
-        # MRoPE axis_map interleaving pattern depends on mrope_section sizes.
-        # The algorithm cycles through axes [0(T), 1(H), 2(W)] round-robin,
-        # skipping any axis that has exhausted its allocated pairs.
-        #
-        # For GLM-V (mrope_section=[8,12,12]):
-        #   T(8) < H(12) = W(12), so T exhausts first at pair 24.
-        #   Result: [0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 1,1,2, 1,1,2, 2,2]
-        #   After T runs out, only H and W fill the remaining slots.
-        #
-        # For Qwen3-VL (mrope_section=[24,20,20]):
-        #   T(24) > H(20) = W(20), so H and W exhaust first near the tail.
-        #   Result: [0,1,2, 0,1,2, ...repeated evenly..., 0,1, 0,1, 0,0]
-        #   After H/W run out, T fills the remaining slots.
-
-        if self.mrope_interleaved_glm:
-            num_pairs = rotary_dim // 2
-            axis_map = torch.empty(num_pairs, dtype=torch.long)
-            assert sum(self.mrope_section) == num_pairs
-            counts = [0, 0, 0]
-            current_ax = 0
-
-            for i in range(num_pairs):
-                current_ax = i % 3
-                while counts[current_ax] >= self.mrope_section[current_ax]:
-                    current_ax = (current_ax + 1) % 3
-
-                axis_map[i] = current_ax
-                counts[current_ax] += 1
-            self.register_buffer("axis_map", axis_map, persistent=False)
-        else:
-            self.axis_map = None
+        self.register_buffer("axis_map", self._build_axis_map(), persistent=False)
         if self._force_native:
             self._forward_method = self.forward_native
+
+    def _build_axis_map(self) -> Optional[torch.Tensor]:
+        """Which of the temporal, height and width axes owns each rotary lane."""
+        if not self.mrope_section:
+            return None
+        section = self.mrope_section
+        num_pairs = self.rotary_dim // 2
+        assert (
+            len(section) == 3 and sum(section) == num_pairs
+        ), f"mrope_section {section} must be three axes summing to {num_pairs}"
+        if self.mrope_interleaved_glm:
+            axes = []
+            spent = [0, 0, 0]
+            for lane in range(num_pairs):
+                axis = lane % 3
+                while spent[axis] >= section[axis]:
+                    axis = (axis + 1) % 3
+                spent[axis] += 1
+                axes.append(axis)
+        elif self.mrope_interleaved:
+            axes = [0] * num_pairs
+            for axis in (1, 2):
+                for lane in range(axis, min(3 * section[axis], num_pairs), 3):
+                    axes[lane] = axis
+        else:
+            axes = [axis for axis, size in enumerate(section) for _ in range(size)]
+        return torch.tensor(axes, dtype=torch.long, device=self.cos_sin_cache.device)
+
+    @property
+    def _legacy_axis_map(self) -> Optional[torch.Tensor]:
+        """The map only where the older rope kernels read it; one is out of tree."""
+        return self.axis_map if self.mrope_interleaved_glm else None
 
     def get_cos_sin_with_position(self, positions):
         if positions.ndim == 1:
@@ -269,7 +271,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.mrope_interleaved,
             self.mrope_interleaved_glm,
             self.is_neox_style,
-            self.axis_map,
+            self._legacy_axis_map,
         )
         return query, key
 
@@ -319,7 +321,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                 self.mrope_interleaved,
                 self.mrope_interleaved_glm,
                 self.is_neox_style,
-                self.axis_map,
+                self._legacy_axis_map,
             )
             return query, key
         return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
@@ -514,6 +516,10 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
             mrope_interleaved=mrope_interleaved,
         )
         self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(apply_rotary_emb)
+
+    def _build_axis_map(self) -> Optional[torch.Tensor]:
+        """No map: the shared builder reads mrope_section as t, h, w, Ernie as h, w, t."""
+        return None
 
     def forward_native(
         self,

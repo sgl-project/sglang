@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers import flashinfer_comm_fusion as fusion
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, override_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -101,7 +101,7 @@ class TestFlashInferCommFusion(CustomTestCase):
         multi_node = ("auto", True)
 
         # Blackwell: mnnvl on both single-node and multi-node.
-        with patch.object(fusion, "is_sm100_supported", return_value=True):
+        with override_platform(is_sm100=True):
             self.assertEqual(
                 fusion._resolve_backend(*single_node),
                 "mnnvl",
@@ -110,8 +110,8 @@ class TestFlashInferCommFusion(CustomTestCase):
 
         # SM90: auto uses trtllm on single-node, multi-node is unsupported.
         with (
-            patch.object(fusion, "is_sm100_supported", return_value=False),
-            patch.object(fusion, "is_sm90_supported", return_value=True),
+            override_platform(is_sm100=False),
+            override_platform(is_sm90=True),
         ):
             self.assertEqual(
                 fusion._resolve_backend(*single_node),
@@ -125,8 +125,8 @@ class TestFlashInferCommFusion(CustomTestCase):
         for arch in ("pre_sm90", "post_sm10x"):
             with (
                 self.subTest(arch=arch),
-                patch.object(fusion, "is_sm100_supported", return_value=False),
-                patch.object(fusion, "is_sm90_supported", return_value=False),
+                override_platform(is_sm100=False),
+                override_platform(is_sm90=False),
             ):
                 with self.assertRaises(ValueError):
                     fusion._resolve_backend(*single_node)
@@ -140,8 +140,8 @@ class TestFlashInferCommFusion(CustomTestCase):
         multi_node_trtllm = ("trtllm", True)
 
         with (
-            patch.object(fusion, "is_sm100_supported", return_value=False),
-            patch.object(fusion, "is_sm90_supported", return_value=True),
+            override_platform(is_sm100=False),
+            override_platform(is_sm90=True),
         ):
             self.assertEqual(
                 fusion._resolve_backend(*single_node_mnnvl),
@@ -156,7 +156,7 @@ class TestFlashInferCommFusion(CustomTestCase):
             with self.assertRaises(ValueError):
                 fusion._resolve_backend(*multi_node_trtllm)
 
-        with patch.object(fusion, "is_sm100_supported", return_value=True):
+        with override_platform(is_sm100=True):
             self.assertEqual(
                 fusion._resolve_backend(*multi_node_mnnvl),
                 "mnnvl",
@@ -167,8 +167,8 @@ class TestFlashInferCommFusion(CustomTestCase):
         for arch in ("pre_sm90", "post_sm10x"):
             with (
                 self.subTest(arch=arch),
-                patch.object(fusion, "is_sm100_supported", return_value=False),
-                patch.object(fusion, "is_sm90_supported", return_value=False),
+                override_platform(is_sm100=False),
+                override_platform(is_sm90=False),
             ):
                 for args in (
                     single_node_mnnvl,
