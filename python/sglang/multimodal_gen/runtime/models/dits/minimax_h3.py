@@ -52,10 +52,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionRequirements,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    claim_deferred_component_attn_backend,
     get_attn_backend,
-    get_component_forced_attn_backend,
     get_global_forced_attn_backend,
-    record_component_attn_backend,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -2011,12 +2010,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         )
         # Component overrides disappear when the loader context exits. Preserve
         # only that selection; process-wide overrides are resolved at first use.
-        self._component_attention_backend_override = get_component_forced_attn_backend()
-        if self._component_attention_backend_override is not None:
-            record_component_attn_backend(
-                self._component_attention_backend_override,
-                "deferred model-specific resolution",
-            )
+        self._component_attention_backend_override = (
+            claim_deferred_component_attn_backend()
+        )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
         self._mark_missing_params_required()
 
