@@ -1,0 +1,142 @@
+# MI355X DeepSeek-V4-Pro (FP4) 2-node 1P1D combining BOTH memory features in one
+# PD leg: HiCache on the PREFILL role + HiSparse on the DECODE role, KV transfer
+# over MORI, unified-KV layout.
+#
+# FP4 is driven by the nightly block precision: fp4 (launcher sets
+# SGLANG_DSV4_FP4_EXPERTS); no fp4-specific flag belongs in this recipe.
+#
+# The two features live on opposite roles by design and do not conflict:
+#   * HiCache is prefill-only  (a decode server never prefills; pd_disaggregation_hook
+#                               forces disable_radix_cache=True on decode anyway).
+#   * HiSparse is decode-only  (prefill keeps the dense C4 source layout,
+#                               hisparse_hook:107).
+#
+# Requires three PRs, in order (none merged into the image yet, so this leg runs
+# via SGLANG_USE_CHECKOUT_RUNTIME=1 against a tree that contains all three):
+#   #29168  unified-KV HiSparse on ROCm         (removes the unified-KV guard,
+#                                                 adds HiSparseUnifiedC4DevicePool)
+#   #32368  HiSparse PD over MoRI               (the PD/cross-node KV transfer;
+#                                                 declares "based on #29168")
+#   #36966  device-alias pointer fix            (both features hit the same
+#                                                 DeepSeekV4PagedHostPool; without
+#                                                 it, GPU-faults at PD warmup /
+#                                                 backup on non-SVM host kernels)
+#
+# VALIDATION STATUS: the two features were each validated SEPARATELY on 2026-08-29
+# (HiSparse-on-decode GSM8K 0.960; HiCache-on-prefill GSM8K 0.950), both 0 GPU
+# faults. The COMBINED config in this recipe (both at once) has not yet been run
+# end-to-end -- this leg is its first exercise. If it regresses, split back into
+# the per-feature recipes to isolate which side breaks.
+#
+# The launcher auto-adds --enable-dp-attention/--dp-size, --moe-a2a-backend/
+# --deepep-mode, and the DSV4 parser flags; only the feature flags below are
+# recipe-specific.
+
+resources:
+  prefill_workers: 1
+  decode_workers: 1
+
+backend:
+  sglang_config:
+    prefill:
+      tensor-parallel-size: 8
+      expert-parallel-size: 8
+      data-parallel-size: 8
+    decode:
+      tensor-parallel-size: 8
+      expert-parallel-size: 8
+      data-parallel-size: 8
+
+runtime:
+  image: lmsysorg/sglang-rocm:v0.5.18-rocm724-mi35x-20260826
+  attention_backend: dsv4
+  moe_a2a_backend: mori
+  kv_transfer_backend: mori
+  # HiSparse host-RDMA needs all 8 rails + rank-local IB (env below).
+  ib_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+  dist_socket_ifname: eno0
+  prefill_port: 30025
+  decode_port: 30026
+  prefill_bootstrap_port: 8998
+  decode_bootstrap_port: 9001
+  lb_port: 8000
+  mem_fraction_static: 0.85
+  page_size: 256
+  max_running_requests: 192
+  chunked_prefill_size: 65536
+  swa_full_tokens_ratio: 0.1
+  # Required for the HiCache (prefill) side: --disable-radix-cache is otherwise
+  # hardcoded into both role strings, and hierarchical-cache + disable-radix-cache
+  # is a hard ValueError. HiCache L1 *is* the radix cache. In practice only prefill
+  # is affected: pd_disaggregation_hook still forces disable_radix_cache=True on the
+  # decode role, which is what the HiSparse decode side wants.
+  disable_radix_cache: false
+  wide_ep:
+    kv_cache_dtype: fp8_e4m3
+    # PREFILL: HiCache. hicache-ratio 2 matched validation; if the PD device pool
+    # makes the host budget too large ("Not enough host memory"), switch to an
+    # absolute --hicache-size (GB per rank) as the dsr1 leg does.
+    prefill_extra_flags: "--enable-hierarchical-cache --hicache-ratio 2 --hicache-io-backend kernel --hicache-mem-layout layer_first"
+    # DECODE: HiSparse. device_buffer_size 2048 sizes the device C4 pool so
+    # requests admit (hisparse_req_budget > 0).
+    decode_extra_flags: "--disable-overlap-schedule --enable-hisparse --hisparse-config '{\"top_k\":1024,\"device_buffer_size\":2048,\"host_to_device_ratio\":2}'"
+    prefill_extra_env:
+      SGLANG_HACK_FLASHMLA_BACKEND: unified_kv_triton
+      MORI_RDMA_TC: 104
+      MORI_IO_TC: 104
+      MORI_RDMA_SL: 3
+      MORI_IO_SL: 3
+      MORI_IO_TC_DISABLE: 0
+      MORI_SHMEM_MODE: ISOLATION
+      MORI_IO_SQ_BACKOFF_TIMEOUT_US: 500000
+      MORI_IO_QP_MAX_SEND_WR: 32767
+      MORI_IO_QP_MAX_CQE: 32768
+      MORI_IO_QP_MAX_SGE: 2
+      SGLANG_MORI_QP_PER_TRANSFER: 4
+      SGLANG_MORI_NUM_WORKERS: 4
+      MORI_ENABLE_DMABUF_REG: 0
+      NCCL_IB_HCA: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+      SGLANG_MORI_COMBINE_DTYPE: auto
+      SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK: 16384
+      SGLANG_MORI_RANK_LOCAL_IB_DEVICE: 1
+      SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES: 268435456
+      # nightly nodes have no hugepages reserved; strict mode hard-fails, so run
+      # off plain mmap out of normal RAM.
+      SGLANG_HUGEPAGE_STRICT: 0
+    decode_extra_env:
+      SGLANG_HACK_FLASHMLA_BACKEND: unified_kv_triton
+      MORI_RDMA_TC: 104
+      MORI_IO_TC: 104
+      MORI_RDMA_SL: 3
+      MORI_IO_SL: 3
+      MORI_IO_TC_DISABLE: 0
+      MORI_SHMEM_MODE: ISOLATION
+      MORI_IO_SQ_BACKOFF_TIMEOUT_US: 500000
+      MORI_IO_QP_MAX_SEND_WR: 32767
+      MORI_IO_QP_MAX_CQE: 32768
+      MORI_IO_QP_MAX_SGE: 2
+      SGLANG_MORI_QP_PER_TRANSFER: 4
+      SGLANG_MORI_NUM_WORKERS: 4
+      MORI_ENABLE_DMABUF_REG: 0
+      NCCL_IB_HCA: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+      SGLANG_MORI_COMBINE_DTYPE: auto
+      SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK: 128
+      SGLANG_MORI_RANK_LOCAL_IB_DEVICE: 1
+      SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES: 268435456
+      SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION: 0
+      SGLANG_HUGEPAGE_STRICT: 0
+
+bench:
+  concurrencies: [1, 8, 16, 32, 64, 128, 256]
+  num_prompts_factor: 4
+  # --dataset-name random has ~zero cross-request prefix reuse, so this sweep
+  # reflects overhead, not HiCache benefit. The accuracy gate is the real signal.
+  random_range_ratio: 1.0
+  accuracy:
+    enabled: true
+    num_shots: 5
+    num_questions: 200
+    # TODO(gate): threshold pending. Per-feature validation gave 0.960 (HiSparse)
+    # and 0.950 (HiCache); the combined run sets its own baseline. Set the gate
+    # once that number is in and the gate policy is decided.
+    threshold: 0.91
