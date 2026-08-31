@@ -24,6 +24,13 @@ def _blackwell_or_newer(device: torch.device) -> bool:
     )
 
 
+def _sm103(device: torch.device) -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability(device) == (
+        10,
+        3,
+    )
+
+
 def _nss_activation(t, like=None) -> bool:
     return (
         isinstance(t, torch.Tensor)
@@ -71,6 +78,14 @@ def norm_scale_shift_module() -> Module:
             (
                 "srnss_bf16_row",
                 "norm_scale_shift::ScaleResidualNormScaleShiftKernel::run",
+            ),
+            (
+                "bias_srnss_bf16_row",
+                "norm_scale_shift::BiasScaleResidualNormScaleShiftKernel::run",
+            ),
+            (
+                "bias_mul_add_bf16_row",
+                "norm_scale_shift::BiasMulAddKernel::run",
             ),
         ],
     )
@@ -128,3 +143,58 @@ def try_fused_scale_residual_norm_scale_shift(
         float(eps),
     )
     return y, residual_out
+
+
+def try_fused_bias_scale_residual_norm_scale_shift(
+    residual, x, input_bias, gate, weight, bias, scale, shift, norm_type, eps
+):
+    if torch.compiler.is_compiling():
+        return None
+    if norm_type != "layer" or weight is not None or bias is not None:
+        return None
+    if not (_nss_activation(x) and _nss_activation(residual, x) and _sm103(x.device)):
+        return None
+
+    input_bias = _row_bf16(input_bias, x.device)
+    gate = _row_bf16(gate, x.device)
+    scale = _row_bf16(scale, x.device)
+    shift = _row_bf16(shift, x.device)
+    if any(tensor is None for tensor in (input_bias, gate, scale, shift)):
+        return None
+
+    y = torch.empty_like(x)
+    residual_out = torch.empty_like(x)
+    _module().bias_srnss_bf16_row(
+        y.view(-1, _HIDDEN),
+        residual_out.view(-1, _HIDDEN),
+        residual.view(-1, _HIDDEN),
+        x.view(-1, _HIDDEN),
+        input_bias,
+        gate,
+        scale,
+        shift,
+        float(eps),
+    )
+    return y, residual_out
+
+
+def try_fused_bias_mul_add(x, input_bias, gate, residual):
+    if torch.compiler.is_compiling():
+        return None
+    if not (_nss_activation(x) and _nss_activation(residual, x) and _sm103(x.device)):
+        return None
+
+    input_bias = _row_bf16(input_bias, x.device)
+    gate = _row_bf16(gate, x.device)
+    if input_bias is None or gate is None:
+        return None
+
+    y = torch.empty_like(x)
+    _module().bias_mul_add_bf16_row(
+        y.view(-1, _HIDDEN),
+        x.view(-1, _HIDDEN),
+        input_bias,
+        gate,
+        residual.view(-1, _HIDDEN),
+    )
+    return y
