@@ -56,6 +56,9 @@ class CloudStorage:
                 ".jpeg": "image/jpeg",
                 ".webp": "image/webp",
                 ".mp4": "video/mp4",
+                ".wav": "audio/wav",
+                ".mp3": "audio/mpeg",
+                ".flac": "audio/flac",
                 ".glb": "model/gltf-binary",
                 ".obj": "text/plain",
             }.get(ext, "application/octet-stream")

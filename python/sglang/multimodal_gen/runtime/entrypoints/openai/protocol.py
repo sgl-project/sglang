@@ -229,6 +229,58 @@ class MeshListResponse(BaseModel):
     object: str = "list"
 
 
+# Audio API protocol models (OpenAI /v1/audio/speech + SGLang extensions)
+class AudioSpeechRequest(BaseModel):
+    """OpenAI Audio Speech request, with SGLang TTS / voice-cloning extensions."""
+
+    model_config = ConfigDict(extra="allow")
+
+    # OpenAI
+    input: Optional[str] = None
+    model: Optional[str] = None
+    voice: Optional[Union[str, Dict[str, Any]]] = "alloy"  # OpenAI label; not a path
+    instructions: Optional[str] = None
+    response_format: Optional[str] = "wav"
+    speed: Optional[float] = 1.0
+    stream_format: Optional[str] = "audio"
+
+    # SGLang extensions (image/video-style SamplingParams passthrough)
+    prompt: Optional[str] = None  # alias for input
+    prompt_text: Optional[str] = None
+    prompt_audio_path: Optional[str] = None
+    guidance_method: Optional[str] = None
+    guidance_scale: Optional[float] = None
+    num_inference_steps: Optional[int] = None
+    duration_seconds: Optional[float] = None
+    seed: Optional[Union[int, List[int]]] = None
+    generator_device: Optional[str] = None  # None → SamplingParams / pipeline default
+
+
+class AudioSpeechResponse(BaseModel):
+    """SGLang metadata for a completed speech request (not returned by OpenAI)."""
+
+    id: str
+    object: str = "audio.speech"
+    model: str = ""
+    status: str = "completed"
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    response_format: str = "wav"
+    voice: Optional[str] = None
+    url: Optional[str] = None
+    completed_at: Optional[int] = None
+    error: Optional[Dict[str, Any]] = None
+    file_path: Optional[str] = None
+    file_size_bytes: Optional[int] = None
+    sample_rate: Optional[int] = None
+    peak_memory_mb: Optional[float] = None
+    inference_time_s: Optional[float] = None
+
+
+class AudioSpeechListResponse(BaseModel):
+    data: List[AudioSpeechResponse]
+    object: str = "list"
+
+
 @dataclass
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)

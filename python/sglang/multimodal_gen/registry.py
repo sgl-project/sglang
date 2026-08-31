@@ -73,6 +73,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineCo
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
     LingBotVideoMoEPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_audiodit import (
+    LongCatAudioDiTPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
     LongCatImageEditPipelineConfig,
     LongCatImagePipelineConfig,
@@ -149,6 +152,9 @@ from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
 )
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.longcat_audiodit import (
+    LongCatAudioDiTSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.longcat_image import (
     LongCatImageEditSamplingParams,
@@ -342,6 +348,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+    "longcat-audiodit": "LongCatAudioDiTPipeline",
 }
 
 
@@ -1318,6 +1325,17 @@ def _register_configs():
         ],
     )
 
+    # LongCat-AudioDiT
+    register_configs(
+        sampling_param_cls=LongCatAudioDiTSamplingParams,
+        pipeline_config_cls=LongCatAudioDiTPipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-AudioDiT-1B",
+            "meituan-longcat/LongCat-AudioDiT-3.5B",
+        ],
+        model_detectors=[lambda hf_id: "longcat-audiodit" in hf_id.lower()],
+    )
+
     # LongCat-Image
     register_configs(
         sampling_param_cls=LongCatImageSamplingParams,
@@ -1326,7 +1344,8 @@ def _register_configs():
             "meituan-longcat/LongCat-Image",
         ],
         model_detectors=[
-            lambda hf_id: "longcat" in hf_id.lower() and "edit" not in hf_id.lower(),
+            lambda hf_id: "longcat-image" in hf_id.lower()
+            and "edit" not in hf_id.lower(),
         ],
     )
 

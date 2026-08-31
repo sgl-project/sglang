@@ -110,6 +110,7 @@ diffusion = [
   "diffusers==0.37.0",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
+  "librosa>=0.10.0",
   "moviepy>=2.0.0",
   "msgpack",
   "nvidia-modelopt",
