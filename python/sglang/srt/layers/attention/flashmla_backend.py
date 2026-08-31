@@ -615,6 +615,7 @@ class FlashMLAMultiStepDraftBackend:
             )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self.kv_index_translator = model_runner.kv_index_translator
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
             (

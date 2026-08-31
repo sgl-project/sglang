@@ -1220,6 +1220,7 @@ class FlashInferMLAMultiStepDraftBackend:
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = get_schedule().page_size
+        self.kv_index_translator = model_runner.kv_index_translator
 
     def common_template(
         self,
@@ -1242,6 +1243,7 @@ class FlashInferMLAMultiStepDraftBackend:
             seq_lens_sum=seq_lens_sum,
         )
 
+        v2p = self.kv_index_translator.full_flat_v2p()
         self.generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
@@ -1251,6 +1253,7 @@ class FlashInferMLAMultiStepDraftBackend:
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
+            v2p,
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
@@ -1258,6 +1261,7 @@ class FlashInferMLAMultiStepDraftBackend:
             next_power_of_2(self.speculative_num_steps),
             next_power_of_2(bs),
             self.page_size,
+            TRANSLATE=v2p is not None,
         )
 
         assert forward_batch.spec_info is not None

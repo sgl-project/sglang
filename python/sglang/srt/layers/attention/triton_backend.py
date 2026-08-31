@@ -2417,6 +2417,7 @@ class TritonMultiStepDraftBackend:
         self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
             model_runner
         )
+        self.kv_index_translator = model_runner.kv_index_translator
 
     def common_template(
         self,
@@ -2435,6 +2436,7 @@ class TritonMultiStepDraftBackend:
             # over-estimate is safe. Use a static UB to skip the per-iter .sum().item() D2H.
             seq_lens_sum = num_seqs * self.max_context_len
 
+        v2p = self.kv_index_translator.full_flat_v2p()
         generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
@@ -2444,6 +2446,7 @@ class TritonMultiStepDraftBackend:
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
+            v2p,
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
@@ -2453,6 +2456,7 @@ class TritonMultiStepDraftBackend:
             self.page_size,
             self.draft_window_size,
             self.draft_sink_size,
+            TRANSLATE=v2p is not None,
         )
 
         if call_fn is None:
