@@ -3223,6 +3223,9 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             swa_allocator=self.swa_attn_allocator,
         )
 
+        # Always set: readers (the KV index translator) key on it unconditionally.
+        # DCP is rejected for this composite at argument validation, so 1.
+        self.dcp_size = 1
         self.free_group = None
         self.free_page_reps_group: Optional[List[torch.Tensor]] = None
         # Empty (not None) for the leak checker.
