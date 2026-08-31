@@ -366,9 +366,7 @@ class DSV4Metadata:
         default=None, repr=False
     )
     # Derived by the first C4 layer of a forward and reused by the rest.
-    fp4_k_write_metadata: Optional[FP4KWriteMetadata] = field(
-        default=None, repr=False
-    )
+    fp4_k_write_metadata: Optional[FP4KWriteMetadata] = field(default=None, repr=False)
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
