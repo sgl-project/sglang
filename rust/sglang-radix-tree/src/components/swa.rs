@@ -233,6 +233,15 @@ impl SwaComponent {
             }
             return;
         };
+        // Cache-mode graft commit only (buffer fills never reach here):
+        // a hit-shrunk window mid-tree is missing its head, so drop it.
+        // Root anchors are complete windows of their own.
+        if node_id != tree_core.arena.root()
+            && window_require_pages < self.sliding_window_size.div_ceil(page_size)
+        {
+            self.release_swa_host_(host_indices.shallow_clone(), cache_actions);
+            return;
+        }
         if window_require_pages == 0 || loaded_pages < window_require_pages {
             self.release_swa_host_(host_indices.shallow_clone(), cache_actions);
             return;

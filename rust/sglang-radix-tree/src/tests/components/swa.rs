@@ -4109,9 +4109,9 @@ fn prefetch_commit_without_a_target_releases_the_whole_buffer() {
 }
 
 #[test]
-fn prefetch_commit_releases_the_out_of_path_prefix() {
+fn prefetch_commit_releases_a_shortened_window_under_a_non_root_anchor() {
     // root -> a -> b -> c, one token each; anchor b, target c: the loaded
-    // window spans two tokens but the leaf->anchor path covers only c's one.
+    // window is missing its head and cannot be reused as a complete SWA window.
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
     let [a, b, c] = chain::<3>(&mut tc);
     let mut cache_actions = Vec::new();
@@ -4137,21 +4137,15 @@ fn prefetch_commit_releases_the_out_of_path_prefix() {
         Some(&mut insert_result),
         Some(&storage_result),
     );
-    // c (on path) fills with the buffer tail; the out-of-path prefix releases.
-    assert!(
-        tc.arena
-            .node(c)
-            .host_value(SWA)
-            .equal(&Tensor::from_slice(&[31i64]))
-    );
+    assert!(!tc.arena.node(c).has_host_value(SWA));
     assert!(!tc.arena.node(b).has_host_value(SWA));
     assert!(!tc.arena.node(a).has_host_value(SWA));
-    assert!(tc.host_lru_list(SWA).in_list(Some(c)));
+    assert!(!tc.host_lru_list(SWA).in_list(Some(c)));
     assert_eq!(cache_actions.len(), 1);
     let CacheAction::FreeComponentHostSlot { host_indices, .. } = &cache_actions[0] else {
         panic!("expected a host free");
     };
-    assert!(host_indices[0].equal(&Tensor::from_slice(&[30i64])));
+    assert!(host_indices[0].equal(&Tensor::from_slice(&[30i64, 31])));
 }
 
 #[test]
