@@ -25,7 +25,7 @@ static CRYPTO_PROVIDER_INIT: Once = Once::new();
 
 fn ensure_crypto_provider() {
     CRYPTO_PROVIDER_INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        smg::crypto::ensure_crypto_provider_installed();
     });
 }
 

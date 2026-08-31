@@ -19,3 +19,4 @@ default-features = true
 [features]
 default = ["pyo3/extension-module"]
 vendored-openssl = ["sgl-model-gateway/vendored-openssl"]
+fips = ["sgl-model-gateway/fips"]
