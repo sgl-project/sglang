@@ -2268,6 +2268,8 @@ class TestDeepEPv2Args(CustomTestCase):
             "DeepseekV3ForCausalLM",
             "DeepseekV4ForCausalLM",
             "Qwen3MoeForCausalLM",
+            "MiMoV2ForCausalLM",
+            "MiMoV2FlashForCausalLM",
         ):
             args = self._args(moe_runner_backend="deep_gemm")
             args._model_config.hf_config.architectures = [architecture]
@@ -2440,6 +2442,19 @@ class TestDeepEPv2Args(CustomTestCase):
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(1024):
             with self.assertRaisesRegex(ValueError, "required=1280"):
                 validate_deepep_v2_dispatch_token_budget(args)
+
+    def test_prefill_budget_divides_by_attn_tp_size(self):
+        # DP-attention (dp<tp): a per-DP chunk scatters across attn-TP ranks, so
+        # the per-EP-rank budget is chunked/(tp/dp). Here 2048/(16/2)=256 <= 1024
+        # passes, while the undivided 2048 would falsely exceed the cap.
+        args = self._args(
+            chunked_prefill_size=2048,
+            tp_size=16,
+            dp_size=2,
+            enable_dp_attention=True,
+        )
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(1024):
+            validate_deepep_v2_dispatch_token_budget(args)
 
     def test_disabled_chunking_uses_max_prefill_tokens(self):
         for disabled in (None, 0, -1):

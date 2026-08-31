@@ -1598,8 +1598,8 @@ def pre_permute_deepep_v2_to_deep_gemm(
     running_state: dict,
 ) -> DeepGemmRunnerInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import (
-        ep_expand_init_m_indices_from_psum,
         ep_scatter_from_psum,
+        fill_m_indices_from_psum,
     )
 
     hidden_states = dispatch_output.hidden_states
@@ -1661,17 +1661,23 @@ def pre_permute_deepep_v2_to_deep_gemm(
                 expected_m=deepep_v2_expected_m,
             )
 
-        # Mark aligned expert rows and leave the unused receive tail at -1.
-        m_indices = torch.full(
-            (all_tokens,), -1, device=hidden_states.device, dtype=torch.int32
+        # Real expert id per row (incl. padding) straight from device psum; padding
+        # rows compute harmless garbage that combine skips via handle metadata.
+        num_local_experts = psum_num_recv_tokens_per_expert.shape[0]
+        m_indices = fill_m_indices_from_psum(
+            psum_num_recv_tokens_per_expert,
+            num_local_experts,
+            all_tokens,
+            deepep_v2_expert_alignment,
         )
-        ep_expand_init_m_indices_from_psum(psum_num_recv_tokens_per_expert, m_indices)
+        # Leave hidden_states_scale_tma_aligned at its default False: DeepEP's
+        # expanded recv scale is not in the contiguous GEMM's TMA-aligned layout,
+        # so _run_contiguous_gemm must still run tma_align_input_scale on it.
         return DeepGemmRunnerInput(
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
             use_masked_gemm=False,
             m_indices=m_indices,
-            hidden_states_scale_tma_aligned=hidden_states_scale_tma_aligned,
         )
 
     all_tokens = int(psum_num_recv_tokens_per_expert[-1].item())
@@ -1751,10 +1757,11 @@ def post_permute_deep_gemm_to_deepep_v2(
             )
             return DeepEPv2CombineInput(hidden_states, None)
         if topk_weights is not None:
-            # Expanded combine does not consume top-k weights.
-            hidden_states = hidden_states * topk_weights.to(
-                hidden_states.dtype
-            ).unsqueeze(-1)
+            # Weight the expanded rows in place before combine (which ignores
+            # topk_weights in expand mode); coalesced kernel, ~3x over mul_.
+            from sglang.kernels.ops.moe.ep_moe_kernels import scale_expanded_rows_
+
+            scale_expanded_rows_(hidden_states, topk_weights)
         return DeepEPv2CombineInput(hidden_states, None)
 
     hidden_states = runner_output.hidden_states

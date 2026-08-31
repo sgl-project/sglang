@@ -146,6 +146,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
     check_quantized_moe_compatibility,
     init_lplb_solvers,
+    prebuild_deepep_v2_buffers,
     prepare_moe_topk,
 )
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
@@ -1082,6 +1083,21 @@ class ModelRunner:
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
+
+        # Build the deepep_v2 ElasticBuffer here (after capture, before serving) so
+        # the first request does not pay the lazy build. Skip if decode graph
+        # capture already built it; the eager / PD-prefill path needs it explicit.
+        decode_runner_captured = (
+            self.decode_cuda_graph_runner is not None
+            and not isinstance(self.decode_cuda_graph_runner, EagerRunner)
+        )
+        if not decode_runner_captured:
+            prebuild_deepep_v2_buffers(
+                model=self.model,
+                disaggregation_mode=self.server_args.disaggregation_mode,
+                chunked_prefill_size=self.server_args.chunked_prefill_size,
+                attn_tp_size=get_parallel().attn_tp_size,
+            )
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
