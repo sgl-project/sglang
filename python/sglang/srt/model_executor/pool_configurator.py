@@ -560,6 +560,15 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # is meaningless here -- there is no full pool to relate to, and every
         # token beyond the sliding window can be evicted. So cell_size = S*ns,
         # with no ratio factor applied.
+        # Fused draft KV (unified hybrid-SWA + EAGLE): the draft rides inside
+        # every full-side page, so the full term is the EXACT fused entry
+        # (host + draft + lcm pad, priced through the same spec the pool
+        # factory builds) and the per-draft-layer approximation must not
+        # double-charge.
+        self._fused_full_entry = kvc.fused_full_entry_bytes()
+        if self._fused_full_entry is not None:
+            self._draft_full_layers_num = 0
+
         if self._full_layers_num == 0:
             self._cell_size = (
                 self._swa_per_token * self._swa_layers_num
@@ -569,9 +578,14 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 + self._draft_cell_size
             )
         else:
-            self._cell_size = (
-                self._full_per_token
+            full_term = (
+                self._fused_full_entry
+                if self._fused_full_entry is not None
+                else self._full_per_token
                 * (self._full_layers_num + self._draft_full_layers_num)
+            )
+            self._cell_size = (
+                full_term
                 + self._swa_per_token * self._draft_swa_full_layers_num
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token

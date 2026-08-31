@@ -790,6 +790,81 @@ class KVCacheConfigurator:
             sliding_window_size=self.model_config.sliding_window_size,
         )
 
+    def fused_draft_kv_region(self):
+        """The EAGLE draft's KV geometry when it fuses into the target's pages.
+
+        Fusion engages only for: unified memory ON, a hybrid-SWA target (the
+        draft is dense per token, so it fuses into the FULL sub-pool), an
+        EAGLE-family algorithm whose draft config was loaded at target boot,
+        and a uniform-row draft (dense views need equal K/V widths). None
+        otherwise; callers keep their non-fused arrangement.
+        """
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            DenseDraftRegion,
+            _store_dtype_for,
+        )
+
+        aux = self.spec_aux_config
+        if not (
+            get_memory().enable_unified_memory
+            and self.is_hybrid_swa
+            and not self.is_draft_worker
+            and self.spec_algorithm.is_eagle()
+            and aux.eagle_draft_num_layers
+            and aux.eagle_draft_total_kv_heads
+        ):
+            return None
+        if aux.eagle_draft_head_dim != aux.eagle_draft_v_head_dim:
+            logger.warning(
+                "fused draft KV disabled: the draft's K/V rows are asymmetric "
+                "(head_dim=%s, v_head_dim=%s) and cannot form dense views.",
+                aux.eagle_draft_head_dim,
+                aux.eagle_draft_v_head_dim,
+            )
+            return None
+        # Per-GPU kv heads, mirroring the target's own division above. The
+        # resolver stores the UNDIVIDED count (it runs before the attn-TP
+        # group exists), so apply attn_tp here — dcp is deliberately absent:
+        # `ModelConfig.get_num_kv_heads` documents that drafts never join the
+        # DCP group, and the unified gate pins dcp_size == 1 regardless.
+        draft_kv_heads = max(
+            1, int(aux.eagle_draft_total_kv_heads) // get_parallel().attn_tp_size
+        )
+        return DenseDraftRegion(
+            layer_num=int(aux.eagle_draft_num_layers),
+            head_num=draft_kv_heads,
+            head_dim=int(aux.eagle_draft_head_dim),
+            # Drafts store KV in the same server kv dtype as the target.
+            store_dtype=_store_dtype_for(self.kv_cache_dtype),
+        )
+
+    def fused_full_entry_bytes(self) -> Optional[int]:
+        """Per-token bytes of the FUSED full-side entry (host + draft + pad),
+        for the boot solve's cell model. Single source of truth: assembled
+        through the same `MHASubPoolSpec` the pool factory builds, so the
+        priced entry and the allocated entry cannot drift. None when fusion
+        is off."""
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            MHASubPoolSpec,
+            _store_dtype_for,
+        )
+
+        region = self.fused_draft_kv_region()
+        if region is None:
+            return None
+        spec = MHASubPoolSpec(
+            name="full",
+            layer_num=len(self.model_config.full_attention_layer_ids),
+            head_num=self.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            ),
+            head_dim=self.model_config.head_dim,
+            store_dtype=_store_dtype_for(self.kv_cache_dtype),
+            grow_direction="down",
+            draft_region=region,
+        )
+        return spec.entry_bytes()
+
     def _init_unified_swa_pools(
         self,
         *,
@@ -856,6 +931,22 @@ class KVCacheConfigurator:
             if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
 
+        # Resolve ONCE here (not inline below) so the boot log reports exactly
+        # the region the factory is handed: a silently-declined fusion and an
+        # engaged one otherwise look identical from outside.
+        draft_kv_geometry = self.fused_draft_kv_region()
+        if draft_kv_geometry is not None:
+            logger.info(
+                "[unified-memory-pool] fused draft region: %d layer(s) x %d kv "
+                "head(s) x %d head_dim @ %s = %d B/token, carried inside the "
+                "full-side page envelope",
+                draft_kv_geometry.layer_num,
+                draft_kv_geometry.head_num,
+                draft_kv_geometry.head_dim,
+                draft_kv_geometry.store_dtype,
+                draft_kv_geometry.entry_bytes(),
+            )
+
         bundle = init_unified_swa_pools(
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
@@ -887,6 +978,7 @@ class KVCacheConfigurator:
             # charged, see `_check_bs1_feasibility_floor`.
             model_context_len=self.model_config.context_len,
             sliding_window_size=self.model_config.sliding_window_size,
+            draft_kv_geometry=draft_kv_geometry,
         )
         return UnifiedPoolBundle(
             unified_memory_pool=bundle.unified_memory_pool,
