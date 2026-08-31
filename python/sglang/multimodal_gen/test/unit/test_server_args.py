@@ -1585,6 +1585,8 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(
             ltx23_config.dit_config.arch_config.enable_packed_qkv_input_a2a
         )
+        self.assertFalse(ltx23_config.supports_auto_residency)
+        self.assertFalse(QwenImageLayeredPipelineConfig().supports_auto_residency)
 
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertEqual(sana_wm_deployment.dit_layerwise_offload_modes, ("memory",))
