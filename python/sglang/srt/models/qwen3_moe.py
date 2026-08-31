@@ -267,9 +267,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
         )
 
-        # Router gate: description-driven quant, mirroring vllm-ascend. Only the
-        # offline ModelSlim path (which carries a per-layer quant_model_description)
-        # may quantise the gate — if the checkpoint stored it as MXFP8 it is loaded
+        # Router gate: description-driven quant. Only the offline ModelSlim path
+        # (which carries a per-layer quant_model_description) may quantise the
+        # gate — if the checkpoint stored it as MXFP8 it is loaded
         # and dequantised correctly instead of cast to bf16 without its block scale.
         # The online Fp8/mxfp8 path keeps the gate in bf16 (unchanged, verified).
         gate_quant_config = (

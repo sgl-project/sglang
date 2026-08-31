@@ -53,8 +53,7 @@ def _format_megakernel_config(config: Any) -> str:
         return repr(config)
 
     parts = []
-    for field in dataclasses.fields(config):
-        value = getattr(config, field.name)
+    for field, value in zip(dataclasses.fields(config), dataclasses.astuple(config)):
         if isinstance(value, torch.Tensor):
             value = (
                 f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, "
@@ -227,8 +226,8 @@ def _ensure_flashinfer_megamoe_layer(
     layer: FusedMoE,
     *,
     megakernel_config: Any,
-    w13_scale_name: str,
-    w2_scale_name: str,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
 ) -> Any:
     mega = layer._flashinfer_megamoe_layer
     if mega is not None:
@@ -241,8 +240,6 @@ def _ensure_flashinfer_megamoe_layer(
         MoEEpMegaLayer,
     )
 
-    w13_scale = getattr(layer, w13_scale_name)
-    w2_scale = getattr(layer, w2_scale_name)
     transformed_weights = (
         (layer.w13_weight.data, w13_scale.data),
         (layer.w2_weight.data, w2_scale.data),
@@ -295,8 +292,8 @@ def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             top_k=layer.top_k,
             activation_clamp=layer.moe_runner_config.swiglu_limit,
         ),
-        w13_scale_name="w13_weight_scale_inv",
-        w2_scale_name="w2_weight_scale_inv",
+        w13_scale=layer.w13_weight_scale_inv,
+        w2_scale=layer.w2_weight_scale_inv,
     )
 
 
@@ -321,8 +318,8 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             fc2_alpha=layer.g2_alphas,
             fc1_norm_const=layer.w2_input_scale_quant,
         ),
-        w13_scale_name="w13_weight_scale",
-        w2_scale_name="w2_weight_scale",
+        w13_scale=layer.w13_weight_scale,
+        w2_scale=layer.w2_weight_scale,
     )
 
 
@@ -342,8 +339,8 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
         ),
-        w13_scale_name="w13_weight_scale_inv",
-        w2_scale_name="w2_weight_scale_inv",
+        w13_scale=layer.w13_weight_scale_inv,
+        w2_scale=layer.w2_weight_scale_inv,
     )
 
 
@@ -517,12 +514,7 @@ def run_flashinfer_megamoe(
         fc1_norm_const=quant_info.fc1_norm_const,
     )
     with _capture_safe_ue8m0_pack():
-        if getattr(mega, "supports_output_view", False):
-            y = mega.forward(t, return_workspace_view=True)
-        else:
-            # Keep compatibility with older MegaMoE implementations that do
-            # not expose the workspace-view capability.
-            y = mega.forward(t)
+        y = mega.forward(t, return_workspace_view=True)
 
     if quant_info.apply_routed_scaling_factor:
         rsf = runner_config.routed_scaling_factor

@@ -50,8 +50,8 @@ class TestFlashinferDispatcher(CustomTestCase):
 
             for workspace in MoeAlltoAll._WORKSPACE_CACHE.values():
                 mnnvl_mem = workspace.get("mnnvl_mem")
-                if mnnvl_mem is not None and hasattr(mnnvl_mem, "ptr"):
-                    delattr(mnnvl_mem, "ptr")
+                if mnnvl_mem is not None and "ptr" in vars(mnnvl_mem):
+                    del mnnvl_mem.ptr
             MoeAlltoAll._WORKSPACE_CACHE.clear()
         except ImportError:
             pass

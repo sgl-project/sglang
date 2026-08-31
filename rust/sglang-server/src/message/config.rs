@@ -1,7 +1,7 @@
 //! Runtime configuration: the rust-server boot knobs
 //! ([`RustServerServerArgs`]), the scheduler's typed `server_args` handoff
 //! ([`ServerArgs`] / [`ModelConfig`]), the [`RuntimeConfig`] pairing them for
-//! `runtime::start`, and the native MM pipeline handoff ([`MmSpec`]).
+//! `runtime::start`, and the Rust MM pipeline handoff ([`MmSpec`]).
 //!
 //! [`ServerArgs`] / [`ModelConfig`] / [`DefaultSamplingParams`] /
 //! [`DisaggregationMode`] / [`MmSpec`] / [`MmFamily`] / [`MmResample`] are
@@ -29,7 +29,7 @@ pub struct RustServerServerArgs {
     pub http_api_worker_num: usize,
     pub to_scheduler_cap: usize,
     pub from_scheduler_cap: usize,
-    pub channel_cap: usize,
+    pub stage_channel_cap: usize,
     /// CPU core ids the pools pin to (e.g. this rank's NUMA-local cores minus
     /// the scheduler's reserved launch cores). `None` → run unpinned.
     pub cores: Option<Vec<usize>>,
@@ -42,7 +42,7 @@ impl Default for RustServerServerArgs {
             http_api_worker_num: 2,
             to_scheduler_cap: 8192,
             from_scheduler_cap: 8192,
-            channel_cap: 8192,
+            stage_channel_cap: 8192,
             cores: None,
         }
     }
@@ -404,15 +404,15 @@ impl DefaultSamplingParams {
     }
 }
 
-/// The native MM pipeline handoff, built by `RustServer._build_mm_spec` from
-/// the resolved `NativeMmSpec` and passed to `Server.start_mm_workers`. Same
+/// The Rust MM pipeline handoff, built by `RustServer._build_mm_spec` from
+/// the resolved `RustMmSpec` and passed to `Server.start_mm_workers`. Same
 /// contract as [`ServerArgs`]: every field is a required, typed constructor
 /// keyword, so a drifted Python caller fails at boot.
 #[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
 #[derive(Clone, Debug)]
 pub struct MmSpec {
     /// Park feature buffers in POSIX shm rather than inline. Set by the Python
-    /// launcher (`NativeMmHost._use_feature_shm`) exactly when the scheduler
+    /// launcher (`RustMmProcessor._use_feature_shm`) exactly when the scheduler
     /// broadcasts across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
     /// The family pipeline and its resolved processor parameters.
@@ -475,7 +475,7 @@ impl MmSpec {
 
 /// Which `sglang_mm` family pipeline serves the model — one variant per
 /// [`sglang_mm::registry::PipelineSpec`] arm. Exposed to Python as an enum
-/// (`MmFamily.QwenVl`); `NativeMmFamily.name` maps onto it at handoff.
+/// (`MmFamily.QwenVl`); `RustMmFamily.name` maps onto it at handoff.
 #[pyo3::pyclass(
     eq,
     frozen,
@@ -487,9 +487,9 @@ pub enum MmFamily {
     QwenVl,
 }
 
-/// The HF image processor the native resize must reproduce bit-exactly (see
+/// The HF image processor the Rust resize must reproduce bit-exactly (see
 /// [`sglang_mm::qwen_vl::Resampler`]). Exposed to Python as an enum
-/// (`MmResample.AtenU8` / `.Pil`); `NativeMmFamily.image_processors` maps each
+/// (`MmResample.AtenU8` / `.Pil`); `RustMmFamily.image_processors` maps each
 /// processor class onto it.
 #[pyo3::pyclass(
     eq,

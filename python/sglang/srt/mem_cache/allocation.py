@@ -296,10 +296,7 @@ def alloc_for_extend(
 
     reuse_kv = None
     if batch.is_dllm():
-        reuse_kv = [
-            r.req_pool_idx is not None and bool(r.dllm_incomplete_ids)
-            for r in batch.reqs
-        ]
+        reuse_kv = [r.kv.holds_kv and bool(r.dllm_incomplete_ids) for r in batch.reqs]
 
     # Create tensors for allocation
     pin_memory = is_pin_memory_available(batch.device)
@@ -387,6 +384,7 @@ def alloc_for_extend(
 
     for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
         req.kv.kv_allocated_len = seq_len
+        req.kv.kv_committed_len = seq_len
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
@@ -581,6 +579,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     for req in batch.reqs:
         req.kv.kv_allocated_len += token_per_req
+        req.kv.kv_committed_len += token_per_req
 
     return out_cache_loc
 

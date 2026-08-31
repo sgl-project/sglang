@@ -26,6 +26,8 @@ import json
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
+from sglang.srt.runtime_context import get_exec
+
 
 class Phase:
     """The two phases of model forward."""
@@ -201,7 +203,6 @@ def check_cuda_graph_backend(phase: str, backend: str) -> bool:
     """True if cuda_graph_config[phase].backend == backend on the
     published config. Returns False if the config has not been published
     yet (e.g. unit tests, early startup)."""
-    from sglang.srt.runtime_context import get_exec
 
     try:
         cfg = get_exec().graph.cuda_graph_config
