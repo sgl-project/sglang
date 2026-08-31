@@ -2901,8 +2901,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 ensure_nvfp4_moe_layer_for_flashinfer_megamoe,
             )
 
+            mega = ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer)
             quant_info = FlashInferMegaMoeQuantInfo(
-                mega=ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer),
+                mega=mega,
+                mega_forward=layer._flashinfer_megamoe_forward,
                 fc1_alpha=layer.g1_alphas,
                 fc2_alpha=layer.g2_alphas,
                 fc1_norm_const=layer.w2_input_scale_quant,

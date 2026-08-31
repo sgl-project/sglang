@@ -23,7 +23,7 @@ and combine stay pure no-ops; this module owns the layer build + forward.
 from __future__ import annotations
 
 import logging
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -118,10 +118,31 @@ def _capture_safe_ue8m0_pack() -> Generator[None, None, None]:
 @dataclass
 class FlashInferMegaMoeQuantInfo(MoeQuantInfo):
     mega: Any
+    mega_forward: Callable[[Any, Any], torch.Tensor] | None = None
     fc1_alpha: torch.Tensor | None = None
     fc2_alpha: torch.Tensor | None = None
     fc1_norm_const: torch.Tensor | None = None
     apply_routed_scaling_factor: bool = False
+
+    def __post_init__(self) -> None:
+        if self.mega_forward is None:
+            self.mega_forward = _select_megamoe_forward(self.mega)
+
+
+def _forward_megamoe_with_workspace_view(mega: Any, tensors: Any) -> torch.Tensor:
+    return mega.forward(tensors, return_workspace_view=True)
+
+
+def _forward_megamoe_legacy(mega: Any, tensors: Any) -> torch.Tensor:
+    return mega.forward(tensors)
+
+
+def _select_megamoe_forward(mega: Any) -> Callable[[Any, Any], torch.Tensor]:
+    import inspect
+
+    if "return_workspace_view" in inspect.signature(mega.forward).parameters:
+        return _forward_megamoe_with_workspace_view
+    return _forward_megamoe_legacy
 
 
 def _resolve_max_tokens_per_rank() -> int:
@@ -220,6 +241,7 @@ def _bind_transformed_weights(
 
 def _init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> None:
     layer._flashinfer_megamoe_layer = None
+    layer._flashinfer_megamoe_forward = None
 
 
 def _get_or_init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> Any:
@@ -281,6 +303,7 @@ def _ensure_flashinfer_megamoe_layer(
         ),
     )
     layer._flashinfer_megamoe_layer = mega
+    layer._flashinfer_megamoe_forward = _select_megamoe_forward(mega)
     return mega
 
 
@@ -522,7 +545,8 @@ def run_flashinfer_megamoe(
         fc1_norm_const=quant_info.fc1_norm_const,
     )
     with _capture_safe_ue8m0_pack():
-        y = mega.forward(t, return_workspace_view=True)
+        assert quant_info.mega_forward is not None
+        y = quant_info.mega_forward(mega, t)
 
     if quant_info.apply_routed_scaling_factor:
         rsf = runner_config.routed_scaling_factor

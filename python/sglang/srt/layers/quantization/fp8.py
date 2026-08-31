@@ -2577,8 +2577,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     "FlashInfer MegaMOE does not support standard FP8 MoE "
                     "weights; use MXFP8, NVFP4, or an FP4-expert checkpoint."
                 )
+            mega = ensure_megamoe_layer(layer)
             quant_info = FlashInferMegaMoeQuantInfo(
-                mega=ensure_megamoe_layer(layer),
+                mega=mega,
+                mega_forward=layer._flashinfer_megamoe_forward,
                 apply_routed_scaling_factor=(
                     not layer.should_fuse_routed_scaling_factor_in_topk
                 ),
