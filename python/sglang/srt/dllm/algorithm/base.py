@@ -14,6 +14,15 @@ from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
+_argmax_softmax_prob_fused = None
+if _is_npu:
+    try:
+        from sgl_kernel_npu.sample.argmax_softmax_prob import (
+            argmax_softmax_prob_fused as _argmax_softmax_prob_fused,
+        )
+    except (ImportError, OSError):
+        pass
+
 DllmRunOutput = Tuple[
     Union[LogitsProcessorOutput, torch.Tensor],
     List,
@@ -21,6 +30,63 @@ DllmRunOutput = Tuple[
     Optional[List[Any]],
     bool,
 ]
+
+
+def argmax_and_softmax_prob(
+    full_logits_2d: torch.Tensor,
+    vocab_chunk: int = 16384,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-row argmax and its exact softmax probability.
+
+    Three implementations of the same quantity, picked by what the caller has
+    already paid for:
+
+    * ``softmax(logits).gather(argmax)`` when the logits are already an fp32
+      ``[tokens, vocab]`` tensor. Callers that retain fp32 do so to keep the
+      pre-existing numerics and latency, so this path is taken even when a
+      fused kernel is installed;
+    * a fused single-pass kernel, when one is available for this device, for
+      logits kept in lm_head dtype;
+    * otherwise a max reduction plus a vocab-chunked exp-sum, whose transients
+      are only ``[tokens, vocab_chunk]``. This is the path that lets a caller
+      keep the logits in lm_head dtype and never materialize the fp32
+      ``[tokens, vocab]`` copy that OOMs large dLLM batches. Chunking matters
+      on NPU: even ``sum(dtype=float32)`` on a bf16 operand materializes a full
+      fp32 cast internally.
+
+    The argmax is identical across all three; the probability differs only by
+    exp's precision in the input dtype.
+    """
+    if full_logits_2d.dtype == torch.float32:
+        # The fp32 copy already exists; chunking would save nothing, and the
+        # caller retained fp32 precisely to keep this exact path.
+        argmax_ids = torch.argmax(full_logits_2d, dim=-1)
+        prob = torch.gather(
+            torch.softmax(full_logits_2d, dim=-1),
+            dim=-1,
+            index=argmax_ids.unsqueeze(-1),
+        ).squeeze(-1)
+        return argmax_ids, prob
+
+    if _argmax_softmax_prob_fused is not None:
+        # Single-pass fused kernel: one read of the logits vs the 5-6 below.
+        return _argmax_softmax_prob_fused(full_logits_2d)
+
+    row_max, argmax_ids = torch.max(full_logits_2d, dim=-1)
+    row_max_col = row_max.unsqueeze(1)
+    denom: Optional[torch.Tensor] = None
+    for start in range(0, full_logits_2d.shape[1], vocab_chunk):
+        # Subtract and exponentiate in fp32. In the input dtype, exp() rounds
+        # every term before the fp32 sum sees it, and bf16's 8-bit mantissa is
+        # coarse enough for that to move `prob` across a strict threshold. The
+        # fp32 transient stays [rows, vocab_chunk] -- bounded by the chunk, not
+        # the vocab -- so this does not reintroduce the full-width copy.
+        shifted = full_logits_2d[:, start : start + vocab_chunk].to(torch.float32)
+        shifted.sub_(row_max_col)
+        shifted.exp_()
+        part = shifted.sum(dim=-1, dtype=torch.float32)
+        denom = part if denom is None else denom + part
+    return argmax_ids, 1.0 / denom
 
 
 class DllmAlgorithm:
