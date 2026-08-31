@@ -132,7 +132,7 @@ def handle_flashinfer_a2a_dispatch_type(server_args: Any):
 
     supports_nvfp4_dispatch = (
         cfg.quantization == "modelopt_fp4"
-        or server_args.get_model_config().nvfp4_moe_meta is not None
+        or model_config_of(server_args).nvfp4_moe_meta is not None
     )
     if dispatch_type == "auto":
         if cfg.quantization == "mxfp8":
@@ -184,7 +184,7 @@ def validate_flashinfer_megamoe_envs() -> None:
 
 
 def validate_flashinfer_megamoe_model(server_args: Any) -> None:
-    model_config = server_args.get_model_config()
+    model_config = model_config_of(server_args)
     architectures = model_config.hf_config.architectures or []
     validated_architectures = (
         "DeepseekV2ForCausalLM",
