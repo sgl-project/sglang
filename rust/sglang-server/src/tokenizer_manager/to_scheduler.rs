@@ -193,7 +193,7 @@ impl Intake {
                             .normalize(self.limits.skip_tokenizer_init, self.limits.vocab_size)
                         {
                             Err(e) => Err(e),
-                            // The native pipeline produces the final input_ids,
+                            // The Rust MM pipeline produces the final input_ids,
                             // so it wins even over a pre-tokenized prompt (which
                             // still needs placeholder expansion) — the same
                             // precedence as the Python TokenizerManager.

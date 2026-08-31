@@ -2,7 +2,7 @@
 
 Covers what the CPU parity units structurally cannot: the sidecar handoff, the
 drain ordering, Rust-side tokenization of multimodal prompts, and the rejection
-of inputs outside the native pipeline's scope (there is no Python fallback).
+of inputs outside the Rust pipeline's scope (there is no Python fallback).
 """
 
 import base64

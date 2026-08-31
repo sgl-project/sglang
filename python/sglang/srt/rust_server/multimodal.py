@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
-    """Resolved parameters of the native Rust MM pipeline for one model,
+    """Resolved parameters of the Rust MM pipeline for one model,
     consumed by the Rust worker pool (as the typed extension ``MmSpec``, see
     :meth:`RustServer._build_mm_spec`), the ``_multimodal`` parity API
     (:meth:`rust_json`) and the drain adapter
@@ -35,8 +35,7 @@ class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
     max_pixels: int
     image_mean: Tuple[float, ...]
     image_std: Tuple[float, ...]
-    # Which HF processor the Rust resize must reproduce bit-exactly, from
-    # `RustMmProcessor.NATIVE_IMAGE_PROCESSORS`.
+    # Which HF processor the Rust resize must reproduce bit-exactly.
     resample: str
     vision_start_token_id: Optional[int]
     vision_end_token_id: Optional[int]
@@ -64,13 +63,13 @@ class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
     plus its Rust arm — the launch gate is data-driven."""
 
     name: str
-    # The registered Python mm-processor the native pipeline replaces, as
+    # The registered Python MM processor the Rust pipeline replaces, as
     # "module:Class". Compared by identity, so an
-    # SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE override still disables the native path.
+    # SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE override still disables the Rust path.
     mm_processor: str
     # Model types whose image-only M-RoPE matches the family's fast path.
     model_types: FrozenSet[str]
-    # HF image processors the native resize reproduces bit-exactly, each mapped
+    # HF image processors the Rust resize reproduces bit-exactly, each mapped
     # to the `resample` the Rust pipeline must use (see `RustMmSpec.resample`).
     image_processors: Dict[str, str]
 
@@ -114,7 +113,7 @@ def rust_mm_family_for(
 
 
 class RustMmProcessor:
-    """Builds and validates the native Rust MM pipeline for one model.
+    """Builds and validates the Rust MM pipeline for one model.
 
     Construction registers the same ``mm_processor`` mapping the Python
     TokenizerManager would build — not to process requests (the Rust worker pool
@@ -123,7 +122,7 @@ class RustMmProcessor:
     time :meth:`build_output` wraps the Rust-produced buffers into the
     scheduler's ``MultimodalProcessorOutput``.
 
-    There is no Python fallback: a model without a native spec fails at launch,
+    There is no Python fallback: a model without a Rust MM spec fails at launch,
     and inputs outside the pipeline's scope are rejected per request.
     """
 
@@ -158,11 +157,11 @@ class RustMmProcessor:
 
     def resolve_spec(self) -> Optional[RustMmSpec]:
         """The :class:`RustMmSpec` for this model, or ``None`` when it has no
-        native pipeline (the launch gate turns that into a hard error).
+        Rust pipeline (the launch gate turns that into a hard error).
 
         Carries only resolved settings — patch geometry, pixel limits,
         normalization, token ids — never the HF config, and is conservative by
-        design: an unrecognized knob disables the native path rather than being
+        design: an unrecognized knob disables the Rust path rather than being
         approximated."""
         from sglang.srt.managers.multimodal_processor import get_mm_processor_cls
 
@@ -179,7 +178,7 @@ class RustMmProcessor:
         resample = family.image_processors.get(type(ip).__name__)
         if resample is None:
             return None
-        # The native pipeline always resizes, rescales by 1/255 and normalizes;
+        # The Rust pipeline always resizes, rescales by 1/255 and normalizes;
         # Rust's fused normalize constants assume that factor. Anything else
         # would silently produce different features.
         stages = ("do_resize", "do_rescale", "do_normalize")
@@ -189,7 +188,7 @@ class RustMmProcessor:
             return None
 
         # `--mm-process-config {"image": {...}}`: only pixel-limit overrides are
-        # mirrored natively, anything else disables the pipeline.
+        # mirrored by Rust; anything else disables the pipeline.
         image_overrides = dict((get_mm().mm_process_config or {}).get("image", {}))
         if not set(image_overrides) <= {"min_pixels", "max_pixels"}:
             return None
@@ -220,7 +219,7 @@ class RustMmProcessor:
             )
         except (AttributeError, TypeError):  # missing/odd processor attrs
             return None
-        logger.info("rust server: native MM pipeline enabled (family=%s)", family.name)
+        logger.info("rust server: Rust MM pipeline enabled (family=%s)", family.name)
         return spec
 
     def _use_feature_shm(self) -> bool:
@@ -318,5 +317,3 @@ class RustMmProcessor:
             mrope_positions=torch.from_numpy(entry.mrope.reshape(3, -1)),
             mrope_position_delta=torch.tensor([[entry.mrope_delta]], dtype=torch.long),
         )
-
-

@@ -122,8 +122,9 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         flume::bounded::<crate::message::request::Request>(cfg.rust_server_args.stage_channel_cap);
     // Encoding → MM worker pool. Bounded like the other stage edges so a slow
     // pool back-pressures instead of buffering unboundedly.
-    let (mm_worker_tx, mm_worker_rx) =
-        flume::bounded::<crate::message::request::MmRequest>(cfg.rust_server_args.stage_channel_cap);
+    let (mm_worker_tx, mm_worker_rx) = flume::bounded::<crate::message::request::MmRequest>(
+        cfg.rust_server_args.stage_channel_cap,
+    );
     let detokenizer_worker_num = cfg.server_args.detokenizer_worker_num;
     let mut detokenizer_tx = Vec::with_capacity(detokenizer_worker_num);
     let mut detokenizer_rx = Vec::with_capacity(detokenizer_worker_num);

@@ -1,11 +1,11 @@
 """Embedded Rust server lifecycle for the scheduler.
 
 The Rust server replaces the Python api-server + `TokenizerManager` +
-`DetokenizerManager` stack (hence this module sits beside them in `managers/`),
-running them as Rust threads inside the scheduler process. This wrapper keeps
-all `SGLANG_RUST_SERVER` plumbing — startup, CPU-core partitioning, the
-typed `server_args` handoff, and control-response routing — out of `scheduler.py`. The
-scheduler holds an `Optional[RustServer]` and delegates to it.
+`DetokenizerManager` stack, running them as Rust threads inside the scheduler
+process. This wrapper keeps all `SGLANG_RUST_SERVER` plumbing — startup,
+CPU-core partitioning, the typed `server_args` handoff, and control-response
+routing — out of `scheduler.py`. The scheduler holds an `Optional[RustServer]`
+and delegates to it.
 """
 
 from __future__ import annotations
@@ -23,13 +23,13 @@ from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
+from sglang.srt.runtime_context import get_mm, get_serving
 from sglang.srt.rust_server.config import _build_server_args, _partition_cores
 from sglang.srt.rust_server.multimodal import (
     RUST_MM_FAMILIES,
     RustMmProcessor,
     RustMmSpec,
 )
-from sglang.srt.runtime_context import get_mm, get_serving
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
     NestedRowColumns,
@@ -39,8 +39,7 @@ from sglang.srt.utils.flatten import (
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.rust_extensions._server import MmSpec, Server, ServerArgs
-    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.rust_extensions._server import MmSpec, Server
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +112,7 @@ class RustServer:
             http_addr=http_addr,
         )
 
-        # Multimodal models must have a native Rust pipeline — there is no Python
+        # Multimodal models must have a Rust pipeline — there is no Python
         # fallback.
         mm_spec = None
         if scheduler.model_config.is_multimodal:
@@ -140,7 +139,7 @@ class RustServer:
                     set(chain.from_iterable(f.model_types for f in RUST_MM_FAMILIES))
                 )
                 raise RuntimeError(
-                    "SGLANG_RUST_SERVER=1: no native Rust MM pipeline for "
+                    "SGLANG_RUST_SERVER=1: no Rust MM pipeline for "
                     f"model_type={scheduler.model_config.hf_config.model_type!r} "
                     f"(supported: {', '.join(supported)}; "
                     "images only). Unset SGLANG_RUST_SERVER to serve this model."
@@ -221,7 +220,7 @@ class RustServer:
                 pos += nbytes
             if self.mm_spec is not None and isinstance(obj, TokenizedGenerateReqInput):
                 # The buffers rode the Rust sidecar, parked before the ring push;
-                # wrapping them into tensors is the only Python step of the native
+                # wrapping them into tensors is the only Python step of the Rust
                 # path. `None` for a text-only request on a multimodal model.
                 mm_result = self.server.take_mm_result(obj.rid)
                 if mm_result is not None:
@@ -245,9 +244,9 @@ class RustServer:
 
         # Invariant: control requests always carry a rust-minted rid; without
         # one the response is unroutable, so fail loudly rather than drop it.
-        assert (
-            recv_req.rid is not None
-        ), f"control response without rid: {type(output).__name__}"
+        assert recv_req.rid is not None, (
+            f"control response without rid: {type(output).__name__}"
+        )
         # No local try/except: a failed push propagates to run_scheduler_process's
         # outer handler, which logs the full traceback (scheduler-fatal either way).
         payload = (
@@ -374,7 +373,9 @@ class RustServer:
                     assert len(col) in (
                         0,
                         batch_size,
-                    ), f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
+                    ), (
+                        f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
+                    )
                     populated |= len(col) > 0
                 if populated:
                     active.append(extra)

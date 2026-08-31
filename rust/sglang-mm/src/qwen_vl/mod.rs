@@ -406,7 +406,7 @@ mod python {
 
     /// `(pixel_values flat f32, (t, h, w))` for one preprocessed image.
     type PyProcessedImage<'py> = (Bound<'py, PyArray1<f32>>, (u32, u32, u32));
-    /// Full native pipeline output at the scheduler boundary:
+    /// Full Rust pipeline output at the scheduler boundary:
     /// `(input_ids, features, grids, hashes, offsets, mrope, mrope_delta)`.
     type PyNativeOutput<'py> = (
         Vec<i32>,

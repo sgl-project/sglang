@@ -1,7 +1,7 @@
 //! Runtime configuration: the rust-server boot knobs
 //! ([`RustServerServerArgs`]), the scheduler's typed `server_args` handoff
 //! ([`ServerArgs`] / [`ModelConfig`]), the [`RuntimeConfig`] pairing them for
-//! `runtime::start`, and the native MM pipeline handoff ([`MmSpec`]).
+//! `runtime::start`, and the Rust MM pipeline handoff ([`MmSpec`]).
 //!
 //! [`ServerArgs`] / [`ModelConfig`] / [`DefaultSamplingParams`] /
 //! [`DisaggregationMode`] / [`MmSpec`] / [`MmFamily`] / [`MmResample`] are
@@ -404,7 +404,7 @@ impl DefaultSamplingParams {
     }
 }
 
-/// The native MM pipeline handoff, built by `RustServer._build_mm_spec` from
+/// The Rust MM pipeline handoff, built by `RustServer._build_mm_spec` from
 /// the resolved `RustMmSpec` and passed to `Server.start_mm_workers`. Same
 /// contract as [`ServerArgs`]: every field is a required, typed constructor
 /// keyword, so a drifted Python caller fails at boot.
@@ -487,7 +487,7 @@ pub enum MmFamily {
     QwenVl,
 }
 
-/// The HF image processor the native resize must reproduce bit-exactly (see
+/// The HF image processor the Rust resize must reproduce bit-exactly (see
 /// [`sglang_mm::qwen_vl::Resampler`]). Exposed to Python as an enum
 /// (`MmResample.AtenU8` / `.Pil`); `RustMmFamily.image_processors` maps each
 /// processor class onto it.

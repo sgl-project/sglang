@@ -1,10 +1,10 @@
-"""The native-MM launch gate's family selection (managers/rust_server.py).
+"""The Rust-MM launch gate's family selection.
 
-``RUST_MM_FAMILIES`` decides which models the Rust pipeline serves natively;
+``RUST_MM_FAMILIES`` decides which models the Rust pipeline serves;
 for everything else ``rust_mm_family_for`` must return ``None``, which
 ``RustServer.launch`` turns into a hard launch error. Pins that non-Qwen
 multimodal models — Inkling being the in-tree case — keep their Python
-processor and never match a native family, so growing the registry cannot
+processor and never match a Rust family, so growing the registry cannot
 silently reroute them.
 """
 

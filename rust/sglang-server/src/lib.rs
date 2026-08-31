@@ -35,30 +35,33 @@ fn value_error(context: &str, err: impl std::fmt::Display) -> PyErr {
 }
 
 /// One drained MM result (see [`Server::take_mm_result`]), consumed by
-/// `RustServer.build_output` to build the scheduler's
+/// `RustMmProcessor.build_output` to build the scheduler's
 /// `MultimodalProcessorOutput`.
 #[pyclass(frozen, get_all)]
 struct MmEncodeResult {
-    /// *Generic.* All items' `pixel_values` concatenated, flat `f32` of logical
-    /// shape `[sum(t*h*w), feature_dim]`; `Some` on the inline (single-rank) path.
+    // General fields.
+    /// All items' `pixel_values` concatenated as flat `f32` with logical shape
+    /// `[sum(t*h*w), feature_dim]`; present on the inline (single-rank) path.
     features: Option<Py<numpy::PyArray1<f32>>>,
-    /// *Generic.* Per-item POSIX shm segment name holding that item's features
-    /// (`[t*h*w, feature_dim]` f32); `Some` on the TP-broadcast path.
+    /// Per-item POSIX shared-memory segment holding `[t*h*w, feature_dim]` f32
+    /// features; present on the TP-broadcast path.
     shm_names: Option<Vec<String>>,
-    /// *Generic.* Per-item content hash of the raw source bytes (or the caller's
-    /// `mm_hashes` override), precomputed so the drain never re-hashes.
+    /// Per-item content hash of the raw source bytes, or the caller-provided
+    /// `mm_hashes` override, precomputed so draining never re-hashes.
     hashes: Vec<u64>,
-    /// *Generic.* Per-item inclusive `(start, end)` placeholder-token span in the
-    /// expanded `input_ids`.
+    /// Per-item inclusive `(start, end)` placeholder-token span in the expanded
+    /// `input_ids`.
     offsets: Vec<(u32, u32)>,
-    /// *Qwen-VL specific.* Per-item `image_grid_thw` `(t, h, w)` in patch units;
-    /// `t*h*w` is also the item's row count in `features`.
+
+    // Qwen-VL-specific fields.
+    /// Per-item `image_grid_thw` `(t, h, w)` in patch units; `t*h*w` is also the
+    /// item's row count in `features`.
     grids: Vec<(u32, u32, u32)>,
-    /// *Qwen-VL specific.* M-RoPE position ids, flat `i64` of row-major shape
-    /// `[3, seq_len]` (temporal, height, width rows).
+    /// M-RoPE position ids as flat `i64` with row-major shape `[3, seq_len]`
+    /// (temporal, height, and width rows).
     mrope: Py<numpy::PyArray1<i64>>,
-    /// *Qwen-VL specific.* M-RoPE delta, `max(mrope) + 1 - seq_len`, that decode
-    /// adds to the plain sequence position.
+    /// M-RoPE delta, `max(mrope) + 1 - seq_len`, added to the plain sequence
+    /// position during decoding.
     mrope_delta: i64,
 }
 
@@ -203,8 +206,8 @@ impl Server {
     /// Spawn the MM worker pool for the pipeline in `spec` (built from the
     /// resolved processor config; see `RustMmProcessor.resolve_spec` and
     /// `RustServer._build_mm_spec`). Image-only requests are processed entirely
-    /// in Rust and parked for [`Server::take_mm_result`]; anything the pipeline cannot
-    /// serve is rejected back to the client — there is no Python fallback.
+    /// in Rust and parked for [`Server::take_mm_result`]; anything the pipeline
+    /// cannot serve is rejected back to the client — there is no Python fallback.
     fn start_mm_workers(&self, spec: MmSpec, workers: usize) -> PyResult<()> {
         let ctx = multi_modality::worker::Context::new(
             spec,

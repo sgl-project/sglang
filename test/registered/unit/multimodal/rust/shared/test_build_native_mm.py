@@ -1,4 +1,4 @@
-"""``RustMmProcessor.build_output`` (managers/rust_server.py): the drain-time
+"""``RustMmProcessor.build_output``: the drain-time
 wrapping contracts — tensors are zero-copy views over the Rust-owned buffers, and
 pad values come from worker-precomputed hashes, since the scheduler loop must
 never hash features. Synthetic buffers, so this needs no Rust extension."""

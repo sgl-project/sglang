@@ -72,7 +72,7 @@ fn max_new_tokens_default() -> Option<i64> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SamplingParams {
-    // --- API parameters (set by callers) ---
+    // Output length and stopping.
     #[serde(default = "max_new_tokens_default")]
     pub max_new_tokens: Option<i64>,
     /// API input alias, copied to `stop_strs` then cleared by `normalize`.
@@ -85,6 +85,8 @@ pub struct SamplingParams {
     /// API input alias, copied to `stop_regex_strs` then cleared by `normalize`.
     #[serde(default)]
     pub stop_regex: Option<OneOrMany<String>>,
+
+    // Sampling distribution and penalties.
     #[serde(
         default = "f64_one::default",
         deserialize_with = "f64_one::deserialize"
@@ -125,6 +127,8 @@ pub struct SamplingParams {
         deserialize_with = "i64_zero::deserialize"
     )]
     pub min_new_tokens: i64,
+
+    // Sequence count and beam search.
     #[serde(
         default = "i64_one::default",
         deserialize_with = "i64_one::deserialize"
@@ -134,6 +138,8 @@ pub struct SamplingParams {
     /// positional wire layout even though the rust path rejects it below.
     #[serde(default)]
     pub beam_width: Option<i64>,
+
+    // Structured-output constraints.
     #[serde(default)]
     pub json_schema: Option<String>,
     #[serde(default)]
@@ -142,6 +148,8 @@ pub struct SamplingParams {
     pub ebnf: Option<String>,
     #[serde(default)]
     pub structural_tag: Option<String>,
+
+    // Output handling.
     #[serde(
         default = "bool_false::default",
         deserialize_with = "bool_false::deserialize"
@@ -164,6 +172,8 @@ pub struct SamplingParams {
     pub no_stop_trim: bool,
     #[serde(default)]
     pub stream_interval: Option<i64>,
+
+    // Logit processing and reproducibility.
     /// Token id (as a string key, matching Python) → bias. Keys are vocab-bounded
     /// by [`verify`](Self::verify).
     #[serde(default)]
@@ -175,7 +185,7 @@ pub struct SamplingParams {
     #[serde(default)]
     pub custom_params: Option<serde_json::Value>,
 
-    // --- Internal fields (populated by the pipeline below, not API-facing) ---
+    // Normalized internal fields.
     //
     // All `skip_deserializing`: they are outputs of `normalize`, and a client that
     // could set them would be setting the pipeline's own state. `is_normalized` is
