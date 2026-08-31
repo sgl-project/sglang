@@ -51,6 +51,8 @@ from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
     is_cuda,
+    is_gfx95_supported,
+    is_gfx942_supported,
     is_hip,
     log_info_on_rank0,
 )
@@ -61,6 +63,8 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_gfx942_supported = is_gfx942_supported()
+_is_gfx95_supported = is_gfx95_supported()
 _device_sm = get_device_sm()
 
 
@@ -162,7 +166,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             return "Shared experts fusion currently requires CUDA or ROCm devices."
         if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             return "Shared experts fusion requires SM80 or newer GPUs."
-        if _is_hip and torch.cuda.get_device_capability("cuda") < (9, 4):
+        if _is_hip and not (_is_gfx942_supported or _is_gfx95_supported):
             return "Shared experts fusion requires gfx942 or newer GPUs."
         if get_parallel().moe_ep_size > 1:
             return (
