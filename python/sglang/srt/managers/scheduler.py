@@ -3587,15 +3587,13 @@ class Scheduler(
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
-                    req.mamba_cow_src_index = None
-                    req.mamba_needs_clear = False
-                    if req.mamba_pool_idx is not None and not getattr(
-                        req, "session", None
-                    ):
+                    req.kv.mamba_cow_src_index = None
+                    req.kv.mamba_needs_clear = False
+                    if req.kv.holds_mamba and not getattr(req, "session", None):
                         self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                            req.mamba_pool_idx.unsqueeze(-1)
+                            req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
-                        req.mamba_pool_idx = None
+                        req.kv.mamba_pool_idx = None
                 break
 
         if mamba_allocator is not None:
@@ -3680,9 +3678,20 @@ class Scheduler(
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
-            running_batch = ScheduleBatch(
-                reqs=[], batch_is_full=running_batch.batch_is_full
-            )
+                if not self.enable_overlap and not self.spec_algorithm.is_none():
+                    # Non-overlap spec never writes the relay; stash the
+                    # tails' pending tokens for the mixed input resolve.
+                    last_tokens = torch.tensor(
+                        [r.output_ids[-1] for r in running_batch.reqs],
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    self.future_map.stash_bonus_tokens(
+                        running_batch.req_pool_indices, last_tokens
+                    )
+                running_batch = ScheduleBatch(
+                    reqs=[], batch_is_full=running_batch.batch_is_full
+                )
         else:
             new_batch.decoding_reqs = None
 
@@ -4852,7 +4861,7 @@ class Scheduler(
 
             # For mamba radix cache
             if (
-                req.mamba_pool_idx is not None
+                req.kv.holds_mamba
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
@@ -4867,10 +4876,7 @@ class Scheduler(
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
                 )
-                if (
-                    req.kv.req_pool_idx is not None
-                    or getattr(req, "mamba_pool_idx", None) is not None
-                ):
+                if req.kv.holds_kv or req.kv.holds_mamba:
                     release_kv_cache(req, self.tree_cache, is_insert=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
