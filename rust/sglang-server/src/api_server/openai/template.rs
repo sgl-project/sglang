@@ -14,8 +14,12 @@ use thiserror::Error;
 
 use crate::message::types::OneOrMany;
 
+#[cfg(test)]
 pub(super) use super::template_builtins::builtin_template;
-pub(super) use super::template_legacy::{LegacyFormatter, LegacySpec};
+pub(super) use super::template_legacy::LegacyFormatter;
+#[cfg(test)]
+pub(super) use super::template_legacy::LegacySpec;
+#[cfg(test)]
 use super::template_loader::infer_legacy_template_from_model_path;
 pub(super) use super::template_loader::load_chat_formatter;
 
