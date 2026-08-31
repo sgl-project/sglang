@@ -949,5 +949,64 @@ class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
         tree.sanity_check()
 
 
+
+class TestSWARadixCacheCompact(CustomTestCase):
+    def _build_chain(self, n_tokens: int, window: int = 4):
+        tree, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            kv_size=64,
+            kv_size_swa=64,
+            sliding_window_size=window,
+            page_size=1,
+        )
+        for i in range(1, n_tokens + 1):
+            _insert(tree, allocator, list(range(i)))
+        leaf = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", list(range(n_tokens)))))
+        ).last_device_node
+        return tree, leaf
+
+    def test_compact_preserves_active_swa_uuid(self):
+        window = 4
+        n_tokens = 6
+        tree, leaf = self._build_chain(n_tokens, window=window)
+
+        lock1 = tree.inc_lock_ref(leaf)
+        uuid1 = lock1.swa_uuid_for_lock
+        self.assertIsNotNone(uuid1)
+        tree.dec_lock_ref(leaf, DecLockRefParams(swa_uuid_for_lock=uuid1))
+
+        boundary = leaf
+        while boundary is not tree.root_node and boundary.swa_uuid != uuid1:
+            boundary = boundary.parent
+        self.assertEqual(boundary.swa_uuid, uuid1)
+
+        lock2 = tree.inc_lock_ref(leaf)
+        uuid2 = lock2.swa_uuid_for_lock
+        self.assertEqual(uuid2, uuid1)
+
+        child = next(iter(boundary.children.values()))
+        child.swa_uuid = uuid1 + 99991
+
+        with envs.SGLANG_OPT_SWA_RADIX_CACHE_COMPACT.override(True):
+            leaf2 = tree.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", list(range(n_tokens)))))
+            ).last_device_node
+
+        n = leaf2
+        found = False
+        while n is not tree.root_node:
+            if n.swa_uuid == uuid2:
+                found = True
+                break
+            n = n.parent
+        self.assertTrue(found, f"active swa_uuid {uuid2} missing after compact")
+
+        tree.dec_lock_ref(leaf2, DecLockRefParams(swa_uuid_for_lock=uuid2))
+        self.assertEqual(tree.swa_protected_size_, 0)
+        self.assertEqual(tree.full_protected_size_, 0)
+        tree.sanity_check()
+
+
 if __name__ == "__main__":
     unittest.main()

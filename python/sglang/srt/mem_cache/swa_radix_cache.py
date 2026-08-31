@@ -1018,9 +1018,8 @@ class SWARadixCache(BasePrefixCache):
         )
 
     def _compact_single_child_chain(self, node: TreeNode) -> None:
-        # FIXME(ispobock): drifts retract pool accounting (commit 6348cb506);
-        # also overwrites active swa_uuid when window > page_size. Off by
-        # default via SGLANG_OPT_SWA_RADIX_CACHE_COMPACT.
+        # FIXME(ispobock): drifts retract pool accounting (commit 6348cb506).
+        # Off by default via SGLANG_OPT_SWA_RADIX_CACHE_COMPACT.
         while len(node.children) == 1:
             child = next(iter(node.children.values()))
             if len(child.children) == 0:
@@ -1052,7 +1051,8 @@ class SWARadixCache(BasePrefixCache):
             for grandchild in node.children.values():
                 grandchild.parent = node
 
-            if child.swa_uuid is not None:
+            # Keep an existing parent uuid (may be the active lock boundary).
+            if node.swa_uuid is None and child.swa_uuid is not None:
                 node.swa_uuid = child.swa_uuid
 
             if node.hash_value is not None and child.hash_value is not None:
