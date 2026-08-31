@@ -27,6 +27,7 @@ from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
     LoadBalanceMethod,
+    resolve_local_rank_ranges,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 
@@ -349,6 +350,94 @@ class TestRefreshLoadBudgetThrottle(CustomTestCase):
             ctl.dp_budget.total_tokens,
             after_burst,
             "a stale-timestamp snapshot must not wipe the speculative state",
+        )
+
+
+class TestLocalRankRanges(CustomTestCase):
+    """Which (pp_rank, tp_rank) coordinates a process owns.
+
+    Invariants:
+    - A scale joiner owns a whole TP group at pipeline stage 0. Its --node-rank
+      is a marker, not a coordinate: reading it as one offsets every global rank
+      the cohort claims by tp_size and puts them outside the world it declares
+      to the process group.
+    - Ordinary multi-node layouts keep splitting by node_rank as before.
+    """
+
+    def _ranges(self, **kwargs):
+        pp_range, tp_range, _, _ = resolve_local_rank_ranges(**kwargs)
+        return list(pp_range), list(tp_range)
+
+    def test_scale_joiner_starts_at_pipeline_stage_zero(self):
+        self.assertEqual(
+            self._ranges(
+                pp_size=1, tp_size=2, nnodes=1, node_rank=1, is_scale_joiner=True
+            ),
+            ([0], [0, 1]),
+        )
+
+    def test_scale_joiner_claims_exactly_its_offset_window(self):
+        """rank = offset + tp_size * pp_rank + tp_rank, for every cohort size."""
+        for rank_offset, tp_size in ((1, 1), (4, 2), (32, 8)):
+            with self.subTest(rank_offset=rank_offset, tp_size=tp_size):
+                pp_range, tp_range, _, _ = resolve_local_rank_ranges(
+                    pp_size=1,
+                    tp_size=tp_size,
+                    nnodes=1,
+                    node_rank=1,
+                    is_scale_joiner=True,
+                )
+                claimed = [
+                    rank_offset + tp_size * pp_rank + tp_rank
+                    for pp_rank in pp_range
+                    for tp_rank in tp_range
+                ]
+                self.assertEqual(
+                    claimed, list(range(rank_offset, rank_offset + tp_size))
+                )
+
+    def test_single_node_deployment(self):
+        self.assertEqual(
+            self._ranges(
+                pp_size=1, tp_size=4, nnodes=1, node_rank=0, is_scale_joiner=False
+            ),
+            ([0], [0, 1, 2, 3]),
+        )
+
+    def test_tp_split_across_two_nodes(self):
+        for node_rank, expected_tp in ((0, [0, 1, 2, 3]), (1, [4, 5, 6, 7])):
+            with self.subTest(node_rank=node_rank):
+                self.assertEqual(
+                    self._ranges(
+                        pp_size=1,
+                        tp_size=8,
+                        nnodes=2,
+                        node_rank=node_rank,
+                        is_scale_joiner=False,
+                    ),
+                    ([0], expected_tp),
+                )
+
+    def test_pipeline_stage_follows_node_rank_for_ordinary_nodes(self):
+        for node_rank in (0, 1):
+            with self.subTest(node_rank=node_rank):
+                self.assertEqual(
+                    self._ranges(
+                        pp_size=2,
+                        tp_size=4,
+                        nnodes=2,
+                        node_rank=node_rank,
+                        is_scale_joiner=False,
+                    ),
+                    ([node_rank], [0, 1, 2, 3]),
+                )
+
+    def test_both_pipeline_stages_on_one_node(self):
+        self.assertEqual(
+            self._ranges(
+                pp_size=2, tp_size=4, nnodes=1, node_rank=0, is_scale_joiner=False
+            ),
+            ([0, 1], [0, 1, 2, 3]),
         )
 
 
