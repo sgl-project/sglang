@@ -634,4 +634,28 @@ export const benchmarks = [
   { match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "single" } },
   { match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "balanced", nodes: "single" } },
   { match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "high-throughput", nodes: "single" } },
+  // ====================================================================
+  // B200 + FP4 — Flash Vision (Exp)
+  // ====================================================================
+  {
+    match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "dev-dsv4-flash-vision",
+    accuracy: { mmmu_pro_pct: 74.96 },
+    notes: "MMMU-Pro (standard, 10-option) measured with sgl-eval on 4×B200 (TP=4) at temperature 1.0, top-p 0.95, --reasoning-effort max.",
+  },
+  { match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" } },
+  // B300 / GB200 / GB300 / H200 / H100 — Flash Vision (Exp), all pending
+  { match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" } },
+  { match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" } },
+  { match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" } },
+  { match: { hw: "h200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "h200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "h100", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
 ];
