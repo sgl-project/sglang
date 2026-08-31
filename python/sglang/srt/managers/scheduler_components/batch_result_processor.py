@@ -336,7 +336,7 @@ class SchedulerBatchResultProcessor:
                         and req in batch.decoding_reqs
                         and not batch.spec_algorithm.is_none()
                     ):
-                        req.kv_committed_len += 1
+                        req.kv.kv_committed_len += 1
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
