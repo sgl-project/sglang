@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
 )
 from sglang.srt.utils import is_hip, is_npu
 
@@ -171,13 +172,13 @@ def unified_memory_disagg_move_gate(scheduler):
     )
 
 
-def should_bypass_dsa_cp_prefix_cache(server_args) -> bool:
+def should_bypass_dsa_cp_prefix_cache() -> bool:
     """Bypass prefix cache under DSA Prefill CP until CP-aware radix resharding
     exists; without it, cache hits let attention read non-local page rows."""
     return (
-        server_args.disaggregation_mode == DisaggregationMode.PREFILL.value
-        and server_args.attn_cp_size > 1
-        and server_args.enable_dsa_prefill_context_parallel
+        get_disagg().disaggregation_mode == DisaggregationMode.PREFILL.value
+        and get_parallel().attn_cp_size > 1
+        and get_parallel().enable_dsa_prefill_context_parallel
     )
 
 

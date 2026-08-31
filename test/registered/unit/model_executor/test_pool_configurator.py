@@ -746,7 +746,7 @@ class TestEagleConfigurator(CustomTestCase):
 
                 expected = (
                     full_pt * (16 + 4 * dcp_size)
-                    + mr.server_args.swa_full_tokens_ratio * swa_pt * 16
+                    + get_schedule().swa_full_tokens_ratio * swa_pt * 16
                 )
                 self.assertEqual(cfg._cell_size, expected)
 

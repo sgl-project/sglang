@@ -19,8 +19,7 @@ class _FakeReq:
 
     def __init__(self, rid: str):
         self.rid = rid
-        self.req_pool_idx = 1
-        self.mamba_pool_idx = None
+        self.kv = SimpleNamespace(req_pool_idx=1)
         self.to_finish = None
         self._finished = False
 
@@ -33,6 +32,7 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.chunked_req = chunked_req
     sched._pending_chunked_abort_req = pending_req
     sched.waiting_queue = []
+    sched.mm_receiver = None
     sched.dllm_config = None
     sched.grammar_manager = Mock()
     sched.disaggregation_mode = None

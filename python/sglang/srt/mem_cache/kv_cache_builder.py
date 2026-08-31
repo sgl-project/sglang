@@ -239,7 +239,7 @@ def build_kv_cache(
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
-    bypass_dsa_cp_prefix_cache = should_bypass_dsa_cp_prefix_cache(server_args)
+    bypass_dsa_cp_prefix_cache = should_bypass_dsa_cp_prefix_cache()
     disable_radix_cache = (
         get_memory().disable_radix_cache
         or (model_config.is_multimodal and uses_transformers_backend)

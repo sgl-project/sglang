@@ -47,7 +47,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_device, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -154,7 +154,7 @@ class IndexerKPool(MultiPlatformOp):
                 base=rope_theta,  # type: ignore
                 rope_scaling=rope_scaling,
                 is_neox_style=is_neox_style,
-                device=get_server_args().device,
+                device=get_device().device,
             )
         self.block_size = block_size
         self.scale_fmt = scale_fmt

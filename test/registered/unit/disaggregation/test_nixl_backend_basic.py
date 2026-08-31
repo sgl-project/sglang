@@ -452,6 +452,7 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.decode_kv_args_table = {
             "agent": SimpleNamespace(
                 decode_tp_size=1,
+                decode_tp_rank=0,
                 dst_kv_ptrs=[0],
                 dst_aux_ptrs=[0],
                 gpu_id=0,
@@ -475,6 +476,8 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.is_mla_backend = False
         mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1
+        mgr.attn_tp_rank = 0
+        mgr.attn_cp_rank = 0
         mgr.transfer_source_rank = 0
         mgr.kv_args = SimpleNamespace(engine_rank=0, kv_data_ptrs=[0])
         mgr.exceptions = {}

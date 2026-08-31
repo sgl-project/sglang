@@ -60,7 +60,10 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    is_shared_experts_fusion_disabled,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -118,7 +121,7 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_forward, get_mm, get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -622,7 +625,7 @@ class Glm5NextDecoderLayer(nn.Module):
         rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            get_server_args().speculative_algorithm
+            get_spec().speculative_algorithm
         )
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
@@ -1321,7 +1324,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         text_config.hidden_size,
                         quant_config=quant_config,
                         prefix=add_prefix("lm_head", prefix),
-                        use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                        use_attn_tp_group=get_parallel().enable_dp_lm_head,
                     )
             else:
                 self.lm_head = PPMissingLayer()
@@ -1361,7 +1364,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 text_config.mhc,
             )
 
-        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
         self.visual = None
         if not self.language_only:
             self.visual = Glm5NextVisionModel(
@@ -1420,22 +1423,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
         return None
 
     def determine_num_fused_shared_experts(self):
-        self.num_fused_shared_experts = 0
-        if get_server_args().disable_shared_experts_fusion:
-            return
-
-        disable_reason = type(self).shared_experts_fusion_disable_reason(
-            self.config, self.quant_config
+        self.num_fused_shared_experts = (
+            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
-
-        if disable_reason is not None:
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
+        if self.num_fused_shared_experts == 0:
             return
-
-        self.num_fused_shared_experts = self.config.n_shared_experts
         assert (
             self.num_fused_shared_experts == 1
         ), f"Only 1 fused shared expert is supported for {type(self).__name__}"

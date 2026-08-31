@@ -321,8 +321,8 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
                 name,
             )
             declare_resolution(
-                "_disable_breakable_cudagraph_if_incompatible",
                 server_args,
+                "_disable_breakable_cudagraph_if_incompatible",
                 cuda_graph_config=with_phase(
                     cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
                 ),
