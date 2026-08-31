@@ -46,12 +46,13 @@ from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTr
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import RebuildFullToSWAMapping
 from sglang.srt.mem_cache.unified_cache.components import (
-    BASE_COMPONENT_TYPE,
+    CacheTransferPhase,
     ComponentType,
 )
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    BufferBackupSnapshot,
+    BufferBackupState,
     NodeId,
-    UnifiedTreeNode,
 )
 
 if TYPE_CHECKING:
@@ -65,16 +66,12 @@ class _UnifiedBackupIntent(msgspec.Struct):
     """Buffer-mode backup intent, unpinned while queued.
 
     Snapshots node identity at enqueue time: a split rewrites the node's
-    key/hash in place while these copies stay intact, so
-    ``node.hash_value != hash_values`` doubles as split detection and a None
-    FULL device value as eviction detection (``_backup_intent_stale``).
+    key/hash in place while these copies stay intact, so a key-length change
+    detects a split and a missing FULL device value detects eviction
+    (``_validate_backup_intent``).
     """
 
-    node: UnifiedTreeNode
-    node_id: int
-    hash_values: list[str]
-    key: RadixKey
-    prefix_keys: Optional[list[str]] = None
+    snapshot: BufferBackupSnapshot
 
 
 class _UnifiedBufferBackupEntry(msgspec.Struct):
@@ -289,18 +286,19 @@ class BufferModePipeline:
 
     # ---- backup pipeline (device -> staging -> storage) ----
 
-    def _backup_parent_covered(self, node: UnifiedTreeNode) -> bool:
+    def _backup_parent_covered(self, state: BufferBackupState) -> bool:
         """Only admit a node whose parent is stored/in-flight: writing above
         a dropped parent creates a permanent longest-prefix hole."""
-        parent = node.parent
         if (
-            parent is self._cache.root_node
-            or parent.id in self.inflight_backup_node_ids
+            state.parent_is_root
+            or state.parent_node_id in self.inflight_backup_node_ids
         ):
             return True
-        last_hash = parent.get_last_hash_value()
-        return last_hash is not None and self._cache.storage_existence_cache.contains(
-            PoolName.KV, last_hash
+        return (
+            state.parent_last_hash is not None
+            and self._cache.storage_existence_cache.contains(
+                PoolName.KV, state.parent_last_hash
+            )
         )
 
     def _log_backup_dropped(self, num_tokens: int) -> None:
@@ -308,22 +306,29 @@ class BufferModePipeline:
         if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
             cache.storage_metrics_collector.log_backup_dropped_tokens(num_tokens)
 
-    def enqueue_backup_intent(self, node: UnifiedTreeNode) -> None:
+    def enqueue_backup_intent(self, node_id: NodeId) -> None:
         """Snapshot a backup intent and commit it to the write queue.
         Admission gates: belief skip, parent-cover, backlog cap, oversize.
         Drops are silent; the node re-triggers on a later hit."""
-        if not self._cache.enable_storage or not node.hash_value:
+        if not self._cache.enable_storage:
             return
-        if node.id in self.inflight_backup_node_ids:
+        if node_id in self.inflight_backup_node_ids:
+            return
+        snapshot = self._cache.tree_core.snapshot_buffer_backup(
+            node_id, self._cache.hicache_storage_pass_prefix_keys
+        )
+        if snapshot is None:
             return
         # Admission cover: beliefs plus content past its D2H launch. The
         # launched cover keeps republished content (fill inserts under new
         # node ids) from re-writing while the original write drains.
         if self._cache.storage_existence_cache.covers_all(
-            PoolName.KV, node.hash_value, extra_cover=self.inflight_backup_hashes
+            PoolName.KV,
+            snapshot.hash_values,
+            extra_cover=self.inflight_backup_hashes,
         ):
             return
-        intent_tokens = len(node.hash_value) * self._cache.page_size
+        intent_tokens = len(snapshot.hash_values) * self._cache.page_size
         if self.write_backlog_tokens_ >= self.write_backlog_cap:
             # The cap sits at 2x the intrinsic live-backlog ceiling (see
             # init_hicache), so reaching it means leaked accounting or a
@@ -344,51 +349,59 @@ class BufferModePipeline:
             return
         # A span larger than any pool's whole staging capacity can never
         # stage; admitting it would wedge the head-of-line queue forever.
-        if not self._backup_parent_covered(node) or self._backup_oversize(
-            node, intent_tokens
+        state = BufferBackupState(
+            parent_node_id=snapshot.parent_node_id,
+            parent_is_root=snapshot.parent_is_root,
+            parent_last_hash=snapshot.parent_last_hash,
+        )
+        if not self._backup_parent_covered(state) or self._backup_oversize(
+            snapshot.node_id, snapshot.hash_values, intent_tokens
         ):
             self._log_backup_dropped(intent_tokens)
             return
 
-        prefix_keys = (
-            node.get_prefix_hash_values(node.parent)
-            if self._cache.hicache_storage_pass_prefix_keys
-            else None
-        )
-        intent = _UnifiedBackupIntent(
-            node=node,
-            node_id=node.id,
-            hash_values=list(node.hash_value),
-            key=node.key,
-            prefix_keys=prefix_keys,
-        )
+        intent = _UnifiedBackupIntent(snapshot=snapshot)
         self.pending_write_queue.append(intent)
-        self.inflight_backup_node_ids.add(node.id)
+        self.inflight_backup_node_ids.add(snapshot.node_id)
         self.write_backlog_tokens_ += intent_tokens
 
     def _build_aux_staging_transfers(
-        self, node: UnifiedTreeNode
-    ) -> Optional[list[PoolTransfer]]:
+        self,
+        node_id: NodeId,
+        hash_values: list[str],
+        comp_xfers: Optional[dict[ComponentType, list[PoolTransfer]]] = None,
+    ) -> list[PoolTransfer]:
         """Keys-only aux transfers mirroring what BACKUP_STORAGE would write;
         sizes the per-pool oversize gate (beliefs do not consult these)."""
         transfers: list[PoolTransfer] = []
         if ComponentType.SWA in self._cache.components:
-            cd = node.component_data[ComponentType.SWA]
-            if cd.value is not None:
-                num_pages = len(cd.value) // self._cache.page_size
+            current = (
+                comp_xfers.get(ComponentType.SWA)
+                if comp_xfers is not None
+                else self._cache.tree_core.build_hicache_transfers(
+                    ComponentType.SWA,
+                    node_id,
+                    CacheTransferPhase.BACKUP_HOST,
+                )
+            )
+            for transfer in current or ():
+                if transfer.device_indices is None:
+                    continue
+                num_pages = len(transfer.device_indices) // self._cache.page_size
                 if num_pages > 0:
                     transfers.append(
                         PoolTransfer(
                             name=PoolName.SWA,
-                            keys=node.hash_value[-num_pages:],
+                            keys=hash_values[-num_pages:],
                             hit_policy=PoolHitPolicy.TRAILING_PAGES,
                         )
                     )
-        return transfers or None
+        return transfers
 
     def _backup_oversize(
         self,
-        node: UnifiedTreeNode,
+        node_id: NodeId,
+        hash_values: list[str],
         intent_tokens: int,
         aux_xfers: Optional[list[PoolTransfer]] = None,
     ) -> bool:
@@ -400,7 +413,7 @@ class BufferModePipeline:
         if intent_tokens > cc.mem_pool_host.size:
             return True
         if aux_xfers is None:
-            aux_xfers = self._build_aux_staging_transfers(node)
+            aux_xfers = self._build_aux_staging_transfers(node_id, hash_values)
         for t in aux_xfers or ():
             entry = cc.mem_pool_host.entry_map.get(t.name)
             if entry is not None and (
@@ -420,35 +433,37 @@ class BufferModePipeline:
             host_pool.size // 10,
         )
 
-    def _backup_intent_stale(self, intent: _UnifiedBackupIntent) -> bool:
-        # Arena-lookup failure = deleted, hash mismatch vs the enqueue-time
-        # snapshot = split, a None FULL device value = evicted. Stale
+    def _validate_backup_intent(
+        self, intent: _UnifiedBackupIntent
+    ) -> Optional[BufferBackupState]:
+        # Arena-lookup failure = deleted, key-length mismatch vs the snapshot
+        # = split, a None FULL device value = evicted. Stale
         # intents drop silently; the node re-triggers on a later hit.
-        node = intent.node
-        try:
-            self._cache.tree_core.node_by_id(intent.node_id)
-        except KeyError:
-            return True
-        return (
-            node.component_data[BASE_COMPONENT_TYPE].value is None
-            or node.hash_value != intent.hash_values
+        snapshot = intent.snapshot
+        return self._cache.tree_core.validate_buffer_backup(
+            snapshot.node_id, len(snapshot.key)
         )
 
-    def _sweep_stale_backup_intents(self) -> None:
+    def _sweep_stale_backup_intents(self) -> dict[NodeId, BufferBackupState]:
         """Cancel stale intents anywhere in the queue, not just at the head:
         a dead intent would otherwise inflate the backlog accounting and
         hold FIFO position ahead of live segments."""
         if not self.pending_write_queue:
-            return
+            return {}
         page_size = self._cache.page_size
         survivors: deque[_UnifiedBackupIntent] = deque()
+        states: dict[NodeId, BufferBackupState] = {}
         for intent in self.pending_write_queue:
-            if self._backup_intent_stale(intent):
-                self.inflight_backup_node_ids.discard(intent.node_id)
-                self.write_backlog_tokens_ -= len(intent.hash_values) * page_size
+            snapshot = intent.snapshot
+            state = self._validate_backup_intent(intent)
+            if state is None:
+                self.inflight_backup_node_ids.discard(snapshot.node_id)
+                self.write_backlog_tokens_ -= len(snapshot.hash_values) * page_size
                 continue
             survivors.append(intent)
+            states[snapshot.node_id] = state
         self.pending_write_queue = survivors
+        return states
 
     def flush_pending_writes(self) -> None:
         """Launch D2H transfers for admitted intents, head-of-line: device
@@ -456,7 +471,7 @@ class BufferModePipeline:
         if not self.pending_write_queue:
             return
         cc = self._cache.cache_controller
-        self._sweep_stale_backup_intents()
+        states = self._sweep_stale_backup_intents()
         # Loads have priority (writes are deferrable): the write window is
         # the pool minus prefetch occupancy minus a 10% margin, floored at
         # the configured fraction.
@@ -467,34 +482,56 @@ class BufferModePipeline:
         )
         while self.pending_write_queue:
             intent = self.pending_write_queue[0]
-            intent_tokens = len(intent.hash_values) * self._cache.page_size
-            if not self._backup_parent_covered(intent.node) or self._backup_oversize(
-                intent.node, intent_tokens
-            ):
-                # Unwritable intent (dropped parent or unstageable size):
-                # cascade the drop down the chain rather than creating a
-                # permanent storage hole / stalling the head-of-line queue.
+            snapshot = intent.snapshot
+            state = states[snapshot.node_id]
+            intent_tokens = len(snapshot.hash_values) * self._cache.page_size
+            if not self._backup_parent_covered(state):
+                # Cascade a dropped parent down the chain rather than creating
+                # a permanent storage hole.
                 self.pending_write_queue.popleft()
-                self.inflight_backup_node_ids.discard(intent.node_id)
+                self.inflight_backup_node_ids.discard(snapshot.node_id)
                 self.write_backlog_tokens_ -= intent_tokens
                 self._log_backup_dropped(intent_tokens)
                 continue
             if self.write_staged_tokens_ >= live_cap:
                 # Yield to live fetch demand; retry next round.
                 break
-            if self._aux_budget_blocked(intent):
+            device_value, comp_xfers = self._cache.tree_core.build_backup_spec(
+                snapshot.node_id
+            )
+            sizing_xfers = self._build_aux_staging_transfers(
+                snapshot.node_id, snapshot.hash_values, comp_xfers
+            )
+            if self._backup_oversize(
+                snapshot.node_id,
+                snapshot.hash_values,
+                intent_tokens,
+                sizing_xfers,
+            ):
+                # A permanently unstageable head must not block the queue.
+                self.pending_write_queue.popleft()
+                self.inflight_backup_node_ids.discard(snapshot.node_id)
+                self.write_backlog_tokens_ -= intent_tokens
+                self._log_backup_dropped(intent_tokens)
+                continue
+            if self._aux_budget_blocked(intent, sizing_xfers):
                 # An aux pool lacks staging headroom: yield at the gate
                 # instead of failing the alloc inside cc.write; acks free
                 # aux staging, retry next round.
                 break
-            if not self._launch_backup_intent(intent):
+            if not self._launch_backup_intent(intent, device_value, comp_xfers):
                 # Pool full of in-flight staging and nothing reclaimable
                 # (the tree never holds host values in buffer mode):
                 # defer, head-of-line; pending acks will free slots.
                 break
             self.pending_write_queue.popleft()
 
-    def _launch_backup_intent(self, intent: _UnifiedBackupIntent) -> bool:
+    def _launch_backup_intent(
+        self,
+        intent: _UnifiedBackupIntent,
+        device_value: torch.Tensor,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+    ) -> bool:
         """Launch one admitted intent's D2H (staging alloc + device lock +
         async copy); the caller removes it from pending_write_queue. Returns
         False when staging cannot be allocated. From a successful launch the
@@ -502,33 +539,34 @@ class BufferModePipeline:
         LAUNCHED cover consulted by admission."""
         cache = self._cache
         cc = cache.cache_controller
-        node = intent.node
-        # Build aux transfers from the node's CURRENT state: a SWA span
-        # tombstoned since admission backs up FULL-only, as in cache mode.
-        device_value, comp_xfers = cache.tree_core.build_backup_spec(node.id)
+        snapshot = intent.snapshot
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         host_indices = cc.write(
             device_value,
-            node_id=node.id,
+            node_id=snapshot.node_id,
             extra_pools=aux_xfers or None,
         )
         if host_indices is None:
             return False
-        _track_content_refs(self.inflight_backup_hashes, intent.hash_values)
+        _track_content_refs(self.inflight_backup_hashes, snapshot.hash_values)
         # NOTE: no commit_backup — the node must never appear
         # host-resident in buffer mode; staging slots live in the entry.
-        lock_params = cache.inc_lock_ref(node.id).to_dec_params()
-        self.ongoing_write_through[node.id] = _UnifiedBufferBackupEntry(
+        lock_params = cache.inc_lock_ref(snapshot.node_id).to_dec_params()
+        self.ongoing_write_through[snapshot.node_id] = _UnifiedBufferBackupEntry(
             intent=intent,
             host_indices=host_indices,
             aux_xfers=aux_xfers,
             lock_params=lock_params,
         )
         self.write_staged_tokens_ += len(host_indices)
-        self.write_backlog_tokens_ -= len(intent.hash_values) * cache.page_size
+        self.write_backlog_tokens_ -= len(snapshot.hash_values) * cache.page_size
         return True
 
-    def _aux_budget_blocked(self, intent: _UnifiedBackupIntent) -> bool:
+    def _aux_budget_blocked(
+        self,
+        intent: _UnifiedBackupIntent,
+        aux: Optional[list[PoolTransfer]] = None,
+    ) -> bool:
         """True when an aux pool cannot stage this intent right now (free
         minus the loads-priority margin falls short of the need): defer at
         the gate instead of failing the alloc inside cc.write and blocking
@@ -536,7 +574,11 @@ class BufferModePipeline:
         loads-have-priority on aux pools the way live_cap does on the KV
         pool; avail already reflects prefetch-held slots, so no occupancy
         subtraction here."""
-        aux = self._build_aux_staging_transfers(intent.node)
+        snapshot = intent.snapshot
+        if aux is None:
+            aux = self._build_aux_staging_transfers(
+                snapshot.node_id, snapshot.hash_values
+            )
         if not aux:
             return False
         cc = self._cache.cache_controller
@@ -574,14 +616,15 @@ class BufferModePipeline:
         (which reads from the staging copy, so device eviction may proceed)."""
         entry = self.ongoing_write_through.pop(ack_id)
         intent = entry.intent
-        self._cache.dec_lock_ref(intent.node_id, entry.lock_params)
+        snapshot = intent.snapshot
+        self._cache.dec_lock_ref(snapshot.node_id, entry.lock_params)
 
         # Every aux pool writes a trailing snapshot keyed by the last KV page
         # hashes it covers: the SWA window spans page_size-sized pages, the
         # Mamba state is a single slot (host pool page_size 1 -> one key).
         storage_xfers: list[PoolTransfer] = []
         for staged in entry.aux_xfers:
-            keys = self._aux_window_keys(intent.hash_values, staged)
+            keys = self._aux_window_keys(snapshot.hash_values, staged)
             if keys is None:
                 continue
             storage_xfers.append(
@@ -594,9 +637,9 @@ class BufferModePipeline:
             )
         operation_id = self._cache.cache_controller.write_storage(
             entry.host_indices,
-            intent.key.token_ids,
-            intent.hash_values,
-            intent.prefix_keys,
+            snapshot.key.token_ids,
+            snapshot.hash_values,
+            snapshot.prefix_keys,
             extra_pools=storage_xfers or None,
         )
         self.ongoing_backup[operation_id] = entry
@@ -611,11 +654,12 @@ class BufferModePipeline:
         if entry is None:
             return
         intent = entry.intent
-        self._cache.storage_existence_cache.add(PoolName.KV, intent.hash_values)
+        snapshot = intent.snapshot
+        self._cache.storage_existence_cache.add(PoolName.KV, snapshot.hash_values)
         self._free_staging_now(entry.host_indices, entry.aux_xfers)
         self.write_staged_tokens_ -= len(entry.host_indices)
-        self.inflight_backup_node_ids.discard(entry.intent.node_id)
-        _untrack_content_refs(self.inflight_backup_hashes, intent.hash_values)
+        self.inflight_backup_node_ids.discard(snapshot.node_id)
+        _untrack_content_refs(self.inflight_backup_hashes, snapshot.hash_values)
 
     def _free_staging_now(
         self, host_indices: torch.Tensor, aux_xfers: list[PoolTransfer]
@@ -671,10 +715,18 @@ class BufferModePipeline:
                 )
             return "cap_skip"
         cache = self._cache
+        anchor_tokens = array("q", prefix_tokens)
+        if cache.tree_core.is_eagle:
+            # The suffix owns the boundary token shared with the last matched
+            # bigram, so include it when rebuilding the anchor key.
+            info = cache.ongoing_prefetch.get(req_id)
+            if info is None or not info.prefetch_key.token_ids:
+                return "anchor_lost"
+            anchor_tokens.append(info.prefetch_key.token_ids[0])
         match = cache.match_prefix(
             MatchPrefixParams(
                 key=RadixKey(
-                    array("q", prefix_tokens),
+                    anchor_tokens,
                     extra_key=extra_key,
                     is_bigram=cache.tree_core.is_eagle,
                     cache_salt=cache_salt,
