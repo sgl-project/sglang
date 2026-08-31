@@ -1,8 +1,8 @@
 """Platform predicates and the import-time fallback selector.
 
 Several diffusion Triton kernels have no Triton on the live device (Ascend
-NPU, Apple MPS, MUSA, CPU) and must resolve to a pure-``torch`` — or
-MLX-accelerated — implementation.  That choice is made once at import time,
+NPU, Apple MPS, MUSA, CPU) and must resolve to a pure-``torch`` implementation.
+That choice is made once at import time,
 which used to mean a hand-rolled four-branch ``if`` block repeated in every
 such module, each importing ``current_platform`` directly.
 
@@ -75,8 +75,8 @@ def lazy_fallback(kind: str, name: str) -> Callable:
     """Name a fallback without importing its module.
 
     ``select_impl`` is handed every candidate at once, so a plain import here
-    would pull in *all* fallback modules on every platform -- including MLX on
-    CUDA hosts.  The returned shim imports ``common.fallback_<kind>`` on its
+    would pull in *all* fallback modules on every platform.  The returned shim
+    imports ``common.fallback_<kind>`` on its
     first call instead, which for the unselected candidates never happens.
     """
 
