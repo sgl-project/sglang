@@ -140,6 +140,12 @@ class TestGptOssMoeAllReduceGuard(CustomTestCase):
             _, all_reduce = self._forward_normal_tracking_all_reduce()
         all_reduce.assert_called_once()
 
+    def test_partial_attention_dp_with_ep4_still_all_reduces(self):
+        """TP4/DP2/EP4 keeps all-reduce because attention TP is two."""
+        with self._parallel_ctx(dpa_enabled=True, attn_dp_size=2, moe_ep_size=4):
+            _, all_reduce = self._forward_normal_tracking_all_reduce()
+        all_reduce.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
