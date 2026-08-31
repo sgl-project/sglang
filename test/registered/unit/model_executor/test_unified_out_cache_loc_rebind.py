@@ -121,7 +121,7 @@ class TestPadComposesWithDerivation(CustomTestCase):
     def test_pad_lanes_derive_to_sink_and_slices_stay_pointwise(self):
         """The REAL `_pad_inputs_to_size` composes with phase 2: pad lanes are
         zeros, zeros derive to the slot-0 sink, and any slice of the padded
-        tensor (the TBO-child shape) derives pointwise — no handover call
+        tensor (the TBO-child shape) derives pointwise -- no handover call
         exists for the pad to make."""
         n, padded = 3, 6
         v2p = torch.arange(64, dtype=torch.int64) * 3
@@ -137,7 +137,7 @@ class TestPadComposesWithDerivation(CustomTestCase):
         fb._pad_inputs_to_size(self._fake_runner_for_pad(src), padded, fb.batch_size)
 
         self.assertEqual(fb.out_cache_loc.shape[0], padded)
-        # Padded tail lanes go to slot 0 — the reserved dummy-write sink.
+        # Padded tail lanes go to slot 0 -- the reserved dummy-write sink.
         self.assertTrue(bool((fb.out_cache_loc[n:] == 0).all()))
         loc = src._swa_write_loc_unified(fb.out_cache_loc)
         self.assertTrue(torch.equal(loc[:n], swa_map[virt]))

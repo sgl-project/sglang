@@ -611,7 +611,7 @@ class TestWriteLoc(unittest.TestCase):
 
     def test_slice_and_copy_derive_pointwise_without_handover(self):
         """REGRESSION (design): the retired identity-resolver refused any
-        tensor it had not been handed — a TBO child's re-padded slice or a
+        tensor it had not been handed -- a TBO child's re-padded slice or a
         registry's fresh copy raised. Value-based derivation must accept
         both, pointwise, with no adopt/handover call."""
         src, _, rows, seq_lens, _, want_full, want_swa = self._built(n=4)

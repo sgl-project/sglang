@@ -541,7 +541,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
 
     def test_slot_zero_sink_invariant_survives_churn(self):
         """PINNED INVARIANT: virtual 0 <-> physical 0 (the padding sink), so
-        `translate_kv_loc(zeros) == zeros` — after init AND after alloc/free/
+        `translate_kv_loc(zeros) == zeros` -- after init AND after alloc/free/
         compaction churn. The cuda-graph capture path RELIES on this: the
         physical-loc contract replaced capture-time translate with a plain
         copy of the zero-filled static buffer, which is only equivalent while

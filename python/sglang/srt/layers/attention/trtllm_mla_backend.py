@@ -648,9 +648,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
-        # Eager path: no capture-stable kernel-facing write loc; the pool door
-        # receives forward_batch.out_cache_loc directly (already kernel-facing —
-        # rebound at ForwardBatch construction).
         self._decode_kernel_loc = None
         # Delegate to parent for non-decode modes.
         if (
@@ -1096,8 +1093,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             if self._decode_kernel_loc is not None:
-                # cuda-graph path: the refilled capture-stable buffer, so the
-                # in-graph write captures no data-dependent allocation.
                 if merge_query and self._fused_set_kv_concat_q:
                     # Fused: KV scatter + [q_nope | q_rope] concat in one
                     # launch; None when the inputs are not covered.

@@ -209,10 +209,7 @@ class TritonAttnBackend(AttentionBackend):
         # Lets the Triton wrappers specialize on PAGE_SIZE; page_size=1 is
         # byte-identical to the slot-based envelope.
         self.page_size = getattr(model_runner, "page_size", 1) or 1
-        # The backends uses the translator instead of translating by itself.
         self.kv_index_translator = model_runner.kv_index_translator
-        # Set unconditionally: the read site evaluates it before the call,
-        # and a non-translating pool never looks at its value.
         self.kv_read_tables = None
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_num_steps = get_spec().speculative_num_steps
