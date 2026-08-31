@@ -232,7 +232,7 @@ def _wo_a_ue8m0_sm12x() -> bool:
 
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         return False
-    return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and is_sm120_supported()
+    return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and get_platform().is_sm120
 
 
 _MHC_POST_MULT_VALUE = 2.0
@@ -263,7 +263,7 @@ def _dsv4_mqa_padded_num_heads(n_local_heads: int, n_heads: int) -> int:
     32 real heads to 64 there doubles the attention work and disqualifies
     the tuned 32-head configurations.
     """
-    if _B12X_SPARSE_MLA and is_sm120_supported():
+    if _B12X_SPARSE_MLA and get_platform().is_sm120:
         for h in _B12X_H_Q_SPECIALIZATIONS:
             if n_local_heads <= h:
                 return h
