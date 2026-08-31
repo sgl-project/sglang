@@ -20,7 +20,7 @@ from sglang.srt.managers.multimodal_processor import (  # noqa: E402
     get_mm_processor_cls,
     import_processors,
 )
-from sglang.srt.managers.rust_server import native_mm_family_for  # noqa: E402
+from sglang.srt.rust_server import native_mm_family_for  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

@@ -15,7 +15,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.rust_server import NativeMmHost, NativeMmSpec  # noqa: E402
+from sglang.srt.rust_server import NativeMmHost, NativeMmSpec  # noqa: E402
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

@@ -198,7 +198,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
-from sglang.srt.managers.rust_server import RustServer
+from sglang.srt.rust_server import RustServer
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,

@@ -22,7 +22,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.mm_utils import hash_feature  # noqa: E402
-from sglang.srt.managers.rust_server import NativeMmHost  # noqa: E402
+from sglang.srt.rust_server import NativeMmHost  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
