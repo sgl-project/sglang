@@ -694,6 +694,18 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         # The cache assigns tree_core.enable_storage at storage init; forward it.
         self._binding.set_enable_storage(value)
 
+    @property
+    def enable_external_cache_linker(self) -> bool:
+        return False
+
+    @enable_external_cache_linker.setter
+    def enable_external_cache_linker(self, value: bool) -> None:
+        # TODO(Jialin): Port external cache linker support from #37091 and #37151.
+        if value:
+            raise ValueError(
+                "External cache linker is not supported by the Rust TreeCore"
+            )
+
     def insert_host(
         self,
         node_id: NodeId,

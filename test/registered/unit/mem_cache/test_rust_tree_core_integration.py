@@ -317,6 +317,14 @@ def test_configuration_reads_the_locked_rust_state():
     assert swa_core.has_swa_host_pool is True
 
 
+def test_external_cache_linker_is_rejected():
+    core = _tree_core()
+    assert core.enable_external_cache_linker is False
+    with pytest.raises(ValueError, match="External cache linker"):
+        core.enable_external_cache_linker = True
+    assert core.enable_external_cache_linker is False
+
+
 def test_sanity_check_passes_after_the_full_flow():
     core = _tree_core()
     _insert(core, [1, 2, 3], [10, 11, 12])
