@@ -1362,9 +1362,24 @@ class UnifiedRadixCache(BasePrefixCache):
             lock_params = None
             if not write_back:
                 lock_params = self.inc_lock_ref(node_id).to_dec_params()
-            self._track_write_through_node(node_id, lock_params)
+            publish_node_ids = self._backup_publish_node_ids(node_id, comp_xfers)
+            self._track_write_through_node(
+                node_id, lock_params, publish_node_ids=publish_node_ids
+            )
             written = len(host_indices)
         return written
+
+    @staticmethod
+    def _backup_publish_node_ids(
+        node_id: NodeId, comp_xfers: dict[ComponentType, list[PoolTransfer]]
+    ) -> list[NodeId]:
+        publish_node_ids: list[NodeId] = []
+        for transfers in comp_xfers.values():
+            for transfer in transfers:
+                publish_node_ids.extend(transfer.nodes_to_load or ())
+        if node_id not in publish_node_ids:
+            publish_node_ids.append(node_id)
+        return list(dict.fromkeys(publish_node_ids))
 
     def _build_backup_sidecar(self, device_value, comp_xfers):
         """Gather sidecar transfer spec."""
@@ -1391,10 +1406,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         node_id: NodeId,
         lock_params: Optional[DecLockRefParams],
+        publish_node_ids: list[NodeId],
     ) -> None:
-        self.tree_core.mark_write_through_pending(node_id)
+        self.tree_core.mark_write_through_pending(publish_node_ids, ack_id=node_id)
         self.ongoing_write_through[node_id] = _OngoingWriteThrough(
-            node_id, lock_params, [node_id]
+            node_id, lock_params, publish_node_ids
         )
 
     def _replace_pending_write_through_node(

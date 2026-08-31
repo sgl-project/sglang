@@ -7499,6 +7499,19 @@ def _component_with_cache(component_type, cache):
 class TestUnifiedRadixCacheActionRouting(CustomTestCase):
     """CacheAction routing: each type forwards to the right Controller API."""
 
+    def test_backup_publish_node_ids_collects_component_nodes_once(self):
+        comp_xfers = {
+            ComponentType.SWA: [PoolTransfer(name=PoolName.SWA, nodes_to_load=[3, 4])],
+            ComponentType.MAMBA: [
+                PoolTransfer(name=PoolName.MAMBA, nodes_to_load=[4, 5])
+            ],
+        }
+
+        self.assertEqual(
+            UnifiedRadixCache._backup_publish_node_ids(7, comp_xfers),
+            [3, 4, 5, 7],
+        )
+
     def test_apply_cache_action_routes_replace_write_through(self):
         cache = mock.MagicMock()
         action = ReplaceWriteThroughOnNodeSplit(

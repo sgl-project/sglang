@@ -2158,10 +2158,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self._update_duplicate_tracking(node)
             node = node.parent
 
-    def mark_write_through_pending(self, node_id: NodeId) -> None:
-        """Mark a node as having an in-flight write-through backup."""
-        node = self.node_by_id(node_id)
-        node.write_through_pending_id = node_id
+    def mark_write_through_pending(
+        self, node_ids: list[NodeId], ack_id: NodeId
+    ) -> None:
+        """Mark every node covered by one in-flight write-through backup."""
+        nodes = [self.node_by_id(node_id) for node_id in node_ids]
+        for node in nodes:
+            assert node.write_through_pending_id in (None, ack_id)
+        for node in nodes:
+            node.write_through_pending_id = ack_id
 
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the

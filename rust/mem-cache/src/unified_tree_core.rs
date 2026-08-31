@@ -3649,10 +3649,24 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
     }
 
-    /// Mark a node as having an in-flight write-through backup.
-    pub fn mark_write_through_pending(&mut self, node_id: NodeId) {
-        let node_idx = self.arena.resolve(node_id);
-        self.arena.node_mut(node_idx).write_through_pending_id = Some(node_id);
+    /// Mark every node covered by one in-flight write-through backup.
+    pub fn mark_write_through_pending(&mut self, node_ids: Vec<NodeId>, ack_id: NodeId) {
+        let node_indices = node_ids
+            .into_iter()
+            .map(|node_id| self.arena.resolve(node_id))
+            .collect::<Vec<_>>();
+        for &node_idx in &node_indices {
+            let node = self.arena.node(node_idx);
+            assert!(
+                node.write_through_pending_id.is_none()
+                    || node.write_through_pending_id == Some(ack_id),
+                "node {} is already pending under a different write-through ack",
+                node.id
+            );
+        }
+        for node_idx in node_indices {
+            self.arena.node_mut(node_idx).write_through_pending_id = Some(ack_id);
+        }
     }
 
     /// Clear the write-through-pending mark (when it matches ack_id) and record the
