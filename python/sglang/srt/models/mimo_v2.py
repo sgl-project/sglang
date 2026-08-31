@@ -434,8 +434,11 @@ class MiMoV2MoE(nn.Module):
         )
 
         # todo : implement tbo forward needed
+        # is_deepep_v2() must be included or deepep_v2 skips this branch and
+        # leaves ep_size / num_experts unset.
         if (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
@@ -453,8 +456,11 @@ class MiMoV2MoE(nn.Module):
                 else None
             )
 
+        # is_deepep_v2() must be included or _enable_a2a_moe is False and MoE runs
+        # forward_normal, whose extra all_reduce (forward_deepep skips it) hangs.
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_ascend_fuseep()
         )
