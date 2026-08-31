@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 import time
+import weakref
 from typing import TYPE_CHECKING
 
 import torch
@@ -93,12 +94,15 @@ class DecodeKVCacheOffloadManager:
 
         self.ongoing_offload = {}
         self.ongoing_backup = {}
-        # A caller may reuse a rid as soon as the previous response finishes,
-        # while that request's asynchronous D2H copy is still in flight. Key
-        # lifecycle state by the Req instance so a late ack cannot mutate the
-        # new request's state.
-        self.offloaded_state: dict[Req, OffloadedState] = {}
-        self.offload_inflight: dict[Req, int] = {}
+        # Keyed by Req identity (a caller-supplied rid can be reused while the
+        # previous request's D2H copy is in flight); weak keys so a request
+        # released outside _release_finished_req is not pinned here forever.
+        self.offloaded_state: weakref.WeakKeyDictionary[Req, OffloadedState] = (
+            weakref.WeakKeyDictionary()
+        )
+        self.offload_inflight: weakref.WeakKeyDictionary[Req, int] = (
+            weakref.WeakKeyDictionary()
+        )
         logger.info("Enable offload kv cache for decode side")
 
     def release_host_resources(self) -> None:
@@ -117,6 +121,10 @@ class DecodeKVCacheOffloadManager:
     def _has_inflight_offload(self, req: Req):
         return self.offload_inflight.get(req, 0) > 0
 
+    def _prefill_offloaded_len(self, req: Req) -> int:
+        # Page-aligned prompt length; the prefill instance offloaded this part.
+        return len(req.origin_input_ids) // self.page_size * self.page_size
+
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
 
@@ -132,9 +140,7 @@ class DecodeKVCacheOffloadManager:
 
         # Prefill side offloads page-aligned origin_input_ids, decode side offloads the incremental part
         all_tokens = req.origin_input_ids + req.output_ids[:-1]
-        prefill_offloaded_len = (
-            len(req.origin_input_ids) // self.page_size * self.page_size
-        )
+        prefill_offloaded_len = self._prefill_offloaded_len(req)
         state = self.offloaded_state.get(req)
         if state is None:
             prefill_hashes = self._compute_prefix_hash(
@@ -143,13 +149,9 @@ class DecodeKVCacheOffloadManager:
             last_prefill_hash = (
                 prefill_hashes[-1] if prefill_offloaded_len > 0 else None
             )
-            state = OffloadedState(
-                prefill_len=prefill_offloaded_len,
-                inc_len=0,
-                last_hash=last_prefill_hash,
-            )
+            state = OffloadedState(last_hash=last_prefill_hash)
             self.offloaded_state[req] = state
-        incremental_total = len(all_tokens) - state.prefill_len
+        incremental_total = len(all_tokens) - prefill_offloaded_len
         incremental_new = incremental_total - state.inc_len
         incremental_aligned_len = (
             incremental_new // self.offload_stride * self.offload_stride
@@ -159,7 +161,7 @@ class DecodeKVCacheOffloadManager:
             return False
 
         # Extract incremental tokens and indices for the newly available chunk
-        start = state.prefill_len + state.inc_len
+        start = prefill_offloaded_len + state.inc_len
         end = start + incremental_aligned_len
         incremental_tokens = all_tokens[start:end]
         incremental_indices = token_indices[start:end]
@@ -187,8 +189,6 @@ class DecodeKVCacheOffloadManager:
             host_indices,
             incremental_tokens,
             time.time(),
-            start,
-            end,
         )
         state.inc_len += incremental_aligned_len
         return True
@@ -224,8 +224,6 @@ class DecodeKVCacheOffloadManager:
                     host_indices,
                     incremental_tokens,
                     start_time,
-                    start,
-                    end,
                 ) = self.ongoing_offload.pop(ack_id)
 
                 self._mark_offload_finished(req)
@@ -241,12 +239,10 @@ class DecodeKVCacheOffloadManager:
                     self.offloaded_state[req].last_hash = last_hash
 
                 if req.finished() and not self._has_inflight_offload(req):
-                    state = self.offloaded_state.get(req)
-                    start_offset = state.prefill_len if state is not None else start
-                    self._release_finished_req(req, start_offset)
+                    self._release_finished_req(req)
             finish_count -= 1
 
-    def _release_finished_req(self, req: Req, start_offset: int):
+    def _release_finished_req(self, req: Req):
         # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
         # so a previously-released request must be skipped here to avoid
         # non-idempotent side effects (e.g. tree_cache.protected_size_
@@ -261,13 +257,13 @@ class DecodeKVCacheOffloadManager:
         # concurrent admission. Now consolidated here at request
         # finish, where the request is guaranteed to no longer attend
         # to those slots.
-        state = self.offloaded_state.get(req)
-        if state is not None and state.prefill_len > 0:
+        prefill_len = self._prefill_offloaded_len(req)
+        if prefill_len > 0:
             prefill_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, : state.prefill_len
+                req.kv.req_pool_idx, :prefill_len
             ]
             self.token_to_kv_pool_allocator.free(prefill_indices)
-        start = start_offset
+        start = prefill_len
         end = kv_committed_len
         # Free the incremental part of the request (DSA-aware)
         kv_indices = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, start:end]
@@ -327,24 +323,6 @@ class DecodeKVCacheOffloadManager:
 
     def finalize_release_on_finish(self, req: Req):
         """Free any remaining tail KV that was not offloaded due to non-aligned length."""
-        # ReqToTokenPool.free sets req_pool_idx to None on release, so
-        # guard against both sentinels here.
-        if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
-            return
-        state = self.offloaded_state.get(req)
-        if state is None:
-            prefill_len = len(req.origin_input_ids) // self.page_size * self.page_size
-            inc_len = 0
-        else:
-            prefill_len = state.prefill_len
-            inc_len = state.inc_len
-        # Prefill-aligned slots are freed by _release_finished_req. Make
-        # sure state exists so it can find prefill_len.
-        if state is None:
-            self.offloaded_state[req] = OffloadedState(
-                prefill_len=prefill_len, inc_len=0, last_hash=None
-            )
         if self._has_inflight_offload(req):
             return
-        start_offset = prefill_len
-        self._release_finished_req(req, start_offset)
+        self._release_finished_req(req)
