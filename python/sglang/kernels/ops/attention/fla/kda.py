@@ -31,6 +31,9 @@ from sglang.kernels.ops.attention.fla.utils import (
     is_nvidia,
     is_tf32_supported,
 )
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 if is_intel:
     from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
@@ -212,17 +215,8 @@ def rms_norm_gated(
     return y if not prenorm else (y, residual_out.reshape(x_shape_og))
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["BC", "IS_VARLEN"],
-)
 @triton.jit(do_not_specialize=["T"])
-def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
+def _chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     q,
     k,
     g,
@@ -326,12 +320,19 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
-    key=["BK", "BT", "IS_VARLEN"],
-)
+chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter = triton.autotune(
+    configs=[
+        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64]
+        for num_warps in [1, 2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=["BC", "IS_VARLEN"],
+)(_chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter)
+
+
 @triton.jit(do_not_specialize=["T"])
-def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
+def _chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     q,
     k,
     g,
@@ -422,6 +423,12 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
         p_gk += H * K
 
 
+chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra = triton.autotune(
+    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
+    key=["BK", "BT", "IS_VARLEN"],
+)(_chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra)
+
+
 def chunk_kda_scaled_dot_kkt_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -473,8 +480,21 @@ def chunk_kda_scaled_dot_kkt_fwd(
     BK = max(next_power_of_2(K), 16)
     A = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
     Aqk = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
+    if not _is_npu:
+        inter_kernel = chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter
+        inter_config = {}
+        intra_kernel = chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra
+        intra_config = {}
+    else:
+        # Ascend's autotuner benchmarks CUDA-oriented candidates during the
+        # first request. Launch the stable A3 configurations directly.
+        inter_kernel = _chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter
+        inter_config = {"BK": 64, "num_warps": 4, "num_stages": 3}
+        intra_kernel = _chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra
+        intra_config = {"num_warps": 4, "num_stages": 3}
+
     grid = (NT, NC * NC, B * H)
-    chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter[grid](
+    inter_kernel[grid](
         q=q,
         k=k,
         g=gk,
@@ -492,10 +512,11 @@ def chunk_kda_scaled_dot_kkt_fwd(
         BC=BC,
         NC=NC,
         IS_VARLEN=cu_seqlens is not None,
+        **inter_config,
     )
 
     grid = (NT, NC, B * H)
-    chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra[grid](
+    intra_kernel[grid](
         q=q,
         k=k,
         g=gk,
@@ -513,6 +534,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
         BC=BC,
         BK=BK,
         IS_VARLEN=cu_seqlens is not None,
+        **intra_config,
     )
     return A, Aqk
 
