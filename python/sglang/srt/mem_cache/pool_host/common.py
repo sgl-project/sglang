@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+from sglang.srt.runtime_context import get_memory
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,6 @@ def get_allocator_from_storage(allocator_type):
 
 def get_allocator_type() -> str:
     """The host-allocator kind the published HiCache configuration asks for."""
-    from sglang.srt.runtime_context import get_memory
 
     backend = get_memory().hicache_storage_backend
     if backend == "shm":
