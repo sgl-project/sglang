@@ -62,6 +62,7 @@ from sglang.srt.speculative.draft_worker_common import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     SIMULATE_ACC_METHOD,
@@ -70,7 +71,7 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
 
@@ -176,6 +177,17 @@ def _commit_accept(candidates, accept_len, bonus_tokens):
     out_tokens[:, -1].fill_(0)
     out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus_tokens[:, None])
     return out_tokens, accept_len.to(torch.int32) + 1
+
+
+def _resolve_dflash_embedding_module(draft_model, target_model):
+    if getattr(draft_model, "is_nemotron_35_draft", False):
+        embed_module = draft_model.get_input_embeddings()
+        if embed_module is None:
+            raise RuntimeError(
+                "Nemotron 3.5 DFLASH draft requires its checkpoint embedding."
+            )
+        return embed_module
+    return target_model.get_input_embeddings()
 
 
 def _is_all_greedy(sampling_info) -> bool:
@@ -291,11 +303,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._draft_probs_buf = None
         self._logged_first_verify = False
+        self._tp_sync = SpecTpSync(get_tp_group())
 
         bundle = build_draft_tp_worker(
             server_args=server_args,
             gpu_id=gpu_id,
-            ps=replace(ps, pp_rank=0),
+            ps=replace(ps, pp_rank=0, pp_size=1),
             nccl_port=nccl_port,
             target_model_config=target_worker.model_runner.model_config,
             algo_label="DFLASH",
@@ -454,7 +467,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
         )
         if is_cuda() and capture_decode_cuda_graph:
-            available_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            available_mem = self._tp_sync.available_memory_gb(
+                SpecTpSyncSite.DFLASH_MEM,
+                self.device,
+                self.gpu_id,
+                group=get_tp_group(),
+            )
             if available_mem < 1.0:
                 capture_decode_cuda_graph = False
                 logger.warning(
@@ -1608,6 +1626,89 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._new_seq_lens_bufs[slot][:bs],
         )
 
+    def _accept_block(
+        self,
+        *,
+        candidates: torch.Tensor,
+        next_token_logits: torch.Tensor,
+        sampling_info,
+        draft_input,
+        prefix_lens: torch.Tensor,
+        bs: int,
+    ):
+        new_seq_lens = None
+        target_predict = None
+        if self._selector_sample is not None:
+            selector_candidate_ids, selector_q_rows = self._selector_sample
+            accept_len, bonus = self._selector_sampling_accept(
+                candidates=candidates,
+                next_token_logits=next_token_logits,
+                candidate_ids=selector_candidate_ids,
+                q_rows=selector_q_rows,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+            )
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
+            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+        elif (
+            not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
+        ):
+            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
+                candidates=candidates,
+                next_token_logits=next_token_logits,
+                sampling_info=sampling_info,
+                max_top_k=draft_input.max_top_k,
+                uniform_top_k_value=draft_input.uniform_top_k_value,
+            )
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, accept_len)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
+            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+        else:
+            target_predict = torch.argmax(next_token_logits, dim=-1).view(
+                bs, int(self.block_size)
+            )
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
+            if self._use_triton_accept_bonus:
+                try:
+                    (
+                        accept_len,
+                        commit_lens,
+                        bonus,
+                        out_tokens,
+                        new_seq_lens,
+                    ) = self._next_accept_bonus_buffers(bs)
+                    _compute_dflash_accept_bonus_triton_unchecked(
+                        candidates=candidates,
+                        target_top1=target_predict,
+                        accept_lens_out=accept_len,
+                        commit_lens_out=commit_lens,
+                        bonus_ids_out=bonus,
+                        out_tokens_out=out_tokens,
+                        prefix_lens=prefix_lens,
+                        new_seq_lens_out=new_seq_lens,
+                    )
+                except Exception as e:
+                    self._use_triton_accept_bonus = False
+                    logger.warning(
+                        "DFLASH Triton accept/bonus failed; falling back to eager path: %s",
+                        e,
+                    )
+                    accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                        candidates=candidates,
+                        target_predict=target_predict,
+                    )
+                    out_tokens, commit_lens = _commit_accept(
+                        candidates, accept_len, bonus
+                    )
+            else:
+                accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                )
+                out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict
+
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
         # A selector draft carries its own q and verifies through accept_sampling, so
@@ -1651,19 +1752,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
             )
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,
                 batch_output.next_token_ids,
             )
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, next_token_ids)
             batch_output.new_seq_lens = batch.seq_lens
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1753,7 +1858,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
-        embed_module = unwrap_lora_layer(target_model.get_input_embeddings())
+        embed_module = unwrap_lora_layer(
+            _resolve_dflash_embedding_module(self.draft_model, target_model)
+        )
         lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
         if lm_head is None or not (
             hasattr(lm_head, "weight")
@@ -2013,72 +2120,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             grammar_mask.apply(logits_output.next_token_logits)
 
         candidates = draft_tokens
-        new_seq_lens = None
-        target_predict = None
-        if self._selector_sample is not None:
-            selector_candidate_ids, selector_q_rows = self._selector_sample
-            accept_len, bonus = self._selector_sampling_accept(
-                candidates=candidates,
-                next_token_logits=logits_output.next_token_logits,
-                candidate_ids=selector_candidate_ids,
-                q_rows=selector_q_rows,
-                sampling_info=sampling_info,
-                draft_input=draft_input,
-            )
-            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
-        elif (
-            not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
-        ):
-            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
-                candidates=candidates,
-                next_token_logits=logits_output.next_token_logits,
-                sampling_info=sampling_info,
-                max_top_k=draft_input.max_top_k,
-                uniform_top_k_value=draft_input.uniform_top_k_value,
-            )
-            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
-        else:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
-            )
-            if self._use_triton_accept_bonus:
-                try:
-                    (
-                        accept_len,
-                        commit_lens,
-                        bonus,
-                        out_tokens,
-                        new_seq_lens,
-                    ) = self._next_accept_bonus_buffers(bs)
-                    _compute_dflash_accept_bonus_triton_unchecked(
-                        candidates=candidates,
-                        target_top1=target_predict,
-                        accept_lens_out=accept_len,
-                        commit_lens_out=commit_lens,
-                        bonus_ids_out=bonus,
-                        out_tokens_out=out_tokens,
-                        prefix_lens=prefix_lens,
-                        new_seq_lens_out=new_seq_lens,
-                    )
-                except Exception as e:
-                    self._use_triton_accept_bonus = False
-                    logger.warning(
-                        "DFLASH Triton accept/bonus failed; falling back to eager path: %s",
-                        e,
-                    )
-                    accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
-                        candidates=candidates,
-                        target_predict=target_predict,
-                    )
-                    out_tokens, commit_lens = _commit_accept(
-                        candidates, accept_len, bonus
-                    )
-            else:
-                accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
-                    candidates=candidates,
-                    target_predict=target_predict,
-                )
-                out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+        (
+            accept_len,
+            commit_lens,
+            bonus,
+            out_tokens,
+            new_seq_lens,
+            target_predict,
+        ) = self._accept_block(
+            candidates=candidates,
+            next_token_logits=logits_output.next_token_logits,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            prefix_lens=prefix_lens,
+            bs=bs,
+        )
 
         if SIMULATE_ACC_LEN > 0:
             if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):

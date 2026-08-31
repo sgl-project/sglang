@@ -71,7 +71,8 @@ class AdapterLoader(PlainStateDictComponentLoader):
             server_args, component_name, precision_attr="dit_precision"
         )
 
-        config_cls = self._CONFIG_CLASSES[component_name]
+        component_type = self.structural_component_type(component_name)
+        config_cls = self._CONFIG_CLASSES[component_type]
         with set_default_torch_dtype(default_dtype), skip_init_modules():
             adapter_cfg = config_cls()
             adapter_cfg.update_model_arch(config)

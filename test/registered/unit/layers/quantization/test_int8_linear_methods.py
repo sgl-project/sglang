@@ -12,6 +12,7 @@ import torch
 
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import (
@@ -112,7 +113,9 @@ class TestBlockInt8Linear(_Int8LinearCheck):
             activation_scheme="dynamic",
             weight_block_size=[128, 128],
         )
-        layer = make_tp1_column_parallel_linear(quant_config, n, k)
+        # create_weights reads get_parallel().tp_size, not the layer's argument.
+        with get_parallel().override(tp_size=1, tp_rank=0):
+            layer = make_tp1_column_parallel_linear(quant_config, n, k)
         w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
         w_int8, scale_inv, w_dequant = _quantize_int8_block(w)
         load_linear_weights(layer, weight=w_int8, weight_scale_inv=scale_inv)

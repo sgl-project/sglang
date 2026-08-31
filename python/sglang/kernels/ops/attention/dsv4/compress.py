@@ -409,6 +409,11 @@ def compress_forward(
     else:
         fn = module.decode if plan.is_decode else module.prefill
 
+    # C4/C128 kernels use the same InputFloat type for APE and kv_score_input.
+    # Keep the model parameter in FP32 but convert it to the kernel input dtype
+    # at the fused-kernel boundary.
+    if ape.dtype != kv_score_input.dtype:
+        ape = ape.to(dtype=kv_score_input.dtype)
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out
 
@@ -448,6 +453,8 @@ def compress_norm_rope_store(
             kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
         )
         fn = module.forward_fp4 if use_fp4 else module.forward
+        if norm_weight.dtype != kv.dtype:
+            norm_weight = norm_weight.to(dtype=kv.dtype)
         fn(
             kv,
             plan[1],
