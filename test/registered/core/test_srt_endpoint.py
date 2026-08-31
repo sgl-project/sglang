@@ -31,8 +31,8 @@ from sglang.test.test_utils import (
     run_logprob_check,
 )
 
-register_cuda_ci(est_time=260, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=260, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=280, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=280, suite="stage-b-test-1-gpu-small-amd")
 
 SERVER_ENV = {"SGLANG_USE_PICKLE_IPC": "0"}
 
@@ -108,6 +108,54 @@ class TestSRTEndpoint(CustomTestCase):
 
         print(json.dumps(response_json, indent=2))
         print("=" * 100)
+
+        # One response object per (prompt, sample). `batch=True` sends the prompt
+        # in list form, which makes the reply an array on its own; `n > 1` does
+        # the same. Both inputs matter, so both are exercised below.
+        num_prompts = len(text) if batch else 1
+        expects_array = batch or n > 1
+        num_choices = num_prompts * n
+
+        if stream:
+            # Frames carry `index` only when there is more than one response to
+            # tell apart. Asserting the n == 1 side matters as much as the other:
+            # tagging a single request would be a wire change for every existing
+            # streaming client.
+            indexes = {f["index"] for f in response_json if "index" in f}
+            if expects_array:
+                self.assertEqual(indexes, set(range(num_choices)))
+            else:
+                self.assertEqual(indexes, set(), "a lone request carries no index")
+            return
+
+        if expects_array:
+            self.assertIsInstance(response_json, list)
+            self.assertEqual(len(response_json), num_choices)
+            items = response_json
+        else:
+            # NOT a one-element list: turning `{..}` into `[{..}]` here would
+            # silently break every caller that does not pass `n`.
+            self.assertIsInstance(response_json, dict)
+            items = [response_json]
+
+        # Each entry stands on its own, and the ids are distinct so a caller can
+        # tell the samples apart.
+        for item in items:
+            self.assertIn("text", item)
+            self.assertIn("id", item["meta_info"])
+        self.assertEqual(len({item["meta_info"]["id"] for item in items}), num_choices)
+
+    def test_simple_decode(self):
+        self.run_decode()
+
+    def test_simple_decode_batch(self):
+        self.run_decode(batch=True)
+
+    def test_parallel_sample(self):
+        self.run_decode(n=3)
+
+    def test_parallel_sample_stream(self):
+        self.run_decode(n=3, stream=True)
 
     def test_logprob(self):
         self.run_decode(
