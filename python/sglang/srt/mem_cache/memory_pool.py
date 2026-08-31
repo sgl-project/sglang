@@ -1359,32 +1359,34 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         for req in reqs:
-            if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
+            if req.kv.holds_mamba:  # for radix cache / continuing chunked
                 pass
             else:
                 mid = self.mamba_allocator.alloc(1)
                 assert (
                     mid is not None
                 ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
-                req.mamba_pool_idx = mid[0]
-                req.mamba_needs_clear = True
+                req.kv.mamba_pool_idx = mid[0]
+                req.kv.mamba_needs_clear = True
                 # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
                 # ring. write_pos=0 means "ring empty", so the decode kernel
                 # ignores ring contents and reads only the checkpoint state
                 # (the post-prefill state that prefill wrote into this slot).
                 if self.mamba_pool.replayssm_write_pos is not None:
-                    self.mamba_pool.replayssm_write_pos[req.mamba_pool_idx] = 0
+                    self.mamba_pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
                 # ReplaySSM spec-verify ring: an empty ring also resets the
                 # circular origin + flush flag so the first verify step on this
                 # freshly-prefilled slot reconstructs from the checkpoint alone.
                 if self.mamba_pool.replayssm_cache_base is not None:
-                    self.mamba_pool.replayssm_cache_base[req.mamba_pool_idx] = 0
-                    self.mamba_pool.replayssm_is_flush[req.mamba_pool_idx] = 0
-            mamba_indices.append(req.mamba_pool_idx)
+                    self.mamba_pool.replayssm_cache_base[req.kv.mamba_pool_idx] = 0
+                    self.mamba_pool.replayssm_is_flush[req.kv.mamba_pool_idx] = 0
+            mamba_indices.append(req.kv.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
-                if req.mamba_ping_pong_track_buffer is None:
+                if req.kv.mamba_ping_pong_track_buffer is None:
                     self._alloc_ping_pong_buffer(req)
-                mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
+                mamba_ping_pong_track_buffers.append(
+                    req.kv.mamba_ping_pong_track_buffer
+                )
         assert len(select_index) == len(
             mamba_indices
         ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
@@ -1449,7 +1451,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def get_mamba_ping_pong_keep_idx(self, req: Req) -> int:
         """Return the ping-pong index holding the most recent tracked state."""
-        return req.mamba_last_track_idx
+        return req.kv.mamba_last_track_idx
 
     def _alloc_ping_pong_buffer(self, req: Req):
         """Allocate the ping-pong track buffer for a new request.
@@ -1474,9 +1476,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=slots.device,
         )
         buf[:n] = slots
-        req.mamba_ping_pong_track_buffer = buf
-        req.mamba_next_track_idx = 0
-        req.mamba_last_track_idx = (
+        req.kv.mamba_ping_pong_track_buffer = buf
+        req.kv.mamba_next_track_idx = 0
+        req.kv.mamba_last_track_idx = (
             0
             if self.enable_mamba_extra_buffer_lazy
             else self.get_mamba_ping_pong_other_idx(0)
@@ -1489,9 +1491,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         req_index_to_mamba_ping_pong_track_buffer_mapping in sync so that
         set_mamba_track_indices_from_reqs reads correct slot indices.
         """
-        req.mamba_ping_pong_track_buffer[idx] = value
+        req.kv.mamba_ping_pong_track_buffer[idx] = value
         self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.kv.req_pool_idx] = (
-            req.mamba_ping_pong_track_buffer
+            req.kv.mamba_ping_pong_track_buffer
         )
 
     def donate_mamba_ping_pong_slot(
@@ -1504,14 +1506,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         """
         donate_idx = self.get_mamba_ping_pong_keep_idx(req)
         mamba_value_donated = (
-            req.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
+            req.kv.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
         )
         if _MAMBA_DEBUG_ASSERTS:
             # .item() forces a cudaStreamSynchronize; only pay it when debugging.
             assert mamba_value_donated.item() != -1, (
                 f"Donated mamba slot is -1: donate_idx={donate_idx}, "
-                f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
-                f"next_track_idx={req.mamba_next_track_idx}, "
+                f"buf={req.kv.mamba_ping_pong_track_buffer.tolist()}, "
+                f"next_track_idx={req.kv.mamba_next_track_idx}, "
                 f"rid={req.rid}"
             )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
@@ -1520,10 +1522,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def free_mamba_cache(
         self, req: Req, mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
     ):
-        mamba_index = req.mamba_pool_idx
+        mamba_index = req.kv.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
         self.mamba_allocator.free(mamba_index.unsqueeze(0))
-        req.mamba_pool_idx = None
+        req.kv.mamba_pool_idx = None
 
         if self.enable_mamba_extra_buffer:
             mamba_ping_pong_track_buffer_to_free = (
@@ -1565,13 +1567,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     ]
                 )
             self.mamba_allocator.free(mamba_ping_pong_track_buffer_to_free)
-            # Match the req.mamba_pool_idx=None clear above so the next
+            # Match the req.kv.mamba_pool_idx=None clear above so the next
             # alloc() doesn't see a stale ping-pong reference on the req
             # and skip allocation (which would silently reuse a freed
             # tensor on the req side while the new pool slot leaks).
-            req.mamba_ping_pong_track_buffer = None
-            req.mamba_next_track_idx = None
-            req.mamba_last_track_idx = None
+            req.kv.mamba_ping_pong_track_buffer = None
+            req.kv.mamba_next_track_idx = None
+            req.kv.mamba_last_track_idx = None
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
