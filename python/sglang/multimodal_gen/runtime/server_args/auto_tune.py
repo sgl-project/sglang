@@ -55,6 +55,11 @@ def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
         return "disabled via SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY"
     if server_args.performance_mode != "auto":
         return f"performance_mode={server_args.performance_mode}"
+    if (
+        server_args.pipeline_class_name == "LTX2TwoStagePipeline"
+        and server_args.ltx2_two_stage_device_mode is None
+    ):
+        return "legacy LTX-2 two-stage placement"
     if server_args.ltx2_two_stage_device_mode == "original":
         return "LTX-2 original two-stage placement"
     if (
