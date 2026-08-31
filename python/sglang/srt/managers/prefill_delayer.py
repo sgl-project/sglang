@@ -129,9 +129,9 @@ class PrefillDelayer:
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len.
+        # waiting_queue_len, prefill_in_flight.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, attn_tp_size, 5),
+            (dp_size_dim, attn_tp_size, 6),
             dtype=torch.int64,
             device=self._gather_device,
         )
@@ -140,6 +140,7 @@ class PrefillDelayer:
 
         self._curr_state: Optional[_State] = None
         self.skip_first_delayer = True
+        self._last_any_prefill_in_flight = False
 
         assert (
             not get_schedule().disable_overlap_schedule
@@ -153,6 +154,7 @@ class PrefillDelayer:
         max_prefill_bs: int = 0,
         max_running_requests: int = 0,
         waiting_queue_len: int = 0,
+        prefill_in_flight: bool = False,
     ) -> _NegotiateOutput:
         out = self._negotiate_should_allow_prefill_pure(
             prev_state=self._curr_state,
@@ -162,6 +164,7 @@ class PrefillDelayer:
             max_prefill_bs=max_prefill_bs,
             max_running_requests=max_running_requests,
             waiting_queue_len=waiting_queue_len,
+            prefill_in_flight=prefill_in_flight,
         )
         self._curr_state = out.next_state
         return out
@@ -176,6 +179,7 @@ class PrefillDelayer:
         max_prefill_bs: int = 0,
         max_running_requests: int = 0,
         waiting_queue_len: int = 0,
+        prefill_in_flight: bool = False,
     ) -> _NegotiateOutput:
         # Compute local states
         local_token_watermark_force_allow = (
@@ -191,6 +195,10 @@ class PrefillDelayer:
             running_batch=running_batch,
             max_prefill_bs=max_prefill_bs,
             waiting_queue_len=waiting_queue_len,
+            prefill_in_flight=prefill_in_flight,
+        )
+        self._last_any_prefill_in_flight = bool(
+            self._global_info_buffer[:, :, 5].max().item() > 0
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
@@ -358,6 +366,7 @@ class PrefillDelayer:
         running_batch: int = 0,
         max_prefill_bs: int = 0,
         waiting_queue_len: int = 0,
+        prefill_in_flight: bool = False,
     ):
         local_info = torch.tensor(
             [
@@ -366,6 +375,7 @@ class PrefillDelayer:
                 running_batch,
                 max_prefill_bs,
                 waiting_queue_len,
+                int(prefill_in_flight),
             ],
             device=self._gather_device,
             dtype=torch.int64,
@@ -380,15 +390,31 @@ class PrefillDelayer:
 
 
 class PrefillDelayerSinglePassExecutor:
-    def __init__(self, prefill_delayer: PrefillDelayer, token_usage: float):
+    def __init__(
+        self,
+        prefill_delayer: PrefillDelayer,
+        token_usage: float,
+        prefill_in_flight: bool = False,
+    ):
         self._prefill_delayer = prefill_delayer
         self._token_usage = token_usage
+        self._prefill_in_flight = prefill_in_flight
         self._result: Optional[_NegotiateOutput] = None
         self._attempted_prefill_bs = 0
 
     @property
     def _called(self) -> bool:
         return self._result is not None
+
+    @property
+    def is_phase_prefill(self) -> bool:
+        """Whether any rank runs prefill this pass: a new admission or an
+        in-flight prefill chunk."""
+        if self._result is None:
+            return False
+        if self._prefill_delayer._last_any_prefill_in_flight:
+            return True
+        return self._result.output_allow and self._result.num_prefillable > 0
 
     def finalize(self, *, actual_prefill_bs: int) -> int:
         if not self._called:
@@ -445,6 +471,7 @@ class PrefillDelayerSinglePassExecutor:
             self._result = self._prefill_delayer._negotiate_should_allow_prefill(
                 local_prefillable=local_prefillable,
                 token_usage=self._token_usage,
+                prefill_in_flight=self._prefill_in_flight,
                 running_batch=running_batch,
                 max_prefill_bs=max_prefill_bs,
                 max_running_requests=max_running_requests,
