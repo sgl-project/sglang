@@ -43,11 +43,10 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4_5_VLMoeMLP
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_xpu, make_layers
+from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers.common import get_rope_config
 
 logger = logging.getLogger(__name__)
-_is_xpu = is_xpu()
 
 
 class Ernie4_5_VLMoeAttention(nn.Module):
