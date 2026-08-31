@@ -284,6 +284,7 @@ def fused_moe_mxfp8_native(
         topk_ids = topk_ids.to(torch.int32, copy=True)
         topk_ids.masked_fill_((topk_ids < 0) | (topk_ids >= local_num_experts), -1)
     else:
+        # May alias the caller's tensor; everything below reads topk_ids only.
         topk_ids = topk_ids.to(torch.int32)
 
     block_m = 64
