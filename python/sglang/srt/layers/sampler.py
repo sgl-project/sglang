@@ -363,6 +363,10 @@ class Sampler(nn.Module):
                         filter_apply_order="joint",
                     )
                     if return_sampling_mask:
+                        # Correctness invariant: the fused joint sampler and these
+                        # separate renormalization primitives must share cutoff,
+                        # tie, and joint-support semantics so captured positive
+                        # support exactly describes the sampler's action space.
                         filtered_probs = probs
                         if sampling_info.need_top_k_sampling:
                             filtered_probs = top_k_renorm_prob(
