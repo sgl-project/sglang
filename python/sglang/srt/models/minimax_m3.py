@@ -23,10 +23,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.gemm.router_gemv import (
-    router_gemv,
-    router_gemv_supported,
-)
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
@@ -95,6 +91,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     log_info_on_rank0,
@@ -105,7 +102,16 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_gfx95_supported = _is_hip and is_gfx95_supported()
 _device_sm = get_device_sm()
+
+if _is_gfx95_supported:
+    from sglang.kernels.ops.gemm.router_gemv import (
+        router_gemv,
+        router_gemv_supported,
+    )
+else:
+    router_gemv = router_gemv_supported = None
 
 _FP8_KV_DTYPES = (
     torch.float8_e4m3fn,
@@ -516,7 +522,9 @@ class MiniMaxM3MoE(nn.Module):
 
     def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.bf16_router_gemm:
-            if router_gemv_supported(hidden_states, self.gate.weight):
+            if router_gemv is not None and router_gemv_supported(
+                hidden_states, self.gate.weight
+            ):
                 return router_gemv(hidden_states, self.gate.weight)
             if _is_npu:
                 # NPU lacks aten::mm.dtype; bf16 mm then cast keeps topk semantics.

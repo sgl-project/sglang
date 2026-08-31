@@ -17,6 +17,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_gfx95_supported, is_hip
+
+_is_hip = is_hip()
+_is_gfx95_supported = _is_hip and is_gfx95_supported()
+
 _MAX_M = 64
 
 # (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps) per M bucket.
@@ -128,7 +133,8 @@ def router_gemv_supported(x: torch.Tensor, w: torch.Tensor) -> bool:
     n = w.shape[0]
     _, block_n, block_k, _, _ = _config(m)
     return (
-        x.device.type == "cuda"
+        _is_gfx95_supported
+        and x.device.type == "cuda"
         and w.device == x.device
         and x.dtype == torch.bfloat16
         and w.dtype == torch.bfloat16
