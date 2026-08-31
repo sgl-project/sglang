@@ -2137,7 +2137,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             return None
 
         try:
-            from sglang.kernels.ops.diffusion.triton.sana_wm_gdn import (
+            from sglang.kernels.ops.diffusion import (
                 fused_bigdn_func,
                 fused_qk_inv_rms,
                 prepare_rope_tables,
@@ -2269,9 +2269,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             return None
 
         try:
-            from sglang.kernels.ops.diffusion.triton.sana_wm_gdn_chunkwise import (
-                cam_scan_bidi_chunkwise,
-            )
+            from sglang.kernels.ops.diffusion import cam_scan_bidi_chunkwise
 
             B, heads, _, _ = q.shape
             T, H_sp, W_sp = HW
@@ -2839,14 +2837,19 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
         k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
 
+        q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
         q_dn = q_proj.permute(0, 1, 3, 2)
         k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
         k_dn = k_proj.permute(0, 1, 3, 2)
+        v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
         v_dn = v_proj.permute(0, 1, 3, 2)
 
-        # No RMS downscale here: full post-UCPE q/k/v feed the scan; inflation
-        # is computed from full post-UCPE K vs pre-UCPE K and absorbed only into
-        # beta.
+        # Same per-token RMS downscale as _cam_branch, so a single chunk with
+        # no carried state reduces exactly to the dense scan.
+        q_dn = _downscale_to_reference_rms(q_pre_dn, q_dn)
+        k_dn = _downscale_to_reference_rms(k_pre_dn, k_dn)
+        v_dn = _downscale_to_reference_rms(v_pre_dn, v_dn)
+
         pre_ucpe_k_norm = torch.linalg.vector_norm(
             k_pre_dn.float(), dim=2, keepdim=True
         ).clamp_min(1e-6)
@@ -2912,10 +2915,17 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
         k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
 
-        # No RMS downscale here: full post-UCPE q/k/v feed SDPA directly.
-        q_dn = q_proj.permute(0, 1, 3, 2)
-        k_dn = k_proj.permute(0, 1, 3, 2)
-        v_dn = v_proj.permute(0, 1, 3, 2)
+        # Same per-token RMS downscale as _cam_branch_softmax, so cached
+        # chunks stay on the dense path's numerics.
+        q_dn = _downscale_to_reference_rms(
+            q_bhnd.permute(0, 1, 3, 2), q_proj.permute(0, 1, 3, 2)
+        )
+        k_dn = _downscale_to_reference_rms(
+            k_bhnd.permute(0, 1, 3, 2), k_proj.permute(0, 1, 3, 2)
+        )
+        v_dn = _downscale_to_reference_rms(
+            v_bhnd.permute(0, 1, 3, 2), v_proj.permute(0, 1, 3, 2)
+        )
 
         q_in = q_dn.permute(0, 3, 1, 2).contiguous()  # (B, N_cur, H, D)
         k_in = k_dn.permute(0, 3, 1, 2).contiguous()
@@ -3011,6 +3021,7 @@ class MultiHeadCrossAttention(nn.Module):
         self.attn = LocalAttention(
             num_heads=num_heads,
             head_size=self.head_dim,
+            is_cross_attention=True,
         )
 
     def forward(

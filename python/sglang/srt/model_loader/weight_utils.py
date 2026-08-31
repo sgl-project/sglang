@@ -42,14 +42,15 @@ from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import REQUANTIZATION_METHODS, ModelConfig
-from sglang.srt.distributed import (
-    get_world_group,
-)
+from sglang.srt.distributed import get_world_group
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
+)
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
 )
 from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
@@ -271,19 +272,9 @@ def get_quant_config(
     if model_config.quantization == "gguf":
         return quant_cls.from_config({})
 
-    # Read the quantization config from the HF model config, if available.
-    hf_quant_config = getattr(model_config.hf_config, "quantization_config", None)
-    # some vision model may keep quantization_config in their text_config
-    hf_text_config = getattr(model_config.hf_config, "text_config", None)
-    if hf_quant_config is None and hf_text_config is not None:
-        hf_quant_config = getattr(hf_text_config, "quantization_config", None)
-    if hf_quant_config is None:
-        # compressed-tensors uses a compressions_config
-        hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
-    if hf_quant_config is not None:
-        if not isinstance(hf_quant_config, dict):
-            hf_quant_config = hf_quant_config.to_dict()
-
+    checkpoint_quant_spec = resolve_checkpoint_quant_spec(model_config.hf_config)
+    if checkpoint_quant_spec is not None:
+        hf_quant_config = checkpoint_quant_spec.config
         # For modelopt_mixed, config.json's quantization_config may not
         # contain all runtime metadata. Fall through to the file-based
         # hf_quant_config.json path when the per-layer map or KV-cache
@@ -302,7 +293,7 @@ def get_quant_config(
             hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
             hf_quant_config["hf_config"] = model_config.hf_config
 
-            # This is only used by quantization methods that support requantization (e.g. from fp8 to mxfp4).
+            # This is only used by quantization methods that support requantization (e.g. from nvfp4/fp8 to mxfp4).
             if model_config.quantization in REQUANTIZATION_METHODS:
                 hf_quant_config["requantization_method"] = model_config.quantization
 
@@ -348,6 +339,25 @@ def get_quant_config(
                 quant_cls = Fp8Config
             return quant_cls(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
         if model_config.quantization == "quark_mxfp4":
+            # Some ModelOpt NVFP4 checkpoints store quant metadata only in
+            # hf_quant_config.json; others duplicate it in config.json. Read
+            # hf_quant_config.json first when present and FP4-typed.
+            modelopt_quant_path = os.path.join(hf_folder, "hf_quant_config.json")
+            if os.path.isfile(modelopt_quant_path):
+                with open(modelopt_quant_path) as f:
+                    raw_quant_config = json.load(f)
+                source_quant = raw_quant_config.get("quantization", raw_quant_config)
+                if "FP4" in (source_quant.get("quant_algo") or "").upper():
+                    flat_quant_config = dict(source_quant)
+                    flat_quant_config["quant_method"] = (
+                        raw_quant_config.get("producer", {}).get("name") or "modelopt"
+                    )
+                    flat_quant_config["requantization_method"] = (
+                        model_config.quantization
+                    )
+                    flat_quant_config["packed_modules_mapping"] = packed_modules_mapping
+                    flat_quant_config["hf_config"] = model_config.hf_config
+                    return quant_cls.from_config(flat_quant_config)
             return quant_cls(
                 online_scheme=model_config.quantization,
                 hf_config=model_config.hf_config,

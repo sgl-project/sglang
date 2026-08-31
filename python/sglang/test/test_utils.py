@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from sglang.benchmark.serving import run_benchmark
-from sglang.global_config import global_config
+from sglang.lang.global_config import global_config
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -219,17 +219,10 @@ def is_rust_server_built():
     """Return whether the embedded Rust server extension (``SGLANG_RUST_SERVER``)
     is importable.
 
-    ``sglang/srt/server/`` is not in the source tree — it is produced by
-    ``setup.py build_rust --inplace``, so on a build without it ``find_spec``
-    raises ``ModuleNotFoundError`` for the missing *parent* package rather than
-    returning ``None`` for the missing leaf. Suites gate a rust-server subclass on
-    this at class-definition time, so letting that escape would fail the whole
-    module import instead of skipping the one class.
+    The ``sglang.srt.rust_extensions`` Python package is always present; the
+    private ``_server`` module exists only when the PyO3 extension was built.
     """
-    try:
-        return importlib.util.find_spec("sglang.srt.server._core") is not None
-    except ModuleNotFoundError:
-        return False
+    return importlib.util.find_spec("sglang.srt.rust_extensions._server") is not None
 
 
 def _use_cached_default_models(model_repo: str):
@@ -2095,23 +2088,44 @@ def _wait_for_gpu_idle_in_ci(
             pass
 
 
+# Names the runner kits stamp onto a record that are not members of it.
+# `ModelRunner` computes `use_mla_backend` on itself; the kits copy that bool
+# onto the record they hand the runner, and `hasattr` cannot see it.
+_RUNNER_WRITTEN_NAMES = frozenset({"use_mla_backend"})
+
+
 def server_args_variant(server_args, **fields):
     """A modified deep copy of a config, for a test double whose fixture
     differs from the (possibly published, read-only) config it starts from.
     The receiver is untouched; the copy keeps its read-only guard.
 
-    A name may also shadow a method with a fixture value (the runner kits set
-    ``use_mla_backend``, a method ModelRunner itself overwrites at init);
-    names that exist nowhere on the class fail loudly."""
+    A name may also be one the kits stamp on rather than a field (see
+    ``_RUNNER_WRITTEN_NAMES``); names that exist nowhere fail loudly."""
     variant = copy.deepcopy(server_args)
     cls = type(variant)
     unknown = {
         name
         for name in fields
-        if name not in cls.__dataclass_fields__ and not hasattr(cls, name)
+        if name not in cls.__dataclass_fields__
+        and not hasattr(cls, name)
+        and name not in _RUNNER_WRITTEN_NAMES
     }
     if unknown:
         raise ValueError(f"unknown ServerArgs field(s): {sorted(unknown)}")
+    # Reach the stash as well as the fields (the bags project from raw input
+    # + declarations); through `object` because the copy keeps its read-only
+    # guard.
+    stash = getattr(variant, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        object.__setattr__(variant, "_resolved_overrides", stash)
+    declared = {
+        name: value
+        for name, value in fields.items()
+        if name in cls.__dataclass_fields__
+    }
+    if declared:
+        stash.append(("server_args_variant", dict(declared)))
     for name, value in fields.items():
         object.__setattr__(variant, name, value)
     return variant

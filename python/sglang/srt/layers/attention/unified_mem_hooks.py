@@ -37,7 +37,7 @@ class UnifiedMLAHooks(msgspec.Struct, frozen=True):
     # Page-level virtual->physical table, gathered through by block-table kernels.
     v2p_page_table: Optional[torch.Tensor]
     # Virtual token id -> DENSE kernel-facing id (tombstones clamped to the sink).
-    translate_kv_loc_dense: Optional[Callable[..., torch.Tensor]]
+    translate_kv_loc_for_kernel: Optional[Callable[..., torch.Tensor]]
     # Dense page stride scale (= number of full-attention MLA layers).
     kernel_page_multiplier: int
     enabled: bool
@@ -45,18 +45,18 @@ class UnifiedMLAHooks(msgspec.Struct, frozen=True):
 
 _STATIC_POOL = UnifiedMLAHooks(
     v2p_page_table=None,
-    translate_kv_loc_dense=None,
+    translate_kv_loc_for_kernel=None,
     kernel_page_multiplier=1,
     enabled=False,
 )
 
 
 def unified_mla_hooks(allocator) -> UnifiedMLAHooks:
-    """Probe ``allocator`` for the unified-pool dense-view hooks.
+    """Probe ``allocator`` for the unified-pool per-layer-view hooks.
 
     Detection keys on the v2p table, NOT on ``kernel_page_multiplier > 1``: a
     rank owning exactly ONE full-attention layer has multiplier 1 while its
-    ``req_to_token`` is still virtual. There the dense id collapses onto the
+    ``req_to_token`` is still virtual. There the kernel-facing id collapses onto the
     physical id, so the v2p gather alone is the whole translation.
     """
     v2p = getattr(allocator, "full_v2p_page_table", None)
@@ -64,7 +64,9 @@ def unified_mla_hooks(allocator) -> UnifiedMLAHooks:
         return _STATIC_POOL
     return UnifiedMLAHooks(
         v2p_page_table=v2p,
-        translate_kv_loc_dense=getattr(allocator, "translate_kv_loc_dense", None),
+        translate_kv_loc_for_kernel=getattr(
+            allocator, "translate_kv_loc_for_kernel", None
+        ),
         kernel_page_multiplier=getattr(allocator, "kernel_page_multiplier", 1),
         enabled=True,
     )

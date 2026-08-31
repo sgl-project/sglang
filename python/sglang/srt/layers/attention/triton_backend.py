@@ -11,7 +11,12 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.configs.model_config import AttentionArch, is_kimi_k3
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    is_dspark_draft,
+    is_kimi_k3,
+    is_qwen3_5,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -33,7 +38,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -76,6 +86,25 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
+def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv):
+    if not is_gfx95_supported() or topk != 1:
+        return False
+    if use_mla:
+        return is_kimi_k3(model_config.hf_config)
+    if is_dspark_draft(model_config.hf_config):
+        # Added for the K3 DSpark draft model, which is qwen3 type attention,
+        # and using bidirectional (non-causal) mode.
+        return use_verify_splitkv
+    return (
+        use_verify_splitkv
+        and is_qwen3_5(model_config.hf_config)
+        and model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        == 1
+    )
+
+
 def logit_capping_mod(logit_capping_method, logit_cap):
     # positive logit_cap -> tanh cap
     if logit_capping_method == "tanh":
@@ -107,6 +136,11 @@ class ForwardMetadata:
     # PHYSICAL full-attn write target for the unified pool (eager: translated tensor;
     # cuda-graph: capture-stable buffer view). None for non-unified pools.
     out_cache_loc_full_physical: Optional[torch.Tensor] = None
+    # Lean decode (persistent-grid partial-result buffers)
+    lean_Mp: Optional[torch.Tensor] = None
+    lean_Lp: Optional[torch.Tensor] = None
+    lean_Op: Optional[torch.Tensor] = None
+    lean_locks: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -126,7 +160,11 @@ class TritonAttnBackend(AttentionBackend):
     ):
         # Lazy import to avoid the initialization of cuda context
         from sglang.kernels.ops.attention.decode_attention import (
+            _LEAN_BLOCK_M,
+            _lean_decode_launch_params,
             decode_attention_fwd,
+            lean_capture_policy,
+            lean_decode_seqlen_gate,
         )
         from sglang.kernels.ops.attention.extend_attention import (
             build_unified_kv_indices,
@@ -134,7 +172,7 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd_unified,
         )
         from sglang.kernels.ops.attention.verify_mla import (
-            verify_mla_fwd,
+            verify_shared_kv_fwd,
         )
         from sglang.kernels.ops.attention.verify_splitkv import (
             verify_splitkv_fwd,
@@ -143,6 +181,11 @@ class TritonAttnBackend(AttentionBackend):
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
+        # Work-Centric (Lean) Attention activation. None => auto-gate from host-side
+        # seqlen metadata in forward_decode; True/False => explicit override.
+        self.enable_lean_attention = model_runner.server_args.enable_lean_attention
+        self._lean_decode_seqlen_gate = lean_decode_seqlen_gate
+        self._lean_capture_policy = lean_capture_policy
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
@@ -150,8 +193,8 @@ class TritonAttnBackend(AttentionBackend):
         self.build_unified_kv_indices = torch.compiler.disable(build_unified_kv_indices)
         # Split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
-        # MLA split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
-        self.verify_mla_fwd = torch.compiler.disable(verify_mla_fwd)
+        # Grouped-head split-KV verify kernel for MLA or one shared local KV head.
+        self.verify_shared_kv_fwd = torch.compiler.disable(verify_shared_kv_fwd)
 
         # Parse args
         self.skip_prefill = skip_prefill
@@ -167,11 +210,11 @@ class TritonAttnBackend(AttentionBackend):
         self.page_size = getattr(model_runner, "page_size", 1) or 1
         # Unified pool v2p hook (None = no-op): req_to_token holds VIRTUAL ids but
         # kernels need the kernel-facing id space — PHYSICAL for MHA, DENSE for the
-        # dense-view MLA pool (translate_kv_loc_dense falls back to the physical
+        # per-layer-view MLA pool (translate_kv_loc_for_kernel falls back to the physical
         # translate when kernel_page_multiplier == 1, so preferring it is exact for
         # both). Applied eagerly so the captured graph has no translate.
         self._translate_kv_loc = getattr(
-            self.token_to_kv_pool_allocator, "translate_kv_loc_dense", None
+            self.token_to_kv_pool_allocator, "translate_kv_loc_for_kernel", None
         ) or getattr(self.token_to_kv_pool_allocator, "translate_kv_loc", None)
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_num_steps = get_spec().speculative_num_steps
@@ -184,13 +227,13 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        # The MLA verify kernel (verify_mla_fwd) is tuned and validated for the
-        # Kimi-K3 absorbed-MLA shape; gate it on K3.
-        self.use_verify_mla = (
-            is_gfx95_supported()
-            and self.topk == 1
-            and self.use_mla
-            and is_kimi_k3(model_runner.model_config.hf_config)
+        # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5
+        # GQA with exactly one TP-local KV head.
+        self.use_verify_shared_kv = _should_use_verify_shared_kv(
+            model_runner.model_config,
+            self.topk,
+            self.use_mla,
+            self.use_verify_splitkv,
         )
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
@@ -227,10 +270,18 @@ class TritonAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
+        # Lean decode persistent-grid size (depends only on head architecture).
+        kv_group_num = self.num_head // self.num_kv_head
+        self.lean_total_programs, _, _ = _lean_decode_launch_params(
+            self.num_kv_head, kv_group_num
+        )
+        # BLOCK_M for Lean partial-result buffers; kept as an attribute so the
+        # cuda-graph / eager buffer allocators (separate methods) can size them.
+        self.lean_block_m = _LEAN_BLOCK_M
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
-        self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        self.max_kv_splits = get_exec().kernel.triton_attention_num_kv_splits
         if self.use_mla and not _is_xpu:
             self.max_kv_splits = _mla_decode_kv_splits_cap(
                 self.max_kv_splits,
@@ -256,11 +307,11 @@ class TritonAttnBackend(AttentionBackend):
                 cuda_graph_fully_disabled()
                 or check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
             )
-            and model_runner.server_args.chunked_prefill_size == -1
+            and get_schedule().chunked_prefill_size == -1
         )
 
         self.enable_deterministic = (
-            model_runner.server_args.enable_deterministic_inference
+            get_exec().deterministic.enable_deterministic_inference
         )
 
         if self.enable_deterministic:
@@ -749,6 +800,9 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_offsets = None
         swa_attn_logits = None
         spec_info = forward_batch.spec_info
+        # Lean decode buffers are only allocated on the decode path below; default
+        # to None so the shared ForwardMetadata constructor works for extend/verify.
+        lean_Mp = lean_Lp = lean_Op = lean_locks = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or spec_info.kv_indptr is None:
@@ -827,6 +881,26 @@ class TritonAttnBackend(AttentionBackend):
                     if self.dcp_size > 1
                     else forward_batch.seq_lens
                 ),
+            )
+
+            # Lean decode persistent-grid partial-result buffers.
+            lean_Mp = torch.empty(
+                (self.lean_total_programs, self.lean_block_m),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            lean_Lp = torch.empty(
+                (self.lean_total_programs, self.lean_block_m),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            lean_Op = torch.empty(
+                (self.lean_total_programs, self.lean_block_m, self.v_head_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            lean_locks = torch.zeros(
+                (self.lean_total_programs,), dtype=torch.int32, device=self.device
             )
 
             qo_indptr = None
@@ -985,6 +1059,10 @@ class TritonAttnBackend(AttentionBackend):
             swa_attn_logits=swa_attn_logits,
             swa_out_cache_loc=swa_out_cache_loc,
             out_cache_loc_full_physical=out_cache_loc_full_physical,
+            lean_Mp=lean_Mp,
+            lean_Lp=lean_Lp,
+            lean_Op=lean_Op,
+            lean_locks=lean_locks,
         )
 
     def init_cuda_graph_state(
@@ -1016,6 +1094,26 @@ class TritonAttnBackend(AttentionBackend):
             (max_num_tokens, self.num_head, self.max_kv_splits),
             dtype=torch.float32,
             device=self.device,
+        )
+
+        # Lean decode persistent-grid partial-result buffers (shared across all layers).
+        self.cuda_graph_lean_Mp = torch.zeros(
+            (self.lean_total_programs, self.lean_block_m),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.cuda_graph_lean_Lp = torch.zeros(
+            (self.lean_total_programs, self.lean_block_m),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.cuda_graph_lean_Op = torch.zeros(
+            (self.lean_total_programs, self.lean_block_m, self.v_head_dim),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.cuda_graph_lean_locks = torch.zeros(
+            (self.lean_total_programs,), dtype=torch.int32, device=self.device
         )
 
         if cuda_graph_num_kv_splits_buf is None:
@@ -1128,6 +1226,10 @@ class TritonAttnBackend(AttentionBackend):
                 swa_attn_logits=self.cuda_graph_swa_attn_logits,
                 swa_out_cache_loc=swa_out_cache_loc,
                 out_cache_loc_full_physical=out_cache_loc_full_physical,
+                lean_Mp=self.cuda_graph_lean_Mp,
+                lean_Lp=self.cuda_graph_lean_Lp,
+                lean_Op=self.cuda_graph_lean_Op,
+                lean_locks=self.cuda_graph_lean_locks,
             )
         elif forward_mode.is_target_verify():
             custom_mask = (
@@ -1405,10 +1507,10 @@ class TritonAttnBackend(AttentionBackend):
         # serve bit-equivalently (its can_handle() gates on non-causal / sinks /
         # sliding-window / ragged / topk>1), so we fall through to
         # extend_attention_fwd below. Correctness is never at risk.
-        # Route target-verify to the K3-tuned MLA kernel when eligible, else the
+        # Route target-verify to the grouped-head kernel when eligible, else the
         # per-head split-KV kernel.
-        if self.use_verify_mla:
-            verify_fwd = self.verify_mla_fwd
+        if self.use_verify_shared_kv:
+            verify_fwd = self.verify_shared_kv_fwd
         elif self.use_verify_splitkv:
             verify_fwd = self.verify_splitkv_fwd
         else:
@@ -1850,6 +1952,42 @@ class TritonAttnBackend(AttentionBackend):
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
 
+        # Resolve Work-Centric (Lean) Attention activation. In auto mode (None) the decision
+        # depends on whether this forward is a CUDA-graph capture: during capture seq_lens are
+        # the fill value (1), so the seq-len gate would always bake the standard kernel and Lean
+        # would never activate on the default path. There we key the bake on capture-time-known
+        # signals (batch, head-tiles, is_mla) via lean_capture_policy -- Lean's fixed persistent
+        # grid still adapts to raggedness on-device at replay. In eager decode, real seq_lens
+        # are known, so lean_decode_seqlen_gate uses them. An explicit True/False override is
+        # respected; the SGLANG_DISABLE_LEAN_ATTENTION kill-switch forces the standard kernel.
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        if envs.SGLANG_DISABLE_LEAN_ATTENTION.get():
+            enable_lean = False
+        else:
+            enable_lean = self.enable_lean_attention
+            if enable_lean is None:
+                kv_group_num = layer.tp_q_head_num // layer.tp_k_head_num
+                is_mla = layer.qk_head_dim != layer.v_head_dim
+                if get_is_capture_mode():
+                    enable_lean = self._lean_capture_policy(
+                        layer.tp_q_head_num,
+                        kv_group_num,
+                        forward_batch.batch_size,
+                        is_mla,
+                    )
+                else:
+                    enable_lean = self._lean_decode_seqlen_gate(
+                        layer.tp_q_head_num,
+                        kv_group_num,
+                        forward_batch.batch_size,
+                        forward_batch.seq_lens_sum,
+                        is_mla,
+                    )
+
         if self.dcp_size > 1:
             if score_mod is not None:
                 raise NotImplementedError(
@@ -1884,6 +2022,11 @@ class TritonAttnBackend(AttentionBackend):
                 logit_cap=logits_soft_cap,
                 sinks=sinks,
                 xai_temperature_len=layer.xai_temperature_len,
+                enable_lean=enable_lean,
+                lean_Mp=self.forward_metadata.lean_Mp,
+                lean_Lp=self.forward_metadata.lean_Lp,
+                lean_Op=self.forward_metadata.lean_Op,
+                lean_locks=self.forward_metadata.lean_locks,
             )
             local_lse = torch.logsumexp(
                 self.forward_metadata.attn_lse[
@@ -1916,6 +2059,11 @@ class TritonAttnBackend(AttentionBackend):
             page_size=self.page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            enable_lean=enable_lean,
+            lean_Mp=self.forward_metadata.lean_Mp,
+            lean_Lp=self.forward_metadata.lean_Lp,
+            lean_Op=self.forward_metadata.lean_Op,
+            lean_locks=self.forward_metadata.lean_locks,
         )
         return o
 
@@ -1963,7 +2111,7 @@ class TritonMultiStepDraftBackend:
         # Cached variables for generate_draft_decode_kv_indices
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
-        self.page_size = model_runner.server_args.page_size
+        self.page_size = get_schedule().page_size
 
     def common_template(
         self,

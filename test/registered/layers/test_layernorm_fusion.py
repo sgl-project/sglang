@@ -4,10 +4,43 @@ import unittest
 import torch
 
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=2, suite="stage-b-test-1-gpu-small-amd")
+
+
+class TestRMSNormInputShape(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+
+    def test_higher_rank_residual(self):
+        torch.manual_seed(0)
+        shape = (2, 3, 512)
+
+        cast_modes = (False,) if torch.version.hip is not None else (False, True)
+        for cast_x_before_out_mul in cast_modes:
+            with self.subTest(cast_x_before_out_mul=cast_x_before_out_mul):
+                layer = RMSNorm(
+                    shape[-1], cast_x_before_out_mul=cast_x_before_out_mul
+                ).to(device="cuda", dtype=torch.bfloat16)
+                layer.weight.data.normal_(mean=1.0, std=0.1)
+                x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+                residual = torch.randn_like(x)
+
+                with torch.inference_mode():
+                    expected = layer.forward_native(x.clone(), residual.clone())
+                    actual = layer(x.clone(), residual.clone())
+
+                self.assertEqual(actual[0].shape, x.shape)
+                self.assertEqual(actual[1].shape, residual.shape)
+                torch.testing.assert_close(
+                    actual[0], expected[0], atol=1e-2, rtol=1.5e-2
+                )
+                torch.testing.assert_close(actual[1], expected[1], atol=1e-2, rtol=1e-2)
 
 
 class TestRMSNormFp8QuantFusion(CustomTestCase):
