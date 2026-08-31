@@ -265,7 +265,10 @@ def _configure_encoder_quantization(
     explicit_quantization: str | None = None,
     ignored_layers: list[str] | None = None,
 ) -> None:
-    if getattr(model_cls, "manages_checkpoint_quantization", False):
+    if (
+        issubclass(model_cls, EncoderTensorParallelMixin)
+        and model_cls.checkpoint_quantization_backend == "model"
+    ):
         if explicit_quantization is not None:
             raise ComponentCheckpointUnsupportedError(
                 f"{component_name!r} manages its own checkpoint quantization and "
