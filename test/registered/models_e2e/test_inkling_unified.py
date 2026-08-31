@@ -66,6 +66,10 @@ def _unified_args():
         "128",
         "--mamba-radix-cache-strategy",
         "extra_buffer",
+        # Inkling defaults to a FULL prefill graph, which unified rejects at
+        # boot: the prefill graph runner bypasses the virtual->physical rebind.
+        "--cuda-graph-backend-prefill",
+        "disabled",
         "--swa-full-tokens-ratio",
         "0.1",
         "--mamba-full-memory-ratio",
@@ -87,6 +91,10 @@ def _static_args():
         "128",
         "--mamba-radix-cache-strategy",
         "extra_buffer",
+        # Inkling defaults to a FULL prefill graph, which unified rejects at
+        # boot: the prefill graph runner bypasses the virtual->physical rebind.
+        "--cuda-graph-backend-prefill",
+        "disabled",
         "--swa-full-tokens-ratio",
         "0.1",
         "--mamba-full-memory-ratio",
