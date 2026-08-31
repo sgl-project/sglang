@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -297,7 +298,6 @@ def _quality_server_args():
         enable_torch_compile=False,
         is_dit_layerwise_offload_selected=False,
         minimax_h3_adaln_online=False,
-        minimax_h3_adaln_gpu_plans=64,
         performance_mode="speed",
         quantization=None,
         transformer_weights_path=None,
@@ -368,17 +368,19 @@ def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
     stage = MiniMaxH3PartitionAdmissionStage(metadata)
     server_args = _quality_server_args()
     server_args.minimax_h3_adaln_online = True
-    server_args.minimax_h3_adaln_gpu_plans = 8
     batch = SimpleNamespace(
         sampling_params=SimpleNamespace(task="t2va", quality="lossless"),
         num_inference_steps=50,
         is_warmup=False,
     )
-    with pytest.raises(ValueError, match="--minimax-h3-adaln-gpu-plans"):
-        stage.forward(batch, server_args)
+    with patch.dict(os.environ, {"SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS": "8"}):
+        with pytest.raises(
+            ValueError, match="SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS"
+        ):
+            stage.forward(batch, server_args)
 
-    batch.num_inference_steps = 9
-    assert stage.forward(batch, server_args) is batch
+        batch.num_inference_steps = 9
+        assert stage.forward(batch, server_args) is batch
 
 
 def test_quality_admission_fails_closed_outside_validated_request():

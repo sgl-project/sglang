@@ -7,6 +7,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.sample.sampling_params import QUALITY_LEVELS
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -152,17 +153,18 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
                 "MiniMax H3 requires num_inference_steps >= 2 because its "
                 "video/audio sigma schedules include both interval endpoints"
             )
+        gpu_plans = envs.SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS
         if (
             server_args.minimax_h3_adaln_online
-            and batch.num_inference_steps - 1 > server_args.minimax_h3_adaln_gpu_plans
+            and batch.num_inference_steps - 1 > gpu_plans
         ):
             # Fail here, before the encode stages spend GPU time on a request
             # whose AdaLN rebuild is guaranteed to overflow the slab.
             raise ValueError(
                 f"num_inference_steps={batch.num_inference_steps} needs up to "
                 f"{batch.num_inference_steps - 1} AdaLN plans but the online "
-                f"slab holds {server_args.minimax_h3_adaln_gpu_plans}; raise "
-                "--minimax-h3-adaln-gpu-plans"
+                f"slab holds {gpu_plans}; raise "
+                "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS"
             )
         quality = getattr(batch.sampling_params, "quality", "lossless")
         if quality not in QUALITY_LEVELS:

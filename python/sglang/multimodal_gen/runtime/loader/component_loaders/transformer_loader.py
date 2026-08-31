@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
@@ -436,13 +437,13 @@ class TransformerLoader(ComponentLoader):
                 component_server_args.minimax_h3_adaln_plan_width
             )
             init_params["adaln_max_plans"] = (
-                component_server_args.minimax_h3_adaln_gpu_plans
+                envs.SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS
             )
             init_params["adaln_host_cache_bytes"] = int(
                 component_server_args.minimax_h3_adaln_host_cache_gb * 1e9
             )
             init_params["adaln_precision"] = (
-                component_server_args.minimax_h3_adaln_precision
+                "fp32" if envs.SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32 else "match"
             )
             checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
 

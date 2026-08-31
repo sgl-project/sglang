@@ -352,15 +352,11 @@ class ServerArgs(DisaggServerArgsMixin):
     # Widest timestep plan the rebuild slab is sized for; see
     # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
     minimax_h3_adaln_plan_width: int = 4
-    # Plan slots the online rebuild slab holds; full slots are LRU-evicted.
-    minimax_h3_adaln_gpu_plans: int = 64
     # Pinned-host cache for built AdaLN plans (decimal GB, 0 disables). Plans
     # evicted from the GPU slab swap back in from here instead of re-reading
-    # the 24.2 GiB checkpoint.
+    # the 24.2 GiB checkpoint. Expert knobs (GPU slot count, fp32 rebuild)
+    # live in envs.py as SGLANG_DIFFUSION_MINIMAX_H3_ADALN_*.
     minimax_h3_adaln_host_cache_gb: float = 8.0
-    # 'match' = bit-exact with resident adaln_proj weights; 'fp32' = one-time
-    # fp32 projection at build time (not bit-comparable to the resident path).
-    minimax_h3_adaln_precision: str = "match"
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -628,20 +624,15 @@ class ServerArgs(DisaggServerArgsMixin):
         self.pipeline_config.validate_server_args(self)
 
     def _validate_minimax_h3_adaln(self) -> None:
-        """The online-rebuild tuning flags do nothing in other AdaLN modes;
+        """The online-rebuild tuning flag does nothing in other AdaLN modes;
         an explicitly set but ignored flag is a misconfiguration."""
         if self.minimax_h3_adaln_online:
             return
-        for arg_name in (
-            "minimax_h3_adaln_gpu_plans",
-            "minimax_h3_adaln_host_cache_gb",
-            "minimax_h3_adaln_precision",
-        ):
-            if self.is_arg_explicitly_set(arg_name):
-                flag = "--" + arg_name.replace("_", "-")
-                raise ValueError(
-                    f"{flag} only takes effect with --minimax-h3-adaln-online"
-                )
+        if self.is_arg_explicitly_set("minimax_h3_adaln_host_cache_gb"):
+            raise ValueError(
+                "--minimax-h3-adaln-host-cache-gb only takes effect with "
+                "--minimax-h3-adaln-online"
+            )
 
     def _validate_scheduler_rpc_timeout(self) -> None:
         timeout = self.scheduler_rpc_timeout
@@ -1961,17 +1952,6 @@ class ServerArgs(DisaggServerArgsMixin):
             ),
         )
         parser.add_argument(
-            "--minimax-h3-adaln-gpu-plans",
-            type=int,
-            default=ServerArgs.minimax_h3_adaln_gpu_plans,
-            help=(
-                "Timestep-plan slots the --minimax-h3-adaln-online GPU slab "
-                "holds (9.25 MiB per slot-timestep; the default 64 x width 4 "
-                "= 2.31 GiB). Slots are evicted per plan in LRU order and a "
-                "request needs up to num_inference_steps - 1 of them."
-            ),
-        )
-        parser.add_argument(
             "--minimax-h3-adaln-host-cache-gb",
             type=float,
             default=ServerArgs.minimax_h3_adaln_host_cache_gb,
@@ -1983,20 +1963,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 "50-step schedule needs ~0.9 (t2va) / 1.33 (fl2va) / 1.77 "
                 "(ref2va) GB; the default 8 holds several. Groups are evicted "
                 "LRU and over-cap groups just recompute. 0 disables the tier."
-            ),
-        )
-        parser.add_argument(
-            "--minimax-h3-adaln-precision",
-            type=str,
-            choices=["match", "fp32"],
-            default=ServerArgs.minimax_h3_adaln_precision,
-            help=(
-                "Numerics of the --minimax-h3-adaln-online rebuild. 'match' "
-                "(default) replicates the resident-weight bf16 GEMM shapes "
-                "bit-exactly. 'fp32' upcasts the embedding and weights for a "
-                "one-time fp32 projection (TF32 disabled) before storing "
-                "bf16 -- more accurate params, but not bit-comparable to the "
-                "resident path, so gate it on an e2e trajectory check."
             ),
         )
         parser.add_argument(
