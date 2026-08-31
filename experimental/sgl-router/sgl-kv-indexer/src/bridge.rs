@@ -606,7 +606,10 @@ enum DecodedEvent {
 }
 
 fn parse_event(event: &Value) -> Result<DecodedEvent, BridgeError> {
-    let event = expect_map(event, "KV event")?;
+    let event = event
+        .as_map()
+        .map(Vec::as_slice)
+        .ok_or_else(|| BridgeError::Decode("KV event must be a map".to_string()))?;
     let mut event_type = None;
     let mut block_hashes = None;
     let mut block_size = None;
@@ -858,13 +861,6 @@ fn expect_array<'a>(value: &'a Value, field: &str) -> Result<&'a [Value], Bridge
         .as_array()
         .map(Vec::as_slice)
         .ok_or_else(|| BridgeError::Decode(format!("{field} must be an array")))
-}
-
-fn expect_map<'a>(value: &'a Value, field: &str) -> Result<&'a [(Value, Value)], BridgeError> {
-    value
-        .as_map()
-        .map(Vec::as_slice)
-        .ok_or_else(|| BridgeError::Decode(format!("{field} must be a map")))
 }
 
 fn expect_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, BridgeError> {
