@@ -51,6 +51,11 @@ class NixlRegistry:
         # from a single monotonic counter.
         self._obj_devid_lock = threading.Lock()
         self._obj_devid_next = 1
+        # Path-mode FILE registrations are also keyed by caller-supplied
+        # devId, so overlapping backup and prefetch registrations need
+        # disjoint ranges as well.
+        self._file_devid_lock = threading.Lock()
+        self._file_devid_next = 1
         self.path_mode = mem_type == "FILE" and self._probe_path_mode()
         if mem_type == "FILE" and self.path_mode:
             logger.info("HiCacheNixl: path-mode FILE registration active.")
@@ -130,6 +135,12 @@ class NixlRegistry:
         except Exception:
             return True
 
+    def _allocate_file_dev_ids(self, count: int) -> range:
+        with self._file_devid_lock:
+            base = self._file_devid_next
+            self._file_devid_next += count
+        return range(base, base + count)
+
     @contextmanager
     def storage(self, buffers, keys, direction):
         """Open + register the storage side; deregister and close fds on exit.
@@ -148,8 +159,10 @@ class NixlRegistry:
                 if self.file_manager.use_direct_io:
                     parts.append("direct")
                 spec = ",".join(parts)
+                dev_ids = self._allocate_file_dev_ids(len(keys))
                 tuples = [
-                    (0, sizes[i], i + 1, f"{spec}:{keys[i]}") for i in range(len(keys))
+                    (0, sizes[i], dev_id, f"{spec}:{keys[i]}")
+                    for i, dev_id in enumerate(dev_ids)
                 ]
                 with self._registered(tuples, "FILE") as reg:
                     if reg is None:
