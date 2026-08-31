@@ -188,14 +188,10 @@ class DecodeReqToTokenPool:
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
-        reusing = [i for i, r in enumerate(reqs) if r.kv.req_pool_idx is not None]
-        assert (
-            len(reusing) <= 1
-        ), "only one chunked request may reuse req_pool_idx in a batch"
+        reusing = [i for i, r in enumerate(reqs) if r.kv.holds_kv]
         assert all(
-            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv.kv_committed_len > 0
-            for i in reusing
-        ), "reusing request must be chunked or have committed KV"
+            reqs[i].kv.kv_allocated_len > 0 for i in reusing
+        ), "a reused row must carry allocated KV"
 
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
@@ -204,14 +200,14 @@ class DecodeReqToTokenPool:
         self.free_slots = self.free_slots[need_size:]
         offset = 0
         for r in reqs:
-            if r.kv.req_pool_idx is None:
+            if not r.kv.holds_kv:
                 r.kv.req_pool_idx = select_index[offset]
                 self.req_generation[r.kv.req_pool_idx] += 1
                 offset += 1
         return [r.kv.req_pool_idx for r in reqs]
 
     def free(self, req: Req):
-        assert req.kv.req_pool_idx is not None, "request must have req_pool_idx"
+        assert req.kv.holds_kv, "request must have req_pool_idx"
         self.free_slots.append(req.kv.req_pool_idx)
         req.kv.req_pool_idx = None
 

@@ -292,24 +292,17 @@ class ReqToTokenPool:
     def alloc(self, reqs: list[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
-        reusing = [i for i, r in enumerate(reqs) if r.kv.req_pool_idx is not None]
-        # NOTE: this check is relaxed temporarily
-        # https://github.com/sgl-project/sglang/pull/20476
-        # if not any(r.is_dllm() for r in reqs):
-        #     assert (
-        #         sum(1 for i in reusing if reqs[i].inflight_middle_chunks > 0) <= 1
-        #     ), "only one chunked request may reuse req_pool_idx in a batch"
+        reusing = [i for i, r in enumerate(reqs) if r.kv.holds_kv]
         assert all(
-            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv.kv_committed_len > 0
-            for i in reusing
-        ), "reusing request must be chunked or have committed KV"
+            reqs[i].kv.kv_allocated_len > 0 for i in reusing
+        ), "a reused row must carry allocated KV"
 
         select_index = self.alloc_rows(len(reqs) - len(reusing))
         if select_index is None:
             return None
         offset = 0
         for r in reqs:
-            if r.kv.req_pool_idx is None:
+            if not r.kv.holds_kv:
                 r.kv.req_pool_idx = select_index[offset]
                 offset += 1
         return [r.kv.req_pool_idx for r in reqs]
@@ -338,7 +331,7 @@ class ReqToTokenPool:
         self.free_slots.extend(indices)
 
     def free(self, req: Req):
-        assert req.kv.req_pool_idx is not None, "request must have req_pool_idx"
+        assert req.kv.holds_kv, "request must have req_pool_idx"
         self.free_rows([req.kv.req_pool_idx])
         req.kv.req_pool_idx = None
 
