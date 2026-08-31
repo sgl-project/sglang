@@ -126,6 +126,26 @@ class LinearMethodBase(QuantizeMethodBase):
         raise NotImplementedError
 
 
+def apply_unquantized_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Apply a plain linear projection with the runtime's reference semantics."""
+    if x.device.type == "mps":
+        if x.dtype == weight.dtype and (bias is None or bias.dtype == x.dtype):
+            return F.linear(x, weight, bias)
+        return F.linear(
+            x.to(torch.float32),
+            weight.to(torch.float32),
+            None if bias is None else bias.to(torch.float32),
+        ).to(x.dtype)
+
+    return (
+        F.linear(x, weight, bias)
+        if IS_AMP_SUPPORTED or bias is None
+        else F.linear(x, weight, bias.to(x.dtype))
+    )
+
+
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
@@ -154,23 +174,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
-        if x.device.type == "mps":
-            if x.dtype == layer.weight.dtype and (
-                bias is None or bias.dtype == x.dtype
-            ):
-                return F.linear(x, layer.weight, bias)
-            return F.linear(
-                x.to(torch.float32),
-                layer.weight.to(torch.float32),
-                None if bias is None else bias.to(torch.float32),
-            ).to(x.dtype)
-
-        output = (
-            F.linear(x, layer.weight, bias)
-            if IS_AMP_SUPPORTED or bias is None
-            else F.linear(x, layer.weight, bias.to(x.dtype))
-        )  # NOTE: explicit dtype cast for bias is needed on platforms where amp isn't supported
-        return output
+        return apply_unquantized_linear(x, layer.weight, bias)
 
 
 class LinearBase(torch.nn.Module):

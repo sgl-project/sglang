@@ -28,6 +28,7 @@ from sglang.kernels.ops.diffusion import (
     mount_lingbot_video_rmsnorm,
     mount_ltx2_rms_norm_modulate,
     mount_nvfp4_bias_gelu,
+    mount_qwen_image_added_qkv,
     mount_sana_video_linear_attention,
     unmount_fused_gate_rmsnorm,
     unmount_fused_linear_gelu,
@@ -36,6 +37,7 @@ from sglang.kernels.ops.diffusion import (
     unmount_lingbot_video_rmsnorm,
     unmount_ltx2_rms_norm_modulate,
     unmount_nvfp4_bias_gelu,
+    unmount_qwen_image_added_qkv,
     unmount_sana_video_linear_attention,
 )
 from sglang.multimodal_gen import envs
@@ -172,6 +174,11 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "Wan NVFP4 fused bias+GELU",
         mount_nvfp4_bias_gelu,
         unmount_nvfp4_bias_gelu,
+    ),
+    (
+        "Qwen-Image fused added-QKV",
+        mount_qwen_image_added_qkv,
+        unmount_qwen_image_added_qkv,
     ),
     (
         "fused LN+modulate (affine folding)",
