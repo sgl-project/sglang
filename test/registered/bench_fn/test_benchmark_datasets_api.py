@@ -51,10 +51,14 @@ from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
 from sglang.benchmark.prefix_cache_benchmark import (
     build_point_command,
+    load_completed_results,
     make_tag,
 )
 from sglang.benchmark.prefix_cache_benchmark import (
     parse_args as parse_prefix_cache_benchmark_args,
+)
+from sglang.benchmark.prefix_cache_benchmark import (
+    result_validation_error,
 )
 from sglang.benchmark.serving import (
     _BACKEND_API_PATHS,
@@ -1748,7 +1752,7 @@ class TestPrefixCacheBenchmark(unittest.TestCase):
         self.assertEqual(command[command.index("--gsp-system-prompt-len") + 1], "0")
         self.assertNotIn("--gsp-prewarm-prefixes", command)
 
-    def test_sweep_argument_validation(self):
+    def test_matrix_argument_validation(self):
         with self.assertRaises(SystemExit):
             self._parse("--num-prompts", "50", "--num-groups", "3")
         with self.assertRaises(SystemExit):
@@ -1756,11 +1760,84 @@ class TestPrefixCacheBenchmark(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self._parse("--group-distribution", "zipf")
 
-    def test_sweep_tag_supports_fractional_hit_rate(self):
+    def test_matrix_tag_supports_fractional_hit_rate(self):
         self.assertEqual(
             make_tag("model", 4096, 128, 33.3, 4, 1),
             "model-in4096-out128-hit33p3-c4-r1",
         )
+
+    def test_result_validation_checks_cache_hit_tolerance(self):
+        row = {
+            "tag": "prefix-cache-in32768-out512-hit50-c8",
+            "completed": 50,
+            "cache_report": {"cache_hit_rate_pct": 49.8},
+            "prefix_cache_config": {"expected_hit_rate_pct": 49.9},
+        }
+        self.assertIsNone(result_validation_error(row, 50, 50, 0.5))
+
+        row["cache_report"]["cache_hit_rate_pct"] = 48.0
+        error = result_validation_error(row, 50, 50, 0.5)
+        self.assertIn("exceeding the 0.50-point tolerance", error)
+
+        row["cache_report"] = {}
+        self.assertIn(
+            "missing a finite achieved hit rate",
+            result_validation_error(row, 50, 50, 0.5),
+        )
+
+    def test_load_completed_results_validates_warm_and_cold_points(self):
+        warm_tag = "prefix-cache-in32768-out512-hit50-c8"
+        cold_tag = "prefix-cache-in32768-out512-hit0-c1"
+        rows = [
+            {
+                "tag": warm_tag,
+                "completed": 50,
+                "cache_report": {"cache_hit_rate_pct": 49.8},
+                "prefix_cache_config": {"expected_hit_rate_pct": 49.9},
+            },
+            {
+                "tag": cold_tag,
+                "completed": 50,
+                "cache_report": {"cache_hit_rate_pct": 0.1},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_path = Path(temp_dir) / "results.jsonl"
+            result_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            completed = load_completed_results(
+                result_path,
+                expected_requests=50,
+                target_hit_rates={warm_tag: 50, cold_tag: 0},
+                cache_hit_tolerance=0.5,
+            )
+
+        self.assertEqual(set(completed), {warm_tag, cold_tag})
+
+    def test_load_completed_results_uses_latest_attempt(self):
+        tag = "prefix-cache-in32768-out512-hit50-c8"
+        valid = {
+            "tag": tag,
+            "completed": 50,
+            "cache_report": {"cache_hit_rate_pct": 50.0},
+            "prefix_cache_config": {"expected_hit_rate_pct": 50.0},
+        }
+        invalid = {
+            **valid,
+            "cache_report": {"cache_hit_rate_pct": 40.0},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_path = Path(temp_dir) / "results.jsonl"
+            result_path.write_text(
+                "\n".join(json.dumps(row) for row in (valid, invalid)) + "\n"
+            )
+            completed = load_completed_results(
+                result_path,
+                expected_requests=50,
+                target_hit_rates={tag: 50},
+                cache_hit_tolerance=0.5,
+            )
+
+        self.assertNotIn(tag, completed)
 
 
 if __name__ == "__main__":

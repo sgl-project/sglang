@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 SGLANG_REPO_ROOT = Path(__file__).resolve().parents[3]
 SGLANG_PYTHON_ROOT = SGLANG_REPO_ROOT / "python"
@@ -57,8 +57,49 @@ def make_tag(
     return f"{tag}-r{repetition}" if repetition is not None else tag
 
 
+def result_validation_error(
+    row: dict,
+    expected_requests: int,
+    target_hit_rate_pct: float,
+    cache_hit_tolerance: float,
+) -> str | None:
+    if row.get("completed") != expected_requests:
+        return (
+            f"completed {row.get('completed')!r} requests; "
+            f"expected {expected_requests}"
+        )
+
+    cache_report = row.get("cache_report") or {}
+    actual_hit_rate_pct = cache_report.get("cache_hit_rate_pct")
+    prefix_config = row.get("prefix_cache_config") or {}
+    expected_hit_rate_pct = prefix_config.get(
+        "expected_hit_rate_pct", target_hit_rate_pct
+    )
+    if not isinstance(actual_hit_rate_pct, (int, float)) or not math.isfinite(
+        actual_hit_rate_pct
+    ):
+        return "cache report is missing a finite achieved hit rate"
+    if not isinstance(expected_hit_rate_pct, (int, float)) or not math.isfinite(
+        expected_hit_rate_pct
+    ):
+        return "prefix-cache configuration is missing a finite expected hit rate"
+
+    error = abs(actual_hit_rate_pct - expected_hit_rate_pct)
+    if error > cache_hit_tolerance:
+        return (
+            f"cache-hit error is {error:.2f} percentage points "
+            f"({expected_hit_rate_pct:.2f}% expected, "
+            f"{actual_hit_rate_pct:.2f}% actual), exceeding "
+            f"the {cache_hit_tolerance:.2f}-point tolerance"
+        )
+    return None
+
+
 def load_completed_results(
-    result_path: Path, expected_requests: int
+    result_path: Path,
+    expected_requests: int,
+    target_hit_rates: Mapping[str, float],
+    cache_hit_tolerance: float,
 ) -> dict[str, dict]:
     if not result_path.exists():
         return {}
@@ -68,8 +109,20 @@ def load_completed_results(
             continue
         row = json.loads(line)
         tag = row.get("tag")
-        if tag and row.get("completed") == expected_requests:
+        if tag not in target_hit_rates:
+            continue
+        if (
+            result_validation_error(
+                row,
+                expected_requests,
+                target_hit_rates[tag],
+                cache_hit_tolerance,
+            )
+            is None
+        ):
             completed[tag] = row
+        else:
+            completed.pop(tag, None)
     return completed
 
 
@@ -162,7 +215,9 @@ def build_point_command(
     return tag, command
 
 
-def write_summary(result_path: Path, summary_path: Path) -> None:
+def write_summary(
+    result_path: Path, summary_path: Path, cache_hit_tolerance: float
+) -> None:
     if not result_path.exists():
         return
     rows_by_tag = {}
@@ -178,6 +233,8 @@ def write_summary(result_path: Path, summary_path: Path) -> None:
         "max_concurrency",
         "expected_hit_rate_pct",
         "actual_hit_rate_pct",
+        "cache_hit_error_percentage_points",
+        "cache_hit_within_tolerance",
         "mean_ttft_ms",
         "median_ttft_ms",
         "p90_ttft_ms",
@@ -194,13 +251,26 @@ def write_summary(result_path: Path, summary_path: Path) -> None:
         for tag, row in sorted(rows_by_tag.items()):
             prefix = row.get("prefix_cache_config") or {}
             cache = row.get("cache_report") or {}
+            expected_hit_rate = prefix.get("expected_hit_rate_pct", 0)
+            actual_hit_rate = cache.get("cache_hit_rate_pct")
+            cache_hit_error = (
+                abs(actual_hit_rate - expected_hit_rate)
+                if isinstance(actual_hit_rate, (int, float))
+                and isinstance(expected_hit_rate, (int, float))
+                else None
+            )
             writer.writerow(
                 {
                     "tag": tag,
                     "completed": row.get("completed"),
                     "max_concurrency": row.get("max_concurrency"),
-                    "expected_hit_rate_pct": prefix.get("expected_hit_rate_pct", 0),
-                    "actual_hit_rate_pct": cache.get("cache_hit_rate_pct"),
+                    "expected_hit_rate_pct": expected_hit_rate,
+                    "actual_hit_rate_pct": actual_hit_rate,
+                    "cache_hit_error_percentage_points": cache_hit_error,
+                    "cache_hit_within_tolerance": (
+                        cache_hit_error is not None
+                        and cache_hit_error <= cache_hit_tolerance
+                    ),
                     "mean_ttft_ms": row.get("mean_ttft_ms"),
                     "median_ttft_ms": row.get("median_ttft_ms"),
                     "p90_ttft_ms": row.get("p90_ttft_ms"),
@@ -233,6 +303,7 @@ def write_manifest(args: argparse.Namespace, result_dir: Path) -> None:
         "repetitions": args.repetitions,
         "group_distribution": args.group_distribution,
         "zipf_alpha": args.zipf_alpha,
+        "cache_hit_tolerance_percentage_points": args.cache_hit_tolerance,
         "command": sys.argv,
     }
     try:
@@ -309,6 +380,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--group-distribution", choices=("uniform", "zipf"), default="uniform"
     )
     parser.add_argument("--zipf-alpha", type=float)
+    parser.add_argument(
+        "--cache-hit-tolerance",
+        type=_cache_hit_percent,
+        default=0.5,
+        help=(
+            "Maximum absolute expected-versus-actual cache-hit error in "
+            "percentage points. Rows outside this tolerance are not considered "
+            "complete and abort the matrix (default: 0.5)."
+        ),
+    )
     parser.add_argument("--extra-request-body")
     parser.add_argument("--output-details", action="store_true")
     parser.add_argument("--tag-prefix", default="prefix-cache")
@@ -349,7 +430,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     write_manifest(args, result_dir)
 
-    completed = load_completed_results(result_path, args.num_prompts)
     commands = []
     for input_len in args.input_lens:
         for output_len in args.output_lens:
@@ -368,6 +448,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                             )
                         )
 
+    target_hit_rates = {
+        tag: cache_hit_percent
+        for input_len in args.input_lens
+        for output_len in args.output_lens
+        for cache_hit_percent in args.cache_hit_percentages
+        for concurrency in args.concurrencies
+        for repetition in range(1, args.repetitions + 1)
+        for tag in (
+            make_tag(
+                args.tag_prefix,
+                input_len,
+                output_len,
+                cache_hit_percent,
+                concurrency,
+                repetition if args.repetitions > 1 else None,
+            ),
+        )
+    }
+    completed = load_completed_results(
+        result_path,
+        args.num_prompts,
+        target_hit_rates,
+        args.cache_hit_tolerance,
+    )
+
     print(
         f"Matrix contains {len(commands)} points; {len(completed)} are already complete."
     )
@@ -379,13 +484,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(" ".join(command))
             continue
         run_point(command, tag, log_dir / f"{tag}.log", quiet=args.quiet)
-        completed = load_completed_results(result_path, args.num_prompts)
+        completed = load_completed_results(
+            result_path,
+            args.num_prompts,
+            target_hit_rates,
+            args.cache_hit_tolerance,
+        )
         if tag not in completed:
-            raise RuntimeError(f"{tag} did not write a complete benchmark result")
-        write_summary(result_path, summary_path)
+            matching_rows = [
+                row
+                for line in result_path.read_text().splitlines()
+                if line.strip()
+                for row in (json.loads(line),)
+                if row.get("tag") == tag
+            ]
+            reason = (
+                result_validation_error(
+                    matching_rows[-1],
+                    args.num_prompts,
+                    target_hit_rates[tag],
+                    args.cache_hit_tolerance,
+                )
+                if matching_rows
+                else "no result row was written"
+            )
+            raise RuntimeError(f"{tag} failed result validation: {reason}")
+        write_summary(result_path, summary_path, args.cache_hit_tolerance)
 
     if not args.dry_run:
-        write_summary(result_path, summary_path)
+        write_summary(result_path, summary_path, args.cache_hit_tolerance)
         print(f"Completed all {len(commands)} matrix points. Summary: {summary_path}")
     return 0
 

@@ -419,6 +419,31 @@ points. Use `--repetitions` for repeated samples and `--dry-run` to inspect comm
 without contacting the server. Use `--quiet` to keep detailed subprocess output in the
 per-point log files while printing only matrix progress.
 
+By default, a point is complete only when every requested response succeeds and the
+server-reported cache-hit rate is within 0.5 percentage points of the generated
+workload's expected rate. Set `--cache-hit-tolerance` to change that absolute
+percentage-point threshold. A missing cache report or an out-of-tolerance result stops
+the matrix and is rerun when you restart the same command.
+
+#### Prefix-cache matrix workflow
+
+1. Start SGLang with `--enable-cache-report`. Keep the model, parallelism, KV-cache
+   dtype, chunked-prefill settings, and scheduler configuration fixed across compared
+   runs.
+2. Check cache capacity before selecting the number and length of shared prefixes. The
+   cached prefixes plus the active suffix and output KV working set must fit; otherwise
+   the experiment measures eviction pressure instead of the requested hit rate.
+3. Include a 0% point for a cold-cache baseline. The matrix runner gives each cold
+   request a unique group and does not prewarm it.
+4. For nonzero points, the runner performs generic warmup, flushes the cache, primes
+   one request per generated prefix group, and starts measurement only after all
+   priming requests succeed.
+5. Keep request count, group count, arrival rate, and concurrency fixed when comparing
+   cache-hit targets. Use `--repetitions 3` or greater and compare medians for
+   regression decisions.
+6. Preserve `manifest.json`, `results.jsonl`, `summary.csv`, and the per-point logs.
+   Confirm the expected and actual hit-rate columns before interpreting TTFT or TPOT.
+
 Zipfian / power-law prefix popularity (opt-in via `--gsp-group-distribution=zipf`):
 
 ```bash Command
