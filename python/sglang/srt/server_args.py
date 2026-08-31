@@ -210,6 +210,7 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
     "triton",
     "ascend",
     "trtllm_mha",
+    "intel_amx",
 ]
 add_draft_attention_backend_choices = DRAFT_ATTENTION_BACKEND_CHOICES.extend
 

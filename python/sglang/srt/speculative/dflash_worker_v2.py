@@ -78,9 +78,16 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, use_intel_amx_backend
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    use_intel_amx_backend,
+)
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 
 logger = logging.getLogger(__name__)
@@ -470,8 +477,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        # CPU keeps the draft eager (like EAGLE); the target's own graphs are
+        # initialized elsewhere and unaffected.
         capture_decode_cuda_graph = (
-            get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
+            not _is_cpu
+            and get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
         )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = self._tp_sync.available_memory_gb(
@@ -1983,9 +1993,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # `seq_lens` is carried over from the previous overlap iteration and may have been
         # produced on another stream.
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
+        if not _is_cpu:
+            batch.seq_lens.record_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
 
         bs = len(batch.seq_lens)
         device = self.device

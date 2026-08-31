@@ -25,9 +25,11 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils import use_intel_amx_backend
+from sglang.srt.utils import is_cpu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
+
+_is_cpu = is_cpu()
 
 StepSampler = Callable[[torch.Tensor, int], torch.Tensor]
 
@@ -749,7 +751,9 @@ class DSparkDraftMixin:
     ) -> None:
         ctx_hidden = self.project_target_hidden(target_hidden)
 
-        bundle = self._fused_kv_write_bundle(pool)
+        # The fused norm+rope+write kernel is GPU Triton; CPU takes the
+        # per-layer path below.
+        bundle = None if _is_cpu else self._fused_kv_write_bundle(pool)
         if bundle is not None:
             from sglang.kernels.ops.speculative.dspark.fused_kv_write import (
                 fused_kv_norm_rope_write,

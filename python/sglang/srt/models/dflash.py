@@ -45,11 +45,12 @@ from sglang.srt.speculative.dflash_utils import (
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_npu, set_weight_attrs, use_intel_amx_backend
+from sglang.srt.utils import is_cpu, is_npu, set_weight_attrs, use_intel_amx_backend
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
@@ -229,6 +230,7 @@ class DFlashAttention(nn.Module):
         rotary = self.rotary_emb
         self.use_table_qk_norm_rope = (
             not _is_npu
+            and not _is_cpu
             and hasattr(rotary, "cos_sin_cache")
             and getattr(rotary, "rotary_dim", None) == head_dim
             and getattr(rotary, "is_neox_style", False)
