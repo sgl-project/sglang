@@ -54,11 +54,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
         for field in dataclasses.fields(server_args)
     }
 
-    # Declaration stash for the override/post-process passes. Set before any
-    # short-circuit (none/dummy model paths) so run_post_process_pass and
-    # direct handler invocations can rely on it even when
-    # _handle_model_specific_adjustments never runs.
-    server_args._resolved_overrides = []
+    # Preserve launcher-stage declarations made before Engine starts. They are
+    # part of the same resolution result as the declarations accumulated below.
+    server_args._resolved_overrides = list(
+        getattr(server_args, "_resolved_overrides", ())
+    )
 
     cfg = resolving_view(server_args)
 
