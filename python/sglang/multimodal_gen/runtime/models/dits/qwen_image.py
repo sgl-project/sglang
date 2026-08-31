@@ -16,12 +16,18 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_fused_layernorm_modulate,
     can_use_linear_gelu,
     fused_gelu_active,
+    fused_layernorm_modulate_raw,
     fused_linear_gelu_tanh,
+    is_plain_layer_norm,
     mark_fused_gelu_site,
     try_fused_bias_mul_add,
     try_fused_bias_scale_residual_norm_scale_shift,
+    try_fused_norm_scale_shift_fp8,
+    try_fused_scale_residual_norm_scale_shift_fp8,
 )
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
@@ -70,6 +76,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
     is_nunchaku_available,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp8LinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
@@ -88,6 +97,72 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+_QWEN_NORM_OUT = BitExactFusionGate("Qwen-Image fused norm_out", per_signature=True)
+_QWEN_NORM_OUT_SIGS = _QWEN_NORM_OUT.verified_sigs
+assert _QWEN_NORM_OUT_SIGS is not None
+
+
+def _qwen_norm_out(
+    norm_out: AdaLayerNormContinuous,
+    hidden_states: torch.Tensor,
+    conditioning_embedding: torch.Tensor,
+) -> torch.Tensor:
+    """Bit-exact final LayerNorm and adaLN scale/shift fusion."""
+    if torch.compiler.is_compiling():
+        return norm_out(hidden_states, conditioning_embedding)
+
+    # Keep the projected modulation available for direct eager dispatch. The
+    # public custom-op wrapper costs more than this small final norm itself.
+    emb = norm_out.linear(norm_out.silu(conditioning_embedding).to(hidden_states.dtype))
+    scale, shift = torch.chunk(emb, 2, dim=1)
+    if (
+        _QWEN_NORM_OUT.disabled
+        or not is_plain_layer_norm(norm_out.norm, hidden_states.shape[-1])
+        or not can_use_fused_layernorm_modulate(hidden_states, scale, shift)
+    ):
+        return (
+            norm_out.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+        )
+
+    sig = (
+        hidden_states.dtype,
+        hidden_states.device,
+        hidden_states.shape[0],
+        hidden_states.shape[-1],
+        hidden_states.stride(-1),
+        scale.stride(0) if scale.shape[0] > 1 else hidden_states.shape[-1],
+        shift.stride(0) if shift.shape[0] > 1 else hidden_states.shape[-1],
+        norm_out.norm.eps,
+    )
+    verified = sig in _QWEN_NORM_OUT_SIGS
+    if not verified and torch.cuda.is_current_stream_capturing():
+        return (
+            norm_out.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+        )
+    try:
+        fused = fused_layernorm_modulate_raw(
+            hidden_states, scale, shift, norm_out.norm.eps
+        )
+    except Exception as exc:
+        _QWEN_NORM_OUT.on_exception(exc, logger=logger)
+        return (
+            norm_out.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+        )
+    if verified:
+        return fused
+    reference = (
+        norm_out.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+    )
+    return _QWEN_NORM_OUT.accept_or_fallback(
+        fused,
+        reference,
+        sig=sig,
+        logger=logger,
+        mismatch_msg=(
+            "Qwen-Image fused norm_out is not bit-exact on this platform; "
+            "falling back to eager"
+        ),
+    )
 
 
 def _attn_mask_meta_local_pad(attn_mask_meta) -> int:
@@ -1125,6 +1200,65 @@ class QwenImageTransformerBlock(nn.Module):
             self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
             self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
 
+        self._fp8_img_attn_norm_quant = False
+        self._fp8_txt_attn_norm_quant = False
+        self._fp8_img_mlp_norm_quant = False
+        self._fp8_txt_mlp_norm_quant = False
+
+    @staticmethod
+    def _valid_modelopt_fp8_linear(linear: nn.Module) -> bool:
+        input_scale = getattr(linear, "input_scale", None)
+        return (
+            isinstance(getattr(linear, "quant_method", None), ModelOptFp8LinearMethod)
+            and isinstance(input_scale, torch.Tensor)
+            and input_scale.is_cuda
+            and input_scale.dtype == torch.float32
+            and input_scale.numel() == 1
+            and input_scale.is_contiguous()
+            and bool(torch.isfinite(input_scale).all().item())
+            and bool((input_scale > 0).all().item())
+        )
+
+    @classmethod
+    def _shared_modelopt_fp8_scale(cls, linears: list[nn.Module]) -> bool:
+        if not all(cls._valid_modelopt_fp8_linear(linear) for linear in linears):
+            return False
+        reference = linears[0].input_scale
+        return all(torch.equal(reference, linear.input_scale) for linear in linears[1:])
+
+    def configure_fp8_norm_quant(self) -> None:
+        """Enable exact norm+quant paths after checkpoint scales are materialized."""
+        if not torch.cuda.is_available():
+            return
+        capability = torch.cuda.get_device_capability()
+        if self.dim != 3072 or capability[0] < 10 or self.zero_cond_t:
+            return
+        if self.attn.use_fused_qkv:
+            self._fp8_img_attn_norm_quant = self._valid_modelopt_fp8_linear(
+                self.attn.to_qkv
+            )
+        else:
+            self._fp8_img_attn_norm_quant = self._shared_modelopt_fp8_scale(
+                [self.attn.to_q, self.attn.to_k, self.attn.to_v]
+            )
+        if self.attn.added_kv_proj_dim is not None:
+            if self.attn.use_fused_added_qkv:
+                self._fp8_txt_attn_norm_quant = self._valid_modelopt_fp8_linear(
+                    self.attn.to_added_qkv
+                )
+            else:
+                self._fp8_txt_attn_norm_quant = self._shared_modelopt_fp8_scale(
+                    [self.attn.add_q_proj, self.attn.add_k_proj, self.attn.add_v_proj]
+                )
+        if isinstance(self.img_mlp, QwenImageFeedForward):
+            self._fp8_img_mlp_norm_quant = self._valid_modelopt_fp8_linear(
+                self.img_mlp.net[0].proj
+            )
+        if isinstance(self.txt_mlp, QwenImageFeedForward):
+            self._fp8_txt_mlp_norm_quant = self._valid_modelopt_fp8_linear(
+                self.txt_mlp.net[0].proj
+            )
+
     def _norm_scale_shift(
         self,
         norm_module: LayerNormScaleShift,
@@ -1199,6 +1333,68 @@ class QwenImageTransformerBlock(nn.Module):
             else None
         )
         return img_mod_params, txt_mod_params
+
+    def _try_fp8_norm_quant(
+        self,
+        norm_module: LayerNormScaleShift,
+        *,
+        x: torch.Tensor,
+        mod_params: torch.Tensor,
+        input_scale: Optional[torch.Tensor],
+        enabled: bool,
+        modulate_index: Optional[torch.Tensor],
+        use_bcg_helpers: bool,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if not enabled or modulate_index is not None or use_bcg_helpers:
+            return None
+        shift, scale, gate = mod_params.chunk(3, dim=-1)
+        result = try_fused_norm_scale_shift_fp8(
+            x,
+            getattr(norm_module.norm, "weight", None),
+            getattr(norm_module.norm, "bias", None),
+            scale,
+            shift,
+            input_scale,
+            norm_module.norm_type,
+            norm_module.eps,
+        )
+        if result is None:
+            return None
+        normalized, quantized = result
+        return quantized, gate.unsqueeze(1), normalized
+
+    def _try_fp8_residual_norm_quant(
+        self,
+        norm_module: ScaleResidualLayerNormScaleShift,
+        *,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        residual_gate: torch.Tensor,
+        mod_params: torch.Tensor,
+        input_scale: Optional[torch.Tensor],
+        enabled: bool,
+        modulate_index: Optional[torch.Tensor],
+        use_bcg_helpers: bool,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if not enabled or modulate_index is not None or use_bcg_helpers:
+            return None
+        shift, scale, gate = mod_params.chunk(3, dim=-1)
+        result = try_fused_scale_residual_norm_scale_shift_fp8(
+            residual,
+            x,
+            residual_gate,
+            getattr(norm_module.norm, "weight", None),
+            getattr(norm_module.norm, "bias", None),
+            scale,
+            shift,
+            input_scale,
+            norm_module.norm_type,
+            norm_module.eps,
+        )
+        if result is None:
+            return None
+        normalized, quantized, residual_out = result
+        return quantized, residual_out, gate.unsqueeze(1), normalized
 
     def _modulate(
         self,
@@ -1361,16 +1557,57 @@ class QwenImageTransformerBlock(nn.Module):
         use_bcg_helpers = is_in_breakable_cuda_graph()
 
         # Process image stream - norm1 + modulation
-        img_modulated, img_gate1 = self._modulate(
-            hidden_states,
-            img_mod1,
+        img_fp8 = self._try_fp8_norm_quant(
             self.img_norm1,
-            modulate_index,
+            x=hidden_states,
+            mod_params=img_mod1,
+            input_scale=(
+                (
+                    self.attn.to_qkv.input_scale
+                    if self.attn.use_fused_qkv
+                    else self.attn.to_q.input_scale
+                )
+                if self._fp8_img_attn_norm_quant
+                else None
+            ),
+            enabled=self._fp8_img_attn_norm_quant,
+            modulate_index=modulate_index,
             use_bcg_helpers=use_bcg_helpers,
         )
+        if img_fp8 is None:
+            img_modulated, img_gate1 = self._modulate(
+                hidden_states,
+                img_mod1,
+                self.img_norm1,
+                modulate_index,
+                use_bcg_helpers=use_bcg_helpers,
+            )
+            img_modulated_bf16 = None
+        else:
+            img_modulated, img_gate1, img_modulated_bf16 = img_fp8
         # Process text stream - norm1 + modulation
+        txt_fp8 = self._try_fp8_norm_quant(
+            self.txt_norm1,
+            x=encoder_hidden_states,
+            mod_params=txt_mod1,
+            input_scale=(
+                (
+                    self.attn.to_added_qkv.input_scale
+                    if self.attn.use_fused_added_qkv
+                    else self.attn.add_q_proj.input_scale
+                )
+                if self._fp8_txt_attn_norm_quant
+                else None
+            ),
+            enabled=self._fp8_txt_attn_norm_quant,
+            modulate_index=modulate_index,
+            use_bcg_helpers=use_bcg_helpers,
+        )
         txt_shift1, txt_scale1, txt_gate1_raw = txt_mod1.chunk(3, dim=-1)
-        if use_bcg_helpers:
+        if txt_fp8 is not None:
+            txt_modulated, txt_gate1, txt_modulated_bf16 = txt_fp8
+        elif use_bcg_helpers:
+            txt_modulated_bf16 = None
             txt_modulated = self._norm_scale_shift(
                 self.txt_norm1,
                 encoder_hidden_states,
@@ -1378,10 +1615,12 @@ class QwenImageTransformerBlock(nn.Module):
                 scale=txt_scale1,
             )
         else:
+            txt_modulated_bf16 = None
             txt_modulated = self.txt_norm1(
                 encoder_hidden_states, shift=txt_shift1, scale=txt_scale1
             )
-        txt_gate1 = txt_gate1_raw.unsqueeze(1)
+        if txt_fp8 is None:
+            txt_gate1 = txt_gate1_raw.unsqueeze(1)
 
         # Use QwenAttnProcessor2_0 for joint attention computation
         # This directly implements the DoubleStreamLayerMegatron logic:
@@ -1399,6 +1638,7 @@ class QwenImageTransformerBlock(nn.Module):
             image_rotary_emb=image_rotary_emb,
             **joint_attention_kwargs,
         )
+        del img_modulated_bf16, txt_modulated_bf16
 
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
         (
@@ -1408,16 +1648,40 @@ class QwenImageTransformerBlock(nn.Module):
             txt_attn_bias,
         ) = attn_output
         # Process image stream - norm2 + MLP
-        img_modulated2, hidden_states, img_gate2 = self._modulate(
-            img_attn_output,
-            img_mod2,
+        img_fp8_mlp = self._try_fp8_residual_norm_quant(
             self.img_norm2,
-            modulate_index,
-            gate_x=img_gate1,
-            residual_x=hidden_states,
-            x_bias=img_attn_bias,
+            residual=hidden_states,
+            x=img_attn_output,
+            residual_gate=img_gate1,
+            mod_params=img_mod2,
+            input_scale=(
+                self.img_mlp.net[0].proj.input_scale
+                if self._fp8_img_mlp_norm_quant
+                else None
+            ),
+            enabled=self._fp8_img_mlp_norm_quant,
+            modulate_index=modulate_index,
             use_bcg_helpers=use_bcg_helpers,
         )
+        if img_fp8_mlp is None:
+            img_modulated2, hidden_states, img_gate2 = self._modulate(
+                img_attn_output,
+                img_mod2,
+                self.img_norm2,
+                modulate_index,
+                gate_x=img_gate1,
+                residual_x=hidden_states,
+                x_bias=img_attn_bias,
+                use_bcg_helpers=use_bcg_helpers,
+            )
+            img_modulated2_bf16 = None
+        else:
+            (
+                img_modulated2,
+                hidden_states,
+                img_gate2,
+                img_modulated2_bf16,
+            ) = img_fp8_mlp
         if isinstance(self.img_mlp, QwenImageFeedForward):
             img_mlp_output, img_mlp_bias = self.img_mlp.forward_with_bias(
                 img_modulated2
@@ -1425,6 +1689,7 @@ class QwenImageTransformerBlock(nn.Module):
         else:
             img_mlp_output = self.img_mlp(img_modulated2)
             img_mlp_bias = None
+        del img_modulated2_bf16
 
         if img_mlp_output.dim() == 2:
             img_mlp_output = img_mlp_output.unsqueeze(0)
@@ -1438,7 +1703,30 @@ class QwenImageTransformerBlock(nn.Module):
 
         # Process text stream - norm2 + MLP
         txt_shift2, txt_scale2, txt_gate2_raw = txt_mod2.chunk(3, dim=-1)
-        if use_bcg_helpers:
+        txt_fp8_mlp = self._try_fp8_residual_norm_quant(
+            self.txt_norm2,
+            residual=encoder_hidden_states,
+            x=txt_attn_output,
+            residual_gate=txt_gate1,
+            mod_params=txt_mod2,
+            input_scale=(
+                self.txt_mlp.net[0].proj.input_scale
+                if self._fp8_txt_mlp_norm_quant
+                else None
+            ),
+            enabled=self._fp8_txt_mlp_norm_quant,
+            modulate_index=modulate_index,
+            use_bcg_helpers=use_bcg_helpers,
+        )
+        if txt_fp8_mlp is not None:
+            (
+                txt_modulated2,
+                encoder_hidden_states,
+                txt_gate2,
+                txt_modulated2_bf16,
+            ) = txt_fp8_mlp
+        elif use_bcg_helpers:
+            txt_modulated2_bf16 = None
             if txt_attn_bias is not None:
                 txt_attn_output = txt_attn_output + txt_attn_bias
             (
@@ -1453,6 +1741,7 @@ class QwenImageTransformerBlock(nn.Module):
                 scale=txt_scale2,
             )
         elif txt_attn_bias is not None:
+            txt_modulated2_bf16 = None
             txt_modulated2, encoder_hidden_states, _ = self._modulate(
                 txt_attn_output,
                 txt_mod2,
@@ -1462,6 +1751,7 @@ class QwenImageTransformerBlock(nn.Module):
                 x_bias=txt_attn_bias,
             )
         else:
+            txt_modulated2_bf16 = None
             txt_modulated2, encoder_hidden_states = self.txt_norm2(
                 residual=encoder_hidden_states,
                 x=txt_attn_output,
@@ -1469,7 +1759,8 @@ class QwenImageTransformerBlock(nn.Module):
                 shift=txt_shift2,
                 scale=txt_scale2,
             )
-        txt_gate2 = txt_gate2_raw.unsqueeze(1)
+        if txt_fp8_mlp is None:
+            txt_gate2 = txt_gate2_raw.unsqueeze(1)
         if isinstance(self.txt_mlp, QwenImageFeedForward):
             txt_mlp_output, txt_mlp_bias = self.txt_mlp.forward_with_bias(
                 txt_modulated2
@@ -1477,6 +1768,7 @@ class QwenImageTransformerBlock(nn.Module):
         else:
             txt_mlp_output = self.txt_mlp(txt_modulated2)
             txt_mlp_bias = None
+        del txt_modulated2_bf16
 
         if txt_mlp_output.dim() == 2:
             txt_mlp_output = txt_mlp_output.unsqueeze(0)
@@ -1631,6 +1923,24 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         self.layer_names = ["transformer_blocks"]
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        for block in self.transformer_blocks:
+            block.configure_fp8_norm_quant()
+        enabled = sum(
+            block._fp8_img_attn_norm_quant
+            + block._fp8_txt_attn_norm_quant
+            + block._fp8_img_mlp_norm_quant
+            + block._fp8_txt_mlp_norm_quant
+            for block in self.transformer_blocks
+        )
+        if enabled:
+            logger.info(
+                "Enabled Qwen FP8 norm+quant fusion for %d/%d block paths",
+                enabled,
+                4 * len(self.transformer_blocks),
+            )
 
     @functools.lru_cache(maxsize=50)
     def build_modulate_index(self, img_shapes: tuple[int, int, int], device):
@@ -1829,7 +2139,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     + controlnet_block_samples[index_block // interval_control]
                 )
         # Use only the image part (hidden_states) from the dual-stream blocks
-        hidden_states = self.norm_out(hidden_states, temb_txt)
+        hidden_states = _qwen_norm_out(self.norm_out, hidden_states, temb_txt)
 
         output, _ = self.proj_out(hidden_states)
         return output
