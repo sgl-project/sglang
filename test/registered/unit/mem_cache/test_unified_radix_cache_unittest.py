@@ -601,7 +601,7 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
                 sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
             )
             req_to_token_pool.alloc([req])
-            params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
+            params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
         cache.insert(params)
 
     def _build_internal_chain(self, component_type, enable_session_radix_cache):
@@ -1075,7 +1075,7 @@ class UnifiedRadixCacheSuite:
         params = InsertParams(key=key, value=value[: len(key)], priority=priority)
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
-            params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
+            params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
         return cache.insert(params)
 
     def test_insert_and_match_basic(self):
@@ -1189,7 +1189,7 @@ class UnifiedRadixCacheSuite:
         )
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
-            params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
+            params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
         result = cache.insert(params)
         self.assertEqual(result.prefix_len, len(seq_1p))
         self.assertEqual(
@@ -1213,7 +1213,7 @@ class UnifiedRadixCacheSuite:
         )
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
-            params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
+            params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
         result = cache.insert(params)
         self.assertEqual(result.prefix_len, len(seq_2p))
         self.assertEqual(
@@ -1235,7 +1235,7 @@ class UnifiedRadixCacheSuite:
         req.output_ids = array("q", output_ids)
         kv_len = len(input_ids) + len(output_ids)
         kv_indices = self._alloc(allocator, kv_len)
-        req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv.kv_committed_len = kv_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
@@ -1246,7 +1246,7 @@ class UnifiedRadixCacheSuite:
             len(req.prefix_indices), len(req.full_untruncated_fill_ids)
         )
         if self.cfg.has_mamba:
-            req.mamba_last_track_seqlen = kv_len
+            req.kv.mamba_last_track_seqlen = kv_len
 
         cache.cache_finished_req(
             req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
@@ -1275,7 +1275,7 @@ class UnifiedRadixCacheSuite:
         )
         kv_len = req.extend_range.end
         kv_indices = self._alloc(allocator, kv_len)
-        req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv.kv_committed_len = kv_len
         req.kv.kv_allocated_len = kv_len
         req.last_node = cache.root_node_handle()
@@ -1283,7 +1283,7 @@ class UnifiedRadixCacheSuite:
         req.swa_uuid_for_lock = None
         req.extra_key = None
         if self.cfg.has_mamba:
-            req.mamba_last_track_seqlen = kv_len
+            req.kv.mamba_last_track_seqlen = kv_len
         req.reasoning_tokens = 1
 
         # cache_finished_req reads get_serving().strip_thinking_cache
@@ -1297,7 +1297,7 @@ class UnifiedRadixCacheSuite:
             start_p = ((start_p + ps - 1) // ps) * ps
         if start_p < end_p:
             allocator.free(
-                req_to_token_pool.req_to_token[req.req_pool_idx][start_p:end_p]
+                req_to_token_pool.req_to_token[req.kv.req_pool_idx][start_p:end_p]
             )
 
         prompt_aligned = (len(prompt_ids) // ps) * ps
@@ -1320,7 +1320,7 @@ class UnifiedRadixCacheSuite:
         req.output_ids = array("q")
         kv_len = len(tokens)
         kv_indices = self._alloc(allocator, kv_len)
-        req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv.kv_committed_len = kv_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
@@ -1355,14 +1355,14 @@ class UnifiedRadixCacheSuite:
         )
         kv_len = len(tokens)
         kv_indices = self._alloc(allocator, kv_len)
-        req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv.kv_committed_len = kv_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
         if self.cfg.has_mamba:
-            req.mamba_last_track_seqlen = kv_len
+            req.kv.mamba_last_track_seqlen = kv_len
 
         cache.cache_unfinished_req(req)
 
@@ -1392,7 +1392,9 @@ class UnifiedRadixCacheSuite:
         req.full_untruncated_fill_ids = array("q", tokens)
         req.set_extend_range(0, len(req.full_untruncated_fill_ids))
         kv_indices = self._alloc(allocator, len(tokens))
-        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
+        )
         req.kv.kv_committed_len = len(tokens)
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
@@ -1494,7 +1496,7 @@ class UnifiedRadixCacheSuite:
         req.output_ids = array("q")
         kv_len = len(input_ids)
         kv_indices = self._alloc(allocator, kv_len)
-        req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv.kv_committed_len = kv_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
@@ -1505,7 +1507,7 @@ class UnifiedRadixCacheSuite:
             len(req.prefix_indices), len(req.full_untruncated_fill_ids)
         )
         if self.cfg.has_mamba:
-            req.mamba_last_track_seqlen = kv_len
+            req.kv.mamba_last_track_seqlen = kv_len
 
         avail_before = allocator.available_size()
         cache.cache_finished_req(
@@ -1575,12 +1577,12 @@ class UnifiedRadixCacheSuite:
             MatchPrefixParams(key=RadixKey(array("q", seq)), cow_mamba=True, req=req2)
         )
         self.assertEqual(len(m.device_indices), len(seq))
-        self.assertIsNotNone(req2.mamba_pool_idx)
+        self.assertIsNotNone(req2.kv.mamba_pool_idx)
 
         src_value = _device_value(cache, m.last_device_node, ComponentType.MAMBA)
         self.assertTrue(
             torch.all(
-                mamba_pool.mamba_cache.conv[0][:, req2.mamba_pool_idx]
+                mamba_pool.mamba_cache.conv[0][:, req2.kv.mamba_pool_idx]
                 == mamba_pool.mamba_cache.conv[0][:, src_value]
             )
         )
@@ -1619,7 +1621,7 @@ class UnifiedRadixCacheSuite:
         req.set_extend_range(0, len(req.full_untruncated_fill_ids))
         kv_len = len(tokens)
         fresh_value = self._alloc(allocator, kv_len)
-        req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), fresh_value)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), fresh_value)
         req.kv.kv_committed_len = kv_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
@@ -2206,7 +2208,7 @@ class UnifiedRadixCacheSuite:
         req.full_untruncated_fill_ids = array("q", tokens)
         req.set_extend_range(0, len(req.full_untruncated_fill_ids))
         kv_indices = self._alloc(allocator, pre_len)
-        req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), kv_indices)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, pre_len)), kv_indices)
         req.kv.kv_committed_len = pre_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
@@ -2295,7 +2297,7 @@ class UnifiedRadixCacheSuite:
         req.full_untruncated_fill_ids = array("q", tokens)
         req.set_extend_range(0, len(req.full_untruncated_fill_ids))
         kv_indices = self._alloc(allocator, pre_len)
-        req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), kv_indices)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, pre_len)), kv_indices)
         req.kv.kv_committed_len = pre_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
@@ -5467,7 +5469,7 @@ class UnifiedRadixCacheSuite:
 
         # Simulate a request without its own mamba slot so load-back allocates one
         # (that allocation is what a called-off load-back must free + not publish).
-        req.mamba_pool_idx = None
+        req.kv.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
         new_indices, new_node = cache.init_load_back(
             InitLoadBackParams(
@@ -5483,7 +5485,7 @@ class UnifiedRadixCacheSuite:
         self.assertIsNone(_device_value(cache, leaf, ComponentType.FULL))
         self.assertIsNone(_device_value(cache, leaf, ComponentType.MAMBA))
         # A failed load-back must roll back the pre-allocated mamba slot.
-        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_pool_idx)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), avail_before
         )
@@ -5508,7 +5510,7 @@ class UnifiedRadixCacheSuite:
         self._apply_match_to_req(req, match)
 
         # Simulate a request without its own mamba slot so load-back allocates one.
-        req.mamba_pool_idx = None
+        req.kv.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
         # H->D load fails after the mamba slot is pre-allocated -> must free it.
         with mock.patch.object(cache.cache_controller, "load", return_value=None):
@@ -5522,7 +5524,7 @@ class UnifiedRadixCacheSuite:
             )
 
         self.assertEqual(len(new_indices), 0)
-        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_pool_idx)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), avail_before
         )
@@ -5547,7 +5549,7 @@ class UnifiedRadixCacheSuite:
         self._apply_match_to_req(req, match)
 
         # Simulate a request without its own mamba slot so load-back allocates one.
-        req.mamba_pool_idx = None
+        req.kv.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
         # No device room and eviction frees nothing -> load-back bails after the
         # mamba pre-alloc, which must still be freed.
@@ -5569,7 +5571,7 @@ class UnifiedRadixCacheSuite:
             )
 
         self.assertEqual(len(new_indices), 0)
-        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_pool_idx)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), avail_before
         )
@@ -5590,8 +5592,8 @@ class UnifiedRadixCacheSuite:
 
         # A request whose mamba slot was released: load_back's CoW arm allocates one.
         req = self._make_req(req_to_token_pool)
-        req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
-        req.mamba_pool_idx = None
+        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+        req.kv.mamba_pool_idx = None
         mamba_avail = req_to_token_pool.mamba_allocator.available_size()
 
         # Impossible quota -> load_back aborts after building the transfers.
@@ -5599,7 +5601,7 @@ class UnifiedRadixCacheSuite:
 
         self.assertFalse(loaded)
         # the aborted call must return its slot and not leave req pointing at it
-        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_pool_idx)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), mamba_avail
         )
@@ -5619,8 +5621,8 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
 
         req = self._make_req(req_to_token_pool)
-        req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
-        req.mamba_pool_idx = None
+        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+        req.kv.mamba_pool_idx = None
         mamba_avail = req_to_token_pool.mamba_allocator.available_size()
 
         # cache_controller.load() failing (device alloc / transfer resolution)
@@ -5629,7 +5631,7 @@ class UnifiedRadixCacheSuite:
             loaded = cache.load_back(leaf, req=req)
 
         self.assertFalse(loaded)
-        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_pool_idx)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), mamba_avail
         )
@@ -5650,14 +5652,14 @@ class UnifiedRadixCacheSuite:
 
         # The request already owns its slot: an aborted load-back must not free it.
         req = self._make_req(req_to_token_pool)
-        preexisting_slot = req.mamba_pool_idx
+        preexisting_slot = req.kv.mamba_pool_idx
         self.assertIsNotNone(preexisting_slot)
         mamba_avail = req_to_token_pool.mamba_allocator.available_size()
 
         loaded = cache.load_back(leaf, mem_quota=-(10**9), req=req)
 
         self.assertFalse(loaded)
-        self.assertIs(req.mamba_pool_idx, preexisting_slot)
+        self.assertIs(req.kv.mamba_pool_idx, preexisting_slot)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), mamba_avail
         )
@@ -5677,15 +5679,15 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
 
         req = self._make_req(req_to_token_pool)
-        req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
-        req.mamba_pool_idx = None
+        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+        req.kv.mamba_pool_idx = None
         mamba_avail = req_to_token_pool.mamba_allocator.available_size()
 
         loaded = cache.load_back(leaf, req=req)
 
         self.assertTrue(loaded)
         # the successful load must keep the freshly allocated slot published
-        self.assertIsNotNone(req.mamba_pool_idx)
+        self.assertIsNotNone(req.kv.mamba_pool_idx)
         self.assertIsNotNone(_device_value(cache, leaf, ComponentType.MAMBA))
         # one slot restores the node's mamba value, one is the request's CoW slot
         self.assertEqual(
@@ -5715,17 +5717,17 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
 
         req = self._make_req(req_to_token_pool)
-        req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
-        req.mamba_pool_idx = None
+        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+        req.kv.mamba_pool_idx = None
 
         loaded = cache.load_back(leaf, req=req)
         self.assertTrue(loaded)
-        self.assertIsNotNone(req.mamba_pool_idx)
+        self.assertIsNotNone(req.kv.mamba_pool_idx)
         self._finish_pending_loads(cache)
 
         # The CoW slot must actually hold the backed-up mamba state, not merely exist.
         actual_temporal, actual_conv = self._snapshot_mamba_state(
-            req_to_token_pool, req.mamba_pool_idx.unsqueeze(0)
+            req_to_token_pool, req.kv.mamba_pool_idx.unsqueeze(0)
         )
         self.assertTrue(torch.equal(actual_temporal, expected_temporal))
         self.assertEqual(len(actual_conv), len(expected_conv))
@@ -5745,12 +5747,12 @@ class UnifiedRadixCacheSuite:
 
         self._backup_node(cache, leaf)
         req = self._make_req(req_to_token_pool)
-        req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
-        req.mamba_pool_idx = None
+        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+        req.kv.mamba_pool_idx = None
 
         # device value still present -> nothing to prepare even though host-backed
         self.assertIsNone(comp.prepare_load_back(leaf, req=req).allocated_mamba_slot)
-        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_pool_idx)
 
         cache.evict(EvictParams(num_tokens=_node_key_length(cache, leaf)))
         self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
@@ -5767,16 +5769,16 @@ class UnifiedRadixCacheSuite:
         # fresh request + host-only mamba -> allocates and publishes onto req
         prep = comp.prepare_load_back(leaf, req=req)
         self.assertIsNotNone(prep.allocated_mamba_slot)
-        self.assertEqual(int(req.mamba_pool_idx), int(prep.allocated_mamba_slot[0]))
+        self.assertEqual(int(req.kv.mamba_pool_idx), int(prep.allocated_mamba_slot[0]))
 
         # node without host-backed mamba -> nothing to prepare
         req2 = self._make_req(req_to_token_pool)
-        req_to_token_pool.mamba_allocator.free(req2.mamba_pool_idx.unsqueeze(0))
-        req2.mamba_pool_idx = None
+        req_to_token_pool.mamba_allocator.free(req2.kv.mamba_pool_idx.unsqueeze(0))
+        req2.kv.mamba_pool_idx = None
         root = cache.root_node_handle()
         self.assertIsNone(_host_value(cache, root, ComponentType.MAMBA))
         self.assertIsNone(comp.prepare_load_back(root, req=req2).allocated_mamba_slot)
-        self.assertIsNone(req2.mamba_pool_idx)
+        self.assertIsNone(req2.kv.mamba_pool_idx)
 
     def test_prepare_load_back_skips_device_present_node(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
@@ -5794,12 +5796,12 @@ class UnifiedRadixCacheSuite:
         self.assertIsNotNone(_host_value(cache, leaf, ComponentType.MAMBA))
 
         req = self._make_req(req_to_token_pool)
-        req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
-        req.mamba_pool_idx = None
+        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+        req.kv.mamba_pool_idx = None
         mamba_avail = req_to_token_pool.mamba_allocator.available_size()
 
         self.assertIsNone(comp.prepare_load_back(leaf, req=req).allocated_mamba_slot)
-        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_pool_idx)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), mamba_avail
         )
@@ -5818,8 +5820,8 @@ class UnifiedRadixCacheSuite:
         cache.evict(EvictParams(num_tokens=_node_key_length(cache, leaf)))
 
         req = self._make_req(req_to_token_pool)
-        req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
-        req.mamba_pool_idx = None
+        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+        req.kv.mamba_pool_idx = None
         retry_slot = req_to_token_pool.mamba_allocator.alloc(1)
 
         # first alloc fails -> prepare must evict a mamba slot and retry
@@ -5836,7 +5838,7 @@ class UnifiedRadixCacheSuite:
             prep = comp.prepare_load_back(leaf, req=req)
         evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=0, mamba_num=1))
         self.assertIs(prep.allocated_mamba_slot, retry_slot)
-        self.assertEqual(int(req.mamba_pool_idx), int(retry_slot[0]))
+        self.assertEqual(int(req.kv.mamba_pool_idx), int(retry_slot[0]))
 
     def test_hicache_swa_load_back_min_suffix(self):
         """LOAD_BACK collects only the suffix nodes needed to cover sliding_window_size."""
@@ -6692,7 +6694,7 @@ class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
                 InsertParams(
                     key=RadixKey(array("q", tokens)),
                     value=value[: len(tokens)],
-                    mamba_value=req.mamba_pool_idx.unsqueeze(0),
+                    mamba_value=req.kv.mamba_pool_idx.unsqueeze(0),
                 )
             )
 
@@ -6783,14 +6785,16 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         req.kv.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.mamba_last_track_seqlen = len(tokens)
+        req.kv.mamba_last_track_seqlen = len(tokens)
         return req
 
     def _cache_finished(self, cache, allocator, req_to_token_pool, tokens):
         req = self._make_req(req_to_token_pool, tokens)
         kv_indices = allocator.alloc(len(tokens))
         self.assertIsNotNone(kv_indices)
-        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
+        )
         req.last_node = cache.root_node_handle()
 
         cache.cache_finished_req(
@@ -8104,7 +8108,7 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         req.full_untruncated_fill_ids = array("q", tokens)
         req.set_extend_range(0, len(req.full_untruncated_fill_ids))
         kv_indices = self._alloc_paged(allocator, seq_len)
-        req_to_token_pool.write((req.req_pool_idx, slice(0, seq_len)), kv_indices)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, seq_len)), kv_indices)
         req.kv.kv_committed_len = seq_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0

@@ -93,11 +93,10 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             priority=priority,
             origin_input_ids=[1, 2, 3],
             output_ids=[],
-            req_pool_idx=int(priority) % 8,
             finished_reason=FINISH_ABORT("failed") if failed else None,
             return_logprob=False,
             sampling_params=SimpleNamespace(max_new_tokens=8),
-            kv=SimpleNamespace(cache_protected_len=0),
+            kv=SimpleNamespace(req_pool_idx=int(priority) % 8, cache_protected_len=0),
             time_stats=MagicMock(),
         )
         return SimpleNamespace(
