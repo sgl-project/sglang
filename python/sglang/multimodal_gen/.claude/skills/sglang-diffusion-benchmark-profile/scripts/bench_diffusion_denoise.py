@@ -73,6 +73,7 @@ GATED_MODELS = {
     "flux2",
     "flux2-klein",
     "flux2-klein-base",
+    "stable-diffusion-3.5-medium",
 }
 DIFFUSERS_FALLBACK_SIGNALS = (
     "falling back to diffusers backend",
@@ -120,7 +121,16 @@ MODEL_WEIGHT_SUFFIXES = {
     ".pth",
     ".safetensors",
 }
-GENERATED_OUTPUT_SUFFIXES = {".jpeg", ".jpg", ".mp4", ".png", ".wav", ".webp"}
+GENERATED_OUTPUT_SUFFIXES = {
+    ".glb",
+    ".jpeg",
+    ".jpg",
+    ".mp4",
+    ".obj",
+    ".png",
+    ".wav",
+    ".webp",
+}
 NIGHTLY_PRESET_ORDER = (
     "flux",
     "flux2",
@@ -421,6 +431,55 @@ MODELS = {
             "--guidance-scale=4.5",
             "--enable-prompt-rewrite=false",
             "--performance-mode=manual",
+        ],
+    },
+    "longcat-image-edit": {
+        "path": "meituan-longcat/LongCat-Image-Edit",
+        "prompt": "Make the cat wear a red hat.",
+        "image_path": "https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        "bcg_warmup_resolutions": ["1264x848"],
+        "extra_args": [
+            "--enable-prompt-rewrite=false",
+            "--performance-mode=manual",
+        ],
+    },
+    "longcat-image-edit-turbo": {
+        "path": "meituan-longcat/LongCat-Image-Edit-Turbo",
+        "prompt": "Make the cat wear a red hat.",
+        "image_path": "https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        "bcg_warmup_resolutions": ["1264x848"],
+        "extra_args": [
+            "--enable-prompt-rewrite=false",
+            "--performance-mode=manual",
+        ],
+    },
+    # The original Qwen edit checkpoint has a separate pipeline config from
+    # the 2509/2511 multi-image checkpoints, so keep an explicit preset.
+    "qwen-edit-base": {
+        "path": "Qwen/Qwen-Image-Edit",
+        "prompt": "Make the cat wear a red hat.",
+        "image_path": "https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+        ],
+    },
+    "qwen-image-layered": {
+        "path": "Qwen/Qwen-Image-Layered",
+        "prompt": "a high quality, cute halloween themed illustration, consistent style and lighting",
+        "image_path": "https://raw.githubusercontent.com/QwenLM/Qwen-Image-Layered/main/assets/test_images/4.png",
+        "extra_args": [
+            "--num-frames=4",
+            "--width=640",
+            "--height=640",
+        ],
+    },
+    "stable-diffusion-3.5-medium": {
+        "path": "stabilityai/stable-diffusion-3.5-medium-diffusers",
+        "prompt": "A red panda reading a book beside a sunlit window.",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
         ],
     },
     "sana-video": {
@@ -1261,7 +1320,70 @@ def _safe_cache_component(value: str) -> str:
     return component
 
 
-def _prepare_model_cache(cache_root: Path, model_key: str, label: str) -> Path:
+def _resolve_seed_hub_cache(seed_root: Path) -> Path:
+    seed_root = seed_root.expanduser().resolve()
+    hub_root = seed_root / "hub"
+    if hub_root.is_dir():
+        return hub_root
+    if seed_root.name == "hub" and seed_root.is_dir():
+        return seed_root
+    raise FileNotFoundError(
+        "A seed model cache must be either a Hugging Face home containing "
+        f"hub/ or the hub directory itself: {seed_root}"
+    )
+
+
+def _seed_hub_entry(source_entry: Path, target_entry: Path) -> None:
+    """Build a writable cache overlay without copying immutable payloads."""
+    if not source_entry.is_dir():
+        if not target_entry.exists() and not target_entry.is_symlink():
+            target_entry.symlink_to(source_entry.resolve())
+        return
+
+    target_entry.mkdir(exist_ok=True)
+    for source_path in sorted(source_entry.rglob("*")):
+        relative_path = source_path.relative_to(source_entry)
+        target_path = target_entry / relative_path
+        if target_path.exists() or target_path.is_symlink():
+            continue
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if source_path.is_symlink():
+            target_path.symlink_to(
+                os.readlink(source_path), target_is_directory=source_path.is_dir()
+            )
+        elif source_path.is_dir():
+            target_path.mkdir()
+        elif relative_path.parts[0] in {"refs", "trees"}:
+            shutil.copy2(source_path, target_path)
+        else:
+            target_path.symlink_to(source_path.resolve())
+
+
+def _seed_model_cache(cache_dir: Path, seed_roots: list[Path]) -> None:
+    """Expose read-only Hugging Face caches through copy-on-write overlays."""
+    target_hub = cache_dir / "huggingface" / "hub"
+    target_hub.mkdir(parents=True, exist_ok=True)
+    (target_hub / ".locks").mkdir()
+
+    for seed_root in seed_roots:
+        source_hub = _resolve_seed_hub_cache(seed_root)
+        if source_hub == target_hub or target_hub in source_hub.parents:
+            raise ValueError(
+                f"Refusing to seed the isolated cache from itself: {source_hub}"
+            )
+        for source_entry in sorted(source_hub.iterdir()):
+            if source_entry.name == ".locks":
+                continue
+            target_entry = target_hub / source_entry.name
+            _seed_hub_entry(source_entry, target_entry)
+
+
+def _prepare_model_cache(
+    cache_root: Path,
+    model_key: str,
+    label: str,
+    seed_model_cache_roots: list[Path] | None = None,
+) -> Path:
     cache_root = cache_root.expanduser().resolve()
     unsafe_roots = {Path("/"), Path.home().resolve(), REPO_ROOT.resolve()}
     if cache_root in unsafe_roots:
@@ -1288,6 +1410,8 @@ def _prepare_model_cache(cache_root: Path, model_key: str, label: str) -> Path:
             f"delete it without inspection: {cache_dir}"
         )
     cache_dir.mkdir()
+    if seed_model_cache_roots:
+        _seed_model_cache(cache_dir, seed_model_cache_roots)
     return cache_dir
 
 
@@ -1600,17 +1724,17 @@ def build_sglang_cmd(
     if breakable_cuda_graph:
         cmd.append("--enable-breakable-cuda-graph")
         parsed_args = _parse_cli_args(cmd)
-        if (
-            "warmup-resolutions" not in parsed_args
-            and "width" in parsed_args
-            and "height" in parsed_args
-        ):
-            cmd.extend(
-                [
-                    "--warmup-resolutions",
-                    f"{parsed_args['width']}x{parsed_args['height']}",
-                ]
-            )
+        if "warmup-resolutions" not in parsed_args:
+            warmup_resolutions = cfg.get("bcg_warmup_resolutions")
+            if warmup_resolutions is None and all(
+                name in parsed_args for name in ("width", "height")
+            ):
+                warmup_resolutions = [f"{parsed_args['width']}x{parsed_args['height']}"]
+            if warmup_resolutions:
+                cmd.append("--warmup-resolutions")
+                cmd.extend(warmup_resolutions)
+        if "warmup-num-frames" not in parsed_args and "num-frames" in parsed_args:
+            cmd.extend(["--warmup-num-frames", str(parsed_args["num-frames"])])
         if bcg_text_buckets is not None:
             cmd.append("--bcg-text-buckets")
             cmd.extend(str(bucket) for bucket in bcg_text_buckets)
@@ -1910,6 +2034,7 @@ def run_benchmark_once(
     breakable_cuda_graph: bool = False,
     bcg_text_buckets: list[int] | None = None,
     model_cache_root: Path | None = None,
+    seed_model_cache_roots: list[Path] | None = None,
     cleanup_model_cache: bool = False,
     cleanup_ledger_path: Path | None = None,
 ) -> dict:
@@ -1917,7 +2042,12 @@ def run_benchmark_once(
     cache_dir = None
     exit_reason = "error"
     if model_cache_root is not None:
-        cache_dir = _prepare_model_cache(model_cache_root, model_key, label)
+        cache_dir = _prepare_model_cache(
+            model_cache_root,
+            model_key,
+            label,
+            seed_model_cache_roots=seed_model_cache_roots,
+        )
 
     try:
         result = _run_benchmark_once_impl(
@@ -1964,6 +2094,7 @@ def run_quality_bcg_matrix(
     warmup: bool = True,
     bcg_text_buckets: list[int] | None = None,
     model_cache_root: Path | None = None,
+    seed_model_cache_roots: list[Path] | None = None,
     cleanup_model_cache: bool = False,
     cleanup_ledger_path: Path | None = None,
 ) -> list[dict]:
@@ -1976,7 +2107,10 @@ def run_quality_bcg_matrix(
     exit_reason = "error"
     if model_cache_root is not None:
         cache_dir = _prepare_model_cache(
-            model_cache_root, model_key, f"{label}-quality-bcg-matrix"
+            model_cache_root,
+            model_key,
+            f"{label}-quality-bcg-matrix",
+            seed_model_cache_roots=seed_model_cache_roots,
         )
 
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -2154,6 +2288,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--seed-model-cache-root",
+        action="append",
+        default=[],
+        help=(
+            "Seed each isolated cache with a copy-on-write overlay from this "
+            "read-only Hugging Face home or hub directory. May be repeated."
+        ),
+    )
+    parser.add_argument(
         "--cleanup-ledger",
         type=str,
         help="JSONL cleanup ledger path (default: <output-dir>/cleanup.jsonl).",
@@ -2185,9 +2328,12 @@ def main():
         )
     if args.cleanup_model_cache and not args.model_cache_root:
         parser.error("--cleanup-model-cache requires --model-cache-root")
+    if args.seed_model_cache_root and not args.model_cache_root:
+        parser.error("--seed-model-cache-root requires --model-cache-root")
     model_cache_root = (
         Path(args.model_cache_root) if args.model_cache_root is not None else None
     )
+    seed_model_cache_roots = [Path(path) for path in args.seed_model_cache_root]
     cleanup_ledger_path = (
         Path(args.cleanup_ledger) if args.cleanup_ledger is not None else None
     )
@@ -2205,6 +2351,7 @@ def main():
                     warmup=warmup,
                     bcg_text_buckets=args.bcg_text_buckets,
                     model_cache_root=model_cache_root,
+                    seed_model_cache_roots=seed_model_cache_roots,
                     cleanup_model_cache=args.cleanup_model_cache,
                     cleanup_ledger_path=cleanup_ledger_path,
                 )
@@ -2221,6 +2368,7 @@ def main():
                     breakable_cuda_graph=args.breakable_cuda_graph,
                     bcg_text_buckets=args.bcg_text_buckets,
                     model_cache_root=model_cache_root,
+                    seed_model_cache_roots=seed_model_cache_roots,
                     cleanup_model_cache=args.cleanup_model_cache,
                     cleanup_ledger_path=cleanup_ledger_path,
                 )

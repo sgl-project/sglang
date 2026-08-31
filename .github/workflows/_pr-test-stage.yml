@@ -100,8 +100,10 @@ jobs:
   run:
     name: ${{ inputs.self_name }} (${{ matrix.partition }})
     # Runs on schedule / parallel-dispatch / non-failed PR with main_package or sgl_kernel changes.
+    # Temporarily skip the broken GB300 runner before GitHub tries to allocate it.
     if: |
       always() &&
+      inputs.runner_config != '4-gpu-gb300' &&
       ((github.event_name == 'schedule' || fromJson(inputs.caller_inputs).test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
       (fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).sgl_kernel == 'true')
     # runs-on resolved from runs_on_map; check-changes already substituted

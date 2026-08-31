@@ -124,7 +124,13 @@ class DecodeHiCachePreallocMixin:
                 else None
             )
             self.tree_cache.prefetch_from_storage(
-                req.rid, prefix_match.last_host_node, suffix, last_hash, prefix_keys
+                req.rid,
+                prefix_match.last_host_node,
+                suffix,
+                last_hash,
+                prefix_keys,
+                extra_key=req.extra_key,
+                cache_salt=req.cache_salt,
             )
             prefix_match.prefetch_registered = (
                 req.rid in self.tree_cache.ongoing_prefetch
@@ -300,7 +306,7 @@ class DecodeHiCacheTransferMixin:
 
         self.tree_cache.req_to_token_pool.write(
             (
-                decode_req.req.req_pool_idx,
+                decode_req.req.kv.req_pool_idx,
                 slice(prefix_match.l1_prefix_len, prefix_match.decode_prefix_len),
             ),
             decode_req.hicache_restored_kv_indices,
