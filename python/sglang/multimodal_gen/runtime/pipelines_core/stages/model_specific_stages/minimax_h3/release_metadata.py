@@ -152,6 +152,18 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
                 "MiniMax H3 requires num_inference_steps >= 2 because its "
                 "video/audio sigma schedules include both interval endpoints"
             )
+        if (
+            server_args.minimax_h3_adaln_online
+            and batch.num_inference_steps - 1 > server_args.minimax_h3_adaln_gpu_plans
+        ):
+            # Fail here, before the encode stages spend GPU time on a request
+            # whose AdaLN rebuild is guaranteed to overflow the slab.
+            raise ValueError(
+                f"num_inference_steps={batch.num_inference_steps} needs up to "
+                f"{batch.num_inference_steps - 1} AdaLN plans but the online "
+                f"slab holds {server_args.minimax_h3_adaln_gpu_plans}; raise "
+                "--minimax-h3-adaln-gpu-plans"
+            )
         quality = getattr(batch.sampling_params, "quality", "lossless")
         if quality not in QUALITY_LEVELS:
             raise ValueError(

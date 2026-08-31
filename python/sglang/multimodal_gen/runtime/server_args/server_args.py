@@ -352,6 +352,8 @@ class ServerArgs(DisaggServerArgsMixin):
     # Widest timestep plan the rebuild slab is sized for; see
     # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
     minimax_h3_adaln_plan_width: int = 4
+    # Plan slots the online rebuild slab holds; full slots are LRU-evicted.
+    minimax_h3_adaln_gpu_plans: int = 64
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -1932,6 +1934,17 @@ class ServerArgs(DisaggServerArgsMixin):
                 "for. The default 4 covers every task; a deployment serving "
                 "only t2va (2) or fl2va (3) can shrink the slab proportionally. "
                 "A request exceeding it is rejected rather than truncated."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-adaln-gpu-plans",
+            type=int,
+            default=ServerArgs.minimax_h3_adaln_gpu_plans,
+            help=(
+                "Timestep-plan slots the --minimax-h3-adaln-online GPU slab "
+                "holds (9.25 MiB per slot-timestep; the default 64 x width 4 "
+                "= 2.31 GiB). Slots are evicted per plan in LRU order and a "
+                "request needs up to num_inference_steps - 1 of them."
             ),
         )
         parser.add_argument(

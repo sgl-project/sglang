@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import struct
+from collections import OrderedDict
 from contextlib import ExitStack
 from typing import Callable
 
@@ -86,8 +87,10 @@ class MiniMaxH3AdalnCache(nn.Module):
         self.hidden_size = arch.hidden_size
         self.block_width = 6 * MINIMAX_H3_ADALN_MODALITY_NUM * arch.hidden_size
         self.final_width = 2 * arch.hidden_size
-        # Rebuild path only: plan bit pattern -> slot, tracked on the host.
-        self._slots: dict[tuple[int, ...], int] = {}
+        # Plan bit pattern -> slot, tracked on the host in LRU order (oldest
+        # first). The rebuild path evicts per plan; a sidecar never evicts.
+        self._slots: OrderedDict[tuple[int, ...], int] = OrderedDict()
+        self._free_slots: list[int] = list(range(max_plans))
         self.rebuilds = 0
 
     def load(self, device: torch.device) -> None:
@@ -222,8 +225,8 @@ class MiniMaxH3AdalnCache(nn.Module):
             return
         if len(wanted) > self.max_plans:
             raise ValueError(
-                f"MiniMax H3 AdaLN rebuild needs {len(wanted)} plans but "
-                f"max_plans is {self.max_plans}"
+                f"MiniMax H3 AdaLN rebuild needs {len(wanted)} plans but the "
+                f"slab holds {self.max_plans}; raise --minimax-h3-adaln-gpu-plans"
             )
         widest = max(timesteps.numel() for timesteps in wanted.values())
         if widest > self.max_plan_width:
@@ -233,19 +236,26 @@ class MiniMaxH3AdalnCache(nn.Module):
                 "--minimax-h3-adaln-plan-width (t2va needs 2, fl2va 3, ref2va 4)"
             )
 
-        reset = len(self._slots) + len(missing) > self.max_plans
-        # A reset also evicts this request's cache hits, so rebuild its complete
-        # plan set rather than only the plans that were initially missing.
-        plans_to_build = wanted if reset else missing
-        if reset:
-            self._slots.clear()
-            self.plan_lengths.zero_()
+        for key in wanted:
+            if key in self._slots:
+                self._slots.move_to_end(key)
+        shortfall = len(missing) - len(self._free_slots)
+        if shortfall > 0:
+            # The wanted-count check above guarantees enough resident plans
+            # outside this request to cover the shortfall, in LRU order.
+            victims = [key for key in self._slots if key not in wanted][:shortfall]
+            for key in victims:
+                slot = self._slots.pop(key)
+                # Zero the length first: the slot must be invisible to lookup
+                # and resolve_slots before its contents are overwritten.
+                self.plan_lengths[slot] = 0
+                self._free_slots.append(slot)
 
         device = self.block_params.device
         slots = []
         pending_slots: dict[tuple[int, ...], int] = {}
-        for offset, (key, timesteps) in enumerate(plans_to_build.items()):
-            slot = len(self._slots) + offset
+        for key, timesteps in missing.items():
+            slot = self._free_slots.pop()
             pending_slots[key] = slot
             slots.append((slot, timesteps.numel(), embed(timesteps.to(device))))
             self.plan_timesteps[slot, : timesteps.numel()] = timesteps.to(device)
@@ -258,6 +268,39 @@ class MiniMaxH3AdalnCache(nn.Module):
         tp_size = get_tp_world_size()
         tp_rank = get_tp_rank() if tp_size > 1 else 0
 
+        try:
+            self._project_plans_from_checkpoint(
+                slots, tp_size=tp_size, tp_rank=tp_rank, device=device
+            )
+        except BaseException:
+            # The pending slots never became visible (their lengths stayed
+            # zero); hand them back so a retry does not leak capacity.
+            self._free_slots.extend(pending_slots.values())
+            raise
+
+        for slot, length, _ in slots:
+            self.plan_lengths[slot] = length
+        # Commit host metadata only after every layer has been written. If a
+        # checkpoint read or projection raises, the zero-length slots remain
+        # invisible and a later request can retry the rebuild.
+        self._slots.update(pending_slots)
+        self.rebuilds += 1
+        logger.info(
+            "MiniMax H3 AdaLN: rebuilt %d plan(s), %d/%d resident, pass #%d",
+            len(missing),
+            len(self._slots),
+            self.max_plans,
+            self.rebuilds,
+        )
+
+    def _project_plans_from_checkpoint(
+        self,
+        slots: list[tuple[int, int, torch.Tensor]],
+        *,
+        tp_size: int,
+        tp_rank: int,
+        device: torch.device,
+    ) -> None:
         with ExitStack() as stack:
             handles = [
                 stack.enter_context(safe_open(f, framework="pt", device=str(device)))
@@ -291,21 +334,6 @@ class MiniMaxH3AdalnCache(nn.Module):
             for slot, length, adaln_input in slots:
                 self.final_params[slot, :length] = project(adaln_input, weight, bias)
             del weight, bias
-
-        for slot, length, _ in slots:
-            self.plan_lengths[slot] = length
-        # Commit host metadata only after every layer has been written. If a
-        # checkpoint read or projection raises, the zero-length slots remain
-        # invisible and a later request can retry the rebuild.
-        self._slots.update(pending_slots)
-        self.rebuilds += 1
-        logger.info(
-            "MiniMax H3 AdaLN: rebuilt %d plan(s), %d/%d resident, pass #%d",
-            len(plans_to_build),
-            len(self._slots),
-            self.max_plans,
-            self.rebuilds,
-        )
 
     def resolve_slots(self, step_timesteps: list[torch.Tensor]) -> torch.Tensor:
         """Per-step slab slots as one device tensor, resolved on the host.

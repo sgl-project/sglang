@@ -296,6 +296,8 @@ def _quality_server_args():
         enable_breakable_cuda_graph=False,
         enable_torch_compile=False,
         is_dit_layerwise_offload_selected=False,
+        minimax_h3_adaln_online=False,
+        minimax_h3_adaln_gpu_plans=64,
         performance_mode="speed",
         quantization=None,
         transformer_weights_path=None,
@@ -349,6 +351,34 @@ def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
         "Cache-DiT was requested but is disabled because breakable CUDA graphs "
         "are enabled."
     )
+
+
+def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
+    metadata = MiniMaxH3ReleaseMetadata.from_model_index(
+        {
+            "_minimax_h3": {
+                "schema_version": 1,
+                "partition": "fl2va",
+                "tasks": ["t2va", "fl2va"],
+                "task_aliases": {},
+                "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+            }
+        }
+    )
+    stage = MiniMaxH3PartitionAdmissionStage(metadata)
+    server_args = _quality_server_args()
+    server_args.minimax_h3_adaln_online = True
+    server_args.minimax_h3_adaln_gpu_plans = 8
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(task="t2va", quality="lossless"),
+        num_inference_steps=50,
+        is_warmup=False,
+    )
+    with pytest.raises(ValueError, match="--minimax-h3-adaln-gpu-plans"):
+        stage.forward(batch, server_args)
+
+    batch.num_inference_steps = 9
+    assert stage.forward(batch, server_args) is batch
 
 
 def test_quality_admission_fails_closed_outside_validated_request():

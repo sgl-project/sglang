@@ -184,8 +184,8 @@ def test_slab_buffers_stay_out_of_state_dict(tmp_path):
     assert not any("params" in key or "plan" in key for key in cache.state_dict())
 
 
-def test_online_cache_reset_rebuilds_previously_resident_request_plans(tmp_path):
-    """A capacity reset must not drop plans reused by the current request."""
+def test_online_cache_eviction_preserves_in_flight_request_plans(tmp_path):
+    """Capacity eviction must never drop plans reused by the current request."""
     cache = _online_cache(tmp_path, max_plan_width=1)
     plan_a = torch.tensor([1.0])
     plan_b = torch.tensor([2.0])
@@ -196,6 +196,49 @@ def test_online_cache_reset_rebuilds_previously_resident_request_plans(tmp_path)
 
     cache.lookup(plan_a)
     cache.lookup(plan_c)
+    with pytest.raises(ValueError, match="does not cover"):
+        cache.lookup(plan_b)
+
+
+def test_online_cache_lru_keeps_alternating_plan_sets_resident(tmp_path):
+    """Two alternating schedules must both stay resident once built.
+
+    The pre-LRU slab did a full reset whenever slots overflowed, so two
+    alternating plan sets re-read the whole checkpoint on every request.
+    """
+    cache = _online_cache(tmp_path, max_plans=4, max_plan_width=1)
+    set_a = [torch.tensor([1.0]), torch.tensor([2.0])]
+    set_b = [torch.tensor([3.0]), torch.tensor([4.0])]
+
+    cache.build(set_a, embed=_embed)
+    cache.build(set_b, embed=_embed)
+    passes = cache.rebuilds
+    cache.build(set_a, embed=_embed)
+    cache.build(set_b, embed=_embed)
+    assert cache.rebuilds == passes
+
+    slots_a = cache.resolve_slots(set_a)
+    slots_b = cache.resolve_slots(set_b)
+    assert sorted(slots_a.tolist() + slots_b.tolist()) == [0, 1, 2, 3]
+
+
+def test_online_cache_evicts_least_recently_used_plan_first(tmp_path):
+    cache = _online_cache(tmp_path, max_plans=2, max_plan_width=1)
+    plan_a = torch.tensor([1.0])
+    plan_b = torch.tensor([2.0])
+    plan_c = torch.tensor([3.0])
+
+    cache.build([plan_a], embed=_embed)
+    cache.build([plan_b], embed=_embed)
+    # Touch plan_a so plan_b becomes the LRU entry, then overflow with plan_c.
+    cache.build([plan_a, plan_c], embed=_embed)
+
+    cache.lookup(plan_a)
+    cache.lookup(plan_c)
+    with pytest.raises(ValueError, match="does not cover"):
+        cache.lookup(plan_b)
+    with pytest.raises(ValueError, match="does not cover"):
+        cache.resolve_slots([plan_b])
 
 
 def test_online_cache_failed_rebuild_can_be_retried(tmp_path):
