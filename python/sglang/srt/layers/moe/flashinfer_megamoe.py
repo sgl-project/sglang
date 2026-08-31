@@ -219,6 +219,10 @@ def _bind_transformed_weights(
     copy_or_rebind_param(layer, w2_scale_name, w2_scale)
 
 
+def _init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> None:
+    layer._flashinfer_megamoe_layer = None
+
+
 def _ensure_flashinfer_megamoe_layer(
     layer: FusedMoE,
     *,
@@ -226,7 +230,7 @@ def _ensure_flashinfer_megamoe_layer(
     w13_scale_name: str,
     w2_scale_name: str,
 ) -> Any:
-    mega = getattr(layer, "_flashinfer_megamoe_layer", None)
+    mega = layer._flashinfer_megamoe_layer
     if mega is not None:
         return mega
 
@@ -278,7 +282,7 @@ def _ensure_flashinfer_megamoe_layer(
 
 
 def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
-    mega = getattr(layer, "_flashinfer_megamoe_layer", None)
+    mega = layer._flashinfer_megamoe_layer
     if mega is not None:
         return mega
 
@@ -297,7 +301,7 @@ def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
 
 
 def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
-    mega = getattr(layer, "_flashinfer_megamoe_layer", None)
+    mega = layer._flashinfer_megamoe_layer
     if mega is not None:
         return mega
 
@@ -323,7 +327,7 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
 
 
 def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
-    mega = getattr(layer, "_flashinfer_megamoe_layer", None)
+    mega = layer._flashinfer_megamoe_layer
     if mega is not None:
         return mega
 
@@ -352,6 +356,8 @@ def prepare_fp4_moe_weights_for_flashinfer_megamoe(
     current moe_ep API owns backend-specific weight preprocessing, including
     DeepGEMM scale layout transforms.
     """
+    _init_flashinfer_megamoe_layer_state(layer)
+
     from flashinfer.moe_ep import (
         MoEWeightPack,
         preprocess_mega_weights,
@@ -389,7 +395,7 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
             "FlashInfer NVFP4 MegaMOE requires hidden_size to be a multiple "
             f"of 128, got {layer.hidden_size}."
         )
-    if getattr(layer.quant_config, "use_per_token_activation", False):
+    if layer.quant_config.use_per_token_activation:
         raise ValueError(
             "FlashInfer NVFP4 MegaMOE does not support per-token activation "
             "scaling. Use flashinfer_trtllm/flashinfer_trtllm_routed for "
@@ -434,6 +440,8 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
 def prepare_mxfp8_moe_weights_for_flashinfer_megamoe(
     layer: FusedMoE,
 ) -> None:
+    _init_flashinfer_megamoe_layer_state(layer)
+
     from flashinfer.moe_ep import (
         MoEWeightPack,
         preprocess_mxfp8_cutedsl_mega_weights,

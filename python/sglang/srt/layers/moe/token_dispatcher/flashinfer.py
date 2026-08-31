@@ -309,6 +309,18 @@ class FlashinferDispatcher(BaseDispatcher):
             StandardTopKOutput(topk_weights, topk_ids, topk_output.router_logits),
         )
 
+    def _effective_dispatch_type(self) -> FlashinferA2ADispatchType:
+        if self.dispatch_type == FlashinferA2ADispatchType.NVFP4:
+            global_scale = (self.quant_config or {}).get("input_global_scale", None)
+            if global_scale is None:
+                return FlashinferA2ADispatchType.BF16
+        elif self.dispatch_type == FlashinferA2ADispatchType.MXFP8:
+            # Draft/NextN or mixed layers may not be MXFP8 even when the
+            # process-wide default is MXFP8.
+            if not (self.quant_config or {}).get("use_mxfp8", False):
+                return FlashinferA2ADispatchType.BF16
+        return self.dispatch_type
+
     @debug_kernel_api
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -336,7 +348,7 @@ class FlashinferDispatcher(BaseDispatcher):
             )
 
         output_dtype = hidden_states.dtype
-        dispatch_type = self.dispatch_type
+        dispatch_type = self._effective_dispatch_type()
         x = hidden_states
         x_sf = None
         # FlashInfer dispatch requires materialized top-k IDs and weights.
