@@ -294,11 +294,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self._v2p_page_table = _hooks.v2p_page_table
         self._kernel_page_multiplier = _hooks.kernel_page_multiplier
         self._unified_mla = _hooks.enabled
-        # virtual token id -> DENSE kernel-facing id, for the KV write loc.
-        self._translate_kv_loc_dense = _hooks.translate_kv_loc_for_kernel
-        # Per-forward kernel-facing write loc ([:n] view of a capture-stable buffer),
-        # set by the cuda-graph out-graph hook; None on the eager path (where the
-        # write translates through the pool's _full_translate hook instead).
+        # Per-forward kernel-facing write loc ([:n] view of a capture-stable buffer);
+        # None on the eager path, which passes out_cache_loc straight through.
         self._decode_kernel_loc: Optional[torch.Tensor] = None
         self.cuda_graph_out_cache_loc_kernel: Optional[torch.Tensor] = None
         # Fused KV-scatter + q-concat on the decode dense-loc path (one launch
@@ -636,7 +633,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             out_cache_loc = forward_batch.out_cache_loc
             n = out_cache_loc.shape[0]
             dst = self.cuda_graph_out_cache_loc_kernel[:n]
-            self._translate_kv_loc_dense(out_cache_loc, out=dst)
+            dst.copy_(out_cache_loc)
             # Replay-prep receives the RAW (unpadded) out_cache_loc
             # (build_replay_fb_view), but the captured write kernel consumes the
             # full captured tier of this buffer. Zero the tail so pad rows write
@@ -651,8 +648,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
-        # Eager path: no capture-stable kernel-facing write loc; the pool's _full_translate
-        # hook translates the write loc (safe out of a cuda graph).
         self._decode_kernel_loc = None
         # Delegate to parent for non-decode modes.
         if (
@@ -950,11 +945,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q: torch.Tensor,
         q_rope: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """Decode: scatter the KV row at ``loc`` (already physical — the
-        dense-loc buffer on the unified pool, or out_cache_loc on the static
-        pool where ``_full_translate`` is identity) and build the
-        [q_nope | q_rope] fmha query in one kernel launch (saves one launch
-        per MLA layer and keeps the PDL chain intact).
+        """Decode: scatter the KV row at ``loc`` (already kernel-facing) and
+        build the [q_nope | q_rope] fmha query in one kernel launch (saves one
+        launch per MLA layer and keeps the PDL chain intact).
 
         Returns the concatenated query, or None when the fused kernel does
         not cover the inputs (caller falls back to the two-kernel path).
@@ -1100,8 +1093,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             if self._decode_kernel_loc is not None:
-                # cuda-graph path: kernel-facing write loc precomputed out-of-graph, so
-                # the in-graph write captures no translate allocation.
                 if merge_query and self._fused_set_kv_concat_q:
                     # Fused: KV scatter + [q_nope | q_rope] concat in one
                     # launch; None when the inputs are not covered.
@@ -1115,21 +1106,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     )
                 if query is None:
                     self.token_to_kv_pool.set_mla_kv_buffer(
-                        layer,
-                        self._decode_kernel_loc,
-                        k,
-                        k_rope,
-                        loc_is_kernel_facing=True,
+                        layer, self._decode_kernel_loc, k, k_rope
                     )
             else:
-                # eager (or static pool): the pool's _full_translate handles it.
+                # eager (or static pool): out_cache_loc is kernel-facing.
                 if (
                     merge_query
                     and self._fused_set_kv_concat_q
                     and not self._unified_mla
                 ):
-                    # Static pool: _full_translate is identity, so
-                    # out_cache_loc is already the physical write loc.
+                    # Static pool only, conservatively.
                     query = self._set_kv_and_concat_q_fused(
                         layer=layer,
                         loc=forward_batch.out_cache_loc,
@@ -1265,7 +1251,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             if self._decode_kernel_loc is not None:
                 self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, self._decode_kernel_loc, k, k_rope, loc_is_kernel_facing=True
+                    layer, self._decode_kernel_loc, k, k_rope
                 )
             else:
                 self.token_to_kv_pool.set_mla_kv_buffer(

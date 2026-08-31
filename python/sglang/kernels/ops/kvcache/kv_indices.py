@@ -7,19 +7,33 @@ FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SI
 
 @triton.jit
 def create_flashinfer_kv_indices_triton(
-    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_to_token_ptr,  # [max_batch, max_context_len] token table; at
+    # ENTRY_PAGE_SIZE > 1 a PAGE-granular table (the unified pool's read table)
     req_pool_indices_ptr,
     page_kernel_lens_ptr,
     kv_indptr,
     kv_start_idx,
     kv_indices_ptr,
-    req_to_token_ptr_stride: tl.constexpr,
+    # Runtime, not constexpr: the translator's eager table is allocated at the
+    # batch's live width, so a constexpr stride would JIT-specialize per width
+    # (a recompile every few decode steps at small page sizes).
+    req_to_token_ptr_stride,
+    ENTRY_PAGE_SIZE: tl.constexpr = 1,
 ):
+    """Gather per-request token ids into a flat CSR kv_indices stream.
+
+    ``ENTRY_PAGE_SIZE == 1`` (default): the source table is token-granular and
+    entries are emitted verbatim -- byte-identical to the historical kernel.
+    ``ENTRY_PAGE_SIZE == ps``: the source is the translator's PAGE-granular
+    read table (entries already kernel-facing page ids); token ids are rebuilt
+    as ``token = entry * ps + pos % ps``, exact because converting an id keeps
+    its offset inside the page.
+    """
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
 
     # find the req pool idx, this is for batch to token
-    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+    req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
     kv_indices_offset = tl.load(kv_indptr + pid)
 
     kv_start = 0
@@ -34,13 +48,23 @@ def create_flashinfer_kv_indices_triton(
         # index into req_to_token_ptr needs to be int64
         offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
         mask = offset < kv_end - kv_start
-        data = tl.load(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + kv_start
-            + offset,
-            mask=mask,
-        )
+        if ENTRY_PAGE_SIZE == 1:
+            data = tl.load(
+                req_to_token_ptr
+                + req_pool_index * req_to_token_ptr_stride
+                + kv_start
+                + offset,
+                mask=mask,
+            )
+        else:
+            pos = kv_start + offset
+            entry = tl.load(
+                req_to_token_ptr
+                + req_pool_index * req_to_token_ptr_stride
+                + pos // ENTRY_PAGE_SIZE,
+                mask=mask,
+            )
+            data = entry.to(tl.int64) * ENTRY_PAGE_SIZE + pos % ENTRY_PAGE_SIZE
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
 
 

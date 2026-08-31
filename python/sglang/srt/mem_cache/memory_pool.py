@@ -81,7 +81,10 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
-from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.async_probe import (
+    maybe_detect_kernel_facing_loc,
+    maybe_detect_oob,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -1595,21 +1598,22 @@ class KVWriteLoc:
     """Write target(s) for ``KVCache.set_kv_buffer``.
 
     All location info lives here (in the attention metadata), NOT in the pool:
-    - ``loc``: the generic per-token write location (the allocated
-      ``out_cache_loc``). VIRTUAL under the unified memory pool (it indexes the
-      virtual slot space); already physical for a non-unified memory pool.
-    - ``swa_loc``: the pre-translated SWA-sub-pool PHYSICAL location for hybrid
-      SWA pools (``None`` otherwise).
-    - ``full_loc``: the pre-translated full-attention-sub-pool PHYSICAL location
-      for the unified memory pool (``None`` otherwise), computed once per forward in
-      attention metadata (``ForwardMetadata.out_cache_loc_full_physical``). The
-      shared full pool writes it directly; the pool never translates (replacing
-      the former per-layer v2p gather / ``set_full_loc`` pin).
+    - ``loc``: the generic per-token write location (``out_cache_loc``).
+      KERNEL-FACING on every pool: physical by allocation on non-unified
+      pools, rebound at ForwardBatch construction (``rebind_write_loc``) on
+      the unified pool.
+    - ``swa_loc``: the pre-resolved SWA-sub-pool location for hybrid SWA pools
+      (``None`` otherwise).
+    - ``full_loc``: the full-attention-sub-pool location for the unified
+      memory pool (``None`` otherwise), carried in attention metadata
+      (``ForwardMetadata.out_cache_loc_full_physical``). Since the
+      construction-time rebind it is the SAME id space as ``loc``; the shared
+      full pool writes it directly and never translates.
 
     ``swa_loc`` and ``full_loc`` are the parallel pair (each a pre-resolved
-    PHYSICAL loc into its sub-pool, mirroring ``swa_kv_pool`` / ``full_kv_pool``);
-    ``loc`` is the generic, possibly-virtual fallback. Bundling them lets a
-    backend issue one ``set_kv_buffer`` call regardless of pool type.
+    loc into its sub-pool, mirroring ``swa_kv_pool`` / ``full_kv_pool``);
+    ``loc`` is the generic fallback. Bundling them lets a backend issue one
+    ``set_kv_buffer`` call regardless of pool type.
     """
 
     loc: torch.Tensor
@@ -1690,6 +1694,10 @@ class KVCache(abc.ABC):
     ):
         self.size = size
         self.page_size = page_size
+        # Row-blocks one page holds in this pool's kernel-facing id space; >1
+        # only where the per-layer views are dense (the unified pool), and then
+        # a write loc must have been translated into that space first.
+        self.kernel_page_blocks = 1
         self.dtype = dtype
         self.device = device
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
@@ -2389,6 +2397,9 @@ class MHATokenToKVPool(KVCache):
         # Catch stale slot ids here instead of as illegal-addr / silent KV
         # corruption in the store_kvcache write (gated on SGLANG_ENABLE_ASYNC_ASSERT).
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA)")
+        maybe_detect_kernel_facing_loc(
+            loc, self.page_size, self.kernel_page_blocks, "set_kv_buffer (MHA)"
+        )
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
@@ -3654,9 +3665,10 @@ class HybridLinearKVPool(KVCache):
         # virtual->physical mamba-slot translate for the HiCache offload path;
         # identity for a static pool, the allocator's `translate` for the unified pool.
         self._mamba_translate = lambda ids: ids
-        # virtual->kernel-facing full-KV translate for the model-level MLA entry points
-        # (`set_mla_kv_buffer` / `get_mla_kv_buffer` receive VIRTUAL locs);
-        # identity for a static pool, `translate_kv_loc_for_kernel` for the unified pool.
+        # The MLA doors take DIFFERENT id spaces: `get_mla_kv_buffer` gets
+        # ForwardBatch-built read indices (prefix_chunk_kv_indices /
+        # fetch_mha_one_shot_kv_indices), still VIRTUAL, so it translates;
+        # `set_mla_kv_buffer` gets out_cache_loc, already kernel-facing.
         self._full_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
@@ -3943,17 +3955,8 @@ class HybridLinearKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
-        loc_is_kernel_facing: bool = False,
     ):
         assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
-        # Model-level MLA entry point: `loc` is a VIRTUAL loc under the unified
-        # pool, so translate to the kernel-facing id space here.
-        #
-        # `loc_is_kernel_facing`: the caller already translated `loc` (the unified-pool
-        # cuda-graph decode precomputes it out-of-graph into a capture-stable
-        # buffer, so the in-graph write does not capture a translate allocation).
-        if not loc_is_kernel_facing:
-            loc = self._full_translate(loc)
         with self._transfer_id_context(layer):
             self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
 
@@ -4092,6 +4095,9 @@ class MLATokenToKVPool(KVCache):
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
+        maybe_detect_kernel_facing_loc(
+            loc, self.page_size, self.kernel_page_blocks, "set_kv_buffer (MLA)"
+        )
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
@@ -4175,6 +4181,9 @@ class MLATokenToKVPool(KVCache):
             0,
             (self.size + self.page_size) * get_parallel().attn_dcp_size,
             "set_mla_kv_buffer (MLA)",
+        )
+        maybe_detect_kernel_facing_loc(
+            loc, self.page_size, self.kernel_page_blocks, "set_mla_kv_buffer (MLA)"
         )
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
