@@ -420,10 +420,12 @@ without contacting the server. Use `--quiet` to keep detailed subprocess output 
 per-point log files while printing only matrix progress.
 
 By default, a point is complete only when every requested response succeeds and the
-server-reported cache-hit rate is within 0.5 percentage points of the generated
-workload's expected rate. Set `--cache-hit-tolerance` to change that absolute
-percentage-point threshold. A missing cache report or an out-of-tolerance result stops
-the matrix and is rerun when you restart the same command.
+server-reported cache-hit rate is close to the generated workload's expected rate. The
+allowed absolute error is the larger of 0.5 percentage points and one server-reported
+cache page divided by the average prompt length. This accounts for page rounding
+without hiding larger cache-capacity or eviction errors. Set `--cache-hit-tolerance`
+to change the 0.5-point floor. A missing cache report or an out-of-tolerance result
+stops the matrix and is rerun when you restart the same command.
 
 #### Prefix-cache matrix workflow
 

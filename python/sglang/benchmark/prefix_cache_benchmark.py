@@ -84,15 +84,35 @@ def result_validation_error(
     ):
         return "prefix-cache configuration is missing a finite expected hit rate"
 
+    allowed_error = cache_hit_tolerance_for_row(row, cache_hit_tolerance)
     error = abs(actual_hit_rate_pct - expected_hit_rate_pct)
-    if error > cache_hit_tolerance:
+    if error > allowed_error:
         return (
             f"cache-hit error is {error:.2f} percentage points "
             f"({expected_hit_rate_pct:.2f}% expected, "
             f"{actual_hit_rate_pct:.2f}% actual), exceeding "
-            f"the {cache_hit_tolerance:.2f}-point tolerance"
+            f"the {allowed_error:.2f}-point tolerance"
         )
     return None
+
+
+def cache_hit_tolerance_for_row(row: dict, tolerance_floor: float) -> float:
+    server_info = row.get("server_info") or {}
+    page_size = server_info.get("page_size")
+    total_input_tokens = row.get("total_input_tokens")
+    completed = row.get("completed")
+    if (
+        isinstance(page_size, (int, float))
+        and page_size > 0
+        and isinstance(total_input_tokens, (int, float))
+        and total_input_tokens > 0
+        and isinstance(completed, int)
+        and completed > 0
+    ):
+        average_prompt_tokens = total_input_tokens / completed
+        page_rounding_error = 100 * page_size / average_prompt_tokens
+        return max(tolerance_floor, page_rounding_error)
+    return tolerance_floor
 
 
 def load_completed_results(
@@ -234,6 +254,7 @@ def write_summary(
         "expected_hit_rate_pct",
         "actual_hit_rate_pct",
         "cache_hit_error_percentage_points",
+        "allowed_cache_hit_error_percentage_points",
         "cache_hit_within_tolerance",
         "mean_ttft_ms",
         "median_ttft_ms",
@@ -259,6 +280,9 @@ def write_summary(
                 and isinstance(expected_hit_rate, (int, float))
                 else None
             )
+            allowed_cache_hit_error = cache_hit_tolerance_for_row(
+                row, cache_hit_tolerance
+            )
             writer.writerow(
                 {
                     "tag": tag,
@@ -267,9 +291,12 @@ def write_summary(
                     "expected_hit_rate_pct": expected_hit_rate,
                     "actual_hit_rate_pct": actual_hit_rate,
                     "cache_hit_error_percentage_points": cache_hit_error,
+                    "allowed_cache_hit_error_percentage_points": (
+                        allowed_cache_hit_error
+                    ),
                     "cache_hit_within_tolerance": (
                         cache_hit_error is not None
-                        and cache_hit_error <= cache_hit_tolerance
+                        and cache_hit_error <= allowed_cache_hit_error
                     ),
                     "mean_ttft_ms": row.get("mean_ttft_ms"),
                     "median_ttft_ms": row.get("median_ttft_ms"),
@@ -303,7 +330,7 @@ def write_manifest(args: argparse.Namespace, result_dir: Path) -> None:
         "repetitions": args.repetitions,
         "group_distribution": args.group_distribution,
         "zipf_alpha": args.zipf_alpha,
-        "cache_hit_tolerance_percentage_points": args.cache_hit_tolerance,
+        "cache_hit_tolerance_floor_percentage_points": args.cache_hit_tolerance,
         "command": sys.argv,
     }
     try:
@@ -385,9 +412,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=_cache_hit_percent,
         default=0.5,
         help=(
-            "Maximum absolute expected-versus-actual cache-hit error in "
-            "percentage points. Rows outside this tolerance are not considered "
-            "complete and abort the matrix (default: 0.5)."
+            "Minimum allowed absolute expected-versus-actual cache-hit error "
+            "in percentage points. The effective tolerance is the larger of "
+            "this value and one server-reported cache page divided by the "
+            "average prompt length (default: 0.5)."
         ),
     )
     parser.add_argument("--extra-request-body")

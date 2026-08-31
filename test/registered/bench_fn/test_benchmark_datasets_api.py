@@ -51,6 +51,7 @@ from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
 from sglang.benchmark.prefix_cache_benchmark import (
     build_point_command,
+    cache_hit_tolerance_for_row,
     load_completed_results,
     make_tag,
 )
@@ -1784,6 +1785,18 @@ class TestPrefixCacheBenchmark(unittest.TestCase):
             "missing a finite achieved hit rate",
             result_validation_error(row, 50, 50, 0.5),
         )
+
+    def test_result_validation_allows_cache_page_rounding(self):
+        row = {
+            "tag": "prefix-cache-in128-out8-hit50-c1",
+            "completed": 50,
+            "total_input_tokens": 6400,
+            "server_info": {"page_size": 64},
+            "cache_report": {"cache_hit_rate_pct": 25.0},
+            "prefix_cache_config": {"expected_hit_rate_pct": 50.0},
+        }
+        self.assertEqual(cache_hit_tolerance_for_row(row, 0.5), 50.0)
+        self.assertIsNone(result_validation_error(row, 50, 50, 0.5))
 
     def test_load_completed_results_validates_warm_and_cold_points(self):
         warm_tag = "prefix-cache-in32768-out512-hit50-c8"
