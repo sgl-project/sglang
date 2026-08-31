@@ -185,10 +185,10 @@ class RadixCacheCpp(BasePrefixCache):
     ):
         """Cache request when it finishes."""
         self._reject_cache_salt(req.cache_salt)
-        assert req.req_pool_idx is not None
+        assert req.kv.req_pool_idx is not None
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_len_to_handle
+            req.kv.req_pool_idx, :kv_len_to_handle
         ].to(dtype=torch.int64, copy=True)
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
@@ -223,11 +223,11 @@ class RadixCacheCpp(BasePrefixCache):
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         self._reject_cache_salt(req.cache_salt)
-        assert req.req_pool_idx is not None
+        assert req.kv.req_pool_idx is not None
         token_ids = req.get_fill_ids()
         prefill_len = len(token_ids)  # prefill only (maybe chunked)
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :prefill_len
+            req.kv.req_pool_idx, :prefill_len
         ].to(dtype=torch.int64, copy=True)
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
@@ -254,7 +254,7 @@ class RadixCacheCpp(BasePrefixCache):
             )
             reused_indices = new_indices[old_prefix_len:new_prefix_len]
             self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, old_prefix_len:new_prefix_len
+                req.kv.req_pool_idx, old_prefix_len:new_prefix_len
             ] = reused_indices
 
         if req.last_node != new_last_node:

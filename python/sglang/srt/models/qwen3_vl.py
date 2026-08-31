@@ -1053,6 +1053,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_cos,
             rotary_pos_emb_sin,
         ) = self._prepare_graph_inputs(x, grid_thw)
+        attention_layout_key = (tuple(cu_seqlens.tolist()), None)
         if not isinstance(cu_seqlens, torch.Tensor):
             cu_seqlens = torch.tensor(cu_seqlens, device=x.device, dtype=torch.int32)
         else:
@@ -1067,6 +1068,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             cu_seqlens=cu_seqlens,
             cu_window_seqlens=None,
             output_indices=None,
+            attention_layout_key=attention_layout_key,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
