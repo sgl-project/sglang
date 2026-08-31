@@ -12,7 +12,7 @@
 //!     [`Runtime::spawn_mm_pool`] (multimodal models only)
 //!
 //! Keeping CPU-bound tokenize/detokenize off the async executor avoids stalling
-//! axum's worker threads.
+//! the HTTP server's worker threads.
 
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -283,6 +283,25 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let http_addr = cfg.rust_server_args.http_addr;
         let listener = bind_tcp_listener(http_addr)
             .map_err(|e| format!("binding API listener on {} failed: {e}", http_addr))?;
+        // Same hard-startup-error rule as the HTTP bind.
+        let grpc_listener = match cfg.rust_server_args.grpc_addr {
+            Some(addr) => Some(
+                bind_tcp_listener(addr)
+                    .map_err(|e| format!("binding gRPC listener on {addr} failed: {e}"))?,
+            ),
+            None => None,
+        };
+        // Built once here — not per transport — so a second transport (gRPC)
+        // mounts the same instance and the chat formatter loads once.
+        let state = std::sync::Arc::new(crate::api_server::core::state::CoreState {
+            senders,
+            response_buf: cfg.rust_server_args.channel_cap,
+            api_key: cfg.rust_server_args.api_key.clone(),
+            server_args: cfg.server_args.clone(),
+            chat_formatter: crate::api_server::core::openai::load_chat_support(&cfg.server_args),
+            // Response heartbeat watched by `/health_generate`.
+            response_activity,
+        });
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
             .spawn(move || {
@@ -300,15 +319,17 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     });
                 }
                 let rt = builder.build().expect("build api runtime");
-                rt.block_on(api_server::app::serve(
-                    listener,
-                    senders,
-                    cfg.rust_server_args.channel_cap,
-                    cfg.server_args.clone(),
-                    // Response heartbeat watched by `/health_generate`.
-                    response_activity,
-                    shutdown_rx,
-                ))
+                // The gRPC transport shares the api runtime and the shutdown
+                // signal; when `app::serve` returns and the runtime drops, the
+                // spawned serve future is aborted with it.
+                if let Some(grpc_listener) = grpc_listener {
+                    rt.spawn(crate::api_server::grpc::app::serve(
+                        grpc_listener,
+                        state.clone(),
+                        shutdown_rx.clone(),
+                    ));
+                }
+                rt.block_on(api_server::http::app::serve(listener, state, shutdown_rx))
             })
             .expect("spawn api runtime");
         threads.push(handle);

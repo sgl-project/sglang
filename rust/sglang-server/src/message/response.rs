@@ -611,7 +611,7 @@ impl ChunkExtras {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::finish_reason::{FinishKind, Matched};
+    use crate::message::finish_reason::{FinishReason, Matched};
 
     #[test]
     fn batch_cols_match_single_joined_buffer() {
@@ -678,12 +678,7 @@ mod tests {
         // The whole reason survives msgpack (type + matched), not just the type.
         assert_eq!(
             events[1].finish_reason,
-            Some(
-                FinishKind::Stop {
-                    matched: Some(Matched::Token(5))
-                }
-                .into()
-            )
+            Some(FinishReason::stop(Some(Matched::Token(5))))
         );
         assert_eq!(events[2].rid, Rid::from("3"));
         assert_eq!(events[2].token_ids, vec![12]);

@@ -1,15 +1,8 @@
-//! API server (axum / tokio). I/O-bound; own pinned multi-thread runtime. Only
-//! this module knows HTTP, so other protocols can mount the same `AppState`.
-//! `/generate` submits a `Request` then awaits one `Done` (unary) or relays SSE
-//! frames (`data: {json}` … `[DONE]`), byte-compatible with Python
-//! `http_server.generate_request`; `/server_info` reuses it for one control result.
-pub mod app;
-mod common;
-mod disaggregation;
-mod frame;
-mod guard;
-mod log;
-mod native_api;
-mod openai;
-mod prefetch;
-mod submit;
+//! The API serving stack: transport-agnostic endpoint logic in `core`, the
+//! HTTP transport in `http`, the gRPC transport in `grpc`, and the tower
+//! layers shared by both stacks in `layers`.
+
+pub(crate) mod core;
+pub(crate) mod grpc;
+pub(crate) mod http;
+mod layers;

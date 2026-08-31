@@ -1,0 +1,59 @@
+// The terminal finish reason — Python's `FinishReasonDict`
+// (`BaseFinishReason.to_json()` in schedule_batch.py), echoed verbatim as
+// `meta_info.finish_reason`. JSON is internally tagged by "type" with the
+// variant payload inlined; a type this build doesn't know round-trips
+// unchanged (unknown_variant_passthrough) so a Python-side addition never
+// fails a frame decode.
+
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/json/v1/options.proto";
+
+// Python's `matched` key, `Union[str, int, List[int]]`: the three wire shapes
+// are disjoint, so shape alone picks the arm (untagged).
+message Matched {
+  oneof value {
+    option (sglang.json.v1.oneof_json).untagged = true;
+    int64 token = 1;
+    string str = 2;
+    MatchedTokens tokens = 3;
+  }
+}
+
+message MatchedTokens {
+  option (sglang.json.v1.message_json).bare_list = true;
+  repeated int64 ids = 1;
+}
+
+// `FINISH_MATCHED_TOKEN` / `FINISH_MATCHED_STR` / `FINISHED_MATCHED_REGEX` —
+// all three report `type: "stop"`, matching the OpenAI API's value.
+message FinishStop {
+  optional Matched matched = 1;
+}
+
+// `FINISH_LENGTH` — hit `max_new_tokens` (or the context limit).
+message FinishLength {
+  optional uint64 length = 1;
+}
+
+// The `FINISH_ABORT` payload. Python emits all three keys, nulls included.
+message FinishAbort {
+  optional string message = 1 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional uint32 status_code = 2 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional string err_type = 3 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+}
+
+message FinishReason {
+  oneof kind {
+    option (sglang.json.v1.oneof_json).tag = "type";
+    option (sglang.json.v1.oneof_json).unknown_variant_passthrough = true;
+    FinishStop stop = 1;
+    FinishLength length = 2;
+    FinishAbort abort = 3;
+    // The passthrough arm: an unrecognized `type`, kept as its raw map
+    // (JSON text — Struct would coerce integer values to doubles).
+    string unknown = 4 [(sglang.json.v1.field_json).raw_json = true];
+  }
+}

@@ -26,6 +26,10 @@ use serde::Serialize;
 #[derive(Clone, Debug)]
 pub struct RustServerServerArgs {
     pub http_addr: SocketAddr,
+    /// The gRPC transport's listen address; `None` (the default) keeps it off.
+    pub grpc_addr: Option<SocketAddr>,
+    /// Bearer key gating both transports; `None` (the default) leaves them open.
+    pub api_key: Option<String>,
     pub http_api_worker_num: usize,
     pub to_scheduler_cap: usize,
     pub from_scheduler_cap: usize,
@@ -39,6 +43,8 @@ impl Default for RustServerServerArgs {
     fn default() -> Self {
         Self {
             http_addr: "127.0.0.1:30000".parse().unwrap(),
+            grpc_addr: None,
+            api_key: None,
             http_api_worker_num: 2,
             to_scheduler_cap: 8192,
             from_scheduler_cap: 8192,

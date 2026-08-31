@@ -1,115 +1,13 @@
-//! The terminal finish reason: Python's `FinishReasonDict` — what
-//! `BaseFinishReason.to_json()` (schedule_batch.py) puts on the response, and
-//! what the API echoes back as `meta_info.finish_reason`.
+//! The terminal finish reason — re-exported from the schema-generated types:
+//! `proto/sglang/api/v1/finish.proto` is the ground truth for Python's
+//! `FinishReasonDict` (`BaseFinishReason.to_json()` in schedule_batch.py),
+//! which the API echoes back as `meta_info.finish_reason`. The accessors
+//! (`kind_name`, `matched`, `abort_status`) live in sglang-api-types' ext.
 
-use serde::{Deserialize, Serialize};
-
-/// The stop that ended a request — Python's `matched` key, typed
-/// `Union[str, int, List[int]]`: a stop token id, a stop string
-/// (`FINISH_MATCHED_STR` / `FINISHED_MATCHED_REGEX`), or a multi-token stop
-/// sequence. Untagged because the three wire shapes are disjoint, so the shape
-/// alone picks the arm.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Matched {
-    Token(i64),
-    Str(String),
-    Tokens(Vec<i64>),
-}
-
-/// The finish reasons this build knows, keyed by the `type` tag Python writes.
-/// Every field is optional so a reason missing one still classifies (and keeps its
-/// tag) instead of falling through to [`FinishReason::Unknown`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum FinishKind {
-    /// `FINISH_MATCHED_TOKEN` / `FINISH_MATCHED_STR` / `FINISHED_MATCHED_REGEX` —
-    /// all three report `type: "stop"`, to match the OpenAI API's value.
-    Stop {
-        #[serde(default)]
-        matched: Option<Matched>,
-    },
-    /// `FINISH_LENGTH` — hit `max_new_tokens` (or the context limit).
-    Length {
-        #[serde(default)]
-        length: Option<u64>,
-    },
-    /// `FINISH_ABORT` — a scheduler-side termination. Boxed because it is by far
-    /// the widest variant and the rarest: unboxed it would set the size of every
-    /// [`ChunkEvent`], including the plain stop/length ones (see
-    /// `chunk_event_frame_stays_small`).
-    Abort(Box<AbortReason>),
-}
-
-/// The `FINISH_ABORT` payload. `status_code`/`err_type` are `None` for a plain
-/// abort and set for a request error (e.g. over-context → 400); Python emits all
-/// three keys, nulls included, so none of them is skipped on the way out.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AbortReason {
-    #[serde(default)]
-    pub message: Option<String>,
-    #[serde(default)]
-    pub status_code: Option<u16>,
-    #[serde(default)]
-    pub err_type: Option<String>,
-}
-
-/// A terminal finish reason exactly as `BaseFinishReason.to_json()`
-/// (schedule_batch.py) puts it on the wire — Python's `FinishReasonDict`. It
-/// round-trips: the API echoes it verbatim as `meta_info.finish_reason`, so the
-/// serialized form must stay key-for-key what Python would have sent.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum FinishReason {
-    Known(FinishKind),
-    /// A `type` this build doesn't know, kept as its raw map and echoed unchanged.
-    /// This arm is why the outer enum is untagged: a finish reason added Python-side
-    /// must not fail the header decode, which rejects the whole frame — every
-    /// request in the batch, not just the one that carried it.
-    // Keep the native frame compact even when HTTP/rendering dependencies turn
-    // on serde_json's large `preserve_order` map representation.
-    Unknown(Box<serde_json::Map<String, serde_json::Value>>),
-}
-
-impl From<FinishKind> for FinishReason {
-    fn from(kind: FinishKind) -> Self {
-        FinishReason::Known(kind)
-    }
-}
-
-impl FinishReason {
-    /// Returns the wire type without reserializing the finish reason.
-    pub fn kind_name(&self) -> Option<&str> {
-        match self {
-            FinishReason::Known(FinishKind::Stop { .. }) => Some("stop"),
-            FinishReason::Known(FinishKind::Length { .. }) => Some("length"),
-            FinishReason::Known(FinishKind::Abort(_)) => Some("abort"),
-            FinishReason::Unknown(fields) => fields.get("type").and_then(|value| value.as_str()),
-        }
-    }
-
-    /// The stop this request matched, if it stopped on one. `None` for
-    /// length/abort and for an unknown type.
-    pub fn matched(&self) -> Option<&Matched> {
-        match self {
-            FinishReason::Known(FinishKind::Stop { matched }) => matched.as_ref(),
-            _ => None,
-        }
-    }
-
-    /// `Some((status, message))` when this is an abort carrying a `status_code` —
-    /// a scheduler-side request error the API surfaces as that HTTP status instead
-    /// of as a normal completion. A plain abort (no code) reads as `None`.
-    pub fn abort_status(&self) -> Option<(u16, &str)> {
-        match self {
-            FinishReason::Known(FinishKind::Abort(a)) => Some((
-                a.status_code?,
-                a.message.as_deref().unwrap_or("request aborted"),
-            )),
-            _ => None,
-        }
-    }
-}
+pub use sglang_api_types::api::v1::FinishReason;
+#[cfg(test)]
+pub use sglang_api_types::api::v1::finish_reason;
+pub use sglang_api_types::api::v1::matched::Value as Matched;
 
 #[cfg(test)]
 mod tests {
@@ -174,7 +72,7 @@ mod tests {
         );
         assert_eq!(
             m(serde_json::json!({"type": "stop", "matched": [9, 10]})),
-            Some(Matched::Tokens(vec![9, 10]))
+            Some(Matched::Tokens(vec![9, 10].into()))
         );
         // A stop with no `matched`, and the non-stop reasons.
         assert_eq!(m(serde_json::json!({"type": "stop"})), None);
@@ -204,7 +102,7 @@ mod tests {
         ] {
             let parsed: FinishReason = serde_json::from_value(wire.clone()).unwrap();
             assert!(
-                matches!(parsed, FinishReason::Known(_)),
+                !matches!(parsed.kind, Some(finish_reason::Kind::Unknown(_))),
                 "must classify, not fall back to Unknown: {wire}"
             );
             assert_eq!(serde_json::to_value(&parsed).unwrap(), wire);
@@ -218,10 +116,12 @@ mod tests {
     fn unknown_finish_type_is_preserved_not_rejected() {
         let wire = serde_json::json!({"type": "tool_calls", "name": "search"});
         let parsed: FinishReason = serde_json::from_value(wire.clone()).unwrap();
-        assert!(matches!(parsed, FinishReason::Unknown(_)));
+        assert!(matches!(parsed.kind, Some(finish_reason::Kind::Unknown(_))));
         assert_eq!(serde_json::to_value(&parsed).unwrap(), wire);
         // Unknown reasons classify as neither an abort nor a matched stop.
         assert!(parsed.abort_status().is_none());
         assert!(parsed.matched().is_none());
+        // But their `type` still reads out for the OpenAI finish mapping.
+        assert_eq!(parsed.kind_name().as_deref(), Some("tool_calls"));
     }
 }

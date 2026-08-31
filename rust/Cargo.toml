@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
+    "sglang-api-codegen",
+    "sglang-api-types",
     "sglang-grpc",
     "sglang-mm",
     "sglang-server"
@@ -29,6 +31,17 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+
+# The generated-API stack (sglang-api-types + the tonic transport). prost must
+# be one version across every crate that touches the generated types; the
+# frozen sglang-grpc bridge stays on its own prost 0.13/tonic 0.12 pair (no
+# generated types cross that boundary).
+prost = "0.14"
+prost-types = "0.14"
+tonic = "0.14"
+tonic-prost = "0.14"
+tower = { version = "0.5", features = ["util"] }
+
 
 # Profiles only take effect at the workspace root; per-member profile sections
 # are ignored by cargo. Per-package tweaks live in the override tables below.
