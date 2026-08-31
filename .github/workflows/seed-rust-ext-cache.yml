@@ -10,8 +10,11 @@ on:
     paths:
       - 'rust/**'
       - 'python/setup.py'
+      - 'python/pyproject.toml'
+      - 'python/sglang/srt/rust_extensions/torch_build.py'
       # The key's prefix lives in this file, so a bump there also moves the key.
       - '.github/workflows/_pr-test-rust-ext-build.yml'
+      - 'scripts/ci/utils/stage_rust_ext_modules.sh'
   workflow_dispatch:
 
 # Only the newest merge needs to seed; earlier ones are already stale.

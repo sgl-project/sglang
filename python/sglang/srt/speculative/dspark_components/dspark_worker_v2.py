@@ -490,7 +490,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
-        batch_output.new_seq_lens = batch.seq_lens
+        new_seq_lens = batch.seq_lens
+        batch_output.new_seq_lens = new_seq_lens
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
 
@@ -547,7 +548,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,
-            new_seq_lens=batch.seq_lens,
+            new_seq_lens=new_seq_lens,
         )
         return batch_output
 
