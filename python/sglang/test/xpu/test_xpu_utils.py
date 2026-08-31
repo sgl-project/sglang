@@ -6,6 +6,8 @@ so XPU and Ascend nightly runs render the same Markdown table in
 """
 
 import json
+import os
+import sys
 
 from sglang.srt.environ import envs
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
@@ -65,10 +67,16 @@ def _append_metric_records(results: dict) -> None:
     path = envs.SGLANG_TEST_METRICS_FILE.get()
     if not path:
         return
+    # sys.argv[0] is the test script path when a unittest file is run via
+    # `python3 test_foo.py`; renderer groups rich records to the file they came
+    # from so file-level fallback rows don't double-count them.
+    test_file = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else ""
     try:
         with open(path, "a") as f:
             for model, metrics in results.items():
                 record = {
+                    "kind": "model",
+                    "test_file": test_file,
                     "model": model,
                     "accuracy": metrics.get("accuracy"),
                     "accuracy_threshold": metrics.get("accuracy_threshold"),
