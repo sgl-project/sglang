@@ -73,8 +73,5 @@ jobs:
 
       - name: Enforce rate limit for low-permission actors (optional)
         if: github.event_name == 'pull_request' && inputs.cool-down-minutes > 0
-        uses: actions/github-script@v8
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
+        run:
             exit 0
