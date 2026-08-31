@@ -1218,14 +1218,10 @@ def init_unified_mamba_pools(
             max_total_num_tokens * full_spec.entry_bytes()
             + max_mamba_cache_size * mamba_spec.entry_bytes()
         )
-    # bs=1 floor: the state slots ONE running request locks (1 active + 2 radix
-    # checkpoints -- the checkpoint slots are a per-request FLOOR, not headroom)
-    # + the reserved slot-0 sink page. The token side is NOT charged: the
-    # scheduler already clamps a request to the pool
-    # (TpModelWorker.get_worker_info: max_req_len = min(context_len,
-    # effective_max_total_num_tokens) - 1), so a too-long request is refused at
-    # admission rather than retract-livelocking, and charging the full context
-    # here would reject configs that serve fine today.
+    # bs=1 floor: the state slots one running request locks (1 active + 2 radix
+    # checkpoints, a FLOOR not headroom) + the slot-0 sink. The token side is
+    # not charged -- `TpModelWorker.get_worker_info` already clamps max_req_len
+    # to the pool, so a too-long request is refused at admission, not livelocked.
     _check_bs1_feasibility_floor(
         total_bytes=total_bytes,
         floor_terms=[
@@ -1682,10 +1678,8 @@ def init_unified_swa_pools(
         grow_direction="up",
     )
     if unified_total_bytes is not None:
-        # PROFILED byte budget: the buffer is sized from it directly, so the
-        # swa ratio's byte-partition effect and the re-sum's floor losses
-        # disappear from the BUFFER; the ratio-derived token counts remain
-        # boot labels / conserve caps.
+        # PROFILED byte budget, sized from directly: the re-sum's floor losses
+        # stay out of the buffer, and the token counts remain boot labels.
         total_bytes = unified_total_bytes
     else:
         total_bytes = (
@@ -1694,11 +1688,9 @@ def init_unified_swa_pools(
         )
     if model_context_len is not None:
         # bs=1 floor: ONE sliding window of swa KV (+ a page of slack for the
-        # window's page-granular walk) + the reserved slot-0 sink page. The
-        # full-attention token side is NOT charged -- max_req_len already
-        # clamps a request to the full pool, so it cannot livelock; the swa
-        # sub-pool is sized separately and that clamp says nothing about it,
-        # which is why the window term stays.
+        # page-granular walk) + the slot-0 sink. The full side is not charged
+        # (max_req_len clamps it); the swa sub-pool is sized independently of
+        # that clamp, which is why the window term stays.
         swa_bs1_tokens = (
             min(model_context_len, sliding_window_size + page_size)
             if sliding_window_size is not None

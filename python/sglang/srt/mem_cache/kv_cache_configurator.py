@@ -2054,12 +2054,9 @@ class KVCacheConfigurator:
             budget_bytes, get_schedule().page_size
         )
         if get_memory().enable_unified_memory:
-            # Capture the PROFILED byte budget for the unified factories: the
-            # buffer is sized from it directly, so the ratio-derived token
-            # counts become boot labels, not a byte partition. Floor-align to
-            # 4096 B — the factories `.view()` the whole uint8 buffer as the
-            # KV/state dtype, so the total must be a dtype-size multiple, and
-            # an arbitrary profiled budget is not.
+            # Floor-align to 4096 B: the factories `.view()` the whole uint8
+            # buffer as the KV/state dtype, so the total must be a dtype-size
+            # multiple and a profiled budget is not. Flooring never overcommits.
             config.unified_total_bytes = budget_bytes - (budget_bytes % 4096)
         max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
         if cap_tokens is not None:
