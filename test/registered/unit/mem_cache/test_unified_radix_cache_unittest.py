@@ -5409,7 +5409,7 @@ class UnifiedRadixCacheSuite:
 
         kv_indices = self._alloc(allocator, forward_len)
         req_to_token_pool.write(
-            (req.req_pool_idx, slice(0, forward_len)),
+            (req.kv.req_pool_idx, slice(0, forward_len)),
             kv_indices,
         )
 
