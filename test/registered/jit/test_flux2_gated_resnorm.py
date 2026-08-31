@@ -8,7 +8,6 @@ import torch.nn as nn
 
 import sglang.multimodal_gen.runtime.models.dits.flux_2 as flux2
 from sglang.kernels.ops.diffusion import residual_gate_add
-from sglang.kernels.ops.diffusion.common.platform import is_cuda
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -16,11 +15,7 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b
 
 
 def _is_blackwell() -> bool:
-    return (
-        torch.cuda.is_available()
-        and is_cuda()
-        and torch.cuda.get_device_capability()[0] >= 10
-    )
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 
 
 @unittest.skipUnless(_is_blackwell(), "FLUX.2 gated residual fusion requires SM100+")
