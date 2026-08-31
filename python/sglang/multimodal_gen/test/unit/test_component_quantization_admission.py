@@ -39,6 +39,13 @@ class _TestLoader(PlainStateDictComponentLoader):
 
 
 class TestComponentQuantizationAdmission(unittest.TestCase):
+    def test_plain_loader_admits_its_exact_precision(self):
+        server_args = SimpleNamespace(component_precisions={"vocoder": "fp16"})
+
+        self.assertEqual(
+            _TestLoader().component_load_precision(server_args, "vocoder"), "fp16"
+        )
+
     def test_direct_gpu_selection_requires_a_declared_component(self):
         server_args = SimpleNamespace(
             component_direct_gpu_weight_loading={"missing_vae": True}
@@ -51,6 +58,7 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
 
     def test_direct_gpu_selector_is_rejected_by_unqualified_loader(self):
         server_args = SimpleNamespace(
+            component_precisions={},
             component_quantizations={},
             should_direct_gpu_weight_load_component=lambda component: component
             == "vocoder",
@@ -65,6 +73,7 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
 
     def test_direct_gpu_selector_is_rejected_by_unqualified_component(self):
         server_args = SimpleNamespace(
+            component_precisions={},
             component_quantizations={},
             should_direct_gpu_weight_load_component=lambda component: component
             == "audio_vae",

@@ -90,6 +90,25 @@ class _FakeReq:
         return kv
 
 
+def test_session_slot_round_trip_preserves_mamba_state():
+    # The mamba state rides in the shared ReqKvInfo record. mamba_branching_seqlen
+    # is a per-turn match observation on the Req and is not preserved by the slot.
+    req = _FakeReq("session-a", req_pool_idx=0, committed=4, allocated=4)
+    req.kv.mamba_next_track_idx = 1
+    req.kv.mamba_last_track_idx = 0
+    req.kv.mamba_last_track_seqlen = 3
+
+    slot = SessionSlot()
+    slot.save_from_req(req, is_first=True)
+
+    next_req = _FakeReq("session-a", req_pool_idx=1, committed=0, allocated=0)
+    slot.restore_to_req(next_req)
+
+    assert next_req.kv.mamba_next_track_idx == 1
+    assert next_req.kv.mamba_last_track_idx == 0
+    assert next_req.kv.mamba_last_track_seqlen == 3
+
+
 def test_preabort_detaches_session_and_preserves_slot():
     """Pre-aborted req (to_finish set before match_prefix) is detached from
     the session: session=None, abort_req() called. Slot stays intact."""
