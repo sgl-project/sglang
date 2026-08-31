@@ -49,8 +49,9 @@ from sglang.srt.runtime_context import get_device as get_device_namespace
 from sglang.srt.runtime_context import (
     get_exec,
     get_schedule,
+    logs_expert_balancedness_to_server_log,
+    reports_expert_balancedness,
 )
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_device, get_int_env_var
 
 if TYPE_CHECKING:
@@ -84,7 +85,6 @@ class ExpertDistributionRecorder(ABC):
 
     @staticmethod
     def init_new(
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
@@ -94,9 +94,7 @@ class ExpertDistributionRecorder(ABC):
             ), "ExpertLocationMetadata is required for expert distribution recording. One possible"
             "reason is that you are using a model that does not support expert distribution"
             "recording. Try setting `get_model_config_for_expert_location` in your model."
-            return _ExpertDistributionRecorderReal(
-                server_args, expert_location_metadata, rank
-            )
+            return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
         else:
             return _ExpertDistributionRecorderNoop()
 
@@ -159,11 +157,9 @@ class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
 class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def __init__(
         self,
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
-        self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
 
         self._recording = False
@@ -171,15 +167,13 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
-        self._accumulator = _Accumulator.init_new(
-            server_args, expert_location_metadata, rank
-        )
+        self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
         self._single_pass_gatherers = {
-            k: _SinglePassGatherer.init_new(server_args, expert_location_metadata, rank)
+            k: _SinglePassGatherer.init_new(expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
-        if server_args.should_report_expert_balancedness():
+        if reports_expert_balancedness():
             logger.info(
                 "ExpertDistributionRecorder auto start record since "
                 f"expert_balancedness_report_mode={get_exec().moe.expert_balancedness_report_mode}"
@@ -328,14 +322,11 @@ def set_global_expert_distribution_recorder(value):
 class _SinglePassGatherer(ABC):
     @staticmethod
     def init_new(
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> _SinglePassGatherer:
         if get_exec().moe.expert_distribution_recorder_mode == "per_token":
-            return _DetailSinglePassGatherer(
-                server_args, expert_location_metadata, rank
-            )
+            return _DetailSinglePassGatherer(expert_location_metadata, rank)
 
         if get_exec().moe.moe_a2a_backend == "mori":
             return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
@@ -402,7 +393,6 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
 
     def __init__(
         self,
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
@@ -667,11 +657,10 @@ _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
 class _Accumulator(ABC):
     @staticmethod
     def init_new(
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> _Accumulator:
-        return _Accumulator.get_class()(server_args, expert_location_metadata, rank)
+        return _Accumulator.get_class()(expert_location_metadata, rank)
 
     @staticmethod
     def get_class() -> Type[_Accumulator]:
@@ -684,11 +673,9 @@ class _Accumulator(ABC):
 
     def __init__(
         self,
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
-        self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
 
@@ -718,7 +705,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self._enable = self._server_args.should_report_expert_balancedness()
+        self._enable = reports_expert_balancedness()
 
         if self._enable:
             self.window_sizes = EPLB_BALANCEDNESS_WINDOW_SIZES
@@ -726,7 +713,6 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self._reset_server_log_history = True
             self._rank = torch.distributed.get_rank()
             expert_dispatch_cls = resolve_collector_class(
-                self._server_args,
                 STAT_LOGGER_ROLE_EXPERT_DISPATCH,
                 ExpertDispatchCollector,
             )
@@ -776,12 +762,10 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 compute_utilization_rate(gpu_physical_count)
             )
             should_track_history = not math.isclose(
-                self._server_args.eplb_min_rebalancing_utilization_threshold, 1.0
+                get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
             )
 
-            should_log = (
-                self._server_args.should_log_expert_balancedness_to_server_log()
-            )
+            should_log = logs_expert_balancedness_to_server_log()
             outputs["metrics"] = ExpertDistributionMetrics(
                 forward_pass_id=forward_pass_id,
                 eplb_balancedness=utilization_rate_gpu,
@@ -953,7 +937,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
     def _get_global_average_utilization_rate(self):
         if not self._enable or math.isclose(
-            self._server_args.eplb_min_rebalancing_utilization_threshold, 1.0
+            get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
         ):
             return None
 

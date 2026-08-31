@@ -237,14 +237,26 @@ DEFAULT_EST_TIME_SECONDS = 300.0
 STARTUP_OVERHEAD_SECONDS = 120.0
 DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
 
+STANDALONE_FILES = {
+    "2-npu": [
+        "ascend/test_glm_image_distributed.py",
+    ],
+}
+
+STANDALONE_FILE_EST_TIMES = {
+    "2-npu": {
+        "ascend/test_glm_image_distributed.py": 900.0,
+    },
+}
+
 SUITES = {
     "1-npu": [
         "ascend/test_server_1_npu.py",
-        # add new 1-npu test files here
+        *STANDALONE_FILES.get("1-npu", []),
     ],
     "2-npu": [
         "ascend/test_server_2_npu.py",
-        # add new 2-npu test files here
+        *STANDALONE_FILES.get("2-npu", []),
     ],
 }
 
@@ -258,6 +270,5 @@ PARAMETRIZED_CASE_GROUPS = {
 }
 
 FILE_SUITES = {}
-STANDALONE_FILES = {}
 COMPONENT_ACCURACY_SUITES = {}
 _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = None

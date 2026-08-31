@@ -146,6 +146,9 @@ class MambaPoolHost(HostKVCache):
                 device=device,
                 pin_memory=pin_memory,
                 allocator=allocator,
+                registration_granularity_bytes=(
+                    int(np.prod(dims[1:])) * dtype.itemsize
+                ),
             )
 
         if self.layout in ["page_first", "page_first_direct"]:

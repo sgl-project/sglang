@@ -133,7 +133,7 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
-                if get_parallel().config.pp_async_batch_depth > 0:
+                if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -149,7 +149,7 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                if get_parallel().config.pp_async_batch_depth == 0:
+                if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -285,7 +285,7 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
-                if get_parallel().config.pp_async_batch_depth > 0:
+                if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -303,7 +303,7 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                if get_parallel().config.pp_async_batch_depth == 0:
+                if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -446,7 +446,7 @@ class SchedulerPPMixin:
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
                 # early send output if possible
-                if get_parallel().config.pp_async_batch_depth > 0:
+                if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -464,7 +464,7 @@ class SchedulerPPMixin:
                         self.last_rank_comm_queue,
                     )
 
-                if get_parallel().config.pp_async_batch_depth == 0:
+                if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -575,12 +575,10 @@ class SchedulerPPMixin:
                 self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
-        self.pp_loop_size: int = (
-            self.ps.pp_size + get_parallel().config.pp_async_batch_depth
-        )
+        self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
-            not get_parallel().config.enable_dsa_prefill_context_parallel
+            not get_parallel().enable_dsa_prefill_context_parallel
         )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
@@ -741,15 +739,15 @@ class SchedulerPPMixin:
                 latencies.append(latency_ms)
 
                 # Release KV and Mamba cache
-                if req.req_pool_idx is not None:
+                if req.kv.holds_kv:
                     kv_indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, : req.extend_range.end
+                        req.kv.req_pool_idx, : req.extend_range.end
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
-                    if req.mamba_pool_idx is not None:
+                    if req.kv.holds_mamba:
                         self.req_to_token_pool.free_mamba_cache(req)
                     self.req_to_token_pool.free(req)
-                    req.kv = None
+                    req.kv.mark_kv_released()
 
             logger.info(
                 f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
@@ -1059,6 +1057,14 @@ class SchedulerPPMixin:
                     result.next_verify_top_scores_index
                 )
 
+        # Draft extend runs only on the last stage, but every rank needs its relayed
+        # output to fill PD auxiliary buffers.
+        draft_input = result.next_draft_input
+        if draft_input is not None and draft_input.topk_p is not None:
+            tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
+            tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
+            tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
+
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
             tensor_dict = {
@@ -1256,17 +1262,33 @@ class SchedulerPPMixin:
             return output_result
 
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
-        if is_spec:
-            # Spec prefill round: the sampled first token roots round 1's chain.
-            # Only the chunk that finishes the prompt samples a real token; a
-            # middle chunk's next_token_ids is a placeholder no consumer reads,
-            # and storing it would seed the next verify round with a token the
-            # model never emitted.
+
+        # Rebind the last stage's ring proposal as batch.spec_info so the PD result
+        # processor sees the same object on every rank.
+        next_draft_input = None
+        if "draft_topk_p" in pp_outputs.tensors:
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            next_draft_input = EagleDraftInput(
+                topk_p=pp_outputs["draft_topk_p"],
+                topk_index=pp_outputs["draft_topk_index"],
+                hidden_states=pp_outputs["draft_hidden_states"],
+                bonus_tokens=next_token_ids,
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+            )
+            batch.spec_info = next_draft_input
+
+        if is_spec and self._pp_spec_relay:
+            # Gated single-instance PP+spec: the sampled first token roots
+            # round 1's tree. Only the chunk that finishes the prompt samples
+            # a real token; a middle chunk's next_token_ids is a placeholder
+            # no consumer reads, and storing it would seed the next verify
+            # round with a token the model never emitted. The decode rounds
+            # relay their own state, so the future_map stash is skipped.
             if batch.contains_last_prefill_chunk:
                 from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
 
-                # The request leaves prefill proposing nothing; the last stage
-                # drafts a real tree for it at the end of its first verify.
                 fwd_batch = (
                     mb_metadata.fwd_batch
                     if mb_metadata.fwd_batch is not None
@@ -1284,16 +1306,27 @@ class SchedulerPPMixin:
             # PP rank 0 also relays into output_tokens_buf so the next iter's
             # resolve_forward_inputs finds these tokens for the decode portion
             # of mixed-chunk batches (which gather via mix_running_indices).
-            # (Spec FutureMap stores draft-input payloads, not bare bonus
-            # tokens, so the stash is non-spec only.)
             self.future_map.stash(
-                batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
+                batch.req_pool_indices,
+                RelayPayload(
+                    bonus_tokens=next_token_ids,
+                    topk_p=None if next_draft_input is None else next_draft_input.topk_p,
+                    topk_index=(
+                        None if next_draft_input is None else next_draft_input.topk_index
+                    ),
+                    hidden_states=(
+                        None
+                        if next_draft_input is None
+                        else next_draft_input.hidden_states
+                    ),
+                ),
             )
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
             next_token_ids=pp_outputs["next_token_ids"],
+            next_draft_input=next_draft_input,
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
