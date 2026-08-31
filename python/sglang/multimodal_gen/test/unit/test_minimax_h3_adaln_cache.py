@@ -321,6 +321,19 @@ def test_precision_fp32_projects_in_fp32_then_stores_bf16(tmp_path):
         MiniMaxH3AdalnCache(_ARCH, weight_files=[str(weight_path)], precision="fp64")
 
 
+def test_lora_guard_rejects_adaln_keys_in_cache_mode():
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+        MiniMaxH3DiTModel,
+    )
+
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model._adaln_precomputed = True
+    adapter = {"blocks.0.adaln_proj.linear.lora_A": torch.zeros(1)}
+    with pytest.raises(ValueError, match="adaln_proj"):
+        MiniMaxH3DiTModel.prepare_lora_adapter(model, adapter)
+
+
 def test_invalidate_drops_all_tiers_and_allows_rebuild(tmp_path):
     cache = _online_cache(
         tmp_path,

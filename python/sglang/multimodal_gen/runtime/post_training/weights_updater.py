@@ -409,6 +409,20 @@ class WeightsUpdater:
                 self._module_weight_dirs[module_name] = weights_map[module_name]
             if target_modules is None:
                 self.pipeline.model_path = local_model_path
+            # Deferred import: this module must stay importable without the
+            # model zoo.
+            from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+                MiniMaxH3DiTModel,
+            )
+
+            for module_name, module in modules_to_update:
+                if isinstance(module, MiniMaxH3DiTModel):
+                    # Cached AdaLN plans are weight-derived; they must not
+                    # survive a weight swap (regardless of flush_cache, which
+                    # only governs optimization caches like TeaCache).
+                    module.refresh_adaln_cache_after_weight_update(
+                        weights_path=weights_map[module_name]
+                    )
 
         gc.collect()
         torch.cuda.empty_cache()

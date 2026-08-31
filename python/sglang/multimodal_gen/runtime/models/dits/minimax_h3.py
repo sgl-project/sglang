@@ -7,6 +7,7 @@ contract accepts packed inference keyword arguments and returns packed logits.
 
 from __future__ import annotations
 
+import glob
 import math
 import os
 from collections import defaultdict
@@ -1464,6 +1465,19 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self, adapter: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Project released-checkpoint AdaLN LoRAs onto pruned coordinates."""
+        if self._adaln_precomputed:
+            adaln_keys = sorted(key for key in adapter if ".adaln_proj." in key)
+            if adaln_keys:
+                # Without this the adapter's adaln deltas are dropped without
+                # a trace (no adaln_proj modules exist to attach them to) and
+                # the online rebuild reads base weights from disk regardless.
+                raise ValueError(
+                    "MiniMax H3 AdaLN cache modes (--minimax-h3-adaln-online / "
+                    "--minimax-h3-adaln-cache-path) cannot apply LoRA deltas "
+                    f"on adaln_proj ({len(adaln_keys)} keys, e.g. "
+                    f"{adaln_keys[0]!r}); serve this adapter with resident "
+                    "AdaLN weights"
+                )
         full_width = self.arch.adaln_affine_input_dim
         if full_width is None:
             return adapter
@@ -1546,6 +1560,40 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
             cache.build(step_timesteps, embed=embed)
         return cache.resolve_slots(step_timesteps)
+
+    def refresh_adaln_cache_after_weight_update(
+        self, *, weights_path: str | None
+    ) -> None:
+        """Drop cached AdaLN plans after the checkpoint changed on disk.
+
+        Cached plans are weight-derived values; keeping them after an update
+        silently serves the previous checkpoint's conditioning.
+        """
+        cache = self.adaln_cache
+        if cache is None:
+            return
+        if cache.weight_files is None:
+            logger.warning(
+                "MiniMax H3 AdaLN sidecar (--minimax-h3-adaln-cache-path) was "
+                "built against the previous weights; requests keep using its "
+                "stale conditioning until the sidecar is rebuilt"
+            )
+            return
+        files: list[str] = []
+        if weights_path is not None:
+            if os.path.isdir(weights_path):
+                files = sorted(glob.glob(os.path.join(weights_path, "*.safetensors")))
+            elif weights_path.endswith(".safetensors"):
+                files = [weights_path]
+        if files:
+            cache.weight_files = files
+        else:
+            logger.warning(
+                "MiniMax H3 AdaLN rebuild source not retargeted (no safetensors "
+                "under %s); rebuilds keep reading the original checkpoint",
+                weights_path,
+            )
+        cache.invalidate()
 
     def _can_batch_block_adaln(self) -> bool:
         return (

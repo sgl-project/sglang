@@ -420,6 +420,15 @@ class TransformerLoader(ComponentLoader):
                     "--minimax-h3-adaln-online and --minimax-h3-adaln-cache-path "
                     "are mutually exclusive"
                 )
+            if dit_config.arch_config.checkpoint_uses_diffusers_layout:
+                # The rebuild reads native tensor names straight from the
+                # shards; on a Diffusers-layout checkpoint it would KeyError
+                # on the first request instead of failing here.
+                raise ValueError(
+                    "--minimax-h3-adaln-online requires the native-layout "
+                    "MiniMax H3 checkpoint (FL2VA/transformer or "
+                    "Ref2VA/transformer), not the Diffusers-layout one"
+                )
             # Keep the weights off-device; the model rebuilds the AdaLN
             # outputs from the checkpoint for each request's timestep plan.
             init_params["adaln_weight_files"] = safetensors_list

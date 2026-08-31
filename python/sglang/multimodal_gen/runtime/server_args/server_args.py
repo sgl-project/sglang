@@ -624,7 +624,24 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_cfg_parallel()
         self._validate_batching()
         self._validate_breakable_cuda_graph()
+        self._validate_minimax_h3_adaln()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_minimax_h3_adaln(self) -> None:
+        """The online-rebuild tuning flags do nothing in other AdaLN modes;
+        an explicitly set but ignored flag is a misconfiguration."""
+        if self.minimax_h3_adaln_online:
+            return
+        for arg_name in (
+            "minimax_h3_adaln_gpu_plans",
+            "minimax_h3_adaln_host_cache_gb",
+            "minimax_h3_adaln_precision",
+        ):
+            if self.is_arg_explicitly_set(arg_name):
+                flag = "--" + arg_name.replace("_", "-")
+                raise ValueError(
+                    f"{flag} only takes effect with --minimax-h3-adaln-online"
+                )
 
     def _validate_scheduler_rpc_timeout(self) -> None:
         timeout = self.scheduler_rpc_timeout
