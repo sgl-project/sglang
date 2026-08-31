@@ -42,6 +42,7 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
     )
+
     try:
         from sgl_kernel.kvcacheio import transfer_kv_per_layer_mla_lf_pf
     except ImportError:
@@ -355,9 +356,7 @@ class DSAIndexerPoolHost(HostKVCache):
         if self._is_device_layer_sharded(device_pool):
             # Per-layer generic kernels dereference both index arrays on device.
             if io_backend == "kernel" and not host_indices.is_cuda:
-                host_indices = host_indices.to(
-                    device_indices.device, non_blocking=True
-                )
+                host_indices = host_indices.to(device_indices.device, non_blocking=True)
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
                     device_pool, host_indices, device_indices, layer_id, io_backend

@@ -52,11 +52,7 @@ device_module = get_device_module()
 
 def should_skip_mla_storage_backup(config: HiCacheStorageConfig) -> bool:
     """Skip redundant MLA TP writers only when context parallelism is disabled."""
-    return (
-        config.is_mla_model
-        and config.attn_cp_size == 1
-        and config.tp_rank != 0
-    )
+    return config.is_mla_model and config.attn_cp_size == 1 and config.tp_rank != 0
 
 
 class LayerLoadingEvent:

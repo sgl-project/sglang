@@ -152,9 +152,7 @@ def _cpu_jit_one_layer_mla_copy(
     cache_dst[indices_dst] = cache_src[indices_src]
 
 
-def _cpu_per_layer_mla_lf_pf_copy(
-    *, src, dst, src_indices, dst_indices, layer_id, **_
-):
+def _cpu_per_layer_mla_lf_pf_copy(*, src, dst, src_indices, dst_indices, layer_id, **_):
     src_indices = src_indices.to(dtype=torch.int64, device="cpu")
     dst_indices = dst_indices.to(dtype=torch.int64, device="cpu")
     dst[dst_indices, layer_id] = src[src_indices]

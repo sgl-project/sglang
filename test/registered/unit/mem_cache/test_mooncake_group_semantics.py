@@ -386,12 +386,8 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         call1 = fake_store1.batch_put_calls[0]
         self.assertEqual(call0["keys"], ["page0_cp0_8_k"])
         self.assertEqual(call1["keys"], ["page0_cp1_8_k"])
-        self.assertEqual(
-            call0["args"][0].group_ids, ["sglang-hicache:page0:cp0_8"]
-        )
-        self.assertEqual(
-            call1["args"][0].group_ids, ["sglang-hicache:page0:cp1_8"]
-        )
+        self.assertEqual(call0["args"][0].group_ids, ["sglang-hicache:page0:cp0_8"])
+        self.assertEqual(call1["args"][0].group_ids, ["sglang-hicache:page0:cp1_8"])
 
     def test_mla_cp_ranks_use_distinct_v2_indexer_keys(self):
         store0, fake_store0 = _make_store(
@@ -420,12 +416,8 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         call1 = fake_store1.batch_put_calls[0]
         self.assertEqual(call0["keys"], ["page0_cp0_8_indexer"])
         self.assertEqual(call1["keys"], ["page0_cp1_8_indexer"])
-        self.assertEqual(
-            call0["args"][0].group_ids, ["sglang-hicache:page0:cp0_8"]
-        )
-        self.assertEqual(
-            call1["args"][0].group_ids, ["sglang-hicache:page0:cp1_8"]
-        )
+        self.assertEqual(call0["args"][0].group_ids, ["sglang-hicache:page0:cp0_8"])
+        self.assertEqual(call1["args"][0].group_ids, ["sglang-hicache:page0:cp1_8"])
 
     def test_split_heads_group_ids(self):
         store, fake_store = _make_store(
