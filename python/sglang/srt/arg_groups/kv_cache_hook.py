@@ -272,13 +272,14 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "audited for the unified pool's virtual/kernel-facing loc translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
+    assert cfg.speculative_eagle_topk in (None, 1), (
+        "--enable-unified-memory supports a linear draft chain only "
+        "(--speculative-eagle-topk in {None, 1}); tree verify relocates "
+        "accepted tokens one at a time inside the target pool, which the "
+        "unified pool's page-granular move_kv_cache cannot express. Got "
+        f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+    )
     if cfg.speculative_algorithm == "DSPARK":
-        assert cfg.speculative_eagle_topk in (None, 1), (
-            "--enable-unified-memory + DSPARK supports a linear draft "
-            "chain only (--speculative-eagle-topk in {None, 1}); tree "
-            "verify is not audited for the unified pool. Got "
-            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
-        )
         _assert_spec_verify_backends(server_args, algorithm="DSPARK")
     assert not cfg.enable_two_batch_overlap, (
         "--enable-unified-memory does not support --enable-two-batch-overlap: "
