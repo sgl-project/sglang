@@ -93,6 +93,7 @@ class TestComponentLoaderIdentity(unittest.TestCase):
             component_precisions={},
             component_weights_paths={},
             component_direct_gpu_weight_loading=set(),
+            pipeline_config=SimpleNamespace(),
             resolve_component_attention_backend=lambda *_names: (None, None),
         )
 
