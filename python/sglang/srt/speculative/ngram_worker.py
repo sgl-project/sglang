@@ -29,6 +29,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
+    generate_tree_mask_func,
     move_accept_tokens_to_target_kvcache,
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
@@ -360,21 +361,18 @@ class NGRAMWorker(BaseSpecWorker):
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
         if USE_FULL_MASK and not _is_cpu:
-            tree_mask = []
-            mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
-            # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
-            for i in range(bs):
-                req_mask = torch.cat(
-                    (
-                        ones_masks[i],
-                        torch.from_numpy(mask[i]).to(
-                            device=self.device, non_blocking=True
-                        ),
-                    ),
-                    dim=1,
-                ).to(torch.bool)
-                tree_mask.append(req_mask.flatten())
-            tree_mask = torch.cat(tree_mask, dim=0)
+            req_masks_size = batch.seq_lens_sum * self.draft_token_num
+            tree_mask_size = mask.size
+            req_masks = torch.ones(
+                (req_masks_size,), dtype=torch.bool, device=self.device
+            )
+            output = torch.empty(
+                (req_masks_size + tree_mask_size,), dtype=torch.bool, device=self.device
+            )
+            generate_tree_mask_func(
+                req_masks, tree_mask, batch, self.draft_token_num, output
+            )
+            tree_mask = output
 
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.input_ids = draft_tokens
