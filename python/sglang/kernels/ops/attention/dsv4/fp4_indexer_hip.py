@@ -33,7 +33,7 @@ class FP4DecodeWorkspace(NamedTuple):
     c4_seq_lens: torch.Tensor
     cta_info: torch.Tensor
     cta_count: int
-    logits: torch.Tensor
+    max_seq_len: int
     # Held only so AITER's schedule scratch never returns to the graph memory
     # pool: the captured builder writes it again on every replay.
     schedule_scratch: torch.Tensor
@@ -45,7 +45,7 @@ class FP4PrefillWorkspace(NamedTuple):
     local_starts: torch.Tensor
     cta_info: torch.Tensor
     cta_count: int
-    logits: torch.Tensor
+    max_seq_len: int
 
 
 def aiter_q_indexer_fp4(
@@ -134,13 +134,8 @@ def prepare_fp4_decode_workspace(
         next_n=1,
         cta_info_out=cta_info,
     )
-    # AITER writes every score below c4_seq_lens and length-aware top-k reads
-    # exactly that window, so the tail never has to be initialized.
-    logits = torch.empty(
-        (num_queries, max_seq_len), dtype=torch.float32, device=guarded.device
-    )
     return FP4DecodeWorkspace(
-        guarded, c4_seq_lens, cta_info, cta_count, logits, schedule_scratch
+        guarded, c4_seq_lens, cta_info, cta_count, max_seq_len, schedule_scratch
     )
 
 
@@ -179,13 +174,10 @@ def prepare_fp4_prefill_workspace(
                 (cta_count, CTA_INFO_WIDTH), dtype=torch.int32, device=guarded.device
             ),
             cta_count=cta_count,
-            # See prepare_fp4_decode_workspace on why the tail stays uninitialized.
-            logits=torch.empty(
-                (num_queries, max_seq_len), dtype=torch.float32, device=guarded.device
-            ),
+            max_seq_len=max_seq_len,
         )
     else:
-        _, max_seq_len = _guard_page_table(page_table, out=workspace.guarded_page_table)
+        _guard_page_table(page_table, out=workspace.guarded_page_table)
 
     assert c4_seq_lens.shape[0] == workspace.row_to_batch.shape[0], (
         f"c4_seq_lens rows {c4_seq_lens.shape[0]} do not match the workspace's "
@@ -197,7 +189,7 @@ def prepare_fp4_prefill_workspace(
         c4_seq_lens,
         block_k=256,
         parallel_unit_num=workspace.cta_count,
-        max_seq_len=max_seq_len,
+        max_seq_len=workspace.max_seq_len,
         cta_info_out=workspace.cta_info,
     )
     return workspace
@@ -228,20 +220,27 @@ def aiter_fp4_paged_mqa_logits(
     workspace = decode_workspace if is_decode else prefill_workspace
     # A workspace is bound to one row count. DP padding or truncated activations
     # can leave it stale, in which case fall back to building the schedule here.
-    if workspace is not None and workspace.logits.shape[0] != num_tokens:
+    if workspace is not None and workspace.guarded_page_table.shape[0] != num_tokens:
         workspace = None
     if workspace is not None:
         page_table = workspace.guarded_page_table
-        max_seq_len = workspace.logits.shape[1]
+        max_seq_len = workspace.max_seq_len
     else:
         page_table, max_seq_len = _guard_page_table(page_table)
     q_payload = q_fp4.view(torch.uint8)
     k_payload = k_payload.view(torch.uint8)
+    # Scored write-once and freed with this call. Recycling it through the
+    # allocator costs nothing because a pinned cta_info makes the kernel skip
+    # its -inf pre-fill and the length-aware top-k reads only [0, c4_seq_len).
+    logits = torch.empty(
+        (num_tokens, max_seq_len), dtype=torch.float32, device=q_fp4.device
+    )
     common = {
         "weight_scale": weight_scale,
         "block_k": 256,
         "kv_block_size": _KV_BLOCK_SIZE,
         "num_warps": 4,
+        "out": logits,
     }
 
     if is_decode:
@@ -249,7 +248,6 @@ def aiter_fp4_paged_mqa_logits(
             {}
             if workspace is None
             else {
-                "out": workspace.logits,
                 "cta_info": workspace.cta_info,
                 "total_ctas": workspace.cta_count,
             }
@@ -279,7 +277,6 @@ def aiter_fp4_paged_mqa_logits(
             )
         else:
             pinned = {
-                "out": workspace.logits,
                 "cta_info": workspace.cta_info,
                 "n_ctas": workspace.cta_count,
             }

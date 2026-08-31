@@ -895,6 +895,10 @@ class DeepseekV4HipRadixBackend(
     def _fp4_workspaces_enabled(self, metadata) -> bool:
         return (
             self.enable_deepseek_v4_fp4_indexer
+            # Draft-step backends drive the NextN layer, which is built with
+            # compress_ratio_override=0 and so owns no C4 indexer. Their
+            # workspaces would be built, scheduled, and never read.
+            and self.speculative_num_steps == 0
             and isinstance(metadata, DSV4Metadata)
             and metadata.indexer_metadata is not None
             and metadata.c4_compress_metadata is not None
