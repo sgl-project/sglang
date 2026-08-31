@@ -782,7 +782,10 @@ class QwenImageCrossAttention(nn.Module):
         ) = _get_qkv_projections(self, hidden_states, encoder_hidden_states)
 
         freqs_complex = cross_attention_kwargs.get("freqs_complex")
-        img_complex, txt_complex = freqs_complex
+        if freqs_complex is not None:
+            img_complex, txt_complex = freqs_complex
+        else:
+            img_complex = txt_complex = None
 
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.local_num_heads, self.head_dim))
