@@ -235,6 +235,14 @@ def _resolve_dflash_aux_hidden_state(
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
+        # Draft KV head geometry for the unified fused-draft-KV path — the
+        # same fields the EAGLE arm records (one trio serves every draft-KV
+        # algorithm); same pre-distributed-init contract: TOTAL kv heads.
+        config.eagle_draft_total_kv_heads = int(
+            draft_model_config.get_total_num_kv_heads()
+        )
+        config.eagle_draft_head_dim = int(draft_model_config.head_dim)
+        config.eagle_draft_v_head_dim = int(draft_model_config.v_head_dim)
         config.dflash_target_layer_ids = target_layer_ids
         config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,

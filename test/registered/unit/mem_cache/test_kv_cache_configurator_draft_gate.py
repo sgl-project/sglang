@@ -201,7 +201,16 @@ class TestDraftBindingDispatch(CustomTestCase):
             forward_stream=None,
         )
 
-    def _run(self, *, algorithm, alloc, max_total_num_tokens):
+    def _run(
+        self,
+        *,
+        algorithm,
+        alloc,
+        max_total_num_tokens,
+        req_to_token_pool="shared",
+    ):
+        if req_to_token_pool == "shared":
+            req_to_token_pool = object()
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
         cfg.is_draft_worker = True
         cfg.spec_algorithm = algorithm
@@ -224,6 +233,8 @@ class TestDraftBindingDispatch(CustomTestCase):
         def _capture(self, *, sizes, **kw):
             raise _CapturedSizes(sizes)
 
+        built_req_pool = SimpleNamespace(kind="private-compact")
+
         with (
             patch.object(
                 kcc,
@@ -243,10 +254,15 @@ class TestDraftBindingDispatch(CustomTestCase):
                 lambda self, *a, **kw: None,
             ),
             patch.object(kcc.KVCacheConfigurator, "_build_token_to_kv_pool", _capture),
+            patch.object(
+                kcc.KVCacheConfigurator,
+                "_build_req_to_token_pool",
+                lambda self, *, max_num_reqs: built_req_pool,
+            ),
         ):
             return cfg._init_pools(
                 sizes=sizes,
-                req_to_token_pool=object(),
+                req_to_token_pool=req_to_token_pool,
                 token_to_kv_pool_allocator=alloc,
             )
 
@@ -273,6 +289,37 @@ class TestDraftBindingDispatch(CustomTestCase):
         )
         self.assertIsInstance(pools.token_to_kv_pool, UnifiedDraftKVPool)
         self.assertIs(pools.token_to_kv_pool_allocator, alloc)
+
+    def test_dspark_draft_with_a_region_binds_the_fused_pool(self):
+        """DSPARK's draft KV fuses when the target resolved a region (its
+        block rows are indexed by the same token->page identity); the
+        region-less private arm above remains the automatic fallback."""
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedDraftKVPool
+
+        alloc = self._swa_allocator(with_draft_region=True)
+        pools = self._run(
+            algorithm=SpeculativeAlgorithm.DSPARK,
+            alloc=alloc,
+            max_total_num_tokens=alloc.size_full,
+        )
+        self.assertIsInstance(pools.token_to_kv_pool, UnifiedDraftKVPool)
+
+    def test_compact_dflash_draft_fuses_with_a_private_req_table(self):
+        """Compact-window DFLASH passes req_to_token_pool=None (it keeps a
+        private table narrowing WHICH pages the draft reads) while the KV
+        itself stays fused: the fused arm must build that table instead of
+        refusing the None."""
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedDraftKVPool
+
+        alloc = self._swa_allocator(with_draft_region=True)
+        pools = self._run(
+            algorithm=SpeculativeAlgorithm.DFLASH,
+            alloc=alloc,
+            max_total_num_tokens=alloc.size_full,
+            req_to_token_pool=None,
+        )
+        self.assertIsInstance(pools.token_to_kv_pool, UnifiedDraftKVPool)
+        self.assertEqual(pools.req_to_token_pool.kind, "private-compact")
 
     def test_eagle_draft_without_a_region_falls_back_to_the_private_arm(self):
         """Target boot declines a region for legitimate geometry (asymmetric

@@ -513,9 +513,14 @@ class KVCacheConfigurator:
                         UnifiedDraftKVPool,
                     )
 
-                    assert (
-                        req_to_token_pool is not None
-                    ), "a draft worker shares the target's req_to_token_pool"
+                    if req_to_token_pool is None:
+                        # Compact-window DFLASH: a private req->token table
+                        # (entries = target virtual ids) narrows WHICH pages
+                        # the draft reads; the KV itself stays fused in the
+                        # target's pages.
+                        req_to_token_pool = self._build_req_to_token_pool(
+                            max_num_reqs=sizes.max_running_requests
+                        )
                     draft_pool = UnifiedDraftKVPool(
                         unified_buffer=alloc.unified_buffer,
                         host_sub_pool_name="full",
@@ -638,7 +643,9 @@ class KVCacheConfigurator:
         of its own). Fallback is automatic: target boot declines a region for
         legitimate geometry (asymmetric draft rows), and the private arm is
         the rollback lever."""
-        if not self.spec_algorithm.is_eagle():
+        if not (
+            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family()
+        ):
             return None
         spec = alloc.unified_buffer.spec("full")
         if spec.draft_region is None:
@@ -871,9 +878,10 @@ class KVCacheConfigurator:
         Fusion engages only for: unified memory ON, a unified target
         (hybrid-SWA or mamba hybrid, either full-pool kind — the draft is
         dense per token, so it fuses into the full sub-pool's pages), an
-        EAGLE-family algorithm whose draft config was loaded at target boot,
-        and a uniform-row draft (dense views need equal K/V widths). None
-        otherwise; callers fall back to the private draft pool.
+        EAGLE-family or DFLASH/DSPARK algorithm whose draft config was
+        loaded at target boot, and a uniform-row draft (dense views need
+        equal K/V widths). None otherwise; callers fall back to the private
+        draft pool.
         """
         from sglang.srt.mem_cache.unified_memory_pool import (
             DenseDraftRegion,
@@ -891,12 +899,17 @@ class KVCacheConfigurator:
         host_has_fusable_full_pool = (
             self.is_hybrid_swa or self.mambaish_config is not None
         ) and not (self.is_hybrid_swa and self.mambaish_config is not None)
+        if self.spec_algorithm.is_eagle():
+            draft_num_layers = aux.eagle_draft_num_layers
+        elif self.spec_algorithm.is_dflash_family():
+            draft_num_layers = aux.dflash_draft_num_layers
+        else:
+            draft_num_layers = None
         if not (
             get_memory().enable_unified_memory
             and host_has_fusable_full_pool
             and not self.is_draft_worker
-            and self.spec_algorithm.is_eagle()
-            and aux.eagle_draft_num_layers
+            and draft_num_layers
             and aux.eagle_draft_total_kv_heads
         ):
             return None
@@ -917,7 +930,7 @@ class KVCacheConfigurator:
             1, int(aux.eagle_draft_total_kv_heads) // get_parallel().attn_tp_size
         )
         return DenseDraftRegion(
-            layer_num=int(aux.eagle_draft_num_layers),
+            layer_num=int(draft_num_layers),
             head_num=draft_kv_heads,
             head_dim=int(aux.eagle_draft_head_dim),
             # Drafts store KV in the same server kv dtype as the target.
