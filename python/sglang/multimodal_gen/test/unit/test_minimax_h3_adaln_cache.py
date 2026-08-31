@@ -14,7 +14,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
-from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     MiniMaxH3AdalnCache,
 )
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
