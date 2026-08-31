@@ -1213,6 +1213,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )
+                return batch_output
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 
