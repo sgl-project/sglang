@@ -720,6 +720,16 @@ class ServerArgs:
         "The number of decode rounds to run after a prefill batch before scheduling the next prefill. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
         NS("schedule"),
     ] = 0
+    enable_prefill_decode_phase_separation: A[
+        bool,
+        (
+            "Keep prefill and decode phases separate across data-parallel "
+            "attention ranks. When any rank schedules prefill, ranks without "
+            "prefill execute an idle batch and preserve their running decode "
+            "batch for a later iteration."
+        ),
+        NS("schedule"),
+    ] = False
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",

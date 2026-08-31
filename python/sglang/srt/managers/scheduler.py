@@ -3290,15 +3290,15 @@ class Scheduler(
             running_batch = prefill_plan.running_batch
 
         need_mlp_sync = self.require_mlp_sync
-        if (
-            need_mlp_sync
-            and not self.spec_algorithm.is_none()
-            and not get_spec().speculative_skip_dp_mlp_sync
+        if need_mlp_sync and (
+            get_schedule().enable_prefill_decode_phase_separation
+            or (
+                not self.spec_algorithm.is_none()
+                and not get_spec().speculative_skip_dp_mlp_sync
+            )
         ):
-            # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
-            # Before merging the new batch into running batch:
-            # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
-            # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
+            # A peer prefill turns None into IDLE and preserves local decode.
+            # All-None keeps need_mlp_sync set for the selected decode below.
             new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 

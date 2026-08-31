@@ -157,6 +157,15 @@ class TestPrepareServerArgs(CustomTestCase):
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
 
+    def test_prefill_decode_phase_separation(self):
+        args = prepare_server_args(
+            ["--model-path", "dummy", "--enable-prefill-decode-phase-separation"]
+        )
+        args.resolve_once()
+        self.assertTrue(
+            resolution_result(args, "enable_prefill_decode_phase_separation")
+        )
+
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
