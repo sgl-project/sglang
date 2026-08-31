@@ -351,8 +351,12 @@ class GptOssSparseMoeBlock(nn.Module):
 def moe_impl(layer_id: int, hidden_states: torch.Tensor) -> torch.Tensor:
     forward_context = get_tc_piecewise_forward_context()
     moe_fusion = forward_context.moe_fusions[layer_id]
-    router_logits, _ = moe_fusion.router(hidden_states)
-    topk_output = moe_fusion.topk(hidden_states, router_logits)
+    router_input = hidden_states
+    router_in_dim = moe_fusion.router.weight.shape[-1]
+    if hidden_states.shape[-1] != router_in_dim:
+        router_input = hidden_states[..., :router_in_dim]
+    router_logits, _ = moe_fusion.router(router_input)
+    topk_output = moe_fusion.topk(router_input, router_logits)
     final_hidden_states = moe_fusion.experts(hidden_states, topk_output)
     return final_hidden_states
 
