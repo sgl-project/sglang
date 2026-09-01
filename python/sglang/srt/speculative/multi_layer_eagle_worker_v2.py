@@ -164,7 +164,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 is_multi_layer_eagle=True,
@@ -844,7 +844,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     self.cuda_graph_runner_for_draft_extend.prune_draft_extend_logits
                 )
             else:
-                prune_logits = not require_gathered_buffer(self.server_args)
+                prune_logits = not require_gathered_buffer()
             if prune_logits:
                 forward_batch.spec_info.select_index = select_index
             # Left unmarked on every platform: each de-tied runner has its own

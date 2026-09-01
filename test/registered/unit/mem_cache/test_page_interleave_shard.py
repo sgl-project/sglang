@@ -506,10 +506,9 @@ class _GraftReq:
         self.fill_ids = list(fill_ids)
         self.origin_input_ids = array("q", fill_ids)
         self.output_ids = array("q", [])
-        self.req_pool_idx = req_pool_idx
+        self.kv = SimpleNamespace(req_pool_idx=req_pool_idx, cache_protected_len=0)
         self.extra_key = None
         self.cache_salt = None
-        self.cache_protected_len = 0
         self.prefix_indices = torch.empty(0, dtype=torch.int64)
         self.last_node = None
         self.priority = 0
@@ -602,7 +601,7 @@ class TestRotationGraftDecline(CustomTestCase):
         # No dedup free, no rebind: the request keeps its own locs whole.
         allocator.free.assert_not_called()
         self.assertTrue(torch.equal(req.prefix_indices, own_locs))
-        self.assertEqual(req.cache_protected_len, 0)
+        self.assertEqual(req.kv.cache_protected_len, 0)
         self.assertTrue(torch.equal(req_to_token[0, :12], own_locs))
 
     def test_cache_finished_decline_frees_duplicates_and_suffix(self):

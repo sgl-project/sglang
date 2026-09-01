@@ -1111,6 +1111,7 @@
                         "pages": [
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_r1",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v3_2",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v4_flash",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_1",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/hy3",
@@ -1133,7 +1134,9 @@
                         "pages": [
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v3_2",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v4_flash",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/glm_5_1",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/glm_5_2",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/minimax_m2_5",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_flash",
@@ -1226,6 +1229,8 @@
                   {
                     "group": "GLM",
                     "pages": [
+                      "cookbook/autoregressive/GLM/GLM-5.3",
+                      "cookbook/autoregressive/GLM/GLM-5.3-Flash",
                       "cookbook/autoregressive/GLM/GLM-5.2",
                       "cookbook/autoregressive/GLM/GLM-5.1",
                       "cookbook/autoregressive/GLM/GLM-5",
@@ -1242,6 +1247,7 @@
                   {
                     "group": "Qwen",
                     "pages": [
+                      "cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next",
                       "cookbook/autoregressive/Qwen/Qwen3.8",
                       "cookbook/autoregressive/Qwen/Qwen3.8-27B",
                       "cookbook/autoregressive/Qwen/Qwen3.6",
@@ -1300,6 +1306,12 @@
                       "cookbook/autoregressive/Google/EmbeddingGemma",
                       "cookbook/autoregressive/Google/Gemma4",
                       "cookbook/autoregressive/Google/DiffusionGemma"
+                    ]
+                  },
+                  {
+                    "group": "IBM",
+                    "pages": [
+                      "cookbook/autoregressive/IBM/Granite-4.2"
                     ]
                   },
                   {
@@ -1418,6 +1430,7 @@
                   {
                     "group": "Tencent",
                     "pages": [
+                      "cookbook/autoregressive/Tencent/Hy4-Preview",
                       "cookbook/autoregressive/Tencent/Hy3",
                       "cookbook/autoregressive/Tencent/Hunyuan3-Preview"
                     ]
@@ -1487,6 +1500,13 @@
                     "pages": [
                       "cookbook/diffusion/Qwen-Image/Qwen-Image",
                       "cookbook/diffusion/Qwen-Image/Qwen-Image-Edit"
+                    ]
+                  },
+                  {
+                    "group": "LongCat-Image",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/LongCat/LongCat-Image"
                     ]
                   },
                   {

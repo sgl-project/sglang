@@ -12,6 +12,10 @@ from transformers import PretrainedConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
+    LongCatImageEditPipelineConfig,
+    LongCatImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
 )
@@ -27,6 +31,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8Config
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
+    ComfyNvfp4Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -51,7 +58,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     ComponentCheckpointUnsupportedError,
     ComponentLoader,
     NativeComponentLoaderRequired,
-    uses_native_transformers_bnb4,
+    uses_native_transformers_quantization,
 )
 from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     gguf_weights_iterator,
@@ -128,15 +135,23 @@ _TRANSFORMERS_ENCODER_ONLY_CLASSES = {
 }
 
 
-def _delegate_standard_bnb4_to_transformers(
+def _delegate_quantized_checkpoint_to_transformers(
     component_config: dict,
     component_name: str,
+    *,
+    methods: frozenset[str] | None = None,
 ) -> None:
-    """Use Transformers when it owns a standard serialized BnB4 checkpoint."""
-    if uses_native_transformers_bnb4(component_config, component_name):
+    """Use Transformers when it owns the checkpoint's serialized format."""
+    quant_spec = resolve_checkpoint_quant_spec(component_config)
+    if quant_spec is None or (
+        methods is not None and quant_spec.declared_method not in methods
+    ):
+        return
+    if uses_native_transformers_quantization(component_config, component_name):
+        method = quant_spec.declared_method or "unspecified"
         raise NativeComponentLoaderRequired(
-            f"{component_name!r} delegates serialized bitsandbytes checkpoint "
-            "loading to Transformers"
+            f"{component_name!r} delegates serialized quant_method={method!r} "
+            "checkpoint loading to Transformers"
         )
 
 
@@ -261,9 +276,10 @@ def _configure_encoder_quantization(
         # themselves; running the generic lifecycle as well would process twice.
         return
 
-    _delegate_standard_bnb4_to_transformers(
+    _delegate_quantized_checkpoint_to_transformers(
         component_config,
         component_name,
+        methods=frozenset({"bitsandbytes"}),
     )
     try:
         quant_config = _get_encoder_quant_config(
@@ -273,6 +289,10 @@ def _configure_encoder_quantization(
             model_cls,
         )
     except (KeyError, NotImplementedError, TypeError, ValueError) as error:
+        _delegate_quantized_checkpoint_to_transformers(
+            component_config,
+            component_name,
+        )
         raise ComponentCheckpointUnsupportedError(
             f"Cannot configure checkpoint quantization for {component_name!r}: {error}"
         ) from error
@@ -298,6 +318,10 @@ def _configure_encoder_quantization(
         )
         quant_config = model_config.quant_config
     if quant_config is None:
+        _delegate_quantized_checkpoint_to_transformers(
+            component_config,
+            component_name,
+        )
         return
     if not issubclass(model_cls, EncoderTensorParallelMixin):
         raise ComponentCheckpointUnsupportedError(
@@ -320,7 +344,7 @@ def _resolve_and_configure_encoder_quantization(
     try:
         model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
     except Exception as resolution_error:
-        _delegate_standard_bnb4_to_transformers(
+        _delegate_quantized_checkpoint_to_transformers(
             component_config,
             component_name,
         )
@@ -410,7 +434,13 @@ def _require_quantized_encoder_layers(
         )
     if isinstance(
         quant_config,
-        (ComfyFp8Config, KitchenInt8Config, KitchenW4A4Config, KitchenW4A8Config),
+        (
+            ComfyFp8Config,
+            ComfyNvfp4Config,
+            KitchenInt8Config,
+            KitchenW4A4Config,
+            KitchenW4A8Config,
+        ),
     ):
         expected = set(quant_config.layer_markers)
         selected = set(quant_config.selected)
@@ -469,6 +499,16 @@ class TextEncoderLoader(ComponentLoader):
     component_names = ["text_encoder"]
     expected_library = "transformers"
     supports_online_quantization_override = True
+
+    def component_load_precision(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        override = server_args.component_precisions.get(component_name)
+        if override is not None:
+            return override
+        return server_args.pipeline_config.text_encoder_precisions[
+            self._extract_encoder_index(component_name)
+        ]
 
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
@@ -704,7 +744,9 @@ class TextEncoderLoader(ComponentLoader):
         )
 
         # TODO(mick): had to throw an exception for different text-encoder arch
-        encoder_index = self._extract_encoder_index(component_name)
+        encoder_index = self._extract_encoder_index(
+            self.structural_component_name(component_name)
+        )
         assert encoder_index < len(
             server_args.pipeline_config.text_encoder_configs
         ) and encoder_index < len(server_args.pipeline_config.text_encoder_precisions)
@@ -751,9 +793,8 @@ class TextEncoderLoader(ComponentLoader):
             server_args.encoder_parallel,
             prefer_dp=prefer_dp,
         )
-        encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
-            encoder_index
-        ]
+        encoder_dtype = self.component_load_precision(server_args, component_name)
+        assert encoder_dtype is not None
         # TODO(will): add support for other dtypes
         try:
             return self.load_model(
@@ -869,14 +910,16 @@ class TextEncoderLoader(ComponentLoader):
             with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
-                enable_image_understanding = (
-                    True
-                    if isinstance(
-                        server_args.pipeline_config, QwenImageEditPipelineConfig
-                    )
-                    else False
+                enable_image_understanding = isinstance(
+                    server_args.pipeline_config,
+                    (QwenImageEditPipelineConfig, LongCatImageEditPipelineConfig),
                 )
                 model_config.enable_image_understanding = enable_image_understanding
+                # LongCat feeds its padded body to the DiT, so it must mask
+                # padding on the cache-free path; scoped so others are unchanged.
+                model_config.honor_cache_free_padding_mask = isinstance(
+                    server_args.pipeline_config, LongCatImagePipelineConfig
+                )
                 model = model_cls(model_config)
 
             if not isinstance(model, EncoderTensorParallelMixin):
@@ -926,7 +969,7 @@ class TextEncoderLoader(ComponentLoader):
 
             if quant_config is not None and not isinstance(quant_config, GGUFConfig):
                 postprocess_device: torch.device | None = local_torch_device
-                if isinstance(quant_config, QuantoInt8Config) or (
+                if isinstance(quant_config, (ComfyNvfp4Config, QuantoInt8Config)) or (
                     isinstance(quant_config, KitchenInt8Config)
                     and quant_config.is_checkpoint_int8_serialized
                 ):

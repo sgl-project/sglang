@@ -23,6 +23,9 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedMambaSWATokenToKVPoolAllocator,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
@@ -106,7 +109,7 @@ class SchedulerInvariantChecker:
             session_held = self.pool_stats_observer.session_held_tokens()
             total = self.max_total_num_tokens
         full_evictable_size = ps.full_evictable_size
-        full_available_size = ps.full_available_size
+        full_available = ps.full_available_size
         allocator = self.token_to_kv_pool_allocator
         class_watermark_msg = ""
         from sglang.srt.mem_cache.allocator.page_interleave import (
@@ -126,7 +129,7 @@ class SchedulerInvariantChecker:
                 # The per-class free-page watermarks are exported alongside so
                 # a skewed class shows up in the log.
                 round_to = allocator.physical_page_size
-                full_available_size = allocator.aggregate_free_size()
+                full_available = allocator.aggregate_free_size()
                 class_watermark_msg = (
                     f", class_free_pages={allocator.class_free_page_counts()}"
                 )
@@ -139,9 +142,13 @@ class SchedulerInvariantChecker:
             full_evictable_size = (
                 (full_evictable_size + round_to - 1) // round_to * round_to
             )
+        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
+            # Pair the static per-layer total with the conserve view, never the
+            # byte-coordinated one -- see `conserve_full_available_size`.
+            full_available = allocator.conserve_full_available_size()
         leak, msg = self._check_pool_invariant(
             "full",
-            full_available_size,
+            full_available,
             full_evictable_size,
             protected,
             session_held,
@@ -158,9 +165,15 @@ class SchedulerInvariantChecker:
         return leak, msg
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
+        allocator = self.token_to_kv_pool_allocator
+        swa_available = ps.swa_available_size
+        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
+            # Tri-pool: same floating-boundary phantom as the full pool -- use the
+            # slot-conservation view, not the byte-coordinated min (see _check_full_pool).
+            swa_available = allocator.conserve_swa_available_size()
         return self._check_pool_invariant(
             "swa",
-            ps.swa_available_size,
+            swa_available,
             ps.swa_evictable_size,
             self.tree_cache.swa_protected_size(),
             self.pool_stats_observer.session_held_swa_tokens(),
@@ -276,19 +289,22 @@ class SchedulerInvariantChecker:
         swa_uncached = 0
         for batch in batches:
             for req in batch.reqs:
-                if req.kv is None:
+                if not req.kv.holds_kv:
                     continue
 
                 allocated_len = req.kv.kv_allocated_len
                 if self.page_size > 1:
                     allocated_len = ceil_align(allocated_len, self.page_size)
-                    assert req.cache_protected_len % self.page_size == 0
+                    assert req.kv.cache_protected_len % self.page_size == 0
 
-                full_uncached += allocated_len - req.cache_protected_len
+                full_uncached += allocated_len - req.kv.cache_protected_len
                 if self.is_hybrid_swa:
                     swa_uncached += allocated_len - max(
-                        req.cache_protected_len, req.kv.swa_evicted_seqlen
+                        req.kv.cache_protected_len, req.kv.swa_evicted_seqlen
                     )
+
+                if req.beam_group is not None:
+                    full_uncached += req.beam_group.extra_uncached_tokens()
 
         return full_uncached, swa_uncached
 
@@ -345,24 +361,24 @@ class SchedulerInvariantChecker:
         batch = self.get_last_batch()
         if batch is not None:
             for req in batch.reqs:
-                if req.kv is None:
+                if not req.kv.holds_kv:
                     continue
                 _add_owner(
                     req,
                     f"req {req.rid}",
-                    req.req_pool_idx,
-                    req.kv_committed_len,
+                    req.kv.req_pool_idx,
+                    req.kv.kv_committed_len,
                     req.kv.kv_allocated_len,
                 )
         sess = getattr(self.tree_cache, "slots", None)
         if sess:
             for sid, slot in sess.items():
-                if getattr(slot, "is_holding_kv", False):
+                if slot.kv.holds_kv:
                     _add_owner(
                         slot,
                         f"slot {sid[:8]}",
-                        slot.req_pool_idx,
-                        slot.kv_committed_len,
+                        slot.kv.req_pool_idx,
+                        slot.kv.kv_committed_len,
                         slot.kv.kv_allocated_len,
                     )
 
@@ -497,6 +513,8 @@ class SchedulerInvariantChecker:
         return has_leak, messages
 
     def _check_tree_cache(self):
+        if not envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():
+            return
         if (
             self.tree_cache.is_tree_cache()
             and (self.is_hybrid_swa and self.tree_cache.supports_swa())
