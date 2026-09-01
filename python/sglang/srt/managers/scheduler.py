@@ -4860,7 +4860,7 @@ class Scheduler(
         """Unload the lora adapter."""
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
-        self.weight_updater._lora_applied_names.pop(recv_req.lora_name, None)
+        self.weight_updater.forget_lora_adapter(recv_req.lora_name)
         return result
 
     def register_lora_adapter(
@@ -4869,9 +4869,7 @@ class Scheduler(
         """Create-or-refresh a LoRA adapter's identity and config (weights zeroed)."""
 
         result = self.tp_worker.register_lora_adapter(recv_req)
-        # A re-registered name is a new adapter identity (possibly a different
-        # tensor set); the partial-stream guard must not hold it to the old one.
-        self.weight_updater._lora_applied_names.pop(recv_req.lora_name, None)
+        self.weight_updater.forget_lora_adapter(recv_req.lora_name)
         return result
 
     def init_weights_send_group_for_remote_instance(

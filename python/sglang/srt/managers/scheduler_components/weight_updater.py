@@ -417,6 +417,11 @@ class SchedulerWeightUpdaterManager:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=success, message=message)
 
+    def forget_lora_adapter(self, lora_name: str) -> None:
+        """Drop the partial-stream guard entry: a re-registered or unloaded name
+        is a new adapter identity and may stream a different tensor set."""
+        self._lora_applied_names.pop(lora_name, None)
+
     def _stash_lora_tensors(self, lora_tensors) -> None:
         for prefixed_name, tensor in lora_tensors:
             lora_name, hf_key = prefixed_name.split(":", 1)

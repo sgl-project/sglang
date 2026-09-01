@@ -167,6 +167,18 @@ class TestApplyLoraStash(CustomTestCase):
         self.assertFalse(success)
         self.assertIn("expected manifest", message)
 
+    def test_forget_admits_a_different_tensor_set(self):
+        """Without the forget on re-register/unload, a name that legitimately
+        changes its tensor set is rejected as a partial stream forever."""
+        mgr, _ = self._manager_with_lora()
+        mgr._stash_lora_tensors(
+            [(f"a:{LORA_A}", torch.zeros(1)), (f"a:{LORA_B}", torch.zeros(1))]
+        )
+        self.assertTrue(mgr._apply_lora_stash(None)[0])
+        mgr.forget_lora_adapter("a")
+        mgr._stash_lora_tensors([(f"a:{LORA_A}", torch.zeros(1))])
+        self.assertTrue(mgr._apply_lora_stash(None)[0])
+
     def test_shrunken_tensor_set_rejected(self):
         # The adapter's tensor set is static for its lifetime; a change means a
         # partial stream, which the whole-adapter replace would silently zero.
