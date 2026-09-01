@@ -761,6 +761,22 @@ class TokenizerControlMixin:
                     ),
                     upsert=True,
                 )
+                # Streamed adapters have no path to reload from, so the cap rejects
+                # new registrations instead of evicting (eviction would lose the only
+                # engine-side copy). Same-name upserts don't change the count.
+                if (
+                    not reused
+                    and self.server_args.max_loaded_loras is not None
+                    and self.lora_registry.num_registered_loras
+                    >= self.server_args.max_loaded_loras
+                ):
+                    raise ValueError(
+                        f"Cannot register streamed LoRA adapter '{obj.lora_name}': "
+                        f"{self.lora_registry.num_registered_loras} adapters already "
+                        f"registered (--max-loaded-loras="
+                        f"{self.server_args.max_loaded_loras}). Streamed adapters are "
+                        "never evicted; unload one or raise the cap."
+                    )
                 obj.lora_id = new_adapter.lora_id
                 result = (await self.update_lora_adapter_communicator(obj))[0]
 

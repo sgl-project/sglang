@@ -66,10 +66,10 @@ class TestLoRALoadFromTensor(CustomTestCase):
         with open(os.path.join(lora_adapter, "adapter_config.json"), "r") as f:
             cls.lora_config_dict = json.load(f)
 
-    def test_lora_lru_eviction(self):
-        print("[Test]Testing LRU LoRA eviction...")
+    def test_lora_stream_register_rejected_over_cap(self):
+        """Streamed adapters have no path to reload from, so the cap rejects new
+        registrations instead of evicting; same-name upserts stay allowed."""
         MAX_LOADED_LORAS = 8
-        print(f"[Test]Max loaded LoRAs: {MAX_LOADED_LORAS}")
         test_engine = sgl.Engine(
             model_path=MODEL_PATH,
             enable_lora=True,
@@ -80,48 +80,41 @@ class TestLoRALoadFromTensor(CustomTestCase):
             max_loaded_loras=MAX_LOADED_LORAS,
         )
 
-        # Load 10 LoRA adapters, max allowed is 8
-        # This should trigger LRU eviction when we exceed the limit
         TEST_LORA_COUNT = 10
         for i in range(TEST_LORA_COUNT):
-            print(f"[Test]Loading LoRA adapter {i+1}/10: self_cognition_Alice_{i}")
             result = load_lora_via_stream(
                 test_engine,
                 f"self_cognition_Alice_{i}",
                 self.lora_tensors,
                 self.lora_config_dict,
             )
-            self.assertTrue(
-                result.success,
-                f"Failed to load LoRA adapter {i}: {result.error_message}",
-            )
-            print(
-                f"[Test]Successfully loaded LoRA {i+1}, current loaded adapters: {loaded_adapter_names(test_engine)}"
-            )
+            if i < MAX_LOADED_LORAS:
+                self.assertTrue(
+                    result.success,
+                    f"Failed to load LoRA adapter {i}: {result.error_message}",
+                )
+            else:
+                self.assertFalse(
+                    result.success,
+                    f"Adapter {i} should have been rejected over the cap",
+                )
+                self.assertIn("max-loaded-loras", result.error_message)
 
-        EXPECTED_LORA_ADAPTERS = [
-            "self_cognition_Alice_2",
-            "self_cognition_Alice_3",
-            "self_cognition_Alice_4",
-            "self_cognition_Alice_5",
-            "self_cognition_Alice_6",
-            "self_cognition_Alice_7",
-            "self_cognition_Alice_8",
-            "self_cognition_Alice_9",
-        ]
-        EXPECTED_LORA_COUNT = 8
         loaded = loaded_adapter_names(test_engine)
         self.assertEqual(
-            len(loaded),
-            EXPECTED_LORA_COUNT,
-            f"Loaded adapters count does not match expected result: {len(loaded)} != {EXPECTED_LORA_COUNT}",
-        )
-        self.assertEqual(
             loaded,
-            EXPECTED_LORA_ADAPTERS,
-            f"Loaded adapters do not match expected result: {loaded} != {EXPECTED_LORA_ADAPTERS}",
+            [f"self_cognition_Alice_{i}" for i in range(MAX_LOADED_LORAS)],
+            f"Loaded adapters do not match the first {MAX_LOADED_LORAS} registrations: {loaded}",
         )
-        print(f"[Test]LRU eviction test passed! Final loaded adapters: {len(loaded)}")
+
+        # Same-name upsert must still pass at the cap.
+        result = load_lora_via_stream(
+            test_engine,
+            "self_cognition_Alice_0",
+            self.lora_tensors,
+            self.lora_config_dict,
+        )
+        self.assertTrue(result.success, f"Upsert at cap failed: {result.error_message}")
 
     def test_lora_e2e_load_from_tensor_params(self):
         print("[Test]Testing LoRA load from tensor params...")
