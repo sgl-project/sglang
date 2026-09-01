@@ -425,6 +425,37 @@ MODELS = {
             "num-inference-steps",
         },
     },
+    # FastH3: 4-step VSA-distilled MiniMax-H3 on its trained sparse backend.
+    # Same request contract as minimax-h3-t2va, five sigma points = four
+    # DiT forwards, ulysses-4 (faster than tp2 x ulysses2 on B300).
+    "fasth3-t2va-vsa": {
+        "path": "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        "prompt": (
+            "A curious raccoon peers through a vibrant field of yellow "
+            "sunflowers, its eyes wide with interest."
+        ),
+        "seed": 1000,
+        "config_overrides": {
+            "task": "t2va",
+            "conditions": [],
+            "target": {
+                "short_edge": 768,
+                "aspect_ratio": "16:9",
+                "duration_seconds": 10.0,
+            },
+            "num_inference_steps": 5,
+        },
+        "extra_args": [
+            "--num-gpus=4",
+            "--attention-backend=video_sparse_attn_h3",
+            "--component-attention-backends=text_encoder=fa",
+            '--attention-backend-config={"VSA_sparsity": 0.9}',
+            "--enable-torch-compile=false",
+            # A 1-step warmup is rejected by H3 (its sigma grid needs >= 2 points).
+            "--warmup-steps=2",
+        ],
+        "force_eager": True,
+    },
     # Source-tracked extras from current registry / GPU test coverage.
     "longcat-image": {
         "path": "meituan-longcat/LongCat-Image",

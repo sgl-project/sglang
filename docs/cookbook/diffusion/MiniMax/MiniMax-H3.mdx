@@ -291,7 +291,10 @@ sglang serve \
 
 `$TRANSFORMER_PATH` is the `FL2VA/transformer` or `Ref2VA/transformer`
 directory in the normal SGLang/Hugging Face snapshot; the builder never
-downloads a second copy. A cache only covers the scheduler settings used to
+downloads a second copy. Diffusers-layout transformers such as FastH3's
+(`diffusion_pytorch_model.safetensors.index.json`, `transformer_blocks.*`) are
+accepted as well; pass `--model-variant fl2va --mode t2va --num-inference-steps 5`
+for the FastH3 schedule. A cache only covers the scheduler settings used to
 create it, including its mode, step count, flow shifts, and condition noise
 values. SGLang rejects a request outside that coverage instead of silently
 changing conditioning. Cache mode supports the matching unquantized checkpoint
@@ -678,7 +681,8 @@ shift-12/shift-3 schedule and therefore four DiT evaluations — the distilled
 step count.
 
 `video_sparse_attn_h3` (VSA-H3) is the trained sparse policy: an in-tree
-Triton block-sparse kernel (SM90/SM100) over segment-pure prefix tiles and
+Triton block-sparse kernel (SM90 / SM100 / SM103: H100/H200, B200, B300) over
+segment-pure prefix tiles and
 (4,4,4) 3D video tiles at 64-token kernel granularity, driven by the
 checkpoint's trained `to_gate_compress` compression branch.
 `--component-attention-backends text_encoder=fa` is required whenever the DiT
@@ -712,12 +716,35 @@ sglang generate \
   --save-output
 ```
 
-Measured on 4× H200 SXM at 768×1344, 5 seconds, 124 frames: the dense FA path
-denoised in 6.74 s (10.6 s end-to-end) at about 93 GB peak per GPU. The
-VSA-H3 first request denoised in 13.6 s including its one-time Triton
-autotune; steady-state VSA-H3 numbers are pending. The upstream FastVideo
-reference on the same host measured 8.9 s denoise and 60.7 s end-to-end with
-FSDP-sharded weights.
+Measured on 4× B300 SXM6 (SM103) at 1344×768, 24 fps with audio, seed 1000,
+bf16 eager, Ulysses 4, `VSA_sparsity` 0.9. End-to-end is the client wall clock
+of an OpenAI-style `/v1/videos` request against `sglang serve`, including
+decode, muxing and file output, median of three requests after one warm
+request. Denoise and decode are the server stage timings of the same request.
+
+| Duration | Frames | VSA-H3 e2e | Denoise (4 forwards) | Decode | Peak / GPU | Dense FA4 e2e (`sglang generate`, stage sum) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 5 s | 124 | **4.1 s** | 2.18 s | 0.87 s | 94 GB | 3.77 s |
+| 10 s | 243 | **8.0 s** | 4.83 s | 1.71 s | 103 GB | 9.84 s |
+| 15 s | 362 | **13.3 s** | 8.80 s | 2.56 s | 111 GB | 18.45 s |
+
+For reference, FastVideo's own 4× B200 numbers for the same shapes are 6.1 /
+12.0 / 15.5 s (VSA) and 6.8 / 15.0 / 25.6 s (dense). Dense FA4 is competitive
+at 5 s on Blackwell because the sparse kernel's fixed cost is not amortised at
+34k tokens; from 10 s on VSA-H3 wins and the gap widens with duration. Other
+validated deployments at 5 s: `--tp-size 2 --ulysses-degree 2` (3.42 s, 61 GB
+peak), `--use-fsdp-inference` (3.42 s, 50 GB peak, byte-identical output),
+online `--quantization fp8` (2.93 s, 63 GB peak; the VSA gates stay bf16),
+`--quantization kitchen_int8` (12.6 s, functional only), the AdaLN cache
+(`--minimax-h3-adaln-cache-path`, identical output, 71 GB peak), and
+`num_outputs_per_prompt` fan-out (seeded, distinct outputs). `torch_sdpa` and
+`sage_attn` (which falls back to FA when SageAttention is not installed) run as
+dense fallbacks; `subblock_sparse_attn` is rejected on SM103 because its
+Blackwell kernel is sm_100a-only.
+
+On 4× H200 (before the fused tile data path) the dense FA3 path denoised the
+5-second shape in 4.63 s versus 4.66 s for VSA-H3, and the 10-second shape in
+13.53 s versus 10.18 s.
 
 FastH3 rejects deployment options that do not apply to the distilled preview
 instead of silently ignoring them:
@@ -727,13 +754,16 @@ instead of silently ignoring them:
 - `fl2va` / `ref2va` requests — those capabilities were not distilled.
 - With VSA-H3: `--ring-degree` greater than 1, `torch.compile`, and breakable
   CUDA graph execution.
+- Generic Cache-DiT (`SGLANG_CACHE_DIT_ENABLED=1`) logs that it is a no-op and
+  is not mounted: four forwards never exceed the default `max_warmup_steps`.
 
 <Warning>
 The sibling `FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA` adapters are
 not loadable through `--lora-path`: they carry full-rank `.diff`/`.diff_b`
-deltas and `set_weight` gate tensors beyond the LoRA contract. Supporting them
-would require a fuse-at-load path, which is a planned follow-up. Use the
-merged VSA-DataFree checkpoint above.
+deltas and `to_gate_compress.set_weight` gate tensors beyond the LoRA
+contract, and SGLang rejects them with an explicit error instead of silently
+dropping those tensors. Fusing them onto base H3 only reproduces the merged
+VSA-DataFree checkpoint above, which is the supported way to serve FastH3.
 </Warning>
 
 <Note>
