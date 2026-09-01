@@ -83,13 +83,6 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     ),
     (
         "diffusion.scale_residual_norm_scale_shift",
-        KernelBackend.KDA,
-        "norm.norm_scale_shift_jit:kda_scale_residual_norm_scale_shift",
-        _CUDA,
-        "KDA B200 native CUDA residual + LayerNorm + scale/shift (#27392).",
-    ),
-    (
-        "diffusion.scale_residual_norm_scale_shift",
         KernelBackend.TRITON,
         "norm.rmsnorm_scale_shift_bitexact:fused_scale_residual_rmsnorm_scale_shift_bitexact",
         _CUDA,
@@ -108,13 +101,6 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "norm.fused_residual_norm_flydsl:flydsl_fused_residual_norm_scale_shift",
         _HIP,
         "FlyDSL (ROCm gfx950) residual + norm + scale/shift.",
-    ),
-    (
-        "diffusion.norm_scale_shift",
-        KernelBackend.KDA,
-        "norm.norm_scale_shift_jit:kda_norm_scale_shift",
-        _CUDA,
-        "KDA B200 native CUDA LayerNorm + scale/shift (#27392).",
     ),
     (
         "diffusion.norm_scale_shift",
@@ -174,10 +160,10 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     ),
     (
         "diffusion.residual_gate_add",
-        KernelBackend.KDA,
+        KernelBackend.JIT,
         "modulate.residual_gate_add_jit:residual_gate_add",
         _CUDA,
-        "KDA native CUDA residual + gate * update (#29361).",
+        "Fused residual + gate * update.",
     ),
     (
         "diffusion.timestep_embedding",
@@ -209,10 +195,10 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     ),
     (
         "diffusion.ltx2_qknorm_split_rope",
-        KernelBackend.KDA,
+        KernelBackend.JIT,
         "rope.ltx2_qknorm_split_rope_jit:ltx2_qknorm_split_rope_cuda",
         _CUDA,
-        "KDA native CUDA LTX-2 QK-norm + split RoPE (#29708).",
+        "LTX-2 QK-norm + split RoPE.",
     ),
     (
         "diffusion.ltx25_decoder_rope",
@@ -321,10 +307,10 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     ),
     (
         "diffusion.causal_conv3d_cat_pad",
-        KernelBackend.KDA,
+        KernelBackend.JIT,
         "layout.causal_conv3d_cat_pad_jit:fused_causal_conv3d_cat_pad_cuda",
         _CUDA,
-        "KDA native CUDA causal Conv3d cat + pad (#29281).",
+        "Causal Conv3d cat + pad.",
     ),
     (
         "diffusion.causal_conv3d_cat_pad",
