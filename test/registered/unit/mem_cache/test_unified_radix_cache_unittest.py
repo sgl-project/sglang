@@ -8099,8 +8099,7 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
 
     def test_dup_slice_below_eviction_floor_frees_full_only(self):
         """A re-insert whose duplicate slice starts below the request's eviction
-        floor gives back only the full side there: window eviction already
-        released those SWA peers, so freeing both sides would double-free."""
+        floor gives back only the full side there: those SWA peers are gone."""
         sw = self.cfg.sliding_window_size
         cache, allocator, _ = build_fixture(self.cfg)
         seq = list(range(1, 2 * sw + 1))
@@ -8108,19 +8107,11 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         cache.insert(InsertParams(key=key, value=self._alloc(allocator, len(seq))))
 
         value = self._alloc(allocator, len(seq))
-        actions = []
-        step = cache.tree_core.begin_insert(
-            InsertParams(key=key, value=value, swa_evicted_seqlen=sw)
-        )
-        while True:
-            actions.extend(step.actions)
-            cache._apply_cache_actions(step.actions)
-            if step.result is not None:
-                break
-            step = cache.tree_core.resume_insert()
-        tail = cache.tree_core.end_insert()
-        actions.extend(tail)
-        cache._apply_cache_actions(tail)
+        with mock.patch.object(
+            cache, "_apply_cache_action", wraps=cache._apply_cache_action
+        ) as spy:
+            cache.insert(InsertParams(key=key, value=value, swa_evicted_seqlen=sw))
+        actions = [c.args[0] for c in spy.call_args_list]
 
         full_only = [
             i for a in actions if isinstance(a, FreeDeviceKVFullOnly) for i in a.indices

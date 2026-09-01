@@ -1939,30 +1939,6 @@ fn insert_prev_prefix_len_narrows_the_dup_window() {
 }
 
 #[test]
-fn insert_dup_below_swa_floor_frees_full_only() {
-    let mut tc = core();
-    tc.insert(&insert_params(&vec![1, 2, 3, 4], &[10, 11, 12, 13]));
-    // Below the request's eviction floor the SWA peers are already gone, so
-    // only the full side of the duplicate slice is still ours to release.
-    let result = tc.insert(&InsertParams {
-        swa_evicted_seqlen: 2,
-        ..insert_params(&vec![1, 2, 3, 4], &[20, 21, 22, 23])
-    });
-    let [
-        CacheAction::FreeDeviceKVFullOnly(full_only),
-        CacheAction::FreeDeviceKV(freed),
-    ] = result.cache_actions.as_slice()
-    else {
-        panic!(
-            "expected FreeDeviceKVFullOnly then FreeDeviceKV, got {:?}",
-            action_kinds(&result.cache_actions)
-        );
-    };
-    assert!(full_only[0].equal(&Tensor::from_slice(&[20i64, 21])));
-    assert!(freed[0].equal(&Tensor::from_slice(&[22i64, 23])));
-}
-
-#[test]
 fn insert_extends_an_existing_prefix() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
