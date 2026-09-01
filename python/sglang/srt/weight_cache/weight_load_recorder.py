@@ -187,6 +187,50 @@ def _contiguous_region_element_offset(
     return element_offset
 
 
+def _names_an_expert_slot(tensor_id: str, expert_id: int) -> bool:
+    """Report whether a checkpoint name indexes exactly this expert slot.
+
+    ``expert_id`` comes from the loader signature and is authoritative; this only
+    filters the fused-shared-expert case, where the generic MoE loader passes an
+    out-of-range slot for a tensor that is really shared. Matching the number
+    anywhere is wrong: ``layers.3.mlp.experts.7.w1`` would then credit expert 3
+    to the layer index. Compare against the innermost index instead, which needs
+    no knowledge of container names.
+
+    Still a naming heuristic: it assumes the expert index is the last numeric
+    path segment. Only the loader reporting the slot's valid range could remove
+    the assumption entirely.
+    """
+    innermost = next(
+        (segment for segment in reversed(tensor_id.split(".")) if segment.isdigit()),
+        None,
+    )
+    return innermost == str(expert_id)
+
+
+def _tensor_geometry(tensor: Any) -> tuple[Any, ...]:
+    """Describe only the position and layout of a tensor, never its values.
+
+    Used to decide observationally whether a mutating operation moved a tracked
+    tensor. A reshard plan records where bytes live, so a mutation that leaves
+    this tuple unchanged cannot invalidate anything already recorded.
+    """
+    geometry: tuple[Any, ...] = (
+        tuple(int(value) for value in tensor.shape),
+        tensor.dtype,
+        str(tensor.device),
+    )
+    try:
+        return geometry + (
+            tuple(int(value) for value in tensor.stride()),
+            int(tensor.storage_offset()),
+            _storage_id(tensor),
+            _tensor_address(tensor),
+        )
+    except (NotImplementedError, RuntimeError):
+        return geometry + (None,)
+
+
 def _iter_tensors(value: Any) -> Iterator[torch.Tensor]:
     if isinstance(value, torch.Tensor):
         yield value
@@ -292,6 +336,16 @@ class _WeightLoadDispatchMode(TorchDispatchMode):
                 return func(*args, **kwargs)
             return destination
 
+        if name == "aten::fill_":
+            # default_weight_loader broadcasts single-element checkpoint tensors
+            # with fill_(loaded_weight.item()), which passes a Python scalar and
+            # so carries no provenance of its own.
+            destination = args[0]
+            self._recorder.record_scalar_fill(destination=destination)
+            if self._execute_writes:
+                return func(*args, **kwargs)
+            return destination
+
         provenance_inputs = [
             (tensor, provenance)
             for tensor in _iter_tensors((args, kwargs))
@@ -299,14 +353,25 @@ class _WeightLoadDispatchMode(TorchDispatchMode):
         ]
 
         schema = getattr(func, "_schema", None)
-        if provenance_inputs and bool(getattr(schema, "is_mutable", False)):
-            raise WeightLoadRecordingError(
-                f"unsupported mutating weight-loader operation: {name}"
-            )
+        is_mutable = bool(getattr(schema, "is_mutable", False))
+        geometry_before = (
+            tuple(_tensor_geometry(tensor) for tensor, _ in provenance_inputs)
+            if is_mutable
+            else ()
+        )
 
         result = func(*args, **kwargs)
         if not provenance_inputs:
             return result
+
+        if is_mutable:
+            return self._propagate_mutation(
+                name=name,
+                args=args,
+                result=result,
+                provenance_inputs=provenance_inputs,
+                geometry_before=geometry_before,
+            )
 
         if name == "aten::cat":
             output_provenance = self._record_cat(
@@ -378,6 +443,52 @@ class _WeightLoadDispatchMode(TorchDispatchMode):
             )
             for output in outputs:
                 self._recorder.register_provenance(output, unsupported)
+        return result
+
+    def _propagate_mutation(
+        self,
+        *,
+        name: str,
+        args: tuple[Any, ...],
+        result: Any,
+        provenance_inputs: list[tuple[torch.Tensor, Any]],
+        geometry_before: tuple[Any, ...],
+    ) -> Any:
+        """Decide observationally whether an in-place op invalidated provenance.
+
+        Reshard planning only needs where each byte lives, and a transfer moves
+        the source's final bytes, so a mutation that changes values alone is
+        harmless. Rather than judging operations by name, compare the observed
+        geometry: ``resize_``/``set_``/``transpose_`` move a tracked tensor while
+        ``mul_``/``add_``/``clamp_`` do not.
+        """
+        geometry_after = tuple(
+            _tensor_geometry(tensor) for tensor, _ in provenance_inputs
+        )
+        if geometry_after != geometry_before:
+            reason = f"geometry-changing in-place operation: {name}"
+            for tensor, provenance in provenance_inputs:
+                self._recorder.register_provenance(
+                    tensor, provenance.unsupported(reason)
+                )
+            self._recorder.register_outputs(
+                result, provenance_inputs[0][1].unsupported(reason)
+            )
+            return result
+
+        # In-place operations return the mutated operand, so the output inherits
+        # that operand's provenance rather than an arbitrary input's.
+        mutated = args[0] if args else None
+        inherited = next(
+            (
+                provenance
+                for tensor, provenance in provenance_inputs
+                if tensor is mutated
+            ),
+            None,
+        )
+        if inherited is not None:
+            self._recorder.register_outputs(result, inherited)
         return result
 
     def _record_cat(
@@ -546,7 +657,18 @@ class _WeightLoadDispatchMode(TorchDispatchMode):
             if name == "aten::_to_copy":
                 outputs = tuple(_iter_tensors(result))
                 if outputs and outputs[0].dtype != input_tensor.dtype:
-                    return (provenance.unsupported("dtype-changing aten::_to_copy"),)
+                    # A cast preserves the logical region: geometry is tracked in
+                    # elements, and record_copy records the same layout op when a
+                    # copy_ crosses dtypes. Keep both paths consistent.
+                    return (
+                        _replace_provenance_shape(
+                            provenance,
+                            layout_op=(
+                                f"cast({_dtype_name(input_tensor.dtype)}"
+                                f"->{_dtype_name(outputs[0].dtype)})"
+                            ),
+                        ),
+                    )
             return (provenance,)
 
         if name in self._RESHAPE_OPS:
@@ -615,13 +737,21 @@ class _WeightLoadDispatchMode(TorchDispatchMode):
                 ),
             )
 
-        if name in ("aten::transpose", "aten::permute"):
+        if name in ("aten::transpose", "aten::permute", "aten::t"):
             ndim = len(provenance.local_shape)
             if input_tensor.dim() != ndim:
                 return (provenance.unsupported("permutation after rank-changing view"),)
             if tuple(provenance.local_shape) != tuple(int(v) for v in input_tensor.shape):
                 return (provenance.unsupported("permutation after indexed view"),)
-            if name == "aten::transpose":
+            if name == "aten::t":
+                # torch does not decompose Tensor.t() into aten::transpose, so it
+                # has to be handled as its own 0/1 swap.
+                if ndim > 2:
+                    return (provenance.unsupported("aten::t on a rank>2 tensor"),)
+                order = list(range(ndim))
+                if ndim == 2:
+                    order = [1, 0]
+            elif name == "aten::transpose":
                 first, second = int(args[1]), int(args[2])
                 if first < 0:
                     first += ndim
@@ -645,14 +775,34 @@ class _WeightLoadDispatchMode(TorchDispatchMode):
                 ),
             )
 
-        if name in ("aten::split", "aten::split_with_sizes"):
+        if name in ("aten::split", "aten::split_with_sizes", "aten::unbind"):
             ndim = len(provenance.local_shape)
             if tuple(int(value) for value in input_tensor.shape) != tuple(
                 provenance.local_shape
             ):
                 return (
-                    provenance.unsupported("split after shape-changing view"),
+                    provenance.unsupported(f"{name} after shape-changing view"),
                 )
+            if name == "aten::unbind":
+                # torch exposes unbind directly instead of decomposing it into
+                # aten::select, so each output drops the unbound dimension.
+                dim = int(args[1] if len(args) > 1 else kwargs.get("dim", 0))
+                if dim < 0:
+                    dim += ndim
+                result_provenances = []
+                for index in range(len(tuple(_iter_tensors(result)))):
+                    offset = list(provenance.global_offset)
+                    shape = list(provenance.local_shape)
+                    offset[dim] += index
+                    shape[dim] = 1
+                    result_provenances.append(
+                        _replace_provenance_shape(
+                            provenance,
+                            global_offset=tuple(offset),
+                            local_shape=tuple(shape),
+                        )
+                    )
+                return tuple(result_provenances)
             dim = int(args[2] if len(args) > 2 else kwargs.get("dim", 0))
             if dim < 0:
                 dim += ndim
@@ -984,7 +1134,68 @@ class WeightLoadRecorder:
         if entry is not None and entry[0]() is tensor:
             return entry[1]
         current = _CURRENT_LOGICAL.get()
-        return current if current is not None and tensor.device.type == "meta" else None
+        if current is None or tensor.device.type != "meta":
+            return None
+        # Target replay feeds meta checkpoint tensors, and a loader may derive
+        # further meta tensors the registry never saw. Only adopt the logical
+        # weight in scope when the shape still matches it, so an unrelated
+        # scratch tensor cannot inherit another tensor's position.
+        if isinstance(current, _CompositeProvenance):
+            expected = current.tensor_shape
+        else:
+            expected = current.local_shape
+        if tuple(int(value) for value in tensor.shape) != tuple(expected):
+            return None
+        return current
+
+    def record_scalar_fill(self, *, destination: torch.Tensor) -> None:
+        """Record a scalar broadcast into a single-element registered tensor.
+
+        ``fill_`` receives a Python scalar, so the value itself proves nothing
+        about origin. The logical weight in scope does: the loader is mid-way
+        through one checkpoint tensor, and only a single-element logical weight
+        can be broadcast this way, which makes the attribution unambiguous.
+        """
+        provenance = _CURRENT_LOGICAL.get()
+        if provenance is None:
+            return
+        if prod(provenance.local_shape) != 1 or int(destination.numel()) != 1:
+            return
+        if provenance.unsupported_operation is not None:
+            raise WeightLoadRecordingError(
+                f"{provenance.metadata.tensor_id} uses an unsupported loader "
+                f"operation: {provenance.unsupported_operation}"
+            )
+        owner = self._owner_for(destination)
+        if owner is None:
+            return
+        self._append_event(
+            provenance=provenance,
+            owner=owner,
+            byte_offset=_tensor_address(destination) - owner.begin,
+        )
+
+    def _owner_for(self, destination: torch.Tensor) -> _Destination | None:
+        """Find the registered tensor whose byte range contains this write."""
+        try:
+            storage_id = _storage_id(destination)
+            begin = _tensor_address(destination)
+        except (NotImplementedError, RuntimeError):
+            return None
+        end = begin + int(destination.numel()) * int(destination.element_size())
+        owner = next(
+            (
+                candidate
+                for candidate in self._destinations.get(storage_id, ())
+                if candidate.dtype == destination.dtype
+                and candidate.begin <= begin
+                and end <= candidate.end
+            ),
+            None,
+        )
+        if owner is None:
+            self._reject_unsupported_destination(destination, storage_id)
+        return owner
 
     def record_copy(self, *, destination: torch.Tensor, source: torch.Tensor) -> None:
         provenance = self.provenance_for(source)
@@ -1021,22 +1232,8 @@ class WeightLoadRecorder:
             )
 
         self._reject_unsupported_destination(destination)
-        storage_id = _storage_id(destination)
-        candidates = self._destinations.get(storage_id, ())
-        begin = _tensor_address(destination)
-        end = begin + logical_elements * int(destination.element_size())
-        owner = next(
-            (
-                candidate
-                for candidate in candidates
-                if candidate.dtype == destination.dtype
-                and candidate.begin <= begin
-                and end <= candidate.end
-            ),
-            None,
-        )
+        owner = self._owner_for(destination)
         if owner is None:
-            self._reject_unsupported_destination(destination, storage_id)
             # Temporary tensors are allowed; only final writes into registered
             # model tensors contribute placement records.
             return
@@ -1044,7 +1241,7 @@ class WeightLoadRecorder:
         self._append_event(
             provenance=provenance,
             owner=owner,
-            byte_offset=begin - owner.begin,
+            byte_offset=_tensor_address(destination) - owner.begin,
         )
 
     def _record_composite_copy(
@@ -1137,9 +1334,9 @@ class WeightLoadRecorder:
         byte_offset: int,
     ) -> None:
         expert_id = _CURRENT_EXPERT_ID.get()
-        if expert_id is not None and re.search(
-            rf"(?:^|\.){expert_id}(?:\.|$)", provenance.metadata.tensor_id
-        ) is None:
+        if expert_id is not None and not _names_an_expert_slot(
+            provenance.metadata.tensor_id, expert_id
+        ):
             # Fused shared experts reuse an out-of-range expert slot in the
             # generic MoE loader, but they remain replicated/shared tensors.
             expert_id = None
@@ -1209,7 +1406,49 @@ class WeightLoadRecorder:
                 ),
             )
         )
+        self._require_complete_coverage(views)
         return WeightLoadPlan(logical_weights=metadata, views=views)
+
+    def _require_complete_coverage(
+        self, views: tuple[RecordedWeightView, ...]
+    ) -> None:
+        """Reject a plan whose views do not tile every registered tensor.
+
+        A write the dispatcher never saw (an attribute rebind, a direct kernel)
+        leaves a hole here. Asserting in the layer that produces the plan keeps
+        that guarantee with the plan itself rather than with one consumer.
+        """
+        covered: dict[int, list[tuple[int, int]]] = {}
+        for view in views:
+            covered.setdefault(id(view.parameter), []).append(
+                (view.byte_offset, view.byte_offset + view.nbytes)
+            )
+        for name, tensor, is_parameter in _iter_registered_tensors(self._model):
+            if id(tensor) in self._unsupported_destination_ids:
+                continue
+            intervals = covered.get(id(tensor))
+            kind = "parameter" if is_parameter else "buffer"
+            if not intervals:
+                if not is_parameter:
+                    continue
+                raise WeightLoadRecordingError(
+                    f"no recorded write covers {kind}: {name}"
+                )
+            cursor = 0
+            for begin, end in sorted(intervals):
+                if begin != cursor:
+                    relation = "overlaps" if begin < cursor else "leaves a gap in"
+                    raise WeightLoadRecordingError(
+                        f"recorded writes {relation} {kind} {name} at byte "
+                        f"{begin}; expected {cursor}"
+                    )
+                cursor = end
+            nbytes = int(tensor.numel()) * int(tensor.element_size())
+            if cursor != nbytes:
+                raise WeightLoadRecordingError(
+                    f"recorded writes do not cover complete {kind} {name}: "
+                    f"covered={cursor}, nbytes={nbytes}"
+                )
 
 
 class WeightLoadCapture:

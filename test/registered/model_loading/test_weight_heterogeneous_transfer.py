@@ -34,6 +34,7 @@ from sglang.srt.weight_cache.weight_heterogeneous_transfer import (
 from sglang.srt.weight_cache.weight_load_recorder import (
     WeightLoadRecorder,
     WeightLoadRecordingError,
+    _names_an_expert_slot,
     capture_weight_load_plan,
     record_target_weight_load_plan,
 )
@@ -582,6 +583,124 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 execute_writes=False,
             )
 
+    def test_recorder_records_scalar_broadcast_fill(self):
+        # default_weight_loader broadcasts single-element weights with
+        # fill_(loaded_weight.item()), which carries no tensor provenance.
+        class ScalarModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale = torch.nn.Parameter(torch.empty(1))
+
+            def load_weights(self, weights):
+                for _, loaded_weight in weights:
+                    self.scale.data.fill_(loaded_weight.item())
+
+        recorder = WeightLoadRecorder()
+        recorder.record_model_load(
+            ScalarModel(),
+            (("scale", torch.tensor([2.5])),),
+            execute_writes=True,
+        )
+        plan = recorder.build_plan()
+        self.assertEqual(len(plan.views), 1)
+        self.assertEqual(plan.views[0].tensor_id, "scale")
+
+    def test_recorder_tracks_transpose_shorthand(self):
+        # torch exposes Tensor.t() as aten::t rather than decomposing it.
+        class TransposeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.empty(3, 2))
+
+            def load_weights(self, weights):
+                for _, loaded_weight in weights:
+                    self.weight.data.copy_(loaded_weight.t().contiguous())
+
+        recorder = WeightLoadRecorder()
+        recorder.record_model_load(
+            TransposeModel(),
+            (("weight", torch.empty(2, 3)),),
+            execute_writes=True,
+        )
+        plan = recorder.build_plan()
+        self.assertIn("permute(1,0)", plan.views[0].layout_fingerprint)
+
+    def test_recorder_allows_value_only_in_place_operation(self):
+        # Reshard records where bytes live, so a mutation that leaves geometry
+        # untouched cannot invalidate a recorded position.
+        class ScaleModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.empty(2, 2))
+
+            def load_weights(self, weights):
+                for _, loaded_weight in weights:
+                    self.weight.data.copy_(loaded_weight.mul_(2.0))
+
+        recorder = WeightLoadRecorder()
+        recorder.record_model_load(
+            ScaleModel(),
+            (("weight", torch.ones(2, 2)),),
+            execute_writes=True,
+        )
+        self.assertEqual(len(recorder.build_plan().views), 1)
+
+    def test_recorder_rejects_geometry_changing_in_place_operation(self):
+        class TransposeInPlaceModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.empty(4))
+
+            def load_weights(self, weights):
+                for _, loaded_weight in weights:
+                    loaded_weight.transpose_(0, 1)
+                    self.weight.data.copy_(loaded_weight.reshape(-1))
+
+        with self.assertRaisesRegex(
+            WeightLoadRecordingError, "geometry-changing in-place operation"
+        ):
+            WeightLoadRecorder().record_model_load(
+                TransposeInPlaceModel(),
+                (("weight", torch.empty(2, 2)),),
+                execute_writes=True,
+            )
+
+    def test_recorder_records_dtype_cast_as_layout_op(self):
+        class CastModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.empty(2, 2, dtype=torch.float16)
+                )
+
+            def load_weights(self, weights):
+                for _, loaded_weight in weights:
+                    self.weight.data.copy_(loaded_weight.to(torch.float16))
+
+        recorder = WeightLoadRecorder()
+        recorder.record_model_load(
+            CastModel(),
+            (("weight", torch.empty(2, 2, dtype=torch.float32)),),
+            execute_writes=True,
+        )
+        self.assertIn(
+            "cast(float32->float16)",
+            recorder.build_plan().views[0].layout_fingerprint,
+        )
+
+    def test_expert_slot_matching_ignores_layer_index(self):
+        for tensor_id, expert_id, expected in (
+            ("layers.3.mlp.experts.7.w1.weight", 3, False),
+            ("layers.3.mlp.experts.7.w1.weight", 7, True),
+            ("layers.7.mlp.experts.7.w1.weight", 7, True),
+            ("layers.3.mlp.shared_expert.gate_proj.weight", 4, False),
+            ("experts.0.w1.weight", 0, True),
+        ):
+            with self.subTest(tensor_id=tensor_id, expert_id=expert_id):
+                self.assertEqual(
+                    _names_an_expert_slot(tensor_id, expert_id), expected
+                )
+
     def test_recorder_rejects_index_after_shape_changing_view(self):
         class ReshapeSelectModel(torch.nn.Module):
             def __init__(self):
@@ -668,7 +787,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 "replaced-buffer",
             )
 
-    def test_manifest_rejects_parameter_not_covered_by_native_loader(self):
+    def test_plan_rejects_parameter_not_covered_by_native_loader(self):
         class IncompleteModel(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -686,22 +805,13 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             (("weight", torch.empty(2, 2)),),
             execute_writes=True,
         )
+        # build_plan owns this guarantee so an uncovered parameter cannot reach
+        # any consumer; the manifest builder repeats the check as a second net.
         with self.assertRaisesRegex(
-            WeightManifestError,
-            "native weight-load recorder did not cover parameter: unused",
+            WeightLoadRecordingError,
+            "no recorded write covers parameter: unused",
         ):
-            ImmutableWeightRuntimeManifestBuilder(
-                model=model,
-                load_plan=recorder.build_plan(),
-                topology=WeightParallelTopology(),
-                allowed_devices=("cpu",),
-            ).build(
-                model_id="model",
-                revision="revision",
-                instance_id="worker",
-                worker_id="worker",
-                endpoint="127.0.0.1:1",
-            )
+            recorder.build_plan()
 
     def test_weight_parallel_layout_supports_ep_and_rejects_unsupported_dp(self):
         validate_weight_heterogeneous_transfer_configuration(
