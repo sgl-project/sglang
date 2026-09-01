@@ -47,7 +47,7 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
     # (vae/ -> video_vae/) and declares the t2va-only release contract.
     "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree": {
         "overlay_repo_id": "kevin-mi/FastH3-4step-Preview-overlay",
-        "overlay_revision": "ef32ab0cb005b38412ef13b5e811d53d8ba0e42f",
+        "overlay_revision": "f769cb8001dae335089de7b250364335bc7cb183",
     },
 }
 

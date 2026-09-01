@@ -195,20 +195,6 @@ def test_fasth3_gates_stay_bf16_under_runtime_quantization(quant_name: str) -> N
     assert model.token_refiner.blocks[0].attn.to_gate_compress is None
 
 
-def test_fasth3_adaln_cache_variant_is_the_distilled_partition() -> None:
-    from types import SimpleNamespace
-
-    no_variant = SimpleNamespace(model_variant=None)
-    assert FastH3PipelineConfig().adaln_cache_model_variant(no_variant) == "fl2va"
-    assert MiniMaxH3PipelineConfig().adaln_cache_model_variant(no_variant) is None
-    assert (
-        MiniMaxH3PipelineConfig().adaln_cache_model_variant(
-            SimpleNamespace(model_variant="ref2va")
-        )
-        == "ref2va"
-    )
-
-
 def test_cache_dit_is_a_declared_noop_at_four_forwards() -> None:
     from types import SimpleNamespace
 

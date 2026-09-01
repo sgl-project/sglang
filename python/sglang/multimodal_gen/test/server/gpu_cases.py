@@ -698,7 +698,7 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
                 "--attention-backend",
                 "video_sparse_attn_h3",
                 "--attention-backend-config",
-                '{"VSA_sparsity": 0.9, "vsa_mode": "exempt"}',
+                '{"VSA_sparsity": 0.9}',
                 "--enable-torch-compile",
                 "false",
             ],
@@ -721,7 +721,6 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
                     "aspect_ratio": "16:9",
                     "duration_seconds": 5.0,
                 },
-                # FastH3's trained contract: 5 sigma points = 4 DiT forwards.
                 "num_inference_steps": 5,
                 "seed": 42,
             },

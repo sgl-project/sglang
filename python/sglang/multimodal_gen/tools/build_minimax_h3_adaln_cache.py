@@ -14,8 +14,6 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import safe_open, save_file
 
-from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
-from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     MINIMAX_H3_IMGVID_COND_TIMESTEP,
@@ -141,30 +139,12 @@ def _time_embed(
 def _load_tensor(
     name: str,
     *,
-    weight_map: dict[str, tuple[str, str]],
+    weight_map: dict[str, str],
     files: dict[str, Any],
     device: torch.device,
 ) -> torch.Tensor:
-    filename, source_name = weight_map[name]
-    return files[filename].get_tensor(source_name).to(device)
-
-
-def _load_native_weight_map(transformer_path: Path) -> dict[str, tuple[str, str]]:
-    """Native H3 parameter name -> (shard filename, name inside the shard)."""
-    candidates = [
-        transformer_path / "model.safetensors.index.json",
-        transformer_path / "diffusion_pytorch_model.safetensors.index.json",
-    ]
-    index_path = next((path for path in candidates if path.exists()), None)
-    if index_path is None:
-        raise FileNotFoundError(
-            f"No safetensors index in {transformer_path}; expected one of "
-            f"{[path.name for path in candidates]}"
-        )
-    with index_path.open() as f:
-        weight_map = json.load(f)["weight_map"]
-    mapping = get_param_names_mapping(MiniMaxH3DiTArchConfig().param_names_mapping)
-    return {mapping(name)[0]: (filename, name) for name, filename in weight_map.items()}
+    tensor_file = files[weight_map[name]]
+    return tensor_file.get_tensor(name).to(device)
 
 
 def main() -> None:
@@ -178,7 +158,9 @@ def main() -> None:
     if device.type != "cuda" or not torch.cuda.is_available():
         raise ValueError("MiniMax H3 AdaLN cache must be built on CUDA")
 
-    weight_map = _load_native_weight_map(args.transformer_path)
+    index_path = args.transformer_path / "model.safetensors.index.json"
+    with index_path.open() as f:
+        weight_map = json.load(f)["weight_map"]
 
     plans = _cache_timestep_plans(args)
     if not plans or any(plan.numel() == 0 for plan in plans):
@@ -203,7 +185,7 @@ def main() -> None:
                     device="cpu",
                 )
             )
-            for filename in {filename for filename, _ in weight_map.values()}
+            for filename in set(weight_map.values())
         }
         time_kwargs = {
             f"{module}_{name}": _load_tensor(
@@ -211,7 +193,7 @@ def main() -> None:
                 weight_map=weight_map,
                 files=files,
                 device=device,
-            ).to(torch.float32)
+            )
             for module, name in (
                 ("proj_in", "weight"),
                 ("proj_in", "bias"),

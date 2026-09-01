@@ -37,7 +37,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
@@ -406,7 +409,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         )
         self._minimax_h3_quality = "lossless"
         self._minimax_h3_cache_mode: str | None = None
-        # Per-request VSA-H3 step-metadata builder; None outside VSA requests.
         self._vsa_h3_build_step_metadata: Callable[[int], Any] | None = None
 
     def _owns_compile_warmup_lifecycle(self) -> bool:
@@ -962,13 +964,8 @@ def _maybe_prepare_vsa_h3_step_metadata(
     server_args: ServerArgs,
     device: torch.device,
 ) -> Callable[[int], Any] | None:
-    """Return a per-step VSA-H3 metadata builder, or None off the VSA path.
-
-    The packed layout is request-static, so the tile geometry inputs are
-    resolved once here; only the step index varies per DiT forward.
-    """
-    from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-
+    """Per-step VSA-H3 metadata builder over the request-static packed layout,
+    or None off the VSA path."""
     model._resolve_attention_backend_once()
     if (
         model._resolved_attention_backend

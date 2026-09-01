@@ -293,10 +293,6 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             return [os.path.join(component_model_path, "source", "model.safetensors")]
         return safetensors_list
 
-    def adaln_cache_model_variant(self, server_args) -> str | None:
-        """Partition an AdaLN cache must have been built for."""
-        return server_args.model_variant
-
 
 @dataclass
 class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
@@ -310,9 +306,6 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
 
     def __post_init__(self) -> None:
         self.dit_config.arch_config.has_gate_compress = True
-
-    def adaln_cache_model_variant(self, server_args) -> str:
-        return "fl2va"
 
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
