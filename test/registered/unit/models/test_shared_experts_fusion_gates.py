@@ -332,18 +332,9 @@ class TestBailingMoeV3Gate(_FusionGateCase):
             vocab_size=32000,
             hidden_size=4096,
         )
-        parallel = SimpleNamespace(
-            tp_size=1,
-            moe_ep_size=1,
-            config=SimpleNamespace(enable_dp_lm_head=False),
-        )
+        self._seed(enable_dp_lm_head=False)
         with (
-            unittest.mock.patch.object(
-                bailing_moe_nextn, "get_parallel", return_value=parallel
-            ),
-            unittest.mock.patch.object(
-                bailing_moe_v3, "get_parallel", return_value=parallel
-            ),
+            get_parallel().override(tp_size=1, moe_ep_size=1),
             unittest.mock.patch.object(
                 bailing_moe_v3,
                 "is_shared_experts_fusion_disabled",

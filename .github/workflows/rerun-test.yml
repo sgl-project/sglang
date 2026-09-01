@@ -87,7 +87,8 @@ permissions:
 
 jobs:
   rerun-test-cuda:
-    if: inputs.mode == 'cuda'
+    # Temporarily reject reruns targeting the broken GB300 runner.
+    if: inputs.mode == 'cuda' && inputs.runs_on != '4-gpu-gb300'
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 120
     permissions:
@@ -199,7 +200,8 @@ jobs:
         if: failure()
 
   rerun-test-multimodal-gen:
-    if: inputs.mode == 'multimodal_gen'
+    # Temporarily reject reruns targeting the broken GB300 runner.
+    if: inputs.mode == 'multimodal_gen' && inputs.runs_on != '4-gpu-gb300'
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 120
     permissions:
