@@ -112,6 +112,8 @@ def test_adapter_keeps_router_ids_int32(monkeypatch):
     output = torch.randn_like(hidden_states)
 
     class Mega:
+        _workspace = object()
+
         def forward(self, tensors):
             self.tensors = tensors
             return output
@@ -159,6 +161,7 @@ def test_adapter_requests_workspace_output_view(monkeypatch):
 
     class Mega:
         supports_output_view = True
+        _workspace = object()
 
         def forward(self, tensors, *, return_workspace_view=False):
             self.tensors = tensors
