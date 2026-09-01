@@ -13,8 +13,18 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.disaggregation import decode as decode_mod
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.common.conn import (
+    ABORT_ACK_TAG,
+    ABORT_TAG,
+    AbortAck,
+    AbortNotification,
+    CommonKVManager,
+    CommonKVReceiver,
+)
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
+from sglang.srt.disaggregation.fake.conn import FakeKVReceiver
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -26,7 +36,136 @@ def _make_manager():
     touch (avoids the heavy real __init__)."""
     mgr = CommonKVManager.__new__(CommonKVManager)
     mgr._deferred_abort_ack_tracker = {}
+    mgr.enable_deferred_decode_kv_release = True
     return mgr
+
+
+class _TestReceiver(CommonKVReceiver):
+    def poll(self):
+        raise NotImplementedError
+
+    def failure_exception(self):
+        raise NotImplementedError
+
+
+class TestAbortWireFormat(CustomTestCase):
+    def test_abort_notification_round_trip(self):
+        notification = AbortNotification(100, "10.0.0.1", 5000)
+
+        self.assertEqual(
+            AbortNotification.from_zmq(notification.to_zmq()), notification
+        )
+
+    def test_legacy_abort_without_return_address(self):
+        self.assertEqual(
+            AbortNotification.from_zmq([ABORT_TAG, b"101"]),
+            AbortNotification(room=101),
+        )
+
+    def test_malformed_abort_is_rejected(self):
+        self.assertIsNone(AbortNotification.from_zmq([ABORT_TAG, b"bad-room"]))
+
+    def test_abort_ack_round_trip(self):
+        ack = AbortAck(room=102, prefill_rank=3)
+
+        self.assertEqual(AbortAck.from_zmq(ack.to_zmq()), ack)
+
+
+class TestCommonAbortAckDispatch(CustomTestCase):
+    def test_abort_ack_message_is_aggregated(self):
+        mgr = _make_manager()
+        mgr.register_deferred_abort_room(103)
+
+        claimed = mgr.handle_abort_ack_message([ABORT_ACK_TAG, b"103", b"4"])
+
+        self.assertTrue(claimed)
+        self.assertEqual(mgr._deferred_abort_ack_tracker[103], {4})
+
+    def test_non_ack_message_is_not_claimed(self):
+        mgr = _make_manager()
+
+        self.assertFalse(mgr.handle_abort_ack_message([b"STATUS", b"103", b"4"]))
+
+    def test_malformed_abort_ack_is_ignored(self):
+        mgr = _make_manager()
+        mgr.register_deferred_abort_room(103)
+
+        self.assertTrue(
+            mgr.handle_abort_ack_message([ABORT_ACK_TAG, b"bad-room", b"4"])
+        )
+        self.assertFalse(mgr.is_abort_release_safe(103, required_acks=1))
+
+    def test_abort_for_deferred_release_arms_before_abort(self):
+        mgr = _make_manager()
+        receiver = _TestReceiver.__new__(_TestReceiver)
+        receiver.kv_mgr = mgr
+        receiver.bootstrap_room = 104
+        observed = []
+        receiver.abort = lambda: observed.append(104 in mgr._deferred_abort_ack_tracker)
+
+        receiver.abort_for_deferred_release()
+
+        self.assertEqual(observed, [True])
+
+    def test_abort_for_deferred_release_skips_tracker_when_disabled(self):
+        mgr = _make_manager()
+        mgr.enable_deferred_decode_kv_release = False
+        receiver = _TestReceiver.__new__(_TestReceiver)
+        receiver.kv_mgr = mgr
+        receiver.bootstrap_room = 105
+        receiver.abort = lambda: None
+
+        receiver.abort_for_deferred_release()
+
+        self.assertNotIn(105, mgr._deferred_abort_ack_tracker)
+
+    def test_base_receiver_falls_back_to_plain_abort(self):
+        receiver = FakeKVReceiver.__new__(FakeKVReceiver)
+        receiver.conclude_state = None
+
+        receiver.abort_for_deferred_release()
+
+        self.assertEqual(receiver.conclude_state, KVPoll.Failed)
+
+
+class TestMooncakeAbortNotification(CustomTestCase):
+    @staticmethod
+    def _manager(status=KVPoll.WaitingForInput):
+        mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr.enable_deferred_decode_kv_release = True
+        mgr.request_status = {} if status is None else {106: status}
+        mgr._deferred_ack_targets = {}
+        mgr._staging_outstanding = {}
+        mgr.check_status = lambda room: mgr.request_status[room]
+        mgr.update_status = lambda room, value: mgr.request_status.__setitem__(
+            room, value
+        )
+        mgr._sent = []
+        mgr._send_abort_ack = lambda ip, port, room: mgr._sent.append((ip, port, room))
+        return mgr
+
+    def test_active_room_defers_ack_until_transport_drains(self):
+        mgr = self._manager()
+        mgr._staging_outstanding[106] = 1
+
+        claimed = mgr._handle_abort_notification(
+            AbortNotification(106, "10.0.0.2", 6000).to_zmq()
+        )
+
+        self.assertTrue(claimed)
+        self.assertEqual(mgr.request_status[106], KVPoll.Failed)
+        self.assertEqual(mgr._deferred_ack_targets[106], ("10.0.0.2", 6000))
+        self.assertEqual(mgr._sent, [])
+
+    def test_untracked_quiescent_room_acks_immediately(self):
+        mgr = self._manager(status=None)
+
+        claimed = mgr._handle_abort_notification(
+            AbortNotification(106, "10.0.0.2", 6000).to_zmq()
+        )
+
+        self.assertTrue(claimed)
+        self.assertEqual(mgr._sent, [("10.0.0.2", 6000, 106)])
 
 
 class TestAbortAckAggregation(CustomTestCase):

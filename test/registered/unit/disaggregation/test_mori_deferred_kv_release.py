@@ -54,13 +54,10 @@ def _install_mori_stubs() -> None:
 _install_mori_stubs()
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import ABORT_TAG
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mori.conn import (
-    _TAG_ABORT,
-    _TAG_ABORT_ACK,
     MoriKVManager,
-    MoriKVReceiver,
     MoriKVSender,
     StatusCode,
     _MoriTransferSubmissionError,
@@ -97,7 +94,7 @@ def _manager(enabled: bool = True) -> MoriKVManager:
 
 
 def _abort_message(room: int = 11) -> list[bytes]:
-    return [_TAG_ABORT, str(room).encode(), b"10.0.0.3", b"6000"]
+    return [ABORT_TAG, str(room).encode(), b"10.0.0.3", b"6000"]
 
 
 def _chunk(room: int = 11) -> TransferKVChunk:
@@ -164,7 +161,7 @@ class TestMoriAbortAck(unittest.TestCase):
         manager = _manager()
         manager.request_status[11] = KVPoll.WaitingForInput
 
-        manager._handle_abort_message([_TAG_ABORT, b"11"])
+        manager._handle_abort_message([ABORT_TAG, b"11"])
 
         self.assertEqual(manager.request_status[11], KVPoll.Failed)
         self.assertEqual(manager._sent, [])
@@ -184,7 +181,7 @@ class TestMoriAbortAck(unittest.TestCase):
         manager = _manager()
         manager.request_status[11] = KVPoll.WaitingForInput
 
-        manager._handle_abort_message([_TAG_ABORT, b"11", b"10.0.0.3", b"bad"])
+        manager._handle_abort_message([ABORT_TAG, b"11", b"10.0.0.3", b"bad"])
 
         self.assertEqual(manager.request_status[11], KVPoll.Failed)
         self.assertEqual(manager._sent, [])
@@ -397,69 +394,6 @@ class TestMoriAbortAck(unittest.TestCase):
 
         self.assertEqual(manager._conclude_room_failure.call_count, 2)
         manager._mark_transfer_quiescent.assert_called_once_with(chunk)
-
-
-class TestMoriDecodeAbortAck(unittest.TestCase):
-    def test_ack_is_recorded_for_held_room(self):
-        manager = _manager()
-        manager.register_deferred_abort_room(21)
-
-        manager._handle_abort_ack_message([_TAG_ABORT_ACK, b"21", b"3"])
-
-        self.assertTrue(manager.is_abort_release_safe(21, required_acks=1))
-        self.assertEqual(manager._deferred_abort_ack_tracker[21], {3})
-
-    def test_receiver_arms_tracker_before_sending_abort(self):
-        manager = _manager()
-        manager.request_status[21] = KVPoll.WaitingForInput
-        receiver = MoriKVReceiver.__new__(MoriKVReceiver)
-        receiver.kv_mgr = manager
-        receiver.bootstrap_room = 21
-        receiver.bootstrap_infos = [{"rank": 3}]
-        receiver.abort_notified = False
-        receiver.conclude_state = None
-        receiver.init_time = 1.0
-        receiver.metadata_published = True
-        receiver.clear = MagicMock()
-
-        with patch.object(
-            CommonKVReceiver,
-            "_send_abort_notification",
-            side_effect=lambda: manager._handle_abort_ack_message(
-                [_TAG_ABORT_ACK, b"21", b"3"]
-            ),
-        ):
-            receiver.abort()
-        manager.register_deferred_abort_room(21)
-
-        self.assertEqual(manager._deferred_abort_ack_tracker[21], {3})
-        receiver.clear.assert_called_once_with()
-
-    def test_preallocation_abort_does_not_arm_deferred_tracker(self):
-        manager = _manager()
-        manager.request_status[21] = KVPoll.Bootstrapping
-        receiver = MoriKVReceiver.__new__(MoriKVReceiver)
-        receiver.kv_mgr = manager
-        receiver.bootstrap_room = 21
-        receiver.bootstrap_infos = [{"rank": 3}]
-        receiver.abort_notified = False
-        receiver.conclude_state = None
-        receiver.init_time = None
-        receiver.metadata_published = False
-        receiver.clear = MagicMock()
-
-        with patch.object(CommonKVReceiver, "_send_abort_notification"):
-            receiver.abort()
-
-        self.assertNotIn(21, manager._deferred_abort_ack_tracker)
-
-    def test_malformed_ack_is_ignored(self):
-        manager = _manager()
-        manager.register_deferred_abort_room(21)
-
-        manager._handle_abort_ack_message([_TAG_ABORT_ACK, b"bad", b"3"])
-
-        self.assertFalse(manager.is_abort_release_safe(21, required_acks=1))
 
 
 if __name__ == "__main__":
