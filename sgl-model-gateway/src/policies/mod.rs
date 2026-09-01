@@ -120,6 +120,10 @@ pub struct BucketConfig {
     pub balance_abs_threshold: usize,
     pub balance_rel_threshold: f32,
     pub bucket_adjust_interval_secs: usize,
+    /// When > 0, enables fixed grouped_threshold mode with round-robin per group
+    pub short_count: usize,
+    /// Character count threshold separating short and long requests
+    pub length_threshold: usize,
 }
 
 impl Default for BucketConfig {
@@ -128,6 +132,8 @@ impl Default for BucketConfig {
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.0001,
             bucket_adjust_interval_secs: 5,
+            short_count: 0,
+            length_threshold: 4096,
         }
     }
 }
