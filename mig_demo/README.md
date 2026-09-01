@@ -102,11 +102,16 @@ Greedy output again byte-identical to baseline.
 No collectives at all: two `launch_server` processes, `--mem-fraction-static`
 caps emulating MIG-style memory partitioning, benched concurrently.
 
-| case | throughput (concurrent bench) |
-|---|---:|
-| instance A (:30000), `--mem-fraction-static 0.44` | 319.7 tok/s |
-| instance B (:30001), `--mem-fraction-static 0.47` | 325.2 tok/s |
-| **aggregate on one H200** | **~645 tok/s** — above the 576 tok/s single-server baseline |
+| case | KV tokens | throughput (concurrency 1) | throughput (concurrency 16 x 32 req) |
+|---|---:|---:|---:|
+| instance A (:30000), `--mem-fraction-static 0.42` | 517,529 | 319.7 tok/s | 4,945.9 tok/s |
+| instance B (:30001), `--mem-fraction-static 0.84` | 540,798 | 325.2 tok/s | 4,973.8 tok/s |
+| **aggregate on one H200** | ~1.06M | ~645 tok/s | **~9,920 tok/s** |
+
+The aggregate beats the 576 tok/s single-server baseline at concurrency 1,
+and batched decode makes both engines fly under load. (All 32 requests share
+one prompt, so RadixCache prefix caching amortizes prefill; the number is a
+decode-throughput measurement.)
 
 Mem-fraction pitfall: the second server computes its minimum viable fraction
 *after* the first server's pool exists, so it must be strictly greater than
@@ -125,9 +130,10 @@ server only gets the delta between the two fractions:
 
 B ended up with 1/17 of A's KV capacity from a 3-point fraction gap — below
 one full 40,960-token context. For a roughly even split, the second server's
-fraction must be ~2x the first's (pool_B = fraction_B x total - used_A).
-Hardware MIG partitions would not have this coupling; these software caps
-only emulate them coarsely.
+fraction must be ~2x the first's (pool_B = fraction_B x total - used_A);
+verified: 0.42/0.84 lands 517,529 / 540,798 tokens (within 5%). Hardware
+MIG partitions would not have this coupling; these software caps only
+emulate them coarsely.
 
 ## Files
 

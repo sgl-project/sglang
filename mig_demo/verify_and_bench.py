@@ -7,6 +7,7 @@ Prints one JSON line: label, correctness snippet, and tok/s over N requests.
 import argparse
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -17,6 +18,7 @@ def main() -> None:
     ap.add_argument("--label", default="emulated-tp2")
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--max-new-tokens", type=int, default=128)
+    ap.add_argument("--concurrency", type=int, default=1)
     args = ap.parse_args()
 
     url = f"http://127.0.0.1:{args.port}/generate"
@@ -38,10 +40,8 @@ def main() -> None:
     text = r.json()["text"]
     assert len(text.strip()) > 20, "empty generation"
 
-    # throughput: N requests, count output tokens from meta_info
-    total_tokens = 0
-    t0 = time.perf_counter()
-    for _ in range(args.n):
+    # throughput: N requests at the given concurrency, count output tokens
+    def one_request() -> int:
         r = requests.post(
             url,
             json={
@@ -51,10 +51,14 @@ def main() -> None:
                     "max_new_tokens": args.max_new_tokens,
                 },
             },
-            timeout=120,
+            timeout=300,
         )
         r.raise_for_status()
-        total_tokens += r.json()["meta_info"]["completion_tokens"]
+        return r.json()["meta_info"]["completion_tokens"]
+
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        total_tokens = sum(pool.map(lambda _: one_request(), range(args.n)))
     dt = time.perf_counter() - t0
 
     print(

@@ -13,7 +13,7 @@ LOG_DIR=/root/mig-demo
 pkill -f sglang.launch_server 2>/dev/null
 sleep 3
 
-for item in "30000:${MEM_A:-0.44}" "30001:${MEM_B:-0.47}"; do
+for item in "30000:${MEM_A:-0.42}" "30001:${MEM_B:-0.84}"; do
     p=${item%%:*}; frac=${item##*:}
     nohup python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B \
         --host 127.0.0.1 --port $p --tp 1 --mem-fraction-static $frac \
@@ -29,10 +29,11 @@ for p in 30000 30001; do
     [ "$ok" = 1 ] || { echo "server on $p failed"; tail -5 "$LOG_DIR/dp_$p.log"; exit 1; }
 done
 echo "both servers up; benching concurrently"
+grep -h "max_total_num_tokens" "$LOG_DIR/dp_30000.log" "$LOG_DIR/dp_30001.log"
 
-python /root/mig-demo/verify_and_bench.py --port 30000 --label dp-instance-A --n 4 --max-new-tokens 64 > /tmp/benchA.json 2>&1 &
+python /root/mig-demo/verify_and_bench.py --port 30000 --label dp-instance-A --n 32 --max-new-tokens 128 --concurrency 16 > /tmp/benchA.json 2>&1 &
 BA=$!
-python /root/mig-demo/verify_and_bench.py --port 30001 --label dp-instance-B --n 4 --max-new-tokens 64 > /tmp/benchB.json 2>&1 &
+python /root/mig-demo/verify_and_bench.py --port 30001 --label dp-instance-B --n 32 --max-new-tokens 128 --concurrency 16 > /tmp/benchB.json 2>&1 &
 BB=$!
 wait $BA $BB
 cat /tmp/benchA.json /tmp/benchB.json

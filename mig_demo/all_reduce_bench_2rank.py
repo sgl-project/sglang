@@ -38,7 +38,9 @@ def worker(rank: int, world_size: int) -> None:
         sec = start.elapsed_time(end) / 1e3 / ITERS
         algbw = PAYLOAD_BYTES / sec / 1e9
         busbw = algbw * 2 * (world_size - 1) / world_size
-        print(f"payload=512MiB iters={ITERS} algbw={algbw:.1f}GB/s busbw={busbw:.1f}GB/s")
+        print(
+            f"payload=512MiB iters={ITERS} algbw={algbw:.1f}GB/s busbw={busbw:.1f}GB/s"
+        )
     dist.destroy_process_group()
 
 
