@@ -4383,6 +4383,9 @@ SUPPORTED_LORA_TARGET_MODULES = [
     # Inkling attention projections (merged q/k/v/r and its row-parallel output).
     "qkvr",
     "wo_ud",
+    # GDN (GatedDeltaNet) projections
+    "in_proj_qkvz",
+    "in_proj_ba",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
