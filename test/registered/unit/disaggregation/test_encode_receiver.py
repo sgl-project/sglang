@@ -18,6 +18,7 @@ from sglang.srt.disaggregation.encoder.receiver import (
     _ReceiveRegistrationRunner,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.io_struct import EncoderDispatchErrorReq
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -165,6 +166,100 @@ class TestReceiveRegistration(CustomTestCase):
 
 
 class TestEncodeReceiverRequestConstruction(CustomTestCase):
+    def test_early_dispatch_error_waits_for_scheduler_request(self):
+        encode_finished = threading.Event()
+        scheduler_dispatch_ready = threading.Event()
+        reported = []
+        failure = EncoderDispatchErrorReq(
+            rid="request-1",
+            error_msg="encoder unavailable",
+            error_code=HTTPStatus.BAD_GATEWAY,
+        )
+
+        async def fail_encode(**kwargs):
+            encode_finished.set()
+            return failure
+
+        receiver = SimpleNamespace(encode=fail_encode)
+        worker = threading.Thread(
+            target=MMReceiverBase._run_encode_in_thread,
+            args=(
+                receiver,
+                failure.rid,
+                [],
+                "encode",
+                {},
+                [],
+                None,
+                scheduler_dispatch_ready,
+                reported.append,
+            ),
+        )
+        worker.start()
+
+        self.assertTrue(encode_finished.wait(timeout=1))
+        worker.join(timeout=0.05)
+        self.assertTrue(worker.is_alive())
+        self.assertEqual(reported, [])
+
+        scheduler_dispatch_ready.set()
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(reported, [failure])
+
+    def test_dispatch_error_fails_only_owning_wait(self):
+        class WaitingRequest:
+            def __init__(self, rid):
+                self.rid = rid
+                self.recv_req = SimpleNamespace(rid=rid)
+                self.status = WaitingMMRequestStatus.PENDING
+                self.error_msg = None
+                self.error_code = None
+                self.start_time = 0
+
+            def _try_recv_mm_data(self):
+                pass
+
+            def _fail_and_release(self, error_msg, error_code=None):
+                self.error_msg = error_msg
+                self.error_code = error_code
+                self.status = WaitingMMRequestStatus.FAIL
+
+            def release_resources(self):
+                pass
+
+            def close_recv_socket(self):
+                pass
+
+        owner = WaitingRequest("request-1")
+        other = WaitingRequest("request-2")
+        receiver = SimpleNamespace(
+            waiting_list=[owner, other],
+            waiting_by_rid={owner.rid: owner, other.rid: other},
+            scheduler_recv_socket=None,
+            wait_timeout=float("inf"),
+            tp_group=SimpleNamespace(cpu_group=object()),
+            _drain_scheduler_embeddings=lambda: None,
+            _sync_fail_info_across_tp=lambda request: None,
+            create_req=lambda request: request,
+        )
+        dispatch_error = EncoderDispatchErrorReq(
+            rid=owner.rid,
+            error_msg="bad media",
+            error_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+        )
+
+        with patch("torch.distributed.all_reduce"):
+            _, abort_reqs = MMReceiverBase._process_waiting_requests(
+                receiver, [dispatch_error], waiting_cls=None
+            )
+
+        self.assertEqual(owner.status, WaitingMMRequestStatus.FAIL)
+        self.assertEqual(owner.error_msg, dispatch_error.error_msg)
+        self.assertEqual(owner.error_code, dispatch_error.error_code)
+        self.assertEqual(other.status, WaitingMMRequestStatus.PENDING)
+        self.assertEqual([req.rid for req, _, _ in abort_reqs], [owner.rid])
+
     def test_extra_key_and_cache_salt_are_forwarded(self):
         scheduler = SimpleNamespace(
             model_config=SimpleNamespace(hf_eos_token_id={2}, vocab_size=128),

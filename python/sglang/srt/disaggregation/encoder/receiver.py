@@ -30,7 +30,11 @@ from sglang.srt.distributed.parallel_state import (
     get_mooncake_transfer_engine,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
+from sglang.srt.managers.io_struct import (
+    EncoderDispatchErrorReq,
+    GenerateReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
@@ -1416,10 +1420,10 @@ class WaitingRDMARequest(WaitingMMRequestBase):
 
     async def _check_encoder_responses(self, responses, endpoint: str) -> bool:
         """Record network failures for the scheduler thread to consume."""
-        msg = await _extract_encoder_error(responses, endpoint, f"rid={self.rid}")
-        if msg is None:
+        error = await _extract_encoder_error(responses, endpoint, f"rid={self.rid}")
+        if error is None:
             return True
-        self._record_receive_error(msg)
+        self._record_receive_error(*error)
         return False
 
     async def _pull_meta_and_receive_embedding(self):
@@ -1603,7 +1607,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
 
 
 async def _extract_encoder_error(responses, endpoint, context, encode_requests=None):
-    """Return the first error among gathered encoder responses, or None.
+    """Return the first ``(message, status)`` error, or None.
 
     Pure check — logs each error but has no other side effects; the caller
     decides how to react. ``encode_requests`` optionally enriches each log
@@ -1622,13 +1626,16 @@ async def _extract_encoder_error(responses, endpoint, context, encode_requests=N
                 f"Encoder {endpoint} timeout ({timeout_val}s) for {ctx} "
                 f"(request {i})"
             )
-            return f"Encoder {endpoint} timeout ({timeout_val}s)"
+            return (
+                f"Encoder {endpoint} timeout ({timeout_val}s)",
+                int(HTTPStatus.GATEWAY_TIMEOUT),
+            )
         if isinstance(resp, Exception):
             logger.error(
                 f"Encoder {endpoint} failed for {ctx} (request {i}): {resp}",
                 exc_info=resp,
             )
-            return str(resp)
+            return str(resp), int(HTTPStatus.BAD_GATEWAY)
         if resp.status != 200:
             try:
                 err = await resp.json()
@@ -1636,7 +1643,7 @@ async def _extract_encoder_error(responses, endpoint, context, encode_requests=N
             except Exception:
                 msg = await resp.text()
             logger.error(f"Encoder {endpoint} returned error {resp.status}: {msg}")
-            return msg
+            return msg, int(resp.status)
     return None
 
 
@@ -2094,7 +2101,8 @@ class MMReceiverBase(ABC):
                 done
                 and recv_task not in done
                 and (
-                    encode_task.exception() is not None or encode_task.result() is False
+                    encode_task.exception() is not None
+                    or encode_task.result() is not None
                 )
             ):
                 logger.warning(
@@ -2177,10 +2185,18 @@ class MMReceiverBase(ABC):
         finally:
             recv_socket.close()
 
-    def send_encode_request(self, obj, time_stats_json=None):
-        self._send_encode_request(obj, time_stats_json=time_stats_json)
+    def send_encode_request(
+        self, obj, time_stats_json=None, on_dispatch_error=None
+    ) -> Optional[threading.Event]:
+        return self._send_encode_request(
+            obj,
+            time_stats_json=time_stats_json,
+            on_dispatch_error=on_dispatch_error,
+        )
 
-    def _send_encode_request(self, obj, time_stats_json=None):
+    def _send_encode_request(
+        self, obj, time_stats_json=None, on_dispatch_error=None
+    ) -> Optional[threading.Event]:
         mm_data = self._extract_url_data(obj)
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
@@ -2204,6 +2220,7 @@ class MMReceiverBase(ABC):
             # Freeze the encoder URL snapshot onto obj so the scheduler
             # subprocess uses the same list when indexing encoder_idx.
             obj.encoder_urls = encode_urls
+            scheduler_dispatch_ready = threading.Event()
 
             encode_thread = threading.Thread(
                 target=self._run_encode_in_thread,
@@ -2214,10 +2231,13 @@ class MMReceiverBase(ABC):
                     num_items_assigned,
                     encode_urls,
                     time_stats_json,
+                    scheduler_dispatch_ready,
+                    on_dispatch_error,
                 ),
                 daemon=True,
             )
             encode_thread.start()
+            return scheduler_dispatch_ready
         else:
             # No encoder URLs available (bootstrap may not have any registered yet);
             # reset the flag so the scheduler does not wait for embeddings that will
@@ -2229,6 +2249,7 @@ class MMReceiverBase(ABC):
                     "processing without encoder disaggregation."
                 )
             obj.need_wait_for_mm_inputs = False
+            return None
 
     def _sync_fail_info_across_tp(self, waiting_req: WaitingMMRequestBase) -> None:
         """Share encoder error fields across TP ranks before abort.
@@ -2292,6 +2313,19 @@ class MMReceiverBase(ABC):
         new_recv_reqs = []
         abort_reqs = []
         for recv_req in recv_reqs:
+            if isinstance(recv_req, EncoderDispatchErrorReq):
+                waiting_req = self.waiting_by_rid.get(recv_req.rid)
+                if waiting_req is None:
+                    logger.debug(
+                        "Ignoring encoder dispatch error for inactive request %s",
+                        recv_req.rid,
+                    )
+                else:
+                    waiting_req._fail_and_release(
+                        recv_req.error_msg, recv_req.error_code
+                    )
+                continue
+
             if (
                 isinstance(recv_req, TokenizedGenerateReqInput)
                 and recv_req.need_wait_for_mm_inputs is True
@@ -2322,8 +2356,7 @@ class MMReceiverBase(ABC):
                         embedding_port=self.scheduler_embedding_port,
                         **extra_kwargs,
                     )
-                    if self.scheduler_recv_socket is not None:
-                        self.waiting_by_rid[waiting_req.rid] = waiting_req
+                    self.waiting_by_rid[waiting_req.rid] = waiting_req
                     waiting_req.send_encode_request()
                 except Exception as error:
                     local_error = f"{type(error).__name__}: {error}"
@@ -2450,12 +2483,14 @@ class MMReceiverBase(ABC):
         num_items_assigned,
         encode_urls=None,
         time_stats_json=None,
+        scheduler_dispatch_ready=None,
+        on_dispatch_error=None,
     ):
         # ``embedding_port`` is always None on this path: zmq_to_scheduler /
         # mooncake ranks register their receive ports with the encoder later
         # via /scheduler_receive_url, so the dispatch itself carries no port.
         try:
-            asyncio.run(
+            dispatch_error = asyncio.run(
                 self.encode(
                     req_id=req_id,
                     mm_data=mm_data,
@@ -2468,6 +2503,15 @@ class MMReceiverBase(ABC):
             )
         except Exception as e:
             logger.error(f"Encode failed for request {req_id}: {e}", exc_info=True)
+            dispatch_error = EncoderDispatchErrorReq(
+                rid=req_id,
+                error_msg=str(e),
+                error_code=int(HTTPStatus.BAD_GATEWAY),
+            )
+
+        if dispatch_error is not None and on_dispatch_error is not None:
+            scheduler_dispatch_ready.wait()
+            on_dispatch_error(dispatch_error)
 
     def create_req(self, recv_req: TokenizedGenerateReqInput):
         req = Req(
@@ -2752,11 +2796,15 @@ class MMReceiverHTTP(MMReceiverBase):
             # zmq_to_tokenizer is pushed to our PULL socket during /encode,
             # zmq_to_scheduler to the ports its ranks registered, and mooncake
             # by RDMA once those ranks have pulled sizes and driven /send.
-            return (
-                await _extract_encoder_error(
-                    responses, "HTTP request", f"req_id={req_id}", encode_requests
-                )
-                is None
+            error = await _extract_encoder_error(
+                responses, "HTTP request", f"req_id={req_id}", encode_requests
+            )
+            if error is None:
+                return None
+            return EncoderDispatchErrorReq(
+                rid=req_id,
+                error_msg=error[0],
+                error_code=error[1],
             )
 
 
