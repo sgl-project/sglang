@@ -117,6 +117,21 @@ class GenerationBatchResult:
         this rank/split (a non-last PP rank or a non-final prefill split)."""
         return isinstance(self.next_token_ids, torch.Tensor)
 
+    def snapshot_customized_info(self) -> None:
+        """Detach customized outputs from model-owned reusable buffers.
+
+        This must run on the forward stream before a later overlapping forward
+        can reuse those buffers. In particular, CUDA-graph outputs and model
+        persistent buffers can keep the same storage across replays even while
+        an older ``GenerationBatchResult`` still references them.
+        """
+        if self.logits_output is None or self.logits_output.customized_info is None:
+            return
+        self.logits_output.customized_info = {
+            key: value.clone() if torch.is_tensor(value) else value
+            for key, value in self.logits_output.customized_info.items()
+        }
+
     @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
@@ -151,6 +166,11 @@ class GenerationBatchResult:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
+        if self.logits_output.customized_info is not None:
+            self.logits_output.customized_info = {
+                key: _async_d2h(value) if torch.is_tensor(value) else value
+                for key, value in self.logits_output.customized_info.items()
+            }
         self.next_token_ids = _async_d2h(self.next_token_ids)
 
         if self.accept_lens is not None:
