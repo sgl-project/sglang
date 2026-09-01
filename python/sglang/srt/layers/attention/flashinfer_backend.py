@@ -1964,14 +1964,19 @@ class FlashInferIndicesUpdaterPrefill:
             )
         if prefix_lens is None:
             num_accept_tokens = getattr(spec_info, "num_accept_tokens", None)
+            # Spec verify keeps its query block outside seq_lens, so an unset
+            # prefix means the whole sequence is already-cached prefix.
+            prefix_is_full_seq = num_accept_tokens is None
             prefix_lens = (
                 seq_lens
-                if num_accept_tokens is None
+                if prefix_is_full_seq
                 else seq_lens
                 - num_accept_tokens[: seq_lens.shape[0]].to(
                     device=seq_lens.device, dtype=seq_lens.dtype
                 )
             )
+        else:
+            prefix_is_full_seq = False
         sliding_window_size = self.sliding_window_size
         assert sliding_window_size is not None
         for wrapper_id in range(2):
@@ -1997,7 +2002,14 @@ class FlashInferIndicesUpdaterPrefill:
                         seq_lens,
                         sliding_window_size + seq_lens - prefix_lens,
                     )
-                    paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                    if prefix_is_full_seq and seq_lens_cpu is not None:
+                        # prefix_lens is seq_lens, so the trim is min(seq_lens, window);
+                        # summing the host mirror avoids draining the stream.
+                        paged_kernel_lens_sum = int(
+                            torch.clamp(seq_lens_cpu, max=sliding_window_size).sum()
+                        )
+                    else:
+                        paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = seq_lens - paged_kernel_lens
             else:
                 # full attention
