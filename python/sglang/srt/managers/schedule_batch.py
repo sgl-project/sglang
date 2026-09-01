@@ -2887,14 +2887,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
 
-        # Same row-length reasoning as convert_decode_to_extend: the caller ran
-        # prepare_for_decode, so the tail's prefix is seq_len - 1 and
-        # len(output_ids) is not a fixed offset from it. Spec keeps the request
-        # state, whose tails carry no overlap delay; its rows sit at the
-        # committed base and seq_lens is rebuilt from r.seqlen below.
+        # Same invariant as convert_decode_to_extend: the caller ran
+        # prepare_for_decode, so a tail's prefix is its row length - 1.
         if self.spec_algorithm.is_none():
             running_prefix_lens = [s - 1 for s in running_batch.seq_lens_cpu.tolist()]
         else:
+            # Spec rows sit at the committed base; seq_lens is rebuilt below.
             running_prefix_lens = [r.seqlen - 1 for r in running_batch.reqs]
         for req, prefix_len in zip(
             running_batch.reqs, running_prefix_lens, strict=True
@@ -2972,18 +2970,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Also stale residue; None keeps the prefill result path from
         # re-reporting old prefill stats for what is decode work.
         self.prefill_stats = None
-        # Extend positions are arange(prefix, prefix + extend_len), so a 1-token
-        # extend needs prefix == seq_len - 1; prepare_for_decode already counted
-        # this step's token. len(output_ids) is not a fixed offset from seq_len
-        # here: it lags by one while the previous step's result is unprocessed,
-        # and an iteration that ran prefill instead of decode drains that lag.
-        # A beam tail appends rows past the reqs-aligned ones, so slice to bs.
+        # A 1-token extend's position is arange(prefix, prefix + 1), so prefix
+        # must be seq_len - 1; output_ids trails the row by one or zero and
+        # cannot stand in for it. Rows past bs are a beam tail, not requests.
         seq_lens = self.seq_lens_cpu[:bs].tolist()
         for req, seq_len in zip(self.reqs, seq_lens, strict=True):
             req._refresh_fill_ids()
-            # end runs one past full_untruncated_fill_ids while the lag holds;
-            # decoding_reqs suppresses the cache_unfinished_req path that would
-            # slice the fill ids by it, and the result path reads only .length.
+            # end runs one past full_untruncated_fill_ids while output_ids
+            # trails; safe only while decoding_reqs suppresses cache_unfinished_req.
             req.set_extend_range(seq_len - 1, seq_len)
 
         self.prefix_lens = [seq_len - 1 for seq_len in seq_lens]

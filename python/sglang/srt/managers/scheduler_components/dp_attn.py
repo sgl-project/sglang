@@ -309,9 +309,9 @@ def _local_prefill_cuda_graph_vote(
         and not local_batch.return_logprob
         # Grammar FSMs advance through the decode result path only.
         and not local_batch.has_grammar
-        # Beam member rows ride the decode batch as extra rows with no req of
-        # their own, so the extend view's reqs-aligned lists cannot cover them.
-        # Mirrors the mixed-chunk restriction in get_new_batch_prefill.
+        # A converted batch takes the prefill result path, which commits beam
+        # requests per-req rather than through the batch decode fold; member
+        # rows also have no req of their own for the reqs-aligned extend lists.
         and all(r.beam_group is None for r in local_batch.reqs)
         # Small-bucket BCG replays amplify the a2a EP logits drift (#30898)
         # into an accuracy loss.
