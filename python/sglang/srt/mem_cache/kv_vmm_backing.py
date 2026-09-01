@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 
-from sglang.srt.cuda_vmm_utils import (
+from sglang.srt.utils.cuda_vmm_utils import (
     BumpArenaStub,
     VmmReservation,
     align_up,

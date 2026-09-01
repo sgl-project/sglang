@@ -21,7 +21,7 @@ free to move; the facade is not. `test_import_surface.py` enforces this, with
 a small allowlist for tests that deliberately exercise one backend.
 
 Resolution is lazy (PEP 562): the backends have disjoint heavy dependencies
-(Triton, CUTLASS/CuTe-DSL, FlyDSL on ROCm, MLX on Apple), so an eager
+(Triton, CUTLASS/CuTe-DSL, and FlyDSL on ROCm), so an eager
 re-export would make all of them import-time requirements everywhere.
 
 ## Layout
@@ -63,6 +63,10 @@ looks harmless and is not: on ERNIE-Image it moved the 50-step trajectory to
 PSNR 18.83 dB at `quality=high`, which is what motivated the bit-exact
 rewrite.
 
+SANA-Video's quality-gated linear-attention site keeps BF16 inputs for the
+first GEMM while requesting FP32 accumulation/output, then runs the second
+GEMM in FP32. The default path still promotes Q/K/V before both GEMMs.
+
 ## Entry-point protocol
 
 Every public kernel is a **predicate + kernel** pair:
@@ -86,6 +90,7 @@ Several norms look interchangeable and are not. Start here.
 
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
+| `fuse_scale_shift_kernel` | Triton | close | contiguous BLC; scalar/row/token modulation plus causal-video `[B, F, 1, C]`, using a static capped power-of-two tile to avoid request-time autotuning |
 | `fused_rmsnorm_scale_shift_bitexact` | Triton | bit-exact vs flashinfer CuTe RMSNorm + aten modulate | bf16, contiguous rows, `H == 64 * threads_per_row` |
 | `fused_scale_residual_rmsnorm_scale_shift_bitexact` | Triton | bit-exact, incl. the preceding residual-gate add | as above |
 | `fused_layernorm_modulate` | Triton | bit-exact vs aten `vectorized_layer_norm` | bf16, `N % 4 == 0`, 16B-aligned |
@@ -100,27 +105,43 @@ Several norms look interchangeable and are not. Start here.
 |---|---|---|---|
 | `triton_group_norm_silu` / `apply_group_norm_silu` | Triton | close | NCHW-contiguous, any channels-per-group, always applies SiLU |
 | `group_norm_silu_4d` / `group_norm_silu_rows` | Triton | close | **channels_last only**; power-of-two `C <= 2048`; optional SiLU. This is what lets a VAE decoder run channels_last end-to-end with no `nchwToNhwc` |
-| `wan_rmsnorm_silu` | Triton | close | `channels_last_3d` 5D, Wan VAE channel-first RMSNorm + SiLU |
+| `wan_rmsnorm_silu` | Triton | close | dense `channels_last_3d` 5D (`stride(C) == 1`), Wan VAE channel-first RMSNorm + SiLU |
 | `rmsnorm_scale` / `rmsnorm_tanh_residual` | Triton | bf16-native statistics | Z-Image (matches its own reference exactly), Ideogram 4 (gated) |
 | `zimage_qk_rmsnorm_native` | Triton | bit-exact | Z-Image per-head QK RMSNorm |
 | `fused_qk_head_layernorm` | Triton | bit-exact | per-head LN on q/k, `dim_head % 4 == 0`, `<= 128` |
 | `triton_one_pass_rms_norm` | Triton | close | standalone RMSNorm, one pass |
 
+### Residual gating
+
+| Entry point | Backend | Contract | Applies to |
+|---|---|---|---|
+| `residual_gate_add` | JIT CUDA | bit-exact `residual + update * gate` | contiguous tensors, or a transposed-dense `[B, tokens, hidden]` residual/output with contiguous update and row-broadcast gate (SANA-Video) |
+
+The transposed-dense path uses a shared-memory tile to read the update in
+logical row-major order while keeping residual reads and output writes
+coalesced in their `[B, hidden, tokens]` backing layout. Do not insert a
+`.contiguous()` merely to reach the ordinary path; that restores an entire
+tensor copy per residual site.
+
 ### RoPE / QK-norm
 
 | Entry point | Backend | Contract |
 |---|---|---|
-| `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs split baseline; `round_norm_before_rope=True` makes it exact |
+| `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs split baseline; `round_norm_before_rope=True` makes it exact; supports compact and full-width NeoX/interleaved caches |
 | `fused_qknorm_rope_pack_kv` | JIT CUDA | as above, also packs prefix K/V |
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
+| `fused_interleaved_rope_fp64` | JIT CUDA | bit-exact vs paired SANA-Video fp64 RoPE |
+| `fused_inplace_helios_qk_rope` | JIT CUDA | bit-exact paired in-place RoPE for Helios' transposed frequency layout |
 | `ltx2_qknorm_split_rope_cuda` | JIT CUDA | close; **validated on B200** |
+| `fused_ltx25_decoder_rope` | JIT CUDA | bit-exact paired 3D RoPE from cached compact axis tables |
 | `apply_rotary_embedding` | Triton (+fallbacks) | close; the generic entry point |
 | `hunyuan_qkv_rope_pack` | Triton | bit-exact; packs QKV and applies RoPE in one pass |
 
 ### Data movement (all bit-exact by construction)
 
 `usp_merge_heads`, `pack_qkv_destination_major`, `fused_pack_qkv`,
-`fused_scatter_to_padded`, `fused_causal_conv3d_cat_pad_cuda`,
+`fused_pack_segmented_qkv`, `fused_scatter_to_padded`,
+`fused_causal_conv3d_cat_pad_cuda`,
 `cat_pad_channels_last_3d`, `dup_up3d_add`, `fused_temb_table_slices`,
 `ltx2_ada_values9`.
 

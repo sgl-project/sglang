@@ -7,7 +7,7 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import PIL
@@ -198,8 +198,12 @@ def maybe_unpad_latents(latents, batch):
 class PipelineConfig:
     """The base configuration class for a generation pipeline."""
 
+    native_only_components: ClassVar[tuple[str, ...]] = ()
     task_type: ModelTaskType = ModelTaskType.I2I
     skip_input_image_preprocess: bool = False
+    # Components that cannot fall back to a native Transformers/Diffusers
+    # implementation because their pipeline requires SGLang-specific behavior.
+    native_only_components: tuple[str, ...] = ()
 
     model_path: str = ""
     pipeline_config_path: str | None = None
@@ -225,6 +229,9 @@ class PipelineConfig:
     vae_config: VAEConfig = field(default_factory=VAEConfig)
     vae_precision: str = "fp32"
     vae_decode_precision: str | None = None
+    # Optional request-scoped override. The loader keeps the reference decode
+    # dtype resident so lossless requests never consume pre-rounded weights.
+    vae_decode_precision_high: str | None = None
     vae_tiling: bool = True
     # Bounds the attention grid the diffusion decoder's stages see, which is
     # what makes a full-length decode tractable.

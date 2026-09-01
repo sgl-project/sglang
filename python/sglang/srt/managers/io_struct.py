@@ -50,6 +50,7 @@ import zmq
 import zmq.asyncio
 from pydantic import PlainValidator
 
+from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -68,6 +69,7 @@ from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
     msgspec_struct_pydantic_core_schema,
 )
+from sglang.srt.utils.weight_versions import WeightVersionSpans
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -101,6 +103,10 @@ class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     @classmethod
     def __get_pydantic_core_schema__(cls, source, handler):
         return msgspec_struct_pydantic_core_schema(cls, handler)
+
+
+class BeamSearchOutput(BaseBatchReq, kw_only=True):
+    sequences: List[BeamSearchSequence]
 
 
 class PickleWrapper(msgspec.Struct, tag=True, array_like=True):
@@ -206,6 +212,8 @@ class GenerateReqInput:
     ] = None
     # Whether to extract and process audio from video inputs.
     use_audio_in_video: bool = False
+    # Optional request-scoped video processor configuration.
+    video_config: Optional[Dict[str, Any]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     # Whether to return logprobs.
@@ -317,7 +325,6 @@ class GenerateReqInput:
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
-    mm_data_mooncake: Optional[List[Any]] = None
     # Snapshot of encoder URLs at the time tokenizer-side computed
     # ``num_items_assigned``.
     encoder_urls: Optional[List[str]] = None
@@ -457,6 +464,20 @@ class GenerateReqInput:
                 self.is_single = False
                 self.batch_size = len(self.input_embeds)
 
+    def _sampling_params_beam_width(self) -> int:
+        # 1 means not a beam request.
+        if isinstance(self.sampling_params, dict):
+            return self.sampling_params.get("beam_width") or 1
+        elif isinstance(self.sampling_params, list) and self.sampling_params:
+            return self.sampling_params[0].get("beam_width") or 1
+        return 1
+
+    def _handle_beam_search_parallel_sampling(self) -> int:
+        # No fan-out for beam requests: n means "number of returned sequences".
+        if self._sampling_params_beam_width() > 1:
+            return 1
+        return self.parallel_sample_num
+
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
         # Determine parallel sample count
@@ -472,6 +493,8 @@ class GenerateReqInput:
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
+
+        self.parallel_sample_num = self._handle_beam_search_parallel_sampling()
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
@@ -1024,10 +1047,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
-    # Pickled Optional[List[{"url": MultimodalDataInputItem, "modality": Modality}]]
-    # from MMReceiverBase._extract_url_data. "url" is ImageData.url,
-    # dict["url"] when present, or the original raw multimodal item.
-    mm_data_mooncake: Optional[PickleWrapper] = None
     # Encoder URL snapshot frozen at tokenizer-side dispatch time so that
     # encoder_idx assignments stay consistent in the scheduler subprocess.
     # Internal IPC only.
@@ -1044,11 +1063,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     cache_salt: Optional[str] = None
 
     def wrap_pickle_fields(self):
-        self.mm_data_mooncake = wrap_as_pickle(self.mm_data_mooncake)
         self.time_stats = wrap_as_pickle(self.time_stats)
 
     def unwrap_pickle_fields(self):
-        self.mm_data_mooncake = unwrap_from_pickle(self.mm_data_mooncake)
         self.time_stats = unwrap_from_pickle(self.time_stats)
 
 
@@ -1460,6 +1477,12 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
 
+    # Per-item beam carrier; None entries are non-beam items in a mixed
+    # batch (the whole field is None when the batch has no beam item).
+    beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
+
+    weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
 
@@ -1550,6 +1573,12 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
+
+    # Per-item beam carrier; None entries are non-beam items in a mixed
+    # batch (the whole field is None when the batch has no beam item).
+    beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
+
+    weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
@@ -1928,6 +1957,10 @@ class UpdateWeightVersionReqInput(BaseReq, kw_only=True):
     abort_all_requests: bool = True
 
 
+class UpdateWeightVersionReqOutput(BaseReq, kw_only=True):
+    pass
+
+
 class GetWeightsByNameReqInput(BaseReq, kw_only=True):
     name: str
     truncate_size: int = 100
@@ -2006,6 +2039,7 @@ class AbortReq(BaseReq, kw_only=True):
     # The finished reason data (from BaseFinishReason.to_json())
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
+    weight_versions: Optional[WeightVersionSpans] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code

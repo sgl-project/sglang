@@ -101,7 +101,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
         # The consumer count comes from the published topology.
         override = get_context().override_server_args(
-            enable_dp_attention=False, tp_size=4
+            enable_dp_attention=False, tp_size=4, mm_feature_transport="cuda_vmm"
         )
         override.install()
         self.addCleanup(override.restore)
@@ -122,13 +122,16 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
 
     def test_disabled_transport_is_a_noop(self):
+        from sglang.srt.runtime_context import get_context
         from sglang.srt.utils.cuda_vmm_transport_utils import (
             CudaVmmFeatureTransport,
         )
 
-        transport = CudaVmmFeatureTransport(
-            SimpleNamespace(mm_feature_transport="cpu"), None
-        )
+        # The transport choice is a bag leaf.
+        override = get_context().override_server_args(mm_feature_transport="cpu")
+        override.install()
+        self.addCleanup(override.restore)
+        transport = CudaVmmFeatureTransport(SimpleNamespace(), None)
 
         self.assertEqual(transport.prepare_for_dispatch([None]), [])
         transport.cancel_for_dispatch([])
@@ -136,14 +139,16 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         self.assertIsNone(transport.pool)
 
     def test_vmm_transport_requires_processor(self):
+        from sglang.srt.runtime_context import get_context
         from sglang.srt.utils.cuda_vmm_transport_utils import (
             CudaVmmFeatureTransport,
         )
 
+        override = get_context().override_server_args(mm_feature_transport="cuda_vmm")
+        override.install()
+        self.addCleanup(override.restore)
         with self.assertRaisesRegex(RuntimeError, "multimodal processor"):
-            CudaVmmFeatureTransport(
-                SimpleNamespace(mm_feature_transport="cuda_vmm"), None
-            )
+            CudaVmmFeatureTransport(SimpleNamespace(), None)
 
     def test_image_features_are_packed_per_request(self):
         from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
@@ -440,17 +445,16 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         pool = MagicMock()
         transport.pool = pool
         manager.cuda_vmm_feature_transport = transport
-        server_args = SimpleNamespace(
-            remote_instance_weight_loader_start_seed_via_transfer_engine=False,
-            reasoning_parser=None,
-            tool_call_parser=None,
-            weight_cache_mode=None,
-            enable_elastic_expert_backup=False,
-            elastic_ep_backend=None,
-            node_rank=0,
-            tokenizer_worker_num=1,
-            check_server_args=MagicMock(),
-        )
+        # A real record: the launcher publishes it partway through, and what it
+        # reads after that comes out of the bags, which only project from a
+        # dataclass. The validation is stubbed so the dummy path still launches.
+        from sglang.srt.server_args import ServerArgs
+
+        server_args = ServerArgs(model_path="dummy", tokenizer_worker_num=1)
+        server_args.check_server_args = MagicMock()
+        from sglang.srt.runtime_context import reset_context
+
+        self.addCleanup(reset_context)
         scheduler_init_result = SimpleNamespace(
             all_child_pids=[],
             scheduler_infos=[],

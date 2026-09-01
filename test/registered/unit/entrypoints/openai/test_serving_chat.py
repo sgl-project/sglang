@@ -11,6 +11,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import json
+import re
 import tempfile
 import unittest
 import uuid
@@ -21,6 +22,7 @@ from unittest.mock import Mock, patch
 
 from fastapi import Request
 
+from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.chat_encoding import (
     resolve_dsv4_reasoning_effort_profile,
 )
@@ -42,6 +44,9 @@ from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+# Every spec resolve_chat_encoding_spec can return; pinned by the guard below.
+_ALL_CHAT_ENCODING_SPECS = ("dsv4", "dsv32", "inkling", "kimi_k3")
 
 
 def _spec_result(index):
@@ -1924,6 +1929,34 @@ class ServingChatTestCase(unittest.TestCase):
         serving_chat = OpenAIServingChat(tm, TemplateManager())
         self.assertEqual(serving_chat.chat_encoding_spec, "kimi_k3")
 
+    def test_custom_encoders_own_reasoning_history(self):
+        """Every custom encoding spec takes reasoning history natively.
+
+        The alternative splices a detector's markers into content, which an
+        encoder that frames its own channels turns into visible raw markers.
+        A new spec must not silently default to that path.
+        """
+        for spec in _ALL_CHAT_ENCODING_SPECS:
+            with self.subTest(chat_encoding_spec=spec):
+                self.chat.chat_encoding_spec = spec
+                self.assertTrue(self.chat.supports_native_reasoning_history())
+
+        # The HF chat-template path keeps the wrap-into-content behaviour.
+        self.chat.chat_encoding_spec = None
+        self.assertFalse(self.chat.supports_native_reasoning_history())
+
+    def test_all_chat_encoding_specs_are_enumerated(self):
+        """Guard the spec list this file asserts capabilities over."""
+        source = Path(chat_encoding.__file__).read_text()
+        returned = set(
+            re.findall(
+                r'^\s+return "(\w+)"$',
+                source[source.index("def resolve_chat_encoding_spec") :],
+                re.MULTILINE,
+            )
+        )
+        self.assertEqual(returned, set(_ALL_CHAT_ENCODING_SPECS))
+
     # ------------- dsv4 task + latest_reminder -------------
     def test_dsv4_task_field_schema(self):
         """Top-level `task` accepts the 6 DS task tokens and rejects others."""
@@ -3202,6 +3235,29 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"enable_thinking": True},
         )
         self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
+
+    def test_fallback_ling3_default_on(self):
+        """Ling3 public checkpoints default `thinking_option='on'` in the chat
+        template when `enable_thinking` is omitted, and the template detector
+        cannot infer that indirect assignment. The parser fallback must mirror
+        the template default: omitted kwargs enable reasoning, only an explicit
+        `enable_thinking=False` disables it. Regression: the detector shipped
+        with `explicit_enable_thinking`, which left `reasoning_content` null on
+        default requests while the model was in fact thinking."""
+        self._setup_fallback("ling3")
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "hi"}]
+        )
+        cases = [
+            (None, True),  # no chat_template_kwargs → thinking (template default)
+            ({}, True),  # empty kwargs → thinking
+            ({"enable_thinking": True}, True),  # explicit on
+            ({"enable_thinking": False}, False),  # explicit off
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=kwargs):
+                req.chat_template_kwargs = kwargs
+                self.assertEqual(self.chat._get_reasoning_from_request(req), expected)
 
     def test_fallback_no_detector_returns_false(self):
         self.chat.reasoning_parser = "qwen3"
