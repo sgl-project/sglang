@@ -37,13 +37,14 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     prepare_fp4_k_write_metadata,
     prepare_fp4_prefill_workspace,
 )
-from sglang.srt.utils import get_device, is_hip
+from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=120, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
-    not is_hip(), reason="The FP4 indexer adapters wrap AITER kernels built for ROCm."
+    not (is_hip() and is_gfx95_supported()),
+    reason="The FP4 indexer adapters wrap AITER CDNA4 (gfx95x) kernels.",
 )
 
 HEAD_DIM = 128
