@@ -294,5 +294,38 @@ def test_grouped_conv_supports_runtime_block_sizes():
         torch.testing.assert_close(actual, expected)
 
 
+def test_dflash_missing_target_layer_ids_raises():
+    """A draft config without dflash_config.target_layer_ids must fail loudly:
+    the tap list is baked into the trained weights and cannot be guessed."""
+    config = parse_dflash_draft_config(
+        draft_hf_config={
+            "num_hidden_layers": 5,
+            "dflash_config": {"selector_rank": 256, "selector_top_k": 16},
+        }
+    )
+    with pytest.raises(ValueError, match="target_layer_ids"):
+        config.resolve_target_layer_ids(target_num_layers=36)
+
+
+def test_dflash_target_layer_ids_resolved_verbatim():
+    config = parse_dflash_draft_config(
+        draft_hf_config={
+            "num_hidden_layers": 5,
+            "dflash_config": {
+                "selector_rank": 256,
+                "selector_top_k": 16,
+                "target_layer_ids": [1, 9, 17, 25, 33],
+            },
+        }
+    )
+    assert config.resolve_target_layer_ids(target_num_layers=36) == [
+        1,
+        9,
+        17,
+        25,
+        33,
+    ]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
