@@ -16,8 +16,6 @@
 from __future__ import annotations
 
 import contextlib
-import gc
-import hashlib
 import inspect
 import logging
 import time
@@ -102,7 +100,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
-    get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
@@ -124,7 +121,12 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_cuda_graphs,
     capture_decode_graph,
     capture_prefill_graph,
+    drop_elastic_cuda_graph_state,
     finalize_cuda_graph_capture,
+    recapture_elastic_cuda_graph,
+    resolve_elastic_cuda_graph_config,
+    sync_elastic_cuda_graph_config,
+    validate_elastic_cuda_graph_recapture,
 )
 from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
     compute_post_capture_kv_resize,
@@ -173,7 +175,6 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
-    set_global_graph_memory_pool,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -1075,6 +1076,7 @@ class ModelRunner:
                 capture_decode_cuda_graph and not defer_decode_capture
             ),
             finalize=not defer_decode_capture,
+            defer_distributed_setup=defer_decode_capture,
         )
         self.eager_runner = capture.eager_runner
         self.prefill_cuda_graph_runner = capture.prefill.runner
@@ -1084,7 +1086,6 @@ class ModelRunner:
 
         if is_scale_joiner:
             if self._elastic_cuda_graph_enabled():
-                self._sync_elastic_cuda_graph_config()
                 if defer_decode_capture:
                     self._recapture_elastic_cuda_graphs()
                     finalize_cuda_graph_capture(self)
@@ -2044,46 +2045,6 @@ class ModelRunner:
             state.scale_phase = "serving_expanded"
         self._rearm_eplb_after_elastic_scale()
 
-    def _sync_elastic_cuda_graph_config(self) -> None:
-        decode_backend = (
-            Backend.FULL
-            if check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
-            else Backend.DISABLED
-        )
-        signature = (decode_backend,)
-        if decode_backend == Backend.FULL:
-            capture_bs, compile_bs = get_batch_sizes_to_capture(
-                self, self.decode_num_tokens_per_req()
-            )
-            signature = (
-                decode_backend,
-                tuple(capture_bs),
-                tuple(compile_bs),
-                self.ps.attn_tp_size,
-                self.ps.attn_cp_size,
-                self.decode_attention_backend_str,
-                self.server_args.disable_cuda_graph_padding,
-                self.server_args.enable_two_batch_overlap,
-                get_server_return_hidden_states_mode(),
-            )
-
-        digest = hashlib.sha256(repr(signature).encode()).digest()
-        signature_hash = int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
-        local_hash = torch.tensor(
-            [signature_hash], dtype=torch.int64, device=self.device
-        )
-        gathered_hashes = torch.empty(
-            dist.get_world_size(), dtype=torch.int64, device=self.device
-        )
-        dist.all_gather_into_tensor(gathered_hashes, local_hash, group=dist.group.WORLD)
-        hashes = gathered_hashes.cpu().tolist()
-        if any(value != hashes[0] for value in hashes[1:]):
-            raise RuntimeError(
-                "Elastic EP scale-up requires matching CUDA graph configuration "
-                "and effective capture sizes on every rank; "
-                f"local_signature={signature}, gathered_hashes={hashes}."
-            )
-
     def _finalize_scale_up(
         self,
         ranks_to_join: list[int],
@@ -2135,7 +2096,6 @@ class ModelRunner:
 
         recapture_cuda_graph = self._elastic_cuda_graph_enabled()
         if recapture_cuda_graph:
-            self._sync_elastic_cuda_graph_config()
             self._recapture_elastic_cuda_graphs()
         ElasticEPStateManager.mark_syncing_new_world()
         self._elastic_scale_ready_barrier(
@@ -2174,31 +2134,35 @@ class ModelRunner:
         if not self._elastic_cuda_graph_enabled():
             return
 
+        validate_elastic_cuda_graph_recapture()
         self.attn_backend.validate_elastic_cuda_graph_recapture()
-
-    def _drop_elastic_cuda_graph_state(self) -> None:
-        current_platform.synchronize()
-        runner = self.decode_cuda_graph_runner
-        if runner is not None and runner is not self.eager_runner:
-            runner.backend.cleanup()
-            current_platform.synchronize()
-        self.decode_cuda_graph_runner = None
-        set_global_graph_memory_pool(None)
-        gc.collect()
-        current_platform.empty_cache()
 
     def _recapture_elastic_cuda_graphs(self) -> None:
         if not self._elastic_cuda_graph_enabled():
             return
 
-        self._drop_elastic_cuda_graph_state()
-        self.init_decode_cuda_graph()
-        if self.decode_cuda_graph_runner is None:
-            raise RuntimeError(
-                "Elastic EP CUDA graph recapture did not create a decode graph "
-                "runner."
-            )
-        current_platform.synchronize()
+        sync_elastic_cuda_graph_config(
+            config=resolve_elastic_cuda_graph_config(self),
+            device=self.device,
+            world_group=dist.group.WORLD,
+        )
+        drop_elastic_cuda_graph_state(
+            decode_runner=self.decode_cuda_graph_runner,
+            eager_runner=self.eager_runner,
+        )
+        self.decode_cuda_graph_runner = None
+        capture = recapture_elastic_cuda_graph(model_runner=self)
+        self.decode_cuda_graph_runner = capture.runner
+        self.graph_memory_usage = replace_graph_memory_usage(
+            self.graph_memory_usage,
+            capture.memory_usage,
+            phases=("decode", "target_verify", "draft_decode"),
+        )
+        self.graph_time_usage = replace_graph_time_usage(
+            self.graph_time_usage,
+            capture.time_usage,
+            phases=("decode", "target_verify", "draft_decode"),
+        )
 
     def maybe_join_ep_ranks(self) -> None:
         if not ElasticEPStateManager.is_scaling():

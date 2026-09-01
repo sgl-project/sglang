@@ -82,7 +82,7 @@ if TYPE_CHECKING:
 
 
 class EagerRunner(BaseRunner):
-    def __init__(self, model_runner: ModelRunner) -> None:
+    def __init__(self, model_runner: ModelRunner, *, run_warmup: bool = True) -> None:
         super().__init__(model_runner)
         mr = model_runner
         sa = mr.server_args
@@ -152,7 +152,8 @@ class EagerRunner(BaseRunner):
             dp_size=get_parallel().dp_size,
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
-        self.warmup()
+        if run_warmup:
+            self.warmup()
 
     def _autotune_buffers(self) -> Tuple[Any, int]:
         """Decode-shaped dummy buffers (bs * num_tokens_per_req) for the warmup

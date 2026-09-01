@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import json
 import logging
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.distributed import get_world_group, parallel_state
@@ -27,8 +27,7 @@ logger = logging.getLogger(__name__)
 _SCALE_COHORT_KEY_PREFIX = "elastic_ep/scale_cohort"
 
 
-@dataclass(frozen=True)
-class ScaleCohort:
+class ScaleCohort(msgspec.Struct, frozen=True, kw_only=True):
     target_ep_size: int
     cuda_graph_enabled: bool
 
@@ -39,12 +38,12 @@ def register_scale_cohort(
     store = get_global_tcp_store()
     if store is None:
         raise RuntimeError("Elastic EP scale-up requires the global TCPStore.")
-    payload = json.dumps(
-        {
-            "target_ep_size": target_ep_size,
-            "cuda_graph_enabled": cuda_graph_enabled,
-        }
-    ).encode()
+    payload = msgspec.json.encode(
+        ScaleCohort(
+            target_ep_size=target_ep_size,
+            cuda_graph_enabled=cuda_graph_enabled,
+        )
+    )
     store.set(f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}", payload)
 
 
@@ -55,11 +54,7 @@ def get_scale_cohort(rank_offset: int) -> Optional[ScaleCohort]:
     key = f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}"
     if not store.check([key]):
         return None
-    payload = json.loads(store.get(key).decode())
-    return ScaleCohort(
-        target_ep_size=payload["target_ep_size"],
-        cuda_graph_enabled=payload["cuda_graph_enabled"],
-    )
+    return msgspec.json.decode(store.get(key), type=ScaleCohort)
 
 
 @dataclass
