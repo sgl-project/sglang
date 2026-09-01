@@ -119,6 +119,16 @@ export const benchmarks = [
         ttft_ms: 509, tpot_ms: 11.13, tokens_per_sec_per_gpu: 1210 },
     ],
   },
+  {
+    match: { hw: "b200", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "dev@07c8f7294",
+    accuracy: { gsm8k_pct: 96.82, aime25_pct: 98.96 },
+  },
+  {
+    match: { hw: "b200", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "dev@07c8f7294",
+    accuracy: { gsm8k_pct: 96.44, aime25_pct: 98.33 },
+  },
   // ====================================================================
   // B300 + FP4
   // ====================================================================
