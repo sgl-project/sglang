@@ -319,20 +319,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         # NOTE: the API is not idempotent.
-        if self.page_size == 1:
-            # Resolve the SWA side before deferring the full side: a cache
-            # action later in this group can re-point free_index at a
-            # different SWA slot. page_size > 1 stays on drain-time
-            # resolution: resolving here would pay one _expand_to_full_pages
-            # sync per call instead of one per group.
-            self.free_swa(free_index)
-            if self.free_group is None:
-                self.full_attn_allocator.free(free_index)
-            else:
-                self.free_group.append(self._copy_for_free_group(free_index))
-        elif self.free_group is None:
+        # Resolve the SWA side before deferring the full side: a cache action
+        # later in this group can re-point free_index at a different SWA slot.
+        self.free_swa(free_index)
+        if self.free_group is None:
             self.full_attn_allocator.free(free_index)
-            self.free_swa(free_index)
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
         assert (
@@ -373,7 +364,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.page_size == 1:
             mapping_indices = free_index
         else:
-            mapping_indices = self._expand_to_full_pages(free_index)
+            # Cover the whole page of every listed slot: the paged full side
+            # frees whole pages, and a HiCache-rebuilt page can hold both
+            # mapped and unmapped slots. Duplicates are kept -- deduplicating
+            # here would be a data-dependent torch.unique -- and collapse in
+            # the paged free's own page dedup at release time.
+            base = (free_index // self.page_size) * self.page_size
+            offsets = torch.arange(
+                self.page_size, dtype=free_index.dtype, device=free_index.device
+            )
+            mapping_indices = (base[:, None] + offsets[None, :]).reshape(-1)
 
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
         self.clear_full_to_swa_mapping(mapping_indices)
@@ -414,12 +414,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_free_group = []
 
     def _release_free_group(self, free_index: torch.Tensor):
-        if self.page_size == 1:
-            # The SWA side was resolved at enqueue time; free() would re-read
-            # a mapping that no longer describes these full indices.
-            self.full_attn_allocator.free(free_index)
-        else:
-            super()._release_free_group(free_index)
+        # The SWA side was resolved at enqueue time; free() would re-read a
+        # mapping that no longer describes these full indices.
+        self.full_attn_allocator.free(free_index)
 
     def free_group_end(self):
         super().free_group_end()
@@ -435,13 +432,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
-
-    def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
-        pages = torch.unique(indices // self.page_size)
-        page_offsets = torch.arange(
-            self.page_size, dtype=indices.dtype, device=indices.device
-        )
-        return (pages[:, None] * self.page_size + page_offsets[None, :]).reshape(-1)
 
     def resize(self, config) -> None:
         size_full = int(config.full_max_total_num_tokens)
