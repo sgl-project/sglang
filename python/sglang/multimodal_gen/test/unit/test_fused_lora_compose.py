@@ -11,9 +11,11 @@ import torch.nn.functional as F
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     MergedColumnParallelLinearWithLoRA,
 )
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
     LoRAPipeline,
     stack_or_compose_fused_lora,
+    swap_peft_swiglu_fc1_lora_b,
 )
 from sglang.multimodal_gen.runtime.post_training.weights_updater import (
     _resolve_lora_ipc_layer_dict_key,
@@ -371,3 +373,44 @@ def test_apply_composed_adapter_end_to_end():
         + _reference_delta(x, a_list, b_list, adapter_alpha) * strength
     )
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_h3_ipc_reuses_disk_mapping_and_ffn_swap():
+    module = torch.nn.Module()
+    module.param_names_mapping = MiniMaxH3DiTArchConfig().param_names_mapping
+    qkv, fc1 = object(), object()
+    layer_dict = {
+        "blocks.0.attn.qkv_proj": qkv,
+        "blocks.0.mlp.fc1": fc1,
+        "token_refiner.blocks.1.attn.qkv_proj": qkv,
+    }
+    cases = [
+        ("transformer_blocks.0.attn.to_k", qkv, "blocks.0.attn.qkv_proj", 1),
+        ("transformer_blocks.0.ff.net.0.proj", fc1, "blocks.0.mlp.fc1", None),
+        (
+            "token_refiner.refiner_blocks.1.attn.to_q",
+            qkv,
+            "token_refiner.blocks.1.attn.qkv_proj",
+            0,
+        ),
+    ]
+    for src, layer, key, merge_index in cases:
+        assert _resolve_lora_ipc_layer_dict_key(src, layer_dict, module) == (
+            layer,
+            key,
+            merge_index,
+        )
+
+    peft_b = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    swapped = swap_peft_swiglu_fc1_lora_b(
+        "transformer_blocks.0.ff.net.0.proj.lora_B",
+        "blocks.0.mlp.fc1.lora_B",
+        peft_b,
+    )
+    torch.testing.assert_close(swapped, torch.cat([peft_b[2:], peft_b[:2]]))
+    assert (
+        swap_peft_swiglu_fc1_lora_b(
+            "blocks.0.mlp.fc1.lora_B", "blocks.0.mlp.fc1.lora_B", swapped
+        )
+        is swapped
+    )
