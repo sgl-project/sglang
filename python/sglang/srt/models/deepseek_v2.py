@@ -52,7 +52,13 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.distributed import (
     divide,
     get_pp_group,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
+)
+from sglang.srt.distributed.device_communicators.symm_mem_kernels import (
+    maybe_fused_ag_shared_experts,
+    maybe_fused_shared_add_rs,
+    maybe_fused_ag_gate_mm,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -317,6 +323,7 @@ class DeepseekV2MLP(nn.Module):
         forward_batch=None,
         gemm_output_zero_allocator: BumpAllocator = None,
         gateup_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        precomputed_gate_up: Optional[torch.Tensor] = None,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
@@ -346,7 +353,9 @@ class DeepseekV2MLP(nn.Module):
             out, _ = self.down_proj((out_fp4, out_scale))
             return out
 
-        if gateup_pre_quant is not None:
+        if precomputed_gate_up is not None:
+            gate_up = precomputed_gate_up
+        elif gateup_pre_quant is not None:
             # SGLANG_OPT_MOE_QUANT_ONCE: reuse the caller's per-token-group-128
             # fp8 (q, scale) of x for the gate_up GEMM instead of re-quantizing
             # inside the fp8 linear method. q rows may be padded to a multiple
@@ -1028,7 +1037,7 @@ class DeepseekV2MoE(nn.Module):
 
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
         with torch.cuda.stream(self.alt_stream):
-            shared_output = self._forward_shared_experts(
+            _, shared_output = self._forward_shared_experts(
                 hidden_states,
                 gemm_output_zero_allocator,
                 pre_quant_input=pre_quant_input,
@@ -1098,13 +1107,31 @@ class DeepseekV2MoE(nn.Module):
                 and not self._fuse_shared_experts_inside_sbo
                 and not skip_shared_experts
             ):
-                shared_output = self._forward_shared_experts(
+                ag_out, shared_output = self._forward_shared_experts(
                     hidden_states,
                     gemm_output_zero_allocator,
                     pre_quant_input=pre_quant_input,
                 )
-            # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+                if ag_out is not None:
+                    # calculate allgather in the overlap kernel
+                    hidden_states = ag_out
+            else:
+                shared_output = None
+            
+            if shared_output is None:
+                # fuse allgather with gate matmul
+                ag_out, router_logits = maybe_fused_ag_gate_mm(
+                    hidden_states,
+                    self.gate.weight
+                )
+                if ag_out is not None:
+                    hidden_states = ag_out
+                else:
+                    # fallback: separate allgather + gate matmul
+                    router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            else:
+                router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+
             topk_kwargs = (
                 {"input_ids": input_ids_global}
                 if getattr(self, "is_hash", False)
@@ -1133,7 +1160,7 @@ class DeepseekV2MoE(nn.Module):
                 nonlocal shared_output
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
-                    shared_output = self._forward_shared_experts(
+                    _, shared_output = self._forward_shared_experts(
                         hidden_states, gemm_output_zero_allocator
                     )
 
@@ -1180,11 +1207,29 @@ class DeepseekV2MoE(nn.Module):
             and not self._fuse_shared_experts_inside_sbo
             and not skip_shared_experts
         ):
-            shared_output = self._forward_shared_experts(
+            _, shared_output = self._forward_shared_experts(
                 hidden_states,
                 gemm_output_zero_allocator,
                 pre_quant_input=pre_quant_input,
             )
+        # Fused shared-add + reduce-scatter path (falls through if not applicable).
+        # When humming runner is active, pass topk info for the mul-sum overlap
+        # kernel which fuses topk weighted sum + add shared + RS in one kernel.
+        is_humming = get_moe_runner_backend().is_humming()
+        fused_out = maybe_fused_shared_add_rs(
+            final_hidden_states,
+            shared_output,
+            self.tp_size,
+            self.n_shared_experts,
+            # if fuse shared experts, topk for moe equals to num_experts_per_tok + num_fused_shared_experts
+            self.top_k + self.num_fused_shared_experts,
+            self.routed_scaling_factor,
+            is_humming=is_humming,
+            topk_weights=topk_output.topk_weights if is_humming else None,
+            topk_ids=topk_output.topk_ids if is_humming else None,
+        )
+        if fused_out is not None:
+            return fused_out
 
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
             self.experts,
@@ -1282,7 +1327,7 @@ class DeepseekV2MoE(nn.Module):
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
-                        shared_output = self._forward_shared_experts(hidden_states)
+                        _, shared_output = self._forward_shared_experts(hidden_states)
                         shared_output.record_stream(self.alt_stream)
                         shared_event = self.alt_stream.record_event()
                     if is_in_breakable_cuda_graph():
@@ -1293,7 +1338,7 @@ class DeepseekV2MoE(nn.Module):
                         # allocator recycles shared_output across the break.
                         torch.cuda.current_stream().wait_event(shared_event)
                 else:
-                    shared_output = self._forward_shared_experts(hidden_states)
+                    _, shared_output = self._forward_shared_experts(hidden_states)
             topk_kwargs = (
                 {"input_ids": input_ids_global}
                 if getattr(self, "is_hash", False)
@@ -1322,7 +1367,7 @@ class DeepseekV2MoE(nn.Module):
 
             def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
                 nonlocal shared_output
-                shared_output = self._forward_shared_experts(hidden_states)
+                _, shared_output = self._forward_shared_experts(hidden_states)
                 for handle in deepep_dispatch_hook_handle:
                     handle.remove()
 
@@ -1398,7 +1443,7 @@ class DeepseekV2MoE(nn.Module):
                 with deep_gemm_wrapper.configure_deep_gemm_num_sms(
                     dispatcher.meta_overlap_args["compute_num_sms"]
                 ):
-                    shared_output = self._forward_shared_experts(hidden_states)
+                    _, shared_output = self._forward_shared_experts(hidden_states)
 
                 pre_combine_hook_handle.remove()
 
@@ -1503,6 +1548,41 @@ class DeepseekV2MoE(nn.Module):
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+
+            if shared is None:
+                return None, None
+
+            shared_experts_is_fp8 = self.shared_experts_is_fp8
+            gate_up = shared.gate_up_proj
+
+            from sglang.srt.layers.quantization.humming import HummingLinearMethod
+            is_humming = isinstance(gate_up.quant_method, HummingLinearMethod)
+
+            if is_humming:
+                ag_out, gate_up_local = maybe_fused_ag_shared_experts(
+                    hidden_states,
+                    shared_experts_is_fp8=False,
+                    w_fp8=None,
+                    w_scale=None,
+                    is_humming=True,
+                    humming_weight=gate_up.pre_repacked_weight,
+                    humming_scale=gate_up.pre_repacked_scale,
+                    humming_group_size=(
+                        gate_up.quant_method.weight_schema.weight_scale_group_size
+                    ),
+                )
+            else:
+                ag_out, gate_up_local = maybe_fused_ag_shared_experts(
+                    hidden_states,
+                    shared_experts_is_fp8,
+                    gate_up.weight if not shared_experts_is_fp8 else None,
+                    gate_up.weight_scale_inv if shared_experts_is_fp8 else None,
+                )
+            if gate_up_local is not None and ag_out is not None:
+                return ag_out, self.shared_experts(
+                    hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator,
+                    precomputed_gate_up=gate_up_local,
+                )
             if pre_quant_input is not None:
                 # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a
                 # multiple of 4; the padded rows flow through the MLP (all ops
@@ -1510,12 +1590,12 @@ class DeepseekV2MoE(nn.Module):
                 out = self.shared_experts(
                     hidden_states, gateup_pre_quant=pre_quant_input
                 )
-                return out[: hidden_states.shape[0]]
-            return self.shared_experts(
+                return None, out[: hidden_states.shape[0]]
+            return None, self.shared_experts(
                 hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
             )
         else:
-            return None
+            return None, None
 
     def _moe_quant_once_enabled(self) -> bool:
         """SGLANG_OPT_MOE_QUANT_ONCE: quantize the (dp-gathered) MoE input to
@@ -2843,11 +2923,14 @@ class DeepseekV2Model(nn.Module):
         )
 
         # CP-v2 shards/gathers at the eager-runner boundary instead.
+        use_prefill_cp = dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
         use_cp_v1 = (
-            dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
-            or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+            use_prefill_cp or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
         ) and not is_cp_v2_active(forward_batch)
-
+        if use_prefill_cp:
+            _comm = get_tp_group().torch_symm_mem_comm
+            if _comm is not None:
+                _comm.set_use_cp(True)
         if use_cp_v1:
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
@@ -2917,6 +3000,10 @@ class DeepseekV2Model(nn.Module):
                 ].layer_scatter_modes.layer_output_mode,
                 zero_allocator=zero_allocator,
             )
+
+        _comm = get_tp_group().torch_symm_mem_comm
+        if _comm is not None:
+            _comm.set_use_cp(False)
 
         if not self.pp_group.is_last_rank:
             proxy_tensors = {

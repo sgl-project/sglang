@@ -483,6 +483,9 @@ def _freqs_cis_to_cos_sin(
     _FREQS_CIS_TO_COS_SIN[key] = (cos, sin)
     return cos, sin
 
+def _cp_fused_symm_mem_enabled() -> bool:
+    """True when CP AG/RS should be handled by torch_symm_mem fused kernels."""
+    return envs.SGLANG_OPT_USE_TORCH_SYMM_MEM_FUSED_KERNEL.get() and not get_is_capture_mode()
 
 def _apply_gguf_grouped_wo_a(
     o: torch.Tensor,
@@ -2300,7 +2303,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
-            if moe_a2a_backend.is_none():
+            if moe_a2a_backend.is_none() and not _cp_fused_symm_mem_enabled():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
                 assert (
@@ -2340,7 +2343,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 skip_shared_experts=_do_shared_local,
             )
         if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            if not _cp_fused_symm_mem_enabled():
+                hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
@@ -3103,6 +3107,9 @@ class DeepseekV4Model(nn.Module):
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
         run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
         if use_prefill_cp and not run_tbo:
+            _comm = get_tp_group().torch_symm_mem_comm
+            if _comm is not None and _cp_fused_symm_mem_enabled():
+                _comm.set_use_cp(True)
             if cp_v2_active:
                 input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
             else:
@@ -3162,6 +3169,9 @@ class DeepseekV4Model(nn.Module):
                     hidden_states, prev_residual, prev_post, prev_comb
                 )
 
+        _comm = get_tp_group().torch_symm_mem_comm
+        if _comm is not None:
+            _comm.set_use_cp(False)
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if (
             self.pp_group.is_last_rank
