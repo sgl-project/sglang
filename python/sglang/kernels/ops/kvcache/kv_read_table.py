@@ -21,8 +21,8 @@ the result into `out`:
                 for c < ceil(seq_lens[b] / ps)          -- the row's LIVE prefix
 
 `v2p` is the pool's virtual->physical page table and `multiplier` scales a
-physical page into the id space the per-layer views use (1 when they are not
-dense). Since only the page number is rewritten, a token-level consumer can
+physical page into the id space the per-layer views use (1 when one page maps
+to one row-block). Since only the page number is rewritten, a token-level consumer can
 rebuild flat ids as `entry * ps + offset`.
 
 PREFIX-ONLY per row: columns past the live prefix are never written, so a

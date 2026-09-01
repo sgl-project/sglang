@@ -34,7 +34,7 @@ _UNIFIED_COMMON_ARGS = [
 
 
 class TestUnifiedQwenHybridTriton(DefaultServerBase):
-    """Unified pool on Qwen3.5-4B (GDN-hybrid), Triton pinned: dense
+    """Unified pool on Qwen3.5-4B (GDN-hybrid), Triton pinned: contiguous
     full-attention views + strided conv/SSM state through the reference
     backends."""
 

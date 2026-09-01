@@ -141,12 +141,14 @@ sgl-eval run gsm8k \\
     ],
   },
 
-  // Image for `docker run` framing, keyed by `hw` (or `hw|quant`, resolved first, when one
-  // quant on a shared GPU needs its own image — e.g. an FP4 dev build while FP8/BF16 use the
-  // release tag). ASK the user which sglang build the recipes ran on; don't guess a supporting
-  // release. Default below is :dev (nightly) — replace the tag with the user's release if they
-  // give one. NVIDIA share one image; AMD uses ROCm tags. GB200/GB300/B300 may need a
-  // `-cu130` (CUDA 13) tag — confirm per release.
+  // Image for `docker run` framing, keyed by `hw` (or, resolved before it: `hw|variant|quant`,
+  // `variant|quant`, `hw|quant|strategy`, `hw|quant` — use a more specific key only when a
+  // variant/quant/strategy subset needs its own build, e.g. an FP4 dev build while FP8/BF16 use
+  // the release tag, or a preview image for a not-yet-released variant). ASK the user which
+  // sglang build the recipes ran on; don't guess a supporting release. Default below is :dev
+  // (nightly) — replace the tag with the user's release if they give one. NVIDIA share one
+  // image; AMD uses ROCm tags. GB200/GB300/B300 may need a `-cu130` (CUDA 13) tag — confirm
+  // per release.
   dockerImages: {
     h100:  "lmsysorg/sglang:dev",
     h200:  "lmsysorg/sglang:dev",

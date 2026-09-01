@@ -70,8 +70,8 @@ def _armed_source(v2p, swa_map):
     )
     src.is_translating = True
     src._translate_full = lambda t, out=None: v2p[t.to(torch.int64)]
-    # Phase 2 derives from DENSE values through p2v + the swa v2p; arm the
-    # inverse of the fake v2p (ps=1, both multipliers 1: dense == physical,
+    # Phase 2 derives from kernel-facing values through p2v + the swa v2p; arm
+    # the inverse of the fake v2p (ps=1, both multipliers 1: kernel == physical,
     # and the expected swa loc for virtual t is swa_map[t]).
     p2v = torch.zeros(int(v2p.max()) + 1, dtype=torch.int64)
     p2v[v2p] = torch.arange(v2p.numel(), dtype=torch.int64)
@@ -160,8 +160,8 @@ class TestPadComposesWithDerivation(CustomTestCase):
             with self.subTest(page_size=page_size, blocks=blocks):
                 stride = page_size * blocks
                 virt = torch.arange(1, 2 * stride, dtype=torch.int64)
-                dense = (virt // page_size) * stride + virt % page_size
-                in_space = dense % stride < page_size
+                kernel = (virt // page_size) * stride + virt % page_size
+                in_space = kernel % stride < page_size
                 self.assertTrue(bool(in_space.all()), "kernel-facing ids must pass")
                 # Virtual ids pass only in the first block; that is why the
                 # probe needs a batch, not one id, to be conclusive.
