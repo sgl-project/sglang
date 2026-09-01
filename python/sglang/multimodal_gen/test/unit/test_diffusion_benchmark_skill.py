@@ -271,6 +271,14 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                 bcg_cmd[bucket_index + 1 : bucket_index + 3], ["256", "512"]
             )
 
+            sana_video_bcg_cmd = module.build_sglang_cmd(
+                "sana-video", breakable_cuda_graph=True
+            )
+            self.assertEqual(
+                sana_video_bcg_cmd[sana_video_bcg_cmd.index("--warmup-num-frames") + 1],
+                "17",
+            )
+
             for _, quality, breakable_cuda_graph in module.QUALITY_BCG_ABBA_MATRIX:
                 module.build_sglang_cmd(
                     "longcat-image",
@@ -463,6 +471,41 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
             self.assertEqual(
                 result["missing_artifacts"], ["perf dump", "generated output"]
             )
+
+    def test_mesh_artifacts_are_accepted_and_hashed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_root = Path(tmpdir)
+            module = _load_benchmark_module(temp_root)
+            output_dir = temp_root / "outputs"
+            output_dir.mkdir()
+
+            def finish_run():
+                (output_dir / "hunyuan3d-shape_mesh-output.json").write_text(
+                    json.dumps({"total_duration_ms": 1000, "steps": []}),
+                    encoding="utf-8",
+                )
+                (output_dir / "hunyuan3d-shape-mesh-output.obj").write_bytes(
+                    b"v 0 0 0\n"
+                )
+                return 0
+
+            with patch.object(module.subprocess, "Popen") as popen:
+                popen.return_value.stdout = iter(())
+                popen.return_value.wait.side_effect = finish_run
+                result = module._run_benchmark_once_impl(
+                    "hunyuan3d-shape",
+                    "mesh-output",
+                    output_dir,
+                    warmup=False,
+                    cuda_visible_devices="0",
+                )
+
+            self.assertFalse(result["error"])
+            self.assertEqual(
+                result["output_artifacts"],
+                [str(output_dir / "hunyuan3d-shape-mesh-output.obj")],
+            )
+            self.assertEqual(len(result["output_sha256"]), 1)
 
     def test_high_bcg_rejects_quality_fusion_mounted_after_capture(self):
         with tempfile.TemporaryDirectory() as tmpdir:

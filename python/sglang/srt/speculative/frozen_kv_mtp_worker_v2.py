@@ -143,7 +143,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
@@ -163,9 +163,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.kv_context: Optional[FrozenKVMTPContext] = None
 
         self.draft_tp_context = (
-            draft_tp_context
-            if get_parallel().config.enable_dp_attention
-            else empty_context
+            draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
 
         self.draft_attn_backend = None

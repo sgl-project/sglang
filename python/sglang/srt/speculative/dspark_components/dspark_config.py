@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 
+from sglang.srt.arg_groups.overrides import resolved_view
 from sglang.srt.runtime_context import (
     get_model,
     get_spec,
@@ -142,7 +143,6 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
     silently drops the checkpoint's gamma and the cross-check with
     `--speculative-num-draft-tokens` along with it.
     """
-    from sglang.srt.arg_groups.overrides import resolved_view
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     resolving = resolved_view(server_args)
