@@ -1720,20 +1720,30 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         ):
                             continue
             else:
-                if not name.startswith(nextn_layer_prefix):
+                # A PP-hosted NextN draft is built as a standalone one-stage
+                # model on the last target stage.  It cannot share the target
+                # embedding because that tensor belongs to the first target
+                # stage, so retain and load the draft's own embedding copy.
+                # The lm_head remains shared from the last target stage.
+                is_draft_embedding = name == "model.embed_tokens.weight"
+                if (
+                    not name.startswith(nextn_layer_prefix)
+                    and not is_draft_embedding
+                ):
                     continue
 
-                if "shared_head.head" in name or "embed_tokens" in name:
+                if "shared_head.head" in name:
                     continue
 
-                is_decoder = True
-                for weight_name in nextn_spec_weight_names:
-                    if weight_name in name:
-                        name = name.replace(nextn_layer_prefix, "model")
-                        is_decoder = False
-                        break
-                if is_decoder:
-                    name = name.replace(nextn_layer_prefix, "model.decoder")
+                if not is_draft_embedding:
+                    is_decoder = True
+                    for weight_name in nextn_spec_weight_names:
+                        if weight_name in name:
+                            name = name.replace(nextn_layer_prefix, "model")
+                            is_decoder = False
+                            break
+                    if is_decoder:
+                        name = name.replace(nextn_layer_prefix, "model.decoder")
 
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1886,17 +1896,21 @@ class Glm5NextForConditionalGeneration(nn.Module):
             raise AttributeError(
                 "get_embed_and_head() is not available in encoder-only mode"
             )
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
+        head = self.lm_head.weight if self.pp_group.is_last_rank else None
+        return embed, head
 
     def set_embed_and_head(self, embed, head):
         if self.model is None or self.lm_head is None:
             raise AttributeError(
                 "set_embed_and_head() is not available in encoder-only mode"
             )
-        del self.model.embed_tokens.weight
-        del self.lm_head.weight
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+        if self.pp_group.is_first_rank and embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        if self.pp_group.is_last_rank and head is not None:
+            del self.lm_head.weight
+            self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 

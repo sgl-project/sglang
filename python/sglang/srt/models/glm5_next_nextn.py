@@ -14,6 +14,8 @@
 
 import logging
 
+import torch
+
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.srt.models.utils import WeightsMapper
@@ -67,14 +69,31 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
             f"model.layers.{layer_id}.",
             f"model.language_model.layers.{layer_id}.",
         )
+        embedding_names = (
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+        )
         nextn_weights = (
             (name, weight)
             for name, weight in weights
-            if name.startswith(layer_prefixes)
+            if name.startswith(layer_prefixes) or name in embedding_names
         )
         return Glm5NextForConditionalGeneration.load_weights(
             self, nextn_weights, is_nextn=True
         )
+
+    def set_embed_and_head(self, embed, head):
+        # Under target PP the last stage owns the lm_head but not the target
+        # embedding.  Keep the embedding loaded above when the target returns
+        # None, and share only the tensors that this stage actually owns.
+        if embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        if head is not None:
+            del self.lm_head.weight
+            self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
 EntryClass = [Glm5NextForConditionalGenerationNextN]

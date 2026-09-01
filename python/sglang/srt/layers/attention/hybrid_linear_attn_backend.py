@@ -235,6 +235,35 @@ class MambaAttnBackendBase(AttentionBackend):
                         device=forward_batch.input_ids.device,
                     )
 
+                # MLP sync can pad an eager verify from one real request to a
+                # larger physical request bucket. The input tensor is padded in
+                # token space, but recurrent metadata must keep those fabricated
+                # request rows empty. Otherwise, for example, adaptive N=4 on
+                # attn-TP=8 becomes qsl=[0, 4, 8] with cache slots [real, -1].
+                # RadixLinearAttention trims the tensors back to four real rows,
+                # while the second KDA program still reads rows [4, 8), causing
+                # an out-of-bounds access. Match the CUDA-graph replay contract:
+                # retain padded request rows, poison their cache slots above, and
+                # collapse their query ranges to the logical end.
+                if _real_bs is not None and _real_bs < bs:
+                    if query_start_loc.shape[0] < _real_bs + 1:
+                        raise RuntimeError(
+                            "target-verify query_start_loc does not cover all real "
+                            f"requests: qsl_rows={query_start_loc.shape[0]}, "
+                            f"real_bs={_real_bs}, padded_bs={bs}"
+                        )
+                    logical_end = query_start_loc[_real_bs]
+                    padded_query_start_loc = torch.empty(
+                        (bs + 1,),
+                        dtype=query_start_loc.dtype,
+                        device=query_start_loc.device,
+                    )
+                    padded_query_start_loc[: _real_bs + 1] = query_start_loc[
+                        : _real_bs + 1
+                    ]
+                    padded_query_start_loc[_real_bs + 1 :] = logical_end
+                    query_start_loc = padded_query_start_loc
+
                 if self.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrieve_next_token
                     retrieve_next_sibling = (

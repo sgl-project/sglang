@@ -1,11 +1,13 @@
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     _align_pipeline_layers,
+    capture_cuda_graphs,
     capture_decode_graph,
     has_standard_gqa_for_all_local_layers,
     index_attention_layers_by_global_id,
@@ -90,6 +92,81 @@ def test_model_runner_can_override_decode_graph_runner(monkeypatch):
         assert capture.runner.model_runner is model_runner
     finally:
         override.restore()
+
+
+def test_deep_gemm_budget_uses_runner_tp_group(monkeypatch):
+    """Draft-only PP initialization must not issue a world collective."""
+    from sglang.srt.runtime_context import get_context
+
+    tp_cpu_group = object()
+    calls = []
+    model_runner = SimpleNamespace(
+        device="cuda",
+        gpu_id=3,
+        is_draft_worker=True,
+        model_config=SimpleNamespace(quantization="fp8"),
+        tp_group=SimpleNamespace(world_size=4, cpu_group=tp_cpu_group),
+        server_args=SimpleNamespace(forward_hooks=[]),
+        canary_manager=None,
+        forward_stream=None,
+    )
+    override = get_context().override_server_args(
+        cuda_graph_config=None,
+        moe_runner_backend="deep_gemm",
+        speculative_moe_runner_backend=None,
+        moe_a2a_backend="none",
+        speculative_moe_a2a_backend=None,
+        enable_symm_mem=False,
+    )
+    override.install()
+
+    def fake_available_memory(device, gpu_id, *, distributed, cpu_group):
+        calls.append((device, gpu_id, distributed, cpu_group))
+        return 12.0
+
+    monkeypatch.setattr(
+        cuda_graph_setup.GraphSharedOutput,
+        "create_for_model_runner",
+        lambda _runner: None,
+    )
+    monkeypatch.setattr(cuda_graph_setup, "EagerRunner", lambda _runner: object())
+    monkeypatch.setattr(
+        cuda_graph_setup,
+        "capture_prefill_graph",
+        lambda **_kwargs: cuda_graph_setup.GraphCapture(
+            runner=None, memory_phase="prefill", memory_usage_gb=0, capture_time=0
+        ),
+    )
+    monkeypatch.setattr(
+        cuda_graph_setup, "get_available_gpu_memory", fake_available_memory
+    )
+    monkeypatch.setattr(
+        cuda_graph_setup, "prealloc_symmetric_memory_pool", lambda **_kwargs: None
+    )
+
+    try:
+        with patch(
+            "sglang.srt.layers.moe.moe_runner.deep_gemm.set_masked_standard_layout_memory_budget",
+            return_value=3 << 30,
+        ):
+            capture_cuda_graphs(
+                model_runner=model_runner, capture_decode_cuda_graph=False
+            )
+    finally:
+        override.restore()
+
+    assert calls == [("cuda", 3, True, tp_cpu_group)]
+
+
+def test_deep_gemm_budget_only_tightens_across_coexisting_runners(monkeypatch):
+    from sglang.srt.layers.moe.moe_runner import deep_gemm
+
+    monkeypatch.setattr(deep_gemm.envs.SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION, "get", lambda: 0.5)
+    monkeypatch.setattr(deep_gemm, "_masked_standard_layout_memory_budget_bytes", None)
+
+    assert deep_gemm.set_masked_standard_layout_memory_budget(1000) == 500
+    assert deep_gemm.set_masked_standard_layout_memory_budget(1200) == 500
+    assert deep_gemm.set_masked_standard_layout_memory_budget(800) == 400
 
 
 def test_align_pipeline_layers_uses_absolute_indices():

@@ -311,6 +311,26 @@ class IndexerKPool(MultiPlatformOp):
         if batch == 0:
             return
 
+        seq_lens = metadata.get_seqlens_int32()
+        # DeepEP MLP-sync pads token-aligned tensors to a common per-rank row
+        # count while attention metadata intentionally remains in the real
+        # request domain.  Padding rows participate in MoE collectives but do
+        # not own request slots and must never write DSA KPool state.  This is
+        # symmetric with _get_topk_paged(), which already trims padded q/weight
+        # rows to the metadata row count before reading the KPool.
+        real_batch = seq_lens.shape[0]
+        assert real_batch <= batch, (
+            "DSA KPool metadata has more request rows than token rows: "
+            f"real_batch={real_batch}, physical_batch={batch}"
+        )
+        if real_batch == 0:
+            return
+        if real_batch < batch:
+            key = key[:real_batch]
+            gate_score = gate_score[:real_batch]
+            positions = positions[:real_batch]
+            batch = real_batch
+
         pool = get_token_to_kv_pool()
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
@@ -325,7 +345,7 @@ class IndexerKPool(MultiPlatformOp):
             block_tables=metadata.get_page_table_64(),
             req_pool_indices=forward_batch.req_pool_indices[:batch],
             positions=positions[:batch],
-            seq_lens=metadata.get_seqlens_int32()[:batch],
+            seq_lens=seq_lens[:batch],
             out_cache_loc=forward_batch.out_cache_loc[:batch],
             round_scale=self.scale_fmt is not None,
         )
@@ -900,6 +920,34 @@ class IndexerKPool(MultiPlatformOp):
         assert len(q_fp8.shape) == 3
         num_q_padded = q_fp8.shape[0]
         n_real = seqlens_32.shape[0]
+        metadata_was_trimmed = False
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            real_num_tokens = getattr(
+                forward_batch, "num_token_non_padded_cpu", None
+            )
+            if real_num_tokens is not None:
+                assert 0 <= real_num_tokens <= n_real, (
+                    "DSA KPool paged-MQA real token count is outside its "
+                    f"metadata rows: real={real_num_tokens}, metadata={n_real}"
+                )
+                metadata_was_trimmed = real_num_tokens < n_real
+                n_real = real_num_tokens
+                seqlens_32 = seqlens_32[:n_real]
+                block_tables = block_tables[:n_real]
+        assert n_real <= num_q_padded, (
+            "DSA KPool metadata has more real rows than query rows: "
+            f"real={n_real}, physical={num_q_padded}"
+        )
+        if n_real == 0:
+            return torch.full(
+                (num_q_padded, self.index_topk + self.index_kpool - 1),
+                -1,
+                dtype=torch.int32,
+                device=q_fp8.device,
+            )
         if n_real < num_q_padded:
             q_fp8 = q_fp8[:n_real]
             weights = weights[:n_real]
@@ -917,6 +965,12 @@ class IndexerKPool(MultiPlatformOp):
             not use_aiter_paged_mqa
             and self._should_use_tilelang_paged_mqa_logits(q_fp8)
         )
+        rebuild_deepgemm_schedule = (
+            not use_aiter_paged_mqa
+            and not use_tilelang_paged_mqa
+            and forward_batch.forward_mode.is_target_verify()
+            and metadata_was_trimmed
+        )
 
         pool_seqlens, pool_context_lens, pool_block_tables, pool_schedule_metadata = (
             self._get_kpool_decode_metadata(
@@ -925,11 +979,21 @@ class IndexerKPool(MultiPlatformOp):
                 seqlens_32,
                 blocksize,
                 build_schedule_metadata=not (
-                    use_aiter_paged_mqa or use_tilelang_paged_mqa
+                    use_aiter_paged_mqa
+                    or use_tilelang_paged_mqa
+                    or rebuild_deepgemm_schedule
                 ),
             )
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
+        assert pool_context_lens.shape[0] == q_fp8.shape[0], (
+            pool_context_lens.shape,
+            q_fp8.shape,
+        )
+        assert pool_block_tables.shape[0] == q_fp8.shape[0], (
+            pool_block_tables.shape,
+            q_fp8.shape,
+        )
         if use_aiter_paged_mqa:
             if not aiter_can_use_preshuffle_paged_mqa():
                 raise RuntimeError(
@@ -963,6 +1027,24 @@ class IndexerKPool(MultiPlatformOp):
                 clean_logits=False,
             )
         else:
+            # SM90 DeepGEMM supports next_n only in {1, 2}.  Target verify can
+            # have a larger checkpoint-native draft width, so keep every real
+            # speculative token as an independent next_n=1 row.  Its metadata
+            # is cropped after DeepEP padding is known; rebuild the schedule
+            # from those exact rows instead of replaying a capture/max-batch
+            # schedule that can address outside the token-domain page table.
+            if rebuild_deepgemm_schedule:
+                assert pool_context_lens.shape == (n_real, 1), (
+                    pool_context_lens.shape,
+                    n_real,
+                )
+                assert pool_block_tables.shape[0] == n_real, (
+                    pool_block_tables.shape,
+                    n_real,
+                )
+                pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    pool_context_lens.clamp(min=1), blocksize, self.sm_count
+                )
             logits = deep_gemm.fp8_paged_mqa_logits(
                 q_fp8.unsqueeze(1),
                 kv_cache_fp8,
@@ -973,7 +1055,6 @@ class IndexerKPool(MultiPlatformOp):
                 pool_max_seq_len,
                 clean_logits=False,
             )
-
         page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
         topk_result = self._topk_from_kpool_logits(
             logits,
@@ -1540,6 +1621,12 @@ class IndexerKPool(MultiPlatformOp):
         plan = metadata.attn_metadata.kpool_write_plan
         assert plan is not None, "DSA kpool target_verify requires kpool_write_plan"
         num_draft_tokens = plan.num_draft_tokens
+        pool = get_token_to_kv_pool()
+        tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
+
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            kpool_write_tail_and_maybe_compress,
+        )
 
         query, key, gate_score_maybe = self._get_q_k_bf16(
             q_lora,
@@ -1552,32 +1639,63 @@ class IndexerKPool(MultiPlatformOp):
             ),
         )
 
-        pool = get_token_to_kv_pool()
-        tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
-
-        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
-            kpool_write_tail_and_maybe_compress,
-        )
-
         buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
         def _compress_write() -> None:
+            score = self._compute_gate_score_if_missing(x, gate_score_maybe)
+            real_num_tokens = getattr(
+                forward_batch, "num_token_non_padded_cpu", None
+            )
+            if real_num_tokens is None:
+                real_num_tokens = key.shape[0]
+            assert 0 <= real_num_tokens <= key.shape[0], (
+                "DSA KPool target-verify real token count is outside the "
+                f"physical input: real={real_num_tokens}, physical={key.shape[0]}"
+            )
+            ragged_verify_layout = getattr(
+                getattr(forward_batch, "spec_info", None),
+                "ragged_verify_layout",
+                None,
+            )
+            assert ragged_verify_layout is None, (
+                "DSA KPool target-verify requires fixed-width EAGLE groups; "
+                "ragged verify must use its ragged KPool plan"
+            )
+            assert real_num_tokens % num_draft_tokens == 0, (
+                "DSA KPool target-verify real token count must contain complete "
+                f"draft groups: real={real_num_tokens}, draft={num_draft_tokens}"
+            )
+            real_batch = real_num_tokens // num_draft_tokens
+            assert real_batch <= plan.req.shape[0], (
+                "DSA KPool target-verify real request count is outside the "
+                f"write plan: real={real_batch}, physical={plan.req.shape[0]}"
+            )
+            # DeepEP MLP-sync may append physical token rows after DSA metadata
+            # and its write plan have been built.  Those rows participate in the
+            # following collective but own no speculative request state.  Trim
+            # both token-domain inputs [B * N, ...] and request-domain plan
+            # inputs [B, ...] so the writer cannot associate a padding request
+            # with the final real draft group.
             kpool_write_tail_and_maybe_compress(
                 pool=pool,
                 buf=buf,
-                key=key,
-                score=self._compute_gate_score_if_missing(x, gate_score_maybe),
+                key=key[:real_num_tokens],
+                score=score[:real_num_tokens],
                 tail_k=tail_k_buf,
                 tail_score=tail_score_buf,
                 ape=self.index_kpool_compress_ape,
-                req_pool_indices=plan.req,
-                write_start=plan.write_start,
-                tail_logical_start=plan.tail_logical_start,
-                write_loc=plan.write_loc,
-                out_cache_loc=forward_batch.out_cache_loc,
+                req_pool_indices=plan.req[:real_batch],
+                write_start=plan.write_start[:real_batch],
+                tail_logical_start=plan.tail_logical_start[:real_batch],
+                write_loc=plan.write_loc[:real_batch],
+                out_cache_loc=forward_batch.out_cache_loc[:real_num_tokens],
                 num_draft_tokens=num_draft_tokens,
                 round_scale=self.scale_fmt is not None,
-                effective_n_per_batch=plan.effective_n_per_batch,
+                effective_n_per_batch=(
+                    plan.effective_n_per_batch[:real_batch]
+                    if plan.effective_n_per_batch is not None
+                    else None
+                ),
             )
 
         if enable_dual_stream:

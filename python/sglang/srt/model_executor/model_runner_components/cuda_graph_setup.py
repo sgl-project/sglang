@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelImpl
-from sglang.srt.distributed import get_world_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
@@ -214,12 +213,18 @@ def capture_cuda_graphs(
             set_masked_standard_layout_memory_budget,
         )
 
-        world_group = get_world_group()
+        # A PP stage may initialize an extra speculative draft runner while the
+        # other stages have already entered their event loops.  Reducing over
+        # the world group here would therefore require collectives that those
+        # stages never issue.  The memory budget is consumed by this runner, so
+        # its own TP group is both the relevant scope and the group whose ranks
+        # execute this initialization in lockstep.
+        tp_group = model_runner.tp_group
         available_memory_gb = get_available_gpu_memory(
             model_runner.device,
             model_runner.gpu_id,
-            distributed=world_group.world_size > 1,
-            cpu_group=world_group.cpu_group,
+            distributed=tp_group.world_size > 1,
+            cpu_group=tp_group.cpu_group,
         )
         budget_bytes = set_masked_standard_layout_memory_budget(
             int(available_memory_gb * (1 << 30))

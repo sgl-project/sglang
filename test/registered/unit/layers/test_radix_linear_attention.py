@@ -56,16 +56,83 @@ class _TargetVerifyMode:
         return True
 
 
-class _PhysicalAttentionBackend:
-    def forward(self, *, layer, forward_batch, mixed_qkv, a, b):
-        del layer, forward_batch
-        assert mixed_qkv.shape[0] == 5
-        assert a.shape[0] == 5
-        assert b.shape[0] == 5
-        return torch.full((1, 5, 2, 4), 9.0)
+class _TargetVerifyAttentionBackend:
+    def __init__(self):
+        self.forward_metadata = SimpleNamespace(
+            query_start_loc=torch.tensor([0, 3, 3], dtype=torch.int32),
+            mamba_cache_indices=torch.tensor([17, -1], dtype=torch.int32),
+        )
+
+    def forward(
+        self, *, layer, forward_batch, mixed_qkv, a, b, linear_attn_output=None
+    ):
+        del layer
+        assert mixed_qkv.shape[0] == 3
+        assert a.shape == (1, 3, 8)
+        assert b.shape == (1, 3, 2)
+        assert int(self.forward_metadata.query_start_loc[-1]) == mixed_qkv.shape[0]
+        assert (
+            self.forward_metadata.query_start_loc.shape[0] - 1
+            == self.forward_metadata.mamba_cache_indices.shape[0]
+        )
+        assert forward_batch.spec_info.draft_token_num == 3
+        assert linear_attn_output is not None
+        linear_attn_output.fill_(9.0)
+        return linear_attn_output
 
 
 class TestRadixLinearAttentionPadding(CustomTestCase):
+    def test_piecewise_forward_uses_tail_initializing_custom_op(self):
+        layer = radix_linear_attention.RadixLinearAttention(
+            layer_id=0,
+            num_q_heads=1,
+            num_k_heads=1,
+            num_v_heads=2,
+            head_q_dim=4,
+            head_k_dim=4,
+            head_v_dim=4,
+        )
+        forward_batch = SimpleNamespace(forward_mode=_TargetVerifyMode())
+        marker = torch.full((1, 5, 2, 4), 7.0)
+
+        for in_breakable_graph in (False, True):
+            with (
+                self.subTest(in_breakable_graph=in_breakable_graph),
+                patch.object(
+                    radix_linear_attention,
+                    "get_tc_piecewise_forward_context",
+                    return_value=object(),
+                ),
+                patch.object(
+                    radix_linear_attention,
+                    "is_in_breakable_cuda_graph",
+                    return_value=in_breakable_graph,
+                ),
+                patch.object(
+                    radix_linear_attention,
+                    "unified_linear_attention_with_output",
+                    side_effect=lambda _q, _a, _b, output, _layer_id: output.copy_(
+                        marker
+                    ),
+                ) as tc_op,
+                patch.object(
+                    radix_linear_attention,
+                    "bcg_unified_linear_attention_with_output",
+                    side_effect=lambda _q, _a, _b, output, _layer_id: output.copy_(
+                        marker
+                    ),
+                ) as bcg_op,
+            ):
+                output = layer.forward(
+                    forward_batch=forward_batch,
+                    mixed_qkv=torch.zeros((5, 8)),
+                    a=torch.zeros((5, 2)),
+                    b=torch.zeros((5, 2)),
+                )
+
+            torch.testing.assert_close(output, marker)
+            (bcg_op if in_breakable_graph else tc_op).assert_called_once()
+
     def test_eager_padded_input_is_sliced_and_output_shape_is_restored(self):
         layer = radix_linear_attention.RadixLinearAttention(
             layer_id=0,
@@ -106,7 +173,7 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         torch.testing.assert_close(output[:, 3:], torch.zeros((1, 2, 2, 4)))
         self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
 
-    def test_target_verify_keeps_physical_rows_matching_its_metadata(self):
+    def test_target_verify_drops_mlp_sync_padding_and_restores_output_shape(self):
         layer = radix_linear_attention.RadixLinearAttention(
             layer_id=0,
             num_q_heads=1,
@@ -121,6 +188,7 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
             forward_mode=_TargetVerifyMode(),
             num_token_non_padded_cpu=3,
             out_cache_loc=original_out_cache_loc,
+            spec_info=SimpleNamespace(draft_token_num=3),
         )
 
         with (
@@ -132,17 +200,18 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
             patch.object(
                 radix_linear_attention,
                 "get_attn_backend",
-                return_value=_PhysicalAttentionBackend(),
+                return_value=_TargetVerifyAttentionBackend(),
             ),
         ):
             output = layer.forward(
                 forward_batch=forward_batch,
                 mixed_qkv=torch.zeros((5, 8)),
-                a=torch.zeros((5, 2)),
-                b=torch.zeros((5, 2)),
+                a=torch.zeros((1, 5, 8)),
+                b=torch.zeros((1, 5, 2)),
             )
 
-        torch.testing.assert_close(output, torch.full((1, 5, 2, 4), 9.0))
+        torch.testing.assert_close(output[:, :3], torch.full((1, 3, 2, 4), 9.0))
+        torch.testing.assert_close(output[:, 3:], torch.zeros((1, 2, 2, 4)))
         self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
 
     def test_eager_backend_failure_restores_out_cache_loc(self):

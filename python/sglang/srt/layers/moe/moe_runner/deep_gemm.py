@@ -114,14 +114,25 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
 def set_masked_standard_layout_memory_budget(
     available_memory_bytes: int,
 ) -> int:
-    """Cache the masked-layout share of free non-static device memory."""
+    """Conservatively cache the process-wide masked-layout memory budget.
+
+    Target and speculative runners can coexist in one process and initialize
+    at different times.  Keep the smallest observed budget so a later runner
+    cannot make an earlier runner select a layout that no longer fits.
+    """
     global _masked_standard_layout_memory_budget_bytes
     fraction = envs.SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION.get()
     if not 0.0 < fraction <= 1.0:
         raise ValueError(
             "SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION must be in (0, 1]"
         )
-    _masked_standard_layout_memory_budget_bytes = int(available_memory_bytes * fraction)
+    candidate = int(available_memory_bytes * fraction)
+    if _masked_standard_layout_memory_budget_bytes is None:
+        _masked_standard_layout_memory_budget_bytes = candidate
+    else:
+        _masked_standard_layout_memory_budget_bytes = min(
+            _masked_standard_layout_memory_budget_bytes, candidate
+        )
     return _masked_standard_layout_memory_budget_bytes
 
 
