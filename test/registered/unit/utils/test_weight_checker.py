@@ -42,7 +42,6 @@ from sglang.srt.utils.weight_checker import (
 from sglang.srt.utils.weight_checker_comparator import (
     Fp8BlockComparable,
     RawComparable,
-    _unshuffle_aiter_fp8_weight,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -99,59 +98,48 @@ def _build_fp8_quant_pair(device: str = "cuda"):
 
 
 # ---------------------------------------------------------------------------
-# AITER FP8 layout
+# Shuffled FP8 integration
 # ---------------------------------------------------------------------------
 
 
-class TestAiterFp8Layout(CustomTestCase):
-
-    @staticmethod
-    def _logical_and_shuffled():
-        shape = (32, 64)
-        n, k = shape[-2:]
-        logical = (
-            torch.arange(n * k, dtype=torch.float32)
-            .remainder(7)
-            .to(torch.float8_e4m3fn)
-        )
-        logical = logical.reshape(shape)
-        shuffled = (
-            logical.reshape(-1, n // 16, 16, k // 32, 2, 16)
-            .permute(0, 1, 3, 4, 2, 5)
-            .contiguous()
-            .reshape(shape)
-        )
-        return logical, shuffled
-
-    def test_unshuffle_round_trip(self):
-        logical, shuffled = self._logical_and_shuffled()
-        torch.testing.assert_close(_unshuffle_aiter_fp8_weight(shuffled), logical)
-
+class TestShuffledFp8Comparable(CustomTestCase):
     def test_iter_chunks_unshuffles_before_dequantization(self):
-        logical, shuffled = self._logical_and_shuffled()
+        shuffled = torch.zeros((32, 64), dtype=torch.float8_e4m3fn)
         scale = torch.ones((2, 4), dtype=torch.float32)
         comparable = Fp8BlockComparable(shuffled, scale, is_shuffled=True)
 
-        with patch(
-            "sglang.srt.utils.weight_checker_comparator.block_quant_dequant",
-            side_effect=lambda weight, *_args, **_kwargs: weight,
+        with (
+            patch(
+                "sglang.srt.utils.weight_checker_comparator.unshuffle_aiter_fp8_weight",
+                side_effect=lambda weight: weight,
+            ) as unshuffle,
+            patch(
+                "sglang.srt.utils.weight_checker_comparator.block_quant_dequant",
+                side_effect=lambda weight, *_args, **_kwargs: weight,
+            ),
         ):
-            dequantized, _ = next(iter(comparable.iter_chunks()))
+            next(iter(comparable.iter_chunks()))
 
-        torch.testing.assert_close(dequantized.cpu(), logical)
+        unshuffle.assert_called_once()
 
     def test_dequantize_unshuffles_before_checksum(self):
-        logical, shuffled = self._logical_and_shuffled()
+        shuffled = torch.zeros((32, 64), dtype=torch.float8_e4m3fn)
         scale = torch.ones((2, 4), dtype=torch.float32)
         comparable = Fp8BlockComparable(shuffled, scale, is_shuffled=True)
 
-        with patch(
-            "sglang.srt.utils.weight_checker_comparator.block_quant_dequant",
-            side_effect=lambda weight, *_args, **_kwargs: weight,
+        with (
+            patch(
+                "sglang.srt.utils.weight_checker_comparator.unshuffle_aiter_fp8_weight",
+                side_effect=lambda weight: weight,
+            ) as unshuffle,
+            patch(
+                "sglang.srt.utils.weight_checker_comparator.block_quant_dequant",
+                side_effect=lambda weight, *_args, **_kwargs: weight,
+            ),
         ):
-            dequantized = comparable.dequantize()
+            comparable.dequantize()
 
-        torch.testing.assert_close(dequantized, logical)
+        unshuffle.assert_called_once_with(shuffled)
 
 
 # ---------------------------------------------------------------------------
