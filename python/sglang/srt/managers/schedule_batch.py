@@ -2979,11 +2979,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return total
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
-        """Reclaim evictable tree-cache entries (shortfall only), then report
-        whether the next decode step fits in the KV pool."""
+        """Whether the next decode step fits in the KV pool. The ALLOCATOR owns
+        the capacity gate (eviction + any per-step reservations of its own) —
+        the retract loop converges on this same check, so allocator-side
+        shortfalls retract gracefully instead of tripping fail-loud alloc
+        errors."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        evict_from_tree_cache(self.tree_cache, num_tokens)
-        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+        return self.token_to_kv_pool_allocator.check_decode_capacity(
+            num_tokens=num_tokens, tree_cache=self.tree_cache
+        )
 
     def retract_decode(self) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""

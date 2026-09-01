@@ -1011,6 +1011,9 @@ class ModelRunner:
         self.attn_backend = backends.attn_backend
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
+        self.kv_index_translator.assert_backends_carry_translator(
+            [self.attn_backend, self.decode_attn_backend]
+        )
 
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
