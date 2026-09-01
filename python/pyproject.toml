@@ -213,7 +213,8 @@ killall_sglang = "sglang.cli.killall:main"
 "sglang" = [
   "srt/**/*",
   "kernels/**/*",
-  "multimodal_gen/apps/realtime_webui/**/*"
+  "multimodal_gen/apps/realtime_webui/**/*",
+  "multimodal_gen/model_overlays/**/*"
 ]
 
 [tool.setuptools.exclude-package-data]

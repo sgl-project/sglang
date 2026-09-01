@@ -643,7 +643,107 @@ SGLang projects those adapter factors onto the pruned coordinates at load time.
 A structurally modified checkpoint without that metadata still fails closed,
 and packed GGUF weights remain incompatible with LoRA.
 
-## 6. Sampling and output controls
+## 6. FastH3: 4-step distilled preview
+
+[FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree)
+is a 4-step DMD2 distillation of MiniMax-H3, trained data-free with Video
+Sparse Attention (VSA) at 0.9 sparsity and 64-token tiles. Only the T2VA
+capability was distilled: requests must use `task: "t2va"`, and `fl2va` /
+`ref2va` requests are rejected. The checkpoint inherits the MiniMax-H3
+Community License.
+
+Pass the repository directly to `--model-path`; the registry resolves it like
+any other model. The flat native-Diffusers upload is materialized into the
+base-H3 layout through a bundled model overlay — transparent to users and
+symlink-based, except a one-time re-serialization of the roughly 10 GB video
+VAE on first launch.
+
+```bash 4×H200 VSA-H3
+sglang serve \
+  --model-path FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree \
+  --num-gpus 4 \
+  --attention-backend video_sparse_attn_h3 \
+  --component-attention-backends text_encoder=fa \
+  --attention-backend-config '{"VSA_sparsity": 0.9}' \
+  --port 30010
+```
+
+Requests use the same asynchronous video endpoint as the base model, with
+`task: "t2va"`, `conditions: []`, and a target such as
+`{"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0}`. The
+request defaults are `num_inference_steps: 5` and `guidance_scale: 1.0`; do
+not send the base 50-step schedule. Following the sigma-grid convention from
+the LoRA section above, `5` selects five grid points on the standard
+shift-12/shift-3 schedule and therefore four DiT evaluations — the distilled
+step count.
+
+`video_sparse_attn_h3` (VSA-H3) is the trained sparse policy: an in-tree
+Triton block-sparse kernel (SM90/SM100) over segment-pure prefix tiles and
+(4,4,4) 3D video tiles at 64-token kernel granularity, driven by the
+checkpoint's trained `to_gate_compress` compression branch.
+`--component-attention-backends text_encoder=fa` is required whenever the DiT
+backend is not FA, and the token refiner automatically stays on dense FA.
+Ulysses sequence parallelism is supported. See
+[Attention Backends](/docs/sglang-diffusion/attention_backends) for the full
+VSA-H3 configuration surface (`VSA_sparsity`, `vsa_mode`,
+`vsa_dense_first_n_steps`, `vsa_dense_layers`).
+
+The dense fallback needs no VSA flags; every dense backend that runs on base
+H3 (`fa`, `torch_sdpa`, `sage_attn`, ...) also runs on the FastH3 weights:
+
+```bash 4×H200 dense FA
+sglang serve \
+  --model-path FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree \
+  --num-gpus 4 \
+  --attention-backend fa \
+  --port 30010
+```
+
+Offline generation uses the same flags on `sglang generate`:
+
+```bash Command
+sglang generate \
+  --model-path FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree \
+  --num-gpus 4 \
+  --attention-backend video_sparse_attn_h3 \
+  --component-attention-backends text_encoder=fa \
+  --attention-backend-config '{"VSA_sparsity": 0.9}' \
+  --prompt "A cat walking on a sunny beach, gentle waves." \
+  --save-output
+```
+
+Measured on 4× H200 SXM at 768×1344, 5 seconds, 124 frames: the dense FA path
+denoised in 6.74 s (10.6 s end-to-end) at about 93 GB peak per GPU. The
+VSA-H3 first request denoised in 13.6 s including its one-time Triton
+autotune; steady-state VSA-H3 numbers are pending. The upstream FastVideo
+reference on the same host measured 8.9 s denoise and 60.7 s end-to-end with
+FSDP-sharded weights.
+
+FastH3 rejects deployment options that do not apply to the distilled preview
+instead of silently ignoring them:
+
+- `--model-variant` — the repository has a single partition.
+- `quality: "high"` — there is no audited accelerated deployment for FastH3.
+- `fl2va` / `ref2va` requests — those capabilities were not distilled.
+- With VSA-H3: `--ring-degree` greater than 1, `torch.compile`, and breakable
+  CUDA graph execution.
+
+<Warning>
+The sibling `FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA` adapters are
+not loadable through `--lora-path`: they carry full-rank `.diff`/`.diff_b`
+deltas and `set_weight` gate tensors beyond the LoRA contract. Supporting them
+would require a fuse-at-load path, which is a planned follow-up. Use the
+merged VSA-DataFree checkpoint above.
+</Warning>
+
+<Note>
+Upstream labels this checkpoint a preview. Quality gaps versus base H3 on hard
+motion and fine detail are properties of the released distillation, not of the
+SGLang port. Use base MiniMax-H3 when output quality matters more than
+latency.
+</Note>
+
+## 7. Sampling and output controls
 
 MiniMax-H3 supports more than one output per prompt. The video API accepts
 `num_outputs_per_prompt` (or OpenAI-compatible `n`) from 1 through 10. Offline
@@ -818,7 +918,7 @@ has completed, but the `quality: "high"` path above remains fail-closed
 to the audited 4×H200 workload.
 </Warning>
 
-## 7. Feature contracts and advanced recipes
+## 8. Feature contracts and advanced recipes
 
 The generated command already contains the recommended topology and encoder
 setting. Use the detailed reference below only when applying an optional
@@ -1006,7 +1106,7 @@ fold decision is not node-boundary aware:
 
 </Tabs>
 
-## 8. Configuration notes
+## 9. Configuration notes
 
 - MiniMax-H3 produces the canonical 24 fps output; request duration is expressed through `target.duration_seconds`.
 - `target.duration_seconds` must be between 4 and 15 seconds, inclusive. The command picker defaults to the verified 5-second profile.
@@ -1025,7 +1125,7 @@ fold decision is not node-boundary aware:
 - `speed` keeps model components resident, while `auto` applies the model-aware 120 GiB residency threshold. `memory` prioritizes avoiding OOM and includes the executable VAE decoder in its default layerwise set. A measured recipe with sufficient headroom can opt into `--component-residency vae=resident`; the 2×H100 CI recipe does this because the VAE's 4.8 GiB/GPU cost avoids repeated decoder transfers during tiled decode. DiT residency and prefetch knobs remain scoped to the DiT. Use `speed` only after confirming that the complete target workload fits.
 - Breakable CUDA graph execution is an explicit opt-in, not part of the recommended `speed` preset. It requires `--enable-breakable-cuda-graph`, every served size in `--warmup-resolutions`, and `--bcg-text-buckets` that cover the live H3 condition sequence. The validated 1344×768 Ref2VA recipe uses 5504; other task profiles and reference sets may need a different value. It preserves eager output for matching captured signatures, but graph capture consumes additional GPU memory and may provide little latency benefit when Ulysses attention and collectives dominate, so benchmark it on the target topology before enabling it.
 
-## 9. Benchmarks
+## 10. Benchmarks
 
 The picker exposes resident and FSDP profiles on NVIDIA datacenter GPUs. GPU
 counts are properties of the selected recipes, not a claim that every platform

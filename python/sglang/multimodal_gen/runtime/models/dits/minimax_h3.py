@@ -591,6 +591,7 @@ def _minimax_h3_attention_core_impl(
     ulysses_active: bool,
     subblock_sparse_query_block_mask: torch.Tensor | None = None,
     ring_active: bool = False,
+    gate_compress: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dynamic varlen attention and Ulysses/Ring collectives.
 
@@ -601,11 +602,14 @@ def _minimax_h3_attention_core_impl(
 
     if ulysses_active:
         from sglang.multimodal_gen.runtime.layers.usp import (
+            _usp_input_all_to_all,
             _usp_input_all_to_all_packed_qkv,
             _usp_output_all_to_all,
         )
 
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        if gate_compress is not None:
+            gate_compress = _usp_input_all_to_all(gate_compress[None], head_dim=2)[0]
 
     if attention._attention_impl is None:
         attention._set_attention_backend(
@@ -615,6 +619,39 @@ def _minimax_h3_attention_core_impl(
                 attention_requirements=AttentionRequirements(packed_varlen=True),
             )
         )
+
+    if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
+        if ring_active:
+            raise NotImplementedError(
+                "VSA-H3 does not support --ring-degree > 1; use Ulysses "
+                "sequence parallelism (each rank sees the full packed "
+                "sequence with a head shard)."
+            )
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        # Only main DiT blocks carry step metadata; the token refiner (and any
+        # other non-packed caller) runs outside a forward context and takes
+        # the impl's dense fallback.
+        attn_metadata = (
+            get_forward_context().attn_metadata
+            if attention.prefix.startswith("blocks.")
+            else None
+        )
+        out = attention._attention_impl.forward_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            cu_seqlens_host=cu_seqlens_host,
+            attn_metadata=attn_metadata,
+            gate_compress=gate_compress,
+        )
+        if ulysses_active:
+            out = _usp_output_all_to_all(out[None], head_dim=2)[0]
+        return out
 
     if ring_active:
         ring_ws, _ = get_ring_ctx()
@@ -757,6 +794,24 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
+        # VSA compression-branch gate, head-sharded like Q/K/V. Kept bf16 and
+        # unquantized: 50 gates are ~3.7 GB total and every quant path must
+        # preserve their exact values (zero gate == pure sparse). Only the
+        # main DiT blocks carry gates; the token refiner never runs VSA.
+        self.to_gate_compress: ColumnParallelLinear | None = None
+        if arch.has_gate_compress and prefix.startswith("blocks."):
+            self.to_gate_compress = ColumnParallelLinear(
+                arch.hidden_size,
+                self.inner_dim,
+                bias=False,
+                gather_output=False,
+                params_dtype=_BF16_DTYPE,
+                quant_config=None,
+                prefix=f"{prefix}.to_gate_compress",
+            )
+            # Base H3 checkpoints have no gates; zeros reproduce upstream's
+            # zero-init (pure-sparse VSA) exactly.
+            self.to_gate_compress.weight.missing_param_init = "zeros"
 
     def _set_attention_backend(self, backend) -> None:
         impl_cls = backend.get_impl_cls()
@@ -1013,6 +1068,15 @@ class MiniMaxH3Attention(nn.Module):
                 )
                 q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
 
+        gate_compress = None
+        if (
+            self._attention_backend_enum
+            is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+            and self.to_gate_compress is not None
+        ):
+            gate_flat, _ = self.to_gate_compress(x)
+            gate_compress = gate_flat.view(total, self.num_heads, self.head_dim)
+
         attention_core = (
             _minimax_h3_attention_core_bcg
             if self.bcg_breakpoint
@@ -1029,6 +1093,7 @@ class MiniMaxH3Attention(nn.Module):
             subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            gate_compress=gate_compress,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)

@@ -33,6 +33,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     FluxPipelineConfig,
     HeliosDistilledConfig,
     HeliosMidConfig,
+    FastH3PipelineConfig,
     HeliosT2VConfig,
     HunyuanConfig,
     LingBotWorldCausalDMDConfig,
@@ -162,7 +163,10 @@ from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX23SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
-from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
+from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+    FastH3SamplingParams,
+    MiniMaxH3SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
     MOVA_720P_SamplingParams,
@@ -334,6 +338,7 @@ _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
+    "fasth3": "FastH3Pipeline",
     "lerobot/pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",
     "pi0.5": "Pi05Pipeline",
@@ -969,6 +974,19 @@ def _register_configs():
         ],
         model_detectors=[
             lambda model_id: "minimaxh3"
+            in model_id.lower().replace("-", "").replace("_", "")
+        ],
+    )
+    # FastH3: 4-step DMD2-distilled MiniMax-H3 (t2va only). The detector also
+    # matches the materialized overlay directory name.
+    register_configs(
+        sampling_param_cls=FastH3SamplingParams,
+        pipeline_config_cls=FastH3PipelineConfig,
+        hf_model_paths=[
+            "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        ],
+        model_detectors=[
+            lambda model_id: "fasth3"
             in model_id.lower().replace("-", "").replace("_", "")
         ],
     )
