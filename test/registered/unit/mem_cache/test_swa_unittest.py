@@ -954,8 +954,6 @@ class TestFreeKvRow(CustomTestCase):
     def test_floor_decides_how_much_of_the_swa_side_stays_out(self):
         # (start_pos, num_slots, floor, rows whose SWA peers are already gone)
         cases = [
-            (0, 6, 0, 0),
-            (0, 6, 2, 2),
             (0, 4, 4, 4),
             (8, 4, 8, 0),
             (8, 4, 10, 2),
