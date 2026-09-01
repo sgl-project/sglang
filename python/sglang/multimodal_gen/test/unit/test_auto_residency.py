@@ -9,6 +9,10 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPlus_2511_PipelineConfig,
+    QwenImageEditPlusPipelineConfig,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     ACTIVATION_EXTRAPOLATION_MARGIN,
     GIB_BYTES,
@@ -109,6 +113,24 @@ def _record(
         layerwise_layer_uses=layerwise_layer_uses or {},
         layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage or {},
     )
+
+
+def test_qwen_image_2511_excludes_transformer_only_during_preload():
+    from sglang.multimodal_gen.runtime.pipelines.qwen_image import (
+        QwenImageEditPlusPipeline,
+    )
+
+    pipeline = QwenImageEditPlusPipeline.__new__(QwenImageEditPlusPipeline)
+
+    pipeline.server_args = SimpleNamespace(
+        pipeline_config=QwenImageEditPlus_2511_PipelineConfig()
+    )
+    assert pipeline.preload_residency_excluded_components == frozenset(("transformer",))
+
+    pipeline.server_args = SimpleNamespace(
+        pipeline_config=QwenImageEditPlusPipelineConfig()
+    )
+    assert pipeline.preload_residency_excluded_components == frozenset()
 
 
 class TestEstimateAllocatorHeadroom:

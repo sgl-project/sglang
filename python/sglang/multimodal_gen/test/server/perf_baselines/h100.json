@@ -1638,7 +1638,7 @@
             "expected_avg_denoise_ms": 653.89,
             "expected_median_denoise_ms": 656.68,
             "load_peak_vram_mb": 35350.0,
-            "runtime_peak_vram_mb": 49998.0,
+            "runtime_peak_vram_mb": 52830.0,
             "estimated_full_test_time_s": 243.0
         },
         "wan2_1_i2v_14b_720P_2gpu": {
@@ -1765,7 +1765,7 @@
             "expected_e2e_ms": 83297.78,
             "expected_avg_denoise_ms": 2029.88,
             "expected_median_denoise_ms": 2020.71,
-            "load_peak_vram_mb": 6440.0,
+            "load_peak_vram_mb": 60038.0,
             "runtime_peak_vram_mb": 72524.0,
             "estimated_full_test_time_s": 204.3
         },
