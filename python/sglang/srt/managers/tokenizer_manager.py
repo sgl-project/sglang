@@ -541,7 +541,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _init_dllm_prompt_handling(self) -> None:
         self.dllm_mask_id = None
-        self.dllm_literal_mask_token_ids = ()
+        self.dllm_literal_mask_tokenizer = None
+        self.dllm_prompt_boundary_token_ids = frozenset()
         if self.server_args.dllm_algorithm is None:
             return
 
@@ -555,41 +556,73 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"Could not resolve the reserved dLLM mask token ID {self.dllm_mask_id}"
             )
 
-        backend_tokenizer = getattr(self.tokenizer, "backend_tokenizer", None)
-        missing = object()
-        encode_special_tokens = getattr(
-            backend_tokenizer, "encode_special_tokens", missing
-        )
-        try:
-            literal_mask_token_ids = self.tokenizer.encode(
-                mask_token,
-                add_special_tokens=False,
-                split_special_tokens=True,
+        literal_mask_tokenizer = copy.deepcopy(self.tokenizer)
+        literal_mask_tokenizer.add_special_tokens({"mask_token": mask_token})
+        literal_mask_tokenizer.split_special_tokens = True
+
+        literal_mask_id = literal_mask_tokenizer.convert_tokens_to_ids(mask_token)
+        if literal_mask_id != self.dllm_mask_id:
+            raise RuntimeError(
+                "Registering the reserved dLLM mask token as special changed its "
+                f"token ID from {self.dllm_mask_id} to {literal_mask_id}"
             )
-        finally:
-            if encode_special_tokens is not missing:
-                backend_tokenizer.encode_special_tokens = encode_special_tokens
+
+        literal_mask_token_ids = literal_mask_tokenizer.encode(
+            mask_token,
+            add_special_tokens=False,
+        )
 
         if not literal_mask_token_ids or self.dllm_mask_id in literal_mask_token_ids:
             raise RuntimeError(
                 "The tokenizer could not encode the reserved dLLM mask token "
                 f"{mask_token!r} as ordinary text"
             )
-        self.dllm_literal_mask_token_ids = tuple(literal_mask_token_ids)
+        self.dllm_literal_mask_tokenizer = literal_mask_tokenizer
+        self.dllm_prompt_boundary_token_ids = frozenset(
+            (
+                set(getattr(self.tokenizer, "added_tokens_decoder", {}))
+                | set(getattr(self.tokenizer, "all_special_ids", ()))
+            )
+            - {self.dllm_mask_id}
+        )
 
-    def expand_dllm_literal_mask_tokens(self, input_ids: List[int]) -> List[int]:
-        """Expand reserved mask IDs in a text-derived prompt as ordinary text."""
+    def normalize_dllm_prompt_token_ids(self, input_ids: List[int]) -> List[int]:
+        """Retokenize literal mask text while preserving other added tokens."""
         mask_id = self.dllm_mask_id
         if mask_id is None or mask_id not in input_ids:
             return input_ids
 
-        return [
-            replacement_id
-            for token_id in input_ids
-            for replacement_id in (
-                self.dllm_literal_mask_token_ids if token_id == mask_id else (token_id,)
-            )
-        ]
+        normalized_ids = []
+        span_start = 0
+        for index in range(len(input_ids) + 1):
+            if index < len(input_ids) and (
+                input_ids[index] not in self.dllm_prompt_boundary_token_ids
+            ):
+                continue
+
+            span_ids = input_ids[span_start:index]
+            if mask_id in span_ids:
+                span_text = self.tokenizer.decode(
+                    span_ids,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                span_ids = self.dllm_literal_mask_tokenizer.encode(
+                    span_text,
+                    add_special_tokens=False,
+                )
+                if mask_id in span_ids:
+                    raise RuntimeError(
+                        "The tokenizer left the reserved dLLM mask token in "
+                        "literal prompt text"
+                    )
+            normalized_ids.extend(span_ids)
+
+            if index < len(input_ids):
+                normalized_ids.append(input_ids[index])
+            span_start = index + 1
+
+        return normalized_ids
 
     def _validate_cuda_vmm_feature_transport_support(self) -> None:
         if get_mm().mm_feature_transport != "cuda_vmm":
@@ -1008,7 +1041,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ]
 
         if getattr(self, "dllm_mask_id", None) is not None:
-            input_ids = [self.expand_dllm_literal_mask_tokens(ids) for ids in input_ids]
+            input_ids = [self.normalize_dllm_prompt_token_ids(ids) for ids in input_ids]
 
         # Step 4: Extract results based on input format
         return self._extract_tokenizer_results(
@@ -1226,10 +1259,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and input_ids is not None
             and dllm_mask_id in input_ids
         ):
+            if self.tokenizer is None:
+                prompt_hint = (
+                    "Supply ordinary pretokenized IDs for the literal text, or "
+                    "restart without --skip-tokenizer-init to submit a text prompt."
+                )
+            else:
+                prompt_hint = (
+                    "Pass the mask token as text, or supply ordinary pretokenized "
+                    "IDs for the literal text."
+                )
             raise ValueError(
                 "dLLM prompt input_ids must not contain the reserved mask token ID "
-                f"{dllm_mask_id}. Pass the mask token as text if it should be "
-                "treated as literal prompt content."
+                f"{dllm_mask_id}. {prompt_hint}"
             )
 
         # FIXME: unify the length validation logic with the one in the scheduler.

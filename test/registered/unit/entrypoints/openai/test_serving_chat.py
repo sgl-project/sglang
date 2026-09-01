@@ -523,7 +523,7 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_process_messages_normalizes_text_derived_dllm_prompt_ids(self):
         self.tm.dllm_mask_id = 156895
-        self.tm.expand_dllm_literal_mask_tokens = Mock(
+        self.tm.normalize_dllm_prompt_token_ids = Mock(
             return_value=[156899, 31, 32, 33, 156900]
         )
         request = ChatCompletionRequest(
@@ -546,7 +546,7 @@ class ServingChatTestCase(unittest.TestCase):
             processed = self.chat._process_messages(request, is_multimodal=False)
 
         self.assertEqual(processed.prompt_ids, [156899, 31, 32, 33, 156900])
-        self.tm.expand_dllm_literal_mask_tokens.assert_called_once_with(
+        self.tm.normalize_dllm_prompt_token_ids.assert_called_once_with(
             [156899, 156895, 156900]
         )
 

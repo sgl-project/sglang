@@ -1193,7 +1193,7 @@ class OpenAIServingChat(OpenAIServingBase):
             and getattr(self.tokenizer_manager, "dllm_mask_id", None) is not None
             and isinstance(result.prompt_ids, list)
         ):
-            result.prompt_ids = self.tokenizer_manager.expand_dllm_literal_mask_tokens(
+            result.prompt_ids = self.tokenizer_manager.normalize_dllm_prompt_token_ids(
                 result.prompt_ids
             )
 
