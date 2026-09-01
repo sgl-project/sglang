@@ -102,7 +102,9 @@ def normalize_sm90_fp4_symm_buffer_views(buf):
     required_dtypes = {
         "x": torch.float8_e4m3fn,
         "x_sf": torch.float32,
-        "topk_idx": torch.int32,
+        # The pre-dispatch input topk indices are int32, but the symmetric
+        # buffer slot is int64 (see sm90_mega_moe_pre_dispatch.cuh).
+        "topk_idx": torch.int64,
         "topk_weights": torch.float32,
         "l1_acts": torch.float8_e4m3fn,
         "l1_acts_sf": torch.float32,
@@ -117,11 +119,12 @@ def normalize_sm90_fp4_symm_buffer_views(buf):
         if tensor.dtype == required_dtype:
             normalized[name] = tensor
             continue
-        allowed_wire_dtypes = (
-            (torch.int8, torch.uint8)
-            if required_dtype == torch.float8_e4m3fn
-            else (torch.int32, torch.uint32)
-        )
+        if required_dtype == torch.float8_e4m3fn:
+            allowed_wire_dtypes = (torch.int8, torch.uint8)
+        elif required_dtype == torch.float32:
+            allowed_wire_dtypes = (torch.int32, torch.uint32)
+        else:
+            allowed_wire_dtypes = ()
         if tensor.dtype not in allowed_wire_dtypes:
             raise TypeError(
                 f"DeepGEMM SM90 FP4 buffer {name} cannot reinterpret "

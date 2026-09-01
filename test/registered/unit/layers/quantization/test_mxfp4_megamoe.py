@@ -596,7 +596,7 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
             num_ring_tokens=256,
             x=torch.zeros((2, 4), dtype=torch.uint8),
             x_sf=torch.zeros((2, 1), dtype=torch.int32),
-            topk_idx=torch.zeros((2, 1), dtype=torch.int32),
+            topk_idx=torch.zeros((2, 1), dtype=torch.int64),
             topk_weights=torch.zeros((2, 1), dtype=torch.int32),
             l1_acts=torch.zeros((2, 4), dtype=torch.uint8),
             l1_acts_sf=torch.zeros((2, 1), dtype=torch.int32),
@@ -621,7 +621,7 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
         self.assertIs(result, ring_buffer)
         self.assertEqual(result.x.dtype, torch.float8_e4m3fn)
         self.assertEqual(result.x_sf.dtype, torch.float32)
-        self.assertEqual(result.topk_idx.dtype, torch.int32)
+        self.assertEqual(result.topk_idx.dtype, torch.int64)
         self.assertEqual(result.topk_weights.dtype, torch.float32)
         self.assertEqual(result.l1_acts.dtype, torch.float8_e4m3fn)
         self.assertEqual(result.l1_acts_sf.dtype, torch.float32)
@@ -648,7 +648,7 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
             num_ring_tokens=256,
             x=torch.zeros((2, 4), dtype=torch.float32),
             x_sf=torch.zeros((2, 1), dtype=torch.float32),
-            topk_idx=torch.zeros((2, 1), dtype=torch.int32),
+            topk_idx=torch.zeros((2, 1), dtype=torch.int64),
             topk_weights=torch.zeros((2, 1), dtype=torch.float32),
             l1_acts=torch.zeros((2, 4), dtype=torch.uint8),
             l1_acts_sf=torch.zeros((2, 1), dtype=torch.float32),
@@ -664,7 +664,7 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
             num_ring_tokens=256,
             x=x,
             x_sf=torch.zeros((2, 1), dtype=torch.float16),
-            topk_idx=torch.zeros((2, 1), dtype=torch.int32),
+            topk_idx=torch.zeros((2, 1), dtype=torch.int64),
             topk_weights=torch.zeros((2, 1), dtype=torch.int32),
             l1_acts=torch.zeros((2, 4), dtype=torch.uint8),
             l1_acts_sf=torch.zeros((2, 1), dtype=torch.int32),
