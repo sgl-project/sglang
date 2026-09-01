@@ -23,6 +23,10 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class FakeReceiver:
     def __init__(self):
         self.clear_called = False
+        self.abort_called = False
+
+    def abort(self):
+        self.abort_called = True
 
     def clear(self):
         self.clear_called = True
@@ -172,6 +176,66 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(queue.queue, [])
         self.assertTrue(all(r is not decode_req for r in queue.pending_reqs))
         self.assertIsNone(decode_req.kv_receiver)
+
+    @patch("sglang.srt.disaggregation.decode.prepare_abort")
+    @patch("sglang.srt.disaggregation.decode.time.perf_counter", return_value=111.0)
+    def test_prealloc_timeout_aborts_and_clears_receiver(
+        self, _mock_now, mock_prepare_abort
+    ):
+        receiver = FakeReceiver()
+        req = SimpleNamespace(
+            rid="timed-out-prealloc",
+            bootstrap_room=17,
+            finished_reason=None,
+            finished_output=False,
+            return_logprob=False,
+            time_stats=SimpleNamespace(bootstrap_done_time=100.0),
+        )
+        decode_req = SimpleNamespace(
+            req=req,
+            kv_receiver=receiver,
+            waiting_for_input=True,
+        )
+
+        def mark_aborted(aborted_req, *_args, **_kwargs):
+            aborted_req.finished_reason = FINISH_ABORT("preallocation timeout")
+
+        mock_prepare_abort.side_effect = mark_aborted
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.tp_rank = 0
+        queue.pp_size = 1
+        queue.queue = [decode_req]
+        queue.pending_reqs = [decode_req]
+        queue.retracted_queue = []
+        queue.kv_manager = SimpleNamespace(waiting_timeout=10.0)
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=0)
+        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+
+        scheduler = MagicMock()
+        scheduler.running_batch.reqs = []
+        scheduler.enable_priority_scheduling = False
+        scheduler.enable_hisparse = False
+        scheduler.metrics_reporter.enable_metrics = True
+        queue.scheduler = scheduler
+
+        preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [])
+        self.assertEqual(failed, [decode_req])
+        self.assertEqual(queue.queue, [])
+        self.assertEqual(queue.pending_reqs, [])
+        self.assertTrue(receiver.abort_called)
+        self.assertTrue(receiver.clear_called)
+        self.assertIsNone(decode_req.kv_receiver)
+        scheduler.output_streamer.stream_output.assert_called_once_with(
+            [req], req.return_logprob
+        )
+        scheduler.metrics_collector.increment_prealloc_failed_reqs.assert_called_once_with()
+        mock_prepare_abort.assert_called_once()
 
     def test_swa_reclaim_failure_rejects_only_request(self):
         receiver = FakeReceiver()

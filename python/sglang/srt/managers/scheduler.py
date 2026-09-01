@@ -3126,6 +3126,11 @@ class Scheduler(
             # it. Drop the marker once the request is actually gone.
             if req.finished() or not req.kv.holds_kv:
                 self._pending_chunked_abort_req = None
+                return
+            # The request moved to another scheduler queue after abort_request
+            # deferred it, so retry against its current location.
+            self._pending_chunked_abort_req = None
+            self.abort_request(AbortReq(rid=req.rid))
             return
 
         prepare_abort(req, "Aborted")
@@ -3279,6 +3284,7 @@ class Scheduler(
             running_batch.filter_batch()
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
+                running_batch.is_prefill_only = False
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -3505,6 +3511,9 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if adder.chunk_budget_exhausted():
+                break
+
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -4289,7 +4298,7 @@ class Scheduler(
             )
 
     def maybe_send_health_check_signal(self):
-        if self.return_health_check_ipcs:
+        while self.return_health_check_ipcs:
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
