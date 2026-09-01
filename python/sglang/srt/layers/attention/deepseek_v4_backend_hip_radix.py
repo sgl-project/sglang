@@ -1370,6 +1370,10 @@ class DeepseekV4HipRadixBackend(
             else:
                 state_slot = forward_batch.req_pool_indices[:T]
             if save_kv_cache:
+                # Only verify reaches this under fp8 -- plain decode's rows are
+                # written by the fused kernel itself, which leaves kv None. The
+                # pair arrives already packed, so this is the same scatter with
+                # a second pool hanging off it.
                 runtime.store_swa_into_unified(
                     kv=kv,
                     state_slot=state_slot,
@@ -1378,6 +1382,10 @@ class DeepseekV4HipRadixBackend(
                     win=win,
                     ring_stride=ring_stride,
                     final_pos=positions,
+                    kv_rope=k_rope,
+                    unified_kv_rope=(
+                        None if k_rope is None else pool.get_unified_kv_rope(layer_id)
+                    ),
                 )
             unified_metadata = core_attn_metadata.unified
             if compress_ratio == 0:

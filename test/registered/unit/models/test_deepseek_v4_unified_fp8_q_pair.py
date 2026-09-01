@@ -2,7 +2,9 @@
 
 Decode only needs Q packed -- its K is already in the ring. Prefill is a KV
 source of its own, so it gets a packed K pair beside the Q one, and the same
-buffers have to reach both attention and the ring write after it.
+buffers have to reach both attention and the ring write after it. Verify wants
+both halves: it reads the ring the way decode does and fills it the way prefill
+does, only the write lands before attention instead of after.
 """
 
 import unittest
@@ -112,7 +114,7 @@ class _Harness(deepseek_v4.MQALayer):
         return q_out, k_nope_out
 
 
-def _run(fp8, mode=ForwardMode.DECODE, cp=False):
+def _run(fp8, mode=ForwardMode.DECODE, cp=False, fused_verify=True):
     layer = _Harness()
     layer.dsa_enable_prefill_cp = cp
     backend = _RecordingBackend()
@@ -120,6 +122,7 @@ def _run(fp8, mode=ForwardMode.DECODE, cp=False):
 
     with (
         envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.override(False),
+        envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.override(fused_verify),
         patch.object(env_gate, "is_unified_kv_triton", return_value=True),
         patch.object(env_gate, "is_unified_kv_fp8", return_value=fp8),
         patch.object(deepseek_v4, "get_token_to_kv_pool", return_value=_Pool(fp8)),
@@ -210,17 +213,32 @@ class TestUnifiedFp8QPair(unittest.TestCase):
         self.assertIsNone(layer.prepare_kwargs["k_nope_out"])
         self.assertEqual(call["q"].dtype, torch.bfloat16)
 
-    def test_fp8_target_verify_is_refused_with_a_reason(self):
-        """it needs a packed ring store nobody writes yet, so it must not walk on
+    def test_fp8_target_verify_gets_the_packed_pair(self):
+        """verify reads the ring like decode, but it also feeds it like prefill"""
+        layer, call = _run(fp8=True, mode=ForwardMode.TARGET_VERIFY)
 
-        Without this it reaches the ring scatter holding bf16 kv and dies on a
-        dtype assert inside the scatter, which says nothing about MTP.
-        """
-        with self.assertRaisesRegex(NotImplementedError, "M10"):
-            _run(fp8=True, mode=ForwardMode.TARGET_VERIFY)
+        # packed Q is what picks the decode reader over the Triton one
+        self.assertEqual(call["q"].dtype, torch.float8_e4m3fn)
+        self.assertIsNotNone(call["q_rope"])
+        k, k_rope = call["k"], call["k_rope"]
+        self.assertEqual(k.dtype, torch.float8_e4m3fn)
+        self.assertEqual(tuple(k.shape), (TOKENS, NOPE_ROW_BYTES))
+        self.assertEqual(tuple(k_rope.shape), (TOKENS, ROPE_DIM))
+        self.assertIs(layer.prepare_kwargs["k_nope_out"], k)
+        self.assertIs(layer.prepare_kwargs["k_rope_out"], k_rope)
+        # unlike prefill the ring write happens before attention, but it is the
+        # same flag and the same pair
+        self.assertTrue(call["save_kv_cache"])
+
+    def test_fp8_target_verify_needs_the_fused_store(self):
+        """nothing else packs the pair, so the unfused arm would hand over bf16"""
+        with self.assertRaisesRegex(
+            NotImplementedError, "SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY"
+        ):
+            _run(fp8=True, mode=ForwardMode.TARGET_VERIFY, fused_verify=False)
 
     def test_bf16_target_verify_is_left_alone(self):
-        """the refusal is fp8-only; bf16 verify keeps working as it always did"""
+        """the packing is fp8-only; bf16 verify keeps working as it always did"""
         layer, call = _run(fp8=False, mode=ForwardMode.TARGET_VERIFY)
 
         self.assertNotIn("q_rope", call)

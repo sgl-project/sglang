@@ -1378,14 +1378,21 @@ class MQALayer(MqaAttentionBase):
         # The kernel is token-indexed (q, kv and positions are all length M), so
         # a verify batch carrying several draft tokens per request is a shape it
         # already handles. Only the cache store differs between decode and
-        # verify, and that half is left off below.
+        # verify, and under fp8 that store takes the packed pair instead of bf16.
         fuse_verify = (
             envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.get()
             and forward_batch.forward_mode.is_target_verify()
-            # Under fp8 this path would have to hand the backend a packed pair
-            # instead of the bf16 kv it stores today; MTP + fp8 is gated off
-            # until that store is wired (M10).
-            and not fp8_2buff
+        )
+        # fp8 verify packs like prefill but keeps verify's store timing: the pair
+        # lands in the caller's buffers and the backend writes the ring off the
+        # per-token slot map before attention. Keyed off those buffers the same
+        # way fuse_prefill is, so the two arms cannot disagree about the layout.
+        fuse_verify_fp8 = (
+            fuse_verify
+            and unified
+            and fp8_2buff
+            and k_nope_out is not None
+            and k_rope_out is not None
         )
         # Prefill under fp8 goes through the same fused store: the 2-source
         # kernel reads this chunk as its extend region in the pool's packed form,
@@ -1394,8 +1401,8 @@ class MQALayer(MqaAttentionBase):
         # the caller's buffers the way q_rope_out keys the packed Q, so the two
         # cannot disagree about the layout; both halves are required because the
         # nope one leaves on the kv slot and a missing one would read as "the
-        # fused store did not run". Verify is excluded for the same reason as
-        # above -- it reads rows the ring already holds (M10).
+        # fused store did not run". Verify packs the same way but is its own arm
+        # above: it stores before attention, not after.
         fuse_prefill = (
             unified
             and fp8_2buff
@@ -1445,9 +1452,13 @@ class MQALayer(MqaAttentionBase):
                 # contiguous buffer, so materialise it before the kernel norms
                 # it in place. The unfused path pays the same copy inside
                 # _compute_kv_bf16.
+                #
+                # Under fp8 the kernel writes the packed pair to the caller's
+                # buffers rather than norming kv in place, and the same backend
+                # store takes that pair -- only the row format changes.
                 kv = kv.contiguous()
                 swa_cache, swa_loc = None, None
-                swa_page_size, bf16_store = 1, True
+                swa_page_size, bf16_store = 1, not fuse_verify_fp8
             elif unified and fuse_prefill:
                 # No pools, so the kernel norms + RoPEs + packs and writes no
                 # ring row. It must not: those rows are this fwd's extend region
@@ -1500,8 +1511,8 @@ class MQALayer(MqaAttentionBase):
                 bf16_store=bf16_store,
                 fp8_2buff=fp8_2buff,
                 swa_rope_cache=swa_rope_cache,
-                k_nope_out=k_nope_out if fuse_prefill else None,
-                k_rope_out=k_rope_out if fuse_prefill else None,
+                k_nope_out=k_nope_out if (fuse_prefill or fuse_verify_fp8) else None,
+                k_rope_out=k_rope_out if (fuse_prefill or fuse_verify_fp8) else None,
                 q_rope_out=q_rope_out,
             )
             # On the verify path the kernel normed + RoPE'd kv in place and wrote
@@ -1509,11 +1520,12 @@ class MQALayer(MqaAttentionBase):
             # current chunk (attn_k = kv) and save_kv_cache = kv is not None lets
             # the backend do its normal causally-indexed store into the ring
             # before the decode kernel runs -- exactly as the unfused path did.
-            if unified and fuse_prefill:
+            if unified and (fuse_prefill or fuse_verify_fp8):
                 # The packed nope half rides out on the kv slot -- attention
                 # takes it as attn_k and save_kv_cache stays on so the backend
-                # does the post-attention ring write. Its rope half went to the
-                # caller's buffer, which has no second return slot here.
+                # does the ring write. Its rope half went to the caller's buffer,
+                # which has no second return slot here. Prefill's write lands
+                # after attention, verify's before it; both read this pair.
                 kv = k_nope_out
             elif not (unified and fuse_verify):
                 kv = None
@@ -1671,20 +1683,25 @@ class MQALayer(MqaAttentionBase):
         )
 
         unified = is_unified_kv_triton()
+        unified_fp8_verify = (
+            unified
+            and is_unified_kv_fp8()
+            and forward_batch.forward_mode.is_target_verify()
+        )
         # The v4 nm asm reader takes Q in the pool's own packed form, so fp8
         # decode wants a contiguous fp8 buffer of exactly the local heads --
-        # q_padded below is a FlashMLA layout and buys nothing here.
+        # q_padded below is a FlashMLA layout and buys nothing here. Verify runs
+        # that same reader over the ring, so it takes the same Q.
         unified_fp8_decode = (
             unified
             and is_unified_kv_fp8()
-            and forward_batch.forward_mode.is_decode_or_idle()
+            and (forward_batch.forward_mode.is_decode_or_idle() or unified_fp8_verify)
         )
         # The 2-source prefill kernel wants the same packed Q plus this chunk's
         # K in the pool's layout. Verify is not prefill here even though it takes
-        # the same branch below: it runs the decode kernel off rows the ring
-        # already holds, and wiring that store is M10. Multi-stream picks a
-        # different prepare that has no unified arm at all, so it keeps the bf16
-        # buffers it always had.
+        # the same branch below -- it reads rows the ring already holds, so it
+        # goes with decode above. Multi-stream picks a different prepare that has
+        # no unified arm at all, so it keeps the bf16 buffers it always had.
         unified_fp8_prefill = (
             unified
             and is_unified_kv_fp8()
@@ -1692,19 +1709,14 @@ class MQALayer(MqaAttentionBase):
             and not forward_batch.forward_mode.is_decode_or_idle()
             and not forward_batch.forward_mode.is_target_verify()
         )
-        if (
-            unified
-            and is_unified_kv_fp8()
-            and forward_batch.forward_mode.is_target_verify()
-        ):
-            # Excluded above because it attends over rows the ring already holds,
-            # which needs a packed store nothing writes yet (M10). Refuse here
-            # rather than let it reach the ring scatter with bf16 kv and die on a
-            # dtype assert that says nothing about MTP.
+        if unified_fp8_verify and not envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.get():
+            # The packed pair is produced by the fused norm+RoPE store; with that
+            # off the unfused arm hands the backend bf16 kv and the ring scatter
+            # dies on a dtype assert that says nothing about MTP.
             raise NotImplementedError(
-                "fp8 two-pool unified_kv does not support speculative decoding "
-                "yet: target-verify needs the packed ring store (M10). Run "
-                "without a speculative algorithm, or with "
+                "fp8 two-pool unified_kv needs the fused verify store for "
+                "speculative decoding: set "
+                "SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY=1, or run with "
                 "SGLANG_DSV4_UNIFIED_KV_FP8=0."
             )
         if (
@@ -1740,7 +1752,7 @@ class MQALayer(MqaAttentionBase):
             q_rope = rope_pool.new_empty(
                 (x.shape[0], self.n_local_heads, rope_pool.shape[-1])
             )
-            if unified_fp8_prefill:
+            if unified_fp8_prefill or unified_fp8_verify:
                 k_nope = nope_pool.new_empty((x.shape[0], nope_pool.shape[-1]))
                 k_rope = rope_pool.new_empty((x.shape[0], rope_pool.shape[-1]))
         elif self.attn_tp_size > 1:
