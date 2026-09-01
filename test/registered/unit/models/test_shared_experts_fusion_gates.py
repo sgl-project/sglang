@@ -174,6 +174,26 @@ class TestGlmMoeLiteGate(_FusionGateCase):
 
 
 class TestGlmMoeGate(_FusionGateCase):
+    def test_dsa_routed_only_quantization_cannot_fuse_shared_expert(self):
+        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLM
+
+        self._seed(enforce_shared_experts_fusion=True)
+        mixed = SimpleNamespace(
+            get_name=lambda: "compressed_tensors",
+            can_fuse_shared_expert=lambda: False,
+        )
+        reason = self._reason(
+            GlmMoeDsaForCausalLM,
+            SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"],
+                n_routed_experts=256,
+                n_shared_experts=1,
+            ),
+            mixed,
+        )
+
+        self.assertIn("higher precision", reason)
+
     def test_a_w4afp8_checkpoint_cannot_fuse(self):
         from sglang.srt.models.glm4_moe import Glm4MoeForCausalLM
 

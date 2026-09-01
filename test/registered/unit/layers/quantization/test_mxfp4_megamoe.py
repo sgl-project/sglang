@@ -133,6 +133,21 @@ class _DummyFusedMoE(torch.nn.Module):
 
 
 class TestMxfp4SchemeSelection(CustomTestCase):
+    def test_routed_only_config_cannot_fuse_bf16_shared_expert(self):
+        config = CompressedTensorsConfig.from_config(
+            {
+                "quant_method": "compressed-tensors",
+                "format": "mxfp4-pack-quantized",
+                "config_groups": {"group_0": MXFP4_GROUP},
+                "ignore": [r"re:.*shared_experts.*"],
+            }
+        )
+
+        self.assertFalse(config.can_fuse_shared_expert())
+
+    def test_uniform_config_can_fuse_shared_expert(self):
+        self.assertTrue(_config().can_fuse_shared_expert())
+
     def test_glm52_config_group_linear_and_null_scale_dtype(self):
         group = dict(MXFP4_GROUP)
         group["scale_dtype"] = None

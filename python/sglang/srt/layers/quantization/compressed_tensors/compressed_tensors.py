@@ -159,6 +159,32 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_name(self) -> str:
         return "compressed_tensors"
 
+    def can_fuse_shared_expert(self) -> bool:
+        """Whether routed and shared experts use the same precision path.
+
+        Producer configs commonly target all ``Linear`` modules and keep the
+        shared expert in BF16 through ``ignore``.  Fusing that shared expert
+        into the quantized FusedMoE would remap its ordinary ``weight`` tensors
+        into packed expert parameters that do not exist, silently leaving the
+        fused slot unloaded.  Compare representative routed/shared projection
+        names using the same ignore matcher as layer construction.
+        """
+        projection_names = ("gate_proj", "up_proj", "down_proj")
+        for projection_name in projection_names:
+            routed_ignored = should_ignore_layer(
+                f"model.layers.0.mlp.experts.{projection_name}",
+                ignore=self.ignore,
+                fused_mapping=self.packed_modules_mapping,
+            )
+            shared_ignored = should_ignore_layer(
+                f"model.layers.0.mlp.shared_experts.{projection_name}",
+                ignore=self.ignore,
+                fused_mapping=self.packed_modules_mapping,
+            )
+            if routed_ignored != shared_ignored:
+                return False
+        return True
+
     def get_scaled_act_names(self) -> List[str]:
         return []
 
