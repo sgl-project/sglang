@@ -19,17 +19,18 @@ from sglang.srt.weight_cache.daemon import (
 from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
 from sglang.srt.weight_cache.mooncake_weight_adapter import (
     _parallel_axes,
-    build_mooncake_weight_manifests,
+    build_mooncake_placement_and_bindings,
 )
 from sglang.srt.weight_cache.protocol import get_ready_path, get_socket_path
 from sglang.srt.weight_cache.weight_heterogeneous_transfer import (
-    SourceWeightsManifest,
+    SourceDaemonGroup,
     WeightHeterogeneousTransferError,
     WeightParallelLayout,
     _all_gather_rank_local_phase,
     _initialize_weight_transfer_engine,
-    fetch_source_weights_manifest,
-    register_source_weights_manifest,
+    fetch_weight_manifest,
+    parse_source_daemon_group,
+    register_weight_manifest,
     transfer_weights_from_source_daemons,
     validate_weight_heterogeneous_transfer_configuration,
 )
@@ -283,7 +284,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
 
         self.assertEqual(manifest.generation, IMMUTABLE_WEIGHT_GENERATION)
         self.assertFalse(hasattr(manifest, "lease_id"))
-        placement, bindings = build_mooncake_weight_manifests(
+        placement, bindings = build_mooncake_placement_and_bindings(
             (manifest,),
             placement_set_id="test",
             tp_size=1,
@@ -824,7 +825,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
     def test_internal_fragments_replicated_by_dp_attention_are_not_tp_shards(self):
         from mooncake.reshard.weight import ReplicatedAxis
 
-        inventories = []
+        manifests = []
         for tp_rank in range(2):
             tensors = []
             storage_address = 100_000 + tp_rank * 1_000
@@ -854,7 +855,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                         "rank": {"dp": 0, "tp": tp_rank, "pp": 0, "ep": 0},
                     }
                 )
-            inventories.append(
+            manifests.append(
                 {
                     "model_id": "model",
                     "revision": "revision",
@@ -864,8 +865,8 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 }
             )
 
-        placement, _ = build_mooncake_weight_manifests(
-            inventories,
+        placement, _ = build_mooncake_placement_and_bindings(
+            manifests,
             placement_set_id="target",
             tp_size=2,
             pp_size=1,
@@ -901,8 +902,8 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 stride *= extent
             return tuple(reversed(result))
 
-        def make_inventories(*, ep_size, moe_tp_size, prefix, address_base):
-            inventories = []
+        def make_manifests(*, ep_size, moe_tp_size, prefix, address_base):
+            manifests = []
             num_experts = 4
             experts_per_rank = num_experts // ep_size
             for ep_rank in range(ep_size):
@@ -1000,7 +1001,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                                 expert_id=expert_id,
                             )
 
-                    inventories.append(
+                    manifests.append(
                         {
                             "model_id": "model",
                             "revision": "revision",
@@ -1009,29 +1010,29 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                             "tensors": tensors,
                         }
                     )
-            return tuple(inventories)
+            return tuple(manifests)
 
-        source_inventories = make_inventories(
+        source_manifests = make_manifests(
             ep_size=2,
             moe_tp_size=2,
             prefix="source",
             address_base=0x1000000,
         )
-        target_inventories = make_inventories(
+        target_manifests = make_manifests(
             ep_size=4,
             moe_tp_size=1,
             prefix="target",
             address_base=0x2000000,
         )
-        source, _ = build_mooncake_weight_manifests(
-            source_inventories,
+        source, _ = build_mooncake_placement_and_bindings(
+            source_manifests,
             placement_set_id="source",
             tp_size=4,
             pp_size=1,
             ep_size=2,
         )
-        target, _ = build_mooncake_weight_manifests(
-            target_inventories,
+        target, _ = build_mooncake_placement_and_bindings(
+            target_manifests,
             placement_set_id="target",
             tp_size=4,
             pp_size=1,
@@ -1087,7 +1088,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                         "pp_size": 1,
                         "ep_size": 1,
                     },
-                    "runtime_inventory": {
+                    "runtime_manifest": {
                         "model_id": "model",
                         "revision": "revision",
                         "rank": global_rank,
@@ -1095,12 +1096,12 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 }
             )
 
-        source = SourceWeightsManifest.from_wire(server.get_source_weights_manifest())
+        source = parse_source_daemon_group(server.get_weight_manifest())
         self.assertEqual(source.node_id, "source-node")
         self.assertEqual(source.gpu_ids, (2, 3))
         self.assertEqual(source.parallel_layout.dp_size, 2)
         self.assertEqual(
-            tuple(item["rank"] for item in source.runtime_inventories), (0, 1)
+            tuple(item["rank"] for item in source.runtime_manifests), (0, 1)
         )
 
     def test_tcp_manifest_registry_round_trip(self):
@@ -1108,14 +1109,14 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             host="127.0.0.1", port=0, expected_rank_count=1
         )
         registry_url = f"tcp://127.0.0.1:{server.port}"
-        manifest_state = MagicMock()
-        manifest_state.runtime_inventory_for_wire.return_value = {
+        session = MagicMock()
+        session.runtime_manifest_for_wire.return_value = {
             "model_id": "model",
             "revision": "revision",
             "rank": 0,
         }
         try:
-            register_source_weights_manifest(
+            register_weight_manifest(
                 registry_url,
                 global_rank=0,
                 gpu_id=2,
@@ -1123,26 +1124,26 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 dp_size=1,
                 pp_size=1,
                 ep_size=1,
-                manifest_state=manifest_state,
+                session=session,
                 timeout=2,
             )
-            actual = fetch_source_weights_manifest(registry_url, timeout=2)
+            actual = fetch_weight_manifest(registry_url, timeout=2)
         finally:
             server.close()
 
         self.assertEqual(actual.gpu_ids, (2,))
         self.assertEqual(actual.parallel_layout, WeightParallelLayout(tp_size=1))
         self.assertEqual(
-            actual.runtime_inventories,
+            actual.runtime_manifests,
             ({"model_id": "model", "revision": "revision", "rank": 0},),
         )
 
     def test_target_rejects_overlap_after_fetching_source_manifest(self):
-        source = SourceWeightsManifest(
+        source = SourceDaemonGroup(
             node_id="shared-node",
             parallel_layout=WeightParallelLayout(1),
             gpu_ids=(0,),
-            runtime_inventories=({"rank": 0},),
+            runtime_manifests=({"rank": 0},),
         )
 
         def all_gather(output, _local):
@@ -1150,7 +1151,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
 
         with (
             patch(
-                "sglang.srt.weight_cache.weight_heterogeneous_transfer.fetch_source_weights_manifest",
+                "sglang.srt.weight_cache.weight_heterogeneous_transfer.fetch_weight_manifest",
                 return_value=source,
             ) as fetch,
             patch("torch.distributed.get_rank", return_value=0),
@@ -1169,7 +1170,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 WeightHeterogeneousTransferError, "overlapping ranks"
             ):
                 transfer_weights_from_source_daemons(
-                    target_manifest_state=MagicMock(),
+                    target_session=MagicMock(),
                     model=MagicMock(),
                     gpu_id=0,
                     registry_url="tcp://source:31999",
@@ -1179,11 +1180,11 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         pull.assert_not_called()
 
     def test_target_allows_same_gpu_id_on_another_node(self):
-        source = SourceWeightsManifest(
+        source = SourceDaemonGroup(
             node_id="source-node",
             parallel_layout=WeightParallelLayout(1),
             gpu_ids=(0,),
-            runtime_inventories=({"rank": 0},),
+            runtime_manifests=({"rank": 0},),
         )
 
         def all_gather(output, local):
@@ -1191,7 +1192,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
 
         with (
             patch(
-                "sglang.srt.weight_cache.weight_heterogeneous_transfer.fetch_source_weights_manifest",
+                "sglang.srt.weight_cache.weight_heterogeneous_transfer.fetch_weight_manifest",
                 return_value=source,
             ),
             patch("torch.distributed.get_rank", return_value=0),
@@ -1211,7 +1212,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             ),
         ):
             transfer_weights_from_source_daemons(
-                target_manifest_state=MagicMock(),
+                target_session=MagicMock(),
                 model=MagicMock(),
                 gpu_id=0,
                 registry_url="tcp://source:31999",

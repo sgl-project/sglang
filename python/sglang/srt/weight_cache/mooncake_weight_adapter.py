@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Adapt immutable SGLang weight inventories to Mooncake contracts."""
+"""Adapt immutable SGLang weight manifests to Mooncake contracts."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import msgspec
@@ -45,12 +46,8 @@ class _ImmutableWeightAllocationGuard:
             raise WeightManifestError(
                 "immutable daemon weight binding differs from the planned binding"
             )
-        fragment_ids = {fragment.fragment_id for fragment in self._binding.fragments}
-        missing = set(required_fragment_ids) - fragment_ids
-        if missing:
-            raise WeightManifestError(
-                f"immutable daemon weight binding is missing fragments: {sorted(missing)}"
-            )
+        # weight_allocation_fence rejects fragment ids this binding does not own,
+        # so the ownership contract is enforced once, immediately below.
         token = _ImmutableWeightAllocationToken(
             weight_allocation_fence(
                 self._binding,
@@ -75,6 +72,43 @@ def immutable_weight_allocation_guards(
     }
 
 
+def _alias_key(tensor: dict[str, Any]) -> tuple[Any, ...]:
+    """Identify the exact bytes a fragment occupies, so aliases collapse."""
+    return (
+        tensor["address"],
+        tensor["nbytes"],
+        tuple(tensor["global_offset"]),
+        tuple(tensor["local_shape"]),
+        tensor["dtype"],
+    )
+
+
+def _storage_base(tensor: dict[str, Any]) -> tuple[int, int]:
+    """Recover the owning allocation base and this view's offset, in bytes."""
+    storage_offset_bytes = int(tensor["storage_offset"]) * int(tensor["itemsize"])
+    return int(tensor["address"]) - storage_offset_bytes, storage_offset_bytes
+
+
+def _axis_index(axis: str) -> int:
+    """Map a parallel axis onto its slot in the (PP, EP, MoE-TP) coordinate."""
+    if axis == "ep":
+        return 1
+    if axis == "tp":
+        return 2
+    raise ValueError(f"unsupported parallel axis: {axis}")
+
+
+def _has_expert_fragments(
+    geometry_by_rank: dict[tuple[int, int, int], list[dict[str, Any]]],
+) -> bool:
+    """Report whether any fragment carries a per-expert identity."""
+    return any(
+        tensor.get("expert_id") is not None
+        for tensors in geometry_by_rank.values()
+        for tensor in tensors
+    )
+
+
 def _geometry_signature(tensors: Sequence[dict[str, Any]]) -> tuple[Any, ...]:
     return tuple(
         sorted(
@@ -90,14 +124,14 @@ def _geometry_signature(tensors: Sequence[dict[str, Any]]) -> tuple[Any, ...]:
 
 
 def _index_tensor_geometry(
-    inventories: Sequence[dict[str, Any]],
+    manifests: Sequence[dict[str, Any]],
 ) -> dict[str, dict[tuple[int, int, int], list[dict[str, Any]]]]:
     """Index fragments by logical tensor and (PP, EP, MoE-TP) rank."""
     result: dict[
         str, dict[tuple[int, int, int], list[dict[str, Any]]]
     ] = {}
-    for inventory in inventories:
-        for tensor in inventory["tensors"]:
+    for manifest in manifests:
+        for tensor in manifest["tensors"]:
             rank = tensor["rank"]
             coordinate = (
                 int(rank["pp"]),
@@ -121,19 +155,12 @@ def _infer_replicated_tensor_ids(
     """Find tensors whose complete fragment geometry repeats over one axis."""
     if axis_size <= 1:
         return frozenset()
-    if axis not in ("ep", "tp"):
-        raise ValueError(f"unsupported replication axis: {axis}")
-
-    axis_index = 1 if axis == "ep" else 2
+    axis_index = _axis_index(axis)
     fixed_indices = (0, 2) if axis == "ep" else (0, 1)
     expected = set(range(axis_size))
     replicated = set()
     for tensor_id, geometry_by_rank in geometry_index.items():
-        if axis == "ep" and any(
-            tensor.get("expert_id") is not None
-            for tensors in geometry_by_rank.values()
-            for tensor in tensors
-        ):
+        if axis == "ep" and _has_expert_fragments(geometry_by_rank):
             continue
         groups: dict[tuple[int, int], dict[int, list[dict[str, Any]]]] = {}
         for coordinate, tensors in geometry_by_rank.items():
@@ -166,6 +193,19 @@ def _merge_intervals(
     return tuple((begin, end) for begin, end in merged)
 
 
+def _is_exact_partition(
+    owned: Sequence[tuple[int, int, int]],
+    extent: int,
+) -> bool:
+    """Report whether sorted owned intervals tile [0, extent) without gaps."""
+    cursor = 0
+    for begin, end, _ in owned:
+        if begin != cursor:
+            return False
+        cursor = end
+    return cursor == extent
+
+
 def _infer_split_dims(
     geometry_index: dict[
         str, dict[tuple[int, int, int], list[dict[str, Any]]]
@@ -177,18 +217,11 @@ def _infer_split_dims(
     """Infer process split dims from complete cross-rank logical geometry."""
     if axis_size <= 1:
         return {}
-    if axis not in ("ep", "tp"):
-        raise ValueError(f"unsupported split axis: {axis}")
-
-    axis_index = 1 if axis == "ep" else 2
+    axis_index = _axis_index(axis)
     expected = set(range(axis_size))
     result = {}
     for tensor_id, geometry_by_rank in geometry_index.items():
-        if axis == "ep" and any(
-            tensor.get("expert_id") is not None
-            for tensors in geometry_by_rank.values()
-            for tensor in tensors
-        ):
+        if axis == "ep" and _has_expert_fragments(geometry_by_rank):
             continue
 
         geometry_by_pp: dict[
@@ -239,14 +272,8 @@ def _infer_split_dims(
                     for rank, intervals in intervals_by_rank.items()
                     for begin, end in _merge_intervals(intervals)
                 )
-                cursor = 0
-                for begin, end, _ in owned:
-                    if begin != cursor:
-                        break
-                    cursor = end
-                else:
-                    if cursor == next(iter(extents)):
-                        split_dims.append(dim)
+                if _is_exact_partition(owned, next(iter(extents))):
+                    split_dims.append(dim)
             inferred_by_pp.append(tuple(split_dims))
 
         if len(set(inferred_by_pp)) == 1:
@@ -302,217 +329,232 @@ def _parallel_axes(
     return tuple(axes)
 
 
-def build_mooncake_weight_manifests(
-    runtime_inventories: Sequence[Any],
+@dataclass(frozen=True)
+class _ParallelGeometry:
+    """Per-tensor split/replication structure recovered from reported geometry."""
+
+    ep_replicated_tensor_ids: frozenset[str]
+    tp_replicated_tensor_ids: frozenset[str]
+    ep_split_dims: dict[str, tuple[int, ...]]
+    tp_split_dims: dict[str, tuple[int, ...]]
+
+
+def _infer_parallel_geometry(
+    manifests: Sequence[dict[str, Any]],
     *,
-    placement_set_id: str,
-    tp_size: int,
+    ep_size: int,
+    moe_tp_size: int,
+) -> _ParallelGeometry:
+    """Recover how each tensor is split or replicated across the two axes.
+
+    The structure is derived by comparing the geometry every rank reported, not
+    read from model configuration, so no per-architecture knowledge is needed.
+    """
+    geometry_index = _index_tensor_geometry(manifests)
+    return _ParallelGeometry(
+        ep_replicated_tensor_ids=_infer_replicated_tensor_ids(
+            geometry_index,
+            axis="ep",
+            axis_size=ep_size,
+        ),
+        tp_replicated_tensor_ids=_infer_replicated_tensor_ids(
+            geometry_index,
+            axis="tp",
+            axis_size=moe_tp_size,
+        ),
+        ep_split_dims=_infer_split_dims(
+            geometry_index,
+            axis="ep",
+            axis_size=ep_size,
+        ),
+        tp_split_dims=_infer_split_dims(
+            geometry_index,
+            axis="tp",
+            axis_size=moe_tp_size,
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class _ParticipantPart:
+    """One rank's contribution, split into logical and physical halves."""
+
+    manifest: dict[str, Any]
+    participant_id: str
+    rank: Any
+    descriptors: tuple[Any, ...]
+    placement_fragments: tuple[Any, ...]
+    runtime_fragments: tuple[Any, ...]
+
+
+def _resolve_rank(tensors: Sequence[dict[str, Any]]):
+    """Return the single parallel rank every fragment in one manifest shares."""
+    from mooncake.reshard.weight import ParallelRank
+
+    ranks = {
+        tuple(tensor["rank"][axis] for axis in ("dp", "tp", "pp", "ep"))
+        for tensor in tensors
+    }
+    if len(ranks) != 1:
+        raise WeightManifestError("runtime manifest spans multiple parallel ranks")
+    dp_rank, tp_rank, pp_rank, ep_rank = next(iter(ranks))
+    return ParallelRank(dp=dp_rank, tp=tp_rank, pp=pp_rank, ep=ep_rank)
+
+
+def _build_participant_part(
+    manifest: dict[str, Any],
+    *,
+    geometry: _ParallelGeometry,
+    moe_tp_size: int,
     pp_size: int,
     ep_size: int,
-):
-    """Build a placement using SGLang global TP factored as EP × MoE-TP."""
+) -> _ParticipantPart:
+    """Translate one rank's manifest into placement and runtime fragments.
+
+    Three passes are required and cannot be merged: aliases must be known before
+    fragments are emitted, and a storage's full extent is only known once every
+    fragment sharing it has been seen.
+    """
     from mooncake.reshard.weight import (
-        ParallelRank,
-        ParallelTopology,
         PlacementFragment,
         RuntimeBindingFragment,
         SplitAxis,
         TensorDescriptor,
-        TopologyParticipant,
-        WeightPlacementManifest,
-        WeightPlacementPart,
-        WeightRuntimeBindingManifest,
     )
 
-    inventories = tuple(msgspec.to_builtins(item) for item in runtime_inventories)
-    if not inventories:
-        raise WeightManifestError("runtime inventory set must not be empty")
-    if tp_size % ep_size != 0:
-        raise WeightManifestError(
-            f"tp_size={tp_size} must be divisible by ep_size={ep_size}"
-        )
-    moe_tp_size = tp_size // ep_size
-    geometry_index = _index_tensor_geometry(inventories)
-    ep_replicated_tensor_ids = _infer_replicated_tensor_ids(
-        geometry_index,
-        axis="ep",
-        axis_size=ep_size,
-    )
-    tp_replicated_tensor_ids = _infer_replicated_tensor_ids(
-        geometry_index,
-        axis="tp",
-        axis_size=moe_tp_size,
-    )
-    ep_split_dims = _infer_split_dims(
-        geometry_index,
-        axis="ep",
-        axis_size=ep_size,
-    )
-    tp_split_dims = _infer_split_dims(
-        geometry_index,
-        axis="tp",
-        axis_size=moe_tp_size,
-    )
+    tensors = manifest["tensors"]
+    if not tensors:
+        raise WeightManifestError("runtime manifest must contain tensors")
+    rank = _resolve_rank(tensors)
+    participant_id = f"dp{rank.dp}:pp{rank.pp}:ep{rank.ep}:tp{rank.tp}"
 
-    local_parts = []
-    identity = None
-    for inventory in inventories:
-        current_identity = (
-            inventory["model_id"],
-            inventory["revision"],
-            inventory["generation"],
+    aliases_by_storage: dict[tuple[Any, ...], set[str]] = {}
+    for tensor in tensors:
+        aliases_by_storage.setdefault(_alias_key(tensor), set()).add(
+            tensor["tensor_id"]
         )
-        if identity is None:
-            identity = current_identity
-        elif identity != current_identity:
+
+    descriptors: dict[str, Any] = {}
+    placement_fragments = []
+    placement_id_by_runtime_fragment = {}
+    storage_ends: dict[int, int] = {}
+    for tensor in tensors:
+        storage_address, storage_offset_bytes = _storage_base(tensor)
+        storage_ends[storage_address] = max(
+            storage_ends.get(storage_address, 0),
+            storage_offset_bytes + int(tensor["nbytes"]),
+        )
+
+        tensor_id = tensor["tensor_id"]
+        parallel_axes = _parallel_axes(
+            tensor,
+            tp_size=moe_tp_size,
+            pp_size=pp_size,
+            ep_size=ep_size,
+            ep_split_dims=geometry.ep_split_dims.get(tensor_id, ()),
+            tp_split_dims=geometry.tp_split_dims.get(tensor_id, ()),
+            ep_replicated=tensor_id in geometry.ep_replicated_tensor_ids,
+            tp_replicated=tensor_id in geometry.tp_replicated_tensor_ids,
+        )
+        descriptor = TensorDescriptor(
+            tensor_id=tensor_id,
+            global_shape=tuple(tensor["global_shape"]),
+            dtype=tensor["dtype"],
+            itemsize=int(tensor["itemsize"]),
+            # TensorDescriptor validates rather than derives this, so the split
+            # dimensions have to be projected out of the axes here.
+            shard_dims=tuple(
+                sorted(
+                    {
+                        axis.dim
+                        for axis in parallel_axes
+                        if isinstance(axis, SplitAxis)
+                    }
+                )
+            ),
+            layout_fingerprint=tensor["layout_fingerprint"],
+            parallel_axes=parallel_axes,
+            layer_id=tensor.get("layer_id"),
+            expert_id=tensor.get("expert_id"),
+        )
+        previous = descriptors.setdefault(descriptor.tensor_id, descriptor)
+        if previous != descriptor:
             raise WeightManifestError(
-                "runtime inventories have different model identities"
+                f"runtime tensor descriptors disagree: {descriptor.tensor_id}"
             )
 
-        tensors = inventory["tensors"]
-        if not tensors:
-            raise WeightManifestError("runtime inventory must contain tensors")
-        ranks = {
-            tuple(tensor["rank"][axis] for axis in ("dp", "tp", "pp", "ep"))
-            for tensor in tensors
-        }
-        if len(ranks) != 1:
-            raise WeightManifestError("runtime inventory spans multiple parallel ranks")
-        dp_rank, tp_rank, pp_rank, ep_rank = next(iter(ranks))
-        rank = ParallelRank(
-            dp=dp_rank,
-            tp=tp_rank,
-            pp=pp_rank,
-            ep=ep_rank,
+        aliases = tuple(sorted(aliases_by_storage[_alias_key(tensor)]))
+        fragment = PlacementFragment(
+            tensor_id=tensor_id,
+            global_offset=tuple(tensor["global_offset"]),
+            local_shape=tuple(tensor["local_shape"]),
+            nbytes=int(tensor["nbytes"]),
+            rank=rank,
+            aliases=aliases if len(aliases) > 1 else (),
         )
-        participant_id = f"dp{dp_rank}:pp{pp_rank}:ep{ep_rank}:tp{tp_rank}"
+        placement_fragments.append(fragment)
+        placement_id_by_runtime_fragment[tensor["fragment_id"]] = (
+            fragment.placement_fragment_id
+        )
 
-        aliases_by_storage = {}
-        for tensor in tensors:
-            alias_key = (
-                tensor["address"],
-                tensor["nbytes"],
-                tuple(tensor["global_offset"]),
-                tuple(tensor["local_shape"]),
-                tensor["dtype"],
-            )
-            aliases_by_storage.setdefault(alias_key, set()).add(tensor["tensor_id"])
-
-        descriptors = {}
-        placement_fragments = []
-        placement_id_by_runtime_fragment = {}
-        storage_ends = {}
-        runtime_storage = {}
-        for tensor in tensors:
-            itemsize = int(tensor["itemsize"])
-            storage_offset_bytes = int(tensor["storage_offset"]) * itemsize
-            storage_address = int(tensor["address"]) - storage_offset_bytes
-            storage_ends[storage_address] = max(
-                storage_ends.get(storage_address, 0),
-                storage_offset_bytes + int(tensor["nbytes"]),
-            )
-            runtime_storage[tensor["fragment_id"]] = (
-                storage_address,
-                storage_offset_bytes,
-            )
-
-            parallel_axes = _parallel_axes(
-                tensor,
-                tp_size=moe_tp_size,
-                pp_size=pp_size,
-                ep_size=ep_size,
-                ep_split_dims=ep_split_dims.get(tensor["tensor_id"], ()),
-                tp_split_dims=tp_split_dims.get(tensor["tensor_id"], ()),
-                ep_replicated=(
-                    tensor["tensor_id"] in ep_replicated_tensor_ids
-                ),
-                tp_replicated=tensor["tensor_id"] in tp_replicated_tensor_ids,
-            )
-            descriptor = TensorDescriptor(
-                tensor_id=tensor["tensor_id"],
-                global_shape=tuple(tensor["global_shape"]),
-                dtype=tensor["dtype"],
-                itemsize=itemsize,
-                shard_dims=tuple(
-                    sorted(
-                        {
-                            axis.dim
-                            for axis in parallel_axes
-                            if isinstance(axis, SplitAxis)
-                        }
-                    )
-                ),
-                layout_fingerprint=tensor["layout_fingerprint"],
-                parallel_axes=parallel_axes,
-                layer_id=tensor.get("layer_id"),
-                expert_id=tensor.get("expert_id"),
-            )
-            previous = descriptors.setdefault(descriptor.tensor_id, descriptor)
-            if previous != descriptor:
-                raise WeightManifestError(
-                    f"runtime tensor descriptors disagree: {descriptor.tensor_id}"
-                )
-
-            alias_key = (
-                tensor["address"],
-                tensor["nbytes"],
-                tuple(tensor["global_offset"]),
-                tuple(tensor["local_shape"]),
-                tensor["dtype"],
-            )
-            aliases = tuple(sorted(aliases_by_storage[alias_key]))
-            fragment = PlacementFragment(
-                tensor_id=tensor["tensor_id"],
-                global_offset=tuple(tensor["global_offset"]),
-                local_shape=tuple(tensor["local_shape"]),
+    runtime_fragments = []
+    for tensor in tensors:
+        storage_address, storage_offset_bytes = _storage_base(tensor)
+        runtime_fragments.append(
+            RuntimeBindingFragment(
+                placement_fragment_id=placement_id_by_runtime_fragment[
+                    tensor["fragment_id"]
+                ],
+                fragment_id=tensor["fragment_id"],
+                address=int(tensor["address"]),
                 nbytes=int(tensor["nbytes"]),
-                rank=rank,
-                aliases=aliases if len(aliases) > 1 else (),
-            )
-            placement_fragments.append(fragment)
-            placement_id_by_runtime_fragment[tensor["fragment_id"]] = (
-                fragment.placement_fragment_id
-            )
-
-        runtime_fragments = []
-        for tensor in tensors:
-            storage_address, storage_offset_bytes = runtime_storage[
-                tensor["fragment_id"]
-            ]
-            runtime_fragments.append(
-                RuntimeBindingFragment(
-                    placement_fragment_id=placement_id_by_runtime_fragment[
-                        tensor["fragment_id"]
-                    ],
-                    fragment_id=tensor["fragment_id"],
-                    address=int(tensor["address"]),
-                    nbytes=int(tensor["nbytes"]),
-                    worker_id=tensor["worker_id"],
-                    endpoint=tensor["endpoint"],
-                    device=tensor["device"],
-                    itemsize=int(tensor["itemsize"]),
-                    local_shape=tuple(tensor["local_shape"]),
-                    strides_bytes=tuple(
-                        int(stride) * int(tensor["itemsize"])
-                        for stride in tensor["stride"]
-                    ),
-                    storage_address=storage_address,
-                    storage_nbytes=storage_ends[storage_address],
-                    storage_offset_bytes=storage_offset_bytes,
-                )
-            )
-
-        local_parts.append(
-            (
-                inventory,
-                participant_id,
-                rank,
-                tuple(descriptors.values()),
-                tuple(placement_fragments),
-                tuple(runtime_fragments),
+                worker_id=tensor["worker_id"],
+                endpoint=tensor["endpoint"],
+                device=tensor["device"],
+                itemsize=int(tensor["itemsize"]),
+                local_shape=tuple(tensor["local_shape"]),
+                strides_bytes=tuple(
+                    int(stride) * int(tensor["itemsize"])
+                    for stride in tensor["stride"]
+                ),
+                storage_address=storage_address,
+                storage_nbytes=storage_ends[storage_address],
+                storage_offset_bytes=storage_offset_bytes,
             )
         )
 
+    return _ParticipantPart(
+        manifest=manifest,
+        participant_id=participant_id,
+        rank=rank,
+        descriptors=tuple(descriptors.values()),
+        placement_fragments=tuple(placement_fragments),
+        runtime_fragments=tuple(runtime_fragments),
+    )
+
+
+def _require_single_model_identity(manifests: Sequence[dict[str, Any]]) -> None:
+    """Reject a manifest set that mixes models, revisions, or generations."""
+    identities = {
+        (manifest["model_id"], manifest["revision"], manifest["generation"])
+        for manifest in manifests
+    }
+    if len(identities) != 1:
+        raise WeightManifestError("runtime manifests have different model identities")
+
+
+def _require_complete_topology(
+    parts: Sequence[_ParticipantPart],
+    *,
+    moe_tp_size: int,
+    pp_size: int,
+    ep_size: int,
+) -> None:
+    """Reject a partial grid.
+
+    ParallelTopology only range-checks each rank component, so a missing or
+    duplicated participant would otherwise reach the planner unnoticed.
+    """
     expected_ranks = {
         (0, tp_rank, pp_rank, ep_rank)
         for pp_rank in range(pp_size)
@@ -520,15 +562,65 @@ def build_mooncake_weight_manifests(
         for tp_rank in range(moe_tp_size)
     }
     actual_ranks = {
-        (rank.dp, rank.tp, rank.pp, rank.ep)
-        for _, _, rank, _, _, _ in local_parts
+        (part.rank.dp, part.rank.tp, part.rank.pp, part.rank.ep) for part in parts
     }
     if actual_ranks != expected_ranks:
         raise WeightManifestError(
-            "runtime inventories do not form a complete PP×EP×MoE-TP topology: "
+            "runtime manifests do not form a complete PP×EP×MoE-TP topology: "
             f"missing={sorted(expected_ranks - actual_ranks)[:5]}, "
             f"unexpected={sorted(actual_ranks - expected_ranks)[:5]}"
         )
+
+
+def build_mooncake_placement_and_bindings(
+    runtime_manifests: Sequence[Any],
+    *,
+    placement_set_id: str,
+    tp_size: int,
+    pp_size: int,
+    ep_size: int,
+):
+    """Translate per-rank weight manifests into Mooncake placement and bindings.
+
+    SGLang's flat global TP is factored as EP × MoE-TP because Mooncake models
+    those as separate axes. The address-free placement is what the planner
+    diffs; the bindings carry the addresses used only at late binding time.
+    """
+    from mooncake.reshard.weight import (
+        ParallelTopology,
+        TopologyParticipant,
+        WeightPlacementManifest,
+        WeightPlacementPart,
+        WeightRuntimeBindingManifest,
+    )
+
+    manifests = tuple(msgspec.to_builtins(item) for item in runtime_manifests)
+    if not manifests:
+        raise WeightManifestError("runtime manifest set must not be empty")
+    _require_single_model_identity(manifests)
+
+    moe_tp_size = tp_size // ep_size
+    geometry = _infer_parallel_geometry(
+        manifests,
+        ep_size=ep_size,
+        moe_tp_size=moe_tp_size,
+    )
+    parts = tuple(
+        _build_participant_part(
+            manifest,
+            geometry=geometry,
+            moe_tp_size=moe_tp_size,
+            pp_size=pp_size,
+            ep_size=ep_size,
+        )
+        for manifest in manifests
+    )
+    _require_complete_topology(
+        parts,
+        moe_tp_size=moe_tp_size,
+        pp_size=pp_size,
+        ep_size=ep_size,
+    )
 
     topology = ParallelTopology(
         tp_size=moe_tp_size,
@@ -536,30 +628,22 @@ def build_mooncake_weight_manifests(
         ep_size=ep_size,
         dp_size=1,
         participants=tuple(
-            TopologyParticipant(participant_id, rank)
-            for _, participant_id, rank, _, _, _ in local_parts
+            TopologyParticipant(part.participant_id, part.rank) for part in parts
         ),
     )
     placement_parts = tuple(
         WeightPlacementPart(
-            resource_id=inventory["model_id"],
-            revision=inventory["revision"],
-            weight_generation=int(inventory["generation"]),
+            resource_id=part.manifest["model_id"],
+            revision=part.manifest["revision"],
+            weight_generation=int(part.manifest["generation"]),
             placement_set_id=placement_set_id,
             topology_id=topology.topology_id,
-            participant_id=participant_id,
-            rank=rank,
-            tensors=descriptors,
-            fragments=placement_fragments,
+            participant_id=part.participant_id,
+            rank=part.rank,
+            tensors=part.descriptors,
+            fragments=part.placement_fragments,
         )
-        for (
-            inventory,
-            participant_id,
-            rank,
-            descriptors,
-            placement_fragments,
-            _,
-        ) in local_parts
+        for part in parts
     )
     first = placement_parts[0]
     placement = WeightPlacementManifest(
@@ -576,12 +660,12 @@ def build_mooncake_weight_manifests(
             revision=placement.revision,
             placement_id=placement.placement_id,
             placement_digest=placement.digest,
-            instance_id=inventory["instance_id"],
-            participant_id=participant_id,
-            generation=int(inventory["generation"]),
-            lease_id=f"immutable:{inventory['instance_id']}",
-            fragments=runtime_fragments,
+            instance_id=part.manifest["instance_id"],
+            participant_id=part.participant_id,
+            generation=int(part.manifest["generation"]),
+            lease_id=f"immutable:{part.manifest['instance_id']}",
+            fragments=part.runtime_fragments,
         )
-        for inventory, participant_id, _, _, _, runtime_fragments in local_parts
+        for part in parts
     )
     return placement, bindings

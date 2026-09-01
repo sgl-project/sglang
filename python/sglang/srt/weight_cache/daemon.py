@@ -268,7 +268,7 @@ class WeightCacheDaemon:
         # name -> transport-specific tensor entry metadata (shape/dtype/is_param + payload metadata)
         self.state_entries: Dict[str, Dict[str, Any]] = {}
         self.transport_backend = None
-        self.weights_manifest_state: Optional[Any] = None
+        self.weight_transfer_session: Optional[Any] = None
         self.weight_heterogeneous_transfer_stats: Optional[Dict[str, int]] = None
 
     def _init_distributed(self, server_args, model_config):
@@ -512,9 +512,9 @@ class WeightCacheDaemon:
         current_platform.synchronize()
 
         if self.weight_heterogeneous_transfer_mode is not None:
-            from .weight_heterogeneous_transfer import WeightsManifestState
+            from .weight_heterogeneous_transfer import WeightTransferSession
 
-            self.weights_manifest_state = WeightsManifestState.create(
+            self.weight_transfer_session = WeightTransferSession.create(
                 model=self.model,
                 model_config=model_config,
                 tp_size=self.tp_size,
@@ -541,10 +541,10 @@ class WeightCacheDaemon:
 
         if self.weight_heterogeneous_transfer_mode == "source":
             from .weight_heterogeneous_transfer import (
-                register_source_weights_manifest,
+                register_weight_manifest,
             )
 
-            register_source_weights_manifest(
+            register_weight_manifest(
                 self.weight_heterogeneous_transfer_registry_url,
                 global_rank=compute_global_rank(
                     self.tp_size, self.pp_rank, self.tp_rank
@@ -554,7 +554,7 @@ class WeightCacheDaemon:
                 dp_size=(self.dp_size if self.enable_dp_attention else 1),
                 pp_size=self.pp_size,
                 ep_size=self.ep_size,
-                manifest_state=self.weights_manifest_state,
+                session=self.weight_transfer_session,
             )
             logger.info(
                 "[WeightCacheDaemon gpu=%s] Registered source weight manifest at %s",
@@ -569,7 +569,7 @@ class WeightCacheDaemon:
 
             self.weight_heterogeneous_transfer_stats = (
                 transfer_weights_from_source_daemons(
-                    target_manifest_state=self.weights_manifest_state,
+                    target_session=self.weight_transfer_session,
                     model=self.model,
                     gpu_id=self.gpu_id,
                     registry_url=self.weight_heterogeneous_transfer_registry_url,
@@ -816,9 +816,9 @@ class WeightCacheDaemon:
 
     def shutdown(self):
         """Release GPU memory and clean up."""
-        if self.weights_manifest_state is not None:
-            self.weights_manifest_state.close()
-            self.weights_manifest_state = None
+        if self.weight_transfer_session is not None:
+            self.weight_transfer_session.close()
+            self.weight_transfer_session = None
         if dist.is_initialized():
             dist.destroy_process_group()
         if self.model is not None:

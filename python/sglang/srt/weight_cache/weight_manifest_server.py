@@ -99,15 +99,15 @@ class WeightManifestServer:
             send_msg(conn, {"status": "ok"})
             return
 
-        if request_type == "get_source_weights_manifest":
+        if request_type == "get_weight_manifest":
             try:
-                manifest = self.get_source_weights_manifest()
+                manifest = self.get_weight_manifest()
             except RuntimeError as error:
                 send_msg(conn, {"status": "retry", "message": str(error)})
                 return
             send_msg(
                 conn,
-                {"status": "ok", "source_weights_manifest": manifest},
+                {"status": "ok", "weight_manifest": manifest},
             )
             return
 
@@ -138,14 +138,14 @@ class WeightManifestServer:
                 "source parallel layout does not match expected rank count"
             )
 
-        runtime_inventory = data["runtime_inventory"]
+        runtime_manifest = data["runtime_manifest"]
         model_identity = (
-            str(runtime_inventory["model_id"]),
-            str(runtime_inventory["revision"]),
+            str(runtime_manifest["model_id"]),
+            str(runtime_manifest["revision"]),
         )
         rank_manifest = {
             "gpu_id": int(data["gpu_id"]),
-            "runtime_inventory": runtime_inventory,
+            "runtime_manifest": runtime_manifest,
         }
 
         with self._lock:
@@ -171,7 +171,7 @@ class WeightManifestServer:
 
         logger.info("Registered source weight manifest global_rank=%s", global_rank)
 
-    def get_source_weights_manifest(self) -> dict[str, Any]:
+    def get_weight_manifest(self) -> dict[str, Any]:
         with self._lock:
             if len(self._rank_manifests) != self.expected_rank_count:
                 raise RuntimeError(
@@ -192,8 +192,8 @@ class WeightManifestServer:
             "node_id": self._node_id,
             "parallel_layout": parallel_layout,
             "gpu_ids": gpu_ids,
-            "runtime_inventories": tuple(
-                item["runtime_inventory"] for item in rank_manifests
+            "runtime_manifests": tuple(
+                item["runtime_manifest"] for item in rank_manifests
             ),
         }
 

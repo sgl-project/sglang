@@ -30,7 +30,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 from .mooncake_weight_adapter import (
-    build_mooncake_weight_manifests,
+    build_mooncake_placement_and_bindings,
     immutable_weight_allocation_guards,
 )
 from .protocol import recv_msg, send_msg
@@ -239,7 +239,7 @@ def validate_weight_heterogeneous_transfer_configuration(
         )
 
 
-def _build_weight_runtime_inventory(
+def _build_weight_runtime_manifest(
     *,
     model: Any,
     tp_size: int,
@@ -315,14 +315,14 @@ def _build_weight_runtime_inventory(
         f"adp{parallel.attn_dp_rank}:ep{parallel_topology.ep_rank}:"
         f"mtp{parallel_topology.tp_rank}"
     )
-    runtime_inventory = manifest_builder.build(
+    runtime_manifest = manifest_builder.build(
         model_id=model_id,
         revision=revision,
         instance_id=worker_id,
         worker_id=worker_id,
         endpoint=transfer_endpoint,
     )
-    return runtime_inventory
+    return runtime_manifest
 
 
 def _initialize_weight_transfer_engine():
@@ -358,12 +358,20 @@ def _initialize_weight_transfer_engine():
 
 
 @dataclass
-class WeightsManifestState:
+class WeightTransferSession:
+    """One daemon's local end of a heterogeneous transfer.
+
+    Owns the Transfer Engine handle and every Mooncake memory registration made
+    on its behalf, so it must outlive ``load()`` and be closed from
+    ``shutdown()``. ``runtime_manifest`` doubles as the readiness flag: a source
+    fills it during ``create``, a target only after ``prepare_target``.
+    """
+
     transfer_engine: Any
-    runtime_inventory: Any | None
+    runtime_manifest: Any | None
     parallel_layout: WeightParallelLayout
     registered_memory_ranges: tuple[tuple[int, int], ...]
-    inventory_context: dict[str, Any]
+    manifest_context: dict[str, Any]
 
     @classmethod
     def create(
@@ -381,11 +389,11 @@ class WeightsManifestState:
         revision: str,
         is_source_daemon: bool,
         load_plan: Any | None,
-    ) -> WeightsManifestState:
+    ) -> WeightTransferSession:
         transfer_engine, transfer_endpoint = _initialize_weight_transfer_engine()
         registered_memory_ranges: list[tuple[int, int]] = []
         try:
-            inventory_context = dict(
+            manifest_context = dict(
                 tp_size=tp_size,
                 tp_rank=tp_rank,
                 pp_size=pp_size,
@@ -397,26 +405,26 @@ class WeightsManifestState:
                 model_id=model_identity_from_config(model_config.hf_config),
                 revision=revision,
             )
-            runtime_inventory = None
+            runtime_manifest = None
             if is_source_daemon:
                 if load_plan is None:
                     raise WeightHeterogeneousTransferError(
                         "source daemon has no recorded native weight-load plan"
                     )
-                runtime_inventory = _build_weight_runtime_inventory(
+                runtime_manifest = _build_weight_runtime_manifest(
                     model=model,
                     load_plan=load_plan,
-                    **inventory_context,
+                    **manifest_context,
                 )
                 registered_memory_ranges.extend(
                     _register_weight_fragment_allocations(
                         transfer_engine,
-                        runtime_inventory.tensors,
+                        runtime_manifest.tensors,
                     )
                 )
             return cls(
                 transfer_engine=transfer_engine,
-                runtime_inventory=runtime_inventory,
+                runtime_manifest=runtime_manifest,
                 parallel_layout=WeightParallelLayout(
                     tp_size=tp_size,
                     dp_size=dp_size,
@@ -424,7 +432,7 @@ class WeightsManifestState:
                     ep_size=ep_size,
                 ),
                 registered_memory_ranges=tuple(registered_memory_ranges),
-                inventory_context=inventory_context,
+                manifest_context=manifest_context,
             )
         except BaseException:
             for address, _ in reversed(registered_memory_ranges):
@@ -440,45 +448,45 @@ class WeightsManifestState:
         self,
         *,
         model: Any,
-        source_runtime_inventories: Sequence[Any],
+        source_runtime_manifests: Sequence[Any],
     ) -> None:
-        if self.runtime_inventory is not None:
+        if self.runtime_manifest is not None:
             raise WeightHeterogeneousTransferError(
-                "target runtime inventory was prepared more than once"
+                "target runtime manifest was prepared more than once"
             )
         from .weight_load_recorder import (
             WeightLoadRecordingError,
-            logical_weight_metadata_from_runtime_inventories,
+            logical_weight_metadata_from_runtime_manifests,
             record_target_weight_load_plan,
         )
 
         try:
-            logical_weights = logical_weight_metadata_from_runtime_inventories(
-                source_runtime_inventories
+            logical_weights = logical_weight_metadata_from_runtime_manifests(
+                source_runtime_manifests
             )
             load_plan = record_target_weight_load_plan(model, logical_weights)
-            runtime_inventory = _build_weight_runtime_inventory(
+            runtime_manifest = _build_weight_runtime_manifest(
                 model=model,
                 load_plan=load_plan,
-                **self.inventory_context,
+                **self.manifest_context,
             )
             registered = _register_weight_fragment_allocations(
                 self.transfer_engine,
-                runtime_inventory.tensors,
+                runtime_manifest.tensors,
             )
         except WeightLoadRecordingError as error:
             raise WeightHeterogeneousTransferError(
                 f"target native weight loader is outside recorder support: {error}"
             ) from error
-        self.runtime_inventory = runtime_inventory
+        self.runtime_manifest = runtime_manifest
         self.registered_memory_ranges = registered
 
-    def runtime_inventory_for_wire(self) -> Any:
-        if self.runtime_inventory is None:
+    def runtime_manifest_for_wire(self) -> Any:
+        if self.runtime_manifest is None:
             raise WeightHeterogeneousTransferError(
-                "target runtime inventory has not been prepared"
+                "target runtime manifest has not been prepared"
             )
-        return msgspec.to_builtins(self.runtime_inventory)
+        return msgspec.to_builtins(self.runtime_manifest)
 
     def close(self) -> None:
         failures = []
@@ -495,65 +503,65 @@ class WeightsManifestState:
 
 
 @dataclass(frozen=True)
-class SourceWeightsManifest:
+class SourceDaemonGroup:
+    """The whole source daemon group as advertised through the registry.
+
+    Holds one ``WeightRuntimeManifest`` per source rank in ``runtime_manifests``,
+    plus the placement facts a target needs before planning: which node the
+    group runs on, its parallel layout, and the GPUs it occupies.
+    """
+
     node_id: str
     parallel_layout: WeightParallelLayout
     gpu_ids: tuple[int, ...]
-    runtime_inventories: tuple[Any, ...]
+    runtime_manifests: tuple[Any, ...]
 
-    def to_wire(self) -> dict[str, Any]:
-        return {
-            "node_id": self.node_id,
-            "parallel_layout": {
-                "tp_size": self.parallel_layout.tp_size,
-                "dp_size": self.parallel_layout.dp_size,
-                "pp_size": self.parallel_layout.pp_size,
-                "ep_size": self.parallel_layout.ep_size,
-            },
-            "gpu_ids": self.gpu_ids,
-            "runtime_inventories": self.runtime_inventories,
-        }
 
-    @classmethod
-    def from_wire(cls, wire_manifest: dict[str, Any]) -> SourceWeightsManifest:
-        try:
-            node_id = str(wire_manifest["node_id"])
-            parallel_layout_data = wire_manifest["parallel_layout"]
-            parallel_layout = WeightParallelLayout(
-                tp_size=int(parallel_layout_data["tp_size"]),
-                dp_size=int(parallel_layout_data.get("dp_size", 1)),
-                pp_size=int(parallel_layout_data["pp_size"]),
-                ep_size=int(parallel_layout_data["ep_size"]),
-            )
-            gpu_ids = tuple(int(value) for value in wire_manifest["gpu_ids"])
-            runtime_inventories = tuple(wire_manifest["runtime_inventories"])
-        except (KeyError, TypeError, ValueError) as error:
-            raise WeightHeterogeneousTransferError(
-                "registry returned an invalid source weight manifest"
-            ) from error
+def parse_source_daemon_group(
+    wire_manifest: dict[str, Any],
+) -> SourceDaemonGroup:
+    """Validate one registry payload and convert it into a typed group.
 
-        rank_counts = (
-            len(gpu_ids),
-            len(runtime_inventories),
+    The registry assembles plain dicts from independently registering source
+    ranks, so this is the only place the wire contract is checked before a
+    target plans or writes any weight bytes.
+    """
+    try:
+        node_id = str(wire_manifest["node_id"])
+        parallel_layout_data = wire_manifest["parallel_layout"]
+        parallel_layout = WeightParallelLayout(
+            tp_size=int(parallel_layout_data["tp_size"]),
+            dp_size=int(parallel_layout_data.get("dp_size", 1)),
+            pp_size=int(parallel_layout_data["pp_size"]),
+            ep_size=int(parallel_layout_data["ep_size"]),
         )
-        if rank_counts != (parallel_layout.world_size,) * 2:
-            raise WeightHeterogeneousTransferError(
-                "source manifest rank count mismatch: "
-                f"expected={parallel_layout.world_size}, actual={rank_counts}"
-            )
-        if len(gpu_ids) != len(set(gpu_ids)):
-            raise WeightHeterogeneousTransferError(
-                "source manifest GPU ranks are invalid"
-            )
-        return cls(
-            node_id=node_id,
-            parallel_layout=parallel_layout,
-            gpu_ids=gpu_ids,
-            runtime_inventories=runtime_inventories,
+        gpu_ids = tuple(int(value) for value in wire_manifest["gpu_ids"])
+        runtime_manifests = tuple(wire_manifest["runtime_manifests"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise WeightHeterogeneousTransferError(
+            "registry returned an invalid source weight manifest"
+        ) from error
+
+    rank_counts = (
+        len(gpu_ids),
+        len(runtime_manifests),
+    )
+    if rank_counts != (parallel_layout.world_size,) * 2:
+        raise WeightHeterogeneousTransferError(
+            "source manifest rank count mismatch: "
+            f"expected={parallel_layout.world_size}, actual={rank_counts}"
         )
+    if len(gpu_ids) != len(set(gpu_ids)):
+        raise WeightHeterogeneousTransferError("source manifest GPU ranks are invalid")
+    return SourceDaemonGroup(
+        node_id=node_id,
+        parallel_layout=parallel_layout,
+        gpu_ids=gpu_ids,
+        runtime_manifests=runtime_manifests,
+    )
 
 
-def _request_weight_manifest_registry(
+def _send_request(
     registry_url: str,
     request: dict[str, Any],
     *,
@@ -582,7 +590,7 @@ def _request_weight_manifest_registry(
     return response
 
 
-def register_source_weights_manifest(
+def register_weight_manifest(
     registry_url: str,
     *,
     global_rank: int,
@@ -591,7 +599,7 @@ def register_source_weights_manifest(
     dp_size: int,
     pp_size: int,
     ep_size: int,
-    manifest_state: WeightsManifestState,
+    session: WeightTransferSession,
     timeout: float = 30.0,
 ) -> None:
     """Register one immutable source rank with the manifest server."""
@@ -605,13 +613,13 @@ def register_source_weights_manifest(
             "pp_size": pp_size,
             "ep_size": ep_size,
         },
-        "runtime_inventory": manifest_state.runtime_inventory_for_wire(),
+        "runtime_manifest": session.runtime_manifest_for_wire(),
     }
     deadline = time.monotonic() + timeout
     last_error: Optional[Exception] = None
     while time.monotonic() < deadline:
         try:
-            response = _request_weight_manifest_registry(
+            response = _send_request(
                 registry_url,
                 {"type": "register_weight_manifest", "manifest": payload},
                 timeout=min(5.0, max(deadline - time.monotonic(), 0.1)),
@@ -636,24 +644,24 @@ def register_source_weights_manifest(
     )
 
 
-def fetch_source_weights_manifest(
+def fetch_weight_manifest(
     registry_url: str,
     *,
     timeout: float = 30.0,
-) -> SourceWeightsManifest:
-    """Wait for and fetch one complete source manifest from the registry."""
+) -> SourceDaemonGroup:
+    """Wait for and fetch one complete source group from the registry."""
     deadline = time.monotonic() + timeout
     last_error: Optional[Exception] = None
     while time.monotonic() < deadline:
         try:
-            response = _request_weight_manifest_registry(
+            response = _send_request(
                 registry_url,
-                {"type": "get_source_weights_manifest"},
+                {"type": "get_weight_manifest"},
                 timeout=min(5.0, max(deadline - time.monotonic(), 0.1)),
             )
             if response.get("status") == "ok":
-                return SourceWeightsManifest.from_wire(
-                    response["source_weights_manifest"]
+                return parse_source_daemon_group(
+                    response["weight_manifest"]
                 )
             last_error = RuntimeError(
                 f"manifest server returned an error: {response}"
@@ -668,10 +676,10 @@ def fetch_source_weights_manifest(
 
 def pull_weights_from_source(
     *,
-    target_manifest_state: WeightsManifestState,
-    source_runtime_inventories: Sequence[Any],
+    target_session: WeightTransferSession,
+    source_runtime_manifests: Sequence[Any],
     source_parallel_layout: WeightParallelLayout,
-    target_runtime_inventories: Sequence[Any],
+    target_runtime_manifests: Sequence[Any],
 ) -> dict[str, int]:
     try:
         from mooncake.reshard.weight import (
@@ -685,21 +693,21 @@ def pull_weights_from_source(
             "mooncake.reshard.weight is unavailable in this environment"
         ) from error
 
-    source_placement, source_bindings = build_mooncake_weight_manifests(
-        source_runtime_inventories,
+    source_placement, source_bindings = build_mooncake_placement_and_bindings(
+        source_runtime_manifests,
         placement_set_id="weight-cache-source",
         tp_size=source_parallel_layout.tp_size,
         pp_size=source_parallel_layout.pp_size,
         ep_size=source_parallel_layout.ep_size,
     )
-    target_placement, target_bindings = build_mooncake_weight_manifests(
-        target_runtime_inventories,
+    target_placement, target_bindings = build_mooncake_placement_and_bindings(
+        target_runtime_manifests,
         placement_set_id="weight-cache-target",
-        tp_size=target_manifest_state.parallel_layout.tp_size,
-        pp_size=target_manifest_state.parallel_layout.pp_size,
-        ep_size=target_manifest_state.parallel_layout.ep_size,
+        tp_size=target_session.parallel_layout.tp_size,
+        pp_size=target_session.parallel_layout.pp_size,
+        ep_size=target_session.parallel_layout.ep_size,
     )
-    target_instance_id = target_manifest_state.runtime_inventory.instance_id
+    target_instance_id = target_session.runtime_manifest.instance_id
     try:
         target_binding = next(
             binding
@@ -744,7 +752,7 @@ def pull_weights_from_source(
         )
 
     transfer_reader = MooncakeTransferEngineReader(
-        target_manifest_state.transfer_engine,
+        target_session.transfer_engine,
         max_batch_operations=8192,
     )
     transfer_receipts = transfer_reader.execute(
@@ -820,7 +828,7 @@ def _all_gather_rank_local_phase(
 
 def transfer_weights_from_source_daemons(
     *,
-    target_manifest_state: WeightsManifestState,
+    target_session: WeightTransferSession,
     model: Any,
     gpu_id: int,
     registry_url: str,
@@ -829,27 +837,27 @@ def transfer_weights_from_source_daemons(
     import torch.distributed as dist
 
     # Fetch the source once, then broadcast it to every target daemon rank.
-    source_manifest_result: list[Optional[dict[str, Any]]] = [None]
+    source_group_result: list[Optional[dict[str, Any]]] = [None]
     if dist.get_rank() == 0:
         try:
-            source_manifest_result[0] = {
-                "manifest": fetch_source_weights_manifest(registry_url),
+            source_group_result[0] = {
+                "manifest": fetch_weight_manifest(registry_url),
                 "error": None,
             }
         except Exception as error:
-            source_manifest_result[0] = {
+            source_group_result[0] = {
                 "manifest": None,
                 "error": str(error),
             }
-    dist.broadcast_object_list(source_manifest_result, src=0)
-    result = source_manifest_result[0]
+    dist.broadcast_object_list(source_group_result, src=0)
+    result = source_group_result[0]
     if result is None:
         raise WeightHeterogeneousTransferError(
             "target rank did not receive a manifest registry result"
         )
     if result["error"] is not None:
         raise WeightHeterogeneousTransferError(result["error"])
-    source_weights_manifest = result["manifest"]
+    source_daemon_group = result["manifest"]
 
     # Enforce the deliberately narrow no-overlap contract on a shared node
     # before planning or writing any target weight bytes.
@@ -861,8 +869,8 @@ def transfer_weights_from_source_daemons(
             f"target GPU ranks are not unique: {tuple(target_gpu_ids)}"
         )
     target_node_id = get_local_ip_auto(fallback=socket.gethostname())
-    if source_weights_manifest.node_id == target_node_id:
-        overlap = sorted(set(source_weights_manifest.gpu_ids) & set(target_gpu_ids))
+    if source_daemon_group.node_id == target_node_id:
+        overlap = sorted(set(source_daemon_group.gpu_ids) & set(target_gpu_ids))
         if overlap:
             raise WeightHeterogeneousTransferError(
                 "source and target GPU ranks must not overlap on the same node; "
@@ -870,13 +878,13 @@ def transfer_weights_from_source_daemons(
             )
 
     def prepare_target() -> Any:
-        target_manifest_state.prepare_target(
+        target_session.prepare_target(
             model=model,
-            source_runtime_inventories=source_weights_manifest.runtime_inventories,
+            source_runtime_manifests=source_daemon_group.runtime_manifests,
         )
-        return target_manifest_state.runtime_inventory_for_wire()
+        return target_session.runtime_manifest_for_wire()
 
-    target_runtime_inventories = _all_gather_rank_local_phase(
+    target_runtime_manifests = _all_gather_rank_local_phase(
         "prepare_target",
         prepare_target,
     )
@@ -884,10 +892,10 @@ def transfer_weights_from_source_daemons(
     transfer_stats_by_rank = _all_gather_rank_local_phase(
         "pull",
         lambda: pull_weights_from_source(
-            target_manifest_state=target_manifest_state,
-            source_runtime_inventories=source_weights_manifest.runtime_inventories,
-            source_parallel_layout=source_weights_manifest.parallel_layout,
-            target_runtime_inventories=target_runtime_inventories,
+            target_session=target_session,
+            source_runtime_manifests=source_daemon_group.runtime_manifests,
+            source_parallel_layout=source_daemon_group.parallel_layout,
+            target_runtime_manifests=target_runtime_manifests,
         ),
     )
     transfer_stats = transfer_stats_by_rank[dist.get_rank()]

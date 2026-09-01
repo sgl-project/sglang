@@ -1353,15 +1353,15 @@ def record_target_weight_load_plan(
     return recorder.build_plan()
 
 
-def logical_weight_metadata_from_runtime_inventories(
-    runtime_inventories: Sequence[Any],
+def logical_weight_metadata_from_runtime_manifests(
+    runtime_manifests: Sequence[Any],
 ) -> tuple[LogicalWeightMetadata, ...]:
     metadata: dict[str, LogicalWeightMetadata] = {}
-    for inventory in runtime_inventories:
+    for manifest in runtime_manifests:
         load_tensors = (
-            inventory.get("load_tensors", ())
-            if isinstance(inventory, dict)
-            else getattr(inventory, "load_tensors", ())
+            manifest.get("load_tensors", ())
+            if isinstance(manifest, dict)
+            else getattr(manifest, "load_tensors", ())
         )
         for item in load_tensors:
             if isinstance(item, dict):
@@ -1386,6 +1386,6 @@ def logical_weight_metadata_from_runtime_inventories(
                 )
     if not metadata:
         raise WeightLoadRecordingError(
-            "source runtime inventories contain no recorded load metadata"
+            "source runtime manifests contain no recorded load metadata"
         )
     return tuple(metadata[key] for key in sorted(metadata))
