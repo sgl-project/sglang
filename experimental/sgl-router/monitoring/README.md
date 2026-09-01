@@ -32,7 +32,7 @@ The dashboard graphs every family the router emits:
 | `sgl_router_worker_cb_state` | Gauge | Per-worker circuit breaker state (0=closed, 1=open, 2=half_open) |
 | `sgl_router_worker_inflight_requests` | Gauge | In-flight requests per worker |
 | `sgl_router_stale_requests_total` | Counter | Stale-request cancellations |
-| `sgl_router_decode_affinity_total` | Counter | PD decode-affinity outcomes |
+| `sgl_router_decode_affinity_total` | Counter | PD decode-affinity outcomes (`same_host_picked`, `fallback_no_same_host`, `fallback_breaker`, `fallback_load_imbalance`) |
 | `sgl_router_sticky_total` | Counter | Sticky-session selection outcomes |
 
 The `sgl_router_workers` / `sgl_router_worker_*` gauges are sampled from the

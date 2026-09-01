@@ -19,6 +19,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use bytes::Bytes;
+use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use sgl_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
@@ -153,8 +154,26 @@ async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
     ]);
     let app = build_router(ctx);
 
-    let res = app.oneshot(chat_request()).await.unwrap();
+    let res = app.clone().oneshot(chat_request()).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK, "decode side should 200");
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+
+    let metrics_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let metrics_body = metrics_res.into_body().collect().await.unwrap().to_bytes();
+    let metrics = std::str::from_utf8(&metrics_body).unwrap();
+    assert!(
+        metrics.contains(r#"sgl_router_decode_affinity_total{outcome="same_host_picked"} 1"#),
+        "decode affinity counter must be recorded through the PD chat path; got:\n{metrics}",
+    );
 
     let prefill_body = await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
     let decode_body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
