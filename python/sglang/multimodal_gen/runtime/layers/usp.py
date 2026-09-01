@@ -402,10 +402,24 @@ def _can_use_packed_qkv_a2a_4d(
     )
 
 
+def _can_use_zero_copy_qkv_a2a_4d(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, world_size: int
+) -> bool:
+    """Whether packed receive storage can be consumed directly by attention."""
+    return (
+        _can_use_packed_qkv_a2a_4d(q, k, v, world_size)
+        and q.shape[0] == 1
+        and not torch.is_grad_enabled()
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
 def _usp_input_all_to_all_qkv(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    *,
+    materialize: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Ulysses input exchange for Q/K/V with heads at dim=2.
 
@@ -427,6 +441,8 @@ def _usp_input_all_to_all_qkv(
         )
 
     b, s_local, h_global, d = q.shape
+    if not materialize and b != 1:
+        raise ValueError("zero-copy packed QKV receive requires batch size one")
     h_local = h_global // world_size
     rows = b * s_local
     packed = pack_qkv_destination_major(
@@ -438,7 +454,13 @@ def _usp_input_all_to_all_qkv(
             "usp_packed_qkv_src", (world_size, rows, h_local, 3 * d), q.dtype, q.device
         ),
     )
-    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    # The materialized path copies Q/K/V out and can safely recycle one global
+    # receive staging buffer.  The zero-copy path instead allocates one packed
+    # receive tensor: its three views retain the storage until attention has
+    # consumed them, and PyTorch's stream-aware allocator then recycles it.
+    packed = _usp_all_to_all_single(
+        packed, role="usp_packed_qkv_recv" if materialize else None
+    )
     if b == 1:
         # Received chunks are already sequence-major: rank j's rows arrive at
         # offset j * s_local, so flattening the leading dims is a free view.
@@ -451,6 +473,8 @@ def _usp_input_all_to_all_qkv(
             .view(b, world_size * s_local, h_local, 3 * d)
         )
     q, k, v = packed.split(d, dim=-1)
+    if not materialize:
+        return q, k, v
     # Copy out before the staging buffer is recycled by the next collective.
     return q.contiguous(), k.contiguous(), v.contiguous()
 
