@@ -746,6 +746,9 @@ class TokenizerControlMixin:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
+            assert (
+                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             async with self.lora_update_lock:
                 self._validate_lora_upsert_supported()
                 new_adapter, reused = await self.lora_registry.register_or_reuse(
