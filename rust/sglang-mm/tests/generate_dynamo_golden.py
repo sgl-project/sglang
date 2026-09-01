@@ -11,11 +11,15 @@ Usage (from the sglang repo root, extension built):
         /personal/frontend-crates/mm-preprocessor/tests/fixtures/qwen_vl
 """
 
+from __future__ import annotations
+
 import io
 import json
 import os
 import sys
+from typing import TYPE_CHECKING
 
+import msgspec
 import numpy as np
 import torch
 from PIL import Image
@@ -23,11 +27,17 @@ from PIL import Image
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.rust_extensions import _multimodal
 
-IMAGE_TOKEN_ID = 900
-VISION_START_ID = 901
-VISION_END_ID = 902
+if TYPE_CHECKING:
+    from transformers.image_processing_utils import BaseImageProcessor
 
-QWEN2_VL = dict(
+Config = dict[str, int | list[float]]
+Grid = tuple[int, int, int]
+
+IMAGE_TOKEN_ID: int = 900
+VISION_START_ID: int = 901
+VISION_END_ID: int = 902
+
+QWEN2_VL: Config = dict(
     patch_size=14,
     merge_size=2,
     temporal_patch_size=2,
@@ -37,12 +47,12 @@ QWEN2_VL = dict(
     image_std=[0.26862954, 0.26130258, 0.27577711],
 )
 # A tight pixel budget so the downscale branch stays fixture-sized.
-TINY_MAX = dict(QWEN2_VL, max_pixels=112 * 112)
+TINY_MAX: Config = dict(QWEN2_VL, max_pixels=112 * 112)
 
 # (name, resample, config, image (width, height) list). One placeholder per
 # image: [7, <vs>, <pad>, <ve>, ...] — the wrapper ids are plain text to the
 # driver but let `get_rope_index` locate the spans.
-CASES = [
+CASES: list[tuple[str, str, Config, list[tuple[int, int]]]] = [
     ("aten_upscale", "aten_u8", QWEN2_VL, [(40, 40)]),
     ("aten_downscale", "aten_u8", TINY_MAX, [(300, 200)]),
     ("pil_round", "pil", QWEN2_VL, [(100, 76)]),
@@ -50,7 +60,19 @@ CASES = [
 ]
 
 
-def make_image(width, height, seed):
+class GoldenCase(msgspec.Struct, kw_only=True):
+    prompt_ids: list[int]
+    input_ids: list[int]
+    grids: list[Grid]
+    offsets: list[tuple[int, int]]
+    # Decimal strings: JSON numbers cannot carry a full u64.
+    hashes: list[str]
+    features: np.ndarray
+    mrope: np.ndarray
+    mrope_delta: int
+
+
+def make_image(width: int, height: int, seed: int) -> bytes:
     rng = np.random.default_rng(seed)
     y, x = np.mgrid[0:height, 0:width]
     base = np.stack(
@@ -63,7 +85,7 @@ def make_image(width, height, seed):
     return buffer.getvalue()
 
 
-def hf_image_processor(resample, config):
+def hf_image_processor(resample: str, config: Config) -> "BaseImageProcessor":
     if resample == "pil":
         from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import (
             Qwen2VLImageProcessorPil as cls,
@@ -75,29 +97,31 @@ def hf_image_processor(resample, config):
     return cls(**config)
 
 
-def expected_for(resample, config, pngs):
+def expected_for(resample: str, config: Config, pngs: list[bytes]) -> GoldenCase:
     hf = hf_image_processor(resample, config)
-    features, grids = [], []
+    features: list[np.ndarray] = []
+    grids: list[Grid] = []
     for png in pngs:
-        out = hf(images=[Image.open(io.BytesIO(png)).convert("RGB")], return_tensors="pt")
+        out = hf(
+            images=[Image.open(io.BytesIO(png)).convert("RGB")], return_tensors="pt"
+        )
         features.append(out.pixel_values.numpy().astype(np.float32))
         grids.append(tuple(out.image_grid_thw[0].tolist()))
 
-    prompt_ids = [7]
+    prompt_ids: list[int] = [7]
     for _ in pngs:
         prompt_ids.extend((VISION_START_ID, IMAGE_TOKEN_ID, VISION_END_ID))
     prompt_ids.append(8)
 
-    expanded, offsets = [], []
-    merge = config["merge_size"]
+    expanded: list[int] = []
+    offsets: list[tuple[int, int]] = []
+    merge: int = int(config["merge_size"])
     counts = iter([int(np.prod(g)) // merge**2 for g in grids])
-    grid_iter = iter(grids)
     for tok in prompt_ids:
         if tok == IMAGE_TOKEN_ID:
             n = next(counts)
             offsets.append((len(expanded), len(expanded) + n - 1))
             expanded.extend([IMAGE_TOKEN_ID] * n)
-            next(grid_iter)
         else:
             expanded.append(tok)
 
@@ -111,7 +135,7 @@ def expected_for(resample, config, pngs):
         image_grid_thw=torch.tensor(grids),
         video_grid_thw=None,
     )
-    return dict(
+    return GoldenCase(
         prompt_ids=prompt_ids,
         input_ids=expanded,
         grids=grids,
@@ -125,24 +149,27 @@ def expected_for(resample, config, pngs):
     )
 
 
-def cross_check(spec, pngs, expected):
-    ids, feats, grids, hashes, offsets, mrope, delta = (
-        _multimodal.qwen_vl.process_mm(
-            expected["prompt_ids"], [bytearray(p) for p in pngs], json.dumps(spec)
-        )
+def cross_check(spec: Config, pngs: list[bytes], expected: GoldenCase) -> None:
+    ids, feats, grids, hashes, offsets, mrope, delta = _multimodal.qwen_vl.process_mm(
+        expected.prompt_ids, [bytearray(p) for p in pngs], json.dumps(spec)
     )
-    assert ids == expected["input_ids"]
-    assert [tuple(g) for g in grids] == expected["grids"]
-    assert offsets == expected["offsets"]
-    assert [str(h) for h in hashes] == expected["hashes"]
-    assert delta == expected["mrope_delta"]
-    np.testing.assert_array_equal(np.asarray(feats), expected["features"])
-    np.testing.assert_array_equal(np.asarray(mrope), expected["mrope"])
+    assert ids == expected.input_ids
+    assert [tuple(g) for g in grids] == expected.grids
+    assert offsets == expected.offsets
+    assert [str(h) for h in hashes] == expected.hashes
+    assert delta == expected.mrope_delta
+    np.testing.assert_array_equal(np.asarray(feats), expected.features)
+    np.testing.assert_array_equal(np.asarray(mrope), expected.mrope)
 
 
-def main(out_root):
+def main(out_root: str) -> None:
     for index, (name, resample, config, sizes) in enumerate(CASES):
-        spec = {"family": "qwen_vl", "image_token_id": IMAGE_TOKEN_ID, "resample": resample, **config}
+        spec: Config = {
+            "family": "qwen_vl",
+            "image_token_id": IMAGE_TOKEN_ID,
+            "resample": resample,
+            **config,
+        }
         pngs = [make_image(w, h, seed=10 + index * 8 + i) for i, (w, h) in enumerate(sizes)]
         expected = expected_for(resample, config, pngs)
         cross_check(spec, pngs, expected)
@@ -152,22 +179,22 @@ def main(out_root):
         for i, png in enumerate(pngs):
             with open(os.path.join(case_dir, f"input_{i}.png"), "wb") as f:
                 f.write(png)
-        expected["features"].astype("<f4").tofile(
+        expected.features.astype("<f4").tofile(
             os.path.join(case_dir, "pixel_values.f32le")
         )
-        expected["mrope"].astype("<i8").tofile(os.path.join(case_dir, "mrope.i64le"))
-        meta = {
+        expected.mrope.astype("<i8").tofile(os.path.join(case_dir, "mrope.i64le"))
+        meta: dict[str, object] = {
             "spec": spec,
-            "prompt_ids": expected["prompt_ids"],
-            "input_ids": expected["input_ids"],
-            "grids": [list(g) for g in expected["grids"]],
-            "offsets": [list(o) for o in expected["offsets"]],
-            "hashes": expected["hashes"],
-            "mrope_delta": expected["mrope_delta"],
+            "prompt_ids": expected.prompt_ids,
+            "input_ids": expected.input_ids,
+            "grids": [list(g) for g in expected.grids],
+            "offsets": [list(o) for o in expected.offsets],
+            "hashes": expected.hashes,
+            "mrope_delta": expected.mrope_delta,
         }
         with open(os.path.join(case_dir, "case.json"), "w") as f:
             json.dump(meta, f, indent=1)
-        print(f"  {case_dir}: {len(pngs)} image(s), {expected['features'].size} f32")
+        print(f"  {case_dir}: {len(pngs)} image(s), {expected.features.size} f32")
     print("DYNAMO_GOLDEN_OK")
 
 
