@@ -1,11 +1,12 @@
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
-from sglang.srt.environ import envs
+from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -104,6 +105,20 @@ def _build_swa_tree(
         ),
     )
     return tree, allocator, req_to_token_pool
+
+
+def _sync_error(fn):
+    """The RuntimeError torch raises if `fn` synchronizes, or None."""
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        fn()
+    except RuntimeError as exc:
+        return exc
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+        torch.cuda.synchronize()
+    return None
 
 
 def _swa_alloc(allocator, need_size):
@@ -244,28 +259,16 @@ class TestSWA(unittest.TestCase):
         # its own, which the detector would report as this call's fault.
         allocator.clear_full_to_swa_mapping(full_indices)
 
-        def sync_error(fn):
-            torch.cuda.synchronize()
-            torch.cuda.set_sync_debug_mode("error")
-            try:
-                fn()
-            except RuntimeError as exc:
-                return exc
-            finally:
-                torch.cuda.set_sync_debug_mode("default")
-                torch.cuda.synchronize()
-            return None
-
         # Gate on the pre-fix form: a detector blind to this sync class would pass
         # the assert below no matter how the mapping is cleared.
-        pre_fix_error = sync_error(
+        pre_fix_error = _sync_error(
             lambda: mapping.__setitem__(full_indices.to(torch.int64), 0)
         )
         if pre_fix_error is None:
             self.skipTest("sync debug mode does not flag a blocking H2D copy here")
 
         self.assertIsNone(
-            sync_error(lambda: allocator.clear_full_to_swa_mapping(full_indices))
+            _sync_error(lambda: allocator.clear_full_to_swa_mapping(full_indices))
         )
 
     def test_free_swa_group_owns_deferred_indices(self):
@@ -1012,6 +1015,51 @@ class TestFreeKvRow(CustomTestCase):
         # guards, so an empty range has to stay a no-op here.
         cache.free_kv_row(kv, [(6, 6)])
         self.assertEqual(len(allocator.freed), 2)
+
+
+class TestSWAPeerMappedContract(CustomTestCase):
+    """page_size 1 gives back every peer the mapping names, without filtering:
+    the contract replaces what `swa_indices > 0` used to absorb."""
+
+    def _strict(self):
+        return envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.STRICT))
+
+    def _condition_checked_by(self, allocator, indices):
+        """The predicate free_swa hands the async assert, as a python bool."""
+        with self._strict():
+            with mock.patch.object(torch, "_assert_async") as assert_async:
+                allocator.free_swa(indices)
+        return bool(assert_async.call_args.args[0])
+
+    def test_free_swa_flags_a_slot_whose_peer_is_already_gone(self):
+        _, allocator, _ = _build_swa_tree(is_eagle=False)
+        live = _swa_alloc(allocator, 4)
+        stale = _swa_alloc(allocator, 4)
+        # Whoever released the peer left the mapping reading as the padding slot.
+        allocator.clear_full_to_swa_mapping(stale)
+
+        self.assertTrue(self._condition_checked_by(allocator, live))
+        self.assertFalse(self._condition_checked_by(allocator, stale))
+
+    def test_free_swa_does_not_synchronize(self):
+        """The filter's output shape was data-dependent, so it read a count back
+        to the host; the gather that replaced it has a fixed shape."""
+        _, allocator, _ = _build_swa_tree(is_eagle=False)
+        mapping = allocator.full_to_swa_index_mapping
+
+        # Warm up outside the window: a first-time cudaMalloc can synchronize on
+        # its own, which the detector would report as this call's fault.
+        allocator.free_swa(_swa_alloc(allocator, 4))
+        indices = _swa_alloc(allocator, 4)
+
+        # Gate on the pre-fix form: a detector blind to this sync class would pass
+        # the assert below no matter how free_swa reads the mapping.
+        peers = mapping[indices]
+        if _sync_error(lambda: peers[peers > 0]) is None:
+            self.skipTest("sync debug mode does not flag a data-dependent shape here")
+
+        with self._strict():
+            self.assertIsNone(_sync_error(lambda: allocator.free_swa(indices)))
 
 
 class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):

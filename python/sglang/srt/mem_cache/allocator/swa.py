@@ -6,6 +6,7 @@ from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
+from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
 
 _is_npu = is_npu()
 
@@ -15,6 +16,11 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.allocator_npu import (
         NPUPagedTokenToKVPoolAllocator,
     )
+
+
+# free_swa releases whatever the mapping points at, so an entry that reads as the
+# padding slot would push slot 0 into the SWA free list and hand it out twice.
+_SWA_PEER_MAPPED = Invariant("swa.peer_mapped", Bucket.FATAL_UNCONTAINABLE, IsTrue())
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -360,12 +366,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.page_size == 1:
+            # Every slot here still owns its peer: a caller that knows otherwise
+            # says so with free_full. Filtering instead would make the output
+            # shape data-dependent, which costs a device-to-host sync.
             mapping_indices = free_index
+            swa_indices = self.full_to_swa_index_mapping[mapping_indices]
+            expect(_SWA_PEER_MAPPED, swa_indices > 0, msg="caller wants free_full")
         else:
+            # HiCache LOAD_BACK re-pairs a page-aligned full chunk with an
+            # arbitrarily offset SWA one (commit_hicache_transfer advances by raw
+            # token count), so a page can hold both mapped and unmapped slots.
             mapping_indices = self._expand_to_full_pages(free_index)
+            swa_indices = self.full_to_swa_index_mapping[mapping_indices]
+            swa_indices = swa_indices[swa_indices > 0]
 
-        swa_indices = self.full_to_swa_index_mapping[mapping_indices]
-        swa_indices = swa_indices[swa_indices > 0]
         self.clear_full_to_swa_mapping(mapping_indices)
 
         if self.free_group is not None:
