@@ -39,17 +39,7 @@ from sglang.srt.observability.metrics_collector import (
     TokenizerMetricsCollector,
     resolve_collector_class,
 )
-
-
-class _StubArgs:
-    """Minimal ServerArgs stand-in.
-
-    Avoids triggering the heavy real ServerArgs import chain for unit-level
-    ``resolve_collector_class`` cases.
-    """
-
-    def __init__(self, stat_loggers=None):
-        self.stat_loggers = stat_loggers
+from sglang.srt.runtime_context import get_context, reset_context
 
 
 class TestCollectorClassAttrs(unittest.TestCase):
@@ -79,30 +69,37 @@ class TestCollectorClassAttrs(unittest.TestCase):
 
 
 class TestResolveCollectorClass(unittest.TestCase):
-    def test_returns_default_when_server_args_none(self):
-        cls = resolve_collector_class(None, "scheduler", SchedulerMetricsCollector)
-        self.assertIs(cls, SchedulerMetricsCollector)
+    """The role table is read from the published `observability` bag."""
+
+    def _resolve(self, role, default_cls, **fields):
+        if not fields:
+            return resolve_collector_class(role, default_cls)
+        with get_context().override_server_args(**fields):
+            return resolve_collector_class(role, default_cls)
+
+    def test_returns_default_when_nothing_is_published(self):
+        reset_context()
+        self.assertIs(
+            resolve_collector_class("scheduler", SchedulerMetricsCollector),
+            SchedulerMetricsCollector,
+        )
 
     def test_returns_default_when_stat_loggers_none(self):
-        cls = resolve_collector_class(
-            _StubArgs(stat_loggers=None), "scheduler", SchedulerMetricsCollector
-        )
+        cls = self._resolve("scheduler", SchedulerMetricsCollector, stat_loggers=None)
         self.assertIs(cls, SchedulerMetricsCollector)
 
     def test_returns_default_when_stat_loggers_empty(self):
-        cls = resolve_collector_class(
-            _StubArgs(stat_loggers={}), "scheduler", SchedulerMetricsCollector
-        )
+        cls = self._resolve("scheduler", SchedulerMetricsCollector, stat_loggers={})
         self.assertIs(cls, SchedulerMetricsCollector)
 
     def test_returns_default_when_role_missing(self):
         class MyTokenizer(TokenizerMetricsCollector):
             pass
 
-        cls = resolve_collector_class(
-            _StubArgs(stat_loggers={"tokenizer": MyTokenizer}),
+        cls = self._resolve(
             "scheduler",
             SchedulerMetricsCollector,
+            stat_loggers={"tokenizer": MyTokenizer},
         )
         self.assertIs(cls, SchedulerMetricsCollector)
 
@@ -110,10 +107,10 @@ class TestResolveCollectorClass(unittest.TestCase):
         class MyScheduler(SchedulerMetricsCollector):
             pass
 
-        cls = resolve_collector_class(
-            _StubArgs(stat_loggers={"scheduler": MyScheduler}),
+        cls = self._resolve(
             "scheduler",
             SchedulerMetricsCollector,
+            stat_loggers={"scheduler": MyScheduler},
         )
         self.assertIs(cls, MyScheduler)
 

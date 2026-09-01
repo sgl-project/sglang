@@ -27,6 +27,7 @@ from sglang.srt.configs import (
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
+    Dots3Config,
     DotsOCRConfig,
     DotsVLMConfig,
     ExaoneConfig,
@@ -48,6 +49,7 @@ from sglang.srt.configs import (
     LagunaConfig,
     LocateAnythingConfig,
     LongcatFlashConfig,
+    MiniCPMHybridConfig,
     MiniCPMV4_6Config,
     MiniCPMV4_6VisionConfig,
     MiniMaxM3VLConfig,
@@ -64,6 +66,7 @@ from sglang.srt.configs import (
     Qwen3_5MoeTextConfig,
     Qwen3_5TextConfig,
     Qwen3NextConfig,
+    Spark2_5Config,
     Step3p5Config,
     Step3p7Config,
     Step3VLConfig,
@@ -100,6 +103,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         LocateAnythingConfig,
         InternVLChatConfig,
         LagunaConfig,
+        Spark2_5Config,
         Step3VLConfig,
         LongcatFlashConfig,
         Olmo3Config,
@@ -112,6 +116,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         GraniteMoeHybridConfig,
         DotsVLMConfig,
         DotsOCRConfig,
+        Dots3Config,
         NemotronH_Nano_VL_V2_Config,
         NemotronH_Nano_Omni_Reasoning_V3_Config,
         NemotronHConfig,
@@ -129,6 +134,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         KimiK25Config,
         Step3p5Config,
         Step3p7Config,
+        MiniCPMHybridConfig,
         MiniCPMV4_6Config,
         MiniCPMV4_6VisionConfig,
         InklingModelConfig,
@@ -138,6 +144,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         MiniMaxM3VLConfig,
     ]
 }
+
 
 # DeepSeek V3.2 / V4 reuse the V3 config schema. Subclass the upstream
 # transformers class with each model_type so AutoConfig.register passes its

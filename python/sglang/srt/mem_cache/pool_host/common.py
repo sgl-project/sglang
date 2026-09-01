@@ -7,9 +7,13 @@ from collections import defaultdict
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+from sglang.srt.runtime_context import get_memory
 
 logger = logging.getLogger(__name__)
+
+_CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
 
 
 class HostTensorAllocator:
@@ -99,14 +103,14 @@ def get_allocator_from_storage(allocator_type):
         return HostTensorAllocator()
 
 
-def get_allocator_type(server_args) -> str:
-    backend = getattr(server_args, "hicache_storage_backend", None)
+def get_allocator_type() -> str:
+    """The host-allocator kind the published HiCache configuration asks for."""
+
+    backend = get_memory().hicache_storage_backend
     if backend == "shm":
         return "shm"
     if backend == "dynamic":
-        extra_config_str = getattr(
-            server_args, "hicache_storage_backend_extra_config", None
-        )
+        extra_config_str = get_memory().hicache_storage_backend_extra_config
         if extra_config_str:
             try:
                 config = json.loads(extra_config_str)
@@ -117,30 +121,101 @@ def get_allocator_type(server_args) -> str:
     return backend or "default"
 
 
-def _cuda_host_register(buffer: torch.Tensor) -> None:
+def _cuda_host_register(
+    buffer: torch.Tensor, registration_granularity_bytes: int | None = None
+) -> None:
+    # Avoid oversized cudaHostRegister calls on large host pools.
     cudart = torch.cuda.cudart()
-    n_bytes = buffer.numel() * buffer.element_size()
-    rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
-    if int(rc) != 0:
-        raise RuntimeError(
-            f"cudaHostRegister failed (rc={int(rc)}, "
-            f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
-            f"size={n_bytes}; host buffer is not pinned and device transfers "
-            f"may silently return stale data."
+    base = buffer.data_ptr()
+    total = buffer.numel() * buffer.element_size()
+    chunk_limit_bytes = (
+        max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
+    )
+    # Preserve the legacy single-call behavior unless the caller provides a
+    # copy granularity. Splitting an unknown page-first layout at an arbitrary
+    # byte offset can make one cudaMemcpyBatchAsync span two registrations.
+    chunk_bytes = total
+    if registration_granularity_bytes is not None:
+        if registration_granularity_bytes <= 0:
+            raise ValueError(
+                "registration_granularity_bytes must be positive, got "
+                f"{registration_granularity_bytes}"
+            )
+        if registration_granularity_bytes > chunk_limit_bytes:
+            raise ValueError(
+                "Host registration granularity exceeds the configured chunk limit: "
+                f"granularity={registration_granularity_bytes}, "
+                f"chunk_limit={chunk_limit_bytes}"
+            )
+        chunk_bytes = (
+            chunk_limit_bytes // registration_granularity_bytes
+        ) * registration_granularity_bytes
+    registered_ranges: list[tuple[int, int]] = []
+    try:
+        offset = 0
+        while offset < total:
+            size = min(chunk_bytes, total - offset)
+            ptr = base + offset
+            rc = int(cudart.cudaHostRegister(ptr, size, 0))
+            if rc != 0:
+                raise RuntimeError(
+                    f"cudaHostRegister failed (rc={rc}, "
+                    f"{cudart.cudaGetErrorString(rc)}) at offset={offset} size={size} "
+                    f"(total={total}, chunk_limit={chunk_bytes}); host buffer is not "
+                    f"pinned and device transfers may silently return stale data."
+                )
+            registered_ranges.append((ptr, size))
+            offset += size
+
+        # Keep the exact registration bases alive with the tensor. CUDA requires
+        # cudaHostUnregister to receive each base pointer, not just the tensor's
+        # original base once after several independent registrations.
+        setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, registered_ranges)
+    except Exception:
+        remaining_ranges = _cuda_host_unregister_ranges(
+            cudart, registered_ranges, operation="registration rollback"
         )
+        if remaining_ranges:
+            setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
+        raise
+
+
+def _cuda_host_unregister_ranges(
+    cudart, registered_ranges: list[tuple[int, int]], *, operation: str
+) -> list[tuple[int, int]]:
+    failed_ranges = []
+    for ptr, size in reversed(registered_ranges):
+        rc = int(cudart.cudaHostUnregister(ptr))
+        if rc != 0:
+            failed_ranges.append((ptr, size))
+            logger.warning(
+                "cudaHostUnregister failed during %s (rc=%d, %s) "
+                "for ptr=%#x size=%d",
+                operation,
+                rc,
+                cudart.cudaGetErrorString(rc),
+                ptr,
+                size,
+            )
+    failed_ranges.reverse()
+    return failed_ranges
 
 
 def _cuda_host_unregister(buffer: torch.Tensor) -> None:
     cudart = torch.cuda.cudart()
-    rc = cudart.cudaHostUnregister(buffer.data_ptr())
-    if int(rc) != 0:
-        # Best-effort on shutdown: warn, don't raise -- a leak is reclaimed at exit.
-        logger.warning(
-            "cudaHostUnregister failed (rc=%d, %s) for ptr=%#x",
-            int(rc),
-            cudart.cudaGetErrorString(rc),
-            buffer.data_ptr(),
-        )
+    registered_ranges = getattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, None)
+    if registered_ranges is None:
+        # Compatibility for buffers registered before range metadata was added.
+        registered_ranges = [
+            (buffer.data_ptr(), buffer.numel() * buffer.element_size())
+        ]
+    if not registered_ranges:
+        return
+
+    remaining_ranges = _cuda_host_unregister_ranges(
+        cudart, registered_ranges, operation="host-pool destroy"
+    )
+    setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
 
 
 def alloc_with_host_register(
@@ -149,6 +224,7 @@ def alloc_with_host_register(
     device: str,
     pin_memory: bool,
     allocator: HostTensorAllocator,
+    registration_granularity_bytes: int | None = None,
 ) -> torch.Tensor:
     """
     Allocate tensor and register host memory with cudaHostRegister.
@@ -156,7 +232,7 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        _cuda_host_register(buffer)
+        _cuda_host_register(buffer, registration_granularity_bytes)
     return buffer
 
 
@@ -166,6 +242,7 @@ def alloc_with_pin_memory(
     device: str,
     pin_memory: bool,
     allocator: None,
+    registration_granularity_bytes: int | None = None,
 ) -> torch.Tensor:
     """
     Allocate tensor using PyTorch's built-in pin_memory flag.
