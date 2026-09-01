@@ -653,8 +653,18 @@ export const benchmarks = [
     accuracy: { mmmu_pro_pct: 75.14 },
     notes: "MMMU-Pro (standard, 10-option) measured with sgl-eval on 4×B200 (TP=4) at temperature 1.0, top-p 0.95, --reasoning-effort max, with the bundled DSpark head enabled (--speculative-algorithm DSPARK).",
   },
-  { match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
-  { match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" } },
+  {
+    match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
+    sglang_version: "PR #37253 @ 31854c3",
+    accuracy: { mmmu_pro_pct: 74.10 },
+    notes: "MMMU-Pro (standard, 10-option) measured with sgl-eval on 4×B200 (TP=4, DP=4, DeepEP) at temperature 1.0, top-p 0.95, --reasoning-effort max; target-only (DP Attention is incompatible with DSpark).",
+  },
+  {
+    match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "PR #37253 @ 31854c3",
+    accuracy: { mmmu_pro_pct: 73.76 },
+    notes: "MMMU-Pro (standard, 10-option) measured with sgl-eval on 4×B200 (TP=4, DP=4, MegaMoE) at temperature 1.0, top-p 0.95, --reasoning-effort max; target-only (DP Attention is incompatible with DSpark).",
+  },
   // B300 / GB200 / GB300 / H200 / H100 — Flash Vision (Exp), all pending
   { match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" } },
   { match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" } },
