@@ -74,8 +74,6 @@ class ExpertPackConfig(GGUFConfig):
 
 
 class ExpertPackMoEMethod(FusedMoEMethodBase):
-    fuses_routed_scale_and_shared_add = True
-
     def __init__(self, store: ExpertPackStore, prefix: str) -> None:
         self.store = store
         self.prefix = prefix
