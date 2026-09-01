@@ -435,6 +435,91 @@ class TestGetDcpLens(CustomTestCase):
         self.assertEqual(dcp4_allocator.page_size, 256)
         self.assertEqual(dcp4_allocator.num_pages, 16)
 
+    def test_dsv4_pool_builder_uses_safe_attention_dcp_values(self):
+        class StrictParallel:
+            def __init__(self, size: int, rank: int):
+                self.attn_dcp_size = size
+                self.attn_dcp_rank = rank
+
+            @property
+            def dcp_size(self):
+                raise AssertionError("raw DCP size requires an initialized group")
+
+            @property
+            def dcp_rank(self):
+                raise AssertionError("raw DCP rank requires an initialized group")
+
+        configurator = SimpleNamespace(
+            is_draft_worker=False,
+            layer_info=SimpleNamespace(
+                num_effective_layers=2,
+                start_layer=0,
+                end_layer=2,
+            ),
+            model_config=SimpleNamespace(
+                compress_ratios=[0, 128],
+                window_size=128,
+                qk_nope_head_dim=128,
+                qk_rope_head_dim=64,
+                index_head_dim=128,
+            ),
+            kv_cache_dtype=torch.bfloat16,
+            device="cpu",
+            server_args=SimpleNamespace(max_speculative_num_draft_tokens=None),
+        )
+        req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.empty((7, 16), dtype=torch.int64)
+        )
+
+        captured = {}
+
+        def fake_pool(**kwargs):
+            captured.update(kwargs)
+            return captured
+
+        module = "sglang.srt.mem_cache.kv_cache_configurator"
+        with (
+            patch(f"{module}._is_npu", False),
+            patch(f"{module}.DeepSeekV4TokenToKVPool", new=fake_pool),
+            patch(
+                f"{module}.get_schedule",
+                return_value=SimpleNamespace(page_size=256),
+            ),
+            patch(
+                f"{module}.get_exec",
+                return_value=SimpleNamespace(
+                    features=SimpleNamespace(enable_memory_saver=False)
+                ),
+            ),
+            patch(
+                f"{module}.get_memory",
+                return_value=SimpleNamespace(enable_hisparse=False),
+            ),
+        ):
+            for size, rank in ((1, 0), (8, 3)):
+                captured.clear()
+                with patch(
+                    f"{module}.get_parallel",
+                    return_value=StrictParallel(size, rank),
+                ):
+                    result = KVCacheConfigurator._build_dsv4_kv_pool(
+                        configurator,
+                        max_running_requests=4,
+                        swa_max_total_num_tokens=1024,
+                        c4_max_total_num_tokens=256,
+                        c128_max_total_num_tokens=256,
+                        c4_state_pool_size=16,
+                        c128_state_pool_size=16,
+                        c4_state_dtype=torch.float32,
+                        c128_state_dtype=torch.float32,
+                        req_to_token_pool=req_to_token_pool,
+                    )
+
+                self.assertIs(result, captured)
+                self.assertEqual(captured["dcp_size"], size)
+                self.assertEqual(captured["dcp_rank"], rank)
+                self.assertEqual(captured["num_req_slots"], 7)
+
     def test_live_cell_and_page_ownership_formulas(self):
         dcp_size = 4
         physical_page_size = 64

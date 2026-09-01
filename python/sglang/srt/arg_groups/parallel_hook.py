@@ -151,12 +151,69 @@ def handle_dcp_validation(server_args: Any):
     if cfg.dcp_replicate_q_proj:
         if cfg.dcp_size <= 1:
             raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
-        if cfg.dcp_comm_backend not in ("a2a", "fi_a2a"):
+        if cfg.dcp_comm_backend not in ("a2a", "fi_a2a") and not get_platform().is_hip:
             raise ValueError(
                 "--dcp-replicate-q-proj only applies to the a2a/fi_a2a DCP "
                 "communication backend (it removes the head-dim Q all-gather); "
-                f"got --dcp-comm-backend={cfg.dcp_comm_backend}."
+                f"got --dcp-comm-backend={cfg.dcp_comm_backend}. On AMD HIP the "
+                "DeepSeek-V4 DCP decode path merges through its own _decode_dcp "
+                "helper, so any dcp_comm_backend is accepted."
             )
+
+    if cfg.dcp_size > 1:
+        if cfg.tp_size % cfg.dcp_size != 0:
+            raise ValueError(
+                "Decode context parallel requires --dcp-size to divide "
+                f"--tp-size, but got dcp_size={cfg.dcp_size}, "
+                f"tp_size={cfg.tp_size}."
+            )
+        if get_platform().is_hip:
+            _handle_dsv4_dcp_validation(cfg)
+
+
+def _handle_dsv4_dcp_validation(cfg: Any) -> None:
+    """Fail fast on DeepSeek-V4 DCP configurations that would silently misbehave.
+
+    The V4 decode-CP path is implemented entirely on the HIP unified_kv backend
+    (deepseek_v4_backend_hip_radix._decode_dcp) and is driven by environment
+    variables rather than server args, so a typo or a missing companion flag
+    otherwise degrades into wrong numbers instead of an error.
+    """
+
+    def _on(name: str, default: str = "0") -> bool:
+        return os.environ.get(name, default) not in ("0", "", "false", "False")
+
+    if cfg.attention_backend != "dsv4":
+        return
+
+    if os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND") != "unified_kv_triton":
+        raise ValueError(
+            "DeepSeek-V4 decode context parallel (--dcp-size > 1 with "
+            "--attention-backend dsv4) is only implemented on the unified_kv "
+            "path; set SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton. Got "
+            f"{os.environ.get('SGLANG_HACK_FLASHMLA_BACKEND')!r}."
+        )
+
+    physical = _on("SGLANG_DSV4_DCP_PHYSICAL")
+    if physical and cfg.disaggregation_mode != "null":
+        # Only the mori backend implements the compressed-row transfer plan that
+        # a sharded decode pool needs. Any other transfer backend would write
+        # full-layout rows into a 1/dcp buffer.
+        if cfg.disaggregation_transfer_backend != "mori":
+            raise ValueError(
+                "SGLANG_DSV4_DCP_PHYSICAL=1 shards the decode KV pool, so the "
+                "PD transfer layer must scatter rows to their owning decode "
+                "rank. Only --disaggregation-transfer-backend mori implements "
+                f"this; got {cfg.disaggregation_transfer_backend!r}."
+            )
+
+    if _on("SGLANG_DSV4_DCP_INDEXER_SCORING") and _on("SGLANG_DSV4_DCP_INDEXER_TOPK"):
+        raise ValueError(
+            "SGLANG_DSV4_DCP_INDEXER_SCORING already shards the top-k selection "
+            "(it selects over this rank's candidate shard), so "
+            "SGLANG_DSV4_DCP_INDEXER_TOPK must not also be set -- the two would "
+            "shard the candidate axis twice."
+        )
 
 
 def handle_data_parallelism(server_args: Any):

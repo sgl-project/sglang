@@ -1311,6 +1311,12 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            # NOTE(rebase of #29185): the original call site passed
+            # ModelRunner.dcp_size/dcp_rank, which are valid for both DCP=1 and
+            # DCP>1. The attention accessors preserve that contract when the
+            # DCP group is intentionally absent at world size one.
+            dcp_size=get_parallel().attn_dcp_size,
+            dcp_rank=get_parallel().attn_dcp_rank,
         )
         return token_to_kv_pool
 
