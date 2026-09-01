@@ -99,7 +99,7 @@ run_mode() {
       --chunked-prefill-size 2048 \
       --disable-radix-cache \
       --max-running-requests 8 \
-      --cuda-graph-max-bs 8 \
+      --cuda-graph-max-bs-decode 8 \
       --mamba-ssm-dtype bfloat16 \
       --reasoning-parser qwen3 \
       --port "$port" \

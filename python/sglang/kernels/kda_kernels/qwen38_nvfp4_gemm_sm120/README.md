@@ -37,9 +37,11 @@ throughput from 128.35 to 129.60 token/s.
 
 ## Multi-model SM120 validation
 
-The added Qwen3.5 shapes were validated on an NVIDIA RTX PRO 6000 Blackwell
-Server Edition with `lmsysorg/sglang:dev-qwen38-27b-dflash2`. The pinned
-ModelOpt checkpoints were:
+The added Qwen3.5 shapes were revalidated on an NVIDIA RTX PRO 6000 Blackwell
+Server Edition with PyTorch `2.13.0+cu130` and `flashinfer-python==0.6.18`.
+Stale FlashInfer 0.6.17 cubin and JIT-cache packages were removed rather than
+bypassing FlashInfer's package-version guard. The pinned ModelOpt checkpoints
+were:
 
 - `AxionML/Qwen3.5-4B-NVFP4` at
   `4521f321dc8c46d255929203ae6d3062e51d52fa`
@@ -48,27 +50,26 @@ ModelOpt checkpoints were:
 
 The kernel benchmark rotates through eight distinct weights in a CUDA Graph,
 alternates FlashInfer and KDA timing order across five trials, and reports the
-median per-call latency. All twelve M=1/M=9 rows passed the FlashInfer
-correctness gate (`rtol=1e-2`, `atol=2e-2`). The twelve added Qwen3.5
-M=2/M=4/M=8 rows passed the same gate.
+median per-call latency. All 20 Qwen3.5 rows (two models, two MLP roles, and
+M in {1, 2, 4, 8, 9}) passed the FlashInfer correctness gate (`rtol=1e-2`,
+`atol=2e-2`).
 
 | Model shape | M | Gate/up speedup | Down speedup |
 |---|---:|---:|---:|
-| Qwen3.5-4B | 1 | 1.049x | 2.027x |
-| Qwen3.5-4B | 2 | 1.078x | 2.024x |
-| Qwen3.5-4B | 4 | 1.095x | 2.028x |
-| Qwen3.5-4B | 8 | 1.079x | 2.045x |
-| Qwen3.5-4B | 9 | 1.027x | 2.028x |
-| Qwen3.5-9B | 1 | 1.140x | 1.267x |
-| Qwen3.5-9B | 2 | 1.154x | 1.260x |
-| Qwen3.5-9B | 4 | 1.157x | 1.249x |
-| Qwen3.5-9B | 8 | 1.146x | 1.251x |
-| Qwen3.5-9B | 9 | 1.126x | 1.271x |
-| Qwen3.6/3.8-27B | 1 | 1.027x | 1.189x |
-| Qwen3.6/3.8-27B | 9 | 1.025x | 1.188x |
+| Qwen3.5-4B | 1 | 1.052x | 2.023x |
+| Qwen3.5-4B | 2 | 1.031x | 2.024x |
+| Qwen3.5-4B | 4 | 1.055x | 2.026x |
+| Qwen3.5-4B | 8 | 1.052x | 2.047x |
+| Qwen3.5-4B | 9 | 1.027x | 2.039x |
+| Qwen3.5-9B | 1 | 1.135x | 1.258x |
+| Qwen3.5-9B | 2 | 1.134x | 1.259x |
+| Qwen3.5-9B | 4 | 1.139x | 1.251x |
+| Qwen3.5-9B | 8 | 1.132x | 1.252x |
+| Qwen3.5-9B | 9 | 1.124x | 1.262x |
 
-The geometric-mean speedup is 1.243x for the original twelve M=1/M=9 rows,
-1.336x for the twelve added M=2/M=4/M=8 rows, and 1.288x across all 24 rows.
+The geometric-mean speedup is 1.319x across the 16 production-dispatched
+M=1/M=2/M=4/M=8 rows and 1.318x across all 20 rows. M=9 remains available
+through the low-level API but is not production-dispatched for Qwen3.5.
 
 End-to-end serving used 32 fixed-seed `random-ids` requests per round, 2048
 input tokens, 512 output tokens, concurrency in {1, 2, 4, 8}, and a cache flush
@@ -79,18 +80,19 @@ enabled only through
 
 | Model | Concurrency | Baseline tok/s | KDA tok/s | Adjacent baseline | Throughput | TPOT | E2E latency |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Qwen3.5-4B | 1 | 274.666 | 288.600 | 273.721 | +5.07% | +4.99% | +4.83% |
-| Qwen3.5-4B | 2 | 534.445 | 555.677 | 534.087 | +3.97% | +3.98% | +3.82% |
-| Qwen3.5-4B | 4 | 983.987 | 1022.559 | 985.465 | +3.92% | +3.88% | +3.77% |
-| Qwen3.5-4B | 8 | 1464.628 | 1514.990 | 1464.872 | +3.44% | +3.62% | +3.29% |
-| Qwen3.5-9B | 1 | 184.059 | 189.442 | 183.922 | +2.93% | +2.95% | +2.84% |
-| Qwen3.5-9B | 2 | 358.935 | 368.827 | 358.679 | +2.76% | +2.82% | +2.68% |
-| Qwen3.5-9B | 4 | 679.397 | 696.907 | 679.012 | +2.58% | +2.67% | +2.51% |
-| Qwen3.5-9B | 8 | 1025.235 | 1050.054 | 1025.277 | +2.42% | +2.52% | +2.34% |
+| Qwen3.5-4B | 1 | 266.218 | 289.452 | 265.647 | +8.73% | +8.31% | +8.03% |
+| Qwen3.5-4B | 2 | 522.936 | 558.694 | 522.736 | +6.84% | +6.85% | +6.41% |
+| Qwen3.5-4B | 4 | 960.507 | 1028.929 | 962.763 | +7.12% | +7.02% | +6.65% |
+| Qwen3.5-4B | 8 | 1427.207 | 1520.322 | 1427.246 | +6.52% | +6.63% | +6.10% |
+| Qwen3.5-9B | 1 | 184.624 | 190.493 | 184.476 | +3.18% | +3.19% | +3.08% |
+| Qwen3.5-9B | 2 | 359.919 | 369.908 | 360.482 | +2.78% | +2.82% | +2.71% |
+| Qwen3.5-9B | 4 | 678.651 | 697.802 | 680.757 | +2.82% | +2.81% | +2.74% |
+| Qwen3.5-9B | 8 | 1022.864 | 1050.453 | 1024.721 | +2.70% | +2.78% | +2.62% |
 
-The candidate server logs must contain the KDA fast-path message; the E2E
-runner treats a missing dispatch as a failure. The adjacent baselines reproduce
-the original throughput means within 0.35%, which bounds run-order drift.
-Qwen3.5-9B TTFT changes by -0.81% to +1.46% across the sweep, while its TPOT
+Every formal round completed all 32 requests (65,536 input and 16,384 output
+tokens). The candidate server logs must contain the KDA fast-path message; the
+E2E runner treats a missing dispatch as a failure. The adjacent baselines
+reproduce the original throughput means within 0.32%, which bounds run-order
+drift. TTFT changes range from -1.93% to +3.57% across both models, while TPOT
 and total E2E latency improve at every concurrency, consistent with a
 decode-focused kernel.
