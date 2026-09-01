@@ -39,19 +39,33 @@ def _validate_input_dtypes(
     q_rope: torch.Tensor,
     kv: torch.Tensor,
 ) -> bool:
-    """Validate the common sparse-MLA dtype contract and return ``is_fp8``."""
-    dtype = q_nope.dtype
-    if q_rope.dtype != dtype or kv.dtype != dtype:
+    """Validate sparse-MLA dtypes and return whether the dot path is FP8.
+
+    MI300X produces BF16 queries with an FP8 FNUZ KV cache. The kernels cast
+    query fragments to the KV element type while loading them, so this mixed
+    input avoids separate query-conversion kernels and still uses FP8 MFMA.
+    """
+    q_dtype = q_nope.dtype
+    kv_dtype = kv.dtype
+    if q_rope.dtype != q_dtype:
         raise ValueError(
-            "Triton sparse MLA requires q_nope, q_rope, and kv to have the "
-            f"same dtype; got {dtype}, {q_rope.dtype}, and {kv.dtype}."
+            "Triton sparse MLA requires q_nope and q_rope to have the same "
+            f"dtype; got {q_dtype} and {q_rope.dtype}."
         )
-    if dtype not in _SUPPORTED_INPUT_DTYPES:
+    if (
+        q_dtype not in _SUPPORTED_INPUT_DTYPES
+        or kv_dtype not in _SUPPORTED_INPUT_DTYPES
+    ):
         raise ValueError(
-            "Triton sparse MLA supports bfloat16 and float8_e4m3 inputs; "
-            f"got {dtype}."
+            "Triton sparse MLA supports bfloat16 and float8_e4m3 query/KV "
+            f"inputs; got query dtype {q_dtype} and KV dtype {kv_dtype}."
         )
-    return dtype != torch.bfloat16
+    if q_dtype != torch.bfloat16 and q_dtype != kv_dtype:
+        raise ValueError(
+            "Triton sparse MLA requires FP8 queries to match the KV dtype; "
+            f"got query dtype {q_dtype} and KV dtype {kv_dtype}."
+        )
+    return kv_dtype != torch.bfloat16
 
 
 @functools.lru_cache(maxsize=None)
@@ -280,7 +294,7 @@ def _sparse_mla_fwd_split_dim_kernel(
     if NUM_GROUPS >= 4:
         acc3 = tl.zeros([H, _G], tl.float32)
 
-    input_type = q_nope_ptr.dtype.element_ty
+    input_type = kv_ptr.dtype.element_ty
     if IS_FP8:
         p_dot_scale = 1.0 / fp8_max
     else:
@@ -529,7 +543,7 @@ def _sparse_mla_fused_kernel(
     dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
-    input_type = q_nope_ptr.dtype.element_ty
+    input_type = kv_ptr.dtype.element_ty
     if IS_FP8:
         p_dot_scale = 1.0 / fp8_max
     else:
@@ -711,7 +725,7 @@ def _sparse_mla_split_k_kernel(
     dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
-    input_type = q_nope_ptr.dtype.element_ty
+    input_type = kv_ptr.dtype.element_ty
     if IS_FP8:
         p_dot_scale = 1.0 / fp8_max
     else:

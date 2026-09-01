@@ -139,7 +139,7 @@ def _sparse_mla_decode_fused_kernel(
     dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
-    input_type = q_nope_ptr.dtype.element_ty
+    input_type = kv_ptr.dtype.element_ty
     if IS_FP8:
         p_dot_scale = 1.0 / fp8_max
     else:
@@ -336,7 +336,7 @@ def _sparse_mla_decode_split_kernel(
     dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
-    input_type = q_nope_ptr.dtype.element_ty
+    input_type = kv_ptr.dtype.element_ty
     if IS_FP8:
         p_dot_scale = 1.0 / fp8_max
     else:
