@@ -24,6 +24,7 @@ framework-specific optimization workflow.
 - `python/sglang/kernels/ops/diffusion/norm/native_bf16_rmsnorm_triton.py`
 - `python/sglang/kernels/ops/diffusion/norm/zimage_qk_rmsnorm_triton.py`
 - `python/sglang/kernels/ops/diffusion/rope/rotary_triton.py`
+- `python/sglang/kernels/ops/diffusion/rope/helios_qk_rope_jit.py`
 - `python/sglang/kernels/ops/diffusion/rope/ltx2_rotary_triton.py`
 - `python/sglang/kernels/ops/diffusion/rope/ltx2_qknorm_split_rope_jit.py`
 - `python/sglang/kernels/ops/diffusion/sites/ltx2_rmsnorm_modulate_site.py`
@@ -76,6 +77,10 @@ framework-specific optimization workflow.
 - Locations: `elementwise.py`, `layernorm.py`, `fused_scale_shift_gate.py`, `qwen_image.py`, `triton/scale_shift.py`
 - Use cases: `x * (1 + scale) + shift`, `a * (k + b) + c`, and Qwen-style `(layernorm/residual layernorm) + scale/shift + gate select`.
 - Constraints: `x` must be CUDA and contiguous. `scale/shift` support 0D/1D/2D/3D/4D broadcast. 4D `[B, F, 1, C]` requires `L % F == 0`.
+- Causal-video cold start: the 4D path uses a static capped power-of-two
+  column tile rather than Triton autotuning. Do not reintroduce request-time
+  autotuning here: LingBot-World calls this path once per transformer block,
+  and tuning overhead can dominate its first denoise step.
 - NPU fallback: `scale_shift.py` swaps to `npu_fallback` native path.
 - Validation: `test/registered/kernels/ops/diffusion/test_qwen_image_modulation.py`.
 
@@ -118,8 +123,10 @@ framework-specific optimization workflow.
   fusions and decode-scoped VAE rewrites. Mounting is all-or-nothing per
   transformer/fusion family; VAE gates reset after every decode.
 - Current families include FLUX affine-folded LN+modulate / fused GELU sites,
-  GLM-Image fused GELU sites, generic KL VAE decoder rewrites used by
-  FLUX.1/FLUX.2/Z-Image/SD3, and Wan VAE RMSNorm+SiLU.
+  GLM/Qwen/Hunyuan/LTX fused GELU sites, LTX RMSNorm+modulate, Hunyuan QK
+  RMSNorm, Ideogram gated RMSNorm, SANA-Video linear attention, generic KL VAE
+  decoder rewrites used by FLUX.1/FLUX.2/Z-Image/SD3, and Wan VAE
+  RMSNorm+SiLU.
 - Do not confuse request `--quality` with `--output-quality`, which controls
   output-file compression rather than model math.
 - Validation: `test_quality_gate.py`, `test_fused_ln_modulate.py`,
@@ -168,15 +175,15 @@ framework-specific optimization workflow.
 - Constraints: `cos` and `sin` shapes must match `[B, H, S, head_dim / 2]`, and `inner_dim == H * head_dim`.
 - Workflow rule: if LTX-2 traces show a large split-RoPE PyTorch chain, check whether the LTX2-specific Triton path was disabled by shape or dtype before proposing a new RoPE kernel.
 
-10. LTX2 residual-gate add fusion
+10. Shared residual-gate add fusion (LTX2, LongCat-Image, SANA, and SANA-Video)
 - Kernel: `diffusion_residual_gate_add`
-- Locations: `diffusion/residual_gate_add.py`, `csrc/diffusion/residual_gate_add.cuh`, `runtime/models/dits/ltx_2.py`
-- Use case: `residual + update * gate` in LTX2 self-attention, prompt cross-attention, audio/video cross-attention, and feed-forward residual updates.
-- Constraints: `residual`, `update`, and `gate` must be CUDA tensors on the same device, contiguous, same dtype (`fp16`, `bf16`, or `fp32`), with `update.shape == residual.shape`; `gate` can match `residual` or be row-broadcast with the last dimension matching.
-- Behavior: LTX2 calls `residual_gate_add(...)` from the kernels package directly. The CUDA custom op is used while guards pass. On a runtime exception outside `torch.compile`, it logs once, disables the fast path for the process, and falls back to `residual + update * gate`.
-- Validation: `test/registered/kernels/ops/diffusion/test_residual_gate_add.py`.
+- Locations: `kernels/ops/diffusion/modulate/residual_gate_add_jit.py`, `kernels/jit/csrc/diffusion/residual_gate_add.cuh`, `runtime/models/dits/ltx_2.py`, `runtime/models/dits/longcat_image.py`, `runtime/models/dits/sana.py`, and `runtime/models/dits/sana_video.py`.
+- Use case: `residual + update * gate` in LTX2 attention/MLP residuals, LongCat-Image joint- and single-stream transformer residuals, and SANA/SANA-Video transformer blocks.
+- Constraints: inputs must be same-device CUDA tensors with one dtype (`fp16`, `bf16`, or `fp32`) and `update.shape == residual.shape`. The ordinary path accepts contiguous inputs and a full or row-broadcast gate. The SANA-Video path also accepts a transposed-dense 3D residual (`stride == (tokens * hidden, 1, tokens)`), a contiguous update, and a contiguous `[1, 1, hidden]` gate; it preserves the residual stride in its output.
+- Behavior: model code calls `residual_gate_add(...)` directly. The CUDA custom op is used while guards pass. On a runtime exception outside `torch.compile`, it logs once, disables the fast path for that device/dtype, and falls back to `residual + update * gate`.
+- Validation: `test/registered/kernels/ops/diffusion/test_modulate.py`, `python/sglang/multimodal_gen/test/unit/test_longcat_image_residual_gate.py`.
 - Microbench: `test/registered/kernels/benchmark/diffusion/bench_residual_gate_add.py`.
-- Workflow rule: if LTX2 traces show repeated elementwise `mul` + `add` ladders around attention or MLP residuals, check whether this existing CUDA path was disabled by shape, dtype, contiguity, or a prior runtime failure before proposing another elementwise fusion.
+- Workflow rule: if LTX2, LongCat-Image, or SANA traces show repeated elementwise `mul` + `add` ladders around attention or MLP residuals, inspect input strides and check whether this existing CUDA path was disabled by shape, dtype, layout, or a prior runtime failure before proposing another elementwise fusion. For a transposed residual plus contiguous update, do not force `.contiguous()`; the tiled path is designed to fuse the mixed-layout access.
 
 11. MiniMax-H3 indexed AdaLN modulation and gated residual fusion
 - Kernels: `indexed_scale_shift_bf16_`, `indexed_gate_bf16_`
@@ -214,6 +221,30 @@ framework-specific optimization workflow.
   replacements and run independently of the `quality=high` Wan RMSNorm+SiLU
   path. Unsupported layouts or padding fall back to the aten chain.
 - Validation: `test/registered/kernels/ops/diffusion/test_wan_causal_cache.py`.
+
+15. Helios paired transposed RoPE
+- Kernel: `fused_inplace_helios_qk_rope`.
+- Locations: `rope/helios_qk_rope_jit.py`,
+  `csrc/diffusion/helios_qk_rope.cuh`, and
+  `runtime/models/dits/helios.py`.
+- Use case: apply Helios' transposed fp32 frequency table to already-normalized
+  contiguous Q/K together, in place, instead of launching the eager
+  unflatten/chunk/multiply/add/stack chain twice per attention block.
+- Constraints: CUDA fp16/bf16 Q/K with matching contiguous `[B, S, H, D]`
+  layouts, contiguous fp32 frequencies shaped `[B, S, 2 * D]`, even `D`, and
+  pair-aligned Q/K pointers. Tensor-parallel RMSNorm keeps the eager path.
+  Current real-model validation covers one H100; it is not a multi-GPU scaling
+  claim.
+- Numerical contract: explicit round-to-nearest fp32 operations reproduce the
+  eager elementwise rounding boundaries before the result is cast back to the
+  activation dtype. Correctness tests require `torch.equal`, including the
+  production `[8640, 40, 128]` shape.
+- Validation: `test/registered/kernels/ops/diffusion/test_helios_qk_rope.py`.
+- Microbench:
+  `test/registered/kernels/benchmark/diffusion/bench_helios_qk_rope.py`.
+- Workflow rule: if a Helios trace still shows two transposed-RoPE elementwise
+  ladders per block, check TP mode, dtype, shape, contiguity, and pointer
+  alignment before proposing another RoPE kernel.
 
 **Faster CUDA Kernel Usage Points**
 
@@ -295,6 +326,20 @@ framework-specific optimization workflow.
 - Scope: this is a mainline SANA model fast path. Query projection in cross-attention remains separate because it uses denoising hidden states, while K/V share step-invariant encoder hidden states.
 - Workflow rule: if a SANA trace shows separate self-attention `to_q`, `to_k`, `to_v` GEMMs, or separate cross-attention `to_k` and `to_v` GEMMs, treat that as a regressed existing packed-projection path before proposing a new GEMM fusion.
 
+**Request-Scoped DiT Fusions with Breakable CUDA Graphs**
+
+- `quality=high` DiT sites are mounted at a request boundary. BCG warmup uses
+  the model's lossless sampling default unless a quality-aware graph variant
+  was captured explicitly.
+- A graph captured before the high-quality mount retains the lossless module
+  branches. Replaying it after the mount silently bypasses the requested high
+  kernels even when the tensor signature matches.
+- Workflow rule: a high+BCG cell is valid only when the model has no
+  request-scoped DiT quality sites, or when logs prove those sites were mounted
+  before the matching graph capture. A mount after `[Diffusion BCG] captured`
+  invalidates the row; do not use its latency or output as high-quality
+  evidence.
+
 **Recent Model Audit Boundaries**
 
 - LongCat-Image supports breakable CUDA graph at fixed, captured resolutions.
@@ -318,7 +363,10 @@ framework-specific optimization workflow.
 - LingBot Video MoE's router implements sigmoid+bias grouped top-k in
   `multimodal_gen/runtime/layers/moe.py`. Check parameter and output-order
   compatibility with `srt/layers/moe/topk.py::biased_grouped_topk` before
-  writing a new router kernel.
+  writing a new router kernel. Its released eager path still expands RMSNorm
+  into `pow/mean/rsqrt` chains. #35969 is a measured `quality=high` candidate
+  that dispatches existing Triton row kernels by weight dtype and hidden size;
+  it is not current-main behavior until the PR merges.
 - LTX-2.5 reuses the mature LTX-2 DiT paths. Treat the optional diffusion
   decoder separately: confirm NATTEN `na3d` is active, then inspect its
   per-block 3D RoPE construction and split QKV/SwiGLU projections.
@@ -352,9 +400,10 @@ framework-specific optimization workflow.
   `QualityGatedFusion`, not a first-sight `BitExactFusionGate` — the fused
   kernel is <=1 ULP off aten, so it is request-gated instead of verified),
   wired at the six `LTX2TransformerBlock` adaLN sites in `ltx_2.py`.
-- LTX2 residual-gate add: `ltx_2.py` calls `residual_gate_add` from
+- Shared residual-gate add: `ltx_2.py`, `sana.py`, and `sana_video.py` call `residual_gate_add` from
   `kernels/ops/diffusion/modulate/residual_gate_add_jit.py` directly for attention,
-  cross-attention, and MLP residual updates.
+  cross-attention, and MLP residual updates; SANA-Video's transposed residual
+  uses the mixed-layout tiled kernel without an intermediate contiguous copy.
 - Wan causal VAE: `cat_pad_channels_last_3d` and `dup_up3d_add` in
   `wanvae.py`, backed by `triton/wan_causal_cache.py`.
 - Varlen USP attention: `fused_pack_qkv` and `fused_scatter_to_padded` in `attention/layer.py`.
@@ -381,6 +430,13 @@ framework-specific optimization workflow.
   every additional served resolution in `--warmup-resolutions`, and use
   `--bcg-text-buckets` for prompt signatures. Check this path before proposing
   a second graph-capture mechanism for launch-bound traces.
+- A valid BCG benchmark must show `[Diffusion BCG] captured` and no support
+  disable, capture failure, `serving signature MISSED`, or eager-fallback
+  marker. Width and height are not the whole signature: public
+  `--warmup-resolutions` does not override a video model's synthetic warmup
+  frame count, so a short profiling request can capture the default temporal
+  shape and then miss during serving. Reject that timing instead of labeling
+  it BCG.
 - LongCat-Image uses this generic runner directly: one 1024x1024 capture covers
   short and long prompts because text conditioning is fixed at 512 tokens.
   Keep eager as the baseline because the gain is hardware-dependent; an H200
@@ -410,7 +466,10 @@ relying on any file path, flag, or claim about whether the work has merged.
   - #29361 LTX2 residual-gate CUDA fast path for `residual + update * gate`.
   - #34172 LTX2 quality-high fusion; #34305/#34314 Ideogram eager fusions.
   - #34584 Wan TI2V modulation/RoPE; #34616 FLUX2; #34617 Hunyuan;
-    #34619 GLM; #34620 ERNIE; #34928 SANA; #34932 Cosmos3.
+    #34619 GLM; #34620 ERNIE; #34928 SANA; #34932 Cosmos3; #35728
+    SANA-Video linear attention.
+  - #35961 SANA-Video lossless shared-kernel reuse and #35969 LingBot
+    `quality=high` RMSNorm are open candidates, not current-main fast paths.
 - VAE and decode-side acceleration:
   - #22531 LTX2 parallel VAE support and #20927 batched tiled VAE decode (draft).
 - Attention, communication, and runtime scheduling:
@@ -426,7 +485,8 @@ relying on any file path, flag, or claim about whether the work has merged.
   - #19516 Qwen-Image CUDA Graph.
   - #21912 Z-Image Turbo FP8 full quantization and CUDA Graph.
   - #34174 automatic default-resolution BCG warmup; #34210 Z-Image BCG
-    correctness; #34929 LTX2.3 BCG. #34618 is a closed Cosmos BCG experiment,
+    correctness; #34929 LTX2.3 BCG; #35724 LongCat-Image BCG; #35729
+    SANA-Video fixed-300-token BCG. #34618 is a closed Cosmos BCG experiment,
     not a reusable mainline fast path.
 
 **Constraints and Fallbacks**

@@ -25,13 +25,19 @@ from sglang.kernels.ops.diffusion import (
     mount_fused_linear_gelu,
     mount_fused_ln_modulate,
     mount_hunyuan_qknorm,
+    mount_lingbot_video_rmsnorm,
     mount_ltx2_rms_norm_modulate,
+    mount_nvfp4_bias_gelu,
+    mount_qwen_image_added_qkv,
     mount_sana_video_linear_attention,
     unmount_fused_gate_rmsnorm,
     unmount_fused_linear_gelu,
     unmount_fused_ln_modulate,
     unmount_hunyuan_qknorm,
+    unmount_lingbot_video_rmsnorm,
     unmount_ltx2_rms_norm_modulate,
+    unmount_nvfp4_bias_gelu,
+    unmount_qwen_image_added_qkv,
     unmount_sana_video_linear_attention,
 )
 from sglang.multimodal_gen import envs
@@ -165,6 +171,16 @@ _QUALITY_FUSION_HANDLERS: tuple[
         unmount_fused_linear_gelu,
     ),
     (
+        "Wan NVFP4 fused bias+GELU",
+        mount_nvfp4_bias_gelu,
+        unmount_nvfp4_bias_gelu,
+    ),
+    (
+        "Qwen-Image fused added-QKV",
+        mount_qwen_image_added_qkv,
+        unmount_qwen_image_added_qkv,
+    ),
+    (
         "fused LN+modulate (affine folding)",
         mount_fused_ln_modulate,
         unmount_fused_ln_modulate,
@@ -183,6 +199,11 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "HunyuanVideo strided QK RMSNorm",
         mount_hunyuan_qknorm,
         unmount_hunyuan_qknorm,
+    ),
+    (
+        "LingBot Video fused RMSNorm",
+        mount_lingbot_video_rmsnorm,
+        unmount_lingbot_video_rmsnorm,
     ),
     (
         "SANA-Video BF16-input linear attention",
@@ -501,7 +522,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 config=dit_config,
                 default="max-autotune-no-cudagraphs",
             )
-            compile_kwargs = build_torch_compile_kwargs(mode=mode)
+            compile_kwargs = build_torch_compile_kwargs(mode=mode, module=module)
             logger.info(f"Compiling transformer with mode: {mode}")
 
         if getattr(self.server_args, "regional_compile", False):
@@ -659,6 +680,19 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         mounted_fusions.add(description)
                 else:
                     unmount(transformer)
+
+        if want and mounted_fusions and self.server_args.enable_breakable_cuda_graph:
+            for transformer in filter(None, [self.transformer, self.transformer_2]):
+                for _, _, unmount in _QUALITY_FUSION_HANDLERS:
+                    unmount(transformer)
+            descriptions = ", ".join(sorted(mounted_fusions))
+            raise ValueError(
+                "quality='high' cannot be used with breakable CUDA graphs for "
+                f"this model because its request-scoped DiT fusions "
+                f"({descriptions}) do not match the lossless warmup graphs. "
+                "Disable breakable CUDA graphs or use quality='lossless'."
+            )
+
         self._quality_fusions_mounted = want
         for description in sorted(mounted_fusions):
             logger.info("Mounted %s for quality=high", description)
@@ -1203,8 +1237,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         image_kwargs = self.prepare_extra_func_kwargs(
             getattr(self.transformer, "forward", self.transformer),
             {
+                # Pass None (not []) so T2V paths whose transformer has no
+                # image_embedder skip the branch; diffusers guards on
+                # `is not None` only.
                 # TODO: make sure on-device
-                "encoder_hidden_states_image": image_embeds,
+                "encoder_hidden_states_image": image_embeds if image_embeds else None,
             },
         )
 

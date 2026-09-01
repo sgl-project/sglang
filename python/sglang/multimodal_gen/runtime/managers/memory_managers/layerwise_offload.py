@@ -463,6 +463,7 @@ class LayerwiseOffloadManager:
         self._mapped_regions = MappedRegions()
         # Store forward hooks for removal
         self._forward_hooks: List[Any] = []
+        self._last_forwarded_layer: int | None = None  # skip-compute can jump
 
         if initialize:
             self._initialize()
@@ -711,7 +712,14 @@ class LayerwiseOffloadManager:
                 contiguous_weights: List[Tuple[str, torch.Tensor, torch.Tensor]] = []
                 for name, weight in weights:
                     local_weight = self._to_local_tensor(weight)
-                    if hosting == "mapped" and self._mapped_regions.holds(local_weight):
+                    if (
+                        hosting == "mapped"
+                        and local_weight.is_contiguous()
+                        and self._mapped_regions.holds(local_weight)
+                    ):
+                        # Only a contiguous view can stay mapped: the reload
+                        # path allocates contiguous and would drop any other
+                        # layout without saying so.
                         # Already a view into the checkpoint. Copying it would
                         # add a second copy of bytes the page cache holds
                         # anyway, and that copy is what does not fit.
@@ -727,7 +735,6 @@ class LayerwiseOffloadManager:
                         self._weight_metadata[layer_idx][name] = {
                             "dtype": local_weight.dtype,
                             "shape": tuple(local_weight.shape),
-                            "stride": local_weight.stride(),
                             "preserve_strides": False,
                             "mapped": True,
                         }
@@ -866,6 +873,9 @@ class LayerwiseOffloadManager:
         """
         Prepare for the next round of denoising loop with prefetching the necessary layers
         """
+        self._last_forwarded_layer = None
+        self._release_unneeded_streamed_layers(keep=set(self._head_of_stream()))
+
         # The resident set first: it has to be there for the whole step, and the
         # caller decides whether to block on it.
         for layer_idx in sorted(self._retained_set):
@@ -916,6 +926,22 @@ class LayerwiseOffloadManager:
             self._streamed_order[(start + offset) % total]
             for offset in range(min(count, total))
         ]
+
+    def _release_unneeded_streamed_layers(self, *, keep: Set[int]) -> None:
+        """Free streamed layers that are on GPU but not in ``keep`` or resident."""
+        retain = set(self._retained_set) | keep
+        for layer_idx in list(self._gpu_layers):
+            if layer_idx not in retain:
+                self.release_layer(layer_idx)
+
+    def _release_skip_gap(self, *, last_ran: int, next_ran: int) -> None:
+        """Free speculative prefetches in ``(last_ran, next_ran)`` after a jump."""
+        if next_ran <= last_ran + 1:
+            return
+        retain = set(self._retained_set)
+        for layer_idx in range(last_ran + 1, next_ran):
+            if layer_idx not in retain:
+                self.release_layer(layer_idx)
 
     @torch.compiler.disable
     def _activate_residency(self) -> None:
@@ -1298,7 +1324,17 @@ class LayerwiseOffloadManager:
                 )
 
             dtype = meta["dtype"]
-            if meta.get("preserve_strides", False):
+            if meta.get("mapped", False):
+                # The mapping is a read-only view of the checkpoint, so the new
+                # values cannot be written into it. Own the storage from here
+                # on; every reader of this store copies out of whatever tensor
+                # it holds. This trades mapped bytes for anonymous ones on the
+                # configuration that chose mapping because host memory was
+                # short, so it costs the updated weight's bytes.
+                self._mapped_cpu_weights[layer_idx][name] = (
+                    local_loaded_weight.detach().to(dtype=dtype).contiguous()
+                )
+            elif meta.get("preserve_strides", False):
                 self._strided_cpu_weights[layer_idx][name].copy_(
                     local_loaded_weight.to(dtype=dtype)
                 )
@@ -1366,6 +1402,13 @@ class LayerwiseOffloadManager:
                 if i == 0:
                     self._activate_residency()
                     self.prepare_for_next_req(non_blocking=False)
+                elif (
+                    self._last_forwarded_layer is not None
+                    and i > self._last_forwarded_layer + 1
+                ):
+                    self._release_skip_gap(
+                        last_ran=self._last_forwarded_layer, next_ran=i
+                    )
                 if i not in self._gpu_layers:
                     # LTX audio VAE traverses decoder.up in reverse order
                     self.prefetch_layer(i, non_blocking=False)
@@ -1400,6 +1443,7 @@ class LayerwiseOffloadManager:
             def hook(module, input, output):
                 # previous, we wait here, until the copy stream for next layer is finished,
                 # now with any prefetch_size, only wait for the copy stream, when the copy stream is for the next layer
+                self._last_forwarded_layer = i
                 self.release_layer(i)
 
             return hook
