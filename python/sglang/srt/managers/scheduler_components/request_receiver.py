@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -11,19 +12,22 @@ from typing import (
     Union,
 )
 
+import torch
 import zmq
-from torch.distributed import barrier
+from torch.distributed import ReduceOp, all_reduce, barrier
 
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    MMInputsProcessError,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
 )
 from sglang.srt.managers.mm_utils import (
+    discard_shm_features,
     has_shm_features,
     unwrap_shm_features,
 )
@@ -37,12 +41,14 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-    from sglang.srt.managers.rust_server import RustServer
+    from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
     )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -249,24 +255,63 @@ class SchedulerRequestReceiver:
         return recv_reqs
 
     def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:
-        # Unwrap shared memory features AFTER all broadcasts complete,
-        # so that ShmPointerMMData metadata (not full tensor data) is what
-        # gets serialized during broadcast_pyobj.
-        if recv_reqs:
-            if self.model_config.is_multimodal and has_shm_features(recv_reqs):
-                # The broadcast source returns with its original objects while
-                # peer ranks may still be unpickling ShmPointerMMData
-                # (-> shm_open).  Synchronize the same CPU groups that carried
-                # SHM-backed work requests before materialize() unlinks them.
-                if get_parallel().enable_dp_attention:
-                    if self.ps.attn_tp_size > 1:
-                        barrier(group=self.attn_tp_cpu_group)
-                    if self.ps.attn_cp_size > 1:
-                        barrier(group=self.attn_cp_cpu_group)
-                elif self.ps.tp_size > 1:
-                    barrier(group=self.tp_cpu_group)
-            for req in recv_reqs:
+        """Materialize SHM features or mark the request failed on every rank."""
+        if not recv_reqs or not self.model_config.is_multimodal:
+            return
+
+        tokenized_reqs = []
+        for req in recv_reqs:
+            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                tokenized_reqs.append(req)
+            elif isinstance(
+                req,
+                (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput),
+            ):
+                tokenized_reqs.extend(req.batch)
+        if not tokenized_reqs or not has_shm_features(tokenized_reqs):
+            return
+
+        # 1. wait until every rank has opened the shared feature segments
+        parallel = get_parallel()
+        if parallel.enable_dp_attention:
+            if self.ps.attn_tp_size > 1:
+                barrier(group=self.attn_tp_cpu_group)
+            if self.ps.attn_cp_size > 1:
+                barrier(group=self.attn_cp_cpu_group)
+        elif self.ps.tp_size > 1:
+            barrier(group=self.tp_cpu_group)
+
+        # 2. materialize independently so one bad VLM request does not stop the loop
+        failed = torch.zeros(len(tokenized_reqs), dtype=torch.int32)
+        for index, req in enumerate(tokenized_reqs):
+            if not has_shm_features([req]):
+                continue
+            try:
                 unwrap_shm_features(req)
+            except Exception:
+                logger.exception(
+                    "Failed to materialize shared-memory multimodal features for rid=%s",
+                    req.rid,
+                )
+                discard_shm_features(req)
+                failed[index] = 1
+
+        # 3. all ranks reject the same requests before entering model collectives
+        if parallel.enable_dp_attention:
+            if self.ps.attn_tp_size > 1:
+                all_reduce(failed, op=ReduceOp.MAX, group=self.attn_tp_cpu_group)
+            if self.ps.attn_cp_size > 1:
+                all_reduce(failed, op=ReduceOp.MAX, group=self.attn_cp_cpu_group)
+        elif self.ps.tp_size > 1:
+            all_reduce(failed, op=ReduceOp.MAX, group=self.tp_cpu_group)
+
+        error = MMInputsProcessError(
+            "Failed to materialize shared-memory multimodal features on a scheduler rank."
+        )
+        for index, req in enumerate(tokenized_reqs):
+            if failed[index].item():
+                discard_shm_features(req)
+                req.mm_inputs = error
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
         work_reqs = [

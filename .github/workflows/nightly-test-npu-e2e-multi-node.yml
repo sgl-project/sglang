@@ -79,7 +79,7 @@ jobs:
         KUBECONFIG: /root/.cache/.cache/kb.yaml
         KUBECTL: /root/.cache/.cache/kubectl
         NAMESPACE: sgl-project
-        KUBE_JOB_NAME: ascend-sglang-${{ inputs.test_type }}-test
+        KUBE_JOB_NAME: ascend-sglang-test-${{ github.run_id }}
         SGLANG_IS_IN_CI: true
         ASCEND_E2E_TEST_CONFIG_PATH: python/sglang/test/ascend/e2e
         SGLANG_USE_MODELSCOPE: true
@@ -101,8 +101,9 @@ jobs:
       - name: Prepare code for testing
         run: |
           # copy source code to shared-disk
+          # Append run_id to isolate concurrent runs sharing the same PVC.
           current_path=$(pwd)
-          target_path=/root/.cache/tests/sglang
+          target_path=/root/.cache/tests/sglang-${{ github.run_id }}
           rm -rf ${target_path}
           mkdir -p ${target_path}
           cp -r ${current_path}/* ${target_path}/
@@ -129,7 +130,8 @@ jobs:
         timeout-minutes: 300
         run: |
           # sglang_source_relative_path is shared-disk path
-          sglang_source_relative_path=tests/sglang
+          # Append run_id so concurrent runs do not overwrite each other on the shared PVC.
+          sglang_source_relative_path=tests/sglang-${{ github.run_id }}
           sglang_source_path=/root/.cache/${sglang_source_relative_path}
           echo "Source code path: ${sglang_source_path}"
 
@@ -184,7 +186,8 @@ jobs:
             --test-case ${test_case} \
             --kube-name-space ${NAMESPACE} \
             --kube-job-type ${kube_job_type} \
-            --kube-job-name-prefix ${KUBE_JOB_NAME}"
+            --kube-job-name-prefix ${KUBE_JOB_NAME} \
+            --run-id ${{ github.run_id }}"
 
           if [ "$prefill_decode_deployment" = "separation" ];then
             CMD="${CMD} \
@@ -249,3 +252,5 @@ jobs:
               break
             fi
           done
+          # Cleanup the run-scoped source code directory on the shared PVC.
+          rm -rf /root/.cache/tests/sglang-${{ github.run_id }} || true

@@ -50,11 +50,12 @@ fi
 IMAGE_TORCH_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.__version__)')
 IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
 IMAGE_GPU_ARCH=$(docker exec ci_sglang printenv GPU_ARCH 2>/dev/null || true)
-if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950)(-rocm720|-rocm724)?$ ]]; then
+if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950|gfx1250)(-rocm720|-rocm724|-rocm1000)?$ ]]; then
     echo "[CI-IMAGE] Image GPU_ARCH=${IMAGE_GPU_ARCH}"
     case "${IMAGE_GPU_ARCH}" in
         *-rocm724) IMAGE_BASE_ARG_SUFFIX="_ROCM724"; IMAGE_STAGE_SUFFIX="-rocm724" ;;
         *-rocm720) IMAGE_BASE_ARG_SUFFIX="_ROCM720"; IMAGE_STAGE_SUFFIX="-rocm720" ;;
+        *-rocm1000) IMAGE_BASE_ARG_SUFFIX="_ROCM1000"; IMAGE_STAGE_SUFFIX="-rocm1000" ;;
         *)         IMAGE_BASE_ARG_SUFFIX=""; IMAGE_STAGE_SUFFIX="" ;;
     esac
     IMAGE_GFX="${IMAGE_GPU_ARCH%-*}"
@@ -82,9 +83,9 @@ fi
 unset IMAGE_GPU_ARCH
 
 # Install the required dependencies in CI.
-# ROCm 7.2.4 images ship torch 2.11, which srt_hip cannot satisfy (it pins
-# compressed-tensors 0.15.0, requiring torch<2.11). Select the rocm724 extras.
-if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" ]]; then
+# Select the dependency extra that matches each image's torch stack. Plain
+# srt_hip pins compressed-tensors below the version required by torch 2.11.
+if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm1000" ]]; then
   EXTRAS="${EXTRAS/dev_hip/dev_hip_rocm724}"
 fi
 echo "Image torch ${IMAGE_TORCH_VERSION}, HIP ${IMAGE_HIP_VERSION}; installing python extras: [${EXTRAS}]"
@@ -258,6 +259,11 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
   MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
   MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/')
 
+  if [[ -z "${MORI_COMMIT}" ]]; then
+    echo "[MORI] ERROR: Failed to extract MORI_COMMIT from Dockerfile"
+    exit 1
+  fi
+
   if [[ "${GPU_ARCH}" == "mi35x" ]]; then
     MORI_GPU_ARCHS="gfx950"
   else
@@ -265,9 +271,10 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
   fi
 
   echo "[MORI] Reinstalling MORI ${MORI_COMMIT} (MORI_GPU_ARCHS=${MORI_GPU_ARCHS})"
-  # Only the rocm724 (noble) base is missing libgrpc++-dev; 7.0 and 7.2.0 built
-  # MORI without it for months before this step existed, so skip the apt round
-  # trip there. Where it does run, neither step may be fatal: apt-get update
+  # Only the rocm724 and rocm1000 (noble) bases attempt to install
+  # libgrpc++-dev; 7.0 and 7.2.0 built MORI without it for months before this
+  # step existed, so skip the apt round trip there. Where it does run, neither
+  # step may be fatal: apt-get update
   # exits 100 for a single unreachable index while still keeping every index it
   # did fetch, which under set -e is enough to take out the dependency install
   # on every AMD runner at once. Six external apt hosts are in play, so the
@@ -282,9 +289,29 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     cd /sgl-workspace/mori
     git checkout '${MORI_COMMIT}'
     git submodule update --init --recursive
-    if [ '${IMAGE_STAGE_SUFFIX}' = '-rocm724' ]; then
+    if [ '${IMAGE_STAGE_SUFFIX}' = '-rocm724' ] || [ '${IMAGE_STAGE_SUFFIX}' = '-rocm1000' ]; then
       apt-get update || echo '[MORI] apt-get update reported errors; continuing with the indexes it did fetch'
       apt-get install -y --no-install-recommends libgrpc++-dev || echo '[MORI] libgrpc++-dev unavailable; building MORI without it'
+    fi
+    # The pip ROCm SDK vendors NUMA and libdrm under rocm_sysdeps, outside the
+    # default compiler, CMake, and linker search paths used by MORI.
+    # gfx1250 additionally needs the SDK's own cmake trees on the prefix path:
+    # that is what lets hsakmt-config.cmake resolve find_dependency(NUMA)
+    # without patching MORI's CMakeLists. Same split as docker/rocm.Dockerfile.
+    ROCM_SYSDEPS="\${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps"
+    if [ '${IMAGE_GFX}' = 'gfx1250' ] && [ -d "\${ROCM_SYSDEPS}" ]; then
+      export PATH="\${ROCM_HOME}/bin:\${PATH}"
+      export CMAKE_PREFIX_PATH="\${ROCM_SYSDEPS}/lib/cmake:\${ROCM_SYSDEPS}:\${ROCM_HOME}/lib/cmake:\${ROCM_HOME}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}"
+      export CPATH="\${ROCM_SYSDEPS}/include\${CPATH:+:\${CPATH}}"
+      export LIBRARY_PATH="\${ROCM_SYSDEPS}/lib\${LIBRARY_PATH:+:\${LIBRARY_PATH}}"
+      echo "\${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf
+      ldconfig
+    elif [ '${IMAGE_STAGE_SUFFIX}' = '-rocm1000' ] && [ -d "\${ROCM_SYSDEPS}" ]; then
+      export CMAKE_PREFIX_PATH="\${ROCM_SYSDEPS}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}"
+      export CPATH="\${ROCM_SYSDEPS}/include\${CPATH:+:\${CPATH}}"
+      export LIBRARY_PATH="\${ROCM_SYSDEPS}/lib\${LIBRARY_PATH:+:\${LIBRARY_PATH}}"
+      echo "\${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf
+      ldconfig
     fi
     python3 setup.py develop
     python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))' > /etc/ld.so.conf.d/torch.conf
@@ -319,11 +346,11 @@ echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 # 1. Extract AITER_COMMIT from the Dockerfile stage that built this image, as
 # identified near the top of this script.
 #############################################
-if [[ "${IMAGE_GFX}" == "gfx950" ]]; then
-    _from_line="FROM \$BASE_IMAGE_950${IMAGE_BASE_ARG_SUFFIX} AS gfx950${IMAGE_STAGE_SUFFIX}"
-else
-    _from_line="FROM \$BASE_IMAGE_942${IMAGE_BASE_ARG_SUFFIX} AS gfx942${IMAGE_STAGE_SUFFIX}"
-fi
+case "${IMAGE_GFX}" in
+    gfx950)  _from_line="FROM \$BASE_IMAGE_950${IMAGE_BASE_ARG_SUFFIX} AS gfx950${IMAGE_STAGE_SUFFIX}" ;;
+    gfx1250) _from_line="FROM \$BASE_IMAGE_1250${IMAGE_BASE_ARG_SUFFIX} AS gfx1250${IMAGE_STAGE_SUFFIX}" ;;
+    *)       _from_line="FROM \$BASE_IMAGE_942${IMAGE_BASE_ARG_SUFFIX} AS gfx942${IMAGE_STAGE_SUFFIX}" ;;
+esac
 echo "[CI-AITER-CHECK] Using ${_from_line} from Dockerfile..."
 REPO_AITER_COMMIT=$(grep -F -A20 "${_from_line}" docker/rocm.Dockerfile \
                     | grep 'AITER_COMMIT_DEFAULT=' \
@@ -398,7 +425,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     "
 
     # Re-apply the Dockerfile torch.Stream patch after re-clone (ROCm/aiter#4817).
-    if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" ]]; then
+    if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm1000" ]]; then
         docker exec -i ci_sglang python3 - <<'PY'
 from pathlib import Path
 p = Path("/sgl-workspace/aiter/csrc/cpp_itfs/torch_utils.py")

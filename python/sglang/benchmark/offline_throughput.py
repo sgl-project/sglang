@@ -30,6 +30,7 @@ from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer, set_ulimit
 from sglang.lang.backend.runtime_endpoint import Runtime
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.server_args import ServerArgs
 
@@ -366,6 +367,7 @@ def _create_ray_engine_backend(server_args: ServerArgs):
     RayEngine requires a placement group, so we launch it inside a Ray actor
     and return a lightweight proxy that forwards calls via ray.get().
     """
+    cfg = resolving_view(server_args)
     import ray
     from ray.runtime_env import RuntimeEnv
     from ray.util.placement_group import placement_group
@@ -377,7 +379,7 @@ def _create_ray_engine_backend(server_args: ServerArgs):
     if not ray.is_initialized():
         ray.init(runtime_env=RuntimeEnv(env_vars=env_vars))
 
-    total_gpus = server_args.tp_size * server_args.pp_size
+    total_gpus = cfg.tp_size * cfg.pp_size
     pg = placement_group([{"CPU": 1, "GPU": total_gpus}], strategy="STRICT_PACK")
     ray.get(pg.ready())
 
@@ -398,7 +400,7 @@ def _create_ray_engine_backend(server_args: ServerArgs):
             placement_group=pg,
             placement_group_bundle_index=0,
         ),
-    ).remote(**dict(server_args._raw_input))
+    ).remote(**dict(cfg._raw_input))
 
     class _Proxy:
         """Forwards method calls to the remote RayEngine actor."""
@@ -434,20 +436,21 @@ def throughput_test(
 ):
     # A programmatic caller may hand over a freshly constructed record, and
     # the backends below read the resolved paths and the raw snapshot.
-    server_args.resolve_once()
+    cfg = resolving_view(server_args)
+    cfg.resolve_once()
     if bench_args.backend == "engine":
-        if server_args.use_ray:
+        if cfg.use_ray:
             backend = _create_ray_engine_backend(server_args)
         else:
             backend = Engine(server_args=server_args)
         if not backend:
             raise ValueError("Please provide valid engine arguments")
     elif bench_args.backend == "runtime":
-        backend = Runtime(**dict(server_args._raw_input))
+        backend = Runtime(**dict(cfg._raw_input))
     else:
         raise ValueError('Please set backend to either "engine" or "runtime"')
 
-    tokenizer_id = server_args.tokenizer_path or server_args.model_path
+    tokenizer_id = cfg.tokenizer_path or cfg.model_path
     tokenizer = get_tokenizer(tokenizer_id)
 
     # Set global environments
