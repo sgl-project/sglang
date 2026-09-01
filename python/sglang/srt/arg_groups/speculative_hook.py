@@ -123,17 +123,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         ),
     )
 
-    # Algorithm-independent validation must live here at top level: the
-    # per-family handlers (_handle_eagle_family / _handle_dflash /
-    # _handle_dspark / _handle_ngram / _handle_frozen_kv_mtp) do not all run
-    # for every algorithm, so checks parked inside one of them are silently
-    # skipped for the others.
+    # Top level, not a per-family handler: those do not all run for every
+    # algorithm, so checks parked inside one are skipped for the others.
     if server_args.speculative_use_block_verification:
-        # Block verification (arXiv:2403.10444) replaces the token-level
-        # verification inside rejection sampling. EAGLE/EAGLE3 reach it
-        # through the opt-in rejection-sampling path; DSPARK reaches it
-        # through its internal sampling-accept kernel (greedy requests stay
-        # on AcceptGreedy and are unaffected).
+        # EAGLE/EAGLE3 reach block verification through rejection sampling;
+        # DSPARK through its internal sampling-accept kernel.
         if server_args.speculative_algorithm in ("EAGLE", "EAGLE3"):
             if not server_args.speculative_use_rejection_sampling:
                 raise ValueError(

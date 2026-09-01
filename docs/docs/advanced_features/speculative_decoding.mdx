@@ -183,16 +183,6 @@ To enable EAGLE speculative decoding the following parameters are relevant:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Auto (<code>8</code> for Llama/Grok; <code>4</code> for many other models). If <code>topk=1</code>, it is adjusted to <code>num_steps + 1</code>.</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-use-rejection-sampling</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Verify sampled (non-greedy) drafts with token-level rejection sampling instead of tree-greedy matching (<code>topk=1</code>, EAGLE/EAGLE3 only).</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-use-block-verification</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Verify the whole draft block jointly (block verification, <a href="https://arxiv.org/abs/2403.10444">arXiv:2403.10444</a>) instead of token-by-token. Never accepts fewer tokens than token verification in expectation, same lossless guarantee; gains grow with temperature. Requires <code>--speculative-use-rejection-sampling</code> for EAGLE/EAGLE3; with DSPARK it swaps the internal sampling-accept kernel (greedy requests unaffected).</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-accept-threshold-single</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Acceptance threshold for single-token verification. Lower values accept more aggressively.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1.0</code></td>
@@ -800,18 +790,6 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>int</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code> (auto-chosen when omitted)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum number of draft tokens for verification</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-use-rejection-sampling</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>bool</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Verify sampled (non-greedy) drafts with token-level rejection sampling instead of tree-greedy matching (EAGLE/EAGLE3, <code>topk=1</code>)</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-use-block-verification</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>bool</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Verify the whole draft block jointly (block verification, <a href="https://arxiv.org/abs/2403.10444">arXiv:2403.10444</a>) instead of token-by-token. Never accepts fewer tokens in expectation; same lossless guarantee. Requires <code>--speculative-use-rejection-sampling</code> for EAGLE/EAGLE3; with DSPARK it swaps the internal sampling-accept kernel (greedy requests unaffected)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-dflash-block-size</code></td>

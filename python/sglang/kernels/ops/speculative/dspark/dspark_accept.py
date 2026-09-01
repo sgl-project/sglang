@@ -15,12 +15,7 @@ from sglang.kernels.ops.speculative.reject_sampling import (
 
 
 def _block_verification_enabled() -> bool:
-    """Whether to verify with block verification (arXiv:2403.10444) instead
-    of classic token-level rejection sampling.
-
-    Deferred import: this kernels module must stay importable without a
-    running server context (kernel unit tests, CPU fallback).
-    """
+    """Deferred-import probe (no server context in kernel tests)."""
     try:
         from sglang.srt.runtime_context import get_spec
 

@@ -770,14 +770,10 @@ def eagle_sample(
 
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
         use_block_verification = get_spec().speculative_use_block_verification
-        # The hook guarantees block verification implies rejection sampling,
-        # but join explicitly so direct/programmatic enablement (tests,
-        # embedding the kernel) also gets real draft_probs instead of zeros.
+        # Hook guarantees block implies rejection sampling; join defensively.
         use_sampling_accept = use_rejection_sampling or use_block_verification
 
         if use_block_verification:
-            # Block verification (arXiv:2403.10444): joint per-block verify,
-            # same tensor contract as the classic chain kernel.
             sampling_fn = chain_block_speculative_sampling_triton
         elif use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton

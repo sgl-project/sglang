@@ -12,11 +12,7 @@ def _vocab_scan_residual_mass(
     VOCAB_SIZE: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
-    """Sum over the vocab of max(scale * M_b(x) - M_s(x), 0) on one row.
-
-    NaN draft entries are treated as 0, mirroring the classic kernel's NaN-q
-    guard so the residual falls back to (scaled) target mass.
-    """
+    """Row-wise sum of max(scale * M_b(x) - M_s(x), 0); NaN q treated as 0."""
     acc = 0.0
     for v_start in range(0, VOCAB_SIZE, BLOCK_V):
         v_offsets = v_start + tl.arange(0, BLOCK_V)
@@ -78,27 +74,12 @@ def speculative_sampling_block_kernel(
 ):
     """Block verification (arXiv:2403.10444, Algorithm 2).
 
-    Per-request program for a linear (topk=1) draft chain of gamma =
-    NUM_SLOTS - 1 drafted tokens (candidates[1..gamma]; slot 0 is the root /
-    last committed token). TargetProbs rows 0..gamma are M_b(. | c, X^i),
-    DraftProbs rows 0..gamma-1 are M_s(. | c, X^i) (row gamma unused, same as
-    the classic kernel).
-
-    Differences vs the classic token verification kernel:
-      * acceptance threshold h_i = Z_{i+1} / (Z_{i+1} + 1 - p_i) with
-        p_i = min(p_{i-1} * M_b(X_i) / M_s(X_i), 1) and
-        Z_{i+1} = sum_x max(p_i * M_b(x | row i) - M_s(x | row i), 0)
-        (h_gamma = p_gamma needs no Z), instead of min(p/q, 1);
-      * verification does NOT stop at the first failed token: the accepted
-        prefix length is tau = argmax_i{coin_i <= h_i}, a property that
-        strictly improves the expected number of accepted tokens;
-      * the residual distribution at tau is scaled by p_tau:
-        max(p_tau * M_b - M_s, 0) / Z_{tau+1}.
-
-    One-hot shortcut: when the draft row i places all mass on the drafted
-    token X_{i+1} (d(x_{i+1}) == 1, argmax/greedy drafts), the residual mass
-    is available in closed form, Z_{i+1} = p_i * (1 - M_b(X_{i+1} | row i)),
-    skipping that row's vocab scan.
+    Per-request kernel over a linear (topk=1) chain of gamma = NUM_SLOTS - 1
+    drafted tokens; same tensor contract as speculative_sampling_classic_kernel.
+    Accepts via h_i = Z_{i+1} / (Z_{i+1} + 1 - p_i) with cumulative prefix
+    ratio p_i and residual mass Z_{i+1}; tau = argmax_i{coin_i <= h_i}
+    (no early stop), then resamples from the p_tau-scaled residual.
+    One-hot draft rows use Z_{i+1} = p_i * (1 - M_b(X_{i+1})) in closed form.
     """
     pid = tl.program_id(0)
 
@@ -111,8 +92,7 @@ def speculative_sampling_block_kernel(
 
     tau = 0
     p = 1.0
-    # Residual snapshot at the row where tau was last updated:
-    # z_res = Z_{tau+1}, p_res = p_tau (scale of that row's residual).
+    # Residual snapshot at tau: z_res = Z_{tau+1}, p_res = p_tau.
     z_res = 0.0
     p_res = 1.0
 
@@ -130,16 +110,16 @@ def speculative_sampling_block_kernel(
             + ((step - 1) * stride_dp_s)
             + (draft_token * stride_dp_v)
         )
-        # Degenerate draft density (q=0 or NaN): keep the classic semantics —
-        # q=0 & p>0 behaves like an always-accept, q=0 & p=0 a hard reject.
+        # q=0 or NaN mirrors the classic kernel: q=0 & p>0 accepts, q=0 & p=0
+        # hard-rejects.
         d_ok = (d_prob == d_prob) & (d_prob > 0.0)
         ratio = tl.where(
             d_ok, t_prob / tl.where(d_ok, d_prob, 1.0), tl.where(t_prob > 0.0, 1.0, 0.0)
         )
         p = tl.minimum(p * ratio, 1.0)
 
-        # Z_{step+1} is consumed by h_step (step < gamma) and snapshots into
-        # the residual normalizer when tau lands on this step.
+        # Z_{step+1}: feeds h_step (step < gamma) and the residual normalizer
+        # if tau lands here.
         z = 0.0
         if (step < NUM_SLOTS - 1) & (p > 0.0):
             next_token = tl.load(cand_ptr_base + (step + 1) * stride_cand_s)
@@ -157,10 +137,8 @@ def speculative_sampling_block_kernel(
                     + (step * stride_tp_s)
                     + (next_token * stride_tp_v)
                 )
-                # Clamp: Z is a sum of non-negative terms and cannot be
-                # negative, but 1 - M_b(x) can dip below 0 when top-k/top-p
-                # renormalization rounds a target prob slightly above 1.0; a
-                # negative z would poison denom, h, and residual_norm.
+                # Clamp: 1 - M_b(x) can round slightly below 0 after
+                # top-k/top-p renorm; Z is a sum of non-negative terms.
                 z = tl.maximum(p * (1.0 - next_target_prob), 0.0)
             else:
                 z = _vocab_scan_residual_mass(
@@ -173,9 +151,8 @@ def speculative_sampling_block_kernel(
                     BLOCK_V,
                 )
 
-        # h_gamma = p_gamma (the paper's boundary case needs no Z beyond the
-        # chain). Denominator degenerates only when z == 0 and p == 1, i.e.
-        # scaled target and draft coincide: accept unconditionally.
+        # h_gamma = p_gamma; denom == 0 means scaled p == q, accept
+        # unconditionally.
         denom = z + 1.0 - p
         h_safe = tl.where(denom > 0.0, z / tl.where(denom > 0.0, denom, 1.0), 1.0)
         h = tl.where(step == NUM_SLOTS - 1, p, h_safe)
@@ -188,9 +165,8 @@ def speculative_sampling_block_kernel(
 
     tl.store(AcceptTokenNum + pid, tau)
 
-    # Materialize accepted draft tokens along the chain (same buffer layout
-    # the classic kernel produces: predicts live at the previous accepted
-    # slot's global index).
+    # Same predict layout as the classic kernel: predict at the previous
+    # accepted slot's global index.
     last_accepted_global_idx = root_global_idx
     for step in range(1, NUM_SLOTS):
         if step <= tau:
@@ -214,8 +190,7 @@ def speculative_sampling_block_kernel(
     dp_base_ptr_safe = DraftProbs + (pid * stride_dp_b) + (cur_prob_row * stride_dp_s)
 
     if all_drafts_accepted:
-        # Pure target row sample: draft row gamma does not exist, so this
-        # branch must stay draft-pointer-free.
+        # Draft row gamma does not exist; keep this branch draft-pointer-free.
         residual_norm = _vocab_scan_target_mass(
             tp_base_ptr,
             stride_tp_v,
@@ -223,8 +198,7 @@ def speculative_sampling_block_kernel(
             BLOCK_V,
         )
     else:
-        # tau == 0 never updated the snapshot inside the loop: its residual
-        # row is the root row with scale p_0 = 1. Compute it lazily now.
+        # tau == 0 never snapshotted z_res; scan the root row with scale 1.
         if tau == 0:
             z_res = _vocab_scan_residual_mass(
                 tp_base_ptr,
@@ -237,9 +211,9 @@ def speculative_sampling_block_kernel(
             )
         residual_norm = z_res
 
-    # Degenerate residual (norm == 0, i.e. scaled p == q everywhere) leaves
-    # the cumsum at 0 <= target_u, so final_token falls back to
-    # VOCAB_SIZE - 1, matching the classic kernel's behavior.
+    # Degenerate residual (norm == 0, scaled p == q everywhere) leaves the
+    # cumsum at 0 <= target_u: final_token falls back to VOCAB_SIZE - 1, same
+    # as the classic kernel.
     target_u = coin_final * residual_norm
     cum_sum = 0.0
     final_token = VOCAB_SIZE - 1
@@ -457,8 +431,6 @@ def chain_block_speculative_sampling_triton(
 
     Drop-in replacement for chain_speculative_sampling_triton (same tensor
     contract); verifies the draft block jointly instead of token-by-token.
-    Never accepts fewer tokens than token verification in expectation and
-    preserves the target model's output distribution.
     """
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]

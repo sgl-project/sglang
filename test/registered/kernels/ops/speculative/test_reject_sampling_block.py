@@ -2,23 +2,12 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 
-"""Block verification (arXiv:2403.10444) chain rejection-sampling kernel tests.
+"""Tests for speculative_sampling_block_kernel (arXiv:2403.10444).
 
-Covers ``speculative_sampling_block_kernel`` /
-``chain_block_speculative_sampling_triton`` in
-``python/sglang/kernels/ops/speculative/reject_sampling.py``:
-
-  * exact agreement with a vectorized pure-torch reference implementation of
-    the paper's Algorithm 2 (prefix ratios p_i, thresholds
-    h_i = Z_{i+1}/(Z_{i+1} + 1 - p_i) with h_gamma = p_gamma, tau = argmax,
-    p_tau-scaled residual re-sampling);
-  * the one-hot (greedy draft) closed-form shortcut
-    Z_{i+1} = p_i * (1 - M_b(X_{i+1})) == full vocab scan;
-  * losslessness on the paper's motivating toy model (first emitted token is
-    exactly M_b), plus the paper's analytic block efficiencies
-    (gamma=2 toy: token 10/9 vs block 11/9);
-  * matched-coins aggregate acceptance >= classic token verification;
-  * degenerate draft rows (NaN / zero mass) produce no NaN and valid tokens.
+Covers the kernel against a vectorized torch reference of the paper's
+Algorithm 2, plus the one-hot closed-form shortcut, losslessness on the
+paper's toy model, matched-coins dominance vs the classic kernel, and
+degenerate draft rows.
 """
 
 import unittest
@@ -42,10 +31,9 @@ def block_verify_reference(
 ):
     """Vectorized torch reference of Algorithm 2 (arXiv:2403.10444).
 
-    Returns (accept_token_num, predict_map) where predict_map[b, s] mirrors
-    the kernel's Predicts buffer in slot coordinates: slot k < tau holds the
-    (k+1)-th drafted token, slot tau holds the final (residual / target
-    bonus) token, all other slots keep the sentinel.
+    Returns (accept_token_num, predict_map) in the kernel's slot layout:
+    slot k < tau holds draft k+1, slot tau holds the final token, untouched
+    slots keep the sentinel.
     """
     dev = candidates.device
     bs, S = candidates.shape
