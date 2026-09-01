@@ -159,6 +159,23 @@ fn render_kv_bootstrap(index: &Arc<crate::policies::kv_events::KvEventIndex>) ->
             ));
         }
     }
+
+    // One per sweep, not per rank: separates "settled cold as soon as every
+    // sibling proved empty" (fleet_cold) from "burned the whole deadline"
+    // (timed_out), which the rank outcomes above deliberately fold into the
+    // same `abandoned` label.
+    let sweep_results = tracker.sweep_result_counts();
+    if !sweep_results.is_empty() {
+        out.push_str(
+            "# HELP sgl_router_kv_bootstrap_sweep_total Peer sweeps by terminal verdict.\n",
+        );
+        out.push_str("# TYPE sgl_router_kv_bootstrap_sweep_total counter\n");
+        for (result, count) in sweep_results {
+            out.push_str(&format!(
+                "sgl_router_kv_bootstrap_sweep_total{{result=\"{result}\"}} {count}\n",
+            ));
+        }
+    }
     out
 }
 

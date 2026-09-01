@@ -39,8 +39,9 @@ use tracing::{debug, info, warn};
 
 use super::block_size_oracle::BlockSizeOracle;
 use super::bootstrap::{
-    fetch_cursors, fetch_snapshot, BootstrapState, BootstrapTracker, PeerRegistry, PeerSnapshot,
-    RankOutcome, SnapshotOutcome, VettedSnapshot, WireWorker, SNAPSHOT_FORMAT,
+    fetch_cursors, fetch_snapshot, BootstrapState, BootstrapTracker, FetchAnswer, PeerRegistry,
+    PeerSnapshot, RankOutcome, SnapshotOutcome, SweepOutcome, VettedSnapshot, WireWorker,
+    SNAPSHOT_FORMAT,
 };
 use super::discovery::{fetch_event_config, EventConfig};
 use super::subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
@@ -557,6 +558,12 @@ async fn bootstrap_coordinator(
         // single-flight. Obligations discovered while it runs pile up in the
         // channel and are merged below, so they ride this same snapshot.
         let started = Instant::now();
+        info!(
+            ranks = ranks.len(),
+            peers = deps.peers.len(),
+            deadline_ms = deadline.as_millis(),
+            "kv-bootstrap: sweeping sibling replicas for a tree snapshot",
+        );
         let result = sweep_until_deadline(&deps, &ranks, deadline, pending.freshness_floor).await;
         let joined = drain_ready(&mut rx, &mut pending);
         if joined > 0 || !pending.deferred.is_empty() {
@@ -977,7 +984,9 @@ impl KvEventIndex {
     }
 
     /// A snapshot that declares itself useless, for the paths that must answer
-    /// without a tree. Consumers skip a `producer_ready: false` peer and retry.
+    /// without a tree. Consumers skip a `producer_ready: false` peer and retry;
+    /// the EMPTY node list is separately what makes this body a cold witness in
+    /// a peer sweep, and a fleet of nothing but cold witnesses settles early.
     fn not_ready_snapshot(&self) -> PeerSnapshot {
         let (block_size, is_bigram) = self.block_size_oracle.hash_config().unwrap_or((0, false));
         PeerSnapshot {
@@ -1483,20 +1492,45 @@ enum SweepResult {
     Found(VettedSnapshot),
     /// Discovery confirmed there are no siblings, so waiting cannot help.
     NoPeers,
+    /// Every candidate's latest word was cold-or-terminal: an empty tree, or a
+    /// permanent incompatibility. Waiting out the deadline cannot help —
+    /// anything these peers learn later arrives over this replica's own event
+    /// subscriptions anyway.
+    FleetCold {
+        /// Size of the candidate set the verdict was proven over — not the
+        /// live registry, which may have changed since.
+        peers_tried: usize,
+    },
     TimedOut {
         peers_tried: usize,
         last_reason: Option<String>,
     },
 }
 
-/// Sweep peers until one yields a usable snapshot, discovery proves there are
-/// none, or the budget runs out.
+impl SweepResult {
+    /// The metric-facing verdict, mirroring `VetError::outcome`: the closed
+    /// label set lives in bootstrap.rs so no call site can mint new values.
+    fn outcome(&self) -> SweepOutcome {
+        match self {
+            Self::Found(_) => SweepOutcome::Found,
+            Self::NoPeers => SweepOutcome::NoPeers,
+            Self::FleetCold { .. } => SweepOutcome::FleetCold,
+            Self::TimedOut { .. } => SweepOutcome::TimedOut,
+        }
+    }
+}
+
+/// Sweep peers until one yields a usable snapshot, every sibling proves it
+/// has nothing to give, discovery proves there are none, or the budget runs
+/// out.
 ///
 /// Retries rather than sweeping once: worker discovery regularly completes before
 /// the peer watch has delivered its first EndpointSlice list, so a single sweep
 /// sees zero candidates and abandons — the joining replica then boots cold even
-/// though warm siblings existed. The same loop covers a rolling update whose only
-/// visible candidates are surge pods still finishing their own bootstrap.
+/// though warm siblings existed. A rolling update whose only visible candidates
+/// are surge pods still finishing their own bootstrap is the flip case: they
+/// all answer cold, and the sweep settles early rather than waiting for one —
+/// anything they warm with later arrives over this replica's own subscriptions.
 ///
 /// `freshness_floor` is the instant every fetch demands the peer's export beat:
 /// re-derived per attempt, so a sweep that runs for minutes keeps asking for the
@@ -1519,19 +1553,14 @@ async fn sweep_until_deadline(
     // only "no usable snapshot".
     let last_reason: Mutex<Option<String>> = Mutex::new(None);
     let attempt = async {
-        let mut permanently_rejected: HashSet<String> = HashSet::new();
-        let mut cooldown: HashMap<String, u32> = HashMap::new();
+        let mut state = SweepState::new();
         loop {
-            if let Some(vetted) = sweep_peers(
-                &ctx,
-                ranks,
-                &mut permanently_rejected,
-                &mut cooldown,
-                &last_reason,
-            )
-            .await
-            {
-                return Some(vetted);
+            match sweep_peers(&ctx, ranks, &mut state, &last_reason).await {
+                SweepPass::Found(vetted) => return Some(SweepResult::Found(vetted)),
+                SweepPass::FleetCold { peers_tried } => {
+                    return Some(SweepResult::FleetCold { peers_tried })
+                }
+                SweepPass::KeepLooking => {}
             }
             if deps.peers.known_to_have_no_peers() {
                 debug!("kv-bootstrap: discovery confirmed no sibling replicas");
@@ -1544,7 +1573,7 @@ async fn sweep_until_deadline(
     // The deadline bounds the whole sweep, not each request, so a fleet of slow
     // peers cannot outlast the readiness gate.
     match tokio::time::timeout(deadline, attempt).await {
-        Ok(Some(vetted)) => SweepResult::Found(vetted),
+        Ok(Some(result)) => result,
         Ok(None) => SweepResult::NoPeers,
         Err(_) => SweepResult::TimedOut {
             peers_tried: deps.peers.len(),
@@ -1563,6 +1592,7 @@ async fn deliver_bootstrap(
     deadline: Duration,
 ) {
     let n = obligations.len();
+    deps.bootstrap.record_sweep_result(result.outcome());
     let msg = match result {
         SweepResult::Found(vetted) => PumpControl::ApplySnapshot {
             obligations,
@@ -1572,6 +1602,15 @@ async fn deliver_bootstrap(
             info!(
                 ranks = n,
                 "kv-bootstrap: no sibling replicas to bootstrap from; ranks will run cold",
+            );
+            PumpControl::AbandonBootstrap { obligations }
+        }
+        SweepResult::FleetCold { peers_tried } => {
+            info!(
+                ranks = n,
+                peers_tried,
+                "kv-bootstrap: every sibling replica answered with an empty or \
+                 incompatible tree; settling cold without waiting out the deadline",
             );
             PumpControl::AbandonBootstrap { obligations }
         }
@@ -1595,10 +1634,6 @@ async fn deliver_bootstrap(
     }
 }
 
-/// One pass over the candidate peers, returning the first snapshot that vets.
-///
-/// Kept separate from [`sweep_until_deadline`]'s retry loop so "which peer do we
-/// take?" and "how long do we keep looking?" stay independently readable.
 struct SweepCtx<'a> {
     http: &'a reqwest::Client,
     peers: &'a PeerRegistry,
@@ -1610,13 +1645,125 @@ struct SweepCtx<'a> {
     freshness_floor: Instant,
 }
 
+/// Verdict of one pass over the candidate peers.
+enum SweepPass {
+    /// A peer's snapshot vetted and covers ranks we are bootstrapping.
+    Found(VettedSnapshot),
+    /// Nothing usable this pass, but at least one peer might have state later
+    /// (unanswered, still bootstrapping, or warm-but-not-covering).
+    KeepLooking,
+    /// Every candidate's latest word was cold-or-terminal. Carries the size of
+    /// the candidate set the verdict was proven over; see
+    /// [`SweepResult::FleetCold`].
+    FleetCold { peers_tried: usize },
+}
+
+/// Mutable per-sweep peer state, carried across passes. Bundled so the rules
+/// tying the three collections together — cooldown decays fetches, rejection
+/// is terminal, cold classification survives cooldowns but not a warmer or
+/// unknown answer — live on the data they govern rather than across the
+/// sweep's body.
+struct SweepState {
+    /// Peers whose snapshot is permanently incompatible (format, block size).
+    /// A stable property of the peer for the life of the process, so they are
+    /// never re-fetched.
+    permanently_rejected: HashSet<String>,
+    /// Retriable-failure sit-out, in remaining passes.
+    cooldown: HashMap<String, u32>,
+    /// Peers whose latest answer was an empty tree
+    /// ([`PeerSnapshot::holds_no_state`], NOT the stricter
+    /// [`PeerSnapshot::is_cold`] vetting uses — a peer mid-bootstrap that
+    /// already holds nodes is not done, but it plainly HAS state). Carried
+    /// across passes so a peer in cooldown keeps its last classification;
+    /// dropped on any warmer or unknown answer, since the fleet proving cold
+    /// is only meaningful when EVERY peer's latest word is "I have nothing".
+    cold_witnessed: HashSet<String>,
+}
+
+impl SweepState {
+    fn new() -> Self {
+        Self {
+            permanently_rejected: HashSet::new(),
+            cooldown: HashMap::new(),
+            cold_witnessed: HashSet::new(),
+        }
+    }
+
+    /// A peer that did not answer has unknown warmth: it cannot count toward
+    /// the all-cold verdict, and it sits out a few passes — the failures that
+    /// land here are mostly stable for the life of the process (a transport it
+    /// cannot complete, a body that will not inflate or parse), so re-fetching
+    /// a multi-megabyte body from it on every pass is pure load on a replica
+    /// that is itself serving traffic.
+    fn note_unreachable(&mut self, peer: &str) {
+        self.cold_witnessed.remove(peer);
+        self.cooldown.insert(peer.to_string(), PEER_COOLDOWN_PASSES);
+    }
+
+    /// Record the temperature of an answered snapshot: an empty tree is a
+    /// cold witness; anything with content — usable, still bootstrapping, or
+    /// not covering us — means the fleet holds state worth waiting for.
+    fn note_answer(&mut self, peer: &str, snap: &PeerSnapshot) {
+        if snap.holds_no_state() {
+            self.cold_witnessed.insert(peer.to_string());
+        } else {
+            self.cold_witnessed.remove(peer);
+        }
+    }
+
+    /// Permanent rejection is terminal on its own — a peer whose state we can
+    /// never consume has nothing to give us, whatever it holds.
+    fn note_permanent_reject(&mut self, peer: &str) {
+        self.permanently_rejected.insert(peer.to_string());
+    }
+
+    /// Answered, but nothing for us right now — sit out a few passes WITHOUT
+    /// touching the witness `note_answer` just recorded. Keeping every
+    /// `cooldown` write behind a method is what makes "does this write erase
+    /// the witness?" auditable: `note_unreachable` does, this one does not.
+    fn note_sit_out(&mut self, peer: &str) {
+        self.cooldown.insert(peer.to_string(), PEER_COOLDOWN_PASSES);
+    }
+
+    /// True while `peer` sits out a retriable failure, decaying one pass.
+    fn cooling(&mut self, peer: &str) -> bool {
+        match self.cooldown.get_mut(peer) {
+            Some(remaining) if *remaining > 0 => {
+                *remaining -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The all-cold verdict: every candidate's latest classification says it
+    /// has nothing to give. Peers skipped by cooldown count by their last
+    /// classification; a candidate that has never answered (new to the set,
+    /// or only ever unreachable) keeps the sweep waiting.
+    ///
+    /// An empty candidate set is NOT cold: `all()` on an empty iterator is
+    /// vacuously true, and the peer watch regularly delivers its first list
+    /// after worker discovery completes. An empty set means "no information"
+    /// — handled by the `known_to_have_no_peers` path — not "everyone proved
+    /// empty".
+    fn fleet_is_cold(&self, candidates: &[String]) -> bool {
+        !candidates.is_empty()
+            && candidates
+                .iter()
+                .all(|p| self.permanently_rejected.contains(p) || self.cold_witnessed.contains(p))
+    }
+}
+
+/// One pass over the candidate peers, returning the first snapshot that vets.
+///
+/// Kept separate from [`sweep_until_deadline`]'s retry loop so "which peer do we
+/// take?" and "how long do we keep looking?" stay independently readable.
 async fn sweep_peers(
     ctx: &SweepCtx<'_>,
     ranks: &[KvWorkerId],
-    permanently_rejected: &mut HashSet<String>,
-    cooldown: &mut HashMap<String, u32>,
+    state: &mut SweepState,
     last_reason: &Mutex<Option<String>>,
-) -> Option<VettedSnapshot> {
+) -> SweepPass {
     let SweepCtx {
         http,
         peers,
@@ -1628,53 +1775,47 @@ async fn sweep_peers(
     // The vet needs only the local block size: block hashes at different
     // page sizes can never share a tree. Hashing mode is deliberately not
     // vetted — see `VettedSnapshot::from_wire`.
-    let local_block_size = oracle.get()?;
-    for peer in peers.candidates() {
-        // A format / block-size mismatch is a stable property of that
-        // peer for the life of the process, so re-downloading its whole tree on
-        // every 250ms pass cannot change the answer — it just loads a replica
-        // that is itself booting.
-        if permanently_rejected.contains(&peer) {
+    let Some(local_block_size) = oracle.get() else {
+        return SweepPass::KeepLooking;
+    };
+    let candidates = peers.candidates();
+    for peer in &candidates {
+        if state.permanently_rejected.contains(peer) {
             continue;
         }
-        // Retriable, but not on every single pass.
-        if let Some(remaining) = cooldown.get_mut(&peer) {
-            if *remaining > 0 {
-                *remaining -= 1;
-                continue;
-            }
+        if state.cooling(peer) {
+            continue;
         }
         // Ask for an export that beats the floor. Derived per attempt, not once:
         // the condition is "newer than the floor", and only the age it
         // corresponds to moves as the sweep retries.
         let max_age = freshness_floor.elapsed();
-        let snap = match fetch_snapshot(http, &peer, Some(max_age)).await {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                bootstrap.record_peer_outcome(SnapshotOutcome::Unreachable, &peer, None);
-                cooldown.insert(peer.clone(), PEER_COOLDOWN_PASSES);
+        let snap = match fetch_snapshot(http, peer, Some(max_age)).await {
+            Ok(FetchAnswer::Body(s)) => s,
+            Ok(FetchAnswer::NoBody(status)) => {
+                // Reachable but no usable body — the status names which kind
+                // of wrong: 404 is an older router image that does not serve
+                // the route, 5xx is a sick sibling. Both retriable.
+                state.note_unreachable(peer);
+                let detail = format!("answered HTTP {status}");
+                *last_reason.lock() = Some(format!("{peer}: {detail}"));
+                bootstrap.record_peer_outcome(SnapshotOutcome::Unreachable, peer, Some(&detail));
                 continue;
             }
             Err(e) => {
                 // `{e:#}` for the anyhow chain: the bare Display prints only the
                 // outermost message, dropping the reqwest/io cause that names what
                 // actually went wrong.
-                bootstrap.record_peer_outcome(
-                    SnapshotOutcome::Unreachable,
-                    &peer,
-                    Some(&format!("{e:#}")),
-                );
-                // Cool this peer down like every other non-accept outcome. The
-                // failures reaching here are mostly stable properties of that peer
-                // for the life of the process — a transport it cannot complete, a
-                // body that will not inflate, JSON that will not parse — so
-                // re-fetching a multi-megabyte body from it on every 250ms pass is
-                // pure load on a replica that is itself serving traffic, and it
-                // starves candidates that might actually answer.
-                cooldown.insert(peer.clone(), PEER_COOLDOWN_PASSES);
+                state.note_unreachable(peer);
+                let detail = format!("{e:#}");
+                *last_reason.lock() = Some(format!("{peer}: {detail}"));
+                bootstrap.record_peer_outcome(SnapshotOutcome::Unreachable, peer, Some(&detail));
                 continue;
             }
         };
+        // Classify before vetting: an empty tree is a cold witness even when the
+        // snapshot is otherwise well formed.
+        state.note_answer(peer, &snap);
         // Snapshot the live set at vet time so a peer cannot introduce a worker
         // this replica has not discovered.
         let live = live_workers.lock().clone();
@@ -1691,7 +1832,7 @@ async fn sweep_peers(
                         "kv-bootstrap: peer has no state for the ranks being bootstrapped; \
                          continuing to look",
                     );
-                    cooldown.insert(peer.clone(), PEER_COOLDOWN_PASSES);
+                    state.note_sit_out(peer);
                     continue;
                 }
                 // How much of the copy can steer a selection: carried nodes
@@ -1719,8 +1860,8 @@ async fn sweep_peers(
                     carrier_votes = %format!("{bigram} bigram / {unigram} unigram / {unvoted} unvoted"),
                     "kv-bootstrap: snapshot accepted; handing to pump",
                 );
-                bootstrap.record_peer_outcome(SnapshotOutcome::Accepted, &peer, None);
-                return Some(vetted);
+                bootstrap.record_peer_outcome(SnapshotOutcome::Accepted, peer, None);
+                return SweepPass::Found(vetted);
             }
             Err(e) => {
                 if e.outcome() == SnapshotOutcome::Rejected {
@@ -1733,16 +1874,36 @@ async fn sweep_peers(
                         "kv-bootstrap: peer snapshot is permanently incompatible; \
                          not retrying this peer",
                     );
-                    permanently_rejected.insert(peer.clone());
+                    state.note_permanent_reject(peer);
                 }
                 // Scoped so no guard is ever held across an await.
                 *last_reason.lock() = Some(format!("{peer}: {e}"));
-                cooldown.insert(peer.clone(), PEER_COOLDOWN_PASSES);
-                bootstrap.record_peer_outcome(e.outcome(), &peer, Some(&e.to_string()));
+                state.note_sit_out(peer);
+                bootstrap.record_peer_outcome(e.outcome(), peer, Some(&e.to_string()));
             }
         }
     }
-    None
+    if !state.fleet_is_cold(&candidates) {
+        return SweepPass::KeepLooking;
+    }
+    // A candidate set that changed mid-pass makes this verdict stale before it
+    // is even acted on: a newly added peer was never consulted, and its
+    // historical state (unlike post-subscription events) cannot be recovered
+    // later. Membership is compared as sets — `candidates()` is a shuffled
+    // clone, and a length-only check would miss a same-length swap (one pod
+    // replaced at constant replica count mid-rollout). Only reached under a
+    // cold verdict, so the re-read costs nothing on the ordinary pass.
+    if peers.candidates().into_iter().collect::<HashSet<_>>()
+        != candidates.iter().cloned().collect::<HashSet<_>>()
+    {
+        // Not silent: this is how a flapping EndpointSlice turns a cold
+        // fleet's quick settle into a full-deadline wait.
+        info!("kv-bootstrap: candidate set changed mid-pass; discarding the cold-fleet verdict");
+        return SweepPass::KeepLooking;
+    }
+    SweepPass::FleetCold {
+        peers_tried: candidates.len(),
+    }
 }
 
 /// Shared state the pump task reads and writes. Bundled rather than passed as
@@ -3311,6 +3472,473 @@ mod tests {
             probe_once(snap, &worker_id("http://w1:30000", 0), 10).await,
             SpliceVerdict::Advanced,
         );
+    }
+
+    // ---- sweep early exit (SweepResult::FleetCold) ----
+
+    use crate::policies::kv_events::tree::SnapshotNode;
+
+    fn sweep_deps(peers: Vec<String>, block_size: u32, live: &[&str]) -> BootstrapDeps {
+        let registry = Arc::new(PeerRegistry::new());
+        registry.replace(peers);
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(block_size).expect("first set establishes");
+        let (ctrl_tx, _rx) = mpsc::channel(8);
+        BootstrapDeps {
+            http: reqwest::Client::new(),
+            peers: registry,
+            bootstrap: Arc::new(BootstrapTracker::new(Duration::from_secs(3600))),
+            live_workers: Arc::new(Mutex::new(live.iter().map(|u| worker_id(u, 0)).collect())),
+            oracle,
+            ctrl_tx,
+        }
+    }
+
+    /// A snapshot with real content, carried by `carrier` only.
+    fn warm_snapshot(carrier: &str, block_size: u32) -> PeerSnapshot {
+        PeerSnapshot {
+            format: SNAPSHOT_FORMAT,
+            block_size,
+            is_bigram: false,
+            producer_ready: true,
+            workers: vec![WireWorker {
+                url: carrier.into(),
+                dp_rank: 0,
+            }],
+            cursors: vec![(0, 5)],
+            nodes: vec![SnapshotNode {
+                parent: None,
+                block_hash: 111,
+                workers: vec![0],
+                tiers: vec![],
+            }],
+        }
+    }
+
+    /// The failure this guards: a rolling update into a fleet whose siblings
+    /// all hold EMPTY trees (cold start, or a dev fleet with no traffic) used
+    /// to burn the whole `--kv-bootstrap-timeout-ms` budget of 503 readiness
+    /// retrying peers that could never answer. Anything these peers learn
+    /// later arrives over this replica's own subscriptions, so the sweep must
+    /// settle cold as soon as every peer's latest answer is "I have nothing".
+    #[tokio::test]
+    async fn sweep_settles_early_when_every_peer_is_cold() {
+        let (p1, q1) = serve_snapshot_recording_queries(witness_snapshot(&[])).await;
+        let (p2, q2) = serve_snapshot_recording_queries(witness_snapshot(&[])).await;
+        let deps = sweep_deps(vec![p1, p2], 64, &["http://w1:30000"]);
+        let ranks = vec![worker_id("http://w1:30000", 0)];
+        // A 3600s deadline would hang a broken test; the outer timeout fails
+        // fast instead, and reaching it IS the regression.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            sweep_until_deadline(&deps, &ranks, Duration::from_secs(3600), Instant::now()),
+        )
+        .await
+        .expect("a cold fleet settles immediately, not at the deadline");
+        assert!(
+            matches!(result, SweepResult::FleetCold { peers_tried: 2 }),
+            "every peer proved empty, so the sweep must not wait out the deadline",
+        );
+        // One fetch per peer: the verdict lands at the end of the FIRST pass,
+        // not after a cooldown round of re-fetches.
+        assert_eq!(q1.lock().expect("queries lock").len(), 1);
+        assert_eq!(q2.lock().expect("queries lock").len(), 1);
+    }
+
+    /// An unreachable peer says nothing about its warmth — it may be a warm
+    /// sibling mid-restart — so its presence must veto the early cold exit.
+    #[tokio::test]
+    async fn sweep_waits_out_the_deadline_when_a_peer_is_unreachable() {
+        let (cold, _q) = serve_snapshot_recording_queries(witness_snapshot(&[])).await;
+        // Nothing listens on port 1: a fast connection-refused, not a hang.
+        let deps = sweep_deps(
+            vec![cold, "http://127.0.0.1:1".into()],
+            64,
+            &["http://w1:30000"],
+        );
+        let ranks = vec![worker_id("http://w1:30000", 0)];
+        let result =
+            sweep_until_deadline(&deps, &ranks, Duration::from_millis(500), Instant::now()).await;
+        assert!(
+            matches!(result, SweepResult::TimedOut { peers_tried: 2, .. }),
+            "an unanswered peer keeps the sweep waiting until the deadline",
+        );
+    }
+
+    /// A warm peer that holds no blocks for the bootstrapping ranks is still a
+    /// warm peer: the fleet HAS state, so the sweep keeps looking rather than
+    /// declaring the fleet cold.
+    #[tokio::test]
+    async fn sweep_waits_out_the_deadline_when_a_peer_is_warm_but_uncovering() {
+        let (warm, q) =
+            serve_snapshot_recording_queries(warm_snapshot("http://w2:30000", 64)).await;
+        let deps = sweep_deps(vec![warm], 64, &["http://w1:30000", "http://w2:30000"]);
+        let ranks = vec![worker_id("http://w1:30000", 0)];
+        let result =
+            sweep_until_deadline(&deps, &ranks, Duration::from_millis(500), Instant::now()).await;
+        assert!(
+            matches!(result, SweepResult::TimedOut { peers_tried: 1, .. }),
+            "a warm peer keeps the sweep waiting even when it covers nothing we need",
+        );
+        assert!(
+            q.lock().expect("queries lock").len() <= 2,
+            "a non-covering answer cools the peer down; it is not re-fetched every pass",
+        );
+    }
+
+    /// Permanent rejection (here a block-size mismatch) is as terminal as an
+    /// empty tree: retrying cannot change the answer, so a fleet of nothing
+    /// but incompatible peers also settles early.
+    #[tokio::test]
+    async fn sweep_settles_early_when_every_peer_is_permanently_rejected() {
+        let (p, q) = serve_snapshot_recording_queries(warm_snapshot("http://w1:30000", 999)).await;
+        let deps = sweep_deps(vec![p], 64, &["http://w1:30000"]);
+        let ranks = vec![worker_id("http://w1:30000", 0)];
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            sweep_until_deadline(&deps, &ranks, Duration::from_secs(3600), Instant::now()),
+        )
+        .await
+        .expect("an incompatible fleet settles immediately, not at the deadline");
+        assert!(
+            matches!(result, SweepResult::FleetCold { peers_tried: 1 }),
+            "permanent rejection must count toward the all-cold verdict",
+        );
+        assert_eq!(
+            q.lock().expect("queries lock").len(),
+            1,
+            "a permanently rejected peer is never re-fetched",
+        );
+    }
+
+    /// An empty candidate set is not a cold fleet: `all()` on an empty
+    /// iterator is vacuously true, and the peer set legitimately dips to
+    /// empty during EndpointSlice repacks — exactly the race the retry loop
+    /// exists for (worker discovery wins against the peer watch). This
+    /// registry HAS seen peers, so `known_to_have_no_peers` stays false and
+    /// only the verdict's own `is_empty` guard stands between this and a
+    /// wrong `FleetCold`.
+    #[tokio::test]
+    async fn sweep_does_not_settle_cold_on_a_transiently_empty_peer_set() {
+        let deps = sweep_deps(vec!["http://127.0.0.1:1".into()], 64, &["http://w1:30000"]);
+        deps.peers.replace(vec![]);
+        let ranks = vec![worker_id("http://w1:30000", 0)];
+        let result =
+            sweep_until_deadline(&deps, &ranks, Duration::from_millis(500), Instant::now()).await;
+        assert!(
+            matches!(result, SweepResult::TimedOut { .. }),
+            "an empty candidate set is no information, not a cold fleet",
+        );
+    }
+
+    /// A registry that never had peers maps to `NoPeers`, not `FleetCold`:
+    /// the two deliver identically but log differently, and "no siblings
+    /// exist" is a different operational fact from "siblings proved empty".
+    #[tokio::test]
+    async fn sweep_reports_no_peers_when_discovery_confirms_none() {
+        let deps = sweep_deps(vec![], 64, &["http://w1:30000"]);
+        let ranks = vec![worker_id("http://w1:30000", 0)];
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            sweep_until_deadline(&deps, &ranks, Duration::from_secs(3600), Instant::now()),
+        )
+        .await
+        .expect("a confirmed-empty discovery settles immediately");
+        assert!(matches!(result, SweepResult::NoPeers));
+    }
+
+    /// A peer that warms up mid-sweep must be FOUND, not FleetColded on a
+    /// stale cold classification. The unreachable second peer is what keeps
+    /// the sweep alive past the cold peer's cooldown: without an unclassified
+    /// candidate in the mix, the fleet settles cold at the end of the pass
+    /// that classifies it — before its cooldown ever lets a warmer answer
+    /// through — by design.
+    #[tokio::test]
+    async fn sweep_finds_a_peer_that_warms_during_the_sweep() {
+        let warm = warm_snapshot("http://w1:30000", 64);
+        let (flipper, _q) = serve_snapshot_sequence(vec![witness_snapshot(&[]), warm]).await;
+        let deps = sweep_deps(
+            vec![flipper, "http://127.0.0.1:1".into()],
+            64,
+            &["http://w1:30000"],
+        );
+        let ranks = vec![worker_id("http://w1:30000", 0)];
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            sweep_until_deadline(&deps, &ranks, Duration::from_secs(3600), Instant::now()),
+        )
+        .await
+        .expect("the warm answer ends the sweep on its refetch pass");
+        assert!(
+            matches!(result, SweepResult::Found(_)),
+            "a peer that warms mid-sweep must be found, not settled cold",
+        );
+    }
+
+    /// The cold→warm remove itself: a peer re-fetched as warm-but-uncovering
+    /// must drop its cold witness, or its stale classification would let the
+    /// fleet settle cold while a warm peer exists. Drives `sweep_peers`
+    /// directly so the refetch is not hostage to pass timing.
+    #[tokio::test]
+    async fn a_warm_answer_erases_a_peers_cold_witness() {
+        let uncovering = warm_snapshot("http://w2:30000", 64);
+        let (flipper, _q) = serve_snapshot_sequence(vec![witness_snapshot(&[]), uncovering]).await;
+        // The unreachable second candidate keeps each pass from settling
+        // cold on the flipper's classification alone.
+        let deps = sweep_deps(
+            vec![flipper.clone(), "http://127.0.0.1:1".into()],
+            64,
+            &["http://w1:30000", "http://w2:30000"],
+        );
+        let ctx = SweepCtx {
+            http: &deps.http,
+            peers: &deps.peers,
+            bootstrap: &deps.bootstrap,
+            live_workers: &deps.live_workers,
+            oracle: &deps.oracle,
+            freshness_floor: Instant::now(),
+        };
+        let last_reason = Mutex::new(None);
+        let mut state = SweepState::new();
+        let ranks = vec![worker_id("http://w1:30000", 0)];
+
+        let pass1 = sweep_peers(&ctx, &ranks, &mut state, &last_reason).await;
+        assert!(matches!(pass1, SweepPass::KeepLooking));
+        assert!(state.cold_witnessed.contains(&flipper));
+
+        // Skip the cooldown so pass 2 re-fetches immediately.
+        state.cooldown.clear();
+        let pass2 = sweep_peers(&ctx, &ranks, &mut state, &last_reason).await;
+        assert!(matches!(pass2, SweepPass::KeepLooking));
+        assert!(
+            !state.cold_witnessed.contains(&flipper),
+            "the warm answer must erase the cold witness",
+        );
+        // And with the witness gone, a fleet of {warm-uncovering, rejected}
+        // is NOT cold — the warm peer might cover the ranks later.
+        state.note_permanent_reject("http://c:30000");
+        assert!(!state.fleet_is_cold(&[flipper.clone(), "http://c:30000".into()]));
+    }
+
+    /// The verdict primitives, pinned directly: cold counts, unknown vetoes,
+    /// rejection counts, empty is not cold.
+    #[test]
+    fn fleet_is_cold_only_when_every_candidate_proved_hopeless() {
+        let mut state = SweepState::new();
+        let a = "http://a:30000".to_string();
+        let cold = witness_snapshot(&[]);
+        let warm = warm_snapshot("http://w1:30000", 64);
+        let candidates = std::slice::from_ref(&a);
+
+        // No information at all is not cold.
+        assert!(!state.fleet_is_cold(&[]));
+        assert!(!state.fleet_is_cold(candidates));
+
+        state.note_answer(&a, &cold);
+        assert!(state.fleet_is_cold(candidates));
+
+        // An unreachable spell erases the witness: unknown warmth vetoes.
+        state.note_unreachable(&a);
+        assert!(!state.fleet_is_cold(candidates));
+
+        // Re-cold, then a warm answer erases it again.
+        state.note_answer(&a, &cold);
+        state.note_answer(&a, &warm);
+        assert!(!state.fleet_is_cold(candidates));
+
+        // Settled-empty (ready flag set, zero nodes) is cold too — the
+        // `is_cold` predicate's second disjunct, which `witness_snapshot`
+        // alone never isolates (it is cold on BOTH conditions).
+        let settled_empty = PeerSnapshot {
+            producer_ready: true,
+            nodes: vec![],
+            ..warm_snapshot("http://a:30000", 64)
+        };
+        state.note_answer(&a, &settled_empty);
+        assert!(state.fleet_is_cold(candidates));
+
+        // A peer whose OWN bootstrap has not settled reports
+        // `producer_ready: false` while already holding nodes it ingested
+        // live. `is_cold` (what vetting refuses on) is true for it, but it
+        // plainly HAS state — counting it cold would settle the fleet on the
+        // first pass while the only sibling is seconds from being a source.
+        let mid_bootstrap = PeerSnapshot {
+            producer_ready: false,
+            ..warm_snapshot("http://w1:30000", 64)
+        };
+        assert!(mid_bootstrap.is_cold(), "vetting still refuses to graft it");
+        state.note_answer(&a, &mid_bootstrap);
+        assert!(
+            !state.fleet_is_cold(candidates),
+            "a peer still bootstrapping with a non-empty tree is not a cold witness",
+        );
+
+        // Permanent rejection is terminal on its own.
+        let mut state = SweepState::new();
+        state.note_permanent_reject(&a);
+        assert!(state.fleet_is_cold(candidates));
+    }
+
+    /// End to end for the same hazard: the only candidate is a sibling
+    /// mid-bootstrap that already holds blocks. The sweep must keep looking
+    /// (and find it once it settles), not settle cold on the first pass.
+    #[tokio::test]
+    async fn sweep_waits_for_a_sibling_that_is_still_bootstrapping() {
+        let mid_bootstrap = PeerSnapshot {
+            producer_ready: false,
+            ..warm_snapshot("http://w1:30000", 64)
+        };
+        let (peer, _q) =
+            serve_snapshot_sequence(vec![mid_bootstrap, warm_snapshot("http://w1:30000", 64)])
+                .await;
+        let deps = sweep_deps(vec![peer], 64, &["http://w1:30000"]);
+        let ranks = vec![worker_id("http://w1:30000", 0)];
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            sweep_until_deadline(&deps, &ranks, Duration::from_secs(3600), Instant::now()),
+        )
+        .await
+        .expect("the peer settles on its second answer, well inside the deadline");
+        assert!(
+            matches!(result, SweepResult::Found(_)),
+            "a peer that holds a tree but has not settled must keep the sweep alive",
+        );
+    }
+
+    /// Cooldown sits a peer out for exactly the configured passes, then lets
+    /// it be refetched — a peer whose entry reaches zero is never stuck.
+    #[test]
+    fn cooling_sits_out_exactly_the_configured_passes() {
+        let mut state = SweepState::new();
+        state.note_sit_out("http://a:30000");
+        for _ in 0..PEER_COOLDOWN_PASSES {
+            assert!(state.cooling("http://a:30000"));
+        }
+        assert!(
+            !state.cooling("http://a:30000"),
+            "a peer at zero is refetched, never stuck",
+        );
+        assert!(!state.cooling("http://never-seen:30000"));
+    }
+
+    /// A same-length membership swap mid-pass — one pod replaced at constant
+    /// replica count, the rolling-update norm — must veto the cold-fleet
+    /// verdict even though the registry LENGTH is unchanged: the stale
+    /// candidate list proved cold, but the live newcomer was never consulted.
+    /// The swapping server stands in for the EndpointSlice informer landing a
+    /// `replace` while the pass was in flight.
+    #[tokio::test]
+    async fn sweep_survives_a_same_length_membership_swap_mid_pass() {
+        let cold = witness_snapshot(&[]);
+        let registry = Arc::new(PeerRegistry::new());
+        let reg_in_handler = Arc::clone(&registry);
+        let app = axum::Router::new().route(
+            SNAPSHOT_PATH,
+            axum::routing::get(move || {
+                let registry = Arc::clone(&reg_in_handler);
+                let snap = cold.clone();
+                async move {
+                    // First fetch: the informer swaps this peer for one that
+                    // is down — same length, different membership.
+                    registry.replace(vec!["http://127.0.0.1:1".to_string()]);
+                    axum::Json(snap)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        registry.replace(vec![format!("http://{addr}")]);
+
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(64).expect("first set establishes");
+        let (ctrl_tx, _rx) = mpsc::channel(8);
+        let deps = BootstrapDeps {
+            http: reqwest::Client::new(),
+            peers: registry,
+            bootstrap: Arc::new(BootstrapTracker::new(Duration::from_secs(3600))),
+            live_workers: Arc::new(Mutex::new(
+                ["http://w1:30000"]
+                    .iter()
+                    .map(|u| worker_id(u, 0))
+                    .collect(),
+            )),
+            oracle,
+            ctrl_tx,
+        };
+        let ranks = vec![worker_id("http://w1:30000", 0)];
+        let result =
+            sweep_until_deadline(&deps, &ranks, Duration::from_millis(500), Instant::now()).await;
+        assert!(
+            matches!(result, SweepResult::TimedOut { .. }),
+            "a mid-pass membership swap must veto the verdict, length unchanged or not",
+        );
+    }
+
+    /// `deliver_bootstrap` is the one recording point for the sweep metric:
+    /// every terminal verdict tallies exactly once, so `fleet_cold` stays
+    /// distinguishable from `timed_out` on dashboards.
+    #[tokio::test]
+    async fn deliver_bootstrap_records_the_sweep_verdict_once() {
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel(8);
+        let bootstrap = Arc::new(BootstrapTracker::new(Duration::from_secs(3600)));
+        let deps = BootstrapDeps {
+            http: reqwest::Client::new(),
+            peers: Arc::new(PeerRegistry::new()),
+            bootstrap: Arc::clone(&bootstrap),
+            live_workers: Arc::new(Mutex::new(HashSet::new())),
+            oracle: BlockSizeOracle::new(),
+            ctrl_tx,
+        };
+        deliver_bootstrap(
+            &deps,
+            vec![],
+            SweepResult::FleetCold { peers_tried: 3 },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            matches!(
+                ctrl_rx.recv().await,
+                Some(PumpControl::AbandonBootstrap { .. })
+            ),
+            "a cold fleet releases its ranks through the same abandon path",
+        );
+        assert!(
+            bootstrap.sweep_result_counts().contains(&("fleet_cold", 1)),
+            "the verdict must be tallied exactly once; got {:?}",
+            bootstrap.sweep_result_counts(),
+        );
+    }
+
+    /// Serve a sequence of canned bodies on the real snapshot path: hit N
+    /// gets `snaps[min(N, len-1)]`, so a test can flip a peer's temperature
+    /// mid-sweep.
+    async fn serve_snapshot_sequence(
+        snaps: Vec<PeerSnapshot>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+        let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&queries);
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            SNAPSHOT_PATH,
+            axum::routing::get(move |uri: axum::http::Uri| {
+                let seen = Arc::clone(&seen);
+                let hits = Arc::clone(&hits);
+                let snaps = snaps.clone();
+                async move {
+                    seen.lock()
+                        .expect("queries lock")
+                        .push(uri.query().map(str::to_string));
+                    let n = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(snaps[n.min(snaps.len() - 1)].clone())
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), queries)
     }
 
     /// A worker discovered after readiness opened must still be allowed to warm.

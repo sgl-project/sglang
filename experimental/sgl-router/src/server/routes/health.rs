@@ -24,7 +24,8 @@ pub async fn healthz() -> StatusCode {
 /// 3. Cache-aware peer bootstrap has settled. A replica with an empty KV tree
 ///    routes cache-blind AND scatters prefixes the warm replicas were keeping
 ///    consolidated, so it is held out of the Service until it has pulled a
-///    snapshot from a sibling — or until `--kv-bootstrap-timeout-ms` gives up.
+///    snapshot from a sibling — or until every sibling proves it has no state
+///    to give — or until `--kv-bootstrap-timeout-ms` gives up.
 ///    Always true unless BOTH cache-aware-zmq and `--kv-peer-selector` are
 ///    configured; that pair is what enables the gate at all.
 ///

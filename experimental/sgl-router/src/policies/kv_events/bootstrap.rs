@@ -192,8 +192,12 @@ pub enum SnapshotOutcome {
     /// Peer did not answer, or answered non-200 (including the 404 an older
     /// router image returns for an endpoint it does not serve).
     Unreachable,
-    /// Peer answered but is itself still bootstrapping, so its tree is no
-    /// better than ours.
+    /// Peer answered but has no graftable state for us: still bootstrapping,
+    /// settled with an empty tree, or holding a real tree that shares no
+    /// carriers with our live workers (`NothingUsable`). The last case is a
+    /// WARM peer — deliberately not what [`PeerSnapshot::is_cold`] means, so
+    /// it cannot count toward the sweep's cold-fleet verdict even though it
+    /// shares this metric label.
     ColdPeer,
     /// Peer answered with a snapshot we must not trust: unknown format, an
     /// invalid parent reference, or a block size that makes its hashes
@@ -208,6 +212,29 @@ impl SnapshotOutcome {
             Self::Unreachable => "unreachable",
             Self::ColdPeer => "cold_peer",
             Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// How one bounded peer sweep ended. Doubles as the `result` label on
+/// `sgl_router_kv_bootstrap_sweep_total`; a closed, compiler-checked set like
+/// [`SnapshotOutcome`]'s, since a bare string label would let any call site
+/// mint new metric values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepOutcome {
+    Found,
+    NoPeers,
+    FleetCold,
+    TimedOut,
+}
+
+impl SweepOutcome {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Found => "found",
+            Self::NoPeers => "no_peers",
+            Self::FleetCold => "fleet_cold",
+            Self::TimedOut => "timed_out",
         }
     }
 }
@@ -240,8 +267,9 @@ pub enum RankOutcome {
     /// The accepted snapshot tracked no cursor for this rank, so there was no
     /// watermark to splice against.
     Uncovered,
-    /// No peer supplied a usable snapshot before the bootstrap deadline, or
-    /// discovery confirmed there are no siblings.
+    /// No peer supplied a usable snapshot: the bootstrap deadline expired,
+    /// discovery confirmed there are no siblings, or every sibling proved it
+    /// has no state to give (settled-empty or permanently incompatible).
     Abandoned,
     /// Too many batches piled up waiting for a snapshot; the held prefix was
     /// dropped, so no snapshot can be spliced across it.
@@ -318,6 +346,29 @@ pub struct PeerSnapshot {
 }
 
 impl PeerSnapshot {
+    /// Whether this body is unusable as a graft source right now: the producer
+    /// says it is not ready, or the tree is empty. The single definition of
+    /// "cold" for vetting ([`VetError::ProducerCold`]).
+    pub fn is_cold(&self) -> bool {
+        !self.producer_ready || self.holds_no_state()
+    }
+
+    /// Whether this body proves the producer has nothing to hand over — an
+    /// empty tree.
+    ///
+    /// Deliberately weaker than [`Self::is_cold`], and the predicate the peer
+    /// sweep's cold-fleet verdict is built on. `producer_ready` conjoins "my
+    /// own bootstrap has settled" with "my tree is non-empty", so a peer that
+    /// is mid-bootstrap while already ingesting live events answers
+    /// `producer_ready: false` with a NON-empty node list. Vetting must still
+    /// refuse to graft from it, but the sweep must keep waiting on it:
+    /// counting it as a cold witness lets a joining replica settle cold on the
+    /// first pass while a sibling seconds from being a usable source is the
+    /// only candidate in the fleet.
+    pub fn holds_no_state(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
     /// Last-applied sequence this producer reports for a rank, addressed by wire
     /// identity rather than [`KvWorkerId`].
     ///
@@ -683,7 +734,7 @@ impl VettedSnapshot {
         // Defence in depth against a producer that miscomputes the flag: an
         // empty tree is worthless to graft either way, and accepting it would
         // mark the rank Recovered and stop the search at a peer with nothing.
-        if !snap.producer_ready || snap.nodes.is_empty() {
+        if snap.is_cold() {
             return Err(VetError::ProducerCold);
         }
         if let Some(local) = local_block_size {
@@ -784,6 +835,15 @@ impl VettedSnapshot {
     }
 }
 
+/// Rate-limit key for the snapshot-attempt log: one entry per peer per
+/// verdict.
+type PeerOutcomeKey = (String, &'static str);
+
+/// Rate-limit state for one [`PeerOutcomeKey`]: attempt count plus the
+/// last-seen detail, so a cause CHANGE under the same verdict is surfaced
+/// rather than throttled away.
+type AttemptLogState = (u64, String);
+
 /// Tracks per-rank bootstrap progress and answers the one question `/readyz`
 /// needs: has initial bootstrap settled?
 ///
@@ -860,6 +920,14 @@ pub struct BootstrapTracker {
     /// reasoning as `peer_outcomes`; separate map because the two count
     /// different things and mixing them makes both undivisible.
     rank_outcomes: Mutex<HashMap<&'static str, u64>>,
+    /// Per-(peer, outcome) fetch-attempt counts and last-seen detail, used
+    /// only to rate-limit the attempt log in [`Self::record_peer_outcome`].
+    peer_attempts: Mutex<HashMap<PeerOutcomeKey, AttemptLogState>>,
+    /// Per-sweep-verdict tallies keyed by [`SweepOutcome::as_label`]. Rank and
+    /// fetch outcomes alone cannot separate "settled cold as soon as every
+    /// sibling proved empty" from "burned the whole deadline" — both end in
+    /// `RankOutcome::Abandoned` — so the sweep's own verdict gets a counter.
+    sweep_results: Mutex<HashMap<&'static str, u64>>,
 }
 
 impl BootstrapTracker {
@@ -893,6 +961,8 @@ impl BootstrapTracker {
             gap_retried: Mutex::new(HashSet::new()),
             peer_outcomes: Mutex::new(HashMap::new()),
             rank_outcomes: Mutex::new(HashMap::new()),
+            peer_attempts: Mutex::new(HashMap::new()),
+            sweep_results: Mutex::new(HashMap::new()),
         }
     }
 
@@ -903,11 +973,41 @@ impl BootstrapTracker {
             .lock()
             .entry(outcome.as_label())
             .or_insert(0) += 1;
-        if outcome != SnapshotOutcome::Accepted {
+        if outcome == SnapshotOutcome::Accepted {
+            return;
+        }
+        let detail = detail.unwrap_or("");
+        let (attempts, detail_changed) = {
+            let mut counts = self.peer_attempts.lock();
+            let entry = counts
+                .entry((peer.to_string(), outcome.as_label()))
+                .or_insert((0, String::new()));
+            entry.0 += 1;
+            let changed = entry.1 != detail;
+            if changed {
+                entry.1 = detail.to_string();
+            }
+            (entry.0, changed && entry.0 > 1)
+        };
+        // The first failure against a peer is signal; the thousandth repeat of
+        // the same verdict is not — but a sweep kept alive by unreachable or
+        // non-covering peers must still show progress at the default log level.
+        // A detail CHANGE under the same verdict (connection-refused becoming
+        // DNS, 404 becoming 503) is a new cause, not a repeat: surface it too.
+        if attempts == 1 || attempts % 100 == 0 || detail_changed {
+            info!(
+                peer = %peer,
+                outcome = outcome.as_label(),
+                attempts,
+                detail,
+                "kv-bootstrap: snapshot attempt did not yield state",
+            );
+        } else {
             debug!(
                 peer = %peer,
                 outcome = outcome.as_label(),
-                detail = detail.unwrap_or(""),
+                attempts,
+                detail,
                 "kv-bootstrap: snapshot attempt did not yield state",
             );
         }
@@ -935,6 +1035,25 @@ impl BootstrapTracker {
     /// Per-rank tallies for the metrics surface.
     pub fn rank_outcome_counts(&self) -> Vec<(&'static str, u64)> {
         self.rank_outcomes
+            .lock()
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect()
+    }
+
+    /// Tally one peer sweep's terminal verdict. Called once per sweep, from
+    /// the delivery point, so the counts sum to the number of sweeps run.
+    pub fn record_sweep_result(&self, result: SweepOutcome) {
+        *self
+            .sweep_results
+            .lock()
+            .entry(result.as_label())
+            .or_insert(0) += 1;
+    }
+
+    /// Per-sweep-verdict tallies for the metrics surface.
+    pub fn sweep_result_counts(&self) -> Vec<(&'static str, u64)> {
+        self.sweep_results
             .lock()
             .iter()
             .map(|(k, v)| (*k, *v))
@@ -1229,11 +1348,20 @@ pub(crate) fn cursors_url(peer_base_url: &str) -> String {
 /// (and component tests exercise it). An older PRODUCER ignores the parameter
 /// and answers from its own cache, so the fleet degrades to the pre-parameter
 /// behaviour rather than failing.
+/// What a snapshot fetch got back.
+pub enum FetchAnswer {
+    Body(PeerSnapshot),
+    /// The peer answered non-success. The status distinguishes "an older
+    /// router image that does not serve this route" (404) from a sick peer
+    /// (5xx) — both retriable, but the first-occurrence log should name which.
+    NoBody(reqwest::StatusCode),
+}
+
 pub async fn fetch_snapshot(
     http: &reqwest::Client,
     peer_base_url: &str,
     max_age: Option<Duration>,
-) -> Result<Option<PeerSnapshot>, anyhow::Error> {
+) -> Result<FetchAnswer, anyhow::Error> {
     fetch_body(http, &snapshot_url(peer_base_url, max_age), peer_base_url).await
 }
 
@@ -1265,7 +1393,11 @@ pub async fn fetch_cursors(
     http: &reqwest::Client,
     peer_base_url: &str,
 ) -> Result<Option<PeerSnapshot>, anyhow::Error> {
-    fetch_body(http, &cursors_url(peer_base_url), peer_base_url).await
+    match fetch_body(http, &cursors_url(peer_base_url), peer_base_url).await {
+        Ok(FetchAnswer::Body(snap)) => Ok(Some(snap)),
+        Ok(FetchAnswer::NoBody(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Shared transport for both fetch shapes: send, branch on what the peer
@@ -1290,7 +1422,7 @@ async fn fetch_body(
     http: &reqwest::Client,
     url: &str,
     peer_base_url: &str,
-) -> Result<Option<PeerSnapshot>, anyhow::Error> {
+) -> Result<FetchAnswer, anyhow::Error> {
     let resp = http
         .get(url)
         .header(reqwest::header::ACCEPT_ENCODING, "gzip")
@@ -1302,7 +1434,7 @@ async fn fetch_body(
             status = %resp.status(),
             "kv-bootstrap: peer returned no usable body for the snapshot request",
         );
-        return Ok(None);
+        return Ok(FetchAnswer::NoBody(resp.status()));
     }
     // Branch on what the peer actually sent, not on what we asked for: a router
     // image that predates route compression answers identity, and must keep
@@ -1326,7 +1458,7 @@ async fn fetch_body(
     // more than saving a task hop on the cheap case.
     tokio::task::spawn_blocking(move || decode_snapshot(&body, gzipped))
         .await?
-        .map(Some)
+        .map(FetchAnswer::Body)
 }
 
 /// Inflate (when gzipped) and parse one snapshot body. Blocking and CPU-bound —
@@ -1510,6 +1642,25 @@ mod tests {
         let err = VettedSnapshot::from_wire(snap, &live(&[]), Some(64)).unwrap_err();
         assert_eq!(err, VetError::ProducerCold);
         assert_eq!(err.outcome(), SnapshotOutcome::ColdPeer);
+    }
+
+    /// The `!producer_ready` arm in isolation: a replica still holding blocks
+    /// while another rank is pending (producer_ready conjoins settled AND
+    /// non-empty) is not a usable source either — grafting from it would mark
+    /// the rank Recovered and stop the search at an incomplete tree.
+    #[test]
+    fn vet_rejects_a_not_ready_producer_even_with_nodes() {
+        let mut snap = snapshot(
+            vec![WireWorker {
+                url: "http://w1:30000".into(),
+                dp_rank: 0,
+            }],
+            vec![node(None, 7, vec![0])],
+        );
+        snap.producer_ready = false;
+        let err = VettedSnapshot::from_wire(snap, &live(&[("http://w1:30000", 0)]), Some(64))
+            .unwrap_err();
+        assert_eq!(err, VetError::ProducerCold);
     }
 
     /// A settled-but-empty replica (its own bootstrap timed out) must not be
