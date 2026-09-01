@@ -1,8 +1,10 @@
 import os
 import socket
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.server_args import PortArgs
 from sglang.srt.utils.network import (
     _get_addrinfos_for_bind,
     bind_port,
@@ -133,6 +135,7 @@ class TestSocketUtilities(CustomTestCase):
                 "sglang.srt.utils.network._read_linux_ephemeral_port_range",
                 return_value=(10000, 61000),
             ),
+            patch("sglang.srt.utils.network.random.randrange", return_value=8975),
             patch(
                 "sglang.srt.utils.network.is_port_available",
                 side_effect=mock_is_port_available,
@@ -209,6 +212,43 @@ class TestSocketUtilities(CustomTestCase):
                 self.assertGreater(port, occupied_port)
         finally:
             sock.close()
+
+
+class TestPortArgsRendezvousPortExclusions(CustomTestCase):
+    def test_rendezvous_exclusions_cover_later_bound_listener_ports(self):
+        server_args = SimpleNamespace(
+            port=32000,
+            dp_size=3,
+            engine_info_bootstrap_port=6789,
+            grpc_port=32010,
+            gated_launch_port=32011,
+            smg_grpc_mode=True,
+            grpc_mode=False,
+            smg_http_sidecar_port=32012,
+            disaggregation_bootstrap_port=8998,
+            encoder_bootstrap_port=8997,
+            remote_instance_weight_loader_seed_instance_service_port=32013,
+            remote_instance_weight_loader_send_weights_group_ports=[32014, 32015],
+        )
+
+        exclusions = set(PortArgs._rendezvous_port_exclusions(server_args))
+
+        self.assertTrue(
+            {
+                6789,
+                8997,
+                8998,
+                32000,
+                32001,
+                32002,
+                32010,
+                32011,
+                32012,
+                32013,
+                32014,
+                32015,
+            }.issubset(exclusions)
+        )
 
 
 class TestReservePort(CustomTestCase):

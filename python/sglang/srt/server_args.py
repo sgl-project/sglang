@@ -4331,15 +4331,29 @@ class PortArgs:
 
     @staticmethod
     def _rendezvous_port_exclusions(server_args: ServerArgs) -> List[int]:
-        ports = [server_args.port, server_args.engine_info_bootstrap_port]
+        ports = [
+            server_args.port + dp_rank for dp_rank in range(server_args.dp_size)
+        ] + [
+            server_args.disaggregation_bootstrap_port,
+            server_args.encoder_bootstrap_port,
+            server_args.engine_info_bootstrap_port,
+        ]
         if server_args.grpc_port is not None:
             ports.append(server_args.grpc_port)
+        if server_args.gated_launch_port is not None:
+            ports.append(server_args.gated_launch_port)
         if server_args.smg_grpc_mode or server_args.grpc_mode:
             ports.append(
                 server_args.smg_http_sidecar_port
                 if server_args.smg_http_sidecar_port is not None
                 else server_args.port + 1
             )
+        seed_port = server_args.remote_instance_weight_loader_seed_instance_service_port
+        if seed_port:
+            ports.append(seed_port)
+        group_ports = server_args.remote_instance_weight_loader_send_weights_group_ports
+        if group_ports:
+            ports.extend(group_ports)
         return ports
 
     @staticmethod
