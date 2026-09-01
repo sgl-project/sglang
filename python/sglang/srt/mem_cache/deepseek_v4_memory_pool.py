@@ -15,7 +15,10 @@ from sglang.kernels.ops.attention.dsv4 import (
 from sglang.kernels.ops.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
-from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.kernels.ops.attention.dsv4.index_buf_accessor import (
+    NopeFp8RopeBf16Pack,
+    fp8_dtype,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -257,6 +260,82 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         raise NotImplementedError("HiSparseC4DevicePool does not support load_cpu_copy")
 
 
+class AtomSoaKVPool(DeepSeekV4SingleKVPool):
+    """Two-buffer SoA storage that aiter's fp8 kernels (mla_decode_fwd_v4_nm #3112,
+    pa_sparse_prefill_fp8_opus #3751) read directly, with NO in-kernel dequant.
+
+    Per (page, slot):
+        nope_scale_buffer : 512 bytes uint8 = [ nope 448 fp8 | e8m0 14 (dup) | pad 50 ]
+        rope_buffer       : 64 bf16 (separate tensor, not quantized)
+
+    Numerics are identical to the base 584B packed pool (same fp8_e4m3fn, 1x64
+    e8m0); only the byte layout differs. Additive drop-in: the base class and its
+    FlashMLA consumers are untouched.
+    """
+
+    NOPE_BLOCK = 512  # 448 nope + 14 e8m0 (dup) + 50 pad
+    ROPE_DIM = 64
+
+    def _create_buffers(self):
+        from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+
+        num_pages = (self.size + self.page_size + 1) // self.page_size
+        self._num_pages = num_pages
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.nope_scale_buffer = [
+                    torch.zeros(
+                        num_pages,
+                        self.page_size * self.NOPE_BLOCK,
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.rope_buffer = [
+                    torch.zeros(
+                        num_pages,
+                        self.page_size * self.ROPE_DIM,
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+        # Compatibility: some call sites probe .kv_buffer; expose the nope block.
+        self.kv_buffer = self.nope_scale_buffer
+
+    def set_key_buffer(self, layer_id, loc, cache_nope_fp8_rope_bf16_pack):
+        from sglang.kernels.ops.attention.dsv4.atom_soa_pack import store_atom_soa
+
+        store_atom_soa(
+            self.nope_scale_buffer[layer_id],
+            self.rope_buffer[layer_id],
+            loc,
+            cache_nope_fp8_rope_bf16_pack,
+            self.page_size,
+        )
+
+    def set_key_buffer_fused(self, layer_id, loc, cache_k):
+        raise NotImplementedError("AtomSoaKVPool has no fused store yet.")
+
+    def get_nope_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        """[num_pages, page_size, 512] viewed as fp8 for the aiter kernel."""
+        buf = self.nope_scale_buffer[layer_id - self.start_layer]
+        return buf.view(fp8_dtype).view(self._num_pages, self.page_size, self.NOPE_BLOCK)
+
+    def get_rope_buffer(self, layer_id: int) -> torch.Tensor:
+        """[num_pages, page_size, 64] bf16 rope, separate tensor."""
+        buf = self.rope_buffer[layer_id - self.start_layer]
+        return buf.view(self._num_pages, self.page_size, self.ROPE_DIM)
+
+    def get_key_buffer(self, layer_id: int):
+        return self.get_nope_scale_buffer(layer_id)
+
+
 class DeepSeekV4IndexerPool(KVCache):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
@@ -460,6 +539,91 @@ class DeepSeekV4UnifiedKVPool:
         return data_ptrs, data_lens, item_lens
 
 
+class DeepSeekV4UnifiedKVPoolFp8:
+    """FP8 SoA twin of :class:`DeepSeekV4UnifiedKVPool` for aiter's fp8 kernels.
+
+    Same row addressing as the bf16 unified pool (rows ``[0, swa_pages)`` = SWA
+    ring, rows ``[swa_pages, ...)`` = compressed), but each ratio is backed by
+    TWO buffers instead of one bf16 ``[rows, head_dim]``:
+
+        nope_scale[L] : ``[rows, 512]`` uint8  = [ 448 fp8 nope | 14 e8m0 (dup) | 50 pad ]
+        rope[L]       : ``[rows, 64]``  bf16    (RoPE kept in bf16, separate tensor)
+
+    aiter ``mla_decode_fwd_v4_nm`` / ``pa_sparse_prefill_fp8_opus`` read these two
+    buffers directly with no in-kernel dequant.
+    """
+
+    K_PER_BLOCK = {0: 0, 4: 32, 128: 1}
+
+    NOPE_BLOCK = 512
+    ROPE_DIM = 64
+
+    def __init__(
+        self,
+        *,
+        stage_ratios: List[int],
+        num_slots: int,
+        num_blocks: int,
+        page_size: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        device: str,
+        memory_saver_adapter,
+        custom_mem_pool,
+        swa_ring_size: int,
+    ):
+        self.swa_ring_size = swa_ring_size
+        self.head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.num_slots = num_slots
+        self.swa_pages = num_slots * self.swa_ring_size
+        self.num_blocks = num_blocks
+        self.page_size = page_size
+        self.k_per_block = dict(self.K_PER_BLOCK)
+
+        nope_bufs: List[torch.Tensor] = []
+        rope_bufs: List[torch.Tensor] = []
+        with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(custom_mem_pool)
+                if custom_mem_pool
+                else nullcontext()
+            ):
+                for ratio in stage_ratios:
+                    compress_rows = self.num_blocks * self.k_per_block[ratio]
+                    rows_per_page = self.page_size // ratio if ratio else 0
+                    rows = self.swa_pages + compress_rows + rows_per_page
+                    nope_bufs.append(
+                        torch.zeros(
+                            rows, self.NOPE_BLOCK, dtype=torch.uint8, device=device
+                        )
+                    )
+                    rope_bufs.append(
+                        torch.zeros(
+                            rows, self.ROPE_DIM, dtype=torch.bfloat16, device=device
+                        )
+                    )
+        self.nope_scale_buffer = nope_bufs
+        self.rope_buffer = rope_bufs
+        # Compatibility shim: call sites that only probe ``.kv_buffer`` (buf_infos,
+        # capture-safe checks) see the nope buffers.
+        self.kv_buffer = nope_bufs
+
+    def get_unified_kv_nope(self, local_layer_id: int) -> torch.Tensor:
+        """``[rows, 512]`` viewed as fp8 for the aiter kernel."""
+        return self.nope_scale_buffer[local_layer_id].view(fp8_dtype)
+
+    def get_unified_kv_rope(self, local_layer_id: int) -> torch.Tensor:
+        """``[rows, 64]`` bf16 RoPE."""
+        return self.rope_buffer[local_layer_id]
+
+    def get_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        bufs = self.nope_scale_buffer + self.rope_buffer
+        data_ptrs = [b.data_ptr() for b in bufs]
+        data_lens = [b.nbytes for b in bufs]
+        item_lens = [b[0].nbytes for b in bufs]
+        return data_ptrs, data_lens, item_lens
+
+
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def __init__(
@@ -574,10 +738,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         c128_page_size = page_size // 128
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_aiter,
             is_unified_kv_triton,
         )
 
         self._unified_kv = is_unified_kv_triton()
+        self._unified_kv_fp8 = is_unified_kv_aiter()
 
         if self._unified_kv:
             self.swa_kv_pool = None
@@ -588,7 +754,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 if get_spec().speculative_algorithm is not None
                 else 0
             )
-            self.unified_kv_pool = DeepSeekV4UnifiedKVPool(
+            unified_pool_cls = (
+                DeepSeekV4UnifiedKVPoolFp8
+                if self._unified_kv_fp8
+                else DeepSeekV4UnifiedKVPool
+            )
+            self.unified_kv_pool = unified_pool_cls(
                 stage_ratios=stage_ratios,
                 num_slots=self.num_req_slots,
                 num_blocks=self.c128_size,
@@ -660,6 +831,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # layer's transfer before attention reads it. No-op when HiCache is off.
         self.wait_layer_transfer(layer_id)
         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
+
+    def get_unified_kv_nope(self, layer_id: int) -> torch.Tensor:
+        """FP8 SoA unified nope_scale buffer ``[rows, 512]`` (aiter path only)."""
+        self.wait_layer_transfer(layer_id)
+        return self.unified_kv_pool.get_unified_kv_nope(layer_id - self._stage_start)
+
+    def get_unified_kv_rope(self, layer_id: int) -> torch.Tensor:
+        """FP8 SoA unified rope buffer ``[rows, 64]`` bf16 (aiter path only)."""
+        self.wait_layer_transfer(layer_id)
+        return self.unified_kv_pool.get_unified_kv_rope(layer_id - self._stage_start)
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping

@@ -215,8 +215,33 @@ class CompressorBackendMixin:
 
         state_pool = compressor.get_state_pool(self)
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_aiter,
             is_unified_kv_triton,
         )
+
+        # fp8 SoA unified: the compressed (non-indexer) KV must land in the two
+        # fp8 buffers aiter reads. The indexer store is a separate pool and is
+        # left on its existing all-in-one path below.
+        if is_unified_kv_aiter() and not compressor.is_in_indexer:
+            self._forward_unified_compress_fp8(
+                token_to_kv_pool=token_to_kv_pool,
+                kv_score_input=kv_score_input,
+                state_pool=state_pool,
+                compressor=compressor,
+                layer_id=layer_id,
+            )
+            online_c128_mtp = getattr(self, "online_c128_mtp", None)
+            if online_c128_mtp is not None:
+                online_c128_mtp.write_prefix_states(
+                    layer_id=layer_id,
+                    compressor=compressor,
+                    kv_score_input=kv_score_input,
+                    logical_forward_mode=getattr(
+                        forward_batch, "_original_forward_mode", None
+                    )
+                    or forward_batch.forward_mode,
+                )
+            return
 
         out_loc = self._get_out_loc(compressor.ratio)
         use_fp4_indexer = (
@@ -268,6 +293,98 @@ class CompressorBackendMixin:
                 )
                 or forward_batch.forward_mode,
             )
+
+    def _forward_unified_compress_fp8(
+        self,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        kv_score_input: torch.Tensor,
+        state_pool,
+        compressor: Compressor,
+        layer_id: int,
+    ) -> None:
+        """Compressed-KV store for the fp8 SoA unified path (aiter kernels).
+
+        Reuses the exact bf16 compressed-K production of ``_forward_unified_hip``
+        (compress_forward -> fused norm+rope -> decode boundary zeroing), but the
+        write target is the UNIFIED compressed rows (``c{ratio}_out_loc``) and the
+        store quantizes to the two fp8 SoA buffers instead of the packed AoS
+        extra-key pool. Only this step's compressed tokens are materialized in
+        bf16 (small), so the persistent unified store stays fp8.
+        """
+        from sglang.kernels.ops.attention.deepseek_v4_rope import (
+            fused_norm_rope_inplace_triton,
+        )
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime_fp8
+
+        compress_ratio = compressor.ratio
+        head_dim = compressor.head_dim
+        assert not compressor.is_in_indexer
+        assert head_dim == runtime_fp8.HEAD_DIM, (
+            f"fp8 unified compress expects head_dim={runtime_fp8.HEAD_DIM}, "
+            f"got {head_dim}"
+        )
+
+        plan = self._get_paged_compress_metadata(compress_ratio)
+
+        coff = 2 if is_overlap_compress(compress_ratio) else 1
+        last_dim = 2 * head_dim * coff
+        kv_score_buffer = state_pool.kv_score_buffer.kv_score
+        kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
+
+        kv_compressed = compress_forward(
+            kv_score_buffer=kv_score_buffer,
+            kv_score_input=kv_score_input,
+            ape=compressor.ape.view(-1, head_dim),
+            plan=plan,
+            compress_ratio=compress_ratio,
+            head_dim=head_dim,
+            is_online=False,
+        )
+        if kv_compressed.shape[0] == 0:
+            return
+
+        # Decode: zero non-boundary tokens (their out_loc == 0 null slot).
+        if plan.is_decode:
+            plan_raw = plan[1].view(torch.int32)
+            seq_lens_plan = plan_raw[:, 0].to(torch.int32)
+            is_boundary = (seq_lens_plan % compress_ratio == 0).unsqueeze(-1)
+            kv_compressed = torch.where(
+                is_boundary, kv_compressed, torch.zeros_like(kv_compressed)
+            )
+
+        positions = _extract_positions_from_plan(plan, compress_ratio)
+        positions_safe = positions.clamp(min=0)
+        fused_norm_rope_inplace_triton(
+            kv_compressed,
+            compressor.norm.weight,
+            compressor.norm.variance_epsilon,
+            compressor.freqs_cis,
+            positions=positions_safe,
+        )
+
+        # Unified compressed row targets (absolute rows into the unified store).
+        out_loc = getattr(
+            self.forward_metadata.core_metadata.unified,
+            f"c{compress_ratio}_out_loc",
+        )
+        if plan.is_decode:
+            kv_to_store = kv_compressed
+            out_loc_to_store = out_loc
+        else:
+            kv_to_store = kv_compressed
+            plan_raw = plan[1].view(torch.int32)
+            ragged_ids = plan_raw[:, 1].to(torch.int32) & 0xFFFF
+            out_loc_to_store = out_loc[ragged_ids.long()]
+
+        if kv_to_store.shape[0] == 0:
+            return
+
+        runtime_fp8.store_compress_into_unified_fp8(
+            kv_compressed=kv_to_store,
+            out_loc=out_loc_to_store,
+            nope_buf=token_to_kv_pool.get_unified_kv_nope(layer_id),
+            rope_buf=token_to_kv_pool.get_unified_kv_rope(layer_id),
+        )
 
     def _forward_unified_hip(
         self,

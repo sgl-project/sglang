@@ -1225,12 +1225,34 @@ class DeepseekV4HipRadixBackend(
         core_attn_metadata: DSV4AttnMetadata,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
-        """unified_kv paged-attention path over the bf16 unified_kv"""
+        """unified_kv paged-attention path.
+
+        Two variants share this method (identical index-stream plumbing):
+          * bf16 Triton (``unified_kv_triton``): one bf16 [rows,512] buffer,
+            vendored Triton decode/prefill.
+          * fp8 SoA (``unified_kv_aiter``): two buffers (fp8 nope_scale [rows,512]
+            + bf16 rope [rows,64]), aiter ``mla_decode_fwd_v4_nm`` /
+            ``pa_sparse_prefill_fp8_opus``.
+        """
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_aiter,
+        )
+
+        aiter_fp8 = is_unified_kv_aiter()
+        if aiter_fp8:
+            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import (
+                runtime_fp8,
+            )
 
         pool = self.token_to_kv_pool
         layer_id = layer.layer_id
-        unified = pool.get_unified_kv(layer_id)
+        if aiter_fp8:
+            unified = None
+            nope_buf = pool.get_unified_kv_nope(layer_id)
+            rope_buf = pool.get_unified_kv_rope(layer_id)
+        else:
+            unified = pool.get_unified_kv(layer_id)
         win = pool.unified_swa_window
         ring_stride = pool.unified_swa_ring_size
         swa_pages = pool.unified_swa_pages
@@ -1259,15 +1281,27 @@ class DeepseekV4HipRadixBackend(
             else:
                 state_slot = forward_batch.req_pool_indices[:T]
             if save_kv_cache:
-                runtime.store_swa_into_unified(
-                    kv=kv,
-                    state_slot=state_slot,
-                    positions=positions,
-                    unified_kv=unified,
-                    win=win,
-                    ring_stride=ring_stride,
-                    final_pos=positions,
-                )
+                if aiter_fp8:
+                    runtime_fp8.store_swa_into_unified_fp8(
+                        kv=kv,
+                        state_slot=state_slot,
+                        positions=positions,
+                        nope_buf=nope_buf,
+                        rope_buf=rope_buf,
+                        win=win,
+                        ring_stride=ring_stride,
+                        final_pos=positions,
+                    )
+                else:
+                    runtime.store_swa_into_unified(
+                        kv=kv,
+                        state_slot=state_slot,
+                        positions=positions,
+                        unified_kv=unified,
+                        win=win,
+                        ring_stride=ring_stride,
+                        final_pos=positions,
+                    )
             unified_metadata = core_attn_metadata.unified
             if compress_ratio == 0:
                 kv_indices = unified_metadata.swa_indices
@@ -1288,6 +1322,16 @@ class DeepseekV4HipRadixBackend(
                 )
             else:
                 raise ValueError(f"bad compress_ratio {compress_ratio}")
+            if aiter_fp8:
+                return runtime_fp8.decode(
+                    q=q,
+                    nope_buf=nope_buf,
+                    rope_buf=rope_buf,
+                    kv_indices=kv_indices,
+                    kv_indptr=kv_indptr,
+                    attn_sink=attn_sink,
+                    softmax_scale=self.softmax_scale,
+                )
             return runtime.decode(
                 q=q,
                 unified_kv=unified,
@@ -1363,17 +1407,31 @@ class DeepseekV4HipRadixBackend(
             pad = T + 1 - kpre_p.shape[0]
             kpre_p = torch.cat([kpre_p, kpre_p[-1:].expand(pad)])
             kext_p = torch.cat([kext_p, kext_p[-1:].expand(pad)])
-        o = runtime.prefill(
-            q=q,
-            unified_kv=unified,
-            kv_indices_prefix=kpre_i,
-            kv_indptr_prefix=kpre_p,
-            kv_extend=kv,
-            kv_indices_extend=kext_i,
-            kv_indptr_extend=kext_p,
-            attn_sink=attn_sink,
-            softmax_scale=self.softmax_scale,
-        )
+        if aiter_fp8:
+            o = runtime_fp8.prefill(
+                q=q,
+                nope_buf=nope_buf,
+                rope_buf=rope_buf,
+                kv_indices_prefix=kpre_i,
+                kv_indptr_prefix=kpre_p,
+                kv_extend=kv,
+                kv_indices_extend=kext_i,
+                kv_indptr_extend=kext_p,
+                attn_sink=attn_sink,
+                softmax_scale=self.softmax_scale,
+            )
+        else:
+            o = runtime.prefill(
+                q=q,
+                unified_kv=unified,
+                kv_indices_prefix=kpre_i,
+                kv_indptr_prefix=kpre_p,
+                kv_extend=kv,
+                kv_indices_extend=kext_i,
+                kv_indptr_extend=kext_p,
+                attn_sink=attn_sink,
+                softmax_scale=self.softmax_scale,
+            )
 
         # write this chunk's SWA K into the ring for future chunks / decode
         # only the final-window tokens per request
@@ -1385,15 +1443,27 @@ class DeepseekV4HipRadixBackend(
             _ring_final_pos = final_pos_full if _cp_active else final_pos
             _ring_positions = positions_full if _cp_active else positions
             n_real = _ring_state_slot.shape[0]
-            runtime.store_swa_into_unified(
-                kv=kv[:n_real],
-                state_slot=_ring_state_slot,
-                positions=_ring_positions[:n_real],
-                unified_kv=unified,
-                win=win,
-                ring_stride=ring_stride,
-                final_pos=_ring_final_pos,
-            )
+            if aiter_fp8:
+                runtime_fp8.store_swa_into_unified_fp8(
+                    kv=kv[:n_real],
+                    state_slot=_ring_state_slot,
+                    positions=_ring_positions[:n_real],
+                    nope_buf=nope_buf,
+                    rope_buf=rope_buf,
+                    win=win,
+                    ring_stride=ring_stride,
+                    final_pos=_ring_final_pos,
+                )
+            else:
+                runtime.store_swa_into_unified(
+                    kv=kv[:n_real],
+                    state_slot=_ring_state_slot,
+                    positions=_ring_positions[:n_real],
+                    unified_kv=unified,
+                    win=win,
+                    ring_stride=ring_stride,
+                    final_pos=_ring_final_pos,
+                )
         return o
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
