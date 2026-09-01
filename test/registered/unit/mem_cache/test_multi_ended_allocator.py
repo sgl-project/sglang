@@ -1867,7 +1867,72 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         # And .size matches this conserved sum.
         self.assertEqual(allocator.size, full_avail_before)
 
-    # 16. REGRESSION: the page-math helper used by
+    def _build_mamba_composite(self):
+        """Minimal full+mamba composite sharing one byte buffer."""
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            UnifiedMambaTokenToKVPoolAllocator,
+        )
+
+        full_spec = _make_mha_spec("full", "up")
+        mamba_spec = _make_mamba_spec("mamba", "down")
+        pool = UnifiedKVPool(
+            total_bytes=16 * self.PAGE_SIZE * full_spec.entry_bytes()
+            + 8 * mamba_spec.entry_bytes(),
+            sub_pool_specs=[full_spec, mamba_spec],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        full_kv = _FakeKVCache(pool.max_slots("full"))
+        full_kv.attach_allocator = lambda allocator: None
+        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        mamba_kv.attach_allocator = lambda allocator: None
+        mamba_kv._copy_from_physical = lambda src, dst: None
+
+        class _FakeHybridLinearKVPool:
+            full_kv_pool = full_kv
+            mamba_pool = mamba_kv
+
+        return UnifiedMambaTokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=_FakeHybridLinearKVPool(),
+            device=_DEV,
+            page_size=self.PAGE_SIZE,
+            need_sort=False,
+            forward_stream=None,
+        )
+
+    # 16. The mamba-shortfall eviction is sized with
+    # `full_tokens_for_mamba_slots`. It must be non-zero on the shared
+    # composite and 0 on the base class, so pools that do not share bytes keep
+    # evicting exactly as before.
+    def test_full_tokens_for_mamba_slots(self):
+        from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+
+        allocator = self._build_mamba_composite()
+        self.assertGreater(allocator.full_tokens_for_mamba_slots(1), 0)
+        self.assertEqual(
+            BaseTokenToKVPoolAllocator.full_tokens_for_mamba_slots(allocator, 5), 0
+        )
+
+    # 17. REGRESSION: a free issued inside a free group is only QUEUED, so the
+    # mamba-shortfall path must cash those rows in before its retry or it sees
+    # the same gap it just tried to widen.
+    def test_flush_deferred_frees_returns_bytes_without_closing_group(self):
+        allocator = self._build_mamba_composite()
+        loc = allocator.alloc(2 * self.PAGE_SIZE)
+        self.assertIsNotNone(loc)
+        after_alloc = allocator.available_size()
+
+        allocator.free_group_begin()
+        allocator.free(loc)
+        self.assertEqual(allocator.available_size(), after_alloc)
+
+        allocator.flush_deferred_frees()
+        self.assertGreater(allocator.available_size(), after_alloc)
+        # Group stays open so later batch frees keep coalescing.
+        self.assertIsNotNone(allocator.free_group)
+
+    # 18. REGRESSION: the page-math helper used by
     # `UnifiedSWAKVPool.translate_loc_from_full_to_swa`,
     # `UnifiedSWAKVPool.get_cpu_copy`, and `load_cpu_copy` must do
     # `virt_pages = loc // page_size; offsets = loc % page_size;
