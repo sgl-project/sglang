@@ -12,6 +12,10 @@ from transformers import PretrainedConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
+    LongCatImageEditPipelineConfig,
+    LongCatImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
 )
@@ -27,6 +31,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8Config
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
+    ComfyNvfp4Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -43,6 +50,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.quanto_int8_confi
     QuantoInt8Config,
     inspect_quanto_int8_checkpoint,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
 from sglang.multimodal_gen.runtime.layers.quantization.quanto_int8 import (
     normalize_quanto_int8_weights,
 )
@@ -50,7 +58,13 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     ComponentCheckpointUnsupportedError,
     ComponentLoader,
     NativeComponentLoaderRequired,
-    uses_native_transformers_bnb4,
+    uses_native_transformers_quantization,
+)
+from sglang.multimodal_gen.runtime.loader.gguf_weights import (
+    gguf_weights_iterator,
+    names_gguf_checkpoint,
+    read_gguf_tensor_meta,
+    remap_gguf_tensor_meta,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
@@ -121,15 +135,23 @@ _TRANSFORMERS_ENCODER_ONLY_CLASSES = {
 }
 
 
-def _delegate_standard_bnb4_to_transformers(
+def _delegate_quantized_checkpoint_to_transformers(
     component_config: dict,
     component_name: str,
+    *,
+    methods: frozenset[str] | None = None,
 ) -> None:
-    """Use Transformers when it owns a standard serialized BnB4 checkpoint."""
-    if uses_native_transformers_bnb4(component_config, component_name):
+    """Use Transformers when it owns the checkpoint's serialized format."""
+    quant_spec = resolve_checkpoint_quant_spec(component_config)
+    if quant_spec is None or (
+        methods is not None and quant_spec.declared_method not in methods
+    ):
+        return
+    if uses_native_transformers_quantization(component_config, component_name):
+        method = quant_spec.declared_method or "unspecified"
         raise NativeComponentLoaderRequired(
-            f"{component_name!r} delegates serialized bitsandbytes checkpoint "
-            "loading to Transformers"
+            f"{component_name!r} delegates serialized quant_method={method!r} "
+            "checkpoint loading to Transformers"
         )
 
 
@@ -171,21 +193,45 @@ def _get_encoder_quant_config(
 
     quant_config = get_quant_config(component_config, component_model_path)
     name_mapper = None
+    parameter_name_mapper = None
     if model_cls is not None:
         mapping = vars(model_cls).get("param_names_mapping", {})
         if mapping:
             mapping_fn = get_param_names_mapping(mapping)
 
-            def name_mapper(name: str) -> str:
-                # Layer-prefix metadata omits the suffix that many model
-                # mappings use to delimit a parameter name.
-                mapped_name, merge_index, _ = mapping_fn(f"{name}.weight")
+            def parameter_name_mapper(name: str) -> str:
+                mapped_name, merge_index, _ = mapping_fn(name)
                 if merge_index is not None:
                     raise ValueError(
                         "Serialized quantized component weights cannot use a "
                         "stacked parameter-name mapping"
                     )
+                return mapped_name
+
+            def name_mapper(name: str) -> str:
+                # Layer-prefix metadata omits the suffix that many model
+                # mappings use to delimit a parameter name.
+                mapped_name = parameter_name_mapper(f"{name}.weight")
                 return mapped_name.removesuffix(".weight")
+
+    if names_gguf_checkpoint(component_weights_path):
+        if quant_config is not None:
+            raise ValueError(
+                "A GGUF encoder checkpoint cannot be combined with a second "
+                "quantization declaration"
+            )
+        tensor_meta = read_gguf_tensor_meta(component_weights_path)
+        dequantize_prefixes = (
+            vars(model_cls).get("gguf_dequantize_prefixes", ())
+            if model_cls is not None
+            else ()
+        )
+        tensor_meta = remap_gguf_tensor_meta(
+            tensor_meta,
+            parameter_name_mapper or (lambda name: name),
+            dequantize_prefixes=dequantize_prefixes,
+        )
+        return GGUFConfig(component_weights_path, tensor_meta)
 
     if (
         quant_config is None
@@ -217,6 +263,7 @@ def _configure_encoder_quantization(
     component_weights_path: str,
     component_name: str,
     explicit_quantization: str | None = None,
+    ignored_layers: list[str] | None = None,
 ) -> None:
     if getattr(model_cls, "manages_checkpoint_quantization", False):
         if explicit_quantization is not None:
@@ -229,9 +276,10 @@ def _configure_encoder_quantization(
         # themselves; running the generic lifecycle as well would process twice.
         return
 
-    _delegate_standard_bnb4_to_transformers(
+    _delegate_quantized_checkpoint_to_transformers(
         component_config,
         component_name,
+        methods=frozenset({"bitsandbytes"}),
     )
     try:
         quant_config = _get_encoder_quant_config(
@@ -241,6 +289,10 @@ def _configure_encoder_quantization(
             model_cls,
         )
     except (KeyError, NotImplementedError, TypeError, ValueError) as error:
+        _delegate_quantized_checkpoint_to_transformers(
+            component_config,
+            component_name,
+        )
         raise ComponentCheckpointUnsupportedError(
             f"Cannot configure checkpoint quantization for {component_name!r}: {error}"
         ) from error
@@ -261,9 +313,15 @@ def _configure_encoder_quantization(
             get_quantization_config,
         )
 
-        model_config.quant_config = get_quantization_config(explicit_quantization)()
+        model_config.quant_config = get_quantization_config(explicit_quantization)(
+            ignored_layers=ignored_layers
+        )
         quant_config = model_config.quant_config
     if quant_config is None:
+        _delegate_quantized_checkpoint_to_transformers(
+            component_config,
+            component_name,
+        )
         return
     if not issubclass(model_cls, EncoderTensorParallelMixin):
         raise ComponentCheckpointUnsupportedError(
@@ -280,12 +338,13 @@ def _resolve_and_configure_encoder_quantization(
     component_weights_path: str,
     component_name: str,
     explicit_quantization: str | None = None,
+    ignored_layers: list[str] | None = None,
 ) -> type[nn.Module]:
     architectures = getattr(model_config, "architectures", [])
     try:
         model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
     except Exception as resolution_error:
-        _delegate_standard_bnb4_to_transformers(
+        _delegate_quantized_checkpoint_to_transformers(
             component_config,
             component_name,
         )
@@ -320,6 +379,7 @@ def _resolve_and_configure_encoder_quantization(
         component_weights_path,
         component_name,
         explicit_quantization,
+        ignored_layers,
     )
     return model_cls
 
@@ -374,12 +434,21 @@ def _require_quantized_encoder_layers(
         )
     if isinstance(
         quant_config,
-        (ComfyFp8Config, KitchenInt8Config, KitchenW4A4Config, KitchenW4A8Config),
+        (
+            ComfyFp8Config,
+            ComfyNvfp4Config,
+            KitchenInt8Config,
+            KitchenW4A4Config,
+            KitchenW4A8Config,
+        ),
     ):
         expected = set(quant_config.layer_markers)
         selected = set(quant_config.selected)
     elif isinstance(quant_config, QuantoInt8Config):
         expected = quant_config.layer_prefixes
+        selected = quant_config.selected
+    elif isinstance(quant_config, GGUFConfig):
+        expected = quant_config.quantized_prefixes
         selected = quant_config.selected
     else:
         expected = set()
@@ -431,6 +500,16 @@ class TextEncoderLoader(ComponentLoader):
     expected_library = "transformers"
     supports_online_quantization_override = True
 
+    def component_load_precision(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        override = server_args.component_precisions.get(component_name)
+        if override is not None:
+            return override
+        return server_args.pipeline_config.text_encoder_precisions[
+            self._extract_encoder_index(component_name)
+        ]
+
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
@@ -448,6 +527,17 @@ class TextEncoderLoader(ComponentLoader):
         weights_override = server_args.component_weights_paths.get(component_name)
         if weights_override is None:
             return component_model_path
+        if names_gguf_checkpoint(weights_override):
+            if not current_platform.is_cuda():
+                raise ValueError(
+                    "GGUF encoder checkpoints require CUDA; the GGML kernels have "
+                    f"no {current_platform.device_type} implementation"
+                )
+            if server_args.should_use_fsdp_for_component(component_name):
+                raise ValueError(
+                    f"GGUF encoder checkpoint {component_name!r} is incompatible "
+                    "with FSDP; select resident or layerwise placement"
+                )
         model_weights_path = materialize_weight(resolve_weight(weights_override))
         logger.info(
             "Using weight-file override for %s: %s",
@@ -601,19 +691,14 @@ class TextEncoderLoader(ComponentLoader):
 
     def _get_all_weights(
         self,
-        model: nn.Module,
+        model: EncoderTensorParallelMixin,
         model_path: str,
         to_cpu: bool,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        key_filter = cast(
-            Callable[[str], bool] | None,
-            getattr(model, "should_materialize_checkpoint_weight", None),
-        )
+        key_filter = model.should_materialize_checkpoint_weight
 
         def include_checkpoint_weight(name: str) -> bool:
-            return not name.endswith(".comfy_quant") and (
-                key_filter is None or key_filter(name)
-            )
+            return not name.endswith(".comfy_quant") and key_filter(name)
 
         primary_weights = TextEncoderLoader.Source(
             model_path,
@@ -659,7 +744,9 @@ class TextEncoderLoader(ComponentLoader):
         )
 
         # TODO(mick): had to throw an exception for different text-encoder arch
-        encoder_index = self._extract_encoder_index(component_name)
+        encoder_index = self._extract_encoder_index(
+            self.structural_component_name(component_name)
+        )
         assert encoder_index < len(
             server_args.pipeline_config.text_encoder_configs
         ) and encoder_index < len(server_args.pipeline_config.text_encoder_precisions)
@@ -685,6 +772,7 @@ class TextEncoderLoader(ComponentLoader):
             component_weights_path,
             component_name,
             server_args.component_quantizations.get(component_name),
+            server_args.component_quantization_ignored_layers.get(component_name),
         )
         if issubclass(model_cls, EncoderTensorParallelMixin):
             model_cls.configure_component_paths(
@@ -705,9 +793,8 @@ class TextEncoderLoader(ComponentLoader):
             server_args.encoder_parallel,
             prefer_dp=prefer_dp,
         )
-        encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
-            encoder_index
-        ]
+        encoder_dtype = self.component_load_precision(server_args, component_name)
+        assert encoder_dtype is not None
         # TODO(will): add support for other dtypes
         try:
             return self.load_model(
@@ -823,14 +910,16 @@ class TextEncoderLoader(ComponentLoader):
             with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
-                enable_image_understanding = (
-                    True
-                    if isinstance(
-                        server_args.pipeline_config, QwenImageEditPipelineConfig
-                    )
-                    else False
+                enable_image_understanding = isinstance(
+                    server_args.pipeline_config,
+                    (QwenImageEditPipelineConfig, LongCatImageEditPipelineConfig),
                 )
                 model_config.enable_image_understanding = enable_image_understanding
+                # LongCat feeds its padded body to the DiT, so it must mask
+                # padding on the cache-free path; scoped so others are unchanged.
+                model_config.honor_cache_free_padding_mask = isinstance(
+                    server_args.pipeline_config, LongCatImagePipelineConfig
+                )
                 model = model_cls(model_config)
 
             if not isinstance(model, EncoderTensorParallelMixin):
@@ -840,6 +929,10 @@ class TextEncoderLoader(ComponentLoader):
                 )
             model.bind_encoder_tp_group(encoder_tp_group)
 
+            if isinstance(quant_config, GGUFConfig):
+                quant_config.retain_tensor_meta(
+                    model.should_materialize_checkpoint_weight
+                )
             if quant_config is not None:
                 _require_quantized_encoder_layers(
                     model, component_name, quant_config=quant_config
@@ -858,18 +951,25 @@ class TextEncoderLoader(ComponentLoader):
                 model._keep_checkpoint_mapping = True
 
             weights_to_load = {name for name, _ in model.named_parameters()}
-            checkpoint_weights = self._get_all_weights(
-                model,
-                model_path,
-                to_cpu=component_starts_on_cpu,
-            )
+            if isinstance(quant_config, GGUFConfig):
+                checkpoint_weights = gguf_weights_iterator(
+                    model_path,
+                    quant_config.tensor_meta,
+                    key_filter=model.should_materialize_checkpoint_weight,
+                )
+            else:
+                checkpoint_weights = self._get_all_weights(
+                    model,
+                    model_path,
+                    to_cpu=component_starts_on_cpu,
+                )
             if isinstance(quant_config, QuantoInt8Config):
                 checkpoint_weights = normalize_quanto_int8_weights(checkpoint_weights)
             loaded_weights = model.load_weights(checkpoint_weights)
 
-            if quant_config is not None:
+            if quant_config is not None and not isinstance(quant_config, GGUFConfig):
                 postprocess_device: torch.device | None = local_torch_device
-                if isinstance(quant_config, QuantoInt8Config) or (
+                if isinstance(quant_config, (ComfyNvfp4Config, QuantoInt8Config)) or (
                     isinstance(quant_config, KitchenInt8Config)
                     and quant_config.is_checkpoint_int8_serialized
                 ):

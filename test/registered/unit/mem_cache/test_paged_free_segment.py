@@ -131,7 +131,7 @@ class TestFreeSegment(unittest.TestCase):
             token_to_kv_pool_allocator=alloc,
             req_to_token_pool=SimpleNamespace(req_to_token=row.unsqueeze(0)),
         )
-        req = SimpleNamespace(req_pool_idx=0)
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0))
 
         before = len(alloc.free_pages)
         alloc.free_group_begin()

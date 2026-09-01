@@ -412,13 +412,12 @@ def test_quality_admission_fails_closed_outside_validated_request():
 
 
 def test_validate_server_args_requires_packed_varlen_backend():
-    config = SimpleNamespace(
-        vae_config=SimpleNamespace(resolved_parallel_decode_mode=lambda: None),
-        dit_config=SimpleNamespace(arch_config=SimpleNamespace(attention_head_dim=128)),
-        _server_arg_value=MiniMaxH3PipelineConfig._server_arg_value,
-    )
+    config = MiniMaxH3PipelineConfig()
     server_args = SimpleNamespace(
-        component_attention_backends={}, attention_backend="sage_attn"
+        component_attention_backends={},
+        attention_backend="sage_attn",
+        ring_degree=1,
+        resolve_component_attention_backend=lambda *_names: (None, None),
     )
     with patch(
         "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
@@ -438,12 +437,63 @@ def test_validate_server_args_requires_packed_varlen_backend():
             MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
 
 
-def test_mps_admission_requires_layerwise_residency_for_every_h3_component():
-    config = SimpleNamespace(
-        vae_config=SimpleNamespace(resolved_parallel_decode_mode=lambda: None),
-        dit_config=SimpleNamespace(arch_config=SimpleNamespace(attention_head_dim=128)),
-        _server_arg_value=MiniMaxH3PipelineConfig._server_arg_value,
+def test_validate_server_args_accepts_transformer_backend_override():
+    config = MiniMaxH3PipelineConfig()
+    server_args = SimpleNamespace(
+        component_attention_backends={"transformer": "subblock_sparse_attn"},
+        attention_backend="fa",
+        ring_degree=1,
+        resolve_component_attention_backend=lambda *_names: (
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+            "transformer",
+        ),
     )
+
+    with patch(
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
+    ) as get_attn_backend:
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+    get_attn_backend.assert_called_once_with(
+        128,
+        torch.bfloat16,
+        selected_attention_backend=AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+        attention_requirements=AttentionRequirements(packed_varlen=True),
+    )
+
+
+def test_resolve_transformer_attention_backend_uses_selector_precedence():
+    config = MiniMaxH3PipelineConfig()
+    subblock = AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+    fa = AttentionBackendEnum.FA
+    sdpa = AttentionBackendEnum.TORCH_SDPA
+    cases = (
+        ("fa", subblock, None, subblock),
+        ("subblock_sparse_attn", fa, None, fa),
+        (subblock, None, None, subblock),
+        ("fa", subblock, sdpa, sdpa),
+    )
+    for global_backend, component_backend, forced_backend, expected in cases:
+        server_args = SimpleNamespace(
+            attention_backend=global_backend,
+            resolve_component_attention_backend=lambda *_names: (
+                component_backend,
+                "transformer" if component_backend is not None else None,
+            ),
+        )
+        with patch(
+            "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+            "get_global_forced_attn_backend",
+            return_value=forced_backend,
+        ):
+            resolved = config.resolve_transformer_attention_backend(server_args)
+            assert resolved is expected
+            assert config.uses_subblock_attention(server_args) is (
+                expected is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+            )
+
+
+def test_mps_admission_requires_layerwise_residency_for_every_h3_component():
+    config = MiniMaxH3PipelineConfig()
     modes = {
         "transformer": LAYERWISE_OFFLOAD,
         "text_encoder": LAYERWISE_OFFLOAD,
@@ -454,7 +504,9 @@ def test_mps_admission_requires_layerwise_residency_for_every_h3_component():
         component_attention_backends={},
         attention_backend=None,
         enable_torch_compile=False,
+        ring_degree=1,
         residency_mode=modes.get,
+        resolve_component_attention_backend=lambda *_names: (None, None),
     )
 
     with patch.object(current_platform, "is_mps", return_value=True):

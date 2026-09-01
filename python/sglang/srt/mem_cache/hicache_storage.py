@@ -125,6 +125,13 @@ class PoolTransferResult:
     kv_hit_pages: int
     extra_pool_hit_pages: dict[str, int]
 
+    # Pools with TRAILING_PAGES (SWA, Mamba state) only hold a window that ends on an
+    # offloaded node boundary.
+    # Each rank owns its own shard and may hold a different set, so reducing a
+    # per-rank maximum would pick a length that is illegal on another rank; the
+    # caller intersects these sets instead.
+    restorable_prefix_pages: Optional[List[int]] = None
+
     @classmethod
     def empty(cls) -> PoolTransferResult:
         return cls(0, {})
@@ -133,18 +140,20 @@ class PoolTransferResult:
         """Accumulate kv_hit_pages across batches (max = last successful batch)."""
         self.kv_hit_pages = max(self.kv_hit_pages, kv_hit_pages)
 
-    def update_extra_pool_hit_pages(self, results: dict[str, List[bool]]) -> None:
+    def update_extra_pool_hit_pages(self, results: dict[str, int]) -> None:
         """Record actual load/write success counts per extra pool.
 
         Every extra pool contributes a prefix that must be contiguous from the
         start, so count the leading run of successes
         """
-        self.extra_pool_hit_pages.update(
-            {
-                name: (rs.index(False) if False in rs else len(rs))
-                for name, rs in results.items()
-            }
-        )
+        self.extra_pool_hit_pages.update(results)
+
+
+def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
+    return {
+        name: (rs.index(False) if False in rs else len(rs))
+        for name, rs in results.items()
+    }
 
 
 class HiCacheStorage(ABC):

@@ -6,12 +6,13 @@ import unittest.mock
 
 import torch
 
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     LogicalHostPool,
 )
-from sglang.srt.mem_cache.pool_host import base
+from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.runtime_context import get_context
@@ -236,6 +237,55 @@ class TestHostMemoryBudget(CustomTestCase):
             torch.distributed, "is_initialized", return_value=True
         ), unittest.mock.patch.object(base, "get_world_group", return_value=fake_group):
             self.assertEqual(base.ranks_per_host(), 8)
+
+
+class TestHostPoolGroup(CustomTestCase):
+    @staticmethod
+    def _group(**sizes):
+        return HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName(name),
+                    host_pool=LogicalHostPool(size=size, page_size=1),
+                    device_pool=None,
+                    layer_mapper=lambda layer_id: layer_id,
+                    is_primary_index_anchor=name == PoolName.KV.value,
+                )
+                for name, size in sizes.items()
+            ]
+        )
+
+    def test_resolve_and_release_multi_pool_allocation(self):
+        group = self._group(kv=4, swa=2)
+        primary = group.alloc(2)
+        transfers = [
+            PoolTransfer(name=PoolName.SWA, device_indices=torch.arange(2)),
+            PoolTransfer(name=PoolName.INDEXER, indices_from_pool=PoolName.SWA),
+        ]
+
+        self.assertIsNotNone(
+            group.resolve_host_transfers(
+                transfers,
+                primary_device_indices=torch.arange(2),
+                primary_host_indices=primary,
+            )
+        )
+        self.assertIs(transfers[1].host_indices, transfers[0].host_indices)
+        group.free(primary)
+        group.release_transfers(transfers)
+        self.assertEqual(group.available_size(), 4)
+        self.assertEqual(group.available_size(PoolName.SWA), 2)
+
+    def test_resolve_rolls_back_partial_allocation(self):
+        group = self._group(kv=4, swa=2, mamba=1)
+        transfers = [
+            PoolTransfer(name=PoolName.SWA, device_indices=torch.arange(2)),
+            PoolTransfer(name=PoolName.MAMBA, device_indices=torch.arange(2)),
+        ]
+
+        self.assertIsNone(group.resolve_host_transfers(transfers))
+        self.assertIsNone(transfers[0].host_indices)
+        self.assertEqual(group.available_size(PoolName.SWA), 2)
 
 
 if __name__ == "__main__":
