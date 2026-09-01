@@ -26,6 +26,7 @@ _ACCELERATOR_REGISTERS = {
 _ISSUE = re.compile(r"(?:#\d+|https?://\S+)")
 _UNTIL = re.compile(r"\buntil[ :=]+(\d{4}-\d{2}-\d{2})\b", re.IGNORECASE)
 _ACCELERATOR_COUNT = re.compile(r"(?:^|-)(\d+)-(?:gpu|npu)(?:-|$)")
+_HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 _DEFAULT_PR_ACCELERATOR_SECONDS = 1200
 
 
@@ -78,7 +79,20 @@ def _check_temporary_reason(
     return errors
 
 
-def check_file(path: pathlib.Path, *, today: dt.date | None = None) -> list[str]:
+def _touches_changed_line(node: ast.AST, changed_lines: set[int] | None) -> bool:
+    if changed_lines is None:
+        return True
+    start = getattr(node, "lineno", 0)
+    end = getattr(node, "end_lineno", start)
+    return any(line in changed_lines for line in range(start, end + 1))
+
+
+def check_file(
+    path: pathlib.Path,
+    *,
+    today: dt.date | None = None,
+    changed_lines: set[int] | None = None,
+) -> list[str]:
     today = today or dt.date.today()
     try:
         source = path.read_text(encoding="utf-8")
@@ -95,9 +109,12 @@ def check_file(path: pathlib.Path, *, today: dt.date | None = None) -> list[str]
         and (_call_name(node) or "").endswith("_ci")
     ]
     register_names = {_call_name(node) for node in registrations}
+    changed_registrations = [
+        node for node in registrations if _touches_changed_line(node, changed_lines)
+    ]
     errors = []
 
-    for node in registrations:
+    for node in changed_registrations:
         disabled = _positional_or_keyword_literal(node, 3, "disabled")
         if disabled is not None:
             errors.extend(
@@ -107,16 +124,6 @@ def check_file(path: pathlib.Path, *, today: dt.date | None = None) -> list[str]
             )
 
         name = _call_name(node)
-        if (
-            _CUDA_REGISTER in register_names
-            and name in _ACCELERATOR_REGISTERS
-            and not _has_marker(lines, node.lineno, "backend-specific:")
-        ):
-            errors.append(
-                f"{path}:{node.lineno}: mixed accelerator coverage needs a nearby "
-                '"backend-specific:" comment explaining what this lane can catch'
-            )
-
         stage = _keyword_literal(node, "stage")
         suite = _positional_or_keyword_literal(node, 1, "suite")
         est_time = _positional_or_keyword_literal(node, 0, "est_time")
@@ -147,6 +154,16 @@ def check_file(path: pathlib.Path, *, today: dt.date | None = None) -> list[str]
                     'a nearby "ci-cost-override:" rationale'
                 )
 
+    if changed_registrations and _CUDA_REGISTER in register_names:
+        for node in registrations:
+            if _call_name(node) in _ACCELERATOR_REGISTERS and not _has_marker(
+                lines, node.lineno, "backend-specific:"
+            ):
+                errors.append(
+                    f"{path}:{node.lineno}: mixed accelerator coverage needs a nearby "
+                    '"backend-specific:" comment explaining what this lane can catch'
+                )
+
     for node in calls:
         if not (
             isinstance(node.func, ast.Attribute)
@@ -154,6 +171,8 @@ def check_file(path: pathlib.Path, *, today: dt.date | None = None) -> list[str]
             and node.func.value.id == "unittest"
             and node.func.attr == "skip"
         ):
+            continue
+        if not _touches_changed_line(node, changed_lines):
             continue
         reason = (
             node.args[0].value
@@ -174,10 +193,57 @@ def _git_lines(*args: str) -> list[str] | None:
     return [line for line in result.stdout.splitlines() if line]
 
 
-def changed_registered_files() -> list[pathlib.Path]:
+def _git_text(*args: str) -> str | None:
+    result = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+    return result.stdout if result.returncode == 0 else None
+
+
+def _added_lines_by_file(diff: str) -> dict[pathlib.Path, set[int]]:
+    """Return new-file line numbers added or modified by a zero-context diff."""
+
+    changed: dict[pathlib.Path, set[int]] = {}
+    current_path: pathlib.Path | None = None
+    new_lineno: int | None = None
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            value = line[4:]
+            if value == "/dev/null":
+                current_path = None
+            else:
+                current_path = pathlib.Path(value.removeprefix("b/"))
+                changed.setdefault(current_path, set())
+            new_lineno = None
+            continue
+        match = _HUNK_HEADER.match(line)
+        if match:
+            new_lineno = int(match.group(1))
+            continue
+        if current_path is None or new_lineno is None:
+            continue
+        if line.startswith("+"):
+            changed[current_path].add(new_lineno)
+            new_lineno += 1
+        elif line.startswith("-"):
+            continue
+        elif not line.startswith("\\"):
+            new_lineno += 1
+    return changed
+
+
+def changed_registered_lines() -> dict[pathlib.Path, set[int]]:
     staged = _git_lines("diff", "--cached", "--name-only", "--diff-filter=ACMR")
-    names = staged or []
-    if not names:
+    diff = None
+    if staged:
+        diff = _git_text(
+            "diff",
+            "--cached",
+            "--unified=0",
+            "--no-color",
+            "--diff-filter=ACMR",
+            "--",
+            "test/registered",
+        )
+    else:
         base_ref = os.environ.get("GITHUB_BASE_REF", "main")
         candidates = [f"origin/{base_ref}", base_ref]
         for candidate in candidates:
@@ -186,28 +252,39 @@ def changed_registered_files() -> list[pathlib.Path]:
             merge_base = _git_lines("merge-base", candidate, "HEAD")
             if not merge_base:
                 continue
-            names = (
-                _git_lines(
-                    "diff", "--name-only", "--diff-filter=ACMR", merge_base[0], "HEAD"
-                )
-                or []
+            diff = _git_text(
+                "diff",
+                "--unified=0",
+                "--no-color",
+                "--diff-filter=ACMR",
+                merge_base[0],
+                "HEAD",
+                "--",
+                "test/registered",
             )
             break
 
-    return sorted(
-        pathlib.Path(name)
-        for name in names
-        if name.startswith("test/registered/")
-        and name.endswith(".py")
-        and pathlib.Path(name).is_file()
-    )
+    return {
+        path: lines
+        for path, lines in _added_lines_by_file(diff or "").items()
+        if str(path).startswith("test/registered/")
+        and path.suffix == ".py"
+        and path.is_file()
+        and lines
+    }
 
 
 def main(paths: list[str] | None = None) -> int:
-    selected = (
-        [pathlib.Path(path) for path in paths] if paths else changed_registered_files()
-    )
-    errors = [error for path in selected for error in check_file(path)]
+    if paths:
+        errors = [
+            error for path in map(pathlib.Path, paths) for error in check_file(path)
+        ]
+    else:
+        errors = [
+            error
+            for path, changed_lines in sorted(changed_registered_lines().items())
+            for error in check_file(path, changed_lines=changed_lines)
+        ]
     if not errors:
         return 0
     print("ERROR: registered-test admission policy violations:")

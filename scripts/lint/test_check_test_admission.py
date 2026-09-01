@@ -3,15 +3,61 @@ import pathlib
 import tempfile
 import unittest
 
-from check_test_admission import check_file
+from check_test_admission import _added_lines_by_file, check_file
 
 
 class TestCheckTestAdmission(unittest.TestCase):
-    def check_source(self, source: str) -> list[str]:
+    def check_source(
+        self, source: str, *, changed_lines: set[int] | None = None
+    ) -> list[str]:
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "test_example.py"
             path.write_text(source, encoding="utf-8")
-            return check_file(path, today=dt.date(2026, 8, 31))
+            return check_file(
+                path, today=dt.date(2026, 8, 31), changed_lines=changed_lines
+            )
+
+    def test_zero_context_diff_tracks_only_added_new_file_lines(self):
+        changed = _added_lines_by_file(
+            """diff --git a/test/registered/e2e/x/test_a.py b/test/registered/e2e/x/test_a.py
+--- a/test/registered/e2e/x/test_a.py
++++ b/test/registered/e2e/x/test_a.py
+@@ -1 +1,2 @@
+ unchanged
++added
+diff --git a/test/registered/e2e/x/test_old.py b/test/registered/e2e/x/test_new.py
+similarity index 100%
+rename from test/registered/e2e/x/test_old.py
+rename to test/registered/e2e/x/test_new.py
+"""
+        )
+        self.assertEqual(
+            changed,
+            {
+                pathlib.Path("test/registered/e2e/x/test_a.py"): {2},
+            },
+        )
+
+    def test_ignores_untouched_legacy_registration(self):
+        errors = self.check_source(
+            'register_cuda_ci(est_time=400, stage="base-c", '
+            'runner_config="4-gpu-h100")\n'
+            "value = 1\n",
+            changed_lines={2},
+        )
+        self.assertEqual(errors, [])
+
+    def test_checks_registration_when_any_call_line_changes(self):
+        errors = self.check_source(
+            "register_cuda_ci(\n"
+            "    est_time=400,\n"
+            '    stage="base-c", runner_config="4-gpu-h100"\n'
+            ")\n",
+            changed_lines={2},
+        )
+        self.assertTrue(
+            any("weighted accelerator-seconds" in error for error in errors)
+        )
 
     def test_rejects_unowned_disabled_registration(self):
         errors = self.check_source(
