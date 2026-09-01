@@ -1015,7 +1015,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                     defer_finalize=defer_moe_finalize,
                 )
             else:
-                hidden_states = self.mlp(hidden_states)
+                hidden_states = self.mlp(hidden_states, forward_batch)
         if fuse_mlp_allreduce:
             hidden_states = _finish_mlp_output(
                 hidden_states, expect_deferred=defer_moe_finalize
@@ -1440,7 +1440,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     defer_finalize=defer_moe_finalize,
                 )
             else:
-                hidden_states = self.mlp(hidden_states)
+                hidden_states = self.mlp(hidden_states, forward_batch)
         if fuse_mlp_allreduce:
             hidden_states = _finish_mlp_output(
                 hidden_states, expect_deferred=defer_moe_finalize
