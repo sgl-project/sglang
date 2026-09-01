@@ -8,6 +8,7 @@ from torch import nn
 
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -22,6 +23,7 @@ from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -55,7 +57,9 @@ if _use_aiter:
 # to an empty string and breaks downstream consumers. Set this to 1 to fall back to
 # torch.argmax (which always returns a valid index). Default off so behavior is
 # unchanged elsewhere.
-_disable_aiter_greedy_sample = get_bool_env_var("SGLANG_DISABLE_AITER_GREEDY_SAMPLE")
+_disable_aiter_greedy_sample = (
+    get_bool_env_var("SGLANG_DISABLE_AITER_GREEDY_SAMPLE") or is_gfx1250_supported()
+)
 
 if is_npu():
     import torch_npu
@@ -66,6 +70,18 @@ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+
+
+def _trace_e2e_sampler(stage: str, **fields) -> None:
+    if not envs.SGLANG_TRACE_SAMPLER_E2E.get():
+        return
+    try:
+        parallel = get_parallel()
+        rank = f"dp={parallel.attn_dp_rank} tp={parallel.tp_rank}"
+    except Exception:
+        rank = "rank=unknown"
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"SGLANG_TRACE_SAMPLER_E2E {rank} stage={stage} {details}", flush=True)
 
 
 class Sampler(nn.Module):
@@ -119,15 +135,23 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
+        _trace_e2e_sampler(
+            "forward_enter",
+            logits_shape=tuple(logits.shape),
+            all_greedy=sampling_info.is_all_greedy,
+        )
 
         if _is_hip and logits.shape[0] == 0:
             return torch.empty((0,), dtype=torch.int64, device=logits.device)
 
         # Preprocess logits (custom processors and NaN handling)
+        _trace_e2e_sampler("preprocess_enter")
         logits = self._preprocess_logits(logits, sampling_info)
+        _trace_e2e_sampler("preprocess_returned")
         return_sampling_mask = any(sampling_info.return_sampling_masks or [])
 
         if sampling_info.is_all_greedy:
+            _trace_e2e_sampler("greedy_enter")
             if _use_aiter and not _disable_aiter_greedy_sample:
                 batch_next_token_ids = torch.empty(
                     logits.shape[0], device=logits.device, dtype=torch.int32
@@ -135,6 +159,9 @@ class Sampler(nn.Module):
                 _aiter_greedy_sample(batch_next_token_ids, logits)
             else:
                 batch_next_token_ids = torch.argmax(logits, -1)
+            _trace_e2e_sampler(
+                "greedy_returned", output_shape=tuple(batch_next_token_ids.shape)
+            )
             if return_sampling_mask:
                 self._attach_greedy_sampling_mask_to_output(
                     logits_output, sampling_info, batch_next_token_ids
@@ -243,8 +270,11 @@ class Sampler(nn.Module):
             )
             logprob_result.write_output_to(logits_output)
 
+        _trace_e2e_sampler("token_sync_enter")
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+        _trace_e2e_sampler("token_sync_returned")
 
+        _trace_e2e_sampler("forward_returned")
         return batch_next_token_ids
 
     def _sample_from_probs(

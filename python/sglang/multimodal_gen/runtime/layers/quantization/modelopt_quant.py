@@ -13,9 +13,13 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+    KitchenInt8Config,
 )
 from sglang.multimodal_gen.runtime.models.parameter import (
     ModelWeightParameter,
@@ -35,7 +39,6 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 )
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
-    is_layer_skipped,
     requantize_with_max_scale,
 )
 from sglang.srt.layers.utils.common import copy_or_rebind_param
@@ -119,10 +122,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):
-            if self.is_layer_excluded(prefix) or (
-                self.packed_modules_mapping
-                and is_layer_skipped(prefix, [], self.packed_modules_mapping)
-            ):
+            if self.is_layer_excluded(prefix) or self._is_packed_layer_excluded(prefix):
                 return UnquantizedLinearMethod()
             return Linear(self)
         return None
@@ -158,6 +158,24 @@ class ModelOptQuantConfig(QuantizationConfig):
             if re.fullmatch(regex_str, prefix):
                 return True
         return False
+
+    def _is_packed_layer_excluded(self, prefix: str) -> bool:
+        proj_name = prefix.rsplit(".", 1)[-1]
+        shard_names = self.packed_modules_mapping.get(proj_name)
+        if shard_names is None:
+            return False
+
+        base_prefix = prefix[: -len(proj_name)]
+        shard_exclusions = [
+            self.is_layer_excluded(base_prefix + shard_name)
+            for shard_name in shard_names
+        ]
+        if any(shard_exclusions) and not all(shard_exclusions):
+            raise ValueError(
+                f"Detected some but not all shards of {prefix} are quantized. "
+                "All shards of fused layers must have the same precision."
+            )
+        return all(shard_exclusions)
 
 
 class ModelOptFp8Config(ModelOptQuantConfig):
@@ -236,6 +254,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         checkpoint_uses_packed_qkv: bool = False,
         swap_weight_nibbles: bool = False,
         checkpoint_weight_scale_layout: str = "linear",
+        checkpoint_uses_comfy_quantization: bool = False,
     ) -> None:
         super().__init__(exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
@@ -248,6 +267,33 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         self.checkpoint_uses_packed_qkv = checkpoint_uses_packed_qkv
         self.swap_weight_nibbles = swap_weight_nibbles
         self.checkpoint_weight_scale_layout = checkpoint_weight_scale_layout
+        self.checkpoint_uses_comfy_quantization = checkpoint_uses_comfy_quantization
+        self._comfy_int8_config: KitchenInt8Config | None = None
+        self._comfy_fp8_config: ComfyFp8Config | None = None
+
+    def set_comfy_layer_markers(self, layer_markers: dict[str, dict[str, Any]]) -> None:
+        unsupported = {
+            str(marker.get("format")) for marker in layer_markers.values()
+        } - {"nvfp4", "int8_tensorwise", "float8_e4m3fn"}
+        if unsupported:
+            raise ValueError(
+                "NVFP4 checkpoints cannot dispatch companion Comfy formats: "
+                + ", ".join(sorted(unsupported))
+            )
+        int8_markers = {
+            prefix: marker
+            for prefix, marker in layer_markers.items()
+            if marker.get("format") == "int8_tensorwise"
+        }
+        self._comfy_int8_config = (
+            KitchenInt8Config(layer_markers=int8_markers) if int8_markers else None
+        )
+        fp8_markers = {
+            prefix: marker
+            for prefix, marker in layer_markers.items()
+            if marker.get("format") == "float8_e4m3fn"
+        }
+        self._comfy_fp8_config = ComfyFp8Config(fp8_markers) if fp8_markers else None
 
     @classmethod
     def get_name(cls) -> str:
@@ -348,9 +394,22 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             checkpoint_weight_scale_layout=config.get(
                 "checkpoint_weight_scale_layout", "linear"
             ),
+            checkpoint_uses_comfy_quantization=config.get(
+                "checkpoint_uses_comfy_quantization", False
+            ),
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        if (
+            self._comfy_int8_config is not None
+            and prefix in self._comfy_int8_config.layer_markers
+        ):
+            return self._comfy_int8_config.get_quant_method(layer, prefix)
+        if (
+            self._comfy_fp8_config is not None
+            and prefix in self._comfy_fp8_config.layer_markers
+        ):
+            return self._comfy_fp8_config.get_quant_method(layer, prefix)
         return self._get_quant_method(layer, prefix, Linear=ModelOptFp4LinearMethod)
 
 
@@ -430,16 +489,36 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             if input_scale is not None:
                 copy_or_rebind_param(layer, "input_scale", input_scale)
 
-        max_w_scale, quantized_weight = requantize_with_max_scale(
-            weight, layer.weight_scale, layer.logical_widths
+        complete_shard_scales = (
+            self.cutlass_fp8_supported
+            and len(layer.logical_widths) > 1
+            and bool(
+                torch.all(
+                    layer.weight_scale > torch.finfo(torch.float8_e4m3fn).min
+                ).item()
+            )
         )
+        if complete_shard_scales:
+            # CUTLASS accepts a scale per output channel. Preserve each
+            # checkpoint shard's original FP8 values and scale instead of
+            # requantizing all packed shards to the largest scale.
+            quantized_weight = weight
+            processed_weight_scale = convert_to_channelwise(
+                layer.weight_scale, layer.logical_widths
+            )
+        else:
+            processed_weight_scale, quantized_weight = requantize_with_max_scale(
+                weight, layer.weight_scale, layer.logical_widths
+            )
+            if self.cutlass_fp8_supported:
+                processed_weight_scale = convert_to_channelwise(
+                    processed_weight_scale, layer.logical_widths
+                )
         # Preserve the parameter subclass metadata while rebinding to the
         # transposed FP8 view expected by the runtime.
         layer.weight.data = quantized_weight.t().detach()
         layer.weight.requires_grad_(False)
-        if self.cutlass_fp8_supported:
-            max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
-        copy_or_rebind_param(layer, "weight_scale", max_w_scale)
+        copy_or_rebind_param(layer, "weight_scale", processed_weight_scale)
         copy_or_rebind_param(layer, "input_scale", layer.input_scale.max())
 
     def apply(
@@ -633,18 +712,12 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
 
-        _, flashinfer_backend = _get_fp4_gemm_op()
-        uses_flux1_scale_layout = not getattr(
-            self.quant_config, "checkpoint_uses_packed_qkv", False
-        ) and getattr(layer, "prefix", "").startswith(
-            ("transformer_blocks.", "single_transformer_blocks.")
+        # Every FP4 GEMM reachable here reads block scales in the 128x4 TMA layout;
+        # trtllm, the one backend wanting its own shuffled layout, returned above.
+        padded_scales = padded_scales.reshape(
+            B, M_padded // 128, 4, 32, K_padded // 4, 4
         )
-        if flashinfer_backend is None or uses_flux1_scale_layout:
-            # CUTLASS and FLUX.1 CUDNN paths need the TMA scale layout.
-            padded_scales = padded_scales.reshape(
-                B, M_padded // 128, 4, 32, K_padded // 4, 4
-            )
-            padded_scales = padded_scales.permute(0, 1, 4, 3, 2, 5)
+        padded_scales = padded_scales.permute(0, 1, 4, 3, 2, 5)
 
         padded_scales = padded_scales.contiguous().cuda()
         padded_scales = (
@@ -702,3 +775,37 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)
+
+
+def apply_nvfp4_gemm_prequantized(
+    layer: torch.nn.Module,
+    x_fp4: torch.Tensor,
+    x_scale_interleaved: torch.Tensor,
+    output_dtype: torch.dtype,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run a ModelOpt NVFP4 GEMM from already packed activations and scales."""
+    weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
+    x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
+
+    w = layer.weight
+    w_scale_interleaved = layer.weight_scale_interleaved
+    if x_scale_interleaved.dtype == torch.uint8:
+        x_scale_interleaved = x_scale_interleaved.view(torch.float8_e4m3fn)
+    if w_scale_interleaved.dtype == torch.uint8:
+        w_scale_interleaved = w_scale_interleaved.view(torch.float8_e4m3fn)
+
+    fp4_gemm, flashinfer_backend = _get_fp4_gemm_op()
+    if fp4_gemm is None:
+        raise RuntimeError("No FP4 GEMM kernel available. Install flashinfer.")
+    out = fp4_gemm(
+        x_fp4,
+        w.T,
+        x_scale_interleaved,
+        w_scale_interleaved.T,
+        layer.alpha,
+        output_dtype,
+        backend=flashinfer_backend,
+    )
+    out = slice_nvfp4_output(out, layer.output_size_per_partition)
+    return out + bias if bias is not None else out

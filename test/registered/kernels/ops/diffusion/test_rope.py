@@ -7,7 +7,8 @@ Two families with different oracles:
   sgl_kernel RoPE).  In the default mode the two differ by about one bf16
   rounding step, so those cases use a tolerance; with
   ``round_norm_before_rope=True`` the fused kernel reproduces the split
-  rounding exactly and ``torch.equal`` applies.
+  rounding exactly and ``torch.equal`` applies. Full-width interleaved caches
+  use the Diffusers float32 RoPE chain as their oracle.
 The LTX-2 split-RoPE kernel lives in ``test_rope_ltx2.py``: it is validated on
 B200 and registered on that lane alone, which the cases here cannot share --
 their oracle is the *split* baseline (a separate qknorm kernel plus sgl_kernel
@@ -30,7 +31,7 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=44, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=18, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1, which
 # expands the get_ci_test_range sweeps below.
 register_cuda_ci(est_time=220, stage="nightly", runner_config="1-gpu-large")
@@ -114,11 +115,10 @@ def test_qknorm_rope_rejects_unsupported_dtypes() -> None:
     )
 
 
-BS_LIST = [2**n for n in range(13)]
-BS_LIST += [x + 1 for x in BS_LIST]
-BS_LIST = get_ci_test_range(BS_LIST, [1, 9, 129, 257, 2049, 4097])
-HEADS_LIST = get_ci_test_range([8, 16, 24, 32], [8, 24])
-HEAD_DIM_LIST = get_ci_test_range([64, 128, 256], [64, 128, 256])
+_FULL_BS_LIST = [2**n for n in range(13)]
+_FULL_BS_LIST += [x + 1 for x in _FULL_BS_LIST]
+_FULL_HEADS_LIST = [8, 16, 24, 32]
+_FULL_HEAD_DIM_LIST = [64, 128, 256]
 IS_NEOX_LIST = [False, True]
 POSITION_DTYPES = [torch.int32, torch.int64]
 ROPE_DIM_CHOICES = {
@@ -126,19 +126,34 @@ ROPE_DIM_CHOICES = {
     128: [64, 128],
     256: [64, 128, 256],
 }
-
-
-@pytest.mark.parametrize(
-    "batch_size,num_heads,head_dim,is_neox,position_dtype",
+QKNORM_ROPE_CASES = get_ci_test_range(
     list(
         itertools.product(
-            BS_LIST,
-            HEADS_LIST,
-            HEAD_DIM_LIST,
+            _FULL_BS_LIST,
+            _FULL_HEADS_LIST,
+            _FULL_HEAD_DIM_LIST,
             IS_NEOX_LIST,
             POSITION_DTYPES,
         )
     ),
+    [
+        (1, 8, 64, False, torch.int32),
+        (9, 24, 128, True, torch.int64),
+        (129, 8, 256, True, torch.int32),
+        (257, 24, 64, False, torch.int64),
+        (2049, 8, 128, True, torch.int32),
+        (4097, 24, 256, False, torch.int64),
+        (1, 24, 64, True, torch.int64),
+        (129, 8, 128, False, torch.int32),
+        (2049, 24, 256, True, torch.int64),
+        (4097, 8, 64, False, torch.int32),
+    ],
+)
+
+
+@pytest.mark.parametrize(
+    "batch_size,num_heads,head_dim,is_neox,position_dtype",
+    QKNORM_ROPE_CASES,
 )
 def test_qknorm_rope(
     batch_size: int,
@@ -261,6 +276,51 @@ def test_qknorm_rope_preserves_full_width_neox_cache() -> None:
         cache,
         positions,
         is_neox=True,
+        eps=1e-6,
+        round_norm_before_rope=True,
+        cache_has_full_width=True,
+    )
+
+    assert torch.equal(q, q_ref)
+    assert torch.equal(k, k_ref)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_qknorm_rope_preserves_full_width_interleaved_cache(
+    dtype: torch.dtype,
+) -> None:
+    from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+
+    num_tokens, num_heads, head_dim = 257, 24, 128
+    q = torch.randn(num_tokens, num_heads, head_dim, device=DEVICE, dtype=dtype)
+    k = torch.randn_like(q)
+    q_weight = torch.randn(head_dim, device=DEVICE, dtype=dtype)
+    k_weight = torch.randn(head_dim, device=DEVICE, dtype=dtype)
+    positions = torch.randperm(num_tokens, device=DEVICE, dtype=torch.int64)
+    cos = torch.randn(num_tokens, head_dim, device=DEVICE)
+    sin = torch.randn_like(cos)
+    cache = torch.cat((cos, sin), dim=-1).contiguous()
+
+    def apply_interleaved_rope(x: torch.Tensor) -> torch.Tensor:
+        x_real, x_imag = x.float().reshape(*x.shape[:-1], -1, 2).unbind(-1)
+        x_rotated = torch.stack((-x_imag, x_real), dim=-1).flatten(-2)
+        selected_cos = cos[positions, None]
+        selected_sin = sin[positions, None]
+        return (x.float() * selected_cos + x_rotated * selected_sin).to(dtype)
+
+    q_ref, k_ref = q.clone(), k.clone()
+    fused_inplace_qknorm(q_ref, k_ref, q_weight, k_weight, eps=1e-6)
+    q_ref = apply_interleaved_rope(q_ref)
+    k_ref = apply_interleaved_rope(k_ref)
+
+    fused_inplace_qknorm_rope(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cache,
+        positions,
+        is_neox=False,
         eps=1e-6,
         round_norm_before_rope=True,
         cache_has_full_width=True,

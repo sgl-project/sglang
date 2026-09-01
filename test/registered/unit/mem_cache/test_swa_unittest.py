@@ -6,8 +6,10 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
     DecLockRefParams,
     EvictParams,
     EvictResult,
@@ -15,7 +17,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str
+from sglang.srt.mem_cache.common import (
+    available_and_evictable_str,
+    free_kv_row_segments,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -36,7 +41,7 @@ class _DummyReq:
     def __init__(self):
         self._kv_committed_len = 0
         self.swa_prefix_lock_released = False
-        self.kv = SimpleNamespace(swa_evicted_seqlen=0)
+        self.kv = SimpleNamespace(swa_evicted_seqlen=0, cache_protected_len=0)
 
 
 def _build_swa_tree(
@@ -226,6 +231,43 @@ class TestSWA(unittest.TestCase):
         allocator.free_swa(full_indices[1:2])
         self.assertEqual(allocator.swa_available_size(), 16)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "sync detection needs CUDA")
+    def test_clearing_the_mapping_does_not_synchronize(self):
+        """Clearing the full-to-SWA mapping must not block the stream; writing a
+        host-resident scalar into it does.
+        """
+        _, allocator, _ = _build_swa_tree(is_eagle=False)
+        full_indices = _swa_alloc(allocator, 4)
+        mapping = allocator.full_to_swa_index_mapping
+
+        # Warm up outside the window: a first-time cudaMalloc can synchronize on
+        # its own, which the detector would report as this call's fault.
+        allocator.clear_full_to_swa_mapping(full_indices)
+
+        def sync_error(fn):
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                fn()
+            except RuntimeError as exc:
+                return exc
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+                torch.cuda.synchronize()
+            return None
+
+        # Gate on the pre-fix form: a detector blind to this sync class would pass
+        # the assert below no matter how the mapping is cleared.
+        pre_fix_error = sync_error(
+            lambda: mapping.__setitem__(full_indices.to(torch.int64), 0)
+        )
+        if pre_fix_error is None:
+            self.skipTest("sync debug mode does not flag a blocking H2D copy here")
+
+        self.assertIsNone(
+            sync_error(lambda: allocator.clear_full_to_swa_mapping(full_indices))
+        )
+
     def test_free_swa_group_owns_deferred_indices(self):
         _, allocator, _ = _build_swa_tree(
             is_eagle=False,
@@ -259,6 +301,38 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(
             allocator.swa_available_size(),
             available_before_free + original_indices.numel(),
+        )
+
+    def test_free_swa_group_owns_mapping_at_enqueue_time(self):
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            kv_size=8,
+            kv_size_swa=8,
+        )
+        old_full = _swa_alloc(allocator, 1)
+        new_full = _swa_alloc(allocator, 1)
+        assert old_full is not None and new_full is not None
+        old_swa = allocator.full_to_swa_index_mapping[old_full].clone()
+        new_swa = allocator.full_to_swa_index_mapping[new_full].clone()
+
+        allocator.free_group_begin()
+        allocator.free_swa(old_full)
+
+        # Cache reconciliation can transfer a different SWA slot onto the same
+        # full slot before the group flushes. The deferred free still owns the
+        # mapping observed above, not this replacement mapping.
+        allocator.set_full_to_swa_mapping(old_full, new_swa)
+        allocator.clear_full_to_swa_mapping(new_full)
+        allocator.free_group_end()
+
+        torch.testing.assert_close(
+            allocator.full_to_swa_index_mapping[old_full], new_swa
+        )
+        self.assertTrue(
+            torch.isin(old_swa, allocator.swa_attn_allocator.free_pages).item()
+        )
+        self.assertFalse(
+            torch.isin(new_swa, allocator.swa_attn_allocator.free_pages).item()
         )
 
     def test_swa_radix_cache_1(self):
@@ -600,20 +674,20 @@ class TestSWA(unittest.TestCase):
 
         # Case 1: is_insert=True should pass bigram key and use cache_protected_len.
         req = _DummyReq()
-        req.req_pool_idx = 0
+        req.kv.req_pool_idx = 0
         req.origin_input_ids = array("q", [1, 2, 3, 4, 5, 6])
         req.output_ids = array("q")
         req._kv_committed_len = len(req.origin_input_ids)
         kv_indices = allocator.alloc(req._kv_committed_len)
         req_to_token_pool.write(
-            (req.req_pool_idx, slice(0, req._kv_committed_len)), kv_indices
+            (req.kv.req_pool_idx, slice(0, req._kv_committed_len)), kv_indices
         )
         req.extra_key = None
         req.cache_salt = None
         req.last_node = tree.root_node
         req.swa_uuid_for_lock = None
         req.kv.swa_evicted_seqlen = 0
-        req.cache_protected_len = 1
+        req.kv.cache_protected_len = 1
         # Intentionally mismatch to ensure code does not use len(prefix_indices).
         req.prefix_indices = torch.tensor([7, 8, 9, 10, 11], device=tree.device)
 
@@ -631,27 +705,27 @@ class TestSWA(unittest.TestCase):
             req, is_insert=True, kv_len_to_handle=req._kv_committed_len
         )
 
-        self.assertEqual(captured["prev_prefix_len"], req.cache_protected_len)
+        self.assertEqual(captured["prev_prefix_len"], req.kv.cache_protected_len)
         self.assertTrue(captured["is_bigram"])
         self.assertEqual(captured["key_len"], len(req.origin_input_ids) - 1)
 
         # Case 2: is_insert=False should free [cache_protected_len:page_aligned_len]
         # even when len(prefix_indices) is intentionally larger.
         req2 = _DummyReq()
-        req2.req_pool_idx = 1
+        req2.kv.req_pool_idx = 1
         req2.origin_input_ids = array("q", [11, 12, 13, 14, 15, 16])
         req2.output_ids = array("q")
         req2._kv_committed_len = len(req2.origin_input_ids)
         kv_indices2 = allocator.alloc(req2._kv_committed_len)
         req_to_token_pool.write(
-            (req2.req_pool_idx, slice(0, req2._kv_committed_len)), kv_indices2
+            (req2.kv.req_pool_idx, slice(0, req2._kv_committed_len)), kv_indices2
         )
         req2.extra_key = None
         req2.cache_salt = None
         req2.last_node = tree.root_node
         req2.swa_uuid_for_lock = None
         req2.kv.swa_evicted_seqlen = 0
-        req2.cache_protected_len = 1
+        req2.kv.cache_protected_len = 1
         req2.prefix_indices = torch.tensor([21, 22, 23, 24, 25], device=tree.device)
 
         freed_lens = []
@@ -779,6 +853,219 @@ class TestSWASplitLeafOnInsert(CustomTestCase):
 
         self.assertEqual(tree.swa_protected_size_, 0)
         self.assertEqual(tree.full_protected_size_, 0)
+        tree.sanity_check()
+
+
+class _SinglePoolAllocator(BaseTokenToKVPoolAllocator):
+    """Minimal single-pool allocator: no SWA peer, so the whole range dies
+    together whatever the floor says."""
+
+    def __init__(self):
+        super().__init__(
+            size=16,
+            page_size=1,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        self.freed = []
+
+    def clear(self):
+        self.freed = []
+
+    def alloc(self, need_size: int):
+        raise NotImplementedError
+
+    def free(self, free_index: torch.Tensor):
+        self.freed.append(free_index)
+
+
+class TestFreeFullPartition(CustomTestCase):
+    """`free_full` releases only the full side of a hybrid SWA allocator."""
+
+    def setUp(self):
+        _, self.allocator, _ = _build_swa_tree(is_eagle=False)
+        self.full_baseline = self.allocator.full_available_size()
+        self.swa_baseline = self.allocator.swa_available_size()
+
+    def _sizes(self):
+        return (
+            self.allocator.full_available_size(),
+            self.allocator.swa_available_size(),
+        )
+
+    def test_free_full_keeps_the_swa_peers_allocated(self):
+        indices = _swa_alloc(self.allocator, 4)
+        self.allocator.free_full(indices)
+
+        full_avail, swa_avail = self._sizes()
+        self.assertEqual(full_avail, self.full_baseline)
+        self.assertEqual(swa_avail, self.swa_baseline - 4)
+
+    def test_free_full_leaves_the_mapping_intact(self):
+        indices = _swa_alloc(self.allocator, 4)
+        before = self.allocator.full_to_swa_index_mapping[indices].clone()
+        self.allocator.free_full(indices)
+
+        self.assertTrue(bool((before > 0).all()))
+        self.assertTrue(
+            torch.equal(self.allocator.full_to_swa_index_mapping[indices], before)
+        )
+
+    def test_free_full_is_deferred_inside_a_free_group(self):
+        indices = _swa_alloc(self.allocator, 4)
+
+        self.allocator.free_group_begin()
+        self.allocator.free_full(indices)
+        self.assertEqual(self.allocator.full_available_size(), self.full_baseline - 4)
+        self.allocator.free_group_end()
+
+        self.assertEqual(self.allocator.full_available_size(), self.full_baseline)
+
+
+class _RowCache:
+    """Minimal PrefixCacheTrait host, so free_kv_row can be exercised without
+    standing up a whole tree."""
+
+    free_kv_row = BasePrefixCache.free_kv_row
+
+    def __init__(self, allocator, row):
+        self.req_to_token_pool = SimpleNamespace(req_to_token=row.unsqueeze(0))
+        self.token_to_kv_pool_allocator = allocator
+        self.page_size = allocator.page_size
+
+
+class TestFreeKvRow(CustomTestCase):
+    """A kv row is given back split at `swa_evicted_seqlen`: the full side
+    whole, the SWA side only from the floor up."""
+
+    def setUp(self):
+        _, self.allocator, _ = _build_swa_tree(is_eagle=False)
+        self.full_baseline = self.allocator.full_available_size()
+        self.swa_baseline = self.allocator.swa_available_size()
+
+    def _sizes(self):
+        return (
+            self.allocator.full_available_size(),
+            self.allocator.swa_available_size(),
+        )
+
+    def test_floor_decides_how_much_of_the_swa_side_stays_out(self):
+        # (start_pos, num_slots, floor, rows whose SWA peers are already gone)
+        cases = [
+            (0, 4, 4, 4),
+            (8, 4, 8, 0),
+            (8, 4, 10, 2),
+            (8, 4, 4, 0),
+        ]
+        for start_pos, num_slots, floor, num_dead in cases:
+            with self.subTest(start_pos=start_pos, floor=floor):
+                indices = _swa_alloc(self.allocator, num_slots)
+                free_kv_row_segments(
+                    self.allocator, [(indices, start_pos)], swa_evicted_seqlen=floor
+                )
+                self.assertEqual(
+                    self._sizes(),
+                    (self.full_baseline, self.swa_baseline - num_dead),
+                )
+                # Give the held-back SWA peers back, so the next case starts clean.
+                if num_dead:
+                    self.allocator.free_swa(indices[:num_dead])
+                self.assertEqual(self._sizes(), (self.full_baseline, self.swa_baseline))
+
+    def test_adjacent_below_floor_pieces_release_their_shared_page_once(self):
+        _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
+        indices = _swa_alloc(allocator, 8)
+        after_alloc = allocator.full_available_size()
+
+        # Rows [0, 6) and [6, 8) both sit below the floor and share page 1.
+        free_kv_row_segments(
+            allocator,
+            [(indices[:6], 0), (indices[6:], 6)],
+            swa_evicted_seqlen=8,
+        )
+
+        self.assertEqual(allocator.full_available_size(), after_alloc + 8)
+
+    def test_free_kv_row_reads_the_record_row_and_its_floor(self):
+        indices = _swa_alloc(self.allocator, 8)
+        cache = _RowCache(self.allocator, indices)
+        kv = SimpleNamespace(req_pool_idx=0, swa_evicted_seqlen=3)
+
+        cache.free_kv_row(kv, [(1, 5)])
+
+        # Rows [1, 5) go back on the full side; of those, [1, 3) lost their SWA
+        # peers already, so 6 of the 8 SWA slots are still out.
+        self.assertEqual(self._sizes(), (self.full_baseline - 4, self.swa_baseline - 6))
+
+    def test_single_pool_free_kv_row_still_frees_the_whole_range(self):
+        allocator = _SinglePoolAllocator()
+        cache = _RowCache(allocator, torch.arange(16, dtype=torch.int64))
+        kv = SimpleNamespace(req_pool_idx=0, swa_evicted_seqlen=4)
+
+        cache.free_kv_row(kv, [(2, 6)])
+
+        self.assertEqual([t.tolist() for t in allocator.freed], [[2, 3], [4, 5]])
+
+        # release_session and _free_kv_aligned dropped their own emptiness
+        # guards, so an empty range has to stay a no-op here.
+        cache.free_kv_row(kv, [(6, 6)])
+        self.assertEqual(len(allocator.freed), 2)
+
+
+class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
+    """An unfinished request whose SWA prefix is already gone must insert that
+    prefix as a tombstone, not as live SWA KV."""
+
+    def test_evicted_prefix_inserts_as_tombstone(self):
+        page_size, window, num_tokens, evicted = 4, 4, 16, 8
+        tree, allocator, req_to_token_pool = _build_swa_tree(
+            is_eagle=False, page_size=page_size, sliding_window_size=window
+        )
+        kv_indices = _swa_alloc(allocator, num_tokens)
+        req_to_token_pool.write((0, slice(0, num_tokens)), kv_indices)
+        # Drop the prefix's SWA peers, as window eviction would.
+        allocator.free_swa(kv_indices[:evicted])
+        swa_before = allocator.swa_available_size()
+
+        token_ids = array("q", range(1, num_tokens + 1))
+        req = _DummyReq()
+        req.kv.req_pool_idx = 0
+        req.origin_input_ids = token_ids
+        req.output_ids = array("q")
+        req.get_fill_ids = lambda: token_ids
+        req.extra_key = None
+        req.cache_salt = None
+        req.kv.cache_protected_len = 0
+        req.last_node = tree.root_node
+        req.swa_uuid_for_lock = None
+        req.prefix_indices = torch.empty(0, dtype=torch.int64, device=tree.device)
+        req.kv.swa_evicted_seqlen = evicted
+
+        tree.cache_unfinished_req(req)
+
+        # The insert itself frees nothing.
+        self.assertEqual(allocator.swa_available_size(), swa_before)
+        # The live leaf holds a full window, so the whole key stays matchable.
+        self.assertEqual(req.kv.cache_protected_len, num_tokens)
+        # [0, evicted) is a tombstone; only [evicted, num_tokens) counts as SWA.
+        (first,) = tree.root_node.children.values()
+        self.assertTrue(first.swa_tombstone)
+        self.assertEqual(len(first.value), evicted)
+        self.assertEqual(
+            tree.swa_evictable_size_ + tree.swa_protected_size_,
+            num_tokens - evicted,
+        )
+
+        # Finishing drops the locks, which sanity_check needs; the accounting
+        # must survive the re-walk.
+        tree.cache_finished_req(req, kv_len_to_handle=num_tokens)
+        self.assertEqual(allocator.swa_available_size(), swa_before)
+        self.assertEqual(
+            tree.swa_evictable_size_ + tree.swa_protected_size_,
+            num_tokens - evicted,
+        )
         tree.sanity_check()
 
 

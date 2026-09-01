@@ -740,6 +740,7 @@ class LTX2Attention(nn.Module):
     ) -> None:
         super().__init__()
 
+        is_cross_attention = context_dim is not None
         self.query_dim = int(query_dim)
         self.context_dim = int(query_dim if context_dim is None else context_dim)
         self.heads = int(heads)
@@ -836,6 +837,7 @@ class LTX2Attention(nn.Module):
                 softmax_scale=None,
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
+                is_cross_attention=is_cross_attention,
                 prefix=f"{prefix}.attn",
                 enable_packed_qkv_input_a2a=self.enable_packed_qkv_input_a2a,
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
@@ -850,6 +852,7 @@ class LTX2Attention(nn.Module):
                 softmax_scale=None,
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
+                is_cross_attention=is_cross_attention,
                 prefix=f"{prefix}.attn",
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
                 allow_cudnn_sdp=True,
