@@ -463,6 +463,7 @@ class LayerwiseOffloadManager:
         self._mapped_regions = MappedRegions()
         # Store forward hooks for removal
         self._forward_hooks: List[Any] = []
+        self._last_forwarded_layer: int | None = None  # skip-compute can jump
 
         if initialize:
             self._initialize()
@@ -872,6 +873,9 @@ class LayerwiseOffloadManager:
         """
         Prepare for the next round of denoising loop with prefetching the necessary layers
         """
+        self._last_forwarded_layer = None
+        self._release_unneeded_streamed_layers(keep=set(self._head_of_stream()))
+
         # The resident set first: it has to be there for the whole step, and the
         # caller decides whether to block on it.
         for layer_idx in sorted(self._retained_set):
@@ -922,6 +926,22 @@ class LayerwiseOffloadManager:
             self._streamed_order[(start + offset) % total]
             for offset in range(min(count, total))
         ]
+
+    def _release_unneeded_streamed_layers(self, *, keep: Set[int]) -> None:
+        """Free streamed layers that are on GPU but not in ``keep`` or resident."""
+        retain = set(self._retained_set) | keep
+        for layer_idx in list(self._gpu_layers):
+            if layer_idx not in retain:
+                self.release_layer(layer_idx)
+
+    def _release_skip_gap(self, *, last_ran: int, next_ran: int) -> None:
+        """Free speculative prefetches in ``(last_ran, next_ran)`` after a jump."""
+        if next_ran <= last_ran + 1:
+            return
+        retain = set(self._retained_set)
+        for layer_idx in range(last_ran + 1, next_ran):
+            if layer_idx not in retain:
+                self.release_layer(layer_idx)
 
     @torch.compiler.disable
     def _activate_residency(self) -> None:
@@ -1382,6 +1402,13 @@ class LayerwiseOffloadManager:
                 if i == 0:
                     self._activate_residency()
                     self.prepare_for_next_req(non_blocking=False)
+                elif (
+                    self._last_forwarded_layer is not None
+                    and i > self._last_forwarded_layer + 1
+                ):
+                    self._release_skip_gap(
+                        last_ran=self._last_forwarded_layer, next_ran=i
+                    )
                 if i not in self._gpu_layers:
                     # LTX audio VAE traverses decoder.up in reverse order
                     self.prefetch_layer(i, non_blocking=False)
@@ -1416,6 +1443,7 @@ class LayerwiseOffloadManager:
             def hook(module, input, output):
                 # previous, we wait here, until the copy stream for next layer is finished,
                 # now with any prefetch_size, only wait for the copy stream, when the copy stream is for the next layer
+                self._last_forwarded_layer = i
                 self.release_layer(i)
 
             return hook

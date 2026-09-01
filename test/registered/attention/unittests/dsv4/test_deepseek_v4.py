@@ -444,8 +444,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                     envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True),
                     envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(False),
                     mock.patch(
-                        "sglang.srt.layers.attention.deepseek_v4_backend._is_sm120",
-                        False,
+                        "sglang.srt.layers.attention.deepseek_v4_backend.get_platform",
+                        return_value=SimpleNamespace(is_sm120=False),
                     ),
                 ):
                     backend.prepare_prefill_shared_read_snapshot(
@@ -490,7 +490,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True),
             envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(True),
             mock.patch(
-                "sglang.srt.layers.attention.deepseek_v4_backend._is_sm120", False
+                "sglang.srt.layers.attention.deepseek_v4_backend.get_platform",
+                return_value=SimpleNamespace(is_sm120=False),
             ),
             self.assertRaisesRegex(RuntimeError, "snapshot failed"),
         ):

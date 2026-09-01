@@ -1,11 +1,11 @@
 import logging
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import (
     get_device_sm,
     is_cuda,
     is_musa,
-    is_sm100_supported,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,8 +38,8 @@ def _compute_enable_deep_gemm():
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
-DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_sm100_supported()
+DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and get_platform().is_sm100
 DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (
-    is_sm100_supported() or get_device_sm() == 120
+    get_platform().is_sm100 or get_device_sm() == 120
 )
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
