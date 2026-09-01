@@ -186,5 +186,70 @@ class TestMoveGateRejectsNonPdNode(CustomTestCase):
             unified_memory_disagg_move_gate(scheduler)
 
 
+class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
+    """Every unified composite allocator must OVERRIDE the two PD hooks.
+
+    `BaseTokenToKVPoolAllocator.translate_kv_indices_for_transfer` is the
+    IDENTITY, and `set_disagg_move_gate` exists only where a composite defines
+    it. Inheriting either is silent, not loud: identity puts VIRTUAL ids on the
+    wire (they address real bytes, so the peer gets plausible garbage), and a
+    missing gate lets lazy compaction relocate pages under in-flight RDMA.
+    An AST-level check because instantiating these composites needs a GPU.
+    """
+
+    _COMPOSITES = (
+        "UnifiedMambaTokenToKVPoolAllocator",
+        "UnifiedSWATokenToKVPoolAllocator",
+    )
+
+    @staticmethod
+    def _own_methods(cls_name: str) -> Set[str]:
+        import ast
+        import inspect
+
+        import sglang.srt.mem_cache.multi_ended_allocator as mod
+
+        tree = ast.parse(inspect.getsource(mod))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == cls_name:
+                return {
+                    child.name
+                    for child in node.body
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                }
+        raise AssertionError(f"class {cls_name} not found in multi_ended_allocator")
+
+    def test_transfer_translate_is_not_inherited_identity(self):
+        for name in self._COMPOSITES:
+            with self.subTest(composite=name):
+                self.assertIn(
+                    "translate_kv_indices_for_transfer",
+                    self._own_methods(name),
+                    f"{name} inherits the identity transfer translate; PD would "
+                    "ship VIRTUAL ids and corrupt KV without any error",
+                )
+
+    def test_move_gate_setter_is_defined(self):
+        for name in self._COMPOSITES:
+            with self.subTest(composite=name):
+                self.assertIn(
+                    "set_disagg_move_gate",
+                    self._own_methods(name),
+                    f"{name} has no set_disagg_move_gate; Scheduler."
+                    "init_disaggregation would AttributeError, or -- worse, if "
+                    "the call were guarded -- compaction would run unguarded",
+                )
+
+    def test_swa_composite_translates_the_swa_side_separately(self):
+        """The SWA sub-pool runs its OWN compaction, so a full-side physical id
+        does not name the SWA page holding the same virtual token. The read-path
+        `translate_loc_from_full_to_swa` cannot stand in either: it returns
+        kernel-facing ids, and the transfer addresses raw page envelopes."""
+        self.assertIn(
+            "translate_swa_indices_for_transfer",
+            self._own_methods("UnifiedSWATokenToKVPoolAllocator"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3338,6 +3338,42 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         """SWA-layer read path: virtual TOKEN ids -> swa kernel-facing ids."""
         return self.swa_attn_allocator.translate_kv_loc_for_kernel(kv_indices, out=out)
 
+    def translate_kv_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Virtual TOKEN ids -> full-sub-pool PHYSICAL token ids for the PD
+        transfer engine.
+
+        PHYSICAL, not kernel-facing: the transfer registers page ENVELOPES (see
+        `UnifiedMHATokenToKVPool.get_contiguous_buf_infos`). Without this
+        override the base identity would put VIRTUAL ids on the wire, which
+        address real bytes and so corrupt silently rather than fail.
+        """
+        return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
+
+    def translate_swa_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Virtual TOKEN ids -> swa-sub-pool PHYSICAL token ids.
+
+        The SWA counterpart of the above. `translate_loc_from_full_to_swa`
+        cannot serve here: it returns KERNEL-FACING ids (the physical page
+        scaled by the sub-pool's per-page block count), which index the
+        per-layer views, whereas the SWA state component is registered as whole
+        page envelopes and addressed by physical page.
+        """
+        return self.swa_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
+
+    def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
+        """Install the PD-disaggregation move gate on both sub-allocators."""
+        assert self.lazy_compaction, (
+            "PD disaggregation with the unified memory pool requires lazy "
+            "compaction (eager free-path compaction moves pages under "
+            "in-flight transfers)."
+        )
+        self.full_attn_allocator.disagg_move_gate = gate
+        self.swa_attn_allocator.disagg_move_gate = gate
+
     @property
     def kernel_page_multiplier(self) -> int:
         return self.full_attn_allocator.kernel_page_multiplier

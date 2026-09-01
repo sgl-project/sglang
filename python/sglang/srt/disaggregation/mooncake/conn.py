@@ -1458,6 +1458,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
+                        # Same reason as in `send_kvcache`: a unified sub-pool
+                        # registers ONE region holding every layer's K and V per
+                        # slot envelope, and the MHA branch would half-split it
+                        # into zero layers and ship nothing.
+                        force_flat=get_memory().enable_unified_memory,
                     )
                     or rc
                 )

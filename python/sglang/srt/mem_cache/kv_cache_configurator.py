@@ -439,13 +439,6 @@ class KVCacheConfigurator:
                     unified_total_bytes=sizes.unified_total_bytes,
                 )
             elif self.is_hybrid_swa and not is_dsv4:
-                if pd_enabled:
-                    raise ValueError(
-                        "--enable-unified-memory with PD disaggregation does "
-                        "not support hybrid-SWA models yet (no whole-envelope "
-                        "transfer scheme for the SWA sub-pool). Drop "
-                        "--enable-unified-memory or run without PD."
-                    )
                 bundle = self._init_unified_swa_pools(
                     max_num_reqs=sizes.max_running_requests,
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
@@ -808,12 +801,28 @@ class KVCacheConfigurator:
         extra_max_context_len = 4
         if get_spec().speculative_num_draft_tokens is not None:
             extra_max_context_len += get_spec().speculative_num_draft_tokens
-        req_to_token_pool = ReqToTokenPool(
-            size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
-            device=self.device,
-            enable_memory_saver=get_exec().features.enable_memory_saver,
-        )
+        if get_disagg().disaggregation_mode == "decode":
+            # A decode node hands out request rows to PREALLOCATED transfers on
+            # top of its running set, so it needs the extra-slot pool (and the
+            # `pre_alloc_size` the scheduler's invariant checker reads). Mirrors
+            # `_build_req_to_token_pool`'s decode branch; the mamba composite
+            # already takes `decode_pre_alloc_size` the same way.
+            from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+
+            req_to_token_pool = DecodeReqToTokenPool(
+                size=max_num_reqs,
+                max_context_len=self.model_config.context_len + extra_max_context_len,
+                device=self.device,
+                enable_memory_saver=get_exec().features.enable_memory_saver,
+                pre_alloc_size=get_disagg().disaggregation_decode_extra_slots,
+            )
+        else:
+            req_to_token_pool = ReqToTokenPool(
+                size=max_num_reqs,
+                max_context_len=self.model_config.context_len + extra_max_context_len,
+                device=self.device,
+                enable_memory_saver=get_exec().features.enable_memory_saver,
+            )
 
         head_num = self.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
