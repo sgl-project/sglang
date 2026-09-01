@@ -375,6 +375,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.consume_layer(layer_id - self.start_layer)
 
         kv_buffer = self._get_broadcastable_kv_buffer(layer_id)
         if self.store_dtype != self.dtype:

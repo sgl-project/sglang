@@ -346,7 +346,6 @@ class ModelRunner:
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
-        self.enable_spec_v2_zero_bubble = envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get()
 
         self.init_startup_observability()
 
@@ -1413,7 +1412,6 @@ class ModelRunner:
             and require_gathered_buffer(self.server_args)
             and not is_dsa_enable_prefill_cp()
             and not is_mla_prefill_cp_enabled()
-            and not self.enable_spec_v2_zero_bubble
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(
                 server_args=self.server_args,
@@ -1631,7 +1629,12 @@ class ModelRunner:
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:
-            ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
+            ctx_mgr = forward_context(
+                ForwardContext(
+                    attn_backend=self.attn_backend,
+                    disagg_kv_senders=forward_batch.disagg_kv_senders,
+                )
+            )
         with ctx_mgr:
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph

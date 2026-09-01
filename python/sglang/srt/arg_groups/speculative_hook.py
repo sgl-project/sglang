@@ -143,6 +143,66 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if algo is not None:
         algo.handle_server_args(server_args)
 
+    _check_draft_prefetch(server_args)
+
+
+def _check_draft_prefetch(server_args: ServerArgs) -> None:
+    """Validate --enable-draft-prefetch.
+
+    Runs at the end of handle_speculative_decoding, after the per-algo
+    handlers applied the spec defaults (auto-chosen topk, adaptive
+    auto-disable), so it checks the final config. NEXTN has already been
+    resolved to "EAGLE" by _resolve_speculative_algorithm_alias, which the
+    accepted set covers.
+    """
+    if not server_args.enable_draft_prefetch:
+        if server_args.skip_draft_prefetch_seq_lens_cpu_sync:
+            logger.warning(
+                "--skip-draft-prefetch-seq-lens-cpu-sync only takes effect when "
+                "--enable-draft-prefetch is enabled."
+            )
+        return
+    if server_args.speculative_algorithm not in ("EAGLE3", "EAGLE", "NEXTN"):
+        raise ValueError(
+            "--enable-draft-prefetch only supports EAGLE/EAGLE3/NEXTN "
+            f"speculative algorithms, got {server_args.speculative_algorithm}."
+        )
+    if server_args.speculative_eagle_topk != 1:
+        raise ValueError(
+            "--enable-draft-prefetch requires "
+            "--speculative-eagle-topk == 1: the pre-concatenated "
+            "candidate chain assumes a single chain, got "
+            f"{server_args.speculative_eagle_topk}."
+        )
+    if server_args.speculative_adaptive:
+        raise ValueError(
+            "--enable-draft-prefetch is incompatible with "
+            "--speculative-adaptive: adaptive runtime changes "
+            "speculative_num_steps, which the pre-run draft cannot "
+            "follow."
+        )
+    if server_args.speculative_use_rejection_sampling:
+        raise ValueError(
+            "--enable-draft-prefetch is incompatible with "
+            "--speculative-use-rejection-sampling: the draft-prefetch "
+            "verify input does not carry draft_probs."
+        )
+    if (
+        server_args.speculative_num_steps is None
+        or int(server_args.speculative_num_steps) < 2
+    ):
+        # With num_steps == 1, draft_prefetch returns early (nothing to
+        # pre-run) while the decode entry still bypasses the draft model via
+        # prepare_verify_fully_async_decoding: verify would forever see only
+        # the seed token. Fail fast instead of silently degrading.
+        raise ValueError(
+            "--enable-draft-prefetch requires "
+            "--speculative-num-steps >= 2, got "
+            f"{server_args.speculative_num_steps}: with a single step there is "
+            "no pre-run to overlap and the decode draft forward would be "
+            "skipped entirely."
+        )
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import resolved_view

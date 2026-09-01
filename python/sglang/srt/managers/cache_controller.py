@@ -94,6 +94,10 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        # Callback invoked after a layer's wait resolves, to trigger
+        # on-demand prefetch of the next layer on the load stream.
+        self.on_layer_consumed: Optional[callable] = None
+        self._last_consumed_layer: int = -1
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -106,15 +110,31 @@ class LayerDoneCounter:
 
     def set_consumer(self, index: int):
         self.consumer_index = index
+        self._last_consumed_layer = -1
 
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
             return
         self.events[self.consumer_index].wait(threshold)
 
+    def consume_layer(self, threshold: int):
+        if self.consumer_index < 0:
+            return
+        if self.on_layer_consumed is not None and threshold > self._last_consumed_layer:
+            self._last_consumed_layer = threshold
+            self.on_layer_consumed(threshold + 1)
+
+    def wait_for_prefetch(self, layer_id: int):
+        if self.consumer_index < 0:
+            return
+        if layer_id >= self.num_layers:
+            return
+        self.events[self.consumer_index].wait(layer_id)
+
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1
+        self._last_consumed_layer = -1
 
 
 class CacheOperation:
@@ -288,6 +308,7 @@ class HiCacheController:
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
+        self.layer_done_counter.on_layer_consumed = self.trigger_layer_load
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -305,6 +326,11 @@ class HiCacheController:
 
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
+
+        # On-demand layer prefetch state (populated by start_loading, consumed
+        # by trigger_layer_load during forward).
+        self._prefetch_state = None
+        self._prefetch_next_layer = 0
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -821,6 +847,8 @@ class HiCacheController:
         if len(self.load_queue) == 0:
             return -1
 
+        self._drain_pending_prefetch()
+
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices = self.move_indices(
@@ -832,30 +860,35 @@ class HiCacheController:
 
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
 
+        self._prefetch_state = (
+            host_indices,
+            device_indices,
+            producer_event,
+            ack_finish_event,
+        )
+        self._prefetch_next_layer = 1
+
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             ack_start_event.record()
-            for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_indices,
+                0,
+                self.io_backend,
+            )
+            if self.has_draft and self.mem_pool_host_draft.layer_num > 0:
+                self.mem_pool_host_draft.load_to_device_per_layer(
+                    self.mem_pool_device_draft,
                     host_indices,
                     device_indices,
-                    i,
+                    0,
                     self.io_backend,
                 )
-                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
-                        host_indices,
-                        device_indices,
-                        i,
-                        self.io_backend,
-                    )
-                producer_event.complete(i)
-            ack_finish_event.record()
-            # NOTE: We must save the host indices and device indices here,
-            # this is because we need to guarantee that these tensors are
-            # still alive when the load stream is executing.
+            producer_event.complete(0)
+            if self.layer_num <= 1:
+                ack_finish_event.record()
             if host_indices.is_cuda:
                 host_indices.record_stream(self.load_stream)
             if device_indices.is_cuda:
@@ -873,6 +906,50 @@ class HiCacheController:
             )
         )
         return producer_id
+
+    def trigger_layer_load(self, layer_id: int) -> None:
+        if self._prefetch_state is None:
+            return
+        if layer_id < self._prefetch_next_layer:
+            return
+        if layer_id >= self.layer_num:
+            return
+
+        self._prefetch_next_layer = layer_id + 1
+        host_indices, device_indices, producer_event, ack_finish_event = (
+            self._prefetch_state
+        )
+
+        with device_module.stream(self.load_stream):
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_indices,
+                layer_id,
+                self.io_backend,
+            )
+            if self.has_draft and layer_id < self.mem_pool_host_draft.layer_num:
+                self.mem_pool_host_draft.load_to_device_per_layer(
+                    self.mem_pool_device_draft,
+                    host_indices,
+                    device_indices,
+                    layer_id,
+                    self.io_backend,
+                )
+            producer_event.complete(layer_id)
+            if layer_id == self.layer_num - 1:
+                ack_finish_event.record()
+                self._prefetch_state = None
+
+    def _drain_pending_prefetch(self) -> None:
+        if self._prefetch_state is None:
+            return
+        _, _, producer_event, ack_finish_event = self._prefetch_state
+        with device_module.stream(self.load_stream):
+            for i in range(self._prefetch_next_layer, self.layer_num):
+                producer_event.load_events[i].record()
+            ack_finish_event.record()
+        self._prefetch_state = None
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)

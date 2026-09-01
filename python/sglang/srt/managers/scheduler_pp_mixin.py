@@ -253,6 +253,8 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
+                if envs.SGLANG_DISAGG_LAYERWISE.get():
+                    self.process_disagg_prefill_inflight_queue(transferred_rids)
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
                 )
@@ -322,6 +324,18 @@ class SchedulerPPMixin:
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
+                    # Sync layerwise KV transfers at a single pipeline point
+                    # — after PP batchSendRecv (overlap achieved) but before
+                    # _pp_process_batch_result sets KVPoll.Success.  This
+                    # ensures all PP ranks wait at the same stage, keeping
+                    # the consensus consistent.
+                    for req in self.mbs[next_mb_id].reqs:
+                        sender = getattr(req, "disagg_kv_sender", None)
+                        if sender is not None and hasattr(
+                            sender, "wait_layerwise_send_done"
+                        ):
+                            sender.wait_layerwise_send_done()
+                            break
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
