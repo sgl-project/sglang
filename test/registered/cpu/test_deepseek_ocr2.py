@@ -14,7 +14,15 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cpu_ci(est_time=3600, suite="nightly-xeon-models", nightly=True)
+register_cpu_ci(
+    est_time=3600,
+    suite="nightly-xeon-models",
+    nightly=True,
+    # DeepSeek-OCR-2 (deepseek_vl_v2 arch) does not run correctly on CPU yet:
+    # gsm8k accuracy 0.042 vs baseline 0.800 (~random). Also, an OCR VLM is a
+    # poor fit for a gsm8k accuracy gate. Re-enable once CPU support lands.
+    disabled="DeepSeek-OCR-2 accuracy 0.042 vs 0.8 on CPU -- model not supported yet",
+)
 
 MODEL_PATH = "deepseek-ai/DeepSeek-OCR-2"
 

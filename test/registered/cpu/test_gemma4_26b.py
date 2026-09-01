@@ -32,7 +32,9 @@ class TestGemma4_26BCPU(unittest.TestCase):
             ModelLaunchSettings(
                 MODEL_PATH,
                 extra_args=BASE_ARGS,
-                tp_size=6,
+                # 16 attention heads are not divisible by 6, so tp=6 fails the
+                # ensure_divisibility check on GNR; 16 % 2 == 0.
+                tp_size=2,
                 launch_timeout=CPU_LAUNCH_TIMEOUT,
             ),
         ]
