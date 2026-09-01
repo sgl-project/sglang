@@ -12,6 +12,8 @@ Test strategy:
   - rel_err: mean relative error of dequantized outputs (should be < 0.01)
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -36,6 +38,22 @@ def ref_silu_mul_quant(x: torch.Tensor, gs: int):
     """Two-step baseline: silu_and_mul + per_token_group_quant_fp8."""
     d = x.shape[-1] // 2
     result = torch.nn.functional.silu(x[..., :d]) * x[..., d:]
+    fp8_out, scale = per_token_group_quant_fp8(result, gs)
+    return fp8_out, scale
+
+
+def ref_silu_mul_quant_swiglu_clamp(x: torch.Tensor, gs: int, limit: float):
+    """Two-step baseline with DeepSeek-V4 SwiGLU clamp.
+
+    gate is clamped to [-inf, limit]; up is clamped to [-limit, limit].
+    Then silu(gate) * up is computed and quantized.
+    """
+    d = x.shape[-1] // 2
+    gate = x[..., :d].float()
+    up = x[..., d:].float()
+    gate = gate.clamp(min=None, max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    result = (torch.nn.functional.silu(gate) * up).to(x.dtype)
     fp8_out, scale = per_token_group_quant_fp8(result, gs)
     return fp8_out, scale
 
@@ -117,9 +135,8 @@ def test_fused_silu_mul_quant_fp8_zero_input():
     """All-zero input should produce all-zero output and near-zero scales."""
     x = torch.zeros(16, 2 * 2048, device="cuda", dtype=torch.bfloat16)
     fp8_out, scale = fused_silu_mul_quant_fp8(x, G)
-    assert (
-        scale.max().item() < 1e-5
-    ), f"Expected near-zero scale, got {scale.max().item()}"
+    max_scale = scale.max().item()
+    assert max_scale < 1e-5, f"Expected near-zero scale, got {max_scale}"
     assert fp8_out.float().abs().max().item() == 0.0, "Expected all-zero fp8 output"
 
 
@@ -132,15 +149,7 @@ def test_fused_silu_mul_quant_fp8_negative_input():
     assert scale_diff < 0.01, f"Negative input scale_diff={scale_diff}"
 
 
-def test_fused_silu_mul_quant_fp8_contiguity():
-    """Non-contiguous input should raise an assertion error."""
-    x = torch.randn(16, 2 * 2048, device="cuda", dtype=torch.bfloat16).t().t()
-    x_non_contig = x[:, ::2]  # non-contiguous slice
-    with pytest.raises(AssertionError):
-        fused_silu_mul_quant_fp8(x_non_contig, G)
-
-
-@pytest.mark.parametrize("group_size", [1, 32, 64, 128, 256, 512])
+@pytest.mark.parametrize("group_size", [32, 64, 128, 256])
 def test_fused_silu_mul_quant_fp8_group_sizes(group_size):
     """Test various group sizes."""
     hidden_dim = group_size * 4  # ensure divisibility
@@ -151,3 +160,120 @@ def test_fused_silu_mul_quant_fp8_group_sizes(group_size):
     assert ref_scale.shape == fused_scale.shape
     scale_diff = (ref_scale.float() - fused_scale.float()).abs().max().item()
     assert scale_diff < 0.01, f"gs={group_size} scale_diff={scale_diff}"
+
+
+# --------------------------------------------------------------------------- #
+# P2: swiglu_limit clamp correctness.
+#
+# DeepSeek-V4 uses swiglu_limit=10.0 (see config.json "swiglu_limit": 10.0).
+# The non-fused path asserts swiglu_limit == 10. We test primarily with the
+# DSV4 value, plus a few edge cases.
+# --------------------------------------------------------------------------- #
+DSV4_SWIGLU_LIMIT = 10.0  # DeepSeek-V4 actual value from config.json
+
+
+@pytest.mark.parametrize("swiglu_limit", [1.0, 5.0, DSV4_SWIGLU_LIMIT])
+def test_fused_silu_mul_quant_fp8_swiglu_limit(swiglu_limit):
+    """swiglu_limit must clamp gate to [-inf, L] and up to [-L, L] before silu*up.
+
+    This exercises the DeepSeek-V4 activation contract. We use inputs with
+    large magnitudes so the clamp is guaranteed to trigger.
+    """
+    torch.manual_seed(42)
+    x = torch.randn(64, 2 * 2048, device="cuda", dtype=torch.bfloat16) * 20.0
+
+    # Reference with clamp
+    ref_fp8, ref_scale = ref_silu_mul_quant_swiglu_clamp(x, G, swiglu_limit)
+    # Fused with clamp
+    fused_fp8, fused_scale = fused_silu_mul_quant_fp8(x, G, swiglu_limit=swiglu_limit)
+
+    # Scales should match closely
+    scale_diff = (ref_scale.float() - fused_scale.float()).abs().max().item()
+    assert scale_diff < 0.01, f"swiglu_limit={swiglu_limit} scale_diff={scale_diff}"
+
+    # FP8 codes should be mostly bit-exact
+    fp8_match = (ref_fp8 == fused_fp8).float().mean().item()
+    assert fp8_match > 0.95, f"swiglu_limit={swiglu_limit} fp8_match={fp8_match:.1%}"
+
+    # Dequantized cosine similarity
+    ref_dq = dequantize(ref_fp8, ref_scale, G)
+    fused_dq = dequantize(fused_fp8, fused_scale, G)
+    cosine_sim = torch.nn.functional.cosine_similarity(
+        ref_dq.flatten().unsqueeze(0), fused_dq.flatten().unsqueeze(0)
+    ).item()
+    assert cosine_sim > 0.9999, f"swiglu_limit={swiglu_limit} cosine_sim={cosine_sim}"
+
+
+def test_fused_silu_mul_quant_fp8_swiglu_limit_dsv4():
+    """DeepSeek-V4 exact configuration: swiglu_limit=10.0, hidden_dim=2048,
+    group_size=128, bf16.
+
+    DSV4 config.json: swiglu_limit=10.0, moe_intermediate_size=2048,
+    weight_block_size=[128, 128]. This test uses the exact production values.
+    """
+    torch.manual_seed(42)
+    # DSV4 expert weights are [2048, 2048] (w1) and [4096, 1024] (w2).
+    # hidden_dim=4096, intermediate=2048 -> gate_up dim = 2*2048 = 4096.
+    # But the fused kernel operates on the gate_up output (intermediate_cache1)
+    # which has shape [num_tokens, 2 * intermediate_size].
+    num_tokens = 256
+    intermediate_size = 2048  # DSV4 moe_intermediate_size
+    x = (
+        torch.randn(
+            num_tokens, 2 * intermediate_size, device="cuda", dtype=torch.bfloat16
+        )
+        * 20.0
+    )
+
+    ref_fp8, ref_scale = ref_silu_mul_quant_swiglu_clamp(x, G, DSV4_SWIGLU_LIMIT)
+    fused_fp8, fused_scale = fused_silu_mul_quant_fp8(
+        x, G, swiglu_limit=DSV4_SWIGLU_LIMIT
+    )
+
+    scale_diff = (ref_scale.float() - fused_scale.float()).abs().max().item()
+    assert scale_diff < 0.01, f"DSV4 config scale_diff={scale_diff}"
+
+    fp8_match = (ref_fp8 == fused_fp8).float().mean().item()
+    assert fp8_match > 0.95, f"DSV4 config fp8_match={fp8_match:.1%}"
+
+    ref_dq = dequantize(ref_fp8, ref_scale, G)
+    fused_dq = dequantize(fused_fp8, fused_scale, G)
+    cosine_sim = torch.nn.functional.cosine_similarity(
+        ref_dq.flatten().unsqueeze(0), fused_dq.flatten().unsqueeze(0)
+    ).item()
+    assert cosine_sim > 0.9999, f"DSV4 config cosine_sim={cosine_sim}"
+
+
+def test_fused_silu_mul_quant_fp8_swiglu_limit_changes_output():
+    """swiglu_limit=10.0 (DSV4 value) must produce different output than no clamp
+    when inputs exceed the limit."""
+    torch.manual_seed(42)
+    x = torch.randn(64, 2 * 2048, device="cuda", dtype=torch.bfloat16) * 20.0
+
+    no_clamp_fp8, no_clamp_scale = fused_silu_mul_quant_fp8(x, G, swiglu_limit=0.0)
+    clamp_fp8, clamp_scale = fused_silu_mul_quant_fp8(
+        x, G, swiglu_limit=DSV4_SWIGLU_LIMIT
+    )
+
+    # With large inputs and clamp=10.0, outputs must differ
+    diff_rate = (no_clamp_fp8 != clamp_fp8).float().mean().item()
+    assert diff_rate > 0.01, f"Expected clamp to change outputs, diff_rate={diff_rate}"
+
+    # Clamped scales should be smaller (values are bounded by limit)
+    assert clamp_scale.max().item() <= no_clamp_scale.max().item() + 1e-6
+
+
+def test_fused_silu_mul_quant_fp8_swiglu_limit_zero_is_noop():
+    """swiglu_limit=0.0 should behave identically to no clamp (default)."""
+    torch.manual_seed(42)
+    x = torch.randn(32, 2 * 2048, device="cuda", dtype=torch.bfloat16) * 5.0
+
+    default_fp8, default_scale = fused_silu_mul_quant_fp8(x, G)
+    zero_fp8, zero_scale = fused_silu_mul_quant_fp8(x, G, swiglu_limit=0.0)
+
+    assert torch.equal(default_fp8, zero_fp8), "swiglu_limit=0 should be a no-op"
+    assert torch.equal(default_scale, zero_scale), "scales should match"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

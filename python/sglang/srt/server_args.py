@@ -1982,7 +1982,7 @@ class ServerArgs:
     enable_fused_moe_sum_all_reduce: A[
         bool, "Enable fused moe triton and sum all reduce.", NS("exec.moe")
     ] = False
-    enable_fused_silu_quant_fp8: A[
+    enable_fused_silu_mul_quant_fp8: A[
         bool,
         "Enable fused silu_and_mul + fp8_quant Triton kernel in MoE.",
         NS("exec.kernel"),
