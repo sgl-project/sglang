@@ -12,16 +12,7 @@ from sglang.kernels.ops.speculative.reject_sampling import (
     chain_block_speculative_sampling_triton,
     chain_speculative_sampling_triton,
 )
-
-
-def _block_verification_enabled() -> bool:
-    """Deferred-import probe (no server context in kernel tests)."""
-    try:
-        from sglang.srt.runtime_context import get_spec
-
-        return bool(get_spec().speculative_use_block_verification)
-    except Exception:
-        return False
+from sglang.srt.runtime_context import get_spec
 
 
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -134,7 +125,7 @@ def _accept_sampling_core(
     uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
     accept_fn = (
         chain_block_speculative_sampling_triton
-        if _block_verification_enabled()
+        if get_spec().speculative_use_block_verification
         else chain_speculative_sampling_triton
     )
     accept_fn(
