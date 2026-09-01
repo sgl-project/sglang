@@ -17,6 +17,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+import sglang.srt.runtime_context as rc
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
     FINISH_MATCHED_STR,
@@ -24,6 +25,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -196,6 +198,30 @@ class TestPostEosBonusTokenIncident(CustomTestCase):
         self.assertIsInstance(req.finished_reason, FINISH_MATCHED_TOKEN)
         self.assertEqual(req.finished_len, 4)
         self.assertEqual(list(req.output_ids_through_stop), [10, 11, 12, EOT_ID])
+
+
+class TestSpecOvershootCacheLen(CustomTestCase):
+    """The radix cache key must stop where the client's output stops: keying
+    the tokens a verify step commits past the stop stored a suffix no
+    continuation can reproduce."""
+
+    def setUp(self):
+        rc.reset_context()
+        rc.get_context().set_server_args(ServerArgs(model_path="dummy"))
+
+    def tearDown(self):
+        rc.reset_context()
+
+    def test_commit_past_the_stop_is_excluded(self):
+        # One verify step commits [12, EOS, 20]; the two tokens after the EOS
+        # reach the KV pool but never the client.
+        req = _make_req([10, 11, 12, EOS_ID, 20], max_new_tokens=100)
+        req.kv.kv_committed_len = len(req.origin_input_ids) + len(req.output_ids)
+        req.update_finish_state(new_accepted_len=5)
+        self.assertEqual(req.finished_len, 4)
+        self.assertEqual(
+            req.effective_kv_committed_len(), len(req.origin_input_ids) + 4
+        )
 
 
 if __name__ == "__main__":
