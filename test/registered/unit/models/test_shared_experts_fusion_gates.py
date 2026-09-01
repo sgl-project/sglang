@@ -214,6 +214,54 @@ class TestGlmMoeGate(_FusionGateCase):
             "GlmMoeDsaForCausalLM",
         )
 
+    def test_hopper_modelopt_fp4_marlin_disables_fusion_by_default(self):
+        import sglang.srt.models.deepseek_v2 as deepseek_v2
+        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLM
+
+        self._seed(moe_runner_backend="marlin")
+        config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            n_routed_experts=256,
+            n_shared_experts=1,
+        )
+        with (
+            unittest.mock.patch.object(deepseek_v2, "_is_cuda", True),
+            unittest.mock.patch.object(
+                deepseek_v2.torch.cuda,
+                "get_device_capability",
+                return_value=(9, 0),
+            ),
+        ):
+            self.assertIn(
+                "fusion off by default",
+                self._reason(GlmMoeDsaForCausalLM, config, _quant("modelopt_fp4")),
+            )
+
+    def test_hopper_modelopt_fp4_marlin_can_still_be_forced(self):
+        import sglang.srt.models.deepseek_v2 as deepseek_v2
+        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLM
+
+        self._seed(
+            moe_runner_backend="marlin",
+            enforce_shared_experts_fusion=True,
+        )
+        config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            n_routed_experts=256,
+            n_shared_experts=1,
+        )
+        with (
+            unittest.mock.patch.object(deepseek_v2, "_is_cuda", True),
+            unittest.mock.patch.object(
+                deepseek_v2.torch.cuda,
+                "get_device_capability",
+                return_value=(9, 0),
+            ),
+        ):
+            self.assertIsNone(
+                self._reason(GlmMoeDsaForCausalLM, config, _quant("modelopt_fp4"))
+            )
+
 
 class TestMiniMaxGates(_FusionGateCase):
     def test_a_config_without_shared_experts_cannot_fuse(self):

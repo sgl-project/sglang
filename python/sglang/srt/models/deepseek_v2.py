@@ -3068,6 +3068,19 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             )
         if get_exec().moe.enforce_shared_experts_fusion:
             return None
+        if (
+            cls.fused_shared_experts_architecture == "GlmMoeDsaForCausalLM"
+            and quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and get_moe_runner_backend().is_marlin()
+            and _is_cuda
+            and (9, 0) <= torch.cuda.get_device_capability("cuda") < (10, 0)
+        ):
+            return (
+                "Hopper GLM modelopt_fp4 with moe_runner_backend=marlin: "
+                "fusion off by default until the shared-expert fused load path "
+                "is validated."
+            )
         if is_sbo_enabled() or is_tbo_enabled():
             return "SBO/TBO enabled: incompatible with fusing shared expert into MoE kernel."
         if is_deepep_class_backend():
