@@ -31,7 +31,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -3618,6 +3618,27 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         return k_size_bytes, v_size_bytes
 
 
+def mamba_slot_identity(mamba_indices: torch.Tensor) -> torch.Tensor:
+    """The static pool's `mamba_translate`: its slot ids are already physical."""
+    return mamba_indices
+
+
+def mamba_slot_translate_unset(mamba_indices: torch.Tensor) -> torch.Tensor:
+    """Default `mamba_translate`: refuses instead of assuming identity.
+
+    The unified pool cannot pass its own at construction -- pool -> allocator ->
+    slot allocator -> translate -> pool is a cycle -- so it installs one right
+    after. Defaulting to identity would make a dropped install offload the
+    wrong slots silently; defaulting to a raise makes it say so.
+    """
+    raise RuntimeError(
+        "mamba_translate was never installed on this HybridLinearKVPool, so "
+        "its mamba slot ids cannot be resolved. A static pool passes "
+        "mamba_slot_identity at construction; the unified pool installs the "
+        "allocator's translate right after building the slot allocator."
+    )
+
+
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 
@@ -3646,6 +3667,13 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        # HiCache offload resolves mamba slots through this. The default
+        # REFUSES rather than assuming identity: the unified pool stores
+        # VIRTUAL slot ids, so a forgotten install must not read as "no
+        # translation needed". A static pool passes `mamba_slot_identity`.
+        mamba_translate: Callable[
+            [torch.Tensor], torch.Tensor
+        ] = mamba_slot_translate_unset,
     ):
         self.size = size
         self.dtype = dtype
@@ -3657,9 +3685,7 @@ class HybridLinearKVPool(KVCache):
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
-        # virtual->physical mamba-slot translate for the HiCache offload path;
-        # identity for a static pool, the allocator's `translate` for the unified pool.
-        self._mamba_translate = lambda ids: ids
+        self._mamba_translate = mamba_translate
         self.use_mla = use_mla
         if full_kv_pool is not None:
             # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
@@ -4095,12 +4121,20 @@ class MLATokenToKVPool(KVCache):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         assert not self.dsa_kv_cache_store_fp8
-        parallel = get_parallel()
-        if parallel.dcp_enabled:
-            valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
-            if not valid_mask.all():
-                loc = loc[valid_mask]
-                cache_k = cache_k[valid_mask]
+        # This door has no DCP-aware write path, and cannot be given one: the
+        # two backends that could reach it disagree on the loc space --
+        # flashinfer-MLA's `k_rope is None` branch passes a WIDENED loc (needs
+        # select + collapse), the Triton backend passes one it already
+        # collapsed. `set_mla_kv_buffer` is the DCP-aware door, and every MLA
+        # write takes it today; the masked-but-undivided branch that used to sit
+        # here wrote widened ids straight into a rank-local buffer.
+        assert not get_parallel().dcp_enabled, (
+            "MLATokenToKVPool.set_kv_buffer has no DCP-aware write path. Under "
+            "--dcp-size > 1 the MLA write must go through set_mla_kv_buffer, "
+            "whose kernel resolves the owner rule; reaching the combined-row "
+            "door means an attention backend took a write path that never "
+            "declared which loc space it emits."
+        )
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 

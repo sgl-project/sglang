@@ -63,6 +63,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NoOpMHATokenToKVPool,
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
+    mamba_slot_identity,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
@@ -1764,6 +1765,7 @@ class KVCacheConfigurator:
             full_attention_layer_ids=full_attention_layer_ids,
             device=self.device,
             mamba_pool=req_to_token_pool.mamba_pool,
+            mamba_translate=mamba_slot_identity,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             use_mla=self.use_mla_backend,

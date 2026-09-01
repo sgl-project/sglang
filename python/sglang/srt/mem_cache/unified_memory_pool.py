@@ -1385,7 +1385,9 @@ def init_unified_mamba_pools(
         max_size=req_to_token_pool._shared_mamba_size,
         device=device,
     )
-    # `_mamba_translate` feeds the HiCache offload path, GATED OFF here — wired but inert.
+    # Installs over the refusing default (the pool could not be given this at
+    # construction -- it is one hop of the cycle that ends at this allocator).
+    # Feeds the HiCache offload path, gated off for the unified pool today.
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
     # No full-KV translate hook is wired: both MLA doors now receive
