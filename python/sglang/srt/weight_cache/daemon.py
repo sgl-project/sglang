@@ -2,7 +2,7 @@
 """Weight Cache Daemon — a persistent process that holds post-quantized,
 TP-sharded model weights in GPU memory and serves them via pluggable transport backends.
 
-Each GPU runs one daemon process for its TP rank. The daemon:
+Each GPU runs one daemon process per cache configuration. The daemon:
 1. Loads model weights from disk (full pipeline: disk → TP shard → quantize)
 2. Exports every parameter/buffer as a CUDA IPC handle
 3. Serves transport entries over a Unix socket to requesting engine processes
@@ -56,6 +56,7 @@ from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
+    compute_config_digest,
     compute_env_stamp,
     compute_global_rank,
     compute_local_gpu_id,
@@ -174,8 +175,9 @@ class WeightCacheDaemon:
         self.dist_init_method = dist_init_method
 
         device_uuid = current_platform.get_device_uuid(gpu_id)
-        self.socket_path = get_socket_path(device_uuid)
-        self.ready_path = get_ready_path(device_uuid)
+        config_digest = compute_config_digest(cfg, tp_rank=tp_rank, pp_rank=pp_rank)
+        self.socket_path = get_socket_path(device_uuid, config_digest)
+        self.ready_path = get_ready_path(device_uuid, config_digest)
 
         self.model = None
         self.config: Optional[CacheConfig] = None
@@ -741,7 +743,9 @@ def launch_weight_cache_daemons(
                 gpu_id_step=cfg.gpu_id_step,
             )
             cleanup_stale_daemon_files(
-                current_platform.get_device_uuid(gpu_id), force=force
+                current_platform.get_device_uuid(gpu_id),
+                compute_config_digest(cfg, tp_rank=tp_rank, pp_rank=pp_rank),
+                force=force,
             )
 
     procs = []
@@ -782,7 +786,10 @@ def launch_weight_cache_daemons(
                 base_gpu_id=cfg.base_gpu_id,
                 gpu_id_step=cfg.gpu_id_step,
             )
-            ready_path = get_ready_path(current_platform.get_device_uuid(gpu_id))
+            ready_path = get_ready_path(
+                current_platform.get_device_uuid(gpu_id),
+                compute_config_digest(cfg, tp_rank=tp_rank, pp_rank=pp_rank),
+            )
             while not os.path.exists(ready_path):
                 time.sleep(check_interval)
                 if time.time() - start_time > timeout:
@@ -863,6 +870,8 @@ if __name__ == "__main__":
     from sglang.srt.server_args import prepare_server_args
 
     server_args = prepare_server_args(server_argv)
+    # Generated daemon paths must use resolved ServerArgs.
+    server_args.resolve_once()
     daemon_args = WeightCacheDaemonArgs.from_cli_args(worker_ns)
     if daemon_args.gpu_id is not None or daemon_args.tp_rank is not None:
         gpu_id = (
@@ -877,6 +886,11 @@ if __name__ == "__main__":
         )
         cleanup_stale_daemon_files(
             current_platform.get_device_uuid(gpu_id),
+            compute_config_digest(
+                resolving_view(server_args),
+                tp_rank=tp_rank,
+                pp_rank=daemon_args.pp_rank,
+            ),
             force=daemon_args.force,
         )
         run_weight_cache_daemon(

@@ -25,13 +25,17 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt import runtime_context as rc
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.environ import envs
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.weight_cache.protocol import (
     IPC_QUANT_ALLOWLIST,
     CacheConfig,
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
+    compute_config_digest,
     compute_global_rank,
     compute_local_gpu_id,
     get_quant_method_name,
@@ -80,6 +84,10 @@ def _make_cache_config(**overrides) -> CacheConfig:
     )
     base.update(overrides)
     return CacheConfig(**base)
+
+
+def _make_server_args(**overrides) -> ServerArgs:
+    return ServerArgs(**{"model_path": "dummy", **overrides})
 
 
 class TestProtocolFraming(CustomTestCase):
@@ -241,25 +249,53 @@ class TestGlobalRankAndPaths(CustomTestCase):
         self.assertEqual(compute_global_rank(tp_size=4, pp_rank=1, tp_rank=0), 4)
         self.assertEqual(compute_global_rank(tp_size=4, pp_rank=2, tp_rank=1), 9)
 
-    def test_socket_and_ready_paths_are_unique_per_device_uuid(self):
-        self.assertNotEqual(get_socket_path("gpu-aaa"), get_socket_path("gpu-bbb"))
-        self.assertTrue(get_socket_path("gpu-aaa").endswith("gpu-aaa.sock"))
-        self.assertTrue(get_ready_path("gpu-aaa").endswith("gpu-aaa.ready"))
+    def test_paths_are_unique_per_gpu_and_digest(self):
+        path = get_socket_path("gpu-aaa", "cfg-1")
+        self.assertNotEqual(path, get_socket_path("gpu-bbb", "cfg-1"))
+        self.assertNotEqual(path, get_socket_path("gpu-aaa", "cfg-2"))
+        self.assertTrue(path.endswith("gpu-aaa-cfg-1.sock"))
+        self.assertTrue(
+            get_ready_path("gpu-aaa", "cfg-1").endswith("gpu-aaa-cfg-1.ready")
+        )
 
     def test_custom_template_with_device_uuid_placeholder_is_honored(self):
         with envs.SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE.override(
             "/custom/dir/{device_uuid}.custom-sock"
         ):
             self.assertEqual(
-                get_socket_path("gpu-aaa"), "/custom/dir/gpu-aaa.custom-sock"
+                get_socket_path("gpu-aaa", "cfg-1"),
+                "/custom/dir/gpu-aaa-cfg-1.custom-sock",
             )
+        with envs.SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE.override(
+            "/custom/dir.d/{device_uuid}"
+        ):
+            self.assertEqual(
+                get_socket_path("gpu-aaa", "cfg-1"), "/custom/dir.d/gpu-aaa-cfg-1"
+            )
+
+    def test_socket_path_enforces_linux_af_unix_byte_limit(self):
+        # sun_path is char[108] and must hold the NUL, so 107 is the longest.
+        device_uuid, digest = "gpu", "d" * 20
+        fixed = len(os.fsencode(f"/{device_uuid}-{digest}.sock"))
+
+        with envs.SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE.override(
+            "/" + "x" * (107 - fixed) + "{device_uuid}.sock"
+        ):
+            path = get_socket_path(device_uuid, digest)
+            self.assertEqual(len(os.fsencode(path)), 107)
+
+        with envs.SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE.override(
+            "/" + "x" * (108 - fixed) + "{device_uuid}.sock"
+        ):
+            with self.assertRaisesRegex(ValueError, "107"):
+                get_socket_path(device_uuid, digest)
 
     def test_template_missing_device_uuid_placeholder_raises(self):
         with envs.SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE.override(
             "/tmp/sglang_weight_cache_rank{global_rank}.sock"
         ):
             with self.assertRaises(ValueError):
-                get_socket_path("gpu-aaa")
+                get_socket_path("gpu-aaa", "cfg-1")
 
     def test_compute_local_gpu_id_honors_base_and_step(self):
         # Single-node TP=4: identity mapping rank -> gpu.
@@ -280,6 +316,59 @@ class TestGlobalRankAndPaths(CustomTestCase):
             ),
             4,
         )
+
+
+class TestConfigDigest(CustomTestCase):
+    def setUp(self):
+        rc.reset_context()
+
+    def tearDown(self):
+        rc.reset_context()
+
+    def _digest(self, sa, *, tp_rank=0, pp_rank=0):
+        return compute_config_digest(
+            resolving_view(sa), tp_rank=tp_rank, pp_rank=pp_rank
+        )
+
+    def test_config_and_rank_changes_change_the_digest(self):
+        base = self._digest(_make_server_args())
+        for field, value in (
+            ("model_path", "/models/other"),
+            ("dtype", "bfloat16"),
+            ("revision", "v2"),
+            ("quantization", "fp8"),
+            ("load_format", "dummy"),
+            ("model_loader_extra_config", '{"presharded_path": "/p"}'),
+            ("moe_runner_backend", "triton"),
+            ("enable_eplb", True),
+            ("ep_num_redundant_experts", 4),
+            ("init_expert_location", "/layouts/other.json"),
+            ("eplb_algorithm", "deepseek_hierarchical"),
+            ("nnodes", 2),
+            ("tp_size", 4),
+        ):
+            self.assertNotEqual(
+                base, self._digest(_make_server_args(**{field: value})), msg=field
+            )
+        sa = _make_server_args(tp_size=2, pp_size=2)
+        self.assertNotEqual(self._digest(sa), self._digest(sa, tp_rank=1))
+        self.assertNotEqual(self._digest(sa), self._digest(sa, pp_rank=1))
+
+    def test_launcher_and_client_converge_only_once_resolved(self):
+        # Resolution rewrites moe_a2a_backend, a digest input, so a launcher
+        # that skipped resolve_once() derives a different path than its client.
+        raw = dict(moe_runner_backend="megamoe", moe_a2a_backend="none")
+
+        unresolved = self._digest(_make_server_args(**raw))
+
+        rc.publish(_make_server_args(**raw), role="test")
+        client = self._digest(rc.get_server_args())
+
+        launcher = _make_server_args(**raw)
+        launcher.resolve_once()
+
+        self.assertEqual(self._digest(launcher), client)
+        self.assertNotEqual(unresolved, client)
 
 
 class TestDaemonLaunchConfiguration(CustomTestCase):
@@ -387,9 +476,13 @@ class TestCleanupStaleDaemonFiles(CustomTestCase):
     # A key no real daemon would ever compute, so this never collides with
     # one that might actually be running on the test host.
     KEY = "test-cleanup-stale-daemon-files"
+    DIGEST = "cfg"
 
     def _paths(self):
-        return get_ready_path(self.KEY), get_socket_path(self.KEY)
+        return (
+            get_ready_path(self.KEY, self.DIGEST),
+            get_socket_path(self.KEY, self.DIGEST),
+        )
 
     def tearDown(self):
         for path in self._paths():
@@ -398,7 +491,7 @@ class TestCleanupStaleDaemonFiles(CustomTestCase):
 
     def test_no_files_is_noop(self):
         # Neither file present: must return quietly, not raise.
-        cleanup_stale_daemon_files(self.KEY)
+        cleanup_stale_daemon_files(self.KEY, self.DIGEST)
 
     def test_stale_files_without_live_pid_are_removed(self):
         ready_path, socket_path = self._paths()
@@ -408,7 +501,7 @@ class TestCleanupStaleDaemonFiles(CustomTestCase):
             f.write("stale contents, no pid line\n")
         open(socket_path, "w").close()
 
-        cleanup_stale_daemon_files(self.KEY)
+        cleanup_stale_daemon_files(self.KEY, self.DIGEST)
 
         self.assertFalse(os.path.exists(ready_path))
         self.assertFalse(os.path.exists(socket_path))
@@ -421,10 +514,30 @@ class TestCleanupStaleDaemonFiles(CustomTestCase):
         open(socket_path, "w").close()
 
         with self.assertRaises(RuntimeError):
-            cleanup_stale_daemon_files(self.KEY)
+            cleanup_stale_daemon_files(self.KEY, self.DIGEST)
 
         self.assertTrue(os.path.exists(ready_path))
         self.assertTrue(os.path.exists(socket_path))
+
+    def test_cleanup_is_scoped_to_one_digest(self):
+        other = "cfg-other"
+        ready_a, socket_a = self._paths()
+        ready_b = get_ready_path(self.KEY, other)
+        socket_b = get_socket_path(self.KEY, other)
+        try:
+            for path in (ready_a, socket_a, ready_b, socket_b):
+                open(path, "w").close()
+
+            cleanup_stale_daemon_files(self.KEY, self.DIGEST)
+
+            self.assertFalse(os.path.exists(ready_a))
+            self.assertFalse(os.path.exists(socket_a))
+            self.assertTrue(os.path.exists(ready_b))
+            self.assertTrue(os.path.exists(socket_b))
+        finally:
+            for path in (ready_b, socket_b):
+                if os.path.exists(path):
+                    os.unlink(path)
 
     def test_force_takes_over_from_live_pid(self):
         ready_path, socket_path = self._paths()
@@ -439,7 +552,7 @@ class TestCleanupStaleDaemonFiles(CustomTestCase):
                 f.write(f"pid={child.pid}\n")
             open(socket_path, "w").close()
 
-            cleanup_stale_daemon_files(self.KEY, force=True)
+            cleanup_stale_daemon_files(self.KEY, self.DIGEST, force=True)
 
             self.assertFalse(os.path.exists(ready_path))
             self.assertFalse(os.path.exists(socket_path))
@@ -459,6 +572,13 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
     """
 
     KEY = "test-daemon-mode-refuses-disk-load"
+    DIGEST = "cfg"
+
+    def setUp(self):
+        rc.reset_context()
+
+    def tearDown(self):
+        rc.reset_context()
 
     def _model_config(self):
         from types import SimpleNamespace
@@ -480,7 +600,7 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
         from sglang.srt.configs.load_config import LoadConfig, LoadFormat
         from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
 
-        missing_socket = get_socket_path(self.KEY)
+        missing_socket = get_socket_path(self.KEY, self.DIGEST)
         if os.path.exists(missing_socket):
             os.unlink(missing_socket)
 
@@ -497,29 +617,44 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
         # fall through to a disk load.
         self.assertIn("daemon", str(ctx.exception).lower())
 
-    def test_default_discovery_queries_device_uuid_for_the_caller_gpu(self):
+    def test_default_discovery_derives_the_socket_from_gpu_and_config(self):
         """Without an explicit --weight-cache-socket (the production default),
         discovery must derive the socket from the caller's own gpu_id via
-        get_device_uuid -- not silently substitute GPU 0."""
+        get_device_uuid, not silently substitute GPU 0, and must key it by the
+        caller's own resolved config."""
         from unittest import mock
 
         from sglang.srt.configs.load_config import LoadConfig, LoadFormat
         from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        sa = _make_server_args(tp_size=4)
+        rc.publish(sa, role="test")
+        tp_rank, pp_rank = 2, 0
 
         loader = IpcModelLoader(
             load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE),
             weight_cache_mode="client",
             fallback_load_format="auto",
         )
-        with mock.patch(
-            "sglang.srt.platforms.current_platform.get_device_uuid",
-            return_value="gpu-under-test",
-        ) as get_uuid:
+        with (
+            mock.patch(
+                "sglang.srt.platforms.current_platform.get_device_uuid",
+                return_value="gpu-under-test",
+            ) as get_uuid,
+            rc.get_parallel().override(tp_rank=tp_rank, pp_rank=pp_rank),
+        ):
             result = loader._fetch_from_cache(
                 self._model_config(), SimpleNamespace(gpu_id=5)
             )
         get_uuid.assert_called_once_with(5)
         self.assertIsNone(result)  # no real daemon at that socket -> absent
+
+        expected_digest = compute_config_digest(
+            resolving_view(sa), tp_rank=tp_rank, pp_rank=pp_rank
+        )
+        self.assertEqual(
+            loader.socket_path, get_socket_path("gpu-under-test", expected_digest)
+        )
 
 
 if __name__ == "__main__":
