@@ -71,7 +71,7 @@ def _make_manager() -> LoRAManager:
 class TestLoRAManagerUpsert(CustomTestCase):
     def test_fresh_load_registers_adapter(self):
         manager = _make_manager()
-        ref = LoRARef(lora_name="a", lora_path="__tensor__", pinned=True)
+        ref = LoRARef(lora_name="a", lora_path="__stream__", pinned=True)
 
         result = manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
 
@@ -82,7 +82,7 @@ class TestLoRAManagerUpsert(CustomTestCase):
 
     def test_duplicate_load_without_upsert_asserts(self):
         manager = _make_manager()
-        ref = LoRARef(lora_name="a", lora_path="__tensor__")
+        ref = LoRARef(lora_name="a", lora_path="__stream__")
         manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
 
         with self.assertRaises(AssertionError):
@@ -90,7 +90,7 @@ class TestLoRAManagerUpsert(CustomTestCase):
 
     def test_upsert_refreshes_loaded_adapter_in_place(self):
         manager = _make_manager()
-        ref = LoRARef(lora_name="a", lora_path="__tensor__", pinned=True)
+        ref = LoRARef(lora_name="a", lora_path="__stream__", pinned=True)
         manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
         # Simulate the adapter occupying a memory-pool buffer slot.
         manager.memory_pool.uid_to_buffer_id = {ref.lora_id: 3}
@@ -112,7 +112,7 @@ class TestLoRAManagerUpsert(CustomTestCase):
 
     def test_upsert_skips_pool_copy_when_not_resident(self):
         manager = _make_manager()
-        ref = LoRARef(lora_name="a", lora_path="__tensor__")
+        ref = LoRARef(lora_name="a", lora_path="__stream__")
         manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
 
         result = manager.load_lora_adapter_from_tensors(
@@ -124,7 +124,7 @@ class TestLoRAManagerUpsert(CustomTestCase):
 
     def test_upsert_falls_back_to_register_when_not_loaded(self):
         manager = _make_manager()
-        ref = LoRARef(lora_name="a", lora_path="__tensor__", pinned=True)
+        ref = LoRARef(lora_name="a", lora_path="__stream__", pinned=True)
 
         result = manager.load_lora_adapter_from_tensors(
             ref, {}, CONFIG_DICT, upsert=True
@@ -141,17 +141,17 @@ class TestLoRARegistryRegisterOrReuse(CustomTestCase):
         existing = LoRARef(lora_name="a", lora_path="/x", pinned=False)
         asyncio.run(registry.register(existing))
 
-        candidate = LoRARef(lora_name="a", lora_path="__tensor__", pinned=True)
+        candidate = LoRARef(lora_name="a", lora_path="__stream__", pinned=True)
         resolved, reused = asyncio.run(registry.register_or_reuse(candidate, True))
 
         self.assertTrue(reused)
         self.assertEqual(resolved.lora_id, existing.lora_id)
-        self.assertEqual(resolved.lora_path, "__tensor__")
+        self.assertEqual(resolved.lora_path, "__stream__")
         self.assertTrue(resolved.pinned)
 
     def test_upsert_without_registered_adapter_keeps_fresh_id(self):
         registry = LoRARegistry()
-        candidate = LoRARef(lora_name="a", lora_path="__tensor__")
+        candidate = LoRARef(lora_name="a", lora_path="__stream__")
 
         resolved, reused = asyncio.run(registry.register_or_reuse(candidate, True))
 
@@ -176,7 +176,7 @@ class TestLoRARegistryRegisterOrReuse(CustomTestCase):
         refreshed = LoRARef(
             lora_id=existing.lora_id,
             lora_name="a",
-            lora_path="__tensor__",
+            lora_path="__stream__",
             pinned=True,
         )
         asyncio.run(registry.refresh(refreshed))
@@ -190,7 +190,7 @@ class TestLoRARegistryRegisterOrReuse(CustomTestCase):
 
         with self.assertRaises(AssertionError):
             asyncio.run(
-                registry.refresh(LoRARef(lora_name="a", lora_path="__tensor__"))
+                registry.refresh(LoRARef(lora_name="a", lora_path="__stream__"))
             )
 
 
@@ -202,7 +202,7 @@ class TestUpsertRollback(CustomTestCase):
         manager._create_lora_adapter_from_tensors = Mock(
             side_effect=ValueError("bad tensors")
         )
-        ref = LoRARef(lora_name="a", lora_path="__tensor__")
+        ref = LoRARef(lora_name="a", lora_path="__stream__")
 
         result = manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
 
@@ -214,7 +214,7 @@ class TestUpsertRollback(CustomTestCase):
 
     def test_failed_upsert_staging_keeps_old_adapter_serving(self):
         manager = _make_manager()
-        ref = LoRARef(lora_name="a", lora_path="__tensor__")
+        ref = LoRARef(lora_name="a", lora_path="__stream__")
         manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
         old_config = manager.configs[ref.lora_id]
         old_lora = manager.loras[ref.lora_id]
@@ -233,7 +233,7 @@ class TestUpsertRollback(CustomTestCase):
 
     def test_failed_buffer_rewrite_restores_old_weights(self):
         manager = _make_manager()
-        ref = LoRARef(lora_name="a", lora_path="__tensor__")
+        ref = LoRARef(lora_name="a", lora_path="__stream__")
         manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
         old_config = manager.configs[ref.lora_id]
         old_lora = manager.loras[ref.lora_id]
@@ -261,14 +261,14 @@ class TestUpsertRollback(CustomTestCase):
 class TestUpsertPinnedAccounting(CustomTestCase):
     def test_pinned_flip_updates_counter_both_ways(self):
         manager = _make_manager()
-        unpinned = LoRARef(lora_name="a", lora_path="__tensor__", pinned=False)
+        unpinned = LoRARef(lora_name="a", lora_path="__stream__", pinned=False)
         manager.load_lora_adapter_from_tensors(unpinned, {}, CONFIG_DICT)
         self.assertEqual(manager.num_pinned_loras, 0)
 
         pinned = LoRARef(
             lora_id=unpinned.lora_id,
             lora_name="a",
-            lora_path="__tensor__",
+            lora_path="__stream__",
             pinned=True,
         )
         manager.load_lora_adapter_from_tensors(pinned, {}, CONFIG_DICT, upsert=True)
@@ -279,12 +279,12 @@ class TestUpsertPinnedAccounting(CustomTestCase):
 
     def test_unload_after_pinned_flip_keeps_counter_consistent(self):
         manager = _make_manager()
-        unpinned = LoRARef(lora_name="a", lora_path="__tensor__", pinned=False)
+        unpinned = LoRARef(lora_name="a", lora_path="__stream__", pinned=False)
         manager.load_lora_adapter_from_tensors(unpinned, {}, CONFIG_DICT)
         pinned = LoRARef(
             lora_id=unpinned.lora_id,
             lora_name="a",
-            lora_path="__tensor__",
+            lora_path="__stream__",
             pinned=True,
         )
         manager.load_lora_adapter_from_tensors(pinned, {}, CONFIG_DICT, upsert=True)
@@ -299,7 +299,7 @@ class TestUpsertPinnedAccounting(CustomTestCase):
         freeze RL serving on the step-1 weights."""
         manager = _make_manager()
         manager.max_loras_per_batch = 2
-        ref = LoRARef(lora_name="a", lora_path="__tensor__", pinned=True)
+        ref = LoRARef(lora_name="a", lora_path="__stream__", pinned=True)
         manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
         self.assertEqual(manager.num_pinned_loras, 1)
 
@@ -314,13 +314,13 @@ class TestUpsertPinnedAccounting(CustomTestCase):
         manager = _make_manager()
         manager.max_loras_per_batch = 2
         manager.load_lora_adapter_from_tensors(
-            LoRARef(lora_name="a", lora_path="__tensor__", pinned=True),
+            LoRARef(lora_name="a", lora_path="__stream__", pinned=True),
             {},
             CONFIG_DICT,
         )
 
         result = manager.load_lora_adapter_from_tensors(
-            LoRARef(lora_name="b", lora_path="__tensor__", pinned=True),
+            LoRARef(lora_name="b", lora_path="__stream__", pinned=True),
             {},
             CONFIG_DICT,
         )
