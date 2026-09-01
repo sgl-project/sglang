@@ -10,6 +10,7 @@
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
+#include <algorithm>
 #include <cstdint>
 #include <cuda_fp8.h>
 #include <type_traits>
@@ -208,7 +209,18 @@ struct SiluAndMulClampParams {
   const void* __restrict__ input;
   void* __restrict__ output;
   float swiglu_limit;
+  uint32_t out_vecs;
+  uint32_t blocks_per_row;
 };
+
+template <typename DType2>
+SGL_DEVICE bf16x2_t to_bf16x2(DType2 value) {
+  if constexpr (std::is_same_v<DType2, bf16x2_t>) {
+    return value;
+  } else {
+    return device::cast<bf16x2_t>(device::cast<fp32x2_t>(value));
+  }
+}
 
 template <typename DType, bool kUsePDL>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
@@ -219,21 +231,27 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   constexpr auto kVecSize = 16 / sizeof(DType);
   static_assert(kVecSize % 2 == 0 && kVecSize > 0);
   using Vec = AlignedVector<DType2, kVecSize / 2>;
-  const auto bid = blockIdx.x;
-  const auto tile = tile::Memory<Vec>::cta();
+  const auto row = blockIdx.x / params.blocks_per_row;
+  const auto block_in_row = blockIdx.x % params.blocks_per_row;
+  const auto vec_id = block_in_row * blockDim.x + threadIdx.x;
   const float limit = params.swiglu_limit;
 
   PDLWaitPrimary<kUsePDL>();
-  const auto gate = tile.load(params.input, bid * 2 + 0);
-  const auto up = tile.load(params.input, bid * 2 + 1);
-  Vec out;
+  if (vec_id < params.out_vecs) {
+    const auto input = static_cast<const Vec*>(params.input);
+    auto output = static_cast<Vec*>(params.output);
+    const auto input_row = row * 2 * params.out_vecs;
+    const auto gate = input[input_row + vec_id];
+    const auto up = input[input_row + params.out_vecs + vec_id];
+    Vec out;
 
 #pragma unroll
-  for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-    out[i] = cast<DType2>(silu_and_mul<true>(cast<bf16x2_t>(gate[i]), cast<bf16x2_t>(up[i]), limit));
-  }
+    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+      out[i] = cast<DType2>(silu_and_mul<true>(to_bf16x2(gate[i]), to_bf16x2(up[i]), limit));
+    }
 
-  tile.store(params.output, out, bid);
+    output[row * params.out_vecs + vec_id] = out;
+  }
   PDLTriggerSecondary<kUsePDL>();
 }
 
@@ -349,16 +367,20 @@ struct SiluAndMulClampKernel {
     constexpr uint32_t kVecSize = 16 / sizeof(DType);
     const auto out_dim = static_cast<uint32_t>(H.unwrap());
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    RuntimeCheck(out_dim > 0, "out_dim must be positive");
     RuntimeCheck(out_dim % kVecSize == 0, "out_dim must be divisible by vector size");
-    const auto num_threads = out_dim / kVecSize;
-    RuntimeCheck(num_threads <= 1024, "out_dim too large for single-block-per-row launch");
+    const auto out_vecs = out_dim / kVecSize;
+    const auto num_threads = std::min(out_vecs, 1024u);
+    const auto blocks_per_row = host::div_ceil(out_vecs, num_threads);
 
     const auto params = SiluAndMulClampParams{
         .input = input.data_ptr(),
         .output = output.data_ptr(),
         .swiglu_limit = static_cast<float>(swiglu_limit),
+        .out_vecs = out_vecs,
+        .blocks_per_row = blocks_per_row,
     };
-    LaunchKernel(num_tokens, num_threads, device.unwrap())  //
+    LaunchKernel(num_tokens * blocks_per_row, num_threads, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };
