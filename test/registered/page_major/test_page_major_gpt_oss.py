@@ -28,8 +28,8 @@ _UNIFIED_COMMON_ARGS = [
 
 
 class TestUnifiedGptOssTriton(DefaultServerBase):
-    """Unified pool on gpt-oss-20b (hybrid-SWA MoE), Triton pinned: dense
-    MHA/SWA views through the reference backend."""
+    """Unified pool on gpt-oss-20b (hybrid-SWA MoE), Triton pinned: the MHA/SWA
+    per-layer views through the reference backend."""
 
     model = DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
 

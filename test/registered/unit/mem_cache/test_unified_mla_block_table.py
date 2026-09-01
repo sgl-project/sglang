@@ -11,20 +11,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""DENSE block table / kv_indices for the paged MLA backends under the unified
+"""Block table / kv_indices for the paged MLA backends under the unified
 memory pool (Kimi-Linear).
 
-`req_to_token` holds VIRTUAL token ids, while the per-layer MLA views are dense
-(`build_mla_views`). The paged MLA backends therefore need their page-level
-block table filled with kernel-facing page ids:
+`req_to_token` holds VIRTUAL token ids, while the per-layer MLA views are
+contiguous (`build_mla_views`). The paged MLA backends therefore need their
+page-level block table filled with kernel-facing page ids:
 
-    dense_page(virtual_page) = v2p[virtual_page] * layer_num
+    kernel_page(virtual_page) = v2p[virtual_page] * layer_num
 
 Since the read-path translator, ONE builder computes that formula for every
-family — `build_kv_read_table` (the canonical) — and the backends only
+family — `build_index_table` (the canonical) — and the backends only
 differ in how they consume it:
   - trtllm_mla / cutedsl_mla / tokenspeed_mla / flashmla: rows filled straight
-    into their padded block tables (`KVIndexTranslator.build_into`, prefix-only so
+    into their padded block tables (`KVIndexTranslator.fill_read_table`, prefix-only so
     the backends' own -1 / stale tail sentinels survive);
   - the flashinfer updaters: token ids reconstructed from the canonical by
     `create_flashinfer_kv_indices_triton[ENTRY_PAGE_SIZE=ps]`;
@@ -34,7 +34,7 @@ differ in how they consume it:
 Covered here:
   - the static `create_flashmla_kv_indices_triton` (no id-space knowledge left)
     still matches the plain token//ps reference;
-  - the canonical route against the python dense reference, for several page
+  - the canonical route against the python reference, for several page
     sizes, ragged sequence lengths and a non-identity v2p permutation;
   - lanes past a row's live prefix keep the backend's -1 sentinel (prefix-only
     discipline — the trtllm/flashmla tail contract);
@@ -108,7 +108,7 @@ def _fill_block_table_static(req_to_token, req_pool_indices, seq_lens, page_size
 
 
 def _reference(req_to_token, req_pool_indices, seq_lens, page_size, *, v2p, mult):
-    """Python reference: virtual token -> virtual page -> physical page -> dense."""
+    """Python reference: virtual token -> virtual page -> physical page -> kernel id."""
     bs = req_pool_indices.shape[0]
     max_blocks = (int(seq_lens.max().item()) + page_size - 1) // page_size
     ref = torch.full((bs, max_blocks), -1, dtype=torch.int64, device=_DEV)
@@ -122,7 +122,7 @@ def _reference(req_to_token, req_pool_indices, seq_lens, page_size, *, v2p, mult
 
 
 @unittest.skipUnless(_HAS_CUDA, "requires CUDA")
-class TestDenseBlockTable(unittest.TestCase):
+class TestBlockTable(unittest.TestCase):
     def _make_batch(self, page_size, bs=5, max_ctx=2048, n_pages=512):
         """Ragged batch with a non-identity virtual->physical page permutation."""
         g = torch.Generator(device="cpu").manual_seed(97 + page_size)
@@ -159,7 +159,7 @@ class TestDenseBlockTable(unittest.TestCase):
                 torch.equal(got.long(), want), f"page_size={page_size}: {got} != {want}"
             )
 
-    def test_dense_block_table_matches_reference(self):
+    def test_block_table_matches_reference(self):
         for page_size in (1, 32, 64):
             rt, rpi, sl, v2p = self._make_batch(page_size)
             got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p, mult=_LAYERS)
@@ -206,10 +206,10 @@ class TestDenseBlockTable(unittest.TestCase):
                 f"row {r} padded lanes were written: {got[r]}",
             )
 
-    def test_agrees_with_token_level_dense_translate(self):
+    def test_agrees_with_token_level_translate(self):
         """The flashinfer updaters translate TOKEN ids with
         `translate_kv_loc_for_kernel`; the trtllm path builds PAGE ids in-kernel. Both
-        must address the same dense page block."""
+        must address the same kernel-facing page block."""
         page_size = 64
         rt, rpi, sl, v2p = self._make_batch(page_size)
         block_table = _fill_block_table(
@@ -219,13 +219,13 @@ class TestDenseBlockTable(unittest.TestCase):
             n = int(sl[r].item())
             virt_tokens = rt[r, :n].long()
             # translate_kv_loc_for_kernel's formula, applied to token ids.
-            dense_tokens = (
+            kernel_tokens = (
                 v2p[virt_tokens // page_size] * (page_size * _LAYERS)
                 + virt_tokens % page_size
             )
             # The block-table entry scaled by page_size must be the kernel-facing id of
             # each page's first token.
-            first_of_page = dense_tokens[::page_size]
+            first_of_page = kernel_tokens[::page_size]
             n_pages = (n + page_size - 1) // page_size
             self.assertTrue(
                 torch.equal(block_table[r, :n_pages] * page_size, first_of_page),
@@ -234,7 +234,7 @@ class TestDenseBlockTable(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAS_CUDA, "requires CUDA")
-class TestFa3MetadataDenseBlockTable(unittest.TestCase):
+class TestFa3MetadataBlockTable(unittest.TestCase):
     """fa3's captured-decode page table is written by `normal_decode_set_metadata`
     fed with the translator's read table kernel page table
     (src_is_read_table=True): the fused kernel copies the canonical
@@ -251,7 +251,7 @@ class TestFa3MetadataDenseBlockTable(unittest.TestCase):
             build_kv_read_table,
         )
 
-        maker = TestDenseBlockTable._make_batch
+        maker = TestBlockTable._make_batch
         rt, rpi, sl, v2p_full = maker(self, page_size, bs=bs, max_ctx=max_ctx)
 
         max_pages = (max_ctx + page_size - 1) // page_size
@@ -325,11 +325,11 @@ class TestFa3MetadataDenseBlockTable(unittest.TestCase):
             got, want, sl = self._run(page_size, v2p=False, mult=1)
             self._assert_live_prefix(got, want, sl, page_size)
 
-    def test_dense_mapping_ps1_fast_path(self):
+    def test_translated_mapping_ps1_fast_path(self):
         got, want, sl = self._run(1, v2p=True, mult=_LAYERS)
         self._assert_live_prefix(got, want, sl, 1)
 
-    def test_dense_mapping_general_path(self):
+    def test_translated_mapping_general_path(self):
         got, want, sl = self._run(64, v2p=True, mult=_LAYERS)
         self._assert_live_prefix(got, want, sl, 64)
 
@@ -339,7 +339,7 @@ class TestFa3MetadataDenseBlockTable(unittest.TestCase):
             got, want, sl = self._run(page_size, v2p=True, mult=1)
             self._assert_live_prefix(got, want, sl, page_size)
             virtual = _reference(
-                *TestDenseBlockTable._make_batch(self, page_size)[:3],
+                *TestBlockTable._make_batch(self, page_size)[:3],
                 page_size,
                 v2p=None,
                 mult=1,
