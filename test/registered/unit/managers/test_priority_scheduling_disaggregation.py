@@ -13,7 +13,11 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
     SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
+from sglang.srt.managers.schedule_batch import (  # noqa: E402
+    FINISH_ABORT,
+    Req,
+    ReqKvInfo,
+)
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -96,7 +100,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             finished_reason=FINISH_ABORT("failed") if failed else None,
             return_logprob=False,
             sampling_params=SimpleNamespace(max_new_tokens=8),
-            kv=SimpleNamespace(req_pool_idx=int(priority) % 8, cache_protected_len=0),
+            kv=ReqKvInfo(req_pool_idx=int(priority) % 8, cache_protected_len=0),
             time_stats=MagicMock(),
         )
         return SimpleNamespace(
