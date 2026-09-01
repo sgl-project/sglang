@@ -48,11 +48,15 @@ from sglang.kernels.ops.diffusion import (
     mark_fused_ln_modulate_site,
     mark_hunyuan_qknorm_site,
     mark_ltx2_rms_norm_modulate_site,
+    mark_qwen_image_added_qkv_site,
     mount_fused_ln_modulate,
     mount_hunyuan_qknorm,
     mount_ltx2_rms_norm_modulate,
+    mount_qwen_image_added_qkv,
+    try_flux2_token_cat_nvfp4,
     unmount_hunyuan_qknorm,
     unmount_ltx2_rms_norm_modulate,
+    unmount_qwen_image_added_qkv,
     wan_rmsnorm_silu,
 )
 from sglang.kernels.ops.diffusion.common.platform import is_cuda
@@ -97,9 +101,11 @@ from sglang.multimodal_gen.runtime.models.dits.longcat_image import (
 )
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import _ltx2_rms_norm_modulate
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+    QwenImageCrossAttention,
     QwenImageTransformerBlock,
     _qwen_modulation_cache_key,
     _qwen_norm_out,
+    _split_unquantized_merged_linear,
 )
 from sglang.multimodal_gen.runtime.models.dits.sana import (
     _eager_ln_modulate as _sana_eager_ln_modulate,
@@ -371,10 +377,102 @@ class TestFlux2EagerFusions(CustomTestCase):
         self.assertTrue(torch.equal(actual, expected))
         self.assertEqual(len(flux2._FLUX2_SWIGLU_SIGS), 1)
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
+        reason="FLUX.2 token-cat NVFP4 requires Blackwell SM103",
+    )
+    def test_token_cat_nvfp4_matches_flashinfer(self):
+        import flashinfer
+
+        torch.manual_seed(20260830)
+        attention = torch.randn(1, 17, 6144, device="cuda", dtype=torch.bfloat16)
+        mlp = torch.randn(1, 17, 18432, device="cuda", dtype=torch.bfloat16)
+        global_scale = torch.tensor(0.625, device="cuda", dtype=torch.float32)
+
+        expected_fp4, expected_scales = flashinfer.fp4_quantize(
+            torch.cat([attention, mlp], dim=-1).view(-1, 24576), global_scale
+        )
+        actual = try_flux2_token_cat_nvfp4(attention, mlp, global_scale)
+
+        self.assertIsNotNone(actual)
+        actual_fp4, actual_scales = actual
+        self.assertTrue(torch.equal(actual_fp4, expected_fp4))
+        self.assertTrue(
+            torch.equal(
+                actual_scales.view(torch.uint8), expected_scales.view(torch.uint8)
+            )
+        )
+
+    def test_token_cat_nvfp4_falls_back_while_compiling(self):
+        attention = torch.empty(1, 1, 6144, device="cuda", dtype=torch.bfloat16)
+        mlp = torch.empty(1, 1, 18432, device="cuda", dtype=torch.bfloat16)
+        global_scale = torch.ones(1, device="cuda", dtype=torch.float32)
+
+        with patch("torch.compiler.is_compiling", return_value=True):
+            self.assertIsNone(try_flux2_token_cat_nvfp4(attention, mlp, global_scale))
+
 
 # -------------------------------------------------------------------------
 # Qwen-Image -- reuse timestep-only modulation across serial CFG branches
 # -------------------------------------------------------------------------
+
+
+class _PackedAddedQKV(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.output_partition_sizes = [dim, dim, dim]
+        self.quant_config = None
+        self.weight = nn.Parameter(
+            torch.randn(3 * dim, dim, device="cuda", dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self.bias = nn.Parameter(
+            torch.randn(3 * dim, device="cuda", dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        return F.linear(x, self.weight, self.bias), None
+
+
+def test_qwen_added_qkv_lossless_uses_three_reference_gemms():
+    torch.manual_seed(20260831)
+    dim = 64
+    x = torch.randn(1, 17, dim, device="cuda", dtype=torch.bfloat16)
+    packed = _PackedAddedQKV(dim)
+
+    attention = QwenImageCrossAttention.__new__(QwenImageCrossAttention)
+    nn.Module.__init__(attention)
+    attention.use_fused_added_qkv = True
+    attention._unquantized_added_qkv_is_packed = True
+    attention.to_added_qkv = packed
+    mark_qwen_image_added_qkv_site(attention)
+
+    expected_lossless = _split_unquantized_merged_linear(packed, x)
+    actual_lossless = attention._get_added_qkv_projections(x)
+    assert packed.calls == 0
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(actual_lossless, expected_lossless)
+    )
+
+    assert mount_qwen_image_added_qkv(attention)
+    actual_high = attention._get_added_qkv_projections(x)
+    expected_high = tuple(
+        tensor.contiguous()
+        for tensor in F.linear(x, packed.weight, packed.bias).chunk(3, dim=-1)
+    )
+    assert packed.calls == 1
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(actual_high, expected_high)
+    )
+
+    unmount_qwen_image_added_qkv(attention)
+    attention._get_added_qkv_projections(x)
+    assert packed.calls == 1
 
 
 class _CountingProjection(nn.Module):
