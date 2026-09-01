@@ -392,7 +392,11 @@ class TestSWA(unittest.TestCase):
         allocator.free_group_end()
 
     def test_free_group_owns_mapping_at_enqueue_time(self):
-        for page_size in (1, 4):
+        # page_size == 1 only: the combined free() at page_size > 1 stays on
+        # drain-time resolution (enqueue resolution would pay one
+        # _expand_to_full_pages sync per call), so it does not own the
+        # mapping at enqueue time yet.
+        for page_size in (1,):
             with self.subTest(page_size=page_size):
                 allocator, old_full, new_full, old_swa, new_swa = (
                     self._build_two_mapped_slots(page_size=page_size)

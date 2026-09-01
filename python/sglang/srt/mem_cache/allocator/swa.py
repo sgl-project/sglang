@@ -319,11 +319,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         # NOTE: the API is not idempotent.
-        # Resolve the SWA side before deferring the full side: a cache action
-        # later in this group can re-point free_index at a different SWA slot.
-        self.free_swa(free_index)
-        if self.free_group is None:
+        if self.page_size == 1:
+            # Resolve the SWA side before deferring the full side: a cache
+            # action later in this group can re-point free_index at a
+            # different SWA slot. page_size > 1 stays on drain-time
+            # resolution: resolving here would pay one _expand_to_full_pages
+            # sync per call instead of one per group.
+            self.free_swa(free_index)
+            if self.free_group is None:
+                self.full_attn_allocator.free(free_index)
+            else:
+                self.free_group.append(self._copy_for_free_group(free_index))
+        elif self.free_group is None:
             self.full_attn_allocator.free(free_index)
+            self.free_swa(free_index)
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
         assert (
@@ -367,16 +376,23 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             mapping_indices = self._expand_to_full_pages(free_index)
 
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
-        swa_indices = swa_indices[swa_indices > 0]
         self.clear_full_to_swa_mapping(mapping_indices)
 
         if self.free_group is not None:
             # Resolve ownership now. A cache action later in this group may
-            # install a new mapping for the same full index.
+            # install a new mapping for the same full index. The gather above
+            # is a copy, so the clear cannot disturb what was enqueued.
             self.swa_free_group.append(swa_indices)
             return
 
-        self.swa_attn_allocator.free(swa_indices)
+        self._release_swa(swa_indices)
+
+    def _release_swa(self, swa_indices: torch.Tensor):
+        """Drop the entries that read as the padding slot, then release. Kept
+        out of free_swa so a group filters once: the filter's output shape is
+        data-dependent, which costs a device-to-host sync, and one filter over
+        the batch selects the same slots as one per call."""
+        self.swa_attn_allocator.free(swa_indices[swa_indices > 0])
 
     def free_full(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -398,16 +414,19 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_free_group = []
 
     def _release_free_group(self, free_index: torch.Tensor):
-        # The SWA side was resolved at enqueue time; free() would re-read a
-        # mapping that no longer describes these full indices.
-        self.full_attn_allocator.free(free_index)
+        if self.page_size == 1:
+            # The SWA side was resolved at enqueue time; free() would re-read
+            # a mapping that no longer describes these full indices.
+            self.full_attn_allocator.free(free_index)
+        else:
+            super()._release_free_group(free_index)
 
     def free_group_end(self):
         super().free_group_end()
         if self.swa_free_group:
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
-            self.swa_attn_allocator.free(torch.cat(swa_free_group))
+            self._release_swa(torch.cat(swa_free_group))
         if self.full_free_group:
             full_free_group = self.full_free_group
             self.full_free_group = []
