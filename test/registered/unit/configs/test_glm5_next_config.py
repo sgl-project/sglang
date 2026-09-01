@@ -1,6 +1,8 @@
 """Unit tests for GLM-5 Next configuration compatibility."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.configs.glm5_next import Glm5NextTextConfig
 from sglang.srt.configs.mamba_utils import KimiLinearStateShape
@@ -11,6 +13,36 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestGlm5NextTextConfig(CustomTestCase):
+    def test_kimi_linear_cache_stays_sharded_by_attention_tp(self):
+        config = Glm5NextTextConfig(
+            num_hidden_layers=2,
+            layer_types=["linear_attention", "deepseek_sparse_attention"],
+            linear_head_dim=96,
+            linear_num_heads=32,
+            linear_conv_kernel_dim=3,
+        )
+        parallel = SimpleNamespace(attn_tp_size=4, attn_cp_size=8)
+
+        with (
+            patch(
+                "sglang.srt.configs.glm5_next.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.is_dsa_enable_prefill_cp",
+                return_value=True,
+            ),
+        ):
+            cache_params = config.mamba2_cache_params
+
+        expected_shape = KimiLinearStateShape.create(
+            tp_world_size=4,
+            num_heads=32,
+            head_dim=96,
+            conv_kernel_size=3,
+        )
+        self.assertEqual(cache_params.shape, expected_shape)
+
     def test_kimi_linear_state_shape_preserves_channel_slice_axis(self):
         shape = KimiLinearStateShape.create(
             tp_world_size=8,

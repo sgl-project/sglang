@@ -1761,12 +1761,6 @@ class KVCacheConfigurator:
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
             }
             if is_deepseek_dsa(self.model_config.hf_config):
-                from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
-
-                (
-                    dsa_cp_layer_shard_rank,
-                    dsa_cp_layer_shard_size,
-                ) = get_glm_dsa_cp_layer_shard_info(self)
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
                     use_dsa=True,
@@ -1779,8 +1773,6 @@ class KVCacheConfigurator:
                     index_kpool_compress=get_dsa_index_kpool_compress(
                         self.model_config.hf_config
                     ),
-                    layer_shard_rank=dsa_cp_layer_shard_rank,
-                    layer_shard_size=dsa_cp_layer_shard_size,
                     skip_topk_layers=(
                         None
                         if self.is_draft_worker

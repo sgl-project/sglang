@@ -12,7 +12,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_cp_all_gather_into_tensor,
-    attn_cp_reduce_scatter_tensor,
     is_allocation_symmetric,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -517,98 +516,6 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     )
     output_tensor = output_tensor.view(-1, hidden_size)
     return output_tensor
-
-
-# Plain CP keeps rank-contiguous token slices across layers; only MLA boundaries
-# convert to/from the load-balanced layout.
-def cp_plain_split(input_tensor: torch.Tensor) -> torch.Tensor:
-    cp_size = get_parallel().attn_cp_size
-    cp_rank = get_parallel().attn_cp_rank
-    assert input_tensor.shape[0] % cp_size == 0, (
-        f"cp_plain_split expects total tokens divisible by cp_size, "
-        f"got {input_tensor.shape[0]} % {cp_size} != 0"
-    )
-    chunk = input_tensor.shape[0] // cp_size
-    return input_tensor[cp_rank * chunk : (cp_rank + 1) * chunk].contiguous()
-
-
-def cp_plain_all_gather(input_tensor: torch.Tensor, cp_size: int) -> torch.Tensor:
-    # Rank-major all-gather is already in natural order under the plain layout,
-    # so no rerange is needed.
-    out_shape = (input_tensor.shape[0] * cp_size,) + tuple(input_tensor.shape[1:])
-    with use_symmetric_memory(
-        get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
-    ):
-        output_tensor = input_tensor.new_empty(out_shape)
-    attn_cp_all_gather_into_tensor(output_tensor, input_tensor)
-    return output_tensor
-
-
-def cp_plain_reduce_scatter(input_tensor: torch.Tensor, cp_size: int) -> torch.Tensor:
-    # Contiguous plain layout permits one reduce-scatter and avoids a full-tensor
-    # permutation.
-    S = input_tensor.shape[0]
-    assert S % cp_size == 0, (
-        f"cp_plain_reduce_scatter expects S divisible by cp_size, "
-        f"got S={S}, cp_size={cp_size}"
-    )
-    out_shape = (S // cp_size,) + tuple(input_tensor.shape[1:])
-    with use_symmetric_memory(
-        get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
-    ):
-        output_tensor = input_tensor.new_empty(out_shape)
-    attn_cp_reduce_scatter_tensor(output_tensor, input_tensor.contiguous())
-    return output_tensor
-
-
-def cp_plain_to_scattered(
-    input_tensor: torch.Tensor,
-    forward_batch,
-    cp_size: int,
-) -> torch.Tensor:
-    # When K % cp_size == 0, all-to-all is equivalent to the round-robin split
-    # and avoids a full all-gather.
-    K = input_tensor.shape[0]
-    if is_dsa_prefill_cp_round_robin_split() and K % cp_size == 0:
-        tail = input_tensor.shape[1:]
-        send = (
-            input_tensor.view(K // cp_size, cp_size, *tail).transpose(0, 1).contiguous()
-        )
-        recv = torch.empty_like(send)
-        torch.distributed.all_to_all_single(
-            recv, send, group=get_parallel().attn_cp_group.device_group
-        )
-        return recv.flatten(0, 1)
-
-    full = cp_plain_all_gather(input_tensor, cp_size)
-    return cp_split_and_rebuild_data(forward_batch, full)
-
-
-def cp_scattered_to_plain(
-    input_tensor: torch.Tensor,
-    forward_batch,
-    cp_size: int,
-) -> torch.Tensor:
-    # When K % cp_size == 0, all-to-all avoids a full all-gather; transposing
-    # the received source-major rows restores plain order.
-    K = input_tensor.shape[0]
-    if is_dsa_prefill_cp_round_robin_split() and K % cp_size == 0:
-        tail = input_tensor.shape[1:]
-        send = input_tensor.view(cp_size, K // cp_size, *tail)
-        recv = torch.empty_like(send)
-        torch.distributed.all_to_all_single(
-            recv, send, group=get_parallel().attn_cp_group.device_group
-        )
-        # recv[s, n] = global token at position r*K + n*cp + s on this rank r;
-        # plain out[n*cp + s] = recv[s, n], i.e. transpose dims 0 and 1.
-        return recv.transpose(0, 1).contiguous().view(K, *tail)
-
-    full = cp_all_gather_rerange_output(
-        input_tensor, cp_size, forward_batch, torch.cuda.current_stream()
-    )
-    cp_rank = get_parallel().attn_cp_rank
-    chunk = full.shape[0] // cp_size
-    return full[cp_rank * chunk : (cp_rank + 1) * chunk].contiguous()
 
 
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
