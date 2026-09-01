@@ -1,7 +1,11 @@
 // GLM-5.2 per-cell benchmark numbers, keyed by the same `match` tuple as glm-5.2.jsx cells.
 // See _deployment.jsx for the speed/accuracy schema.
-// Numbers pending: each entry is a bare `match` stub (renders "pending") until measured
-// end-to-end on the corresponding hardware, then filled with sglang_version + speed/accuracy.
+// Spec-decode cells (low-latency MTP 5-1-6, balanced MTP 2-1-3) carry their prior
+// SGLANG_SIMULATE_ACC_LEN-pinned measurement — random-dataset acceptance is unrealistic, so
+// acceptance length is fixed via env (see per-cell notes). High-throughput (MTP off) was
+// re-measured with the exact cookbook serve flags (env=[]) + benchmarkCommands
+// (--random-range-ratio 1.0, --flush-cache, warmup 64). sglang_version is recorded per cell.
+
 export const benchmarks = [
   // ---- H200 + FP8 ----  (8-GPU single node; serve recipe in glm-5.2.jsx; real weights,
   // --random-range-ratio 1.0, flush-cache every run)
@@ -64,14 +68,13 @@ export const benchmarks = [
     ],
   },
   {
-    // HT: DP8 + deepep + mfs 0.85 + max-running 256. B200 (178GB) keeps --max-running-requests 256
-    // (clamps the decode capture list to <=32 < the default 128 DeepEP buffer); no env buffer bump.
-    // No spec, so no SIMULATE_ACC_LEN.
     match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "main @ 09ca4fc",
+    sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 177620, tpot_ms: 47.99, tokens_per_sec_per_gpu: 4059 },
+        ttft_ms: 133322, tpot_ms: 88.48, tokens_per_sec_per_gpu: 5020 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 746614, tpot_ms: 86.46, tokens_per_sec_per_gpu: 5097 },
     ],
   },
   // ---- GB300 + FP8 ----  (4-GPU single node, TP4; real weights, --random-range-ratio 1.0, flush-cache every run)
@@ -109,20 +112,40 @@ export const benchmarks = [
   // env the assert trips at the bs=512 capture bucket. No spec, so no SIMULATE_ACC_LEN.
   {
     match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "main @ 09ca4fc",
+    sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 231101, tpot_ms: 86.01, tokens_per_sec_per_gpu: 6039 },
+        ttft_ms: 197898, tpot_ms: 95.42, tokens_per_sec_per_gpu: 6892 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 1214156, tpot_ms: 100.03, tokens_per_sec_per_gpu: 6708 },
     ],
   },
   // ---- B300 + FP8 ----  (8-GPU single node, TP8; serve recipe in glm-5.2.jsx; benchmark pending re-measurement)
   { match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" } },
   { match: { hw: "b300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
-  { match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" } },
+  {
+    match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 67532, tpot_ms: 116.39, tokens_per_sec_per_gpu: 6301 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 381190, tpot_ms: 235.26, tokens_per_sec_per_gpu: 6634 },
+    ],
+  },
   // ---- B300 + BF16 ----  (unquantized zai-org/GLM-5.2, TP8; serve recipe in glm-5.2.jsx; benchmark pending re-measurement)
   { match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" } },
   { match: { hw: "b300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
-  { match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" } },
+  {
+    match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 454915, tpot_ms: 50.99, tokens_per_sec_per_gpu: 2120 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 2089630, tpot_ms: 55.61, tokens_per_sec_per_gpu: 2122 },
+    ],
+  },
   // ---- BF16 multi-node (inferred) ----  benchmarks pending
   { match: { hw: "h200",  variant: "default", quant: "bf16", strategy: "low-latency",     nodes: "multi-2" } },
   { match: { hw: "h200",  variant: "default", quant: "bf16", strategy: "balanced",        nodes: "multi-2" } },
@@ -157,9 +180,12 @@ export const benchmarks = [
   },
   {
     match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 130174, tpot_ms: 67.12, tokens_per_sec_per_gpu: 5305 },
+        ttft_ms: 72542, tpot_ms: 117.73, tokens_per_sec_per_gpu: 6094 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 551123, tpot_ms: 152.78, tokens_per_sec_per_gpu: 5971 },
     ],
   },
   // ---- B300 + NVFP4 ----  (8-GPU single node, TP8; nvidia/GLM-5.2-NVFP4 via --quantization modelopt_fp4,
@@ -188,10 +214,12 @@ export const benchmarks = [
   },
   {
     match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
-    accuracy: { aime25_pct: 89.58 },
+    sglang_version: "0.5.15.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 6370, tpot_ms: 280, tokens_per_sec_per_gpu: 3870 },
+        ttft_ms: 80118, tpot_ms: 130.46, tokens_per_sec_per_gpu: 5501 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 310125, tpot_ms: 371.61, tokens_per_sec_per_gpu: 5920 },
     ],
   },
   // ---- MI355X + FP8 ----  gfx950, TP8, DSA tilelang, NO MTP (disabled on AMD).
@@ -223,6 +251,37 @@ export const benchmarks = [
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
         ttft_ms: 432058, tpot_ms: 106.44, tokens_per_sec_per_gpu: 1269 },
+    ],
+  },
+  // ---- GB300 + NVFP4 (0.5.15 rebench: exact cookbook config + bench, real spec acceptance) ----
+  {
+    match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
+        ttft_ms: 8236, tpot_ms: 17.05, tokens_per_sec_per_gpu: 5724 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
+        ttft_ms: 17277, tpot_ms: 42.84, tokens_per_sec_per_gpu: 8181 },
+    ],
+  },
+  {
+    match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 86899, tpot_ms: 155.08, tokens_per_sec_per_gpu: 8706 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 770145, tpot_ms: 171.35, tokens_per_sec_per_gpu: 9054 },
+    ],
+  },
+  {
+    match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 298, tpot_ms: 1.82, tokens_per_sec_per_gpu: 1057 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 2129, tpot_ms: 6.47, tokens_per_sec_per_gpu: 3964 },
     ],
   },
 ];
