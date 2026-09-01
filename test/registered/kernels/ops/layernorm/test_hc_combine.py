@@ -1,5 +1,6 @@
-import pytest
 import sys
+
+import pytest
 import torch
 
 from sglang.kernels.ops.layernorm.mhc import hc_combine
