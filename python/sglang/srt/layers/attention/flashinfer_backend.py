@@ -308,10 +308,6 @@ class FlashInferAttnBackend(AttentionBackend):
         super().__init__()
         self.prefill_backend = "fa2"
         self.decode_backend = "fa2"
-        self._enable_dflash_sync_free_decode = (
-            envs.SGLANG_DFLASH_SYNC_FREE_DECODE.get()
-            and model_runner.spec_algorithm.is_dflash()
-        )
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -836,16 +832,10 @@ class FlashInferAttnBackend(AttentionBackend):
             and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
             and getattr(spec_info, "custom_mask", None) is None
             and self.prefill_backend == "fa2"
-            and (
-                self.dispatch_reason is None
-                # SWA rebuilds from window-clamped host lengths, which
-                # call_begin_forward only assembles under the sync-free flag.
-                # Cross-attn has no host-rebuildable layout at all.
-                or (
-                    self.dispatch_reason is WrapperDispatch.SLIDING_WINDOW
-                    and self._enable_dflash_sync_free_decode
-                )
-            )
+            # Full attention rebuilds straight from seq_lens_cpu; SWA rebuilds
+            # from the window-clamped host lengths assembled below. Cross-attn
+            # has no host-rebuildable layout, so it keeps the plain plan().
+            and self.dispatch_reason in (None, WrapperDispatch.SLIDING_WINDOW)
         ):
             # DFLASH target-verify replays are shape-static per
             # (bs, draft_token_num): qo_indptr is a constant arange stride of

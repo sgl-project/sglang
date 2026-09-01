@@ -282,43 +282,30 @@ class TestFilterBatchHostIndices(CustomTestCase):
         torch.testing.assert_close(a.future_indices, b.future_indices)
 
 
-@unittest.skipUnless(_HAS_CUDA, "MRoPE cache requires CUDA")
-class TestDFlashMropeDeltaGpuCache(CustomTestCase):
-    def test_reuses_cache_and_invalidates_on_source_change(self):
+@unittest.skipUnless(_HAS_CUDA, "MRoPE delta upload requires CUDA")
+class TestMropeDeltaOnDevice(CustomTestCase):
+    def test_reuses_device_copy_until_refreshed(self):
         from sglang.srt.managers.schedule_batch import MultimodalInputs
-        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+        from sglang.srt.model_executor.forward_batch_info import _mrope_delta_on_device
 
         mm_input = MultimodalInputs(
             mm_items=[],
             mrope_position_delta=torch.tensor([[3]], dtype=torch.int64),
         )
 
-        cache = ForwardBatch._get_or_create_mrope_delta_gpu_cache(mm_input, "cuda")
-        self.assertEqual(
-            cache.device, torch.device("cuda", torch.cuda.current_device())
-        )
-        torch.testing.assert_close(cache.cpu(), torch.tensor([[3]], dtype=torch.int64))
-        self.assertIs(
-            ForwardBatch._get_or_create_mrope_delta_gpu_cache(mm_input, "cuda"),
-            cache,
-        )
+        first = _mrope_delta_on_device(mm_input, "cuda")
+        self.assertEqual(first.device.type, "cuda")
+        torch.testing.assert_close(first.cpu(), torch.tensor([[3]], dtype=torch.int64))
 
+        # Decode steps read the same tensor: no second upload.
+        self.assertIs(_mrope_delta_on_device(mm_input, "cuda"), first)
+
+        # A new extend re-reads whatever the CPU source now holds.
         mm_input.mrope_position_delta = torch.tensor([[7]], dtype=torch.int64)
-        reassigned_cache = ForwardBatch._get_or_create_mrope_delta_gpu_cache(
-            mm_input, "cuda"
-        )
-        self.assertIsNot(reassigned_cache, cache)
+        refreshed = _mrope_delta_on_device(mm_input, "cuda", refresh=True)
+        self.assertIsNot(refreshed, first)
         torch.testing.assert_close(
-            reassigned_cache.cpu(), torch.tensor([[7]], dtype=torch.int64)
-        )
-
-        mm_input.mrope_position_delta.add_(2)
-        mutated_cache = ForwardBatch._get_or_create_mrope_delta_gpu_cache(
-            mm_input, "cuda"
-        )
-        self.assertIsNot(mutated_cache, reassigned_cache)
-        torch.testing.assert_close(
-            mutated_cache.cpu(), torch.tensor([[9]], dtype=torch.int64)
+            refreshed.cpu(), torch.tensor([[7]], dtype=torch.int64)
         )
 
 
@@ -330,9 +317,7 @@ class TestMultimodalMropeCacheInvalidation(CustomTestCase):
             mm_items=[],
             mrope_position_delta=torch.tensor([[2]], dtype=torch.int64),
             mrope_position_delta_repeated_cache=torch.tensor([[1]], dtype=torch.int64),
-            mrope_position_delta_gpu_cache=torch.tensor([[2]], dtype=torch.int64),
-            mrope_position_delta_gpu_cache_source_id=1,
-            mrope_position_delta_gpu_cache_source_version=0,
+            mrope_position_delta_device=torch.tensor([[2]], dtype=torch.int64),
         )
         right = MultimodalInputs(
             mm_items=[],
@@ -346,9 +331,7 @@ class TestMultimodalMropeCacheInvalidation(CustomTestCase):
             torch.tensor([[2], [5]], dtype=torch.int64),
         )
         self.assertIsNone(left.mrope_position_delta_repeated_cache)
-        self.assertIsNone(left.mrope_position_delta_gpu_cache)
-        self.assertIsNone(left.mrope_position_delta_gpu_cache_source_id)
-        self.assertIsNone(left.mrope_position_delta_gpu_cache_source_version)
+        self.assertIsNone(left.mrope_position_delta_device)
 
 
 class TestDFlashFlashInferHostPlanning(CustomTestCase):
@@ -383,17 +366,22 @@ class TestDFlashFlashInferHostPlanning(CustomTestCase):
             use_ragged=False,
             encoder_lens=None,
             spec_info=SimpleNamespace(num_accept_tokens=None),
+            kv_view=object(),
         )
 
         self.assertEqual(len(calls), 2)
+        # Window wrapper: lengths clamped to the window, summed on the host, and
+        # handed down so the sync-free plan can rebuild kv_lens from them.
         torch.testing.assert_close(calls[0][0][3], torch.tensor([3, 4]))
         self.assertEqual(calls[0][0][4], 7)
         torch.testing.assert_close(
             calls[0][1]["paged_kernel_lens_cpu"], torch.tensor([3, 4])
         )
+        # Full-attention wrapper: device lengths are plain seq_lens, so there is
+        # no clamped prefix to pass -- the plan reads seq_lens_cpu directly.
         torch.testing.assert_close(calls[1][0][3], seq_lens)
         self.assertEqual(calls[1][0][4], 10)
-        torch.testing.assert_close(calls[1][1]["paged_kernel_lens_cpu"], seq_lens_cpu)
+        self.assertIsNone(calls[1][1]["paged_kernel_lens_cpu"])
 
 
 if __name__ == "__main__":

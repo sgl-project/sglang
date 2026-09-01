@@ -390,6 +390,23 @@ class NgramEmbeddingInfo:
         )
 
 
+def _mrope_delta_on_device(
+    mm_input: MultimodalInputs, device, refresh: bool = False
+) -> torch.Tensor:
+    """Device copy of a request's MRoPE delta, uploaded at most once per extend.
+
+    The delta is per-request metadata fixed at prefill, so the decode loop can
+    read the device copy instead of re-uploading. `refresh` re-reads the CPU
+    source; every writer of `mrope_position_delta` either runs before the extend
+    that refreshes it or clears the copy (see `MultimodalInputs.merge`).
+    """
+    cached = mm_input.mrope_position_delta_device
+    if cached is None or refresh:
+        cached = mm_input.mrope_position_delta.to(device=device, non_blocking=True)
+        mm_input.mrope_position_delta_device = cached
+    return cached
+
+
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
@@ -1109,89 +1126,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 (batch_size, 1), dtype=torch.int64, device=device
             )
         else:
-            use_gpu_cache = (
-                envs.SGLANG_DFLASH_SYNC_FREE_DECODE.get()
-                and self.spec_algorithm is not None
-                and self.spec_algorithm.is_dflash()
-            )
-            if use_gpu_cache:
-                mrope_deltas = [
-                    (
-                        torch.zeros(1, dtype=torch.int64, device=device)
-                        if mm_inputs[i] is None
-                        else self._get_or_create_mrope_delta_gpu_cache(
-                            mm_inputs[i], device
-                        ).squeeze(0)
-                    )
-                    for i in range(batch_size)
-                ]
-                mrope_delta_tensor = torch.stack(mrope_deltas, dim=0)
-            else:
-                mrope_deltas = [
-                    (
-                        torch.zeros(1, dtype=torch.int64)
-                        if mm_inputs[i] is None
-                        else mm_inputs[i].mrope_position_delta.squeeze(0)
-                    )
-                    for i in range(batch_size)
-                ]
-                mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            # Stacking device copies keeps the whole batch on-device; the CPU
+            # sources would need a fresh H2D on every decode step.
+            mrope_deltas = [
+                (
+                    torch.zeros(1, dtype=torch.int64, device=device)
+                    if mm_inputs[i] is None
+                    else _mrope_delta_on_device(mm_inputs[i], device).squeeze(0)
+                )
+                for i in range(batch_size)
+            ]
+            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0)
         next_input_positions = (
             (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
         )
 
         self.mrope_positions = next_input_positions
-
-    @staticmethod
-    def _canonical_mrope_cache_device(device) -> torch.device:
-        target_device = torch.device(device)
-        if target_device.type == "cuda" and target_device.index is None:
-            target_device = torch.device("cuda", torch.cuda.current_device())
-        return target_device
-
-    @classmethod
-    def _get_or_create_mrope_delta_gpu_cache(
-        cls, mm_input: MultimodalInputs, device
-    ) -> torch.Tensor:
-        source = mm_input.mrope_position_delta
-        if source is None:
-            raise RuntimeError("DFlash MRoPE GPU cache requires mrope_position_delta")
-
-        target_device = cls._canonical_mrope_cache_device(device)
-        try:
-            source_version = source._version
-        except RuntimeError:
-            # Inference tensors do not expose a version counter. Reassignment
-            # is still detected by source id; these metadata tensors are immutable.
-            source_version = None
-        cache = mm_input.mrope_position_delta_gpu_cache
-        cache_is_valid = (
-            cache is not None
-            and cache.device == target_device
-            and cache.dtype == source.dtype
-            and cache.shape == source.shape
-            and mm_input.mrope_position_delta_gpu_cache_source_id == id(source)
-            and mm_input.mrope_position_delta_gpu_cache_source_version == source_version
-        )
-        if not cache_is_valid:
-            cache = source.to(device=target_device, non_blocking=True)
-            mm_input.mrope_position_delta_gpu_cache = cache
-            mm_input.mrope_position_delta_gpu_cache_source_id = id(source)
-            mm_input.mrope_position_delta_gpu_cache_source_version = source_version
-        return cache
-
-    def _prewarm_dflash_mrope_delta_gpu_cache(
-        self, model_runner: ModelRunner, batch: ScheduleBatch
-    ) -> None:
-        if (
-            not envs.SGLANG_DFLASH_SYNC_FREE_DECODE.get()
-            or self.spec_algorithm is None
-            or not self.spec_algorithm.is_dflash()
-        ):
-            return
-        for mm_input in batch.multimodal_inputs:
-            if mm_input is not None and mm_input.mrope_position_delta is not None:
-                self._get_or_create_mrope_delta_gpu_cache(mm_input, model_runner.device)
 
     def _expand_mrope_from_input(
         self,
@@ -1219,10 +1169,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return mrope_positions
 
     def _compute_mrope_positions(self, model_runner: ModelRunner, batch: ScheduleBatch):
-        # Populate the tiny per-request delta cache during prefill, before the
-        # speculative decode loop can leave draft work queued on the CUDA stream.
-        self._prewarm_dflash_mrope_delta_gpu_cache(model_runner, batch)
-
         # mrope_positions shape: [3, total_seq_len]
         # The first dimension corresponds to temporal, height and width positions.
         forward_mode = self.forward_mode
@@ -1237,6 +1183,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             raise RuntimeError(
                 f"_compute_mrope_positions called with unsupported forward_mode: {forward_mode}"
             )
+
+        # Refill the device copies on the extend, while the stream is still
+        # free: the speculative decode loop that reads them back runs behind
+        # queued draft work. Decode must not land here -- it would re-upload
+        # every step, which is exactly what the device copy avoids.
+        for mm_input in batch.multimodal_inputs:
+            if mm_input is not None and mm_input.mrope_position_delta is not None:
+                _mrope_delta_on_device(mm_input, model_runner.device, refresh=True)
 
         self._compute_mrope_positions_extend(model_runner, batch)
 
