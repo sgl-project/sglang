@@ -225,7 +225,12 @@ impl SwaComponent {
         });
         let target = insert_result
             .and_then(|result| result.inserted_host_node)
-            .map(|id| tree_core.arena.resolve(id));
+            .map(|id| {
+                tree_core
+                    .arena
+                    .resolve(id)
+                    .expect("prefetch insert results must reference live nodes")
+            });
 
         let (Some(target), Some(host_indices)) = (target, transfer.host_indices.as_ref()) else {
             if let Some(host_indices) = &transfer.host_indices {
@@ -347,6 +352,8 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         &self,
         tree_core: &UnifiedTreeCore<K>,
         mut result: MatchResult,
+        _last_device_node_idx: NodeIdx_,
+        best_match_node_idx: NodeIdx_,
         params: &MatchPrefixParams<'_, K>,
         value_chunks: &[Tensor],
         best_value_len: usize,
@@ -356,9 +363,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         // toward the SWA host hit.
         let mut n_swa = 0;
         let mut swa_host_hit = 0;
-        let mut node = tree_core
-            .arena
-            .node(tree_core.arena.resolve(result.best_match_node_id));
+        let mut node = tree_core.arena.node(best_match_node_idx);
         while !node.is_root() && n_swa < self.sliding_window_size {
             if node.has_device_value(SWA) {
                 n_swa += node.device_value_len(SWA);
@@ -974,7 +979,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 let mut swa_chunks: Vec<Tensor> = Vec::new();
                 let mut offset = 0i64;
                 for &loaded_id in transfer.nodes_to_load.iter().flatten() {
-                    let loaded_idx = tree_core.arena.resolve(loaded_id);
+                    let loaded_idx = tree_core
+                        .arena
+                        .resolve(loaded_id)
+                        .expect("load-back transfers must reference live nodes");
                     let n_tokens = tree_core.arena.host_value_len(loaded_idx, SWA) as i64;
                     let swa_chunk = device_indices.narrow(0, offset, n_tokens).copy();
                     tree_core.set_component_device_value_(

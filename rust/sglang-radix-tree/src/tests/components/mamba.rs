@@ -44,7 +44,8 @@ fn hybrid_lock_core() -> (UnifiedTreeCore<Vec<i64>>, NodeIdx_, NodeIdx_) {
     for (node, full_slot, swa_slot, mamba_slot) in [(parent, 10, 20, 30), (leaf, 11, 21, 31)] {
         tc.arena
             .set_device_value(node, FULL, Tensor::from_slice(&[full_slot]));
-        tc.set_component_device_value(tc.arena.node(node).id, SWA, Tensor::from_slice(&[swa_slot]));
+        tc.set_component_device_value(tc.arena.node(node).id, SWA, Tensor::from_slice(&[swa_slot]))
+            .expect("live test node");
         set_mamba_device(&mut tc, node, mamba_slot);
         tc.update_evictable_leaf_sets_(node);
     }
@@ -229,7 +230,8 @@ fn device_value_round_trips_through_the_component() {
     let [a] = chain::<1>(&mut tc);
     let mamba = mamba_component();
     assert!(tc.arena.try_device_value(a, MAMBA).is_none());
-    tc.set_component_device_value(tc.arena.node(a).id, MAMBA, Tensor::from_slice(&[42i64]));
+    tc.set_component_device_value(tc.arena.node(a).id, MAMBA, Tensor::from_slice(&[42i64]))
+        .expect("live test node");
     assert!(
         tc.arena
             .try_device_value(a, MAMBA)
@@ -314,7 +316,9 @@ fn skip_aware_lock_records_only_the_mamba_target() {
     let (mut tc, parent, leaf) = hybrid_lock_core();
     let leaf_handle = tc.arena.node(leaf).id;
 
-    let result = tc.inc_lock_ref_with_skip(leaf_handle, &[MAMBA]);
+    let result = tc
+        .inc_lock_ref_with_skip(leaf_handle, &[MAMBA])
+        .expect("live test node");
 
     assert_eq!(result.skip_lock_node_ids[&MAMBA].len(), 1);
     assert!(result.skip_lock_node_ids[&MAMBA].contains(&leaf_handle));
@@ -333,7 +337,8 @@ fn skip_aware_lock_records_only_the_mamba_target() {
             ..Default::default()
         }),
         /* skip_swa = */ false,
-    );
+    )
+    .expect("live test node");
     assert_eq!(tc.arena.node(parent).device_lock_ref(FULL), 0);
     assert_eq!(tc.arena.node(leaf).device_lock_ref(FULL), 0);
 }
@@ -342,8 +347,10 @@ fn skip_aware_lock_records_only_the_mamba_target() {
 fn swa_only_release_honors_a_skipped_mamba_target() {
     let (mut tc, _parent, leaf) = hybrid_lock_core();
     let leaf_handle = tc.arena.node(leaf).id;
-    let owner = tc.inc_lock_ref(leaf_handle);
-    let skipped = tc.inc_lock_ref_with_skip(leaf_handle, &[MAMBA]);
+    let owner = tc.inc_lock_ref(leaf_handle).expect("live test node");
+    let skipped = tc
+        .inc_lock_ref_with_skip(leaf_handle, &[MAMBA])
+        .expect("live test node");
     assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 1);
 
     let mut device_frees = HashMap::new();
@@ -354,7 +361,8 @@ fn swa_only_release_honors_a_skipped_mamba_target() {
         Some(&skipped.skip_lock_node_ids),
         &mut device_frees,
         &mut host_frees,
-    );
+    )
+    .expect("live test node");
 
     assert!(device_frees.is_empty());
     assert!(host_frees.is_empty());
@@ -370,7 +378,8 @@ fn swa_only_release_honors_a_skipped_mamba_target() {
         leaf_handle,
         Some(&skipped_params),
         /* skip_swa = */ true,
-    );
+    )
+    .expect("live test node");
     let owner_params = DecLockRefParams {
         swa_uuid_for_lock: owner.swa_uuid_for_lock,
         skip_lock_node_ids: owner.skip_lock_node_ids,
@@ -380,7 +389,8 @@ fn swa_only_release_honors_a_skipped_mamba_target() {
         leaf_handle,
         Some(&owner_params),
         /* skip_swa = */ false,
-    );
+    )
+    .expect("live test node");
     assert_eq!(tc.protected_size_(MAMBA), 0);
 }
 
@@ -483,14 +493,14 @@ fn insert_attaches_the_donated_slot_to_the_new_leaf() {
         .best_match_node_id;
     assert!(
         tc.arena
-            .node(tc.arena.resolve(leaf))
+            .node(tc.arena.resolve(leaf).expect("live test node"))
             .try_device_value(MAMBA)
             .unwrap()
             .equal(&Tensor::from_slice(&[7i64]))
     );
     assert!(
         tc.device_lru_list(MAMBA)
-            .in_list(Some(tc.arena.resolve(leaf)))
+            .in_list(Some(tc.arena.resolve(leaf).expect("live test node")))
     );
     assert_eq!(tc.evictable_size_(MAMBA), 1);
 }
@@ -508,7 +518,7 @@ fn reinsert_keeps_the_existing_slot_and_flags_the_caller() {
     // The original slot stays; the caller frees the unused donated one.
     assert!(
         tc.arena
-            .node(tc.arena.resolve(leaf))
+            .node(tc.arena.resolve(leaf).expect("live test node"))
             .try_device_value(MAMBA)
             .unwrap()
             .equal(&Tensor::from_slice(&[7i64]))
@@ -522,7 +532,8 @@ fn reinsert_full_backed_target_schedules_mamba_only_backup() {
     let key = vec![1, 2];
     tc.insert(&insert_params_mamba(&key, &[10, 11], Some(7)));
     let leaf = tc.match_prefix(&match_params(&key)).best_match_node_id;
-    tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new());
+    tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new())
+        .expect("live test node");
 
     let result = tc.insert(&insert_params_mamba(&key, &[20, 21], Some(8)));
     let backups = result
@@ -536,7 +547,7 @@ fn reinsert_full_backed_target_schedules_mamba_only_backup() {
     assert_eq!(backups.len(), 1);
     assert_eq!(backups[0].node_ids, vec![leaf]);
 
-    let (full_device_indices, comp_xfers) = tc.build_backup_spec(leaf);
+    let (full_device_indices, comp_xfers) = tc.build_backup_spec(leaf).expect("live test node");
     assert_eq!(full_device_indices.numel(), 0);
     let mamba_xfers = &comp_xfers[&MAMBA];
     assert_eq!(mamba_xfers.len(), 1);
@@ -548,7 +559,7 @@ fn reinsert_full_backed_target_schedules_mamba_only_backup() {
             .equal(&Tensor::from_slice(&[7i64]))
     );
 
-    tc.mark_write_through_pending(leaf);
+    tc.mark_write_through_pending(leaf).expect("live test node");
     let pending = tc.insert(&insert_params_mamba(&key, &[30, 31], Some(9)));
     assert!(
         !pending
@@ -779,11 +790,25 @@ fn device_walk_advances_one_allocator_mutation_per_call() {
     // The internal node is a complete step so its free can be reused before
     // the walk hands out another victim.
     assert_eq!(first, None);
-    assert!(!tc.arena.node(tc.arena.resolve(a)).has_device_value(MAMBA));
-    assert!(tc.arena.node(tc.arena.resolve(b)).has_device_value(MAMBA));
-    assert!(tc.arena.has_device_value(tc.arena.resolve(a), FULL));
+    assert!(
+        !tc.arena
+            .node(tc.arena.resolve(a).expect("live test node"))
+            .has_device_value(MAMBA)
+    );
+    assert!(
+        tc.arena
+            .node(tc.arena.resolve(b).expect("live test node"))
+            .has_device_value(MAMBA)
+    );
+    assert!(
+        tc.arena
+            .has_device_value(tc.arena.resolve(a).expect("live test node"), FULL)
+    );
     assert_eq!(tracker[&MAMBA], 1);
-    assert!(!tc.device_lru_list(MAMBA).in_list(Some(tc.arena.resolve(a))));
+    assert!(
+        !tc.device_lru_list(MAMBA)
+            .in_list(Some(tc.arena.resolve(a).expect("live test node")))
+    );
 
     let (second, step) = tc.evict_device_next_node(MAMBA, &tracker);
     accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
@@ -801,7 +826,7 @@ fn device_walk_skips_locked_nodes() {
     let b = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    let a_idx = tc.arena.resolve(a);
+    let a_idx = tc.arena.resolve(a).expect("live test node");
     mamba_component().acquire_component_lock(
         &mut tc,
         a_idx,
@@ -816,7 +841,11 @@ fn device_walk_skips_locked_nodes() {
     accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
     // The locked internal node stays; the cursor starts on the leaf.
     assert_eq!(next, Some(b));
-    assert!(tc.arena.node(tc.arena.resolve(a)).has_device_value(MAMBA));
+    assert!(
+        tc.arena
+            .node(tc.arena.resolve(a).expect("live test node"))
+            .has_device_value(MAMBA)
+    );
     assert_eq!(tracker[&MAMBA], 0);
     tc.evict_device_end(MAMBA);
 }
@@ -877,12 +906,16 @@ fn host_eviction_takes_a_host_leaf_atomically() {
             Tensor::from_slice(&[100i64]),
             vec!["h0".to_string()],
         )
+        .expect("live test node")
         .inserted_host_node
         .unwrap();
-    let leaf_idx = tc.arena.resolve(leaf);
+    let leaf_idx = tc.arena.resolve(leaf).expect("live test node");
     set_mamba_host(&mut tc, leaf_idx, 8);
     tc.host_lru_list_mut(MAMBA).insert_mru(leaf_idx);
-    assert!(tc.evictable_host_leaves.contains(tc.arena.resolve(leaf)));
+    assert!(
+        tc.evictable_host_leaves
+            .contains(tc.arena.resolve(leaf).expect("live test node"))
+    );
     let mut tracker = HashMap::from([(MAMBA, 0)]);
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
@@ -897,7 +930,7 @@ fn host_eviction_takes_a_host_leaf_atomically() {
     assert_eq!(tracker[&MAMBA], 1);
     assert!(host_frees[&MAMBA][0].equal(&Tensor::from_slice(&[8i64])));
     assert!(host_frees[&FULL][0].equal(&Tensor::from_slice(&[100i64])));
-    assert!(tc.arena.try_resolve(leaf).is_none());
+    assert!(tc.arena.resolve(leaf).is_err());
     assert!(!tc.host_lru_list(MAMBA).in_list(Some(leaf_idx)));
 }
 
@@ -996,6 +1029,7 @@ fn backup_host_build_carries_the_device_slot() {
             0,
             None,
         )
+        .expect("live test node")
         .unwrap();
     assert_eq!(transfers.len(), 1);
     assert_eq!(transfers[0].name, PoolName::Mamba);
@@ -1026,6 +1060,7 @@ fn backup_host_build_carries_the_device_slot() {
             0,
             None,
         )
+        .expect("live test node")
         .is_none()
     );
 }
@@ -1045,6 +1080,7 @@ fn load_back_build_restores_the_host_only_node() {
             0,
             None,
         )
+        .expect("live test node")
         .unwrap();
     assert_eq!(transfers.len(), 1);
     assert!(
@@ -1073,6 +1109,7 @@ fn load_back_build_skips_device_backed_and_bare_nodes() {
                 0,
                 None,
             )
+            .expect("live test node")
             .is_none()
         );
     }
@@ -1127,7 +1164,8 @@ fn backup_host_commit_stores_the_host_slot_once() {
         &mut cache_actions,
         None,
         None,
-    );
+    )
+    .expect("live test node");
     assert!(
         tc.arena
             .node(a)
@@ -1150,7 +1188,8 @@ fn backup_host_commit_stores_the_host_slot_once() {
         &mut cache_actions,
         None,
         None,
-    );
+    )
+    .expect("live test node");
     assert!(
         tc.arena
             .node(a)
@@ -1183,7 +1222,8 @@ fn load_back_commit_moves_the_node_onto_the_device_tier() {
         &mut cache_actions,
         None,
         None,
-    );
+    )
+    .expect("live test node");
     assert!(
         tc.arena
             .node(a)
@@ -1204,15 +1244,17 @@ fn mamba_device_eviction_skips_a_load_back_pinned_node() {
     let [n] = chain::<1>(&mut tc);
     set_full_host(&mut tc, n, 10);
     set_mamba_host(&mut tc, n, 20);
-    let (kv_xfer, mut comp_xfers) =
-        tc.build_load_back_spec(tc.arena.node(n).id, /* req = */ None);
+    let (kv_xfer, mut comp_xfers) = tc
+        .build_load_back_spec(tc.arena.node(n).id, /* req = */ None)
+        .expect("live test node");
     comp_xfers.get_mut(&MAMBA).unwrap()[0].device_indices = Some(Tensor::from_slice(&[40i64]));
     tc.commit_load_back(
         tc.arena.node(n).id,
         Tensor::from_slice(&[30i64]),
         kv_xfer,
         comp_xfers,
-    );
+    )
+    .expect("live test node");
 
     tc.evict_device_start(MAMBA, /* request_cnt = */ 1);
     let (next, _) = tc.evict_device_next_node(MAMBA, &HashMap::new());
@@ -1220,7 +1262,8 @@ fn mamba_device_eviction_skips_a_load_back_pinned_node() {
     tc.evict_device_end(MAMBA);
     assert!(tc.arena.has_device_value(n, MAMBA));
 
-    tc.finish_load_back(tc.arena.node(n).id);
+    tc.finish_load_back(tc.arena.node(n).id)
+        .expect("live test node");
     tc.evict_device_start(MAMBA, /* request_cnt = */ 1);
     let (next, _) = tc.evict_device_next_node(MAMBA, &HashMap::new());
     assert_eq!(next, Some(tc.arena.node(n).id));
@@ -1236,21 +1279,25 @@ fn mamba_host_eviction_skips_a_load_back_pinned_node() {
     set_full_host(&mut tc, b, 11);
     set_mamba_host(&mut tc, a, 20);
     tc.host_lru_list_mut(MAMBA).insert_mru(a);
-    let (kv_xfer, comp_xfers) = tc.build_load_back_spec(tc.arena.node(b).id, /* req = */ None);
+    let (kv_xfer, comp_xfers) = tc
+        .build_load_back_spec(tc.arena.node(b).id, /* req = */ None)
+        .expect("live test node");
     assert!(comp_xfers.is_empty());
     tc.commit_load_back(
         tc.arena.node(b).id,
         Tensor::from_slice(&[30i64, 31]),
         kv_xfer,
         comp_xfers,
-    );
+    )
+    .expect("live test node");
 
     let result = tc.drive_host_eviction(MAMBA, /* num_tokens = */ 1);
     assert_eq!(result.tracker[&MAMBA], 0);
     assert!(result.host_frees.is_empty());
     assert!(tc.arena.has_host_value(a, MAMBA));
 
-    tc.finish_load_back(tc.arena.node(b).id);
+    tc.finish_load_back(tc.arena.node(b).id)
+        .expect("live test node");
     let result = tc.drive_host_eviction(MAMBA, /* num_tokens = */ 1);
     assert_eq!(result.tracker[&MAMBA], 1);
     assert_eq!(result.host_frees[&MAMBA].len(), 1);
@@ -1278,7 +1325,8 @@ fn backup_storage_commit_is_a_noop() {
         &mut cache_actions,
         None,
         None,
-    );
+    )
+    .expect("live test node");
     assert!(tc.arena.node(a).has_host_value(MAMBA));
     assert!(cache_actions.is_empty());
 }
@@ -1298,6 +1346,7 @@ fn backup_storage_build_keys_the_trailing_hash() {
             0,
             None,
         )
+        .expect("live test node")
         .is_none()
     );
     set_mamba_host(&mut tc, a, 8);
@@ -1312,6 +1361,7 @@ fn backup_storage_build_keys_the_trailing_hash() {
             0,
             None,
         )
+        .expect("live test node")
         .is_none()
     );
     tc.arena.node_mut(a).hash_value = Some(vec!["h0".to_string(), "h1".to_string()]);
@@ -1325,6 +1375,7 @@ fn backup_storage_build_keys_the_trailing_hash() {
             0,
             None,
         )
+        .expect("live test node")
         .unwrap();
     assert_eq!(transfers.len(), 1);
     assert_eq!(transfers[0].keys, Some(vec!["h1".to_string()]));
@@ -1351,6 +1402,7 @@ fn prefetch_build_wraps_the_host_buffer_with_a_placeholder_key() {
             0,
             None,
         )
+        .expect("live test node")
         .unwrap();
     assert_eq!(transfers.len(), 1);
     assert_eq!(transfers[0].keys, Some(vec!["__placeholder__".to_string()]));
@@ -1370,6 +1422,7 @@ fn prefetch_commit_attaches_the_loaded_slot_to_the_inserted_node() {
             Tensor::from_slice(&[100i64]),
             vec!["h0".to_string()],
         )
+        .expect("live test node")
         .inserted_host_node
         .unwrap();
     let mut insert_result = InsertResult {
@@ -1395,17 +1448,18 @@ fn prefetch_commit_attaches_the_loaded_slot_to_the_inserted_node() {
             kv_hit_pages: 1,
             extra_pool_hit_pages: HashMap::from([(PoolName::Mamba, 1)]),
         }),
-    );
+    )
+    .expect("live test node");
     assert!(
         tc.arena
-            .node(tc.arena.resolve(target))
+            .node(tc.arena.resolve(target).expect("live test node"))
             .try_host_value(MAMBA)
             .unwrap()
             .equal(&Tensor::from_slice(&[50i64]))
     );
     assert!(
         tc.host_lru_list(MAMBA)
-            .in_list(Some(tc.arena.resolve(target)))
+            .in_list(Some(tc.arena.resolve(target).expect("live test node")))
     );
     assert!(!insert_result.mamba_exist);
     assert!(cache_actions.is_empty());
@@ -1424,6 +1478,7 @@ fn prefetch_commit_frees_the_buffer_when_it_cannot_attach() {
             Tensor::from_slice(&[100i64]),
             vec!["h0".to_string()],
         )
+        .expect("live test node")
         .inserted_host_node
         .unwrap();
     // Not loaded: the buffer frees and the caller keeps its slot flag.
@@ -1450,10 +1505,11 @@ fn prefetch_commit_frees_the_buffer_when_it_cannot_attach() {
             kv_hit_pages: 1,
             extra_pool_hit_pages: HashMap::new(),
         }),
-    );
+    )
+    .expect("live test node");
     assert!(
         !tc.arena
-            .node(tc.arena.resolve(target))
+            .node(tc.arena.resolve(target).expect("live test node"))
             .has_host_value(MAMBA)
     );
     assert!(insert_result.mamba_exist);
@@ -1468,7 +1524,7 @@ fn prefetch_commit_frees_the_buffer_when_it_cannot_attach() {
     assert!(host_indices[0].equal(&Tensor::from_slice(&[50i64])));
 
     // An already-hosted target frees the buffer too.
-    let target_idx = tc.arena.resolve(target);
+    let target_idx = tc.arena.resolve(target).expect("live test node");
     set_mamba_host(&mut tc, target_idx, 8);
     let mut insert_result = InsertResult {
         total_len: 1,
@@ -1493,12 +1549,13 @@ fn prefetch_commit_frees_the_buffer_when_it_cannot_attach() {
             kv_hit_pages: 1,
             extra_pool_hit_pages: HashMap::from([(PoolName::Mamba, 1)]),
         }),
-    );
+    )
+    .expect("live test node");
     assert!(insert_result.mamba_exist);
     assert_eq!(cache_actions.len(), 1);
     assert!(
         tc.arena
-            .node(tc.arena.resolve(target))
+            .node(tc.arena.resolve(target).expect("live test node"))
             .try_host_value(MAMBA)
             .unwrap()
             .equal(&Tensor::from_slice(&[8i64]))
@@ -1528,7 +1585,9 @@ fn evict_excess_path_states_removes_the_shallowest_states_beyond_the_cap() {
     set_mamba_device(&mut tc, a, 7);
     set_mamba_device(&mut tc, b, 8);
     set_mamba_device(&mut tc, c, 9);
-    let mut result = tc.evict_excess_path_states(tc.arena.node(c).id);
+    let mut result = tc
+        .evict_excess_path_states(tc.arena.node(c).id)
+        .expect("live test node");
     let freed = result
         .device_frees
         .remove(&MAMBA)
@@ -1560,7 +1619,9 @@ fn evict_excess_path_states_preserves_forks_locked_nodes_and_the_tail() {
     tc.arena
         .node_mut(b)
         .set_lock_ref_(ValueSlotIdx::device(MAMBA), 1);
-    let result = tc.evict_excess_path_states(tc.arena.node(c).id);
+    let result = tc
+        .evict_excess_path_states(tc.arena.node(c).id)
+        .expect("live test node");
     assert!(result.device_frees.is_empty());
     assert!(result.host_frees.is_empty());
     assert!(tc.arena.node(a).try_device_value(MAMBA).is_some());
@@ -1574,7 +1635,9 @@ fn evict_excess_path_states_without_a_cap_is_a_no_op() {
     let [a, b] = chain::<2>(&mut tc);
     set_mamba_device(&mut tc, a, 7);
     set_mamba_device(&mut tc, b, 8);
-    let result = tc.evict_excess_path_states(tc.arena.node(b).id);
+    let result = tc
+        .evict_excess_path_states(tc.arena.node(b).id)
+        .expect("live test node");
     assert!(result.device_frees.is_empty());
     assert!(result.host_frees.is_empty());
     assert!(tc.arena.node(a).try_device_value(MAMBA).is_some());
@@ -1616,7 +1679,8 @@ fn swa_evict_on_a_full_locked_leaf_sweeps_mamba_and_spares_full() {
     let [a] = chain::<1>(&mut tc);
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[10i64]));
-    tc.set_component_device_value(tc.arena.node(a).id, SWA, Tensor::from_slice(&[20i64]));
+    tc.set_component_device_value(tc.arena.node(a).id, SWA, Tensor::from_slice(&[20i64]))
+        .expect("live test node");
     set_mamba_device(&mut tc, a, 7);
     // The held Full lock keeps the leaf out of the D-leaf set.
     tc.arena
@@ -1721,11 +1785,20 @@ fn branching_from_a_host_full_hit_is_reusable_after_insert() {
         b,
         Tensor::from_slice(&[100i64, 101, 102, 103]),
         HashMap::new(),
-    );
-    tc.demote(b);
+    )
+    .expect("live test node");
+    tc.demote(b).expect("valid demote state");
     // The demote's cascade swept b's mamba slot: b is Full-host-only, no mamba.
-    assert!(!tc.arena.node(tc.arena.resolve(b)).has_device_value(MAMBA));
-    assert!(!tc.arena.node(tc.arena.resolve(b)).has_host_value(MAMBA));
+    assert!(
+        !tc.arena
+            .node(tc.arena.resolve(b).expect("live test node"))
+            .has_device_value(MAMBA)
+    );
+    assert!(
+        !tc.arena
+            .node(tc.arena.resolve(b).expect("live test node"))
+            .has_host_value(MAMBA)
+    );
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4, 5, 6, 7]));
     assert_eq!(result.best_match_node_id, a);
     assert_eq!(result.last_device_node_id, a);

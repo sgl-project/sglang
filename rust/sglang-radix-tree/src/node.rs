@@ -688,14 +688,21 @@ pub struct ValueState {
 
 // Tree-core runtime errors.
 
+/// A public node handle does not name a live arena node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("node {node_id} is not allocated")]
+pub struct NodeAccessError {
+    pub node_id: NodeId,
+}
+
 /// Errors surfaced from the tree-core runtime API when a caller violates a documented
 /// contract (freeing an unallocated node, allocating under a freed parent).
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, thiserror::Error)]
 pub enum TreeCoreRuntimeError {
     /// A public NodeId no longer names a live arena node.
-    #[error("node {node_id} is not allocated")]
-    NodeNotAllocated { node_id: NodeId },
+    #[error(transparent)]
+    NodeAccess(#[from] NodeAccessError),
     /// `begin_insert`/`insert` called while a resumable insert is suspended.
     #[error("concurrent insert walks")]
     ConcurrentInsertWalk,
@@ -736,6 +743,10 @@ pub enum TreeCoreRuntimeError {
     /// A host insert below a non-root anchor must remain in that anchor's namespace.
     #[error("insert_host namespace does not match non-root anchor {node_id}")]
     InsertHostNamespaceMismatch { node_id: NodeId },
+    /// An inspection-only invariant check failed without mutating the tree.
+    #[cfg(any(test, feature = "inspection"))]
+    #[error("{0}")]
+    InspectionAssertion(String),
 }
 
 // Unigram and bigram child keys.
@@ -1058,18 +1069,12 @@ impl<K: ChildKeyType> NodeArena<K> {
         self.root = self.alloc_root();
     }
 
-    /// The live slot for an external handle; panics on a freed or unknown id.
-    #[track_caller]
-    pub fn resolve(&self, id: NodeId) -> NodeIdx_ {
-        *self
-            .id_map
+    /// The live slot for an external handle.
+    pub fn resolve(&self, id: NodeId) -> Result<NodeIdx_, NodeAccessError> {
+        self.id_map
             .get(&id)
-            .unwrap_or_else(|| panic!("node {id} is not allocated"))
-    }
-
-    /// The live slot for an external handle, or None if freed/unknown.
-    pub fn try_resolve(&self, id: NodeId) -> Option<NodeIdx_> {
-        self.id_map.get(&id).copied()
+            .copied()
+            .ok_or(NodeAccessError { node_id: id })
     }
 
     /// Mint the next external handle for the slot and index it.

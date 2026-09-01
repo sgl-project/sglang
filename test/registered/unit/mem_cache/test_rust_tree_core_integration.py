@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     InsertResult,
     MatchPrefixParams,
+    MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
@@ -173,6 +174,51 @@ def test_stale_handle_reads_raise_key_error_without_poisoning_the_core():
         assert core.is_root(live_root)
 
 
+def test_stale_match_finalizer_handles_raise_key_error_without_poisoning_the_core():
+    from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
+
+    core = RustUnifiedTreeCoreInspector(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            tree_components=(ComponentType.FULL,),
+        )
+    )
+    stale_root = core.root_node_handle()
+    core.reset()
+    live_root = core.root_node_handle()
+    result = MatchResult(
+        device_indices=torch.empty(0, dtype=torch.int64),
+        last_device_node=live_root,
+        last_host_node=live_root,
+        best_match_node=live_root,
+    )
+    params = MatchPrefixParams(key=_key([]))
+
+    for field in ("last_device_node", "last_host_node", "best_match_node"):
+        with pytest.raises(KeyError) as exc_info:
+            core.finalize_component_match_result(
+                ComponentType.FULL,
+                result._replace(**{field: stale_root}),
+                params,
+                value_chunks=[],
+                best_value_len=0,
+            )
+        assert exc_info.value.args == (stale_root,), field
+        assert core.is_root(live_root), field
+
+    finalized = core.finalize_component_match_result(
+        ComponentType.FULL,
+        result,
+        params,
+        value_chunks=[],
+        best_value_len=0,
+    )
+    assert finalized.best_match_node == live_root
+
+
 def test_stale_handle_operations_raise_key_error_without_poisoning_the_core():
     from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
 
@@ -180,15 +226,122 @@ def test_stale_handle_operations_raise_key_error_without_poisoning_the_core():
     stale_root = core.root_node_handle()
     core.reset()
     live_root = core.root_node_handle()
+    empty = torch.empty(0, dtype=torch.int64)
 
-    operations = (
-        lambda: core.demote(stale_root),
-        lambda: core.build_hicache_transfers(
+    operations = {
+        "inc_lock_ref": lambda: core.inc_lock_ref(stale_root),
+        "dec_lock_ref": lambda: core.dec_lock_ref(stale_root),
+        "dec_swa_lock_only": lambda: core.dec_swa_lock_only(stale_root, None),
+        "evict_device_leaf": lambda: core.evict_device_leaf(stale_root, False),
+        "drop_subtree_no_host": lambda: core.drop_subtree_no_host(stale_root),
+        "demote": lambda: core.demote(stale_root),
+        "is_full_device_evicted": lambda: core.is_full_device_evicted(stale_root),
+        "collect_full_device_indices/from": lambda: core.collect_full_device_indices(
+            stale_root, live_root
+        ),
+        "collect_full_device_indices/until": lambda: core.collect_full_device_indices(
+            live_root, stale_root
+        ),
+        "insert_host": lambda: core.insert_host(
+            stale_root, _key([1]), empty, ["0" * 64]
+        ),
+        "build_backup_spec": lambda: core.build_backup_spec(stale_root),
+        "build_storage_backup_spec": lambda: core.build_storage_backup_spec(
+            stale_root, False
+        ),
+        "build_hicache_transfers": lambda: core.build_hicache_transfers(
             ComponentType.FULL, stale_root, CacheTransferPhase.BACKUP_STORAGE
         ),
-        lambda: core.build_load_back_spec(stale_root),
-        lambda: core.get_hash_values(stale_root),
-        lambda: core.dfs_weight_order([stale_root]),
+        "commit_backup": lambda: core.commit_backup(stale_root, empty, {}),
+        "commit_hicache_transfers": lambda: core.commit_hicache_transfers(
+            stale_root,
+            CacheTransferPhase.BACKUP_HOST,
+            {},
+            cache_actions=[],
+        ),
+        "commit_load_back": lambda: core.commit_load_back(
+            stale_root, empty, PoolTransfer(name=PoolName.KV), {}
+        ),
+        "build_load_back_spec": lambda: core.build_load_back_spec(stale_root),
+        "evict_excess_path_states": lambda: core.evict_excess_path_states(
+            stale_root, {}, {}
+        ),
+        "inc_host_lock_ref": lambda: core.inc_host_lock_ref(stale_root),
+        "dec_host_lock_ref": lambda: core.dec_host_lock_ref(stale_root),
+        "mark_write_through_pending": lambda: core.mark_write_through_pending(
+            stale_root
+        ),
+        "finish_write_through": lambda: core.finish_write_through(
+            [stale_root], stale_root
+        ),
+        "finish_load_back": lambda: core.finish_load_back(stale_root),
+        "get_component_device_value": lambda: core.get_component_device_value(
+            stale_root, ComponentType.FULL
+        ),
+        "component_has_host_value_only": lambda: core.component_has_host_value_only(
+            stale_root, ComponentType.FULL
+        ),
+        "get_hash_values": lambda: core.get_hash_values(stale_root),
+        "dfs_weight_order": lambda: core.dfs_weight_order([stale_root]),
+    }
+    for name, operation in operations.items():
+        with pytest.raises(KeyError) as exc_info:
+            operation()
+        assert exc_info.value.args == (stale_root,), name
+        assert core.is_root(live_root), name
+
+
+def test_stale_handles_nested_in_transfer_results_do_not_poison_the_core():
+    from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
+
+    core = _tree_core()
+    stale_root = core.root_node_handle()
+    core.reset()
+    live_root = core.root_node_handle()
+    stale_transfer = PoolTransfer(name=PoolName.KV, nodes_to_load=[stale_root])
+
+    operations = (
+        lambda: core.commit_hicache_transfers(
+            live_root,
+            CacheTransferPhase.LOAD_BACK,
+            {ComponentType.FULL: [stale_transfer]},
+            cache_actions=[],
+        ),
+        lambda: core.commit_hicache_transfers(
+            live_root,
+            CacheTransferPhase.PREFETCH,
+            {},
+            cache_actions=[],
+            insert_result=InsertResult(prefix_len=0, inserted_host_node=stale_root),
+        ),
+        lambda: core.commit_load_back(
+            live_root,
+            torch.empty(0, dtype=torch.int64),
+            stale_transfer,
+            {},
+        ),
+    )
+    for operation in operations:
+        with pytest.raises(KeyError) as exc_info:
+            operation()
+        assert exc_info.value.args == (stale_root,)
+        assert core.is_root(live_root)
+
+
+def test_stale_handle_component_access_does_not_poison_the_core():
+    core = _tree_core(
+        tree_components=(ComponentType.FULL, ComponentType.SWA),
+        sliding_window_size=8,
+    )
+    stale_root = core.root_node_handle()
+    core.reset()
+    live_root = core.root_node_handle()
+
+    operations = (
+        lambda: core.set_component_device_value(
+            stale_root, ComponentType.SWA, torch.empty(0, dtype=torch.int64)
+        ),
+        lambda: core.get_component_device_value(stale_root, ComponentType.SWA),
     )
     for operation in operations:
         with pytest.raises(KeyError) as exc_info:
@@ -1236,6 +1389,10 @@ def test_buffer_backup_snapshot_round_trips_and_detects_a_split():
     )
     assert core.validate_buffer_backup(leaf, len(snapshot.key)) is None
 
+    core.reset()
+    assert core.snapshot_buffer_backup(leaf, pass_prefix_keys=True) is None
+    assert core.validate_buffer_backup(leaf, len(snapshot.key)) is None
+
 
 def test_buffer_backup_snapshot_preserves_bigram_keys():
     core = _tree_core(is_eagle=True)
@@ -1967,6 +2124,123 @@ def test_bigram_insert_value_shorter_than_the_bigram_count_raises():
                 value=torch.tensor([10, 11], dtype=torch.int64),
             ),
         )
+
+
+def test_stale_inspection_handles_raise_key_error_or_report_absence():
+    from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
+
+    from sglang.srt.mem_cache.unified_cache.components import EvictLayer
+
+    core = RustUnifiedTreeCoreInspector(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            tree_components=(ComponentType.FULL,),
+        )
+    )
+    stale_root = core.root_node_handle()
+    core.reset()
+    live_root = core.root_node_handle()
+
+    operations = {
+        "get_parent_node_id": lambda: core.get_parent_node_id(stale_root),
+        "get_child_node_ids": lambda: core.get_child_node_ids(stale_root),
+        "get_node_key_length": lambda: core.get_node_key_length(stale_root),
+        "get_node_token_ids": lambda: core.get_node_token_ids(stale_root),
+        "is_node_key_bigram": lambda: core.is_node_key_bigram(stale_root),
+        "get_component_host_value": lambda: core.get_component_host_value(
+            stale_root, ComponentType.FULL
+        ),
+        "get_component_device_lock_ref": lambda: core.get_component_device_lock_ref(
+            stale_root, ComponentType.FULL
+        ),
+        "get_node_hit_count": lambda: core.get_node_hit_count(stale_root),
+        "get_write_through_pending_id": lambda: core.get_write_through_pending_id(
+            stale_root
+        ),
+        "is_node_in_device_lru": lambda: core.is_node_in_device_lru(
+            stale_root, ComponentType.FULL
+        ),
+        "is_node_in_host_lru": lambda: core.is_node_in_host_lru(
+            stale_root, ComponentType.FULL
+        ),
+        "is_device_leaf": lambda: core.is_device_leaf(stale_root),
+        "set_node_hash_values": lambda: core.set_node_hash_values(stale_root, None),
+        "set_component_device_value_raw": lambda: core.set_component_device_value_raw(
+            stale_root, ComponentType.FULL, None
+        ),
+        "set_component_host_value_raw": lambda: core.set_component_host_value_raw(
+            stale_root, ComponentType.FULL, None
+        ),
+        "set_component_device_lock_ref": lambda: core.set_component_device_lock_ref(
+            stale_root, ComponentType.FULL, 0
+        ),
+        "remove_node_from_device_lru": lambda: core.remove_node_from_device_lru(
+            stale_root, ComponentType.FULL
+        ),
+        "insert_node_into_host_lru": lambda: core.insert_node_into_host_lru(
+            stale_root, ComponentType.FULL
+        ),
+        "update_duplicate_tracking": lambda: core.update_duplicate_tracking(stale_root),
+        "evict_component": lambda: core.evict_component(
+            stale_root, ComponentType.FULL, EvictLayer.DEVICE
+        ),
+        "validate_cascade_evict": lambda: core.validate_cascade_evict(
+            stale_root, ComponentType.FULL, EvictLayer.DEVICE
+        ),
+        "cleanup_tombstone_ancestors": lambda: core.cleanup_tombstone_ancestors(
+            stale_root
+        ),
+        "build_backup_node_ids": lambda: core.build_backup_node_ids(stale_root),
+    }
+    for name, operation in operations.items():
+        with pytest.raises(KeyError) as exc_info:
+            operation()
+        assert exc_info.value.args == (stale_root,), name
+        assert core.is_root(live_root), name
+
+    disabled_component_operations = {
+        "get_component_host_value": lambda: core.get_component_host_value(
+            stale_root, ComponentType.SWA
+        ),
+        "get_component_device_lock_ref": lambda: core.get_component_device_lock_ref(
+            stale_root, ComponentType.SWA
+        ),
+        "set_component_device_value_raw": lambda: core.set_component_device_value_raw(
+            stale_root, ComponentType.SWA, None
+        ),
+        "set_component_host_value_raw": lambda: core.set_component_host_value_raw(
+            stale_root, ComponentType.SWA, None
+        ),
+        "set_component_device_lock_ref": lambda: core.set_component_device_lock_ref(
+            stale_root, ComponentType.SWA, 0
+        ),
+        "remove_node_from_device_lru": lambda: core.remove_node_from_device_lru(
+            stale_root, ComponentType.SWA
+        ),
+        "insert_node_into_host_lru": lambda: core.insert_node_into_host_lru(
+            stale_root, ComponentType.SWA
+        ),
+        "evict_component": lambda: core.evict_component(
+            stale_root, ComponentType.SWA, EvictLayer.DEVICE
+        ),
+        "validate_cascade_evict": lambda: core.validate_cascade_evict(
+            stale_root, ComponentType.SWA, EvictLayer.DEVICE
+        ),
+    }
+    for name, operation in disabled_component_operations.items():
+        with pytest.raises(KeyError) as exc_info:
+            operation()
+        assert exc_info.value.args == (stale_root,), name
+        assert core.is_root(live_root), name
+
+    assert not core.contains_node(stale_root)
+    assert not core.is_device_evictable_leaf(stale_root)
+    assert not core.is_host_evictable_leaf(stale_root)
+    assert not core.is_node_in_device_lru(stale_root, ComponentType.SWA)
+    assert not core.is_node_in_host_lru(stale_root, ComponentType.SWA)
 
 
 if __name__ == "__main__":
