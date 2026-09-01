@@ -44,8 +44,8 @@ def get_qkv_projections(
     ``added_kv_proj_dim`` is not ``None`` — direct attribute access so a
     renamed flag fails loudly instead of silently unfusing.
 
-    ``make_contiguous=False`` preserves zero-copy views for a caller whose
-    epilogue can consume the packed projection stride directly.
+    ``make_contiguous=False`` preserves zero-copy views for a caller that can
+    consume packed projection output strides directly.
     """
     if attn.use_fused_qkv:
         qkv, _ = attn.to_qkv(hidden_states)

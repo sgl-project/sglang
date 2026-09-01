@@ -499,9 +499,9 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             )
         )
         if complete_shard_scales:
-            # CUTLASS accepts a scale per output channel. Preserve every
-            # checkpoint shard's original FP8 bytes and scale instead of
-            # requantizing packed Q/K/V shards to one maximum scale.
+            # CUTLASS accepts a scale per output channel. Preserve each
+            # checkpoint shard's original FP8 values and scale instead of
+            # requantizing all packed shards to the largest scale.
             quantized_weight = weight
             processed_weight_scale = convert_to_channelwise(
                 layer.weight_scale, layer.logical_widths
