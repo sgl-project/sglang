@@ -200,6 +200,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
         runner._input_embeds_arg_idx = None
+        runner._use_draft_input_embeds = False
         runner.buffer_registry = SimpleNamespace(has_slot=lambda _name: False)
         runner.backend = SimpleNamespace(replay=lambda *_args, **_kwargs: None)
         runner.layer_model = SimpleNamespace(forward=lambda *_args, **_kwargs: None)

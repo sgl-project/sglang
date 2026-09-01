@@ -124,6 +124,15 @@ _LATE_RESOLUTION_DYNAMIC_SITES = {
 # there is exposure only through that caller's own reads.
 _CALLER_SUPPLIED_LATE_SITES = frozenset({"runtime_context.py"})
 
+# `get_context().override(..., **expansion)` sites that forward caller-chosen
+# fields, the expansion analogue of the by-name `update_server_args` exemption
+# in `_expanded_override_keys`: the hybrid controller republishes each worker's
+# resolved-config diff at construction (and the base values on teardown), so
+# the key set is the user's --speculative-hybrid-config, not this file's. The
+# controller's own reads go through its locally constructed worker
+# ServerArgs, never the global record, so no exposure flows through the keys.
+_OVERRIDE_FORWARDING_SITES = frozenset({"speculative/hybrid_controller.py"})
+
 # Resolution also branches on ambient environment; those shapes are explicit
 # entries so the written set is the same on every host. `SGLANG_IS_IN_CI`
 # makes resolution fill `soft_watchdog_timeout`.
@@ -816,6 +825,8 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                         continue
                     if kw.arg:
                         written.add(kw.arg)
+                    elif rel in _OVERRIDE_FORWARDING_SITES:
+                        continue
                     else:
                         written |= _expanded_override_keys(rel, tree, node, kw)
         return written

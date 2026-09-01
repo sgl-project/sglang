@@ -112,7 +112,7 @@ class TestHybridServerArgs(CustomTestCase):
                     json.dumps({k: v for k, v in full.items() if k != missing})
                 )
         for name in ("min_continuation_ratio", "min_matching_ratio"):
-            with self.assertRaisesRegex(ValueError, rf"{name} must be in \\(0, 1\\]"):
+            with self.assertRaisesRegex(ValueError, rf"{name} must be in \(0, 1\]"):
                 HybridController._load_config(json.dumps({**full, name: 1.5}))
 
 

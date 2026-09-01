@@ -1293,7 +1293,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )
-            return batch_output
+                return batch_output
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 
@@ -1473,9 +1473,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
     def on_verify_complete_cpu(
-        self,
-        num_correct_drafts_per_req: list[int],
-        batch_size: int = 0,
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(

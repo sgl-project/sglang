@@ -3,7 +3,6 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
@@ -34,10 +33,18 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_for_v2_verify,
     spec_stage_span,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_musa
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 _is_cpu = is_cpu()
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_musa = is_musa()
+
+# Guarded like eagle_utils's sgl_kernel imports: hosts with no accelerator
+# (CPU CI runners) cannot load sgl_kernel at all.
+if _is_cuda or _is_hip or _is_musa or _is_cpu:
+    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 logger = logging.getLogger(__name__)
 
@@ -242,9 +249,7 @@ class NGRAMWorker(BaseSpecWorker):
             )
 
     def on_verify_complete_cpu(
-        self,
-        num_correct_drafts_per_req: list[int],
-        batch_size: int = 0,
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:
         # Signature must match BaseSpecWorker.on_verify_complete_cpu; the
         # result processor calls it with batch_size as a keyword argument.

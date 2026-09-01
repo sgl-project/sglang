@@ -332,9 +332,7 @@ class BaseSpecWorker(ABC):
         return True, "Succeeded to update model weights."
 
     def on_verify_complete_cpu(
-        self,
-        num_correct_drafts_per_req: list[int],
-        batch_size: int = 0,
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:
         """Hook called after verify finishes and accept counts are on CPU.
 
