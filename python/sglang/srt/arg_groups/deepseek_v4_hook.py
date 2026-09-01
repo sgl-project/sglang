@@ -137,9 +137,10 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     if server_args.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported
 
-        assert (
-            cfg.device == "cuda" and is_sm100_supported()
-        ), "--dsv4-attn-backend trtllm requires an SM100/SM103 (Blackwell) GPU."
+        assert is_sm100_supported(), (
+            "--dsv4-attn-backend trtllm requires an SM100/SM103 "
+            "(Blackwell) CUDA GPU."
+        )
         # "auto" is declared-but-unmaterialized here; the resolution pipeline
         # (_deepseek_v4_kv_cache_dtype above) turns it into fp8_e4m3 on cuda.
         assert server_args.kv_cache_dtype in ("auto", "fp8_e4m3"), (
