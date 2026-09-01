@@ -513,6 +513,64 @@ mod suite {
     }
 
     #[tokio::test]
+    async fn standalone_health_reflects_engine_status_timeout_and_availability() {
+        async fn unhealthy(State(hits): State<Arc<AtomicUsize>>) -> StatusCode {
+            if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                StatusCode::IM_A_TEAPOT
+            } else {
+                futures::future::pending().await
+            }
+        }
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let engine = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/health", get(unhealthy))
+                    .with_state(hits.clone()),
+            )
+            .into_future(),
+        );
+        let renderer = Arc::new(RendererService::with_tokenizer(
+            renderer_config(),
+            Arc::new(WordTokenizer),
+            2,
+            2,
+        ));
+        let client = HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer())
+            .unwrap()
+            .with_health_timeout(Duration::from_millis(50));
+        let app = standalone_routes(OpenAIHttpFrontend::new(renderer, client));
+
+        let health = app
+            .clone()
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let timed_out = app
+            .clone()
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(timed_out.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        engine.abort();
+        let _ = engine.await;
+        let unavailable = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn render_only_routes_accept_bodies_above_axum_default() {
         let body = serde_json::json!({
             "model": "model",

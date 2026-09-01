@@ -1,6 +1,5 @@
 //! HTTP client from renderer-owned generation requests to SGLang `/generate`.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::stream;
@@ -12,10 +11,16 @@ use crate::{
     GenerationStream, MatchedStop, PositionLogprobs, ResponseError, TokenIds, TokenLogprob,
 };
 
+// SGLang's deep health probe defaults to 20 seconds. Leave it time to return
+// its own status while still bounding a peer that never sends response headers.
+const ENGINE_HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct HttpGenerateClient {
     client: reqwest::Client,
-    generate_url: Arc<str>,
+    generate_url: reqwest::Url,
+    health_url: reqwest::Url,
+    health_timeout: Duration,
     tokenizer: dynamo_tokenizers::Tokenizer,
 }
 
@@ -33,11 +38,27 @@ impl HttpGenerateClient {
         engine_url: impl AsRef<str>,
         tokenizer: dynamo_tokenizers::Tokenizer,
     ) -> Result<Self, String> {
-        let base = engine_url.as_ref().trim_end_matches('/');
-        if base.is_empty() {
-            return Err("engine URL cannot be empty".into());
+        let engine_url = engine_url.as_ref();
+        let base_url = reqwest::Url::parse(engine_url)
+            .map_err(|error| format!("invalid engine URL {engine_url:?}: {error}"))?;
+        let is_http_origin = matches!(base_url.scheme(), "http" | "https")
+            && base_url.host_str().is_some()
+            && base_url.username().is_empty()
+            && base_url.password().is_none()
+            && base_url.path() == "/"
+            && base_url.query().is_none()
+            && base_url.fragment().is_none();
+        if !is_http_origin {
+            return Err(format!(
+                "invalid engine URL {engine_url:?}: expected an HTTP(S) origin without credentials, a path, query, or fragment"
+            ));
         }
-        let generate_url: Arc<str> = format!("{base}/generate").into();
+        let generate_url = base_url
+            .join("/generate")
+            .map_err(|error| format!("joining /generate to engine URL failed: {error}"))?;
+        let health_url = base_url
+            .join("/health")
+            .map_err(|error| format!("joining /health to engine URL failed: {error}"))?;
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .build()
@@ -45,9 +66,30 @@ impl HttpGenerateClient {
         Ok(Self {
             client,
             generate_url,
+            health_url,
+            health_timeout: ENGINE_HEALTH_REQUEST_TIMEOUT,
             tokenizer,
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_health_timeout(mut self, timeout: Duration) -> Self {
+        self.health_timeout = timeout;
+        self
+    }
+
+    pub(crate) async fn health_status(&self) -> Result<reqwest::StatusCode, ResponseError> {
+        let request = self
+            .client
+            .get(self.health_url.clone())
+            .timeout(self.health_timeout);
+        let response = request
+            .send()
+            .await
+            .map_err(|error| unavailable(format!("engine health check failed: {error}")))?;
+        Ok(response.status())
+    }
+
     pub async fn generate(
         &self,
         mut request: GenerateRequest,
@@ -71,7 +113,7 @@ impl HttpGenerateClient {
 
         let response = self
             .client
-            .post(self.generate_url.as_ref())
+            .post(self.generate_url.clone())
             .json(&EngineGenerateBody {
                 request: &request,
                 incremental_streaming_output: true,
@@ -191,10 +233,6 @@ struct StopMatch {
 
 impl StopStringMatcher {
     fn new(stops: Vec<String>, include_stop: bool) -> Option<Self> {
-        let stops = stops
-            .into_iter()
-            .filter(|stop| !stop.is_empty())
-            .collect::<Vec<_>>();
         (!stops.is_empty()).then_some(Self {
             stops,
             pending: String::new(),
@@ -214,6 +252,12 @@ impl StopStringMatcher {
             })
             .min_by_key(|(position, _)| *position)
         {
+            if stop.is_empty() {
+                return StopMatch {
+                    text: std::mem::take(&mut self.pending),
+                    matched: Some(stop),
+                };
+            }
             let end = if self.include_stop {
                 position + stop.len()
             } else {
@@ -260,21 +304,19 @@ fn decode_output(
     for index in 0..output.token_ids.len() {
         let id = output.token_ids[index];
         let id = u32::try_from(id).map_err(|_| internal("engine returned a negative token ID"))?;
-        if let Some(delta) = decoder
+        let delta = decoder
             .step(id)
-            .map_err(|error| internal(format!("detokenizing engine output failed: {error}")))?
-        {
-            if let Some(matcher) = stop_matcher.as_deref_mut() {
-                let matched = matcher.push(&delta);
-                text.push_str(&matched.text);
-                if let Some(stop) = matched.matched {
-                    truncate_output(output, index + 1)?;
-                    output.text = text;
-                    return Ok(Some(stop));
-                }
-            } else {
-                text.push_str(&delta);
+            .map_err(|error| internal(format!("detokenizing engine output failed: {error}")))?;
+        if let Some(matcher) = stop_matcher.as_deref_mut() {
+            let matched = matcher.push(delta.as_deref().unwrap_or_default());
+            text.push_str(&matched.text);
+            if let Some(stop) = matched.matched {
+                truncate_output(output, index + 1)?;
+                output.text = text;
+                return Ok(Some(stop));
             }
+        } else if let Some(delta) = delta {
+            text.push_str(&delta);
         }
     }
     if output.finish_reason.is_some()
@@ -374,16 +416,20 @@ impl SseParser {
 }
 
 fn event_end(bytes: &[u8]) -> Option<(usize, usize)> {
-    bytes
+    let crlf = bytes
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .map(|position| (position, 4))
-        .or_else(|| {
-            bytes
-                .windows(2)
-                .position(|window| window == b"\n\n")
-                .map(|position| (position, 2))
-        })
+        .map(|position| (position, 4));
+    let lf = bytes
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|position| (position, 2));
+    match (crlf, lf) {
+        (Some(crlf), Some(lf)) => Some(crlf.min(lf)),
+        (Some(crlf), None) => Some(crlf),
+        (None, Some(lf)) => Some(lf),
+        (None, None) => None,
+    }
 }
 
 type WireLogprob = (Option<f32>, i32, Option<String>);
@@ -664,7 +710,7 @@ mod tests {
         routing::post,
     };
     use std::convert::Infallible;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     fn logprob(token_id: i32, logprob: f32) -> TokenLogprob {
         TokenLogprob {
@@ -817,6 +863,26 @@ mod tests {
     }
 
     #[test]
+    fn empty_stop_matches_after_the_first_generated_token() {
+        let tokenizer = tiny_tokenizer();
+        let mut decoder = tokenizer.decode_stream(&[65], true);
+        let mut output = GenerationOutput {
+            token_ids: vec![104, 101],
+            completion_tokens: 2,
+            ..Default::default()
+        };
+        let mut matcher = StopStringMatcher::new(vec!["never".into(), String::new()], false)
+            .expect("the empty stop must remain active");
+
+        let matched = decode_output(&mut decoder, &mut output, Some(&mut matcher)).unwrap();
+
+        assert_eq!(matched.as_deref(), Some(""));
+        assert_eq!(output.token_ids, [104]);
+        assert_eq!(output.completion_tokens, 1);
+        assert_eq!(output.text, "h");
+    }
+
+    #[test]
     fn sse_parser_handles_split_crlf_and_lf_frames() {
         let mut parser = SseParser::default();
         assert!(parser.push(b"data: {\"a\":1}\r\n").is_empty());
@@ -824,6 +890,15 @@ mod tests {
             parser.push(b"\r\ndata: [DONE]\n\n"),
             ["{\"a\":1}", "[DONE]"]
         );
+    }
+
+    #[test]
+    fn sse_parser_uses_the_earliest_mixed_delimiter() {
+        let mut parser = SseParser::default();
+
+        let payloads = parser.push(b"data: {\"a\":1}\n\ndata: {\"b\":2}\r\n\r\n");
+
+        assert_eq!(payloads, ["{\"a\":1}", "{\"b\":2}"]);
     }
 
     #[test]
@@ -1006,6 +1081,35 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn engine_origins_are_validated_and_joined_during_client_construction() {
+        let tokenizer = tiny_tokenizer();
+        for invalid_url in [
+            "127.0.0.1:30001",
+            "ftp://engine.example",
+            "http://user@engine.example",
+            "http://engine.example/base",
+            "http://engine.example?query",
+            "http://engine.example#fragment",
+        ] {
+            let error = match HttpGenerateClient::new(invalid_url, tokenizer.clone()) {
+                Ok(_) => panic!("{invalid_url:?} must be rejected"),
+                Err(error) => error,
+            };
+            assert!(error.contains("invalid engine URL"));
+        }
+
+        let client = HttpGenerateClient::new("http://engine.example:30001/", tokenizer).unwrap();
+        assert_eq!(
+            client.generate_url.as_str(),
+            "http://engine.example:30001/generate"
+        );
+        assert_eq!(
+            client.health_url.as_str(),
+            "http://engine.example:30001/health"
+        );
     }
 
     #[tokio::test]

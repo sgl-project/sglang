@@ -52,12 +52,10 @@ fn renderer_routes(renderer: Arc<crate::RendererService>) -> Router<()> {
     render::routes(renderer.clone()).merge(tokenize::routes(renderer))
 }
 
-fn direct_routes(routes: Router<()>) -> Router<()> {
-    routes
-        .merge(render::health_route())
-        .layer(axum::extract::DefaultBodyLimit::max(
-            DEFAULT_REQUEST_BODY_LIMIT_BYTES,
-        ))
+fn with_request_body_limit(routes: Router<()>) -> Router<()> {
+    routes.layer(axum::extract::DefaultBodyLimit::max(
+        DEFAULT_REQUEST_BODY_LIMIT_BYTES,
+    ))
 }
 
 pub(super) fn unix_seconds_u32() -> u32 {
@@ -78,11 +76,15 @@ pub(super) fn completion_usage(prompt_tokens: u32, completion_tokens: u32) -> Co
 
 pub(crate) fn standalone_routes(frontend: OpenAIHttpFrontend) -> Router<()> {
     let renderer = frontend.renderer.clone();
-    direct_routes(inference_routes(frontend).merge(renderer_routes(renderer)))
+    let generate_client = frontend.generate_client.clone();
+    let routes = inference_routes(frontend).merge(renderer_routes(renderer));
+    let routes = routes.merge(render::engine_health_route(generate_client));
+    with_request_body_limit(routes)
 }
 
 pub(crate) fn render_only_routes(renderer: Arc<crate::RendererService>) -> Router<()> {
-    direct_routes(renderer_routes(renderer))
+    let routes = renderer_routes(renderer).merge(render::health_route());
+    with_request_body_limit(routes)
 }
 
 pub(crate) fn hosted_routes(
