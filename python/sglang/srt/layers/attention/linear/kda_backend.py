@@ -10,6 +10,9 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
+    build_fused_accept_indices,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
@@ -33,6 +36,9 @@ elif is_cpu():
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
     get_spec,
 )
 
@@ -435,6 +441,80 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
+        # Fused-accept spec path (flashinfer recurrent_kda): the next verify
+        # seeds itself in-kernel from the accepted checkpoint slot
+        # (num_accepted_tokens), so the per-round SSM commit scatter is skipped.
+        # accept_lens_pool holds last round's accept length per mamba slot;
+        # extend stages fresh requests with 1 (read slot 0). Its presence is the
+        # signal that switches the post-verify commit to conv-only.
+        if self._can_fuse_accept_state(verify_backend):
+            self.accept_lens_pool = torch.ones(
+                self.req_to_token_pool.size + 1,
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
+
+    @staticmethod
+    def _can_fuse_accept_state(verify_backend) -> bool:
+        """Whether the verify kernel can seed itself from the accepted checkpoint.
+
+        The seed comes from recurrent_kda's ``num_accepted_tokens``, which makes
+        the previous round's accepted state addressable in-kernel so the SSM
+        state never has to round-trip through the committed pool (`temporal`).
+        Hence the keying on the verify backend -- the one that selects the
+        target_verify kernel -- and not on decode, which is set separately.
+
+        `temporal` then goes stale between verifies, which is what the remaining
+        conditions rule out: each is a reader of the committed state that the
+        skipped scatter would starve. Falling short of the contract falls back to
+        the commit scatter rather than raising -- this is a capability, not a
+        mode. Every condition reads its namespace bag rather than the record:
+        these are fields resolution decides, so the record would answer with
+        what the operator typed instead of what was decided.
+        """
+        if not verify_backend.is_flashinfer():
+            return False  # only recurrent_kda takes num_accepted_tokens
+        if get_spec().speculative_algorithm is None:
+            return False  # no verify round, and no intermediate scratch
+        if not get_memory().disable_radix_cache:
+            return False  # mamba radix tracking snapshots `temporal`
+        if get_exec().mamba.enable_linear_replayssm_spec:
+            return False  # the ring already owns the verify-round commitment
+        if get_disagg().disaggregation_mode != "null":
+            return False  # the PD hand-off transfers `temporal`
+        return True
+
+    def _fused_accept_indices(
+        self,
+        *,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        intermediate_state_cache: torch.Tensor,
+        draft_token_num: int,
+    ):
+        """Slot-indexed verify rows + accept lengths for this forward.
+
+        Every KDA layer of a forward verifies the same requests over the same
+        draft window, so the build is hoisted onto the shared forward metadata:
+        layer 0 builds, the rest reuse. Under cuda graph the capture then holds
+        a single build reading the static slot buffer, instead of one per layer.
+        """
+        metadata = self.forward_metadata
+        if metadata.fused_accept_state_indices is None:
+            batch_size = query_start_loc.shape[0] - 1
+            (
+                metadata.fused_accept_state_indices,
+                metadata.fused_accept_num_accepted,
+            ) = build_fused_accept_indices(
+                slots=cache_indices[:batch_size],
+                scratch_steps=intermediate_state_cache.shape[1],
+                draft_token_num=draft_token_num,
+                accept_lens_pool=self.accept_lens_pool,
+            )
+        return (
+            metadata.fused_accept_state_indices,
+            metadata.fused_accept_num_accepted,
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -732,6 +812,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 forward_batch, h, ssm_states, self.forward_metadata
             )
 
+        if (
+            self.accept_lens_pool is not None
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            # Fused-accept staging: the extend kernel just wrote this request's
+            # committed state; copy it into scratch slot 0 and reset the accept
+            # length to 1 so the first verify reads slot 0. Runs once per KDA
+            # layer (the nat write is idempotent; the scratch copy is per-layer).
+            slots = cache_indices.to(torch.int64)
+            intermediate_ssm = mamba_cache_params.intermediate_ssm
+            intermediate_ssm[slots, 0] = ssm_states[slots].to(intermediate_ssm.dtype)
+            self.accept_lens_pool[slots] = 1
+
         return core_attn_out
 
     def _forward_target_verify(
@@ -951,6 +1044,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=layer.lower_bound,
             **ring_kwargs,
+            **(
+                dict(
+                    zip(
+                        ("fused_accept_state_indices", "fused_accept_num_accepted"),
+                        self._fused_accept_indices(
+                            cache_indices=cache_indices,
+                            query_start_loc=query_start_loc,
+                            intermediate_state_cache=intermediate_state_cache,
+                            draft_token_num=draft_token_num,
+                        ),
+                    )
+                )
+                if self.accept_lens_pool is not None
+                else {}
+            ),
         )
         if dense_token_indices is not None:
             # Kernel output is empty-allocated and the capped qsl skips the

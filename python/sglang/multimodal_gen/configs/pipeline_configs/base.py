@@ -7,7 +7,7 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import PIL
@@ -198,6 +198,7 @@ def maybe_unpad_latents(latents, batch):
 class PipelineConfig:
     """The base configuration class for a generation pipeline."""
 
+    native_only_components: ClassVar[tuple[str, ...]] = ()
     task_type: ModelTaskType = ModelTaskType.I2I
     skip_input_image_preprocess: bool = False
     # Components that cannot fall back to a native Transformers/Diffusers

@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
+from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_order import (
     ComponentLoadSpec,
     order_component_load_specs,
@@ -73,6 +74,7 @@ class ComposedPipelineBase(ABC):
     is_video_pipeline: bool = False  # To be overridden by video pipelines
     # should contains only the modules to be loaded
     _required_config_modules: list[str] = []
+    _unfiltered_required_config_modules: tuple[str, ...] = ()
     _extra_config_module_map: dict[str, str] = {}
     server_args: ServerArgs | None = None
     modules: dict[str, Any] = {}
@@ -118,7 +120,8 @@ class ComposedPipelineBase(ABC):
         )
         if base_required_config_modules is None:
             raise NotImplementedError("Subclass must set _required_config_modules")
-        self._required_config_modules = list(base_required_config_modules)
+        self._unfiltered_required_config_modules = tuple(base_required_config_modules)
+        self._required_config_modules = list(self._unfiltered_required_config_modules)
         self._extra_config_module_map = dict(self._extra_config_module_map)
 
         # Filter modules based on disaggregation role
@@ -131,6 +134,7 @@ class ComposedPipelineBase(ABC):
                 extra_allowed_modules=self._get_extra_allowed_modules_for_role(
                     self._disagg_role, task_name
                 ),
+                structural_component_names=self._extra_config_module_map,
             )
             skipped = set(original_modules) - set(self._required_config_modules)
             if skipped:
@@ -308,11 +312,36 @@ class ComposedPipelineBase(ABC):
             get_diffusers_component_config,
         )
 
-        required = set(self.required_config_modules)
-        for module_name in full_model_index:
-            if module_name in required:
-                continue  # will be loaded normally
-            cfg_attr = self._CONFIG_ATTR_MAP.get(module_name)
+        loaded_components = set(self.required_config_modules)
+        loaded_structural_components = {
+            self._extra_config_module_map.get(name, name)
+            for name in self.required_config_modules
+        }
+        skipped_components: list[tuple[str, str]] = []
+        seen_component_keys = loaded_components | loaded_structural_components
+        for component_name in self._unfiltered_required_config_modules:
+            structural_name = self._extra_config_module_map.get(
+                component_name, component_name
+            )
+            if (
+                component_name in seen_component_keys
+                or structural_name in seen_component_keys
+                or (
+                    component_name not in full_model_index
+                    and structural_name not in full_model_index
+                )
+            ):
+                continue
+            skipped_components.append((component_name, structural_name))
+            seen_component_keys.update((component_name, structural_name))
+        for structural_name in full_model_index:
+            if structural_name not in seen_component_keys:
+                skipped_components.append((structural_name, structural_name))
+
+        for component_name, structural_name in skipped_components:
+            cfg_attr = self._CONFIG_ATTR_MAP.get(
+                _normalize_component_type(structural_name)
+            )
             if cfg_attr is None:
                 continue  # not a config we need to patch
 
@@ -322,7 +351,7 @@ class ComposedPipelineBase(ABC):
 
             try:
                 component_path = self._resolve_component_path(
-                    server_args, module_name, module_name
+                    server_args, component_name, structural_name
                 )
                 hf_config = get_diffusers_component_config(
                     component_path=component_path
@@ -336,7 +365,7 @@ class ComposedPipelineBase(ABC):
                     "Disagg role=%s: initialized %s config from HF JSON "
                     "(spatial_compression_ratio=%s)",
                     self._disagg_role.value,
-                    module_name,
+                    component_name,
                     getattr(
                         getattr(pipeline_cfg, "arch_config", None),
                         "spatial_compression_ratio",
@@ -348,7 +377,7 @@ class ComposedPipelineBase(ABC):
                     "Disagg role=%s: failed to read HF config for skipped "
                     "component %s: %s",
                     self._disagg_role.value,
-                    module_name,
+                    component_name,
                     e,
                 )
 
@@ -460,9 +489,11 @@ class ComposedPipelineBase(ABC):
         if self._disagg_role != RoleType.MONOLITHIC:
             self._init_skipped_component_configs(model_index, server_args)
 
+        declared_modules = model_index
         model_index = {
             required_module: model_index[required_module]
             for required_module in self.required_config_modules
+            if required_module in model_index
         }
 
         for module_name in self.required_config_modules:
@@ -477,15 +508,17 @@ class ComposedPipelineBase(ABC):
                     module_name,
                     extra_module_value,
                 )
-                if extra_module_value in model_index:
+                if extra_module_value in declared_modules:
                     logger.info(
                         "Using module %s for %s", extra_module_value, module_name
                     )
-                    model_index[module_name] = model_index[extra_module_value]
+                    model_index[module_name] = declared_modules[extra_module_value]
                     continue
                 else:
                     raise ValueError(
-                        f"Required module key: {module_name} value: {model_index.get(module_name)} was not found in loaded modules {model_index.keys()}"
+                        f"Required module key: {module_name} value: "
+                        f"{declared_modules.get(module_name)} was not found in "
+                        f"declared modules {declared_modules.keys()}"
                     )
 
         # all the component models used by the pipeline
@@ -581,7 +614,8 @@ class ComposedPipelineBase(ABC):
                     matched_backend_key,
                 )
             module, memory_usage = PipelineComponentLoader.load_component(
-                component_name=load_module_name,
+                component_name=module_name,
+                component_type=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
@@ -590,7 +624,7 @@ class ComposedPipelineBase(ABC):
                 component_attn_name=matched_backend_key or module_name,
             )
 
-            self.memory_usages[load_module_name] = memory_usage
+            self.memory_usages[module_name] = memory_usage
 
             if module_name in loaded_components:
                 logger.warning("Overwriting module %s", module_name)

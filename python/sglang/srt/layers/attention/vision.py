@@ -499,8 +499,7 @@ class VisionTritonAttention(nn.Module):
             seq_lens = kwargs.get("sequence_lengths")
             if seq_lens is None:
                 seq_lens = cu_seqlens_gpu[1:] - cu_seqlens_gpu[:-1]
-            else:
-                seq_lens = seq_lens.to(device=q.device, dtype=torch.int32)
+            seq_lens = seq_lens.to(device=q.device, dtype=torch.int32)
             max_seqlen = resolve_precomputed_max_seqlen(
                 cu_seqlens_gpu, kwargs.get("max_seqlen")
             )
