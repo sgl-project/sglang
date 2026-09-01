@@ -622,6 +622,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:raw_bs],
-            hidden_states=out.hidden_states[:raw_bs],
+            # CUDA graph replay reuses its captured output storage. These states
+            # survive into the next draft step, so detach them from that buffer.
+            hidden_states=out.hidden_states[:raw_bs].clone(),
         )
         return out
