@@ -150,6 +150,7 @@ def test_hybrid_wrappers_forward_in_graph_hook():
             return SimpleNamespace(
                 token_to_kv_pool=None,
                 req_to_token_pool=None,
+                kv_index_translator=None,
                 needs_cpu_seq_lens=False,
                 init_forward_metadata_in_graph=lambda fb: calls.append(name),
             )
