@@ -35,6 +35,7 @@ class _FakeReq:
         )
         self.finished_output = False
         self.finished_len = None
+        self.beam_group = None
         self.stream = False
         self.sampling_params = SimpleNamespace(
             stream_interval=None,

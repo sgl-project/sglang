@@ -12,6 +12,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import filter_dcp_local_chunk_kv_indices
 from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
@@ -106,6 +107,10 @@ class ForwardBatchDeepSeekMHAMixin:
                 self.prefix_chunk_starts_cpu[idx],
                 self.prefix_chunk_seq_lens_cpu[idx],
             )
+            # None on a backend that never bound a translator.
+            src = get_attn_backend().kv_index_translator
+            if src is not None:
+                chunk_kv_indices = src.translate_full_attn_ids(chunk_kv_indices)
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
 
         if not (pack_all_prefix_chunks or dense_metadata):
@@ -273,5 +278,9 @@ class ForwardBatchDeepSeekMHAMixin:
             kv_indices,
             req_to_token.shape[1],
         )
+        # None on a backend that never bound a translator.
+        src = get_attn_backend().kv_index_translator
+        if src is not None:
+            kv_indices = src.translate_full_attn_ids(kv_indices)
         self.mha_one_shot_kv_indices = kv_indices
         return kv_indices

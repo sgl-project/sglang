@@ -43,6 +43,7 @@ class _FakeReq:
         self.multimodal_inputs = None
         self.customized_info = None
         self.is_retracted = is_retracted
+        self.beam_group = None
 
         self.return_logprob = True
         self.input_logprob_sent = True

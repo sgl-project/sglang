@@ -53,6 +53,10 @@ class Ideogram4SamplingParams(SamplingParams):
     guidance_scale: float | None = None
     preset: str = "V4_DEFAULT_20"
 
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset({"preset"})
+
     def __post_init__(self) -> None:
         if self.preset not in IDEOGRAM4_PRESETS:
             raise ValueError(
