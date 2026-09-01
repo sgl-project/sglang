@@ -3519,7 +3519,11 @@ class UnifiedRadixCacheSuite:
     # Buffer-only host memory mode (host = transient staging, L3 = cache)
     # ================================================================
 
-    def test_buffer_only_rejects_mamba(self):
+    def test_buffer_only_accepts_mamba(self):
+        """MAMBA is in the supported component set, and the assembled stack
+        clears the buffer-only fences: a host state pool with room for one
+        staging slot plus one in the loads reserve, and no int8 checkpoint
+        pool (a load-back restores a raw state slot, not a checkpoint slot)."""
         if (
             self.cfg.components
             != (
@@ -3533,14 +3537,11 @@ class UnifiedRadixCacheSuite:
         cache, _, _ = build_fixture(self.cfg)
         storage_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
-        with self.assertRaisesRegex(ValueError, "supports only FULL/SWA"):
-            self._init_hicache(
-                cache,
-                storage_backend="file",
-                storage_dir=storage_dir,
-                prefetch_threshold=1,
-                host_memory_mode="buffer_only",
-            )
+        self._init_buffer_hicache(cache, storage_dir)
+        mamba = cache.components[ComponentType.MAMBA]
+        self.assertIsNotNone(mamba._mamba_pool_host)
+        self.assertGreaterEqual(mamba._mamba_pool_host.size, 2)
+        self.assertIsNone(mamba.int8_ckpt_pool)
 
     def _init_buffer_hicache(
         self,
