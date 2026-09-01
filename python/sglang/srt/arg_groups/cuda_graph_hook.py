@@ -115,6 +115,24 @@ def apply_cuda_graph_compatibility(server_args: Any):
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
         return
 
+    # PP prefill graph replay is opt-in. It is most useful for small
+    # aggregate forwards, while enabling it implicitly would also capture
+    # large buckets that can be slower than eager. An explicit backend
+    # selection bypasses this default policy.
+    if cfg.pp_size > 1 and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
+        logger.info(
+            "Disabling breakable prefill CUDA graph by default for pipeline "
+            "parallelism. Set --cuda-graph-backend-prefill=breakable to opt in."
+        )
+        declare_resolution(
+            server_args,
+            "_apply_cuda_graph_compatibility",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
+        return
+
     # Breakable is the CUDA default but not multimodal-compatible;
     # piecewise-allowlisted archs run their validated decoder prefill
     # there instead. Archs also on the breakable allowlist keep it --

@@ -65,6 +65,7 @@ from typing import (
     Callable,
     Dict,
     Generic,
+    Iterator,
     List,
     NamedTuple,
     Optional,
@@ -1052,6 +1053,18 @@ def is_gfx942_supported():
         return False
 
 
+@lru_cache(maxsize=1)
+def is_gfx1250_supported():
+    """
+    Returns whether the current platform is AMD RDNA4 (gfx1250).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx1250"])
+    else:
+        return False
+
+
 def get_hip_version():
     if torch.version.hip:
         return tuple(map(int, torch.version.hip.split("-")[0].split(".")))
@@ -1159,29 +1172,13 @@ def get_device_sm_nvidia_smi():
 
 
 @contextmanager
-def maybe_reindex_device_id(gpu_id: int):
-
-    if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() is False or not is_cuda_alike():
+def maybe_reindex_device_id(gpu_id: int) -> Iterator[int]:
+    if not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get():
         yield gpu_id
         return
 
-    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if original_cuda_visible_devices:
-        cuda_visible_devices = original_cuda_visible_devices.split(",")
-    else:
-        cuda_visible_devices = []
-
-    str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
-    os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
-
-    logger.debug(f"Set CUDA_VISIBLE_DEVICES to {str_gpu_id}")
-
-    yield 0
-
-    if original_cuda_visible_devices:
-        os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
-    else:
-        del os.environ["CUDA_VISIBLE_DEVICES"]
+    with current_platform.reindex_device_id(gpu_id) as reindexed_device_id:
+        yield reindexed_device_id
 
 
 cached_device_index = -1
@@ -1857,7 +1854,20 @@ def _load_image(
                     "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
                     e,
                 )
-    return Image.open(BytesIO(image_bytes))
+    try:
+        image = Image.open(BytesIO(image_bytes))
+    except OSError as e:
+        raise ValueError(f"Could not decode image: {e}") from e
+    return _fully_load_pil_image(image)
+
+
+def _fully_load_pil_image(image: Image.Image) -> Image.Image:
+    """Force PIL's lazy decode while malformed input is still request-local."""
+    try:
+        image.load()
+    except OSError as e:
+        raise ValueError(f"Could not decode image: {e}") from e
+    return image
 
 
 def load_image(
@@ -1874,7 +1884,7 @@ def load_image(
     image = None
     image_size: Optional[tuple[int, int]] = None
     if isinstance(image_file, Image.Image):
-        image = image_file
+        image = _fully_load_pil_image(image_file)
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
         image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
@@ -2144,7 +2154,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.17")
+        min_version: Minimum version required (e.g., "0.6.18")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise

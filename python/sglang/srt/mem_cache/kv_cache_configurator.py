@@ -230,6 +230,7 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     c128_state_pool_size: int
     c4_state_dtype: Optional[torch.dtype]
     c128_state_dtype: Optional[torch.dtype]
+    unified_total_bytes: Optional[int] = None
 
 
 @dataclass(slots=True, kw_only=True)
@@ -390,6 +391,7 @@ class KVCacheConfigurator:
             c128_state_pool_size=c128_state_pool_size,
             c4_state_dtype=c4_state_dtype,
             c128_state_dtype=c128_state_dtype,
+            unified_total_bytes=config.unified_total_bytes,
         )
 
     def _init_pools(
@@ -407,7 +409,30 @@ class KVCacheConfigurator:
         # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
         if get_memory().enable_unified_memory and req_to_token_pool is None:
             pd_enabled = get_disagg().disaggregation_mode != "null"
-            if self.mambaish_config is not None:
+            is_dsv4 = is_deepseek_v4(self.model_config.hf_config)
+            # Order matters: an Inkling-class model is BOTH mambaish and
+            # hybrid-SWA, and the mamba pair would store every SWA layer's KV at
+            # FULL lifetime -- its branch reads the HF config's
+            # full_attention_layer_ids, which for Inkling is ALL layers.
+            if self.mambaish_config is not None and self.is_hybrid_swa and not is_dsv4:
+                if pd_enabled:
+                    # Same limitation as the 2-pool SWA branch below: the
+                    # tri-pool carries an SWA sub-pool, and there is no
+                    # whole-envelope transfer scheme for it.
+                    raise ValueError(
+                        "--enable-unified-memory with PD disaggregation does "
+                        "not support hybrid-SWA models yet (no whole-envelope "
+                        "transfer scheme for the SWA sub-pool); this model "
+                        "routes to the mamba+SWA tri-pool, which has one. Drop "
+                        "--enable-unified-memory or run without PD."
+                    )
+                bundle = self._init_unified_mamba_swa_pools(
+                    max_num_reqs=sizes.max_running_requests,
+                    full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                    swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                    unified_total_bytes=sizes.unified_total_bytes,
+                )
+            elif self.mambaish_config is not None:
                 if pd_enabled and not self.use_mla_backend:
                     raise ValueError(
                         "--enable-unified-memory with PD disaggregation "
@@ -419,8 +444,9 @@ class KVCacheConfigurator:
                 bundle = self._init_unified_mamba_pools(
                     max_num_reqs=sizes.max_running_requests,
                     max_total_num_tokens=sizes.max_total_num_tokens,
+                    unified_total_bytes=sizes.unified_total_bytes,
                 )
-            elif self.is_hybrid_swa and not is_deepseek_v4(self.model_config.hf_config):
+            elif self.is_hybrid_swa and not is_dsv4:
                 if pd_enabled:
                     raise ValueError(
                         "--enable-unified-memory with PD disaggregation does "
@@ -432,6 +458,7 @@ class KVCacheConfigurator:
                     max_num_reqs=sizes.max_running_requests,
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                    unified_total_bytes=sizes.unified_total_bytes,
                 )
             else:
                 # Fail loud, not silently fall through to the normal pools (which would
@@ -568,7 +595,11 @@ class KVCacheConfigurator:
         )
 
     def _init_unified_mamba_pools(
-        self, *, max_num_reqs: int, max_total_num_tokens: int
+        self,
+        *,
+        max_num_reqs: int,
+        max_total_num_tokens: int,
+        unified_total_bytes: Optional[int] = None,
     ) -> UnifiedPoolBundle:
         """Build the shared-KV-pool stack for a hybrid-Mamba model:
         one byte buffer split between the full-attn MHA KV pool and the
@@ -640,8 +671,124 @@ class KVCacheConfigurator:
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, env-var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
+            # Draft workers keep the token-count byte sum (spec is asserted
+            # off under unified; belt only).
+            unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
         )
         return bundle
+
+    def _init_unified_mamba_swa_pools(
+        self,
+        *,
+        max_num_reqs: int,
+        full_max_total_num_tokens: Optional[int],
+        swa_max_total_num_tokens: Optional[int],
+        unified_total_bytes: Optional[int] = None,
+    ) -> UnifiedPoolBundle:
+        """TRI-pool stack for models that are BOTH mambaish and hybrid-SWA
+        (Inkling-class): full KV + SWA KV + mamba/conv state in one buffer,
+        chain [mamba(up) | swa(float) | full(down)]."""
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            init_unified_mamba_swa_pools,
+        )
+
+        config = self.mambaish_config
+        assert config is not None and self.is_hybrid_swa
+        assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
+        assert (
+            not self.use_mla_backend
+        ), "unified tri-pool does not support an MLA full side yet"
+        # Mirror the non-shared path's extra_max_context_len computation.
+        extra_max_context_len = 4
+        if get_spec().speculative_num_draft_tokens is not None:
+            extra_max_context_len += get_spec().speculative_num_draft_tokens
+
+        head_num = self.model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        head_dim = self.model_config.head_dim
+        if self.is_hybrid_swa_compress:
+            # Asymmetric full/SWA head geometry (Inkling): SWA dims from the
+            # hf text config, same as the 2-pool SWA wrapper.
+            v_head_dim = self.model_config.hf_text_config.v_head_dim
+            swa_head_num = max(
+                1,
+                self.model_config.hf_text_config.swa_num_key_value_heads
+                // get_parallel().attn_tp_size,
+            )
+            swa_head_dim = self.model_config.hf_text_config.swa_head_dim
+            swa_v_head_dim = self.model_config.hf_text_config.swa_v_head_dim
+        else:
+            v_head_dim = head_dim
+            swa_head_num = head_num
+            swa_head_dim = head_dim
+            swa_v_head_dim = head_dim
+
+        # From the sglang ModelConfig WRAPPER, never the HF config's
+        # full_attention_layer_ids: that property feeds the conv/attention
+        # pairing, not the KV-lifetime split, and returns ALL layers.
+        swa_attention_layer_ids = [
+            i
+            for i in self.model_config.swa_attention_layer_ids
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
+        full_attention_layer_ids = [
+            i
+            for i in self.model_config.full_attention_layer_ids
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
+        n_local_layers = self.layer_info.end_layer - self.layer_info.start_layer
+        assert (
+            len(full_attention_layer_ids) + len(swa_attention_layer_ids)
+            == n_local_layers
+        ), (
+            "tri-pool KV split must cover every local attention layer exactly "
+            f"once: full={len(full_attention_layer_ids)} + "
+            f"swa={len(swa_attention_layer_ids)} != {n_local_layers} layers in "
+            f"[{self.layer_info.start_layer}, {self.layer_info.end_layer}) — "
+            "the ModelConfig full/swa split is wrong for this architecture"
+        )
+        mamba_layer_ids = [
+            i
+            for i in config.mamba2_cache_params.layers
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
+
+        return init_unified_mamba_swa_pools(
+            device=self.device,
+            kv_cache_dtype=self.kv_cache_dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            swa_head_num=swa_head_num,
+            swa_head_dim=swa_head_dim,
+            swa_v_head_dim=swa_v_head_dim,
+            page_size=self.page_size,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            mamba_layer_ids=mamba_layer_ids,
+            mamba2_cache_params=config.mamba2_cache_params,
+            full_max_total_num_tokens=full_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
+            max_mamba_cache_size=get_schedule().max_mamba_cache_size,
+            model_context_len=self.model_config.context_len,
+            extra_max_context_len=extra_max_context_len,
+            max_num_reqs=max_num_reqs,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+            disable_overlap_schedule=get_schedule().disable_overlap_schedule,
+            need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
+            speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
+            forward_stream=self.forward_stream,
+            lazy_compaction=_should_enable_lazy_compaction(),
+            # Draft workers keep the token-count byte sum (spec is asserted
+            # off under unified; belt only).
+            unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
+            # bs=1 feasibility floor input (context len is already passed).
+            sliding_window_size=self.model_config.sliding_window_size,
+        )
 
     def _init_unified_swa_pools(
         self,
@@ -649,6 +796,7 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         full_max_total_num_tokens: Optional[int],
         swa_max_total_num_tokens: Optional[int],
+        unified_total_bytes: Optional[int] = None,
     ) -> UnifiedPoolBundle:
         """Build the unified-pool stack for a hybrid-SWA model (Triton): one byte
         buffer split between the full-attention and SWA KV pools."""
@@ -731,6 +879,14 @@ class KVCacheConfigurator:
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
+            # Draft workers keep the token-count byte sum (spec is asserted
+            # off under unified; belt only).
+            unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
+            # bs=1 feasibility floor inputs. `model_context_len` bounds the
+            # sliding window term only -- the full-attention side is not
+            # charged, see `_check_bs1_feasibility_floor`.
+            model_context_len=self.model_config.context_len,
+            sliding_window_size=self.model_config.sliding_window_size,
         )
         return UnifiedPoolBundle(
             unified_memory_pool=bundle.unified_memory_pool,
@@ -2034,10 +2190,18 @@ class KVCacheConfigurator:
         config = configurator.calculate_pool_sizes(
             budget_bytes, get_schedule().page_size
         )
+        if get_memory().enable_unified_memory:
+            # Floor-align to 4096 B: the factories `.view()` the whole uint8
+            # buffer as the KV/state dtype, so the total must be a dtype-size
+            # multiple and a profiled budget is not. Flooring never overcommits.
+            config.unified_total_bytes = budget_bytes - (budget_bytes % 4096)
         max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
         if cap_tokens is not None:
             max_tokens = min(max_tokens, cap_tokens)
         if max_tokens != config.max_total_num_tokens:
+            # Token-capped re-derivation: the profiled budget no longer
+            # applies; the recalced config's unified_total_bytes stays None
+            # and the factories fall back to the token-count byte sum.
             config = configurator.calculate_pool_sizes_from_max_tokens(
                 max_tokens, get_schedule().page_size
             )
