@@ -101,6 +101,7 @@ from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
+from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -138,6 +139,12 @@ from sglang.srt.utils.network import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
+from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
+from sglang.srt.weight_cache.protocol import (
+    cleanup_stale_daemon_files,
+    compute_local_gpu_id,
+    get_ready_path,
+)
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -715,19 +722,18 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
         # Validate and clean up stale .ready/.sock files from prior runs.
-        # If a daemon is still alive at this rank, raise instead of clobbering.
-        from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
-        from sglang.srt.weight_cache.protocol import (
-            cleanup_stale_daemon_files,
-            compute_global_rank,
-            compute_local_gpu_id,
-            get_ready_path,
-        )
-
+        # If a daemon is still alive at this GPU, raise instead of clobbering.
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
-                global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-                cleanup_stale_daemon_files(global_rank)
+                gpu_id = compute_local_gpu_id(
+                    pp_rank,
+                    tp_rank,
+                    pp_size_per_node,
+                    tp_size_per_node,
+                    base_gpu_id=server_args.base_gpu_id,
+                    gpu_id_step=server_args.gpu_id_step,
+                )
+                cleanup_stale_daemon_files(current_platform.get_device_uuid(gpu_id))
 
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
@@ -759,8 +765,17 @@ class Engine(EngineScoreMixin, EngineBase):
         try:
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
-                    global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-                    ready_path = get_ready_path(global_rank)
+                    gpu_id = compute_local_gpu_id(
+                        pp_rank,
+                        tp_rank,
+                        pp_size_per_node,
+                        tp_size_per_node,
+                        base_gpu_id=server_args.base_gpu_id,
+                        gpu_id_step=server_args.gpu_id_step,
+                    )
+                    ready_path = get_ready_path(
+                        current_platform.get_device_uuid(gpu_id)
+                    )
                     while not os.path.exists(ready_path):
                         time.sleep(check_interval)
                         if time.time() - start_time > timeout:

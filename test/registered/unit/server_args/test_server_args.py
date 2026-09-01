@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.attention_hook import (
     handle_deterministic_inference,
 )
 from sglang.srt.arg_groups.cuda_graph_hook import (
+    apply_cuda_graph_compatibility,
     disable_tc_piecewise_cudagraph_if_incompatible,
     handle_cuda_graph_config,
 )
@@ -31,6 +32,7 @@ from sglang.srt.arg_groups.kv_cache_hook import (
     validate_prefill_only_disable_kv_cache_args,
 )
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
+from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
@@ -39,6 +41,7 @@ from sglang.srt.arg_groups.moe_hook import (
 )
 from sglang.srt.arg_groups.overrides import (
     cutedsl_moe_max_num_tokens,
+    max_speculative_num_draft_tokens,
     resolution_result,
 )
 from sglang.srt.arg_groups.parallel_hook import (
@@ -58,7 +61,9 @@ from sglang.srt.arg_groups.serving_hook import (
     ssl_verify_of,
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-from sglang.srt.arg_groups.validation_hook import check_two_batch_overlap
+from sglang.srt.arg_groups.validation_hook import (
+    check_two_batch_overlap,
+)
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
     Sidecar,
@@ -110,7 +115,7 @@ class TestPrepareServerArgs(CustomTestCase):
         # daemon to build the same static EPLB layout as the engine.
         handle_load_format(args)
 
-    def test_enable_w4a4_mxfp4_megamoe_sets_deepgemm_env(self):
+    def test_enable_w4a4_mxfp4_megamoe_preserves_legacy_deepgemm_env(self):
         deepgemm_env = {
             "DG_USE_FP4_ACTS": "0",
             "DG_USE_MXF4_KIND": "0",
@@ -129,8 +134,8 @@ class TestPrepareServerArgs(CustomTestCase):
             args.resolve_once()
 
             self.assertTrue(resolution_result(args, "enable_w4a4_mxfp4_megamoe"))
-            self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "1")
-            self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "1")
+            self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
+            self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "0")
 
     def test_w4a4_mxfp4_megamoe_disabled_preserves_deepgemm_env(self):
         deepgemm_env = {
@@ -785,6 +790,19 @@ class TestLoadBalanceMethod(unittest.TestCase):
             resolution_result(server_args, "disaggregation_transfer_backend"),
             "mooncake",
         )
+
+    def test_pd_decode_hicache_allows_rust_tree_core(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            enable_hierarchical_cache=True,
+        )
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
+            handle_pd_disaggregation(server_args)
+
+        self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
 
 
 class TestSkipTokenizerInit(unittest.TestCase):
@@ -1472,6 +1490,16 @@ class TestHiCacheArgs(unittest.TestCase):
                 expected_decode_backend,
             )
 
+    def test_buffer_only_accepts_both_tree_cores(self):
+        for backend in ("python", "rust"):
+            args = self._make_args(
+                enable_hierarchical_cache=True,
+                hicache_host_memory_mode="buffer_only",
+                hicache_storage_backend="file",
+            )
+            with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
+                handle_hicache(args)
+
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [
             {
@@ -1679,6 +1707,7 @@ class TestAdaptiveSpecArgs(CustomTestCase):
             )
 
             handle_speculative_decoding(args)
+            self.assertEqual(max_speculative_num_draft_tokens(args), 6)
 
         self.assertTrue(resolution_result(args, "speculative_adaptive"))
         self.assertEqual(resolution_result(args, "speculative_eagle_topk"), 1)
@@ -1850,6 +1879,58 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
 
         self.assertEqual(config.get_capture_sizes(), [32, 64])
         self.assertEqual(config.compiler, "eager")
+
+
+class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
+    def test_pp_prefill_graph_is_opt_in(self):
+        cases = (
+            (set(), Backend.DISABLED),
+            ({(Phase.PREFILL, "backend")}, Backend.BREAKABLE),
+        )
+        for locked, expected in cases:
+            with self.subTest(locked=locked):
+                args = ServerArgs(
+                    model_path="dummy",
+                    pp_size=4,
+                    cuda_graph_config=CudaGraphConfig(
+                        prefill=PhaseConfig(backend=Backend.BREAKABLE)
+                    ),
+                )
+                args._cuda_graph_config_locked = locked
+                apply_cuda_graph_compatibility(args)
+                self.assertEqual(
+                    resolution_result(args, "cuda_graph_config").prefill.backend,
+                    expected,
+                )
+
+    def test_pp_prefill_capture_limit_policy(self):
+        cases = (
+            (4096, None, 4096),
+            (32768, None, 8192),
+            (32768, 16384, 16384),
+        )
+        for chunked_prefill_size, max_bs, expected in cases:
+            with self.subTest(chunked_prefill_size=chunked_prefill_size, max_bs=max_bs):
+                args = ServerArgs(
+                    model_path="dummy",
+                    pp_size=4,
+                    chunked_prefill_size=chunked_prefill_size,
+                    mem_fraction_static=0.8,
+                    cuda_graph_config=CudaGraphConfig(
+                        decode=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
+                        prefill=PhaseConfig(backend=Backend.BREAKABLE, max_bs=max_bs),
+                    ),
+                )
+                args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")} | (
+                    {(Phase.PREFILL, "max_bs")} if max_bs is not None else set()
+                )
+                with patch(
+                    "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                    return_value=False,
+                ):
+                    handle_gpu_memory_settings(args, gpu_mem=None)
+                prefill = resolution_result(args, "cuda_graph_config").prefill
+                self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 
 
 class TestCudaGraphDisaggregationRoles(CustomTestCase):

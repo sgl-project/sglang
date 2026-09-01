@@ -28,6 +28,7 @@ from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
     pack_aux_hidden_states,
@@ -438,6 +439,15 @@ class LogitsProcessor(nn.Module):
         # DLLM / common dispatch so all three LM-head paths are skipped.
         if _autotune_run_lm_head is False:
             return LogitsProcessorOutput(next_token_logits=None)
+
+        # Under LayerNorm SP the decoder loop leaves these sequence-sharded; undo
+        # that before the LM head, which must not participate.
+        hidden_states, hidden_states_before_norm = layernorm_sp.maybe_exit_gather(
+            hidden_states=hidden_states,
+            hidden_states_before_norm=hidden_states_before_norm,
+            input_ids=input_ids,
+            forward_mode=logits_metadata.forward_mode,
+        )
 
         # Multi-item scoring only for prefill-only requests with pre-computed indices.
         if multi_item_delimiter_indices is not None and logits_metadata.is_prefill_only:
@@ -1186,6 +1196,16 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
     # carrying the draft model's stale ModelOpt quant_method. Only use the
     # ModelOpt lm_head kernel when the runtime quantization state matches it.
     if method_name == "ModelOptFp4LinearMethod":
+        if quant_method.quant_mode == "w4a16":
+            return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
+                lm_head,
+                (
+                    "weight_scale_interleaved",
+                    "alpha",
+                    "input_size_per_partition",
+                    "output_size_per_partition",
+                ),
+            )
         if lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
             lm_head,
             (
