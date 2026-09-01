@@ -87,6 +87,7 @@ def estimate_swa_kv_tokens(
     page_size: int,
     allocation_limit: Optional[int] = None,
     host_hit_length: int = 0,
+    include_allocated_tail: bool = True,
 ) -> int:
     """Peak SWA reservation for one prefill/decode request."""
     if sliding_window_size is None or sliding_window_size <= 0:
@@ -97,8 +98,11 @@ def estimate_swa_kv_tokens(
             if allocation_limit is None
             else min(extend_input_len, allocation_limit)
         )
+        allocated_tail = (
+            max(allocated - sliding_window_size, 0) if include_allocated_tail else 0
+        )
         reserved = (
-            max(allocated - sliding_window_size, 0)
+            allocated_tail
             + min(extend_input_len + max_new_tokens, sliding_window_size)
             + page_size
         )
@@ -767,8 +771,8 @@ class PrefillAdder:
             max_new_tokens,
             sliding_window_size=self.tree_cache.sliding_window_size,
             page_size=self.page_size,
-            allocation_limit=0,
             host_hit_length=swa_host_hit_length,
+            include_allocated_tail=False,
         )
 
     def _swa_new_tokens(self, req: Req) -> int:

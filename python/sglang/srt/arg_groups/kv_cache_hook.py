@@ -198,14 +198,11 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_unified_memory:
         return
-    assert cfg.pp_size == 1, (
-        "--enable-unified-memory does not support pipeline parallelism "
-        "(--pp-size > 1)."
-    )
-    assert (
-        not cfg.enable_mixed_chunk
-    ), "--enable-unified-memory does not support --enable-mixed-chunk."
     if cfg.disaggregation_mode != "null":
+        assert cfg.pp_size == 1, (
+            "--enable-unified-memory with PD disaggregation does not support "
+            "pipeline parallelism (--pp-size > 1)."
+        )
         # Constraints of the whole-envelope transfer; see
         # UnifiedMLATokenToKVPool.get_contiguous_buf_infos.
         assert cfg.disaggregation_transfer_backend == "mooncake", (
