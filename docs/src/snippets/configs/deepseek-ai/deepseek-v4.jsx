@@ -50,11 +50,13 @@ export const config = {
     "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|nvfp4": "nvidia/DeepSeek-V4-Flash-NVFP4",
     "flash-official|fp4": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "flash-official|nvfp4": "nvidia/DeepSeek-V4-Flash-0731-NVFP4",
     "flash-vision|fp4": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
     "pro|fp4":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|fp8":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|nvfp4": "nvidia/DeepSeek-V4-Pro-NVFP4",
     "pro-official|fp4": "deepseek-ai/DeepSeek-V4-Pro-0813",
+    "pro-official|nvfp4": "nvidia/DeepSeek-V4-Pro-0813-NVFP4",
     // H200 FP8 needs the sgl-project repackaging (Hopper can't run FP4-mixed Instruct).
     "h200|flash|fp8": "sgl-project/DeepSeek-V4-Flash-FP8",
     "h200|pro|fp8":   "sgl-project/DeepSeek-V4-Pro-FP8",
@@ -850,6 +852,45 @@ sgl-eval run mmmu_pro \\
       ],
     },
     // ====================================================================
+    // B200 + NVFP4 — Official (0731 / 0813)
+    // Mirrors the Flash/Pro NVFP4 cells; the official checkpoints bundle a
+    // DSpark draft head, so low-latency uses `--speculative-algorithm DSPARK`
+    // instead of the EAGLE shape flags. NOT yet run end-to-end on this hardware.
+    // ====================================================================
+    {
+      match: { hw: "b200", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
     // B300 + NVFP4
     // ====================================================================
     {
@@ -884,6 +925,46 @@ sgl-eval run mmmu_pro \\
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
+        "--chunked-prefill-size 8192",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // B300 + NVFP4 — Official (0731 / 0813)
+    // Mirrors the Flash/Pro NVFP4 cells; the official checkpoints bundle a
+    // DSpark draft head, so low-latency uses `--speculative-algorithm DSPARK`
+    // instead of the EAGLE shape flags. NOT yet run end-to-end on this hardware.
+    // ====================================================================
+    {
+      match: { hw: "b300", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
         "--chunked-prefill-size 8192",
         "--disable-flashinfer-autotune",
         "--swa-full-tokens-ratio 0.1",
@@ -1110,6 +1191,46 @@ sgl-eval run mmmu_pro \\
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
+        "--chunked-prefill-size 8192",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // GB200 + NVFP4 — Official (0731 / 0813)
+    // Mirrors the Flash/Pro NVFP4 cells; the official checkpoints bundle a
+    // DSpark draft head, so low-latency uses `--speculative-algorithm DSPARK`
+    // instead of the EAGLE shape flags. NOT yet run end-to-end on this hardware.
+    // ====================================================================
+    {
+      match: { hw: "gb200", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb200", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
         "--chunked-prefill-size 8192",
         "--disable-flashinfer-autotune",
         "--swa-full-tokens-ratio 0.1",
@@ -1722,7 +1843,7 @@ sgl-eval run mmmu_pro \\
     },
 
     // ====================================================================
-    // GB200 + NVFP4
+    // GB300 + NVFP4
     // ====================================================================
     {
       match: { hw: "gb300", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
@@ -1756,6 +1877,46 @@ sgl-eval run mmmu_pro \\
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
+        "--chunked-prefill-size 8192",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // GB300 + NVFP4 — Official (0731 / 0813)
+    // Mirrors the Flash/Pro NVFP4 cells; the official checkpoints bundle a
+    // DSpark draft head, so low-latency uses `--speculative-algorithm DSPARK`
+    // instead of the EAGLE shape flags. NOT yet run end-to-end on this hardware.
+    // ====================================================================
+    {
+      match: { hw: "gb300", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
         "--chunked-prefill-size 8192",
         "--disable-flashinfer-autotune",
         "--swa-full-tokens-ratio 0.1",
