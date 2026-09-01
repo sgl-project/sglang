@@ -99,6 +99,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
+    _clone_if_runai_streamed_tensor,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
@@ -1796,7 +1797,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     if fuse_qkv_a_proj and (
                         "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                     ):
-                        cached_a_proj[name] = loaded_weight
+                        cached_a_proj[name] = _clone_if_runai_streamed_tensor(
+                            loaded_weight
+                        )
                         q_a_proj_name = (
                             name
                             if "q_a_proj" in name
