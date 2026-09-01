@@ -58,12 +58,31 @@ def is_sm90_fp4_mega_moe_available(experts) -> bool:
         import deep_gemm
     except ImportError:
         return False
+    mega = getattr(deep_gemm, "mega", None)
     return (
         callable(getattr(deep_gemm, "fp8_fp4_mega_moe", None))
         and callable(getattr(deep_gemm, "mega_moe_pre_dispatch_sm90", None))
-        and callable(getattr(deep_gemm, "get_symm_buffer_for_mega_moe", None))
+        and callable(getattr(mega, "get_symm_buffer_for_mega_moe", None))
         and getattr(experts, "_mega_moe_sm90_fp4_weights", False)
     )
+
+
+def _resolve_sm90_fp4_symm_buffer_constructor(deep_gemm) -> Callable:
+    """Return the ring-buffer constructor required by fp8_fp4_mega_moe.
+
+    Some DeepGEMM builds expose a legacy SM90 constructor at the package root
+    while their FP8xFP4 wrapper consumes the newer ``mega.SymmBuffer`` ABI,
+    including ``num_ring_tokens``.  Selecting the constructor from the same
+    module as that wrapper keeps the buffer layout and call ABI paired.
+    """
+    mega = getattr(deep_gemm, "mega", None)
+    constructor = getattr(mega, "get_symm_buffer_for_mega_moe", None)
+    if not callable(constructor):
+        raise RuntimeError(
+            "DeepGEMM fp8_fp4_mega_moe requires the ring-buffer constructor "
+            "deep_gemm.mega.get_symm_buffer_for_mega_moe"
+        )
+    return constructor
 
 
 def run_sm90_mega_routed(

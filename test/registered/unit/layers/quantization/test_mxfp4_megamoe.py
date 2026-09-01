@@ -43,8 +43,13 @@ except (ImportError, RuntimeError):
 
 import torch
 
+from sglang.srt.layers.moe.mega_moe import (
+    _MEGA_MOE_SYMM_BUFFER,
+    _get_mega_moe_symm_buffer,
+)
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.mega_moe_sm90 import (
+    _resolve_sm90_fp4_symm_buffer_constructor,
     _resolve_sm90_fp4_weight_transform,
     _transform_weights_for_mega_moe_sm90_fp4_compat,
     build_sm90_fp4_mega_moe_experts_weights,
@@ -559,8 +564,62 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
             ),
         ):
             self.assertFalse(is_sm90_fp4_mega_moe_available(experts))
-            deep_gemm.get_symm_buffer_for_mega_moe = mock.Mock()
+            deep_gemm.mega = SimpleNamespace(
+                get_symm_buffer_for_mega_moe=mock.Mock()
+            )
             self.assertTrue(is_sm90_fp4_mega_moe_available(experts))
+
+    def test_fp4_buffer_constructor_uses_ring_buffer_abi(self):
+        legacy_constructor = mock.Mock()
+        ring_constructor = mock.Mock()
+        deep_gemm = SimpleNamespace(
+            get_symm_buffer_for_mega_moe=legacy_constructor,
+            mega=SimpleNamespace(
+                get_symm_buffer_for_mega_moe=ring_constructor,
+            ),
+        )
+
+        self.assertIs(
+            _resolve_sm90_fp4_symm_buffer_constructor(deep_gemm), ring_constructor
+        )
+        legacy_constructor.assert_not_called()
+
+    def test_fp4_buffer_constructor_rejects_legacy_only_abi(self):
+        deep_gemm = SimpleNamespace(get_symm_buffer_for_mega_moe=mock.Mock())
+        with self.assertRaisesRegex(RuntimeError, "num_ring_tokens|ring-buffer"):
+            _resolve_sm90_fp4_symm_buffer_constructor(deep_gemm)
+
+    def test_fp4_buffer_factory_calls_ring_buffer_abi(self):
+        legacy_constructor = mock.Mock()
+        ring_buffer = SimpleNamespace(num_ring_tokens=256)
+        ring_constructor = mock.Mock(return_value=ring_buffer)
+        deep_gemm = SimpleNamespace(
+            get_symm_buffer_for_mega_moe=legacy_constructor,
+            mega=SimpleNamespace(
+                get_symm_buffer_for_mega_moe=ring_constructor,
+            ),
+        )
+        group = object()
+
+        with mock.patch.dict("sys.modules", {"deep_gemm": deep_gemm}):
+            result = _get_mega_moe_symm_buffer(
+                group, 256, 8192, 8, 6144, 2048,
+                use_sm90_fp4_ring_buffer=True,
+            )
+
+        self.assertIs(result, ring_buffer)
+        ring_constructor.assert_called_once_with(
+            group,
+            256,
+            8192,
+            8,
+            6144,
+            2048,
+            activation="swiglu",
+            mma_type="fp8xfp4",
+        )
+        legacy_constructor.assert_not_called()
+        _MEGA_MOE_SYMM_BUFFER.clear()
 
     def test_native_transform_output_contract_is_checked(self):
         experts = self._experts()
