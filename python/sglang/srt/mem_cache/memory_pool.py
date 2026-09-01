@@ -4104,6 +4104,18 @@ class MLATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    # Does the WRITE loc reaching this pool already have the DCP owner rule
+    # resolved? False here: `set_mla_kv_buffer` takes a WIDENED loc and its
+    # kernel collapses it. The unified pool resolves it in Python instead
+    # (KVIndexTranslator.rebind_write_loc), so it flips this rather than
+    # re-implementing the write doors -- one method body, no drift.
+    write_loc_is_dcp_resolved = False
+
+    @property
+    def _write_loc_dcp_span(self) -> int:
+        """How many logical ids one stored row spans in the write-loc space."""
+        return 1 if self.write_loc_is_dcp_resolved else get_parallel().attn_dcp_size
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -4121,14 +4133,15 @@ class MLATokenToKVPool(KVCache):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         assert not self.dsa_kv_cache_store_fp8
-        # This door has no DCP-aware write path, and cannot be given one: the
+        # With an unresolved write loc this door cannot be made DCP-aware: the
         # two backends that could reach it disagree on the loc space --
         # flashinfer-MLA's `k_rope is None` branch passes a WIDENED loc (needs
         # select + collapse), the Triton backend passes one it already
         # collapsed. `set_mla_kv_buffer` is the DCP-aware door, and every MLA
         # write takes it today; the masked-but-undivided branch that used to sit
-        # here wrote widened ids straight into a rank-local buffer.
-        assert not get_parallel().dcp_enabled, (
+        # here wrote widened ids straight into a rank-local buffer. A pool that
+        # resolved the loc before the call (the unified one) is unaffected.
+        assert self.write_loc_is_dcp_resolved or not get_parallel().dcp_enabled, (
             "MLATokenToKVPool.set_kv_buffer has no DCP-aware write path. Under "
             "--dcp-size > 1 the MLA write must go through set_mla_kv_buffer, "
             "whose kernel resolves the owner rule; reaching the combined-row "
@@ -4209,11 +4222,12 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
         layer_id_override: Optional[int] = None,
     ):
-        # loc is widened under DCP; the kernel divides by the world size itself.
+        # Unless the pool declares otherwise, loc is widened under DCP and the
+        # kernel divides by the world size itself.
         maybe_detect_oob(
             loc,
             0,
-            (self.size + self.page_size) * get_parallel().attn_dcp_size,
+            (self.size + self.page_size) * self._write_loc_dcp_span,
             "set_mla_kv_buffer (MLA)",
         )
         maybe_detect_kernel_facing_loc(
@@ -4227,6 +4241,7 @@ class MLATokenToKVPool(KVCache):
             loc,
             cache_k_nope,
             cache_k_rope,
+            dcp_resolved=self.write_loc_is_dcp_resolved,
         )
 
     def get_mla_kv_buffer(
