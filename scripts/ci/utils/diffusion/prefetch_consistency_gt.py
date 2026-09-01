@@ -22,6 +22,13 @@ from pathlib import Path
 DEFAULT_CACHE_ROOT = "~/.cache/sglang/consistency-gt"
 DEFAULT_KEEP_DAYS = 14.0
 
+# Three attempts with a flat pause.
+RETRY_ATTEMPTS = 3
+RETRY_SLEEP_SECONDS = 5
+# The probe moves no data; the checkout transferred 10 MiB in ~18s on an a3 host.
+PROBE_TIMEOUT_SECONDS = 30
+CHECKOUT_TIMEOUT_SECONDS = 120
+
 # Written last and checked instead of the directory itself: a job killed
 # mid-extract otherwise leaves a partial tree that the next run treats as a hit.
 MARKER_NAME = ".complete"
@@ -83,27 +90,35 @@ def _github_url(repo: str, suffix: str) -> str:
     return f"{proxy}https://github.com/{repo}{suffix}"
 
 
-def _run(cmd: list[str]) -> None:
+def _run(cmd: list[str], timeout: float | None = None) -> None:
     print(f"+ {' '.join(cmd)}", flush=True)
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, timeout=timeout)
 
 
-def _fetch_sparse_git(repo: str, revision: str, repo_path: str, dest: Path) -> bool:
-    """Fetch only the GT subdirectory. False if the proxy does not pass git."""
-    url = _github_url(repo, ".git")
-    probe = subprocess.run(
-        ["git", "ls-remote", url, "HEAD"],
-        capture_output=True,
-        timeout=180,
-    )
-    if probe.returncode != 0:
+def _git_reachable(url: str) -> bool:
+    """Probe the remote. False only after every attempt fails."""
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            probe = subprocess.run(
+                ["git", "ls-remote", url, "HEAD"],
+                capture_output=True,
+                timeout=PROBE_TIMEOUT_SECONDS,
+            )
+            if probe.returncode == 0:
+                return True
+            reason = probe.stderr.decode(errors="replace").strip()
+        except subprocess.TimeoutExpired:
+            reason = f"timed out after {PROBE_TIMEOUT_SECONDS}s"
         print(
-            "git ls-remote failed through the proxy, falling back to the tarball:\n"
-            f"{probe.stderr.decode(errors='replace').strip()}",
+            f"git ls-remote attempt {attempt}/{RETRY_ATTEMPTS} failed: {reason}",
             flush=True,
         )
-        return False
+        if attempt < RETRY_ATTEMPTS:
+            time.sleep(RETRY_SLEEP_SECONDS)
+    return False
 
+
+def _sparse_checkout(url: str, revision: str, repo_path: str, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     _run(["git", "init", "--quiet", str(dest)])
     _run(["git", "-C", str(dest), "remote", "add", "origin", url])
@@ -128,11 +143,41 @@ def _fetch_sparse_git(repo: str, revision: str, repo_path: str, dest: Path) -> b
             "--filter=blob:none",
             "origin",
             revision,
-        ]
+        ],
+        timeout=CHECKOUT_TIMEOUT_SECONDS,
     )
-    _run(["git", "-C", str(dest), "checkout", "--quiet", "FETCH_HEAD"])
+    _run(
+        ["git", "-C", str(dest), "checkout", "--quiet", "FETCH_HEAD"],
+        timeout=CHECKOUT_TIMEOUT_SECONDS,
+    )
     shutil.rmtree(dest / ".git")
-    return True
+
+
+def _fetch_sparse_git(repo: str, revision: str, repo_path: str, dest: Path) -> bool:
+    """Fetch only the GT subdirectory. False if git cannot deliver it."""
+    url = _github_url(repo, ".git")
+    if not _git_reachable(url):
+        print("git is not usable here, falling back to the tarball", flush=True)
+        return False
+
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            _sparse_checkout(url, revision, repo_path, dest)
+            return True
+        except subprocess.SubprocessError as exc:
+            print(
+                f"sparse checkout attempt {attempt}/{RETRY_ATTEMPTS} failed: {exc}",
+                flush=True,
+            )
+            # Start the next attempt from an empty directory: a failed fetch or
+            # checkout leaves a half-written object store and an unborn HEAD,
+            # and `git remote add origin` fails on a second pass over it.
+            shutil.rmtree(dest, ignore_errors=True)
+            if attempt < RETRY_ATTEMPTS:
+                time.sleep(RETRY_SLEEP_SECONDS)
+
+    print("sparse checkout kept failing, falling back to the tarball", flush=True)
+    return False
 
 
 def _fetch_tarball(repo: str, revision: str, repo_path: str, dest: Path) -> None:
