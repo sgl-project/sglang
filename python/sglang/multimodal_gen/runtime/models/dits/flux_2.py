@@ -182,6 +182,7 @@ def _try_flux2_norm_modulate_fp8(
         ),
     )
 
+
 PendingGatedResidual = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
@@ -244,9 +245,7 @@ def _flux2_norm_maybe_fp8(
         if fp8_enabled:
             hidden_states = residual_gate_add(hidden_states, update, gate)
         else:
-            return _flux2_gated_resnorm(
-                norm, hidden_states, update, gate, scale, shift
-            )
+            return _flux2_gated_resnorm(norm, hidden_states, update, gate, scale, shift)
 
     norm_hidden_states = _try_flux2_norm_modulate_fp8(
         norm, hidden_states, scale, shift, input_scale, enabled=fp8_enabled
