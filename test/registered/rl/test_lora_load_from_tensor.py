@@ -1,6 +1,7 @@
 import json
 import os
 import unittest
+from types import SimpleNamespace
 
 import torch
 from huggingface_hub import snapshot_download
@@ -27,14 +28,19 @@ def load_lora_via_stream(engine, lora_name, tensors, config_dict):
     prefixed tensors through a sync_base=False weight-update session."""
     result = engine.register_lora_adapter(lora_name=lora_name, config_dict=config_dict)
     if not result.success:
-        return result
+        return SimpleNamespace(success=False, error_message=result.error_message)
     engine.begin_weight_update(selector="all", sync_base=False)
     engine.update_weights_from_tensor(
         named_tensors=[
             (f"{lora_name}:{key}", tensor) for key, tensor in tensors.items()
         ]
     )
-    return engine.end_weight_update()
+    success, message = engine.end_weight_update()
+    return SimpleNamespace(success=success, error_message=message)
+
+
+def loaded_adapter_names(engine):
+    return list(engine.tokenizer_manager.lora_registry._registry.keys())
 
 
 class TestLoRALoadFromTensor(CustomTestCase):
@@ -90,7 +96,7 @@ class TestLoRALoadFromTensor(CustomTestCase):
                 f"Failed to load LoRA adapter {i}: {result.error_message}",
             )
             print(
-                f"[Test]Successfully loaded LoRA {i+1}, current loaded adapters: {list(result.loaded_adapters.keys())}"
+                f"[Test]Successfully loaded LoRA {i+1}, current loaded adapters: {loaded_adapter_names(test_engine)}"
             )
 
         EXPECTED_LORA_ADAPTERS = [
@@ -104,19 +110,18 @@ class TestLoRALoadFromTensor(CustomTestCase):
             "self_cognition_Alice_9",
         ]
         EXPECTED_LORA_COUNT = 8
+        loaded = loaded_adapter_names(test_engine)
         self.assertEqual(
-            len(result.loaded_adapters),
+            len(loaded),
             EXPECTED_LORA_COUNT,
-            f"Loaded adapters count does not match expected result: {len(result.loaded_adapters)} != {EXPECTED_LORA_COUNT}",
+            f"Loaded adapters count does not match expected result: {len(loaded)} != {EXPECTED_LORA_COUNT}",
         )
         self.assertEqual(
-            list(result.loaded_adapters.keys()),
+            loaded,
             EXPECTED_LORA_ADAPTERS,
-            f"Loaded adapters do not match expected result: {list(result.loaded_adapters.keys())} != {EXPECTED_LORA_ADAPTERS}",
+            f"Loaded adapters do not match expected result: {loaded} != {EXPECTED_LORA_ADAPTERS}",
         )
-        print(
-            f"[Test]LRU eviction test passed! Final loaded adapters: {len(result.loaded_adapters)}"
-        )
+        print(f"[Test]LRU eviction test passed! Final loaded adapters: {len(loaded)}")
 
     def test_lora_e2e_load_from_tensor_params(self):
         print("[Test]Testing LoRA load from tensor params...")
