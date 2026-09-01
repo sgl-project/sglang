@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -88,6 +89,22 @@ def handle_model_specific_adjustments(server_args: Any):
         raise ValueError(
             "--enable-dsa-cache-layer-split is only supported for DSA "
             "(DeepSeek Sparse Attention) models."
+        )
+
+    # load_tp_by_experts requires load_weights() to call
+    # maybe_ep_to_tp_transform_all_layers() after loading. Fail early if the
+    # architecture doesn't use one of those code paths.
+    extra_config = json.loads(cfg.model_loader_extra_config)
+    if extra_config.get("load_tp_by_experts", False):
+        from sglang.srt.layers.moe.ep_to_tp_transform import (
+            EP_TO_TP_SUPPORTED_ARCHS,
+        )
+
+        assert model_arch in EP_TO_TP_SUPPORTED_ARCHS, (
+            f"load_tp_by_experts is only supported for models whose "
+            f"load_weights() drives the EP-to-TP transform "
+            f"({sorted(EP_TO_TP_SUPPORTED_ARCHS)}), "
+            f"but got architecture {model_arch!r}"
         )
 
     if cfg.enable_cp_decode_attn_tp:
