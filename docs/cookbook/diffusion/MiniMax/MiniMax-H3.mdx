@@ -677,9 +677,9 @@ done
 
 - `"lossless"` (default): the exact reference path. Output is bit-exact
   against the reference implementation and the CI ground truth.
-- `"high"`: the audited accelerated path. Quality is guaranteed (the audited
-  Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
-  `lossless`), but output is no longer bit-identical to the reference.
+- `"high"`: the audited Cache-DiT acceleration path. Output is no longer
+  bit-identical to the reference; the task-specific comparisons below quantify
+  the same-seed difference.
 
 One resident server serves both levels; a `quality: "high"` request mounts
 its audited Cache-DiT policy at the batch boundary, and a later
@@ -754,10 +754,19 @@ absolute perceptual quality: the `high` path can produce a different but
 still plausible realization. It also changes the joint audio-video denoise
 trajectory, while these two metrics cover video only.
 
-`quality: "high"` currently accepts only the exact workload and 4×H200
-deployment above; other hardware, task modes, request shapes, step counts, or
-flow shifts fail before denoising. Offline generation uses the same level
-name, for example `sglang generate --quality high`.
+`quality: "high"` now accepts resident CUDA SM90/SM100 deployments with TP1,
+Ring1, and full Ulysses (`sp_degree == ulysses_degree == num_gpus`). The
+request allowlist covers T2VA, SM100 FL2VA first/last keyframes, and Ref2VA
+with one audio-bearing video reference. Other task materials, shapes, step
+counts, flow shifts, precision modes, or partial-Ulysses topologies still fail
+before denoising.
+
+The table above is the direct 4×H200 T2VA audit. On B200, paired FL2VA and
+Ref2VA runs at Ulysses 4 and 8 measured 1.439–1.946× speedups and video SSIM
+0.917334–0.984353; a Ulysses 2 FL2VA `high` smoke run also completed without
+OOM but has no paired quality result. Other admitted SM90/SM100 combinations
+are architecture-inherited rather than directly measured. Offline generation
+uses the same level name, for example `sglang generate --quality high`.
 
 <Note>
 `quality` selects a model sampling level and can change generated content.
@@ -794,9 +803,8 @@ be combined with FSDP inference. DiT layerwise offload is compatible:
 skipped blocks are not streamed, and the first layer after a skip may
 sync-load. Breakable CUDA graph execution takes precedence and leaves
 Cache-DiT disabled. Tune the cache thresholds only after comparing both
-video and audio quality on the target task profile. A real B200 request
-has completed, but the `quality: "high"` path above remains fail-closed
-to the audited 4×H200 workload.
+video and audio quality on the target task profile. Do not transfer measured
+results to an architecture-inherited deployment without its own paired run.
 </Warning>
 
 ## 7. Feature contracts and advanced recipes

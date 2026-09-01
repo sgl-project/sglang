@@ -14,13 +14,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     minimax_h3_plan_from_batch,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+    MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES,
     canonical_minimax_h3_task,
     partition_for_task,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 _MINIMAX_H3_QUALITY_WORKLOAD = {
-    "task": "t2va",
     "width": 1344,
     "height": 768,
     "fps": 24,
@@ -28,6 +28,14 @@ _MINIMAX_H3_QUALITY_WORKLOAD = {
     "num_inference_steps": 50,
     "flow_shift": 12.0,
     "audio_flow_shift": 3.0,
+}
+_MINIMAX_H3_QUALITY_MATERIAL_SIGNATURES = {
+    "t2va": ((),),
+    "fl2va": tuple(
+        tuple(("keyframe", "image", frame_index) for frame_index in signature)
+        for signature in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES
+    ),
+    "ref2va": ((("reference", "video_audio", None),),),
 }
 
 
@@ -159,12 +167,14 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
             )
         high_quality = quality == "high"
         if high_quality and not batch.is_warmup:
-            server_args.pipeline_config.validate_quality_deployment(server_args)
             plan = minimax_h3_plan_from_batch(batch)
             if plan is None:
                 raise ValueError(
                     'MiniMax-H3 quality="high" requires a resolved request plan'
                 )
+            server_args.pipeline_config.validate_quality_deployment(
+                server_args, task=plan.task
+            )
             shape = plan.shape
             actual = {
                 "task": plan.task,
@@ -183,32 +193,44 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
                     if plan.audio_flow_shift is not None
                     else plan.default_audio_flow_shift
                 ),
+                "material_signature": tuple(
+                    (material.role, material.condition_type, material.frame_index)
+                    for material in plan.materials
+                ),
             }
             exact_fields = (
-                "task",
                 "width",
                 "height",
                 "fps",
                 "frame_count",
                 "num_inference_steps",
             )
-            exact = all(
+            expected_material_signatures = _MINIMAX_H3_QUALITY_MATERIAL_SIGNATURES.get(
+                plan.task, ()
+            )
+            exact = actual[
+                "material_signature"
+            ] in expected_material_signatures and all(
                 actual[name] == _MINIMAX_H3_QUALITY_WORKLOAD[name]
                 for name in exact_fields
             )
-            shifts = math.isclose(
-                actual["flow_shift"],
-                _MINIMAX_H3_QUALITY_WORKLOAD["flow_shift"],
-                abs_tol=1e-9,
-            ) and math.isclose(
-                actual["audio_flow_shift"],
-                _MINIMAX_H3_QUALITY_WORKLOAD["audio_flow_shift"],
-                abs_tol=1e-9,
+            shifts = bool(expected_material_signatures) and (
+                math.isclose(
+                    actual["flow_shift"],
+                    _MINIMAX_H3_QUALITY_WORKLOAD["flow_shift"],
+                    abs_tol=1e-9,
+                )
+                and math.isclose(
+                    actual["audio_flow_shift"],
+                    _MINIMAX_H3_QUALITY_WORKLOAD["audio_flow_shift"],
+                    abs_tol=1e-9,
+                )
             )
             if not exact or not shifts:
                 raise ValueError(
                     'MiniMax-H3 quality="high" is validated only for '
-                    f"{_MINIMAX_H3_QUALITY_WORKLOAD}; got {actual}"
+                    f"{_MINIMAX_H3_QUALITY_WORKLOAD} with material signatures "
+                    f"{_MINIMAX_H3_QUALITY_MATERIAL_SIGNATURES}; got {actual}"
                 )
         return batch
 
