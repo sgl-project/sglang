@@ -674,8 +674,6 @@ class KVCacheConfigurator:
             # Draft workers keep the token-count byte sum (spec is asserted
             # off under unified; belt only).
             unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
-            # Widens the allocator's virtual id space only; the pool below it
-            # still holds this rank's shard.
         )
         return bundle
 
