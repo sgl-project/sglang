@@ -109,6 +109,15 @@ AUTO_PLACEMENT_LATENCY_TOLERANCE_NS = 0
 MIN_POST_ADJUSTMENT_REGRESSION_NS = 100_000_000
 POST_ADJUSTMENT_REGRESSION_FRACTION = 0.05
 
+# Layerwise residency is a startup-time search, not an exhaustive knapsack
+# benchmark. Large heterogeneous models can otherwise create millions of
+# measured resident/HostPin combinations and miss the server startup timeout
+# before the optimizer runs. Keep a deterministic, resource-safe sampling of
+# the frontier; every retained state still uses its exact byte accounting.
+MAX_LAYERWISE_RESIDENT_TARGETS = 64
+MAX_LAYERWISE_PIN_TARGETS = 64
+MAX_LAYERWISE_COMPONENT_TARGETS = 4096
+
 PLACEMENT_STATUS_SKIPPED = "skipped"
 PLACEMENT_STATUS_ADJUSTED = "adjusted"
 PLACEMENT_STATUS_VALIDATED = "validated"
@@ -1361,13 +1370,16 @@ def _layerwise_pin_targets(
     layer_uses: tuple[tuple[int, ...], ...] | None = None,
     constrain_host_transitions: bool = True,
     maximum_utility_only: bool = False,
+    max_targets: int | None = None,
 ) -> list[tuple[tuple[int, ...], ...]]:
-    """Pareto-optimal HostPin targets for one resident-layer placement.
+    """Useful HostPin targets for one resident-layer placement.
 
     Layers with identical transfer value, host cost and current pin state are
     interchangeable, so they are grouped before subset construction. This
     keeps repeated transformer blocks linear while retaining non-prefix
-    packings needed when layer sizes differ.
+    packings needed when layer sizes differ. Large heterogeneous frontiers are
+    deterministically sampled so startup work remains bounded; retained states
+    keep their exact resource costs and transfer utility.
     """
     policies = _resolve_layerwise_policies(managers, residency_policies)
     resolved_uses = _resolve_layerwise_uses(
@@ -1452,7 +1464,57 @@ def _layerwise_pin_targets(
             and left[3] <= right[3]
         )
 
+    def limit(states):
+        if max_targets is None or len(states) <= max_targets:
+            return states
+
+        limit_count = max(1, max_targets)
+        orderings = (
+            sorted(
+                states,
+                key=lambda item: (item[0], item[2], item[3], -item[1], item[4]),
+            ),
+            sorted(
+                states,
+                key=lambda item: (
+                    max(item[2], item[3]),
+                    item[2] + item[3],
+                    item[0],
+                    -item[1],
+                    item[4],
+                ),
+            ),
+            sorted(
+                states,
+                key=lambda item: (-item[1], item[0], item[2], item[3], item[4]),
+            ),
+        )
+        selected = []
+        selected_targets = set()
+
+        def add(state):
+            if state[4] in selected_targets or len(selected) >= limit_count:
+                return
+            selected.append(state)
+            selected_targets.add(state[4])
+
+        for ordering in orderings:
+            add(ordering[0])
+            add(ordering[-1])
+
+        sample_count = max(2, limit_count)
+        for sample_index in range(sample_count):
+            for ordering in orderings:
+                index = round(sample_index * (len(ordering) - 1) / (sample_count - 1))
+                add(ordering[index])
+        return selected
+
     def prune(candidates):
+        # Exact multidimensional dominance is quadratic in the frontier size.
+        # Pre-limit only after the raw expansion is already much larger than
+        # the requested search budget; small frontiers remain fully exact.
+        if max_targets is not None and len(candidates) > max_targets * 8:
+            candidates = limit(candidates)
         if not constrain_host_transitions:
             # host transition scratch cannot constrain this solve, so the local
             # frontier is exactly pinned bytes versus avoided pageable transfer
@@ -1483,7 +1545,7 @@ def _layerwise_pin_targets(
                     continue
                 frontier.append(state)
                 best_utility = state[1]
-            return frontier
+            return limit(frontier)
 
         best_by_cost = {}
         for state in candidates:
@@ -1502,7 +1564,7 @@ def _layerwise_pin_targets(
                 existing for existing in frontier if not dominates(state, existing)
             ]
             frontier.append(state)
-        return frontier
+        return limit(frontier)
 
     for (uses, transfer_bytes, host_bytes, is_current), layers in sorted(
         grouped.items(),
@@ -1555,6 +1617,7 @@ def _layerwise_resident_targets(
     managers: Sequence,
     *,
     layer_uses: tuple[tuple[int, ...], ...] | None = None,
+    current_resident_layers: tuple[int, ...] | None = None,
 ) -> list[tuple[int, ...]]:
     """Useful resident-count tuples for the measured request.
 
@@ -1572,6 +1635,32 @@ def _layerwise_resident_targets(
     explicit interface can represent.
     """
     layer_counts = tuple(manager.num_layers for manager in managers)
+
+    def limit(
+        targets: Collection[tuple[int, ...]],
+        required: Sequence[tuple[int, ...]] = (),
+    ) -> list[tuple[int, ...]]:
+        ordered = sorted(set(targets) | set(required))
+        if len(ordered) <= MAX_LAYERWISE_RESIDENT_TARGETS:
+            return ordered
+        selected = []
+        seen = set()
+
+        def add(target):
+            if target in seen or len(selected) >= MAX_LAYERWISE_RESIDENT_TARGETS:
+                return
+            selected.append(target)
+            seen.add(target)
+
+        for target in required:
+            add(target)
+        sample_count = max(2, MAX_LAYERWISE_RESIDENT_TARGETS)
+        for index in range(sample_count):
+            add(ordered[round(index * (len(ordered) - 1) / (sample_count - 1))])
+        for target in ordered:
+            add(target)
+        return sorted(selected)
+
     if layer_uses is not None:
         resolved_uses = _resolve_layerwise_uses(
             managers=managers,
@@ -1582,7 +1671,67 @@ def _layerwise_resident_targets(
             range(num_layers + 1) if any(count > 1 for count in uses) else (0,)
             for num_layers, uses in zip(layer_counts, resolved_uses)
         ]
-        return list(product(*choices))
+        target_count = 1
+        for group_choices in choices:
+            target_count *= len(group_choices)
+        if target_count <= MAX_LAYERWISE_RESIDENT_TARGETS:
+            targets = list(product(*choices))
+            required = (
+                (current_resident_layers,)
+                if current_resident_layers is not None
+                else ()
+            )
+            return limit(targets, required)
+
+        repeated = tuple(len(group_choices) > 1 for group_choices in choices)
+        targets = {tuple(0 for _ in managers)}
+        maximum_count = max(
+            (
+                num_layers
+                for num_layers, active in zip(layer_counts, repeated)
+                if active
+            ),
+            default=0,
+        )
+        for count in range(1, maximum_count + 1):
+            targets.add(
+                tuple(
+                    min(count, num_layers) if active else 0
+                    for num_layers, active in zip(layer_counts, repeated)
+                )
+            )
+        for manager_index, (num_layers, active) in enumerate(
+            zip(layer_counts, repeated)
+        ):
+            if active:
+                targets.add(
+                    tuple(
+                        num_layers if index == manager_index else 0
+                        for index in range(len(managers))
+                    )
+                )
+        if current_resident_layers is not None:
+            targets.add(current_resident_layers)
+        required = [tuple(0 for _ in managers)]
+        if current_resident_layers is not None:
+            required.append(current_resident_layers)
+        required.append(
+            tuple(
+                num_layers if active else 0
+                for num_layers, active in zip(layer_counts, repeated)
+            )
+        )
+        required.extend(
+            tuple(
+                num_layers if index == manager_index else 0
+                for index in range(len(managers))
+            )
+            for manager_index, (num_layers, active) in enumerate(
+                zip(layer_counts, repeated)
+            )
+            if active
+        )
+        return limit(targets, required)
 
     targets = {tuple(0 for _ in managers)}
 
@@ -1603,7 +1752,10 @@ def _layerwise_resident_targets(
             tuple(max(1, int(round(ratio * num_layers))) for num_layers in layer_counts)
         )
 
-    return sorted(targets)
+    required = [tuple(0 for _ in managers), layer_counts]
+    if current_resident_layers is not None:
+        required.insert(1, current_resident_layers)
+    return limit(targets, required)
 
 
 def _layerwise_policy_targets(
@@ -1959,7 +2111,7 @@ def collect_residency_targets(
     request_duration_ns: int = 0,
     latency_upper_bound_ns_by_component: Mapping[str, int] | None = None,
 ) -> list[ResidencyTarget]:
-    """Build complete target-state frontiers for auto-managed components.
+    """Build bounded target-state frontiers for auto-managed components.
 
     Every option is expressed relative to the currently measured placement,
     but its transfer utility is absolute within the component's frontier.
@@ -1969,8 +2121,8 @@ def collect_residency_targets(
     When both host constraints provably cannot bind and the component latency
     cap cannot flatten transfer utility, every pin subset except the unique
     maximum-utility one is dominated under the solver's latency-first ordering.
-    Only that exact condition permits collapsing the HostPin frontier; otherwise
-    every Pareto-relevant subset remains available to the joint optimizer.
+    Other large layerwise frontiers retain bounded samples across device, host,
+    transition-scratch, and transfer-utility tradeoffs.
     """
     custom_names = set(custom_strategy_names)
     mixed_dtype_names = set(mixed_dtype_components)
@@ -2287,122 +2439,129 @@ def collect_residency_targets(
                 )
             )
 
-        for target_resident_layers in _layerwise_resident_targets(
-            managers, layer_uses=layer_uses
-        ):
+        layerwise_layouts = [
+            (target_resident_layers, target_policies)
+            for target_resident_layers in _layerwise_resident_targets(
+                managers,
+                layer_uses=layer_uses,
+                current_resident_layers=current_resident_layers,
+            )
             for target_policies in _layerwise_policy_targets(
                 managers=managers,
                 resident_layers=target_resident_layers,
                 tune_policy=tune_residency_policy,
-            ):
-                target_resident_bytes = sum(
-                    manager.resident_weight_bytes(count, policy)
-                    for manager, count, policy in zip(
-                        managers, target_resident_layers, target_policies
-                    )
+            )
+        ]
+        max_pin_targets = min(
+            MAX_LAYERWISE_PIN_TARGETS,
+            max(1, MAX_LAYERWISE_COMPONENT_TARGETS // len(layerwise_layouts)),
+        )
+        for target_resident_layers, target_policies in layerwise_layouts:
+            target_resident_bytes = sum(
+                manager.resident_weight_bytes(count, policy)
+                for manager, count, policy in zip(
+                    managers, target_resident_layers, target_policies
                 )
-                target_peak_device_bytes = _layerwise_active_peak_device_bytes(
+            )
+            target_peak_device_bytes = _layerwise_active_peak_device_bytes(
+                managers=managers,
+                resident_layers=target_resident_layers,
+                residency_policies=target_policies,
+                layer_uses=layer_uses,
+            )
+            pin_targets = (
+                _layerwise_pin_targets(
                     managers=managers,
                     resident_layers=target_resident_layers,
                     residency_policies=target_policies,
+                    current_pinned_layers=current_pinned_layers,
+                    uses_per_streamed_layer=uses_per_request,
+                    layer_uses=layer_uses,
+                    constrain_host_transitions=constrain_host_transitions,
+                    maximum_utility_only=(
+                        not constrain_host_transitions
+                        and not constrain_host_pin
+                        and pin_utility_cannot_saturate
+                    ),
+                    max_targets=max_pin_targets,
+                )
+                if allow_host_pin_reallocation
+                else [current_pinned_layers]
+            )
+            if (
+                target_resident_layers == current_resident_layers
+                and target_policies == current_residency_policies
+                and current_pinned_layers not in pin_targets
+            ):
+                # relative utility is anchored to the measured placement;
+                # keep that exact state when every other pin subset folds
+                # into its maximum-utility representative
+                pin_targets.append(current_pinned_layers)
+            for target_pinned_layers in pin_targets:
+                target_pinned_bytes = sum(
+                    sum(
+                        manager.layer_host_store_bytes().get(layer_idx, 0)
+                        for layer_idx in pinned_indices
+                    )
+                    for manager, pinned_indices in zip(managers, target_pinned_layers)
+                )
+                target_transfer_work = _layerwise_transfer_work_bytes(
+                    managers=managers,
+                    resident_layers=target_resident_layers,
+                    residency_policies=target_policies,
+                    pinned_layers=target_pinned_layers,
+                    uses_per_streamed_layer=uses_per_request,
                     layer_uses=layer_uses,
                 )
-                pin_targets = (
-                    _layerwise_pin_targets(
-                        managers=managers,
-                        resident_layers=target_resident_layers,
-                        residency_policies=target_policies,
-                        current_pinned_layers=current_pinned_layers,
-                        uses_per_streamed_layer=uses_per_request,
-                        layer_uses=layer_uses,
-                        constrain_host_transitions=constrain_host_transitions,
-                        maximum_utility_only=(
-                            not constrain_host_transitions
-                            and not constrain_host_pin
-                            and pin_utility_cannot_saturate
-                        ),
-                    )
-                    if allow_host_pin_reallocation
-                    else [current_pinned_layers]
+                unpin_scratch, pin_scratch = _layerwise_host_transition_bytes(
+                    managers=managers,
+                    current_pinned_layers=current_pinned_layers,
+                    target_pinned_layers=target_pinned_layers,
                 )
-                if (
-                    target_resident_layers == current_resident_layers
-                    and target_policies == current_residency_policies
-                    and current_pinned_layers not in pin_targets
-                ):
-                    # relative utility is anchored to the measured placement;
-                    # keep that exact state when every other pin subset folds
-                    # into its maximum-utility representative
-                    pin_targets.append(current_pinned_layers)
-                for target_pinned_layers in pin_targets:
-                    target_pinned_bytes = sum(
-                        sum(
-                            manager.layer_host_store_bytes().get(layer_idx, 0)
-                            for layer_idx in pinned_indices
-                        )
-                        for manager, pinned_indices in zip(
-                            managers, target_pinned_layers
-                        )
+                candidates.append(
+                    ResidencyTarget(
+                        component_name=name,
+                        residency_mode=frontier_mode,
+                        target_residency_mode=LAYERWISE_OFFLOAD,
+                        target_resident_weight_bytes=target_resident_bytes,
+                        h2d_bytes_per_request=(
+                            maximum_transfer_work - target_transfer_work
+                        ),
+                        target_layerwise_resident_layers=target_resident_layers,
+                        target_layerwise_residency_policies=(
+                            target_policies
+                            if tune_residency_policy
+                            and _policy_affects_layerwise_layout(
+                                managers, target_resident_layers
+                            )
+                            else None
+                        ),
+                        target_layerwise_pinned_layers=target_pinned_layers,
+                        pinned_host_delta_bytes=(
+                            target_pinned_bytes - current_pinned_bytes
+                        ),
+                        host_unpin_scratch_bytes=unpin_scratch,
+                        host_pin_scratch_bytes=pin_scratch,
+                        device_transition_delta_bytes=(
+                            -managed_weight_bytes if current_permanent else 0
+                        ),
+                        active_device_delta_bytes=(
+                            target_peak_device_bytes - current_peak_device_bytes
+                        ),
+                        inactive_device_delta_bytes=(-current_inactive_device_bytes),
+                        present_device_delta_bytes=(-current_inactive_device_bytes),
+                        current_placement=(
+                            not current_permanent
+                            and target_resident_layers == current_resident_layers
+                            and target_policies == current_residency_policies
+                            and target_pinned_layers == current_pinned_layers
+                        ),
+                        target_device_weight_bytes=(
+                            unmanaged_weight_bytes + target_resident_bytes
+                        ),
+                        target_pinned_host_bytes=target_pinned_bytes,
                     )
-                    target_transfer_work = _layerwise_transfer_work_bytes(
-                        managers=managers,
-                        resident_layers=target_resident_layers,
-                        residency_policies=target_policies,
-                        pinned_layers=target_pinned_layers,
-                        uses_per_streamed_layer=uses_per_request,
-                        layer_uses=layer_uses,
-                    )
-                    unpin_scratch, pin_scratch = _layerwise_host_transition_bytes(
-                        managers=managers,
-                        current_pinned_layers=current_pinned_layers,
-                        target_pinned_layers=target_pinned_layers,
-                    )
-                    candidates.append(
-                        ResidencyTarget(
-                            component_name=name,
-                            residency_mode=frontier_mode,
-                            target_residency_mode=LAYERWISE_OFFLOAD,
-                            target_resident_weight_bytes=target_resident_bytes,
-                            h2d_bytes_per_request=(
-                                maximum_transfer_work - target_transfer_work
-                            ),
-                            target_layerwise_resident_layers=target_resident_layers,
-                            target_layerwise_residency_policies=(
-                                target_policies
-                                if tune_residency_policy
-                                and _policy_affects_layerwise_layout(
-                                    managers, target_resident_layers
-                                )
-                                else None
-                            ),
-                            target_layerwise_pinned_layers=target_pinned_layers,
-                            pinned_host_delta_bytes=(
-                                target_pinned_bytes - current_pinned_bytes
-                            ),
-                            host_unpin_scratch_bytes=unpin_scratch,
-                            host_pin_scratch_bytes=pin_scratch,
-                            device_transition_delta_bytes=(
-                                -managed_weight_bytes if current_permanent else 0
-                            ),
-                            active_device_delta_bytes=(
-                                target_peak_device_bytes - current_peak_device_bytes
-                            ),
-                            inactive_device_delta_bytes=(
-                                -current_inactive_device_bytes
-                            ),
-                            present_device_delta_bytes=(-current_inactive_device_bytes),
-                            current_placement=(
-                                not current_permanent
-                                and target_resident_layers == current_resident_layers
-                                and target_policies == current_residency_policies
-                                and target_pinned_layers == current_pinned_layers
-                            ),
-                            target_device_weight_bytes=(
-                                unmanaged_weight_bytes + target_resident_bytes
-                            ),
-                            target_pinned_host_bytes=target_pinned_bytes,
-                        )
-                    )
+                )
 
         # Layerwise stores have one fixed dtype, while both coarse strategies
         # cast at every declared use. A mixed-dtype component may be tuned within

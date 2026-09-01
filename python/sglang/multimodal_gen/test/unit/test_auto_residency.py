@@ -16,6 +16,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     ACTIVATION_EXTRAPOLATION_MARGIN,
     GIB_BYTES,
+    MAX_LAYERWISE_RESIDENT_TARGETS,
     MIN_VRAM_RESERVE_BYTES,
     PAGEABLE_H2D_COST_MULTIPLIER,
     AppliedResidencyChange,
@@ -3194,6 +3195,47 @@ class TestCollectResidencyTargets:
 
         assert targets == [(0, 0)]
 
+    def test_measured_resident_frontier_keeps_current_one_shot_layout(self):
+        managers = [
+            _FakeLayerwiseManager(
+                {f"encoder.{index}.w": torch.zeros(16) for index in range(3)}
+            ),
+            _FakeLayerwiseManager(
+                {f"decoder.{index}.w": torch.zeros(16) for index in range(2)}
+            ),
+        ]
+
+        targets = _layerwise_resident_targets(
+            managers,
+            layer_uses=((0, 0, 0), (1, 1)),
+            current_resident_layers=(2, 1),
+        )
+
+        assert targets == [(0, 0), (2, 1)]
+
+    def test_large_measured_resident_frontier_is_bounded_and_keeps_anchors(self):
+        managers = [
+            _FakeLayerwiseManager(
+                {f"first.{index}.w": torch.zeros(16) for index in range(70)}
+            ),
+            _FakeLayerwiseManager(
+                {f"second.{index}.w": torch.zeros(16) for index in range(70)}
+            ),
+        ]
+
+        targets = _layerwise_resident_targets(
+            managers,
+            layer_uses=(tuple([8] * 70), tuple([8] * 70)),
+            current_resident_layers=(13, 17),
+        )
+
+        assert len(targets) <= MAX_LAYERWISE_RESIDENT_TARGETS
+        assert (0, 0) in targets
+        assert (70, 70) in targets
+        assert (70, 0) in targets
+        assert (0, 70) in targets
+        assert (13, 17) in targets
+
     def test_host_pin_frontier_includes_non_prefix_packings(self):
         manager = SimpleNamespace(
             num_layers=3,
@@ -3233,6 +3275,29 @@ class TestCollectResidencyTargets:
         )
 
         assert len(targets) == 41
+
+    def test_large_host_pin_frontier_is_bounded_and_keeps_extremes(self):
+        layer_bytes = {index: 1 << index for index in range(24)}
+        manager = SimpleNamespace(
+            num_layers=24,
+            residency_policy="leading",
+            pin_cpu_memory=True,
+            layer_weight_bytes=lambda: layer_bytes,
+            layer_host_store_bytes=lambda: layer_bytes,
+            pinnable_layer_indices=lambda: tuple(layer_bytes),
+        )
+
+        targets = _layerwise_pin_targets(
+            managers=[manager],
+            resident_layers=(0,),
+            current_pinned_layers=((),),
+            uses_per_streamed_layer=1,
+            max_targets=16,
+        )
+
+        assert len(targets) <= 16
+        assert ((),) in targets
+        assert (tuple(layer_bytes),) in targets
 
     def test_nonbinding_host_resources_keep_only_maximum_pin_utility(self):
         manager = SimpleNamespace(
