@@ -14,18 +14,39 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-_SUPPORTED_KN = frozenset(
+_QWEN_DECODE_KN = frozenset(
+    {
+        # Qwen3.5-4B
+        (2560, 18432),
+        (9216, 2560),
+        # Qwen3.5-9B
+        (4096, 24576),
+        (12288, 4096),
+        # Qwen3.6/3.8-27B
+        (5120, 34816),
+        (17408, 5120),
+        (5120, 248320),
+    }
+)
+_QWEN38_PREFILL_KN = frozenset(
     {
         (5120, 34816),
         (17408, 5120),
         (5120, 248320),
     }
 )
-_SUPPORTED_M = frozenset({1, 9, 4369})
 # This is the only role that improved the full Qwen3.8-27B DSpark serving
-# benchmark without changing acceptance. Other captured shapes remain callable
-# through the low-level API, but ModelOpt keeps using FlashInfer for them.
-_E2E_VALIDATED_MKN = frozenset({(9, 17408, 5120)})
+# benchmark without changing acceptance. Qwen3.5-4B/9B ordinary-decode shapes
+# are enabled only after their own SM120 multi-weight and E2E validation.
+_E2E_VALIDATED_MKN = frozenset(
+    {
+        (1, 2560, 18432),
+        (1, 9216, 2560),
+        (1, 4096, 24576),
+        (1, 12288, 4096),
+        (9, 17408, 5120),
+    }
+)
 _logged_fast_path = False
 
 
@@ -41,13 +62,16 @@ def can_use_kda_nvfp4_gemm(
     """Return whether this call matches the captured SM120 production contract."""
     if not input.is_cuda or input.ndim != 2 or input.dtype != torch.uint8:
         return False
-    if out_dtype != torch.bfloat16 or input.shape[0] not in _SUPPORTED_M:
+    if out_dtype != torch.bfloat16:
         return False
 
     m, packed_k = input.shape
     k = packed_k * 2
     n = int(out_features)
-    if (k, n) not in _SUPPORTED_KN:
+    if not (
+        (m in (1, 9) and (k, n) in _QWEN_DECODE_KN)
+        or (m == 4369 and (k, n) in _QWEN38_PREFILL_KN)
+    ):
         return False
     if input.stride() != (packed_k, 1):
         return False
@@ -107,19 +131,19 @@ def kda_nvfp4_gemm(
     out_dtype: torch.dtype,
     out_features: int,
 ) -> torch.Tensor:
-    """Run the KDA-generated Qwen3.8 NVFP4 GEMM."""
+    """Run the KDA-generated Qwen3.x ModelOpt NVFP4 GEMM."""
     global _logged_fast_path
     if not can_use_kda_nvfp4_gemm(
         input, weight, input_sf, weight_sf, alpha, out_dtype, out_features
     ):
-        raise ValueError("unsupported call for the KDA Qwen3.8 NVFP4 GEMM")
+        raise ValueError("unsupported call for the KDA Qwen3.x NVFP4 GEMM")
 
     from .gemm import decode_fp4_gemm, large_fp4_gemm
 
     if not _logged_fast_path:
         logger.info(
-            "Using the Humanize2/KDA Qwen3.8 NVFP4 GEMM on SM120 "
-            "(BBuf/KDA-Pilot#195)"
+            "Using the Humanize2/KDA ModelOpt NVFP4 GEMM on SM120 "
+            "for qualified Qwen3.x shapes (BBuf/KDA-Pilot#195)"
         )
         _logged_fast_path = True
     if input.shape[0] <= 9:

@@ -399,8 +399,9 @@ def decode_fp4_gemm(
     alpha: torch.Tensor,
 ) -> torch.Tensor:
     rows = input.shape[0]
+    reduction_size = input.shape[1] * 2
     columns = weight.shape[1]
-    is_down_projection = columns == 5120
+    is_down_projection = columns < reduction_size
     is_lm_head = columns == 248320
     use_m1_non_tma_c = rows == 1
     return decode_fp4_gemm_variant(
