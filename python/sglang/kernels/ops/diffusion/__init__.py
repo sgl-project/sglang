@@ -84,6 +84,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     ),
     (
         "diffusion.scale_residual_norm_scale_shift",
+        KernelBackend.KDA,
+        "norm.norm_scale_shift_jit:kda_scale_residual_norm_scale_shift",
+        _CUDA_SM100_PLUS,
+        "KDA B200 native CUDA residual + LayerNorm + scale/shift (#27392).",
+    ),
+    (
+        "diffusion.scale_residual_norm_scale_shift",
         KernelBackend.TRITON,
         "norm.rmsnorm_scale_shift_bitexact:fused_scale_residual_rmsnorm_scale_shift_bitexact",
         _CUDA,
@@ -109,6 +116,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "norm.norm_scale_shift_jit:try_fused_scale_residual_norm_scale_shift_nvfp4",
         _CUDA,
         "Qwen residual LayerNorm/modulation + NVFP4 quantization.",
+    ),
+    (
+        "diffusion.norm_scale_shift",
+        KernelBackend.KDA,
+        "norm.norm_scale_shift_jit:kda_norm_scale_shift",
+        _CUDA_SM100_PLUS,
+        "KDA B200 native CUDA LayerNorm + scale/shift (#27392).",
     ),
     (
         "diffusion.norm_scale_shift",
@@ -168,10 +182,10 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     ),
     (
         "diffusion.residual_gate_add",
-        KernelBackend.JIT,
+        KernelBackend.KDA,
         "modulate.residual_gate_add_jit:residual_gate_add",
         _CUDA,
-        "Fused residual + gate * update.",
+        "KDA native CUDA residual + gate * update (#29361).",
     ),
     (
         "diffusion.timestep_embedding",
@@ -231,10 +245,10 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     ),
     (
         "diffusion.ltx2_qknorm_split_rope",
-        KernelBackend.JIT,
+        KernelBackend.KDA,
         "rope.ltx2_qknorm_split_rope_jit:ltx2_qknorm_split_rope_cuda",
-        _CUDA,
-        "LTX-2 QK-norm + split RoPE.",
+        _CUDA_SM100_PLUS,
+        "KDA native CUDA LTX-2 QK-norm + split RoPE (#29708).",
     ),
     (
         "diffusion.ltx25_decoder_rope",
@@ -350,10 +364,10 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     ),
     (
         "diffusion.causal_conv3d_cat_pad",
-        KernelBackend.JIT,
+        KernelBackend.KDA,
         "layout.causal_conv3d_cat_pad_jit:fused_causal_conv3d_cat_pad_cuda",
         _CUDA,
-        "Causal Conv3d cat + pad.",
+        "KDA native CUDA causal Conv3d cat + pad (#29281).",
     ),
     (
         "diffusion.causal_conv3d_cat_pad",
