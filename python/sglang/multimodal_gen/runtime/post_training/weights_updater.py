@@ -61,6 +61,7 @@ from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import Diffusers
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
     LoRAPipeline,
     stack_or_compose_fused_lora,
+    swap_peft_swiglu_fc1_lora_b,
 )
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -258,12 +259,18 @@ def _resolve_lora_ipc_layer_dict_key(
     if map_name is None:
         return None, layer_prefix, None
 
-    mapped_name, merge_index = map_name(f"{layer_prefix}.weight")
-    mapped = _strip_param_weight_suffix(mapped_name)
-    if mapped != layer_prefix:
-        layer = layer_dict.get(mapped)
-        if layer is not None:
-            return layer, mapped, merge_index
+    # miles-h3 disk mapping is LoRA-suffix-only; main also maps ".weight".
+    for suffix in (".weight", ".lora_A"):
+        mapped_name, merge_index = map_name(f"{layer_prefix}{suffix}")
+        mapped = (
+            mapped_name[: -len(suffix)]
+            if mapped_name.endswith(suffix)
+            else _strip_param_weight_suffix(mapped_name)
+        )
+        if mapped != layer_prefix:
+            layer = layer_dict.get(mapped)
+            if layer is not None:
+                return layer, mapped, merge_index
 
     return None, layer_prefix, None
 
@@ -660,7 +667,7 @@ class WeightsUpdater:
         plain_pairs: list[tuple[torch.Tensor, torch.Tensor, Any]] = []
         fused_sections: dict[Any, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
         for layer_name, (lora_a, lora_b) in pairs.items():
-            layer, _resolved_key, merge_index = _resolve_lora_ipc_layer_dict_key(
+            layer, resolved_key, merge_index = _resolve_lora_ipc_layer_dict_key(
                 layer_name, layer_dict, dit_module
             )
             if layer is None:
@@ -672,6 +679,15 @@ class WeightsUpdater:
                 unknown_layers.append(layer_name)
                 skipped += 1
                 continue
+            # Same PEFT → native rewrite as disk load_lora_adapter: fused QKV
+            # uses merge_index; H3 gated FFN swaps [up, gate] → [gate, up].
+            # Native names already in lora_layers skip both transforms.
+            lora_a = swap_peft_swiglu_fc1_lora_b(
+                f"{layer_name}.lora_A", f"{resolved_key}.lora_A", lora_a
+            )
+            lora_b = swap_peft_swiglu_fc1_lora_b(
+                f"{layer_name}.lora_B", f"{resolved_key}.lora_B", lora_b
+            )
             inferred_rank = int(lora_a.shape[-2])
             if lora_rank is not None and lora_rank != inferred_rank:
                 logger.warning(
