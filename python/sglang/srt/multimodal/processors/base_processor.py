@@ -17,7 +17,6 @@ from typing import (
     Tuple,
     Union,
 )
-from urllib.parse import urlsplit
 
 import numpy as np
 import torch
@@ -83,7 +82,8 @@ def _describe_media_input(data) -> str:
             encoded_length = len(payload) if separator else 0
             return f"<data-uri mime={mime_type} encoded_length={encoded_length}>"
         if data.startswith(("http://", "https://")):
-            return f"<url scheme={urlsplit(data).scheme.lower()}>"
+            scheme = data.partition(":")[0].lower()
+            return f"<url scheme={scheme}>"
         if data.startswith("file://"):
             return "<file-uri>"
         return f"<string length={len(data)}>"

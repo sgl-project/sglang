@@ -119,6 +119,19 @@ class TestServerFaultStaysServerError(CustomTestCase):
 class TestBadInputDoesNotLeakMedia(CustomTestCase):
     """Loader failures must not expose request media in formatted exceptions."""
 
+    def test_malformed_url_preserves_sanitized_client_error(self):
+        url = "https://[invalid"
+
+        with self.assertRaises(ValueError) as ctx:
+            _StubProcessor._load_single_item(url, Modality.IMAGE)
+
+        formatted = "".join(traceback.format_exception(ctx.exception))
+        self.assertNotIn(url, formatted)
+        self.assertIn("Error while loading image data <url scheme=https>", formatted)
+        self.assertIsInstance(ctx.exception.__cause__, ValueError)
+        self.assertIn("<url scheme=https>", str(ctx.exception.__cause__))
+        self.assertIsNone(ctx.exception.__context__)
+
     def test_authenticated_url_is_redacted_from_client_error(self):
         url = (
             "https://media-user:media-password@example.com/private.jpg"
