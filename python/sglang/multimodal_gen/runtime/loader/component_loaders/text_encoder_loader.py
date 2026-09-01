@@ -744,7 +744,9 @@ class TextEncoderLoader(ComponentLoader):
         )
 
         # TODO(mick): had to throw an exception for different text-encoder arch
-        encoder_index = self._extract_encoder_index(component_name)
+        encoder_index = self._extract_encoder_index(
+            self.structural_component_name(component_name)
+        )
         assert encoder_index < len(
             server_args.pipeline_config.text_encoder_configs
         ) and encoder_index < len(server_args.pipeline_config.text_encoder_precisions)
