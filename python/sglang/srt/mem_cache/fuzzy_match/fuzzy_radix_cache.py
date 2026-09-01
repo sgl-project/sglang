@@ -403,7 +403,9 @@ def fuzzy_match_backend_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             "--radix-cache-backend fuzzy_match does not support EAGLE "
             "speculative decoding yet"
         )
-    config = FuzzyMatchConfig.from_server_args(ctx.server_args)
+    config = FuzzyMatchConfig.from_server_args(
+        ctx.server_args, served_model_path=ctx.model_config.model_path
+    )
     provider = create_fuzzy_match_provider(config)
     cache = FuzzyRadixCache(params=ctx.params)
     if provider is not None:

@@ -109,12 +109,16 @@ class FuzzyMatchConfig(msgspec.Struct):
             )
 
     @classmethod
-    def from_server_args(cls, server_args) -> "FuzzyMatchConfig":
+    def from_server_args(
+        cls, server_args, *, served_model_path: Optional[str] = None
+    ) -> "FuzzyMatchConfig":
         """Create a config from ServerArgs.
 
         Only called by the ``fuzzy_match`` radix-cache backend factory, so
         selecting the backend is what enables fuzzy matching; there is no
-        separate enable flag.
+        separate enable flag. ``served_model_path`` comes from the resolved
+        model config rather than the raw argument record, which is the
+        effective path even when resolution or a weight update rewrote it.
         """
         return cls(
             enable_fuzzy_match=True,
@@ -123,5 +127,5 @@ class FuzzyMatchConfig(msgspec.Struct):
             fuzzy_match_provider=server_args.fuzzy_match_provider,
             model_arch=server_args.fuzzy_model_arch,
             fuzzy_min_reuse_ratio=server_args.fuzzy_min_reuse_ratio,
-            served_model_path=server_args.model_path,
+            served_model_path=served_model_path,
         )
