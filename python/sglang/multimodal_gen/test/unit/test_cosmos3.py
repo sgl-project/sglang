@@ -1907,6 +1907,7 @@ class TestCosmos3ModalitySamplingParams(unittest.TestCase):
         self.assertEqual(sp.condition_frame_indexes, [0, 1])
         self.assertEqual(sp.condition_video_keep, "first")
 
+
 class TestCosmos3CaptionMetadata(unittest.TestCase):
     """Structured captions get generation metadata; prose prompts opt out."""
 

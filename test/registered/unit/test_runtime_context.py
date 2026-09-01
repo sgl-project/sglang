@@ -332,6 +332,7 @@ class TestAssertPublished(_IsolatedServerArgs):
 
         self.assertEqual(publish_role(), "tokenizer")
 
+
 class TestServerArgsScopedOverride(_IsolatedServerArgs):
     """ctx.override_server_args: the config tier's scoped test override —
     tests force execution paths by overriding the context, not by

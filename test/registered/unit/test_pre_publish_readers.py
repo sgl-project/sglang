@@ -33,6 +33,7 @@ _EXERCISED = {
     "_set_envs_and_config": _set_envs_and_config,
 }
 
+
 class TestPrePublishReaders(CustomTestCase):
     def setUp(self):
         self._levels = {

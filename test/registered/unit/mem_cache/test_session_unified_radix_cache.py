@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.test_utils import CustomTestCase
 
+
 def make_params(enable_session: bool) -> CacheInitParams:
     dtype = torch.float16
     kv_pool = MHATokenToKVPool(

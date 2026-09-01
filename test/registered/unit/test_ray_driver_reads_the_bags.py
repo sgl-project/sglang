@@ -63,5 +63,6 @@ class TestRayDriverReadsTheBags(CustomTestCase):
         self.assertEqual(get_parallel().tp_size, 8)
         self.assertEqual(_compute_world_size(), 8)
 
+
 if __name__ == "__main__":
     unittest.main()

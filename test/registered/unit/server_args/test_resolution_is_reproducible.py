@@ -607,6 +607,7 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
             "the parent's resolution decided",
         )
 
+
 class TestResolutionStaysLazy(CustomTestCase):
     """Resolving a dummy model must not load the families it never reaches.
 

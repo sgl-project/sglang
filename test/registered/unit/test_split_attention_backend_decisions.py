@@ -169,6 +169,7 @@ class TestSplitBackendsReachTheDecisions(CustomTestCase):
         # reads as "supported".
         self.assertTrue(support_triton(None))
 
+
 class TestDraftFactoryStamping(CustomTestCase):
     """The factory's products carry the stamp `serving_attention_backend`
     prefers -- removing the child-stamping loop, the `cutedsl_mla` rename, or
@@ -273,6 +274,7 @@ class TestDraftFactoryStamping(CustomTestCase):
         self.assertEqual(
             product.attn_backends[0].decode_attention_backend_str, "triton"
         )
+
 
 if __name__ == "__main__":
     unittest.main()
