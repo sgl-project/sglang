@@ -388,8 +388,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._fused_input_proj_cpu_enabled = LazyValue(
             lambda: (
                 _is_cpu
-                and self.in_proj_qkvz.weight.dtype == torch.bfloat16
-                and self.in_proj_ba.weight.dtype == torch.bfloat16
+                and self.in_proj_qkvz._parameters.get("weight") is not None
+                and self.in_proj_ba._parameters.get("weight") is not None
+                and self.in_proj_qkvz._parameters["weight"].dtype == torch.bfloat16
+                and self.in_proj_ba._parameters["weight"].dtype == torch.bfloat16
                 and self.in_proj_qkvz.bias is None
                 and self.in_proj_ba.bias is None
                 and use_intel_amx_backend(self.in_proj_qkvz)

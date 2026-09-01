@@ -1879,22 +1879,22 @@ def max_speculative_num_draft_tokens(server_args: Any) -> Optional[int]:
     memo = server_args.__dict__.get("_max_speculative_num_draft_tokens")
     if memo is not None:
         return memo
-    if cfg.speculative_num_draft_tokens is None:
-        result = None
-    elif not cfg.speculative_adaptive:
-        result = cfg.speculative_num_draft_tokens
-    else:
-        from sglang.srt.speculative.adaptive_spec_params import (
-            resolve_candidate_steps_from_config,
-        )
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-        candidate_steps = resolve_candidate_steps_from_config(
-            cfg_path=cfg.speculative_adaptive_config,
+    result = SpeculativeAlgorithm.from_string(
+        cfg.speculative_algorithm
+    ).resolve_max_speculative_num_draft_tokens(server_args)
+    if (
+        result is not None
+        and cfg.speculative_num_draft_tokens is not None
+        and result < cfg.speculative_num_draft_tokens
+    ):
+        raise ValueError(
+            "The speculative algorithm declared "
+            f"max_speculative_num_draft_tokens={result}, below the configured "
+            "speculative_num_draft_tokens="
+            f"{cfg.speculative_num_draft_tokens}."
         )
-        # TODO: adaptive spec currently requires topk=1, so each runtime
-        # state needs steps + 1 draft-token slots. Revisit this if topk>1
-        # is supported.
-        result = max(candidate_steps) + 1
     if getattr(server_args, "_resolution_finished", False):
         server_args._max_speculative_num_draft_tokens = result
     return result

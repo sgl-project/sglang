@@ -939,14 +939,22 @@ class RuntimeContext:
             _resolved_or_field(server_args, "enable_torch_compile", False)
         )
         self._server_args = server_args
-        # The adaptive draft-token bound memoizes on the config *path*, so a new
-        # publication that reuses the path must not inherit the bound computed
-        # from the file's previous contents.
-        _adaptive_draft_token_bound.cache_clear()
         # Snapshot resolved config into the namespace bags (the single source of
         # truth for config reads). Driven by NS(...) metadata; a mock/partial
         # config with no NS markers yields an empty tree (no bags projected).
         self._config_bags = _build_config_bags(server_args)
+        spec = self._config_bags.get("spec")
+        if spec is not None:
+            from sglang.srt.arg_groups.overrides import (
+                max_speculative_num_draft_tokens as max_draft_tokens_of,
+            )
+
+            # Keep the launch-time capacity stable while adaptive algorithms
+            # change the active width in this bag.
+            spec._set(
+                "max_speculative_num_draft_tokens",
+                max_draft_tokens_of(server_args),
+            )
         # Wire the published `parallel` bag onto the live wrapper: it is the slot
         # the `config` property reads, which is how config-only leaves like
         # pp_max_micro_batch_size are spelled.
@@ -1625,7 +1633,6 @@ def restore_context(state: dict[str, Any]) -> None:
             setattr(_CONTEXT, name, value)
     for name, value in state["__parallel__"].items():
         setattr(_CONTEXT.parallel, name, value)
-    _adaptive_draft_token_bound.cache_clear()
     set_global_dwdp_manager(state["__dwdp__"])
 
 
@@ -1639,7 +1646,6 @@ def reset_context() -> None:
     """
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
-    _adaptive_draft_token_bound.cache_clear()
     _CONTEXT._overrides_log = []
     _CONTEXT._publish_role = None
     _CONTEXT.parallel._config = None
@@ -1917,32 +1923,22 @@ def mamba_track_grid(tree_page: int) -> int:
 def max_speculative_num_draft_tokens() -> int | None:
     """The largest draft-token count speculative decoding may use.
 
-    All three inputs are ``spec`` leaves, so this derives from the bags and
-    follows a post-publish override; ``overrides.max_speculative_num_draft_tokens``
-    is the pre-publish equivalent. Adaptive spec resolves the count from its
-    candidate-step table instead of the flat field.
+    Adaptive algorithms may switch to a longer state after the scheduler
+    reserves KV for the next decode batch, so include the capacity captured
+    when the resolved configuration was published.
     """
     spec = get_spec()
-    if spec.speculative_num_draft_tokens is None:
-        return None
-    if not spec.speculative_adaptive:
-        return spec.speculative_num_draft_tokens
-    # The adaptive branch parses a JSON config, and this is called per decode
-    # batch (`spec_prepare_for_decode`), so memoize on the inputs -- keyed, not
-    # cached once, so a post-publish override still recomputes.
-    return _adaptive_draft_token_bound(spec.speculative_adaptive_config)
-
-
-@functools.lru_cache(maxsize=8)
-def _adaptive_draft_token_bound(cfg_path: str | None) -> int:
-    from sglang.srt.speculative.adaptive_spec_params import (
-        resolve_candidate_steps_from_config,
+    return max(
+        (
+            bound
+            for bound in (
+                spec.speculative_num_draft_tokens,
+                spec.max_speculative_num_draft_tokens,
+            )
+            if bound is not None
+        ),
+        default=None,
     )
-
-    candidate_steps = resolve_candidate_steps_from_config(cfg_path=cfg_path)
-    # Adaptive spec requires topk=1 today, so each runtime state needs
-    # steps + 1 draft-token slots (mirrors the ServerArgs member).
-    return max(candidate_steps) + 1
 
 
 def uses_mla_backend() -> bool:

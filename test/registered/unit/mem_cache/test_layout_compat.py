@@ -14,7 +14,7 @@
 """Unit tests for the page-major envelope byte layout.
 
 The subject here is the ENVELOPE — the byte layout the unified pool stores its
-KV in — pinned through ``MHASubPoolSpec``'s offset math. The dense 3-D views
+KV in — pinned through ``MHASubPoolSpec``'s offset math. The 3-D per-layer views
 the pool exposes over the same bytes are covered by
 ``test_unified_mha_views.py``, which also pins the view addressing
 against the envelope formula byte for byte.

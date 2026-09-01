@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     ComponentOffloadStrategy,
     ResidentStrategy,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+    ImageEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding import (
     RealtimeTextEncodingStage,
 )
@@ -253,11 +256,46 @@ def test_realtime_text_encoder_use_starts_at_call_site():
     stage.text_encoders = [None]
     stage._registered_stage_name = None
 
-    uses = stage.component_uses(SimpleNamespace(), "RealtimeTextEncodingStage")
+    uses = stage.component_uses(
+        SimpleNamespace(component_precisions={}, pipeline_config=None),
+        "RealtimeTextEncodingStage",
+    )
 
     assert len(uses) == 1
     assert uses[0].component_name == "text_encoder"
     assert uses[0].start_at_stage_entry is False
+
+
+def test_image_encoder_use_has_exact_precision():
+    stage = ImageEncodingStage.__new__(ImageEncodingStage)
+    stage.image_encoder = object()
+    stage.text_encoder = None
+    stage._registered_stage_name = None
+
+    uses = stage.component_uses(
+        SimpleNamespace(component_precisions={"image_encoder": "fp16"}),
+        "ImageEncodingStage",
+    )
+
+    assert [(use.component_name, use.target_dtype) for use in uses] == [
+        ("image_encoder", torch.float16)
+    ]
+
+
+def test_image_encoder_use_preserves_loaded_dtype_without_override():
+    stage = ImageEncodingStage.__new__(ImageEncodingStage)
+    stage.image_encoder = object()
+    stage.text_encoder = None
+    stage._registered_stage_name = None
+
+    uses = stage.component_uses(
+        SimpleNamespace(component_precisions={}),
+        "ImageEncodingStage",
+    )
+
+    assert [(use.component_name, use.target_dtype) for use in uses] == [
+        ("image_encoder", None)
+    ]
 
 
 def test_qwen_layered_uses_loaded_text_encoder(monkeypatch):
