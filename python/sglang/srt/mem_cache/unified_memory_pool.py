@@ -708,11 +708,8 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         # Lifetime owned by UnifiedKVPool; do not delete the views.
         pass
 
-    # `KVIndexTranslator.rebind_write_loc` already collapsed the widened id and
-    # sent the rows this rank does not own to the padding sink, so the write
-    # kernels must not re-apply the owner rule and the OOB bound is `_view_rows`
-    # (== size + page_size), not that times dcp_size. Declaring it is all this
-    # pool needs: the write doors themselves are the base class's.
+    # `rebind_write_loc` already collapsed the widened id and sent the rows this
+    # rank does not own to the padding sink.
     write_loc_is_dcp_resolved = True
 
     def get_kv_size_bytes(self):
@@ -1339,9 +1336,8 @@ def init_unified_mamba_pools(
         max_size=req_to_token_pool._shared_mamba_size,
         device=device,
     )
-    # Installs over the refusing default (the pool could not be given this at
-    # construction -- it is one hop of the cycle that ends at this allocator).
-    # Feeds the HiCache offload path, gated off for the unified pool today.
+    # Installs over the refusing default; the pool is one hop of the cycle that
+    # ends at this allocator, so it could not be given this at construction.
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
     # No full-KV translate hook is wired: both MLA doors now receive

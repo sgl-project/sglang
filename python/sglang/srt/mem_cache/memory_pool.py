@@ -3625,18 +3625,15 @@ def mamba_slot_identity(mamba_indices: torch.Tensor) -> torch.Tensor:
 
 
 def mamba_slot_translate_unset(mamba_indices: torch.Tensor) -> torch.Tensor:
-    """Default `mamba_translate`: refuses instead of assuming identity.
+    """Default `mamba_translate`: refuses rather than assuming identity.
 
     The unified pool cannot pass its own at construction -- pool -> allocator ->
-    slot allocator -> translate -> pool is a cycle -- so it installs one right
-    after. Defaulting to identity would make a dropped install offload the
-    wrong slots silently; defaulting to a raise makes it say so.
+    slot allocator -> translate -> pool is a cycle -- so it installs one after.
     """
     raise RuntimeError(
-        "mamba_translate was never installed on this HybridLinearKVPool, so "
-        "its mamba slot ids cannot be resolved. A static pool passes "
-        "mamba_slot_identity at construction; the unified pool installs the "
-        "allocator's translate right after building the slot allocator."
+        "mamba_translate was never installed on this HybridLinearKVPool: a "
+        "static pool passes mamba_slot_identity, the unified pool installs the "
+        "allocator's translate once the slot allocator exists."
     )
 
 
@@ -3668,10 +3665,8 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
-        # HiCache offload resolves mamba slots through this. The default
-        # REFUSES rather than assuming identity: the unified pool stores
-        # VIRTUAL slot ids, so a forgotten install must not read as "no
-        # translation needed". A static pool passes `mamba_slot_identity`.
+        # HiCache offload resolves mamba slots through this; the unified pool
+        # holds VIRTUAL ones. See `mamba_slot_translate_unset` for the default.
         mamba_translate: Callable[
             [torch.Tensor], torch.Tensor
         ] = mamba_slot_translate_unset,
@@ -4105,11 +4100,9 @@ class MLATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
-    # Does the WRITE loc reaching this pool already have the DCP owner rule
-    # resolved? False here: `set_mla_kv_buffer` takes a WIDENED loc and its
-    # kernel collapses it. The unified pool resolves it in Python instead
-    # (KVIndexTranslator.rebind_write_loc), so it flips this rather than
-    # re-implementing the write doors -- one method body, no drift.
+    # Has the WRITE loc reaching this pool already had the DCP owner rule
+    # resolved? False here: `set_mla_kv_buffer` takes a WIDENED loc. The unified
+    # pool resolves it in `KVIndexTranslator.rebind_write_loc` and flips this.
     write_loc_is_dcp_resolved = False
 
     @property
@@ -4124,12 +4117,7 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        """Scatter through the entry point matching this pool's write-loc space.
-
-        Picking by name rather than handing the kernel a width: the DCP width is
-        live topology, so the kernel that needs it reads it, and a pool whose loc
-        space has no sharding left calls the entry point that never asks.
-        """
+        """Scatter through the entry point matching this pool's write-loc space."""
         if self.write_loc_is_dcp_resolved:
             set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
         else:
@@ -4154,14 +4142,10 @@ class MLATokenToKVPool(KVCache):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         assert not self.dsa_kv_cache_store_fp8
-        # With an unresolved write loc this door cannot be made DCP-aware: the
-        # two backends that could reach it disagree on the loc space --
-        # flashinfer-MLA's `k_rope is None` branch passes a WIDENED loc (needs
-        # select + collapse), the Triton backend passes one it already
-        # collapsed. `set_mla_kv_buffer` is the DCP-aware door, and every MLA
-        # write takes it today; the masked-but-undivided branch that used to sit
-        # here wrote widened ids straight into a rank-local buffer. A pool that
-        # resolved the loc before the call (the unified one) is unaffected.
+        # An unresolved write loc cannot be made DCP-aware here: the two
+        # backends that reach this door disagree on the loc space --
+        # flashinfer-MLA's `k_rope is None` branch passes a WIDENED loc, the
+        # Triton backend one it already collapsed.
         assert self.write_loc_is_dcp_resolved or not get_parallel().dcp_enabled, (
             "MLATokenToKVPool.set_kv_buffer has no DCP-aware write path. Under "
             "--dcp-size > 1 the MLA write must go through set_mla_kv_buffer, "
@@ -4186,8 +4170,6 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        # Every branch below writes at this pool's own write-loc space, so each
-        # passes the owner rule that space still carries (`1, 0` once resolved).
         assert not (
             self.write_loc_is_dcp_resolved
             and (self.use_dsa or self.dsa_kv_cache_store_fp8)

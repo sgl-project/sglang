@@ -191,10 +191,8 @@ def set_mla_kv_buffer_triton(
 ):
     """Scatter at locs that already address this rank's rows.
 
-    Nothing to select or collapse, so this asks the parallel context nothing.
-    Under DCP the caller must have resolved the owner rule already (the unified
-    pool does it in `KVIndexTranslator.rebind_write_loc`); a widened loc reaches
-    the wrong row here. `set_mla_kv_buffer_dcp_sharded_triton` is that case.
+    A DCP-widened loc reaches the wrong row here; that case is
+    `set_mla_kv_buffer_dcp_sharded_triton`.
     """
     _set_mla_kv_buffer_impl(
         kv_buffer,
@@ -215,11 +213,7 @@ def set_mla_kv_buffer_dcp_sharded_triton(
     *,
     reserved_skip_index: int = 0,
 ):
-    """Scatter at DCP-WIDENED locs: select this rank's ids and collapse them.
-
-    The width is a live topology read, not an argument -- a stamped one is a
-    quotient of whatever the group was when someone passed it.
-    """
+    """Scatter at DCP-WIDENED locs: select this rank's ids and collapse them."""
     parallel = get_parallel()
     _set_mla_kv_buffer_impl(
         kv_buffer,

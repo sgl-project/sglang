@@ -155,12 +155,10 @@ class KVIndexTranslator:
                 else None
             )
 
-        # One fact, two owners: this translator decides whether the write loc is
-        # rebound (`rebind_write_loc` no-ops when not translating), and the MLA
-        # pool declares whether it arrives rebound. They must agree, or the
-        # write kernel applies the owner rule zero times or twice -- silently.
-        # Not derivable from `kernel_page_blocks`: a rank owning a single
-        # full-attention layer has blocks_per_page 1 and still gets translated.
+        # One fact, two owners: this decides whether the write loc is rebound,
+        # the MLA pool declares whether it arrives rebound. Not derivable from
+        # `kernel_page_blocks` -- a rank owning one full-attention layer has
+        # blocks_per_page 1 and is still translated.
         full_pool = (
             token_to_kv_pool.full_kv_pool
             if isinstance(token_to_kv_pool, HybridLinearKVPool)
