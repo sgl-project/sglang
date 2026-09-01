@@ -73,12 +73,21 @@ sgl-eval run aime26 \\
   --temperature 1.0 --top-p 0.95 --thinking \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
+      aime25_pct:
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run aime25 \\
+  --model {{MODEL_NAME}} --api-key <api-key> \\
+  --n-repeats 16 --max-tokens 64000 \\
+  --temperature 1.0 --top-p 0.95 --thinking \\
+  --out-dir /sgl-workspace/logs \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
     },
     numPromptsByConc: { 1: 8, 16: 64, 64: 128, 256: 512, 1024: 2048, 4096: 8192 },
   },
 
   accuracyLabels: [
     ["aime26_pct", "AIME26",         "%"],
+    ["aime25_pct", "AIME25",         "%"],
     ["gsm8k_pct", "GSM8K (1-shot)", "%"],
   ],
 

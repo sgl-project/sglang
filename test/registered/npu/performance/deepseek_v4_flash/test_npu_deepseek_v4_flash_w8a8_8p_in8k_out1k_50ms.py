@@ -8,12 +8,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(
-    est_time=1800,
-    suite="nightly-perf-16-npu-a3",
-    nightly=True,
-    disabled="Testcase bug, temporarily disabled",
-)
+register_npu_ci(est_time=1800, suite="nightly-perf-16-npu-a3", nightly=True)
 
 # Environment variables for DSV4-Flash single-node PD-mix deployment.
 DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
