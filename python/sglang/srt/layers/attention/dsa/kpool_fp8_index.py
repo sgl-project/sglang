@@ -4,45 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.dsa.utils import (
-    INDEXER_K_CACHE_PRESHUFFLE_TILE,
-    aiter_can_use_preshuffle_paged_mqa,
-)
-from sglang.srt.utils import is_hip
-
 BLOCK_SIZE_K = 64
 INDEX_HEAD_DIM = 128
 KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-
-
-def _preshuffle_tile() -> int:
-    return (
-        INDEXER_K_CACHE_PRESHUFFLE_TILE if aiter_can_use_preshuffle_paged_mqa() else 0
-    )
-
-
-@triton.jit
-def _kpool_cache_k_offsets(
-    page,
-    slot,
-    cols,
-    PAGE_BYTES: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    PRESHUFFLE_TILE: tl.constexpr,
-):
-    if PRESHUFFLE_TILE:
-        token_tile_id = slot // PRESHUFFLE_TILE
-        token_in_tile = slot % PRESHUFFLE_TILE
-        col_tile_id = cols // PRESHUFFLE_TILE
-        col_in_tile = cols % PRESHUFFLE_TILE
-        return (
-            page * PAGE_BYTES
-            + token_tile_id * (PRESHUFFLE_TILE * HEAD_DIM)
-            + col_tile_id * (PRESHUFFLE_TILE * PRESHUFFLE_TILE)
-            + token_in_tile * PRESHUFFLE_TILE
-            + col_in_tile
-        )
-    return page * PAGE_BYTES + slot * HEAD_DIM + cols
 
 
 def kpool_max_closed_pools(num_draft_tokens: int, pool_size: int) -> int:
@@ -97,7 +61,6 @@ def gather_index_k_scale_prefix_into(
         BUF_NUMEL_PER_PAGE=buf.shape[1],
         HEAD_DIM=INDEX_HEAD_DIM,
         S_OFFSET_NBYTES_IN_PAGE=pool.page_size * INDEX_HEAD_DIM,
-        PRESHUFFLE_TILE=_preshuffle_tile(),
         BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
     )
 
@@ -113,7 +76,6 @@ def _gather_index_k_scale_prefix_into_kernel(
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
-    PRESHUFFLE_TILE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     token_id = tl.program_id(0)
@@ -123,14 +85,7 @@ def _gather_index_k_scale_prefix_into_kernel(
 
     offs = tl.arange(0, BLOCK_D)
     mask = offs < HEAD_DIM
-    src_k_offsets = _kpool_cache_k_offsets(
-        page,
-        token_offset_in_page,
-        offs,
-        BUF_NUMEL_PER_PAGE,
-        HEAD_DIM,
-        PRESHUFFLE_TILE,
-    )
+    src_k_offsets = page * BUF_NUMEL_PER_PAGE + token_offset_in_page * HEAD_DIM + offs
     dst_k_offsets = token_id * HEAD_DIM + offs
     k = tl.load(buf_u8_ptr + src_k_offsets, mask=mask)
     tl.store(k_out_ptr + dst_k_offsets, k, mask=mask)
@@ -617,22 +572,6 @@ def topk_from_pooled_history_logits(
             f"is disabled. Got device={logits.device}, dtype={logits.dtype}."
         )
 
-    # The JIT kernel covers group_topk <= 512 on CUDA/HIP; HIP 2048 still
-    # requires the legacy AOT fallback.
-    if is_hip() and group_topk == 2048:
-        return _topk_from_pooled_history_logits_unfused(
-            logits=logits,
-            group_lengths=group_lengths,
-            pool_size=pool_size,
-            topk=topk,
-            page_table=page_table,
-            topk_offsets=topk_offsets,
-            seq_lens=seq_lens,
-            row_starts=row_starts,
-            out_rows=out_rows,
-            page_table_row_index=page_table_row_index,
-        )
-
     if group_topk in (128, 160, 192, 224, 256, 512):
         from sglang.kernels.ops.moe.kpool_topk_transform import (
             fast_kpool_topk_transform_fused,
@@ -694,66 +633,6 @@ def topk_from_pooled_history_logits(
             pool_lens=group_lengths,
             pool_size=pool_size,
             page_table=page_table,
-            topk_offsets=topk_offsets,
-        )
-    if out_rows is None or out_rows == result.shape[0]:
-        return result
-    padded = torch.full(
-        (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
-    )
-    padded[: result.shape[0]] = result
-    return padded
-
-
-def _topk_from_pooled_history_logits_unfused(
-    logits: torch.Tensor,
-    group_lengths: torch.Tensor,
-    pool_size: int,
-    topk: int,
-    page_table: torch.Tensor | None = None,
-    topk_offsets: torch.Tensor | None = None,
-    seq_lens: torch.Tensor | None = None,
-    row_starts: torch.Tensor | None = None,
-    out_rows: int | None = None,
-    page_table_row_index: torch.Tensor | None = None,
-) -> torch.Tensor:
-    from sglang.srt.layers.attention.dsa.dsa_topk_backend import _topk_unfused
-
-    group_topk = history_group_budget_for_topk(topk, pool_size)
-    selected_groups = _topk_unfused(
-        logits,
-        group_lengths,
-        group_topk,
-        row_starts=row_starts,
-        topk_op=torch.topk,
-        topk_op_kwargs={"dim": -1},
-    )
-    group_valid = selected_groups >= 0
-
-    page_table_for_rows = page_table
-    if page_table_row_index is not None:
-        assert page_table is not None
-        page_table_for_rows = page_table.index_select(
-            0, page_table_row_index.to(dtype=torch.int64, device=page_table.device)
-        )
-
-    expanded = expand_pooled_groups_to_topk(
-        selected_groups.contiguous(),
-        group_valid,
-        topk=topk,
-        pool_size=pool_size,
-        page_table=page_table_for_rows,
-        topk_offsets=topk_offsets,
-    )
-    if seq_lens is None:
-        result = expanded
-    else:
-        result = append_kpool_tail_to_topk(
-            expanded,
-            seq_lens=seq_lens,
-            pool_lens=group_lengths,
-            pool_size=pool_size,
-            page_table=page_table_for_rows,
             topk_offsets=topk_offsets,
         )
     if out_rows is None or out_rows == result.shape[0]:
@@ -849,7 +728,6 @@ def kpool_softmax_rotate_write_cache(
         POOL_SIZE=slot_k.shape[1],
         HEAD_DIM=slot_k.shape[2],
         S_OFFSET_NBYTES_IN_PAGE=pool.page_size * pool.index_head_dim,
-        PRESHUFFLE_TILE=_preshuffle_tile(),
         ROUND_SCALE=round_scale,
         HAS_WRITE_MASK=has_write_mask,
         RETURN_COMPRESSED=return_compressed,
@@ -945,7 +823,6 @@ def kpool_decode_update_and_maybe_write_cache(
         HEAD_DIM=tail_k.shape[2],
         BLOCK_TABLE_COLS=block_tables.shape[1],
         S_OFFSET_NBYTES_IN_PAGE=pool.slots_per_page * pool.index_head_dim,
-        PRESHUFFLE_TILE=_preshuffle_tile(),
         ROUND_SCALE=round_scale,
         BLOCK_D=triton.next_power_of_2(tail_k.shape[2]),
         SLOTS_PER_PAGE=pool.slots_per_page,
@@ -995,7 +872,6 @@ def _kpool_softmax_rotate_write_cache_kernel(
     POOL_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
-    PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
     HAS_WRITE_MASK: tl.constexpr,
     RETURN_COMPRESSED: tl.constexpr,
@@ -1071,13 +947,10 @@ def _kpool_softmax_rotate_write_cache_kernel(
         loc = tl.load(loc_ptr + row, mask=do_write, other=0)
         loc_page_index = loc // PAGE_SIZE
         loc_token_offset_in_page = loc % PAGE_SIZE
-        out_k_offsets = _kpool_cache_k_offsets(
-            loc_page_index,
-            loc_token_offset_in_page,
-            offs,
-            BUF_NUMEL_PER_PAGE,
-            HEAD_DIM,
-            PRESHUFFLE_TILE,
+        out_k_offsets = (
+            loc_page_index * BUF_NUMEL_PER_PAGE
+            + loc_token_offset_in_page * HEAD_DIM
+            + offs
         )
         out_s_offset = (
             loc_page_index * BUF_NUMEL_PER_PAGE // 4
@@ -1127,7 +1000,6 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_TABLE_COLS: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
-    PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
     SLOTS_PER_PAGE: tl.constexpr,
@@ -1240,13 +1112,10 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
         )
         loc_page_index = packed_page.to(tl.int64)
         loc_token_offset_in_page = pool_id % SLOTS_PER_PAGE
-        out_k_offsets = _kpool_cache_k_offsets(
-            loc_page_index,
-            loc_token_offset_in_page,
-            offs,
-            BUF_NUMEL_PER_PAGE,
-            HEAD_DIM,
-            PRESHUFFLE_TILE,
+        out_k_offsets = (
+            loc_page_index * BUF_NUMEL_PER_PAGE
+            + loc_token_offset_in_page * HEAD_DIM
+            + offs
         )
         out_s_offset = (
             loc_page_index * BUF_NUMEL_PER_PAGE // 4
@@ -1306,7 +1175,6 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
     TAIL_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
-    PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
     HAS_WRITE_MASK: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -1354,13 +1222,8 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
     loc = tl.load(loc_ptr + row)
     loc_page_index = loc // SLOTS_PER_PAGE
     loc_token_offset_in_page = loc % SLOTS_PER_PAGE
-    out_k_offsets = _kpool_cache_k_offsets(
-        loc_page_index,
-        loc_token_offset_in_page,
-        offs,
-        BUF_NUMEL_PER_PAGE,
-        HEAD_DIM,
-        PRESHUFFLE_TILE,
+    out_k_offsets = (
+        loc_page_index * BUF_NUMEL_PER_PAGE + loc_token_offset_in_page * HEAD_DIM + offs
     )
     out_s_offset = (
         loc_page_index * BUF_NUMEL_PER_PAGE // 4
@@ -1431,7 +1294,6 @@ def kpool_assemble_softmax_rotate_write_cache(
         TAIL_SIZE=tail_k.shape[1],
         HEAD_DIM=INDEX_HEAD_DIM,
         S_OFFSET_NBYTES_IN_PAGE=slots_per_page * INDEX_HEAD_DIM,
-        PRESHUFFLE_TILE=_preshuffle_tile(),
         ROUND_SCALE=round_scale,
         HAS_WRITE_MASK=has_write_mask,
         BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
@@ -1529,7 +1391,6 @@ def _pack_pool_slots_to_payload_kernel(
     head_dim: tl.constexpr,
     page_bytes: tl.constexpr,
     scale_region_off: tl.constexpr,
-    PRESHUFFLE_TILE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -1540,14 +1401,7 @@ def _pack_pool_slots_to_payload_kernel(
 
     offs = tl.arange(0, BLOCK_D)
     mask = offs < head_dim
-    src = _kpool_cache_k_offsets(
-        page,
-        slot,
-        offs,
-        page_bytes,
-        head_dim,
-        PRESHUFFLE_TILE,
-    )
+    src = page_base + slot * head_dim + offs
     val = tl.load(buf_ptr + src, mask=mask, other=0).to(tl.uint8)
     tl.store(payload_ptr + row * payload_bytes + offs, val, mask=mask)
 
@@ -1570,7 +1424,6 @@ def _select_and_scatter_pool_slots_kernel(
     page_bytes: tl.constexpr,
     scale_region_off: tl.constexpr,
     n_total: tl.constexpr,
-    PRESHUFFLE_TILE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -1587,14 +1440,7 @@ def _select_and_scatter_pool_slots_kernel(
     offs = tl.arange(0, BLOCK_D)
     mask = offs < head_dim
     val = tl.load(recv_ptr + recv_row_base + offs, mask=mask, other=0).to(tl.uint8)
-    dst = _kpool_cache_k_offsets(
-        page,
-        slot,
-        offs,
-        page_bytes,
-        head_dim,
-        PRESHUFFLE_TILE,
-    )
+    dst = page_base + slot * head_dim + offs
     tl.store(buf_ptr + dst, val, mask=mask)
 
     s_offs = tl.arange(0, 4)
@@ -1636,7 +1482,6 @@ def all_gather_and_scatter_pool_slots(
         head_dim=head_dim,
         page_bytes=page_bytes,
         scale_region_off=scale_region_off,
-        PRESHUFFLE_TILE=_preshuffle_tile(),
         BLOCK_D=triton.next_power_of_2(head_dim),
     )
 
@@ -1659,7 +1504,6 @@ def all_gather_and_scatter_pool_slots(
         page_bytes=page_bytes,
         scale_region_off=scale_region_off,
         n_total=n_total,
-        PRESHUFFLE_TILE=_preshuffle_tile(),
         BLOCK_D=triton.next_power_of_2(head_dim),
     )
 
@@ -1693,7 +1537,6 @@ def _kpool_write_tail_and_maybe_compress_kernel(
     SLOTS_PER_PAGE: tl.constexpr,
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
-    PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
     HAS_EFFECTIVE_N: tl.constexpr,
     MAX_CLOSED_POOLS: tl.constexpr,
@@ -1758,13 +1601,10 @@ def _kpool_write_tail_and_maybe_compress_kernel(
             loc = tl.load(write_loc_ptr + b * write_loc_stride_0 + p)
             loc_page_index = loc // SLOTS_PER_PAGE
             loc_token_offset_in_page = loc % SLOTS_PER_PAGE
-            out_k_offsets = _kpool_cache_k_offsets(
-                loc_page_index,
-                loc_token_offset_in_page,
-                offs,
-                BUF_NUMEL_PER_PAGE,
-                HEAD_DIM,
-                PRESHUFFLE_TILE,
+            out_k_offsets = (
+                loc_page_index * BUF_NUMEL_PER_PAGE
+                + loc_token_offset_in_page * HEAD_DIM
+                + offs
             )
             out_s_offset = (
                 loc_page_index * BUF_NUMEL_PER_PAGE // 4
@@ -1855,7 +1695,6 @@ def kpool_write_tail_and_maybe_compress(
         SLOTS_PER_PAGE=slots_per_page,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
         S_OFFSET_NBYTES_IN_PAGE=slots_per_page * pool.index_head_dim,
-        PRESHUFFLE_TILE=_preshuffle_tile(),
         ROUND_SCALE=round_scale,
         HAS_EFFECTIVE_N=effective_n_per_batch is not None,
         MAX_CLOSED_POOLS=max_closed_pools,

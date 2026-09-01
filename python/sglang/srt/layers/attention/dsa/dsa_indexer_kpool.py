@@ -30,7 +30,6 @@ if is_npu():
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import (
-    aiter_can_use_preshuffle_paged_mqa,
     cp_zigzag_full_plan_rows,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -166,39 +165,6 @@ class IndexerKPool(MultiPlatformOp):
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
-
-    @staticmethod
-    def _fp8_mqa_logits(
-        q_fp8: torch.Tensor,
-        k_fp8: torch.Tensor,
-        k_scale: torch.Tensor,
-        weights: torch.Tensor,
-        starts: torch.Tensor,
-        ends: torch.Tensor,
-        *,
-        clean_logits: bool,
-    ) -> torch.Tensor:
-        if is_hip():
-            from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
-            return fp8_mqa_logits(
-                q_fp8,
-                k_fp8,
-                k_scale,
-                weights,
-                starts,
-                ends,
-                clean_logits=clean_logits,
-            )
-
-        return deep_gemm.fp8_mqa_logits(
-            q_fp8,
-            (k_fp8, k_scale),
-            weights,
-            starts,
-            ends,
-            clean_logits=clean_logits,
-        )
 
     @staticmethod
     def _cp_gather_concat(
@@ -866,7 +832,7 @@ class IndexerKPool(MultiPlatformOp):
         if not is_cuda():
             return False
         arch_major, _ = torch.cuda.get_device_capability(q_fp8.device)
-        num_heads = q_fp8.shape[1]
+        num_heads = q_fp8.shape[2]
         return arch_major == 9 and num_heads not in (32, 64)
 
     def _get_topk_paged(
@@ -903,6 +869,7 @@ class IndexerKPool(MultiPlatformOp):
         if n_real < num_q_padded:
             q_fp8 = q_fp8[:n_real]
             weights = weights[:n_real]
+        q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache_fp8.shape) == 2
         block_kv = 64
         num_heads_kv = 1
@@ -912,11 +879,7 @@ class IndexerKPool(MultiPlatformOp):
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        use_aiter_paged_mqa = is_hip()
-        use_tilelang_paged_mqa = (
-            not use_aiter_paged_mqa
-            and self._should_use_tilelang_paged_mqa_logits(q_fp8)
-        )
+        use_tilelang_paged_mqa = self._should_use_tilelang_paged_mqa_logits(q_fp8)
 
         pool_seqlens, pool_context_lens, pool_block_tables, pool_schedule_metadata = (
             self._get_kpool_decode_metadata(
@@ -924,36 +887,17 @@ class IndexerKPool(MultiPlatformOp):
                 block_tables,
                 seqlens_32,
                 blocksize,
-                build_schedule_metadata=not (
-                    use_aiter_paged_mqa or use_tilelang_paged_mqa
-                ),
+                build_schedule_metadata=not use_tilelang_paged_mqa,
             )
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
-        if use_aiter_paged_mqa:
-            if not aiter_can_use_preshuffle_paged_mqa():
-                raise RuntimeError(
-                    "ROCm kpool indexer requires the AITER preshuffle paged-MQA kernel"
-                )
-            from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits
-
-            logits = aiter_paged_mqa_logits(
-                q_fp8,
-                kv_cache_fp8,
-                weights,
-                pool_seqlens,
-                pool_block_tables,
-                pool_max_seq_len,
-                preshuffle=True,
-                kv_block_size=block_kv,
-            )
-        elif use_tilelang_paged_mqa:
+        if use_tilelang_paged_mqa:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits,
             )
 
             logits = tilelang_fp8_paged_mqa_logits(
-                q_fp8.unsqueeze(1),
+                q_fp8,
                 kv_cache_fp8,
                 weights,
                 pool_seqlens,
@@ -964,7 +908,7 @@ class IndexerKPool(MultiPlatformOp):
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8.unsqueeze(1),
+                q_fp8,
                 kv_cache_fp8,
                 weights,
                 pool_context_lens,
@@ -1051,10 +995,9 @@ class IndexerKPool(MultiPlatformOp):
                 scale_out=k_scale,
             )
             k_fp8 = k_u8.view(torch.float8_e4m3fn)
-            logits = self._fp8_mqa_logits(
+            logits = deep_gemm.fp8_mqa_logits(
                 q_fp8[:n_real].contiguous(),
-                k_fp8.contiguous(),
-                k_scale.contiguous(),
+                (k_fp8.contiguous(), k_scale.contiguous()),
                 weights[:n_real].contiguous(),
                 ks_per_q,
                 ke_per_q,
@@ -1166,10 +1109,9 @@ class IndexerKPool(MultiPlatformOp):
             ke = torch.div(tail_tokens, pool_size, rounding_mode="floor").to(
                 torch.int32
             )
-            logits = self._fp8_mqa_logits(
+            logits = deep_gemm.fp8_mqa_logits(
                 q_work,
-                k_fp8.contiguous(),
-                k_scale.contiguous(),
+                (k_fp8.contiguous(), k_scale.contiguous()),
                 weights_work,
                 ks,
                 ke,
@@ -1401,10 +1343,9 @@ class IndexerKPool(MultiPlatformOp):
                     and zero_starts_by_batch[i] is not None
                     else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
                 )
-                local_logits = self._fp8_mqa_logits(
+                local_logits = deep_gemm.fp8_mqa_logits(
                     q_fp8[q_slice].contiguous(),
-                    k_fp8.contiguous(),
-                    k_scale.contiguous(),
+                    (k_fp8.contiguous(), k_scale.contiguous()),
                     weights[q_slice].contiguous(),
                     row_starts,
                     local_pool_lens,
@@ -1749,7 +1690,7 @@ class IndexerKPool(MultiPlatformOp):
         if weights is None:
             weights = self._get_logits_head_gate(x, q_scale)
 
-        if is_cuda() or is_hip():
+        if is_cuda():
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
