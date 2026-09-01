@@ -1906,9 +1906,8 @@ class FlashInferIndicesUpdaterPrefill:
                         sliding_window_size + seq_lens - prefix_lens,
                     )
                     if prefix_is_full_seq and seq_lens_cpu is not None:
-                        # prefix_lens is seq_lens here, so the trim above is just
-                        # min(seq_lens, window); the host mirror sums it without
-                        # draining the stream.
+                        # prefix_lens is seq_lens, so the trim is min(seq_lens, window);
+                        # summing the host mirror avoids draining the stream.
                         paged_kernel_lens_sum = int(
                             torch.clamp(seq_lens_cpu, max=sliding_window_size).sum()
                         )
