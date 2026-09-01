@@ -61,11 +61,11 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_triton_kernels_available,
+    is_xpu,
     next_power_of_2,
     round_up,
     set_weight_attrs,
     use_intel_amx_backend,
-    use_intel_xpu_backend,
 )
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
@@ -194,6 +194,7 @@ if TYPE_CHECKING:
 
 _is_cpu = is_cpu()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
@@ -528,7 +529,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
             )
-        elif use_intel_xpu_backend():
+        elif _is_xpu:
             # The XPU grouped GEMM recovers K/N from the packed weight shapes and
             # the group size from the scale shape, so it takes the checkpoint
             # dims. Keep this ahead of the triton_kernels branch so an installed
@@ -1076,7 +1077,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         layer.w2_weight_bias.float(), requires_grad=False
                     )
             return
-        elif use_intel_xpu_backend():
+        elif _is_xpu:
             # sgl-kernel-xpu's W4A16 grouped GEMM consumes the checkpoint MXFP4
             # layout: packed e2m1 [E, N, K/2] plus N-outer ue8m0 scales
             # [E, N, K/32] uint8, with GPT-OSS's interleaved
@@ -1613,7 +1614,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
             return StandardCombineInput(hidden_states=output)
 
-        if use_intel_xpu_backend():
+        if _is_xpu:
             # sgl-kernel-xpu path: moe_grouped_mm_nt_xe20_w4a16 consumes the
             # packed MXFP4 weights directly, so no dequantization happens.
             from sgl_kernel import fused_experts as sgl_fused_experts

@@ -68,7 +68,6 @@ from sglang.srt.utils import (
     is_mps,
     is_npu,
     is_xpu,
-    use_intel_xpu_backend,
 )
 
 _is_gfx95_supported = is_gfx95_supported()
@@ -109,12 +108,11 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 }
 
 
-# On XPU the OCP-MoE `Mxfp4Config` path is only usable with the sgl-kernel-xpu
-# grouped GEMM (`use_intel_xpu_backend()`), which consumes the packed e2m1 +
-# ue8m0 g32 checkpoint layout directly. Without that backend the method would
-# fall through to the `triton_kernels` bf16 upcast, so keep it unregistered and
-# preserve the existing "unknown quantization method" error.
-if is_cpu() or is_cuda() or _is_gfx95_supported or use_intel_xpu_backend():
+# On XPU the OCP-MoE `Mxfp4Config` path is served by the sgl-kernel-xpu grouped
+# GEMM, which consumes the packed e2m1 + ue8m0 g32 checkpoint layout directly.
+# Other backends without that kernel keep the existing "unknown quantization
+# method" error rather than falling through to a bf16 upcast.
+if is_cpu() or is_cuda() or _is_gfx95_supported or is_xpu():
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,
