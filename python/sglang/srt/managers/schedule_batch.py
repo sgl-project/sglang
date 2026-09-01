@@ -2887,10 +2887,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
 
-        for req in running_batch.reqs:
+        # Same row-length reasoning as convert_decode_to_extend: the caller ran
+        # prepare_for_decode, so the tail's prefix is seq_len - 1 and
+        # len(output_ids) is not a fixed offset from it. Spec keeps the request
+        # state, whose tails carry no overlap delay; its rows sit at the
+        # committed base and seq_lens is rebuilt from r.seqlen below.
+        if self.spec_algorithm.is_none():
+            running_prefix_lens = [s - 1 for s in running_batch.seq_lens_cpu.tolist()]
+        else:
+            running_prefix_lens = [r.seqlen - 1 for r in running_batch.reqs]
+        for req, prefix_len in zip(
+            running_batch.reqs, running_prefix_lens, strict=True
+        ):
             req._refresh_fill_ids()
-            full_len = len(req.full_untruncated_fill_ids)
-            req.set_extend_range(full_len - 1, full_len)
+            req.set_extend_range(prefix_len, prefix_len + 1)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
         self.input_ids = None
@@ -2938,18 +2948,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             merged[-running_bs:] = tail_base + 1
             self.seq_lens = merged
 
-        # For overlap scheduler, the output_ids has one step delay;
-        # spec tail request state carries no delay in either mode.
-        if self.spec_algorithm.is_none():
-            delta = 0 if self.enable_overlap else -1
-        else:
-            delta = -1
-
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
-        self.prefix_lens = self.prefix_lens + [
-            len(r.origin_input_ids) + len(r.output_ids) + delta
-            for r in running_batch.reqs
-        ]
+        self.prefix_lens = self.prefix_lens + running_prefix_lens
         self.extend_lens = self.extend_lens + [1] * running_bs
         self.extend_num_tokens = self.extend_num_tokens + running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
@@ -2972,13 +2972,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Also stale residue; None keeps the prefill result path from
         # re-reporting old prefill stats for what is decode work.
         self.prefill_stats = None
-        # seq_lens already counts the token this step decodes. output_ids lags it
-        # by one only while the previous step's result is unprocessed, and a step
-        # that ran prefill instead of decode drains that lag, so the number of
-        # output tokens is not a fixed offset from the row length here.
-        seq_lens = [int(s) for s in self.seq_lens_cpu.tolist()]
-        for req, seq_len in zip(self.reqs, seq_lens):
+        # Extend positions are arange(prefix, prefix + extend_len), so a 1-token
+        # extend needs prefix == seq_len - 1; prepare_for_decode already counted
+        # this step's token. len(output_ids) is not a fixed offset from seq_len
+        # here: it lags by one while the previous step's result is unprocessed,
+        # and an iteration that ran prefill instead of decode drains that lag.
+        # A beam tail appends rows past the reqs-aligned ones, so slice to bs.
+        seq_lens = self.seq_lens_cpu[:bs].tolist()
+        for req, seq_len in zip(self.reqs, seq_lens, strict=True):
             req._refresh_fill_ids()
+            # end runs one past full_untruncated_fill_ids while the lag holds;
+            # decoding_reqs suppresses the cache_unfinished_req path that would
+            # slice the fill ids by it, and the result path reads only .length.
             req.set_extend_range(seq_len - 1, seq_len)
 
         self.prefix_lens = [seq_len - 1 for seq_len in seq_lens]
