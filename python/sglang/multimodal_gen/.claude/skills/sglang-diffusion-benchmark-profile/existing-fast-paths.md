@@ -77,6 +77,10 @@ framework-specific optimization workflow.
 - Locations: `elementwise.py`, `layernorm.py`, `fused_scale_shift_gate.py`, `qwen_image.py`, `triton/scale_shift.py`
 - Use cases: `x * (1 + scale) + shift`, `a * (k + b) + c`, and Qwen-style `(layernorm/residual layernorm) + scale/shift + gate select`.
 - Constraints: `x` must be CUDA and contiguous. `scale/shift` support 0D/1D/2D/3D/4D broadcast. 4D `[B, F, 1, C]` requires `L % F == 0`.
+- Causal-video cold start: the 4D path uses a static capped power-of-two
+  column tile rather than Triton autotuning. Do not reintroduce request-time
+  autotuning here: LingBot-World calls this path once per transformer block,
+  and tuning overhead can dominate its first denoise step.
 - NPU fallback: `scale_shift.py` swaps to `npu_fallback` native path.
 - Validation: `test/registered/kernels/ops/diffusion/test_qwen_image_modulation.py`.
 
@@ -171,15 +175,15 @@ framework-specific optimization workflow.
 - Constraints: `cos` and `sin` shapes must match `[B, H, S, head_dim / 2]`, and `inner_dim == H * head_dim`.
 - Workflow rule: if LTX-2 traces show a large split-RoPE PyTorch chain, check whether the LTX2-specific Triton path was disabled by shape or dtype before proposing a new RoPE kernel.
 
-10. LTX2 and LongCat-Image residual-gate add fusion
+10. Shared residual-gate add fusion (LTX2, LongCat-Image, SANA, and SANA-Video)
 - Kernel: `diffusion_residual_gate_add`
-- Locations: `kernels/ops/diffusion/modulate/residual_gate_add_jit.py`, `kernels/jit/csrc/diffusion/residual_gate_add.cuh`, `runtime/models/dits/ltx_2.py`, `runtime/models/dits/longcat_image.py`
-- Use case: `residual + update * gate` in LTX2 self-attention, prompt cross-attention, audio/video cross-attention, and feed-forward residual updates, plus LongCat-Image joint- and single-stream transformer residuals.
-- Constraints: `residual`, `update`, and `gate` must be CUDA tensors on the same device, contiguous, same dtype (`fp16`, `bf16`, or `fp32`), with `update.shape == residual.shape`; `gate` can match `residual` or be row-broadcast with the last dimension matching.
-- Behavior: LTX2 and LongCat-Image call `residual_gate_add(...)` from the kernels package directly. The CUDA custom op is used while guards pass. On a runtime exception outside `torch.compile`, it logs once, disables the fast path for the process, and falls back to `residual + update * gate`.
+- Locations: `kernels/ops/diffusion/modulate/residual_gate_add_jit.py`, `kernels/jit/csrc/diffusion/residual_gate_add.cuh`, `runtime/models/dits/ltx_2.py`, `runtime/models/dits/longcat_image.py`, `runtime/models/dits/sana.py`, and `runtime/models/dits/sana_video.py`.
+- Use case: `residual + update * gate` in LTX2 attention/MLP residuals, LongCat-Image joint- and single-stream transformer residuals, and SANA/SANA-Video transformer blocks.
+- Constraints: inputs must be same-device CUDA tensors with one dtype (`fp16`, `bf16`, or `fp32`) and `update.shape == residual.shape`. The ordinary path accepts contiguous inputs and a full or row-broadcast gate. The SANA-Video path also accepts a transposed-dense 3D residual (`stride == (tokens * hidden, 1, tokens)`), a contiguous update, and a contiguous `[1, 1, hidden]` gate; it preserves the residual stride in its output.
+- Behavior: model code calls `residual_gate_add(...)` directly. The CUDA custom op is used while guards pass. On a runtime exception outside `torch.compile`, it logs once, disables the fast path for that device/dtype, and falls back to `residual + update * gate`.
 - Validation: `test/registered/kernels/ops/diffusion/test_modulate.py`, `python/sglang/multimodal_gen/test/unit/test_longcat_image_residual_gate.py`.
 - Microbench: `test/registered/kernels/benchmark/diffusion/bench_residual_gate_add.py`.
-- Workflow rule: if LTX2 or LongCat-Image traces show repeated elementwise `mul` + `add` ladders around attention or MLP residuals, check whether this existing CUDA path was disabled by shape, dtype, contiguity, or a prior runtime failure before proposing another elementwise fusion.
+- Workflow rule: if LTX2, LongCat-Image, or SANA traces show repeated elementwise `mul` + `add` ladders around attention or MLP residuals, inspect input strides and check whether this existing CUDA path was disabled by shape, dtype, layout, or a prior runtime failure before proposing another elementwise fusion. For a transposed residual plus contiguous update, do not force `.contiguous()`; the tiled path is designed to fuse the mixed-layout access.
 
 11. MiniMax-H3 indexed AdaLN modulation and gated residual fusion
 - Kernels: `indexed_scale_shift_bf16_`, `indexed_gate_bf16_`
@@ -396,9 +400,10 @@ framework-specific optimization workflow.
   `QualityGatedFusion`, not a first-sight `BitExactFusionGate` — the fused
   kernel is <=1 ULP off aten, so it is request-gated instead of verified),
   wired at the six `LTX2TransformerBlock` adaLN sites in `ltx_2.py`.
-- LTX2 residual-gate add: `ltx_2.py` calls `residual_gate_add` from
+- Shared residual-gate add: `ltx_2.py`, `sana.py`, and `sana_video.py` call `residual_gate_add` from
   `kernels/ops/diffusion/modulate/residual_gate_add_jit.py` directly for attention,
-  cross-attention, and MLP residual updates.
+  cross-attention, and MLP residual updates; SANA-Video's transposed residual
+  uses the mixed-layout tiled kernel without an intermediate contiguous copy.
 - Wan causal VAE: `cat_pad_channels_last_3d` and `dup_up3d_add` in
   `wanvae.py`, backed by `triton/wan_causal_cache.py`.
 - Varlen USP attention: `fused_pack_qkv` and `fused_scatter_to_padded` in `attention/layer.py`.
