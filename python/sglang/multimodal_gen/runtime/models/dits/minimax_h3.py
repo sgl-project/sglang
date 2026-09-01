@@ -85,6 +85,27 @@ logger = init_logger(__name__)
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 
+# Full-rank deltas and gate replacements shipped by the FastH3 LoRA bundles;
+# no LoRA mapping rule applies them, so they must not be dropped silently.
+_NON_LORA_DELTA_SUFFIXES = (".diff", ".diff_b", ".set_weight")
+
+
+def _reject_non_lora_delta_tensors(adapter: dict[str, torch.Tensor]) -> None:
+    offending = sorted(key for key in adapter if key.endswith(_NON_LORA_DELTA_SUFFIXES))
+    if not offending:
+        return
+    preview = ", ".join(offending[:4])
+    if len(offending) > 4:
+        preview += f", ... ({len(offending)} tensors)"
+    raise ValueError(
+        "This adapter is not a plain LoRA: it carries full-rank .diff/.diff_b "
+        "deltas and/or to_gate_compress.set_weight tensors that no MiniMax-H3 "
+        f"LoRA mapping rule can apply ({preview}). This is the layout of the "
+        "FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA bundles; SGLang "
+        "does not fuse them at load. Serve the merged checkpoint "
+        "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree instead."
+    )
+
 
 def _diffusers_h3_checkpoint(
     iterator: Iterable[tuple[str, torch.Tensor]],
@@ -1824,6 +1845,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self, adapter: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Project released-checkpoint AdaLN LoRAs onto pruned coordinates."""
+        _reject_non_lora_delta_tensors(adapter)
         full_width = self.arch.adaln_affine_input_dim
         if full_width is None:
             return adapter

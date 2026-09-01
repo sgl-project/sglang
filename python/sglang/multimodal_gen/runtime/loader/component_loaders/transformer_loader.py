@@ -410,14 +410,15 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                 raise ValueError(
                     "--minimax-h3-adaln-cache-path is only supported by MiniMax H3"
                 )
-            if component_server_args.model_variant not in ("fl2va", "ref2va"):
+            adaln_model_variant = server_args.pipeline_config.adaln_cache_model_variant(
+                component_server_args
+            )
+            if adaln_model_variant not in ("fl2va", "ref2va"):
                 raise ValueError(
                     "MiniMax H3 AdaLN cache requires --model-variant fl2va or ref2va"
                 )
             init_params["adaln_cache_path"] = adaln_cache_path
-            init_params["adaln_cache_model_variant"] = (
-                component_server_args.model_variant
-            )
+            init_params["adaln_cache_model_variant"] = adaln_model_variant
             checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
         if component_server_args.minimax_h3_adaln_online:
             if not is_minimax_h3:

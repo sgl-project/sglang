@@ -140,3 +140,96 @@ def test_fasth3_distilled_schedule_is_uniform_five_points() -> None:
     base = torch.linspace(1.0, 0.0, 5)
     expected = (12.0 * base / (1 + 11.0 * base)).tolist()
     assert sigmas == pytest.approx(expected)
+
+
+def test_fasth3_lora_bundle_is_rejected_loudly() -> None:
+    """The sibling FastH3 LoRA bundle carries .diff/.diff_b deltas and
+    to_gate_compress.set_weight tensors; --lora-path must fail with a readable
+    error instead of silently dropping them."""
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+        MiniMaxH3DiTModel,
+    )
+
+    model = SimpleNamespace(arch=SimpleNamespace(adaln_affine_input_dim=None))
+    plain = {
+        "blocks.0.attn.qkv_proj.lora_A": torch.zeros(3, 64, 8),
+        "blocks.0.attn.qkv_proj.lora_B": torch.zeros(3, 8, 64),
+    }
+    assert MiniMaxH3DiTModel.prepare_lora_adapter(model, dict(plain)) == plain
+
+    bundle = dict(plain)
+    bundle["blocks.0.attn.qkv_proj.diff"] = torch.zeros(3, 64, 64)
+    bundle["audio_patch_proj.diff_b"] = torch.zeros(64)
+    bundle["blocks.0.attn.to_gate_compress.set_weight"] = torch.zeros(64, 64)
+    with pytest.raises(ValueError) as excinfo:
+        MiniMaxH3DiTModel.prepare_lora_adapter(model, bundle)
+    message = str(excinfo.value)
+    assert "not a plain LoRA" in message
+    assert "set_weight" in message
+    assert "FastVideo-FastH3-4-step-Preview-v1-LoRA" in message
+    assert "FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree" in message
+
+
+@pytest.mark.parametrize("quant_name", ["fp8", "kitchen_int8"])
+def test_fasth3_gates_stay_bf16_under_runtime_quantization(quant_name: str) -> None:
+    from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
+    from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+        KitchenInt8Config,
+    )
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+        MiniMaxH3DiTModel,
+    )
+    from sglang.multimodal_gen.test.unit.test_minimax_h3_dit_contract import (
+        _ensure_single_process_parallel_runtime,
+    )
+
+    if quant_name == "kitchen_int8":
+        pytest.importorskip("comfy_kitchen")
+    _ensure_single_process_parallel_runtime()
+    quant_config = Fp8Config() if quant_name == "fp8" else KitchenInt8Config()
+    with torch.device("meta"):
+        model = MiniMaxH3DiTModel(
+            config=FastH3PipelineConfig().dit_config,
+            hf_config={},
+            quant_config=quant_config,
+        )
+
+    attn = model.blocks[0].attn
+    assert not isinstance(attn.qkv_proj.quant_method, UnquantizedLinearMethod)
+    assert isinstance(attn.to_gate_compress.quant_method, UnquantizedLinearMethod)
+    assert attn.to_gate_compress.weight.dtype == torch.bfloat16
+    assert model.token_refiner.blocks[0].attn.to_gate_compress is None
+
+
+def test_fasth3_adaln_cache_variant_is_the_distilled_partition() -> None:
+    from types import SimpleNamespace
+
+    no_variant = SimpleNamespace(model_variant=None)
+    assert FastH3PipelineConfig().adaln_cache_model_variant(no_variant) == "fl2va"
+    assert MiniMaxH3PipelineConfig().adaln_cache_model_variant(no_variant) is None
+    assert (
+        MiniMaxH3PipelineConfig().adaln_cache_model_variant(
+            SimpleNamespace(model_variant="ref2va")
+        )
+        == "ref2va"
+    )
+
+
+def test_cache_dit_is_a_declared_noop_at_four_forwards() -> None:
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+        _cache_dit_noop_reason,
+    )
+
+    batch = SimpleNamespace(sampling_params=SimpleNamespace(cache_dit_params=None))
+    reason = _cache_dit_noop_reason(4, batch)
+    assert reason is not None and "4 DiT forwards" in reason
+    assert _cache_dit_noop_reason(49, batch) is None
+    lowered = SimpleNamespace(
+        sampling_params=SimpleNamespace(cache_dit_params={"max_warmup_steps": 1})
+    )
+    assert _cache_dit_noop_reason(4, lowered) is None
