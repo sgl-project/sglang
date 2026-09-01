@@ -1565,6 +1565,20 @@ class AscendAttnBackend(AttentionBackend):
                 cp_meta.actual_seq_q_prev_tensor,
                 cp_meta.actual_seq_q_next_tensor,
             )
+            if (
+                    forward_batch.extend_prefix_lens_cpu
+                    and sum(forward_batch.extend_prefix_lens_cpu) > 0
+            ):
+                prefix_lens = forward_batch.extend_prefix_lens.squeeze()
+                actual_seq_lengths_kv = (
+                    cp_meta.kv_len_prev_tensor + prefix_lens,
+                    cp_meta.kv_len_next_tensor + prefix_lens,
+                )
+            else:
+                actual_seq_lengths_kv = (
+                    cp_meta.kv_len_prev_tensor,
+                    cp_meta.kv_len_next_tensor,
+                )
             attn_out = self.do_cp_balance_attn(
                 q_nope,
                 k_nope,
