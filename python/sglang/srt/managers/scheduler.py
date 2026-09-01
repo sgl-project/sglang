@@ -2802,18 +2802,15 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.ps.pp_rank == 0 and getattr(
+            self.tree_cache.cache_controller, "pp_prefetch_command_group", None
+        ):
+            self._prefetch_kvcache(req)
+            recv_req.pp_prefetch_ticketed = req.pp_prefetch_ticketed
+
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
-            controller = getattr(self.tree_cache, "cache_controller", None)
-            if (
-                self.ps.pp_rank == 0
-                and controller is not None
-                and controller.pp_prefetch_command_group is not None
-            ):
-                ticketed = req.rid in controller.pp_prefetch_states
-                req.pp_prefetch_ticketed = ticketed
-                recv_req.pp_prefetch_ticketed = ticketed
 
     def handle_batch_generate_request(
         self,
@@ -2827,7 +2824,7 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
-        if self.enable_hicache_storage:
+        if self.enable_hicache_storage and not req.finished():
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
@@ -2863,7 +2860,7 @@ class Scheduler(
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                tree_cache.prefetch_from_storage(
+                ticketed = tree_cache.prefetch_from_storage(
                     req.rid,
                     last_host_node,
                     new_input_tokens,
@@ -2873,6 +2870,8 @@ class Scheduler(
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                 )
+                if ticketed is not None:
+                    req.pp_prefetch_ticketed = ticketed
 
     def _retry_missed_storage_prefetches(self):
         """Re-issue the availability check for queued requests whose prefetch
@@ -2907,22 +2906,14 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
-        controller = getattr(self.tree_cache, "cache_controller", None)
-        skip_pp_prefetch = (
-            self.ps.pp_rank > 0
-            and controller is not None
-            and controller.pp_prefetch_command_group is not None
-        )
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
-            if not skip_pp_prefetch:
-                self._prefetch_kvcache(req)
+            self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            if not skip_pp_prefetch:
-                self._prefetch_kvcache(req)
+            self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
@@ -3550,22 +3541,20 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                controller = getattr(self.tree_cache, "cache_controller", None)
-                pp_ticket = (
-                    controller is not None
-                    and controller.pp_prefetch_command_group is not None
-                )
-                if not pp_ticket or req.pp_prefetch_ticketed:
+                if req.pp_prefetch_ticketed:
+                    prefetch_done = self.tree_cache.check_prefetch_progress(
+                        req.rid, True
+                    )
+                else:
                     prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                    if not prefetch_done:
-                        # skip staging requests that are ongoing prefetch
-                        continue
-                    if pp_ticket:
-                        req.pp_prefetch_ticketed = False
-                    # Pop the number of tokens loaded from storage (L3 hits)
-                    loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
-                    if loaded_tokens > 0:
-                        req.storage_hit_length = loaded_tokens
+                if not prefetch_done:
+                    # skip staging requests that are ongoing prefetch
+                    continue
+                req.pp_prefetch_ticketed = False
+                # Pop the number of tokens loaded from storage (L3 hits)
+                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                if loaded_tokens > 0:
+                    req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
             if (

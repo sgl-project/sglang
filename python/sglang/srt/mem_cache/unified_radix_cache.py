@@ -1691,9 +1691,13 @@ class UnifiedRadixCache(BasePrefixCache):
         matched_prefix_tokens: Optional[list[int]] = None,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
-    ) -> None:
+    ) -> Optional[bool]:
         if not self.enable_storage or self.cache_controller is None:
-            return
+            return None
+
+        submission = self.cache_controller.get_prefetch_submission(req_id)
+        if submission is not None:
+            return submission.decision
 
         buffer_mode = self.host_memory_mode == "buffer_only"
         # Key the span by the request's namespace, not the anchor's (a root
@@ -1724,17 +1728,17 @@ class UnifiedRadixCache(BasePrefixCache):
             # A too-short/fully-matched suffix can become a full recompute if
             # the device match evicts while queued; arm the paced retry.
             self._storage_prefetch_missed_rids.add(req_id)
-            return
+            return None
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
             stats["declined_rate_limited"] += 1
             self._storage_prefetch_missed_rids.add(req_id)
-            return
+            return None
         if req_id in self.ongoing_prefetch or (
             buffer_mode and self.buffer_pipeline.has_staged(req_id)
         ):
             # A fetch (or an unconsumed hold) already exists for this rid;
             # overwriting would leak its staging slots.
-            return
+            return None
 
         # Buffer mode holds no tree state during the fetch: buffers are
         # operation-owned, so the anchor needs no pin.
@@ -1790,53 +1794,33 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
             # Forfeited over transient staging pressure; retryable.
             self._storage_prefetch_missed_rids.add(req_id)
-            return
+            return None
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        pp_ticket = (
-            buffer_mode
-            and self.pp_size > 1
-            and self.cache_controller.pp_prefetch_command_group is not None
+        submission = self.cache_controller.submit_prefetch(
+            req_id,
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+            matched_prefix_tokens,
+            aux_xfers or None,
         )
-        if pp_ticket:
-            operation = self.cache_controller.submit_pp_prefetch(
-                rid=req_id,
-                token_ids=list(prefetch_key.token_ids),
-                last_hash=last_hash,
-                prefix_keys=prefix_keys,
-                matched_prefix_tokens=list(matched_prefix_tokens or []),
-                extra_key=prefetch_key.extra_key,
-                cache_salt=prefetch_key.cache_salt,
-                is_bigram=prefetch_key.is_bigram,
-                pool_transfers=aux_xfers or None,
-            )
-            if operation is None:
-                self.cache_controller.append_host_mem_release(
-                    extra_pools=aux_xfers or None
-                )
-                return
+        operation = submission.operation
+        if operation is not None:
             stats["issued"] += 1
             operation.stats_requested_tokens = prefetch_length
             operation.stats_total_tokens = prefetch_length + len(
                 matched_prefix_tokens or []
             )
-            return
+        if submission.decision is not None:
+            if operation is None:
+                self.cache_controller.append_host_mem_release(
+                    extra_pools=aux_xfers or None
+                )
+            return submission.decision
 
-        operation = self.cache_controller.prefetch(
-            req_id,
-            prefetch_key,
-            last_hash,
-            prefix_keys,
-            extra_pools=aux_xfers or None,
-        )
-        stats["issued"] += 1
-        # Snapshots for the L3 miss accounting at the query outcome (the
-        # hit/revoke drains): requested span and total prompt length.
-        operation.stats_requested_tokens = prefetch_length
-        operation.stats_total_tokens = prefetch_length + len(
-            matched_prefix_tokens or []
-        )
+        assert operation is not None
         self.ongoing_prefetch[req_id] = _OngoingPrefetch(
             last_host_node_id,
             prefetch_key,
@@ -1860,6 +1844,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # Cache mode reserves the requested span up front; buffer mode
             # grants occupancy later at hit-alloc time, sized to the hit.
             self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+        return None
 
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
         return (
@@ -1893,28 +1878,20 @@ class UnifiedRadixCache(BasePrefixCache):
             return True
 
     @rank_consensus(same_params=True, same_results=True)
-    def check_prefetch_progress(self, req_id: str) -> bool:
-        pp_ticket = (
-            self.buffer_pipeline is not None
-            and self.pp_size > 1
-            and self.cache_controller.pp_prefetch_command_group is not None
-        )
-        if pp_ticket:
-            with self.cache_controller.pp_prefetch_state_lock:
-                state = self.cache_controller.pp_prefetch_states.get(req_id)
-                ready = (
-                    self.pp_rank == 0
-                    and state is not None
-                    and state.ready_event.is_set()
-                )
+    def check_prefetch_progress(
+        self, req_id: str, pp_prefetch_ticketed: bool = False
+    ) -> bool:
+        if pp_prefetch_ticketed:
+            ready = self.pp_rank == 0 and self.cache_controller.is_pp_prefetch_ready(
+                req_id
+            )
             ready_tensor = torch.tensor(int(ready), dtype=torch.int, device="cpu")
             self._all_reduce(ready_tensor, torch.distributed.ReduceOp.MAX)
             if ready_tensor.item() == 0:
                 return False
 
-            with self.cache_controller.pp_prefetch_state_lock:
-                state = self.cache_controller.pp_prefetch_states.get(req_id)
-            if state is None or not state.ready_event.wait():
+            state = self.cache_controller.take_ready_pp_prefetch(req_id)
+            if state is None:
                 raise RuntimeError(
                     f"PP prefetch became ready before local state existed: {req_id}"
                 )
@@ -1922,7 +1899,6 @@ class UnifiedRadixCache(BasePrefixCache):
             operation = state.operation
             if operation.host_indices is None or operation.completed_tokens == 0:
                 self.prefetch_loaded_tokens_by_reqid[req_id] = 0
-                self.cache_controller.release_pp_prefetch(req_id)
                 return True
 
             ticket = state.ticket
@@ -1951,8 +1927,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 operation.host_indices[operation.completed_tokens :]
             )
             self._handle_prefetch_result(operation)
-            with self.cache_controller.pp_prefetch_state_lock:
-                self.cache_controller.pp_prefetch_states.pop(req_id, None)
             return True
 
         if req_id not in self.ongoing_prefetch:

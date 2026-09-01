@@ -137,6 +137,12 @@ class PrefetchOperation(StorageOperation):
             return self._terminated_flag
 
 
+@dataclass(frozen=True)
+class PrefetchSubmission:
+    operation: Optional[PrefetchOperation] = None
+    decision: Optional[bool] = None
+
+
 class HybridCacheController(BaseHiCacheController):
     def __init__(
         self,
@@ -165,6 +171,7 @@ class HybridCacheController(BaseHiCacheController):
         self.pp_prefetch_command_queue: Queue[Optional[PPPrefetchTicket]] = Queue()
         self.pp_prefetch_state_lock = threading.Lock()
         self.pp_prefetch_states: dict[str, PPPrefetchState] = {}
+        self.pp_prefetch_decisions: dict[str, bool] = {}
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             mem_pool_host=mem_pool_host,
@@ -271,6 +278,7 @@ class HybridCacheController(BaseHiCacheController):
             self.pp_prefetch_command_group = None
         with self.pp_prefetch_state_lock:
             self.pp_prefetch_states.clear()
+            self.pp_prefetch_decisions.clear()
 
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
@@ -407,6 +415,7 @@ class HybridCacheController(BaseHiCacheController):
         super().reset()
         with self.pp_prefetch_state_lock:
             self.pp_prefetch_states.clear()
+            self.pp_prefetch_decisions.clear()
         if self.enable_storage and self.pp_prefetch_command_group is not None:
             self.pp_prefetch_command_queue = Queue()
             self.pp_prefetch_command_thread = threading.Thread(
@@ -670,6 +679,53 @@ class HybridCacheController(BaseHiCacheController):
         self.prefetch_queue.put(operation)
         return operation
 
+    def get_prefetch_submission(self, rid: str) -> Optional[PrefetchSubmission]:
+        if self.pp_prefetch_command_group is None:
+            return None
+        if self.pp_rank != 0:
+            return PrefetchSubmission()
+        with self.pp_prefetch_state_lock:
+            if rid not in self.pp_prefetch_decisions:
+                return None
+            decision = self.pp_prefetch_decisions.pop(rid)
+        return PrefetchSubmission(decision=decision)
+
+    def submit_prefetch(
+        self,
+        rid: str,
+        prefetch_key: RadixKey,
+        last_hash: Optional[str],
+        prefix_keys: Optional[List[str]],
+        matched_prefix_tokens: Optional[List[int]],
+        pool_transfers: Optional[list[PoolTransfer]],
+    ) -> PrefetchSubmission:
+        if self.pp_prefetch_command_group is None:
+            return PrefetchSubmission(
+                operation=self.prefetch(
+                    rid,
+                    prefetch_key,
+                    last_hash,
+                    prefix_keys,
+                    extra_pools=pool_transfers,
+                )
+            )
+
+        operation = self.submit_pp_prefetch(
+            rid=rid,
+            token_ids=list(prefetch_key.token_ids),
+            last_hash=last_hash,
+            prefix_keys=prefix_keys,
+            matched_prefix_tokens=list(matched_prefix_tokens or []),
+            extra_key=prefetch_key.extra_key,
+            cache_salt=prefetch_key.cache_salt,
+            is_bigram=prefetch_key.is_bigram,
+            pool_transfers=pool_transfers,
+        )
+        decision = operation is not None
+        with self.pp_prefetch_state_lock:
+            self.pp_prefetch_decisions[rid] = decision
+        return PrefetchSubmission(operation=operation, decision=decision)
+
     def submit_pp_prefetch(
         self,
         rid: str,
@@ -807,9 +863,32 @@ class HybridCacheController(BaseHiCacheController):
                 self.mem_pool_host.free(transfer.host_indices, pool=transfer.name)
                 transfer.host_indices = None
 
+    def is_pp_prefetch_ready(self, rid: str) -> bool:
+        with self.pp_prefetch_state_lock:
+            state = self.pp_prefetch_states.get(rid)
+            return state is not None and state.ready_event.is_set()
+
+    def take_ready_pp_prefetch(self, rid: str) -> Optional[PPPrefetchState]:
+        with self.pp_prefetch_state_lock:
+            state = self.pp_prefetch_states.get(rid)
+        if state is None:
+            return None
+        state.ready_event.wait()
+        with self.pp_prefetch_state_lock:
+            if self.pp_prefetch_states.get(rid) is not state:
+                return None
+            self.pp_prefetch_states.pop(rid)
+            if (
+                state.operation.host_indices is None
+                or state.operation.completed_tokens == 0
+            ):
+                self._free_pp_prefetch_state(state)
+            return state
+
     def release_pp_prefetch(self, rid: str) -> bool:
         """Release a ticket that has not transferred ownership to buffer mode."""
         with self.pp_prefetch_state_lock:
+            self.pp_prefetch_decisions.pop(rid, None)
             state = self.pp_prefetch_states.get(rid)
             if state is None:
                 return False
