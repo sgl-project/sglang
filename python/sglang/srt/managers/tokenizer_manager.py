@@ -419,6 +419,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
+        # Orchestrator view: id of the in-flight scale and the slots it freed.
+        self.elastic_operation_id = None
+        self.elastic_retired_ranks: List[int] = []
         self.enable_metrics = get_observability().enable_metrics
         self.incremental_streaming_output = get_serving().incremental_streaming_output
         self.enable_lora = get_lora().enable_lora
@@ -643,6 +646,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 
+        # Shrink admission gate (scale-up routes via DPC ready barrier).
+        self._elastic_shrink_pause_event = asyncio.Event()
+        self._elastic_shrink_pause_event.set()
+        self._elastic_scale_lock = asyncio.Lock()
+
     def init_lora(self):
         # LoRA
         # Initialize the `LoRARegistry` with initial LoRA adapter paths provided in `server_args`.
@@ -808,6 +816,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             async with self.is_pause_cond:
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+
+            if not self._elastic_shrink_pause_event.is_set():
+                await self._elastic_shrink_pause_event.wait()
 
             async with self.model_update_lock.reader_lock:
                 await self._validate_and_resolve_lora(obj)
@@ -3252,28 +3263,75 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.elastic_pending_ep_size = None
             self.elastic_scale_phase = "failed"
             self.elastic_last_error = msg.error
+            self.elastic_retired_ranks = []
+            # A shrink can fail after its retirees have already exited, so the width
+            # reported here is reconciled to who is actually alive. Keeping the
+            # pre-shrink fan-out would park every later control op -- weight update,
+            # flush cache, the next scale -- on a rank that is gone.
+            if msg.effective_ep_size and (
+                msg.effective_ep_size != self.elastic_worker_count
+            ):
+                logger.warning(
+                    "[Elastic EP] scale failed after ranks departed; narrowing "
+                    "control fan-out %d -> %d",
+                    self.elastic_worker_count,
+                    msg.effective_ep_size,
+                )
+                self.elastic_worker_count = msg.effective_ep_size
+                self.update_control_communicator_fan_out(msg.effective_ep_size)
+            self._elastic_shrink_pause_event.set()
             return
 
         self._dispatch_to_scheduler(msg)
         self.elastic_worker_count = msg.effective_ep_size
         self.elastic_pending_ep_size = None
-        self.elastic_scale_phase = "serving_expanded"
+        self.elastic_scale_phase = (
+            "serving_shrunk" if msg.direction == "shrink" else "serving_expanded"
+        )
         self.elastic_last_error = None
+        # Published only post-commit: until then these ranks are load-bearing.
+        self.elastic_retired_ranks = (
+            list(range(msg.slot_offset, msg.slot_offset + msg.slot_count))
+            if msg.direction == "shrink"
+            else []
+        )
         self.update_control_communicator_fan_out(msg.effective_ep_size)
+        self._elastic_shrink_pause_event.set()
 
     def get_elastic_ep_state(self):
+        # A grow clears pending_ep_size at commit but stays warming_up until the
+        # joiner has served, so both have to be quiet before this reads as settled.
+        settled = (
+            self.elastic_pending_ep_size is None
+            and self.elastic_scale_phase != "warming_up"
+        )
         return {
-            "is_scaling_elastic_ep": self.elastic_pending_ep_size is not None,
+            "is_scaling_elastic_ep": not settled,
             "effective_ep_size": self.elastic_worker_count,
             "pending_ep_size": self.elastic_pending_ep_size,
             "scale_phase": self.elastic_scale_phase,
             "last_error": self.elastic_last_error,
+            "operation_id": self.elastic_operation_id,
+            "retired_ranks": list(self.elastic_retired_ranks),
+            # Safe only once the survivors committed; empty mid-scale.
+            "safe_to_terminate_ranks": (
+                list(self.elastic_retired_ranks)
+                if settled and self.elastic_scale_phase == "serving_shrunk"
+                else []
+            ),
         }
 
     async def scale_elastic_ep(
         self, obj: ScaleElasticEPReqInput
     ) -> ScaleElasticEPReqOutput:
         """Send a scale request to every DP scheduler."""
+        # Serialize concurrent HTTP-driven scale requests.
+        async with self._elastic_scale_lock:
+            return await self._scale_elastic_ep_locked(obj)
+
+    async def _scale_elastic_ep_locked(
+        self, obj: ScaleElasticEPReqInput
+    ) -> ScaleElasticEPReqOutput:
         if self.elastic_pending_ep_size is not None:
             return ScaleElasticEPReqOutput(
                 success=False,
@@ -3287,14 +3345,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 scale_phase=self.elastic_scale_phase,
             )
         self.auto_create_handle_loop()
-        responses: List[ScaleElasticEPReqOutput] = (
-            await self.scale_elastic_ep_communicator(obj)
-        )
+
+        # Close the shrink gate and publish pending; reopened on completion/failure.
+        is_shrink = obj.new_ep_size < self.elastic_worker_count
+        self.elastic_pending_ep_size = obj.new_ep_size
+        self.elastic_scale_phase = "waiting_for_cohort"
+        self.elastic_operation_id = obj.operation_id
+        self.elastic_retired_ranks = []
+        if is_shrink:
+            self._elastic_shrink_pause_event.clear()
+
+        try:
+            responses: List[ScaleElasticEPReqOutput] = (
+                await self.scale_elastic_ep_communicator(obj)
+            )
+        # BaseException, not Exception: a disconnected client cancels this task, and
+        # CancelledError would otherwise skip the reopen and leave every later
+        # generate() blocked on the shrink gate for the life of the process.
+        except BaseException:
+            self.elastic_pending_ep_size = None
+            self.elastic_scale_phase = "failed"
+            if is_shrink:
+                self._elastic_shrink_pause_event.set()
+            raise
+
         for res in responses:
             if not res.success:
                 self.elastic_scale_phase = res.scale_phase
                 self.elastic_pending_ep_size = res.pending_ep_size
                 self.elastic_last_error = res.message
+                if is_shrink:
+                    self._elastic_shrink_pause_event.set()
                 return res
         self.elastic_pending_ep_size = responses[0].pending_ep_size
         self.elastic_scale_phase = responses[0].scale_phase

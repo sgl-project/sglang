@@ -27,7 +27,7 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel, is_ep_scale_joiner
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -181,7 +181,8 @@ class SchedulerRequestReceiver:
             # all-ranks gloo sync.
             _local_ctrl = (
                 get_parallel().enable_dp_attention_local_control_broadcast
-                or is_ep_scale_joiner()
+                # Offset joiners, so recover-with-offset as well as scale.
+                or self.server_args.is_ep_offset_joiner
             )
             if _local_ctrl:
                 if self.ps.attn_tp_size != 1:

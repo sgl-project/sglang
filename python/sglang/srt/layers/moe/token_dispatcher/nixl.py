@@ -86,6 +86,18 @@ class NixlEPBuffer:
         )
 
     @classmethod
+    def on_retire(cls, retiree_ranks: list) -> None:
+        """Survivor NIXL disconnect (drops peer QPs; contiguous tail assumed)."""
+        state = cls._state()
+        if state.buffer is None:
+            return
+        cls._disconnect_ranks(state, list(retiree_ranks), tag="retire")
+        new_size = min(retiree_ranks)
+        state.connected_ep_size = new_size
+        state.scale_to = new_size
+        state.dispatch_ep_size = new_size
+
+    @classmethod
     def _connect_ranks(cls, state, ranks: list, *, tag: str) -> None:
         current_store = get_global_tcp_store()
         if current_store is not None:
@@ -100,9 +112,22 @@ class NixlEPBuffer:
         )
 
     @classmethod
+    def _disconnect_ranks(cls, state, ranks: list, *, tag: str) -> None:
+        current_store = get_global_tcp_store()
+        if current_store is not None:
+            state.buffer.set_tcp_store_group(current_store)
+        state.buffer.disconnect_ranks(ranks)
+
+    @classmethod
     def _update_connections(cls, state, scale_to: int) -> None:
-        new_ranks = list(range(state.connected_ep_size, scale_to))
-        cls._connect_ranks(state, new_ranks, tag="update")
+        if scale_to > state.connected_ep_size:
+            cls._connect_ranks(
+                state, list(range(state.connected_ep_size, scale_to)), tag="update"
+            )
+        elif scale_to < state.connected_ep_size:
+            cls._disconnect_ranks(
+                state, list(range(scale_to, state.connected_ep_size)), tag="update"
+            )
         state.connected_ep_size = scale_to
 
     @classmethod
@@ -120,7 +145,7 @@ class NixlEPBuffer:
             if (
                 state.scale_to is not None
                 and state.connected_ep_size is not None
-                and state.scale_to > state.connected_ep_size
+                and state.scale_to != state.connected_ep_size
             ):
                 cls._update_connections(state, state.scale_to)
             return state.buffer
@@ -416,11 +441,16 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             async_finish=not self.return_recv_hook,
             return_recv_hook=self.return_recv_hook,
         )
+        # Peer-state discovery only when connected set drifted (avoids stalled-combine sync).
         if self._mask_buffer is not None:
-            buffer.query_mask_buffer(self._mask_buffer)
-
+            connected = NixlEPBuffer._state().connected_ep_size
             n = ElasticEPStateManager.get_effective_ep_size()
-            self.active_ranks[:n].copy_(1 - self._mask_buffer[:n])
+            if connected is None or connected != n:
+                buffer.query_mask_buffer(self._mask_buffer)
+                # Clear only: between the retire flip and commit_scale this view still
+                # reports retirees alive, and resurrecting them would put departed ranks
+                # back into the mask dp_attention builds collectives on.
+                self.active_ranks[:n].mul_(1 - self._mask_buffer[:n])
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook
