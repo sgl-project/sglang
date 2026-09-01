@@ -501,8 +501,6 @@ def run_moonep_bf16_expert(
 
 
 def _resolve_decode_capacity(prefill_capacity: int) -> int | None:
-    """Token capacity for decode batches, or None to reuse the prefill one.
-    """
     override = envs.SGLANG_MOONEP_DECODE_MAX_DISPATCH_TOKENS_PER_RANK.get()
     if override > 0:
         capacity = override

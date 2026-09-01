@@ -1249,8 +1249,6 @@ def _moonep_m_indices(
     expert_ids: torch.Tensor,
     all_tokens: int,
 ) -> torch.Tensor:
-    """Expand MoonEP's per-group segment ends into DeepGEMM's per-row group ids.
-    """
     num_groups = expert_ids.numel()
     rows = torch.arange(all_tokens, device=cu_seqlens.device, dtype=cu_seqlens.dtype)
     group = torch.searchsorted(cu_seqlens, rows, right=True)
@@ -1284,8 +1282,6 @@ def _moonep_finalize_rows(
     m_indices: torch.Tensor,
     route_weights_nvs: Optional[torch.Tensor],
 ) -> None:
-    """Zero the rows DeepGEMM skipped and scale the rest by their route weight.
-    """
     rows, hidden_size = hidden_states.shape
     BLOCK = 1024
     _moonep_finalize_rows_kernel[(rows, triton.cdiv(hidden_size, BLOCK))](
@@ -1306,8 +1302,6 @@ def pre_permute_moonep_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    """MoonEP dispatch output -> DeepGEMM m-grouped contiguous input.
-    """
     hidden_states = dispatch_output.hidden_states
     if hidden_states.ndim != 2:
         raise ValueError(
@@ -1390,8 +1384,6 @@ def post_permute_deep_gemm_to_moonep(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> MoonEPCombineInput:
-    """DeepGEMM output -> MoonEP combine input, still in dispatched row order.
-    """
     from sglang.srt.layers.moe.token_dispatcher.moonep import MoonEPCombineInput
 
     hidden_states = runner_output.hidden_states

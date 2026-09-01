@@ -16,10 +16,10 @@ rank-local PyTorch reference using the same top-k and expert weights.
 from __future__ import annotations
 
 import argparse
-from enum import IntEnum, auto
 import json
 import os
 import sys
+from enum import IntEnum, auto
 from pathlib import Path
 from types import ModuleType
 from typing import NamedTuple, Protocol, TypeGuard, runtime_checkable
@@ -257,21 +257,27 @@ def main() -> None:
     # The production path should replace this with true symmetric expert-row
     # mappings whose physical storage is owned by each expert's home rank.
     torch.manual_seed(args.seed)
-    gate = torch.randn(
-        num_experts + num_prefetch_slots,
-        args.intermediate_size,
-        args.hidden_size,
-        device=device,
-        dtype=torch.bfloat16,
-    ) / 8
+    gate = (
+        torch.randn(
+            num_experts + num_prefetch_slots,
+            args.intermediate_size,
+            args.hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / 8
+    )
     up = torch.randn_like(gate) / 8
-    down = torch.randn(
-        num_experts + num_prefetch_slots,
-        args.hidden_size,
-        args.intermediate_size,
-        device=device,
-        dtype=torch.bfloat16,
-    ) / 8
+    down = (
+        torch.randn(
+            num_experts + num_prefetch_slots,
+            args.hidden_size,
+            args.intermediate_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / 8
+    )
     gate[num_experts:].zero_()
     up[num_experts:].zero_()
     down[num_experts:].zero_()

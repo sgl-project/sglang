@@ -27,8 +27,8 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
-    MoonEPDispatcher,
     MooncakeEPDispatcher,
+    MoonEPDispatcher,
     MoriEPDispatcher,
     NixlEPDispatcher,
     PplxDispatcher,
