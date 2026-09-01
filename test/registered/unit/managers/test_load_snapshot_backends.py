@@ -75,7 +75,7 @@ def _read_until(read_fn, predicate, attempts=100, interval=0.05):
             return result
         time.sleep(interval)
         result = read_fn()
-    return result
+    raise AssertionError(f"predicate never held; last result: {result!r}")
 
 
 class TestShmRoundTrip(CustomTestCase):
