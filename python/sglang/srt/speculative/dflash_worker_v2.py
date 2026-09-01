@@ -1855,6 +1855,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
+            # Under dp attention, is_extend_in_batch is aggregated across DP
+            # ranks: an idle DP rank (no requests; prepare_for_idle leaves
+            # extend_lens/prefix_lens None) still runs the empty target prefill
+            # above to stay in the DP collective, but must skip the DFlash
+            # draft KV materialization, which needs per-request extend info.
+            if batch.forward_mode.is_idle():
+                batch_output.next_draft_input = DFlashDraftInputV2.create_idle_input(
+                    device=self.device
+                )
+                return batch_output
+
             if logits_output.hidden_states is None:
                 raise RuntimeError(
                     "DFLASH requires target aux hidden capture for prefill, but got None. "
