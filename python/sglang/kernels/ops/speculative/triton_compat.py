@@ -28,9 +28,8 @@ except ImportError:  # pragma: no cover - needs a triton-free environment
         def __getitem__(self, grid):
             def _launch(*args, **kwargs):
                 raise RuntimeError(
-                    f"{self._name} is a Triton kernel but triton is not "
-                    "installed in this environment; this code path only "
-                    "runs on CUDA devices."
+                    f"{self._name} is a Triton kernel and cannot be launched "
+                    "because Triton is not installed in this environment."
                 )
 
             return _launch

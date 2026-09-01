@@ -260,8 +260,9 @@ checkpoint's calibration scales automatically.
   is NVFP4-packed; the BF16 and FP8 checkpoints keep a dense head).
   The Ascend comparison in #35629 used a 910C with BF16 target weights,
   `--tp-size 2 --attention-backend ascend --mamba-ssm-dtype bfloat16
-  --mamba-scheduler-strategy extra_buffer`, and kept RadixCache enabled for
-  both baseline and DFlash2. The DFlash2 run added the three flags shown above.
+  --mamba-scheduler-strategy extra_buffer`, and disabled RadixCache for both
+  baseline and DFlash2 to exclude cache warm-up and prefix reuse. The DFlash2
+  run added the three flags shown above.
   Accuracy used zero-shot GSM8K with greedy sampling, `max_new_tokens=2048`,
   128 examples, and concurrency levels 1, 2, 4, 8, and 16.
   Validation: NVFP4 measured end-to-end on RTX PRO 6000 and RTX 5090; the
