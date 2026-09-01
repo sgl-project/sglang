@@ -42,7 +42,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 
@@ -80,6 +80,8 @@ class TreeNode:
         self.host_value = None
         # store hash values of each page
         self.hash_value: Optional[List[str]] = None
+        # Namespace-aware hashes used only for external KV events.
+        self.event_hash_value: Optional[List[str]] = None
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -340,7 +342,7 @@ class LRUList:
             raise Exception(msg)
 
 
-class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
+class SWARadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.req_to_token_pool = params.req_to_token_pool
@@ -348,8 +350,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self.page_size = params.page_size
         self.disable = params.disable
         self.is_eagle = params.is_eagle
-        self.enable_kv_cache_events = params.enable_kv_cache_events
-        self.kv_event_queue = []
+        self.kv_events = KVCacheEventRecorder(
+            enabled=params.enable_kv_cache_events, page_size=self.page_size
+        )
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -405,7 +408,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(is_swa_list=False)
         self.swa_lru_list = LRUList(is_swa_list=True)
-        self._record_all_cleared_event()
+        self.kv_events.record_all_cleared()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -462,22 +465,25 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         """Cache request when it finishes."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_len_to_handle
+                req.kv.req_pool_idx, :kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_len_to_handle
+            req.kv.req_pool_idx, :kv_len_to_handle
         ]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids,
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
-        old_prefix_len = req.cache_protected_len
+        old_prefix_len = req.kv.cache_protected_len
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
@@ -510,31 +516,37 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         """Cache request when it is unfinished."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.extend_range.end
+                req.kv.req_pool_idx, : req.extend_range.end
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-            req.prefix_indices = kv_indices
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
         token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, : len(token_ids)
         ]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids,
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
-        old_prefix_len = req.cache_protected_len
+        old_prefix_len = req.kv.cache_protected_len
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
+        # The prefix below swa_evicted_seqlen has no SWA peers left; the insert
+        # tombstones it instead of claiming live SWA KV.
         result = self.insert(
             InsertParams(
                 key=radix_key,
                 value=values,
                 prev_prefix_len=old_prefix_len,
+                swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
             )
         )
         new_prefix_len = result.prefix_len
@@ -549,11 +561,11 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         assert old_prefix_len <= len(new_indices), f"{old_prefix_len=}, {new_indices=}"
         assert new_prefix_len <= len(new_indices), f"{new_prefix_len=}, {new_indices=}"
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
+            (req.kv.req_pool_idx, slice(old_prefix_len, len(new_indices))),
             new_indices[old_prefix_len:],
         )
 
-        req.cache_protected_len = len(new_indices)
+        req.kv.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(
             req.last_node,
@@ -582,6 +594,21 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def total_size(self) -> Tuple[int, int]:
         return self._total_size_helper()
 
+    def _free_node_value(
+        self, node: TreeNode, value: Optional[torch.Tensor] = None
+    ) -> Tuple[int, int]:
+        if value is None:
+            value = node.value
+        num_tokens = len(value)
+        if node.swa_tombstone:
+            # SWA peers went back in `dec_swa_lock_only` or an SWA evict, so
+            # only the full side is still ours; `free` would hand the SWA pool
+            # mapping entries that read as the padding slot.
+            self.token_to_kv_pool_allocator.free_full(value)
+            return num_tokens, 0
+        self.token_to_kv_pool_allocator.free(value)
+        return num_tokens, num_tokens
+
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -601,12 +628,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 assert x.full_lock_ref == 0, f"node is in use, {x.id=}"
 
                 # 1. free node kv indices, evict full and swa tokens
-                self._record_remove_event(x)
-                self.token_to_kv_pool_allocator.free(x.value)
-                full_num_evicted += len(x.value)
-                # Tombstoned leaves had their SWA freed earlier in `dec_swa_lock_only`
-                if not x.swa_tombstone:
-                    swa_num_evicted += len(x.value)
+                self.kv_events.record_remove(x)
+                node_full_evicted, node_swa_evicted = self._free_node_value(x)
+                full_num_evicted += node_full_evicted
+                swa_num_evicted += node_swa_evicted
 
                 # 2. get the next leaf, update the lru lists
                 x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
@@ -666,10 +691,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         x.full_lock_ref == 0
                     ), f"leaf node with full lock must also have swa lock, {x.id=}"
                     # 1. a leaf node, free full and swa tokens
-                    self._record_remove_event(x)
-                    self.token_to_kv_pool_allocator.free(x.value)
-                    full_num_evicted += len(x.value)
-                    swa_num_evicted += len(x.value)
+                    self.kv_events.record_remove(x)
+                    node_full_evicted, node_swa_evicted = self._free_node_value(x)
+                    full_num_evicted += node_full_evicted
+                    swa_num_evicted += node_swa_evicted
 
                     # 2. get the next node, update the lru lists
                     x_next = self.swa_lru_list.get_prev_no_lock(x)
@@ -1020,6 +1045,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 node.key.token_ids + child.key.token_ids,
                 node.key.extra_key,
                 is_bigram=node.key.is_bigram,
+                cache_salt=node.key.cache_salt,
             )
             node.value = torch.cat([node.value, child.value])
             node.children = child.children
@@ -1033,6 +1059,12 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 node.hash_value = list(node.hash_value) + list(child.hash_value)
             else:
                 node.hash_value = None
+            if node.event_hash_value is not None and child.event_hash_value is not None:
+                node.event_hash_value = list(node.event_hash_value) + list(
+                    child.event_hash_value
+                )
+            else:
+                node.event_hash_value = None
 
             self.full_lru_list.remove_node(child)
             if not child.swa_tombstone:
@@ -1103,6 +1135,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.parent.children[key.child_key(self.page_size)] = new_node
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
+        )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
         )
 
         # insert the new node and child into the lru lists, insert
@@ -1282,8 +1317,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         allocator = self.token_to_kv_pool_allocator
         swa_value = allocator.translate_loc_from_full_to_swa(incoming_full)
         allocator.set_full_to_swa_mapping(node.value, swa_value)
-        allocator.full_to_swa_index_mapping[incoming_full.to(torch.int64)] = 0
-        allocator.full_attn_allocator.free(incoming_full)
+        allocator.clear_full_to_swa_mapping(incoming_full)
+        allocator.free_full(incoming_full)
 
         node.swa_tombstone = False
         self.swa_lru_list.insert_mru(node)
@@ -1308,7 +1343,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         if not swa_tombstone:
             self.swa_lru_list.insert_mru(new_node)
             self.swa_evictable_size_ += len(value)
-        self._record_store_event(new_node)
+        self.kv_events.record_store(new_node)
         return new_node
 
     def _iteratively_delete_tombstone_leaf(
@@ -1326,9 +1361,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 node.parent.swa_lock_ref == 0
             ), f"tombstone swa_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.swa_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
-            self._record_remove_event(node.parent)
-            self.token_to_kv_pool_allocator.free(node.parent.value)
-            full_num_evicted += len(node.parent.value)
+            self.kv_events.record_remove(node.parent)
+            node_full_evicted, _ = self._free_node_value(node.parent)
+            full_num_evicted += node_full_evicted
             self.full_lru_list.remove_node(node.parent)
             self._delete_tombstone_leaf(node.parent)
             node = node.parent

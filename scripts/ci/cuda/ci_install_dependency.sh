@@ -277,11 +277,24 @@ clean_site_packages() {
 }
 
 setup_cargo_cache() {
+    if [ "${SGLANG_BUILD_RUST_EXTS:-}" = "none" ]; then
+        echo "Using prebuilt Rust extensions; skipping Cargo target setup"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
     # actions/checkout's `git clean -ffdx` deletes the gitignored in-repo
     # rust/target, so every job recompiles the whole dependency graph. Move the
     # target dir out of the tree: setuptools-rust has no target-dir option of its
     # own and defers to CARGO_TARGET_DIR, which uv passes to the build backend.
     export CARGO_TARGET_DIR="${HOME}/.cache/sglang-cargo-target"
+    local cargo_target_lock="${HOME}/.cache/sglang-cargo-target.lock"
+    mkdir -p "${HOME}/.cache"
+    exec 9>"${cargo_target_lock}"
+    echo "Waiting for exclusive cargo target lock: ${cargo_target_lock}"
+    flock --exclusive 9
+    CARGO_TARGET_LOCK_HELD=1
+    echo "Acquired cargo target lock"
     mkdir -p "${CARGO_TARGET_DIR}"
 
     # Same disk-pressure guard as the uv cache in ci_cleanup_venv.sh (which
@@ -296,6 +309,15 @@ setup_cargo_cache() {
     fi
 
     mark_step_done "${FUNCNAME[0]}"
+}
+
+release_cargo_cache_lock() {
+    if [ "${CARGO_TARGET_LOCK_HELD:-0}" = "1" ]; then
+        flock --unlock 9
+        exec 9>&-
+        CARGO_TARGET_LOCK_HELD=0
+        echo "Released cargo target lock"
+    fi
 }
 
 setup_pip_toolchain() {
@@ -413,7 +435,7 @@ uninstall_stale_flashinfer() {
 
 install_pytorch_stack() {
     PYTORCH_SPECS=()
-    for package in torch torchaudio torchvision torchao torchcodec; do
+    for package in torch torchaudio torchvision torchcodec; do
         spec=$(grep -Po -m1 "\"${package}([<>=!~ ;][^\"]*)?\"" python/pyproject.toml | tr -d '"' || true)
         if [ -n "$spec" ]; then
             PYTORCH_SPECS+=("$spec")
@@ -460,7 +482,7 @@ require_prebuilt_rust_exts() {
         return
     fi
 
-    # Exact EXT_SUFFIX rather than a _core*.so glob: no crate sets abi3, so a module
+    # Exact EXT_SUFFIX rather than an _*.so glob: no crate sets abi3, so a module
     # built for another minor version satisfies the glob while the import system
     # ignores it, leaving is_rust_server_built() false and the Rust-server tests
     # silently skipped. Stages have no setup-python, so the interpreter is whatever
@@ -469,14 +491,23 @@ require_prebuilt_rust_exts() {
     local suffix
     suffix=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
     local missing=()
-    local pkg
-    for pkg in server grpc multimodal; do
-        [ -f "python/sglang/srt/${pkg}/_core${suffix}" ] || missing+=("${pkg}")
+    local module
+    for module in server grpc multimodal; do
+        [ -f "python/sglang/srt/rust_extensions/_${module}${suffix}" ] || missing+=("${module}")
     done
+    [ -f "python/sglang/srt/mem_cache/rust_tree_core/mem_cache${suffix}" ] \
+        || missing+=("mem_cache")
+    [ -f "python/sglang/srt/mem_cache/rust_tree_core/mem_cache_inspection${suffix}" ] \
+        || missing+=("mem_cache_inspection")
     if [ ${#missing[@]} -gt 0 ]; then
-        echo "::warning::no prebuilt _core${suffix} for: ${missing[*]}; building from source"
-        ls -l python/sglang/srt/*/_core*.so 2>/dev/null || echo "(no extension modules at all)"
+        echo "::warning::no prebuilt Rust extension ${suffix} for: ${missing[*]}; building from source"
+        ls -l python/sglang/srt/rust_extensions/_*.so 2>/dev/null || echo "(no extension modules at all)"
+        ls -l python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so 2>/dev/null || true
         export SGLANG_BUILD_RUST_EXTS=
+        export SGLANG_RUST_BUILD_MODE=auto
+        if [ -n "${GITHUB_ENV:-}" ]; then
+            echo "SGLANG_RUST_BUILD_MODE=auto" >> "${GITHUB_ENV}"
+        fi
         mark_step_done "${FUNCNAME[0]}"
         return
     fi
@@ -501,6 +532,17 @@ install_sglang() {
        && pip show nvidia-cusparselt-cu13 >/dev/null 2>&1; then
         echo "WARNING: nvidia-cusparselt-cu13 metadata present but libcusparseLt.so.0 missing — reinstalling"
         $PIP_CMD install --reinstall nvidia-cusparselt-cu13 $PIP_INSTALL_SUFFIX
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+install_nccl() {
+    if [ "$CU_MAJOR" = "13" ]; then
+        $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
+            --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    else
+        echo "CUDA ${CU_MAJOR} does not require the NCCL Gin wheel"
     fi
 
     mark_step_done "${FUNCNAME[0]}"
@@ -680,14 +722,10 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    MOONCAKE_VERSION="0.3.12.post1"
+    MOONCAKE_VERSION="0.3.13"
     NIXL_VERSION="1.3.0"
-    # sgl-eval is git-only and cannot be declared in python/pyproject.toml (see
-    # the note there). The nightly GSM8K eval shells out to the sgl-eval CLI and
-    # fails without it. Bumping the SHA can change zero-shot \boxed{} grading, so
-    # re-baseline MODEL_SCORE_THRESHOLDS in
-    # test/registered/eval/test_text_models_gsm8k_eval.py first.
-    SGL_EVAL_REF="b2a2703c42cae379bbcb8b7ff092df6601a61694"
+    # shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
+    source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
@@ -723,7 +761,7 @@ install_extra_deps() {
             --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
     fi
 
-    $PIP_CMD install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@${SGL_EVAL_REF}" $PIP_INSTALL_SUFFIX
+    $PIP_CMD install "$SGL_EVAL_SPEC" $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
@@ -816,7 +854,7 @@ print(f"sglang resolves to {spec.origin}")
 # so a .so that cannot load passes find_spec and only fails inside some suite.
 import importlib
 for mod in ("server", "grpc", "multimodal"):
-    name = f"sglang.srt.{mod}._core"
+    name = f"sglang.srt.rust_extensions._{mod}"
     try:
         importlib.import_module(name)
     except Exception as exc:
@@ -839,14 +877,16 @@ main() {
     install_apt_packages
     install_gdrcopy
     clean_site_packages
-    setup_cargo_cache
     require_prebuilt_rust_exts
     setup_pip_toolchain
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
     install_pytorch_stack
     install_cuda12_deepep_wheel
+    setup_cargo_cache
     install_sglang
+    release_cargo_cache_lock
+    install_nccl
     # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
     # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
     if [ "${SGLANG_CI_EARLY_LD_LIBRARY_PATH:-0}" = "1" ]; then

@@ -5,11 +5,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
 
-from sglang.kernels.ops.diffusion.bitexact_gate import BitExactFusionGate
-from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_fused_bias_glu,
+    can_use_fused_bias_silu,
     can_use_fused_layernorm_modulate,
+    fused_bias_glu,
+    fused_bias_silu,
     fused_layernorm_modulate_raw,
     is_plain_layer_norm,
+    residual_gate_add,
 )
 from sglang.multimodal_gen.configs.models.dits.sana import SanaConfig
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
@@ -29,6 +34,8 @@ _SANA_LN_MOD = BitExactFusionGate("Sana fused LN+modulate", per_signature=True)
 _SANA_LN_MOD_SIGS = _SANA_LN_MOD.verified_sigs
 assert _SANA_LN_MOD_SIGS is not None
 _SANA_LN_MOD_DISABLED = False
+_SANA_CONV_SILU = BitExactFusionGate("Sana fused conv bias-SiLU")
+_SANA_CONV_GLU = BitExactFusionGate("Sana fused conv bias-GLU")
 
 
 def _eager_ln_modulate(
@@ -40,7 +47,7 @@ def _eager_ln_modulate(
     return norm(x) * (1 + scale) + shift
 
 
-def _sana_ln_modulate(
+def sana_ln_modulate(
     norm: nn.LayerNorm,
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -149,6 +156,103 @@ def _mps_safe_conv2d(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
     ).to(x.dtype)
 
 
+def _use_sana_bcg_fast_path(x: torch.Tensor) -> bool:
+    if torch.compiler.is_compiling() or not x.is_cuda:
+        return False
+    return torch.cuda.is_current_stream_capturing() or (
+        torch.cuda.current_stream() != torch.cuda.default_stream()
+    )
+
+
+def _conv2d_without_bias(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
+    return F.conv2d(
+        x,
+        conv.weight,
+        None,
+        conv.stride,
+        conv.padding,
+        conv.dilation,
+        conv.groups,
+    )
+
+
+def sana_conv_bias_silu(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
+    if conv.bias is None or not _use_sana_bcg_fast_path(x):
+        return F.silu(_mps_safe_conv2d(conv, x))
+
+    raw = _conv2d_without_bias(conv, x)
+    if not can_use_fused_bias_silu(raw, conv.bias):
+        return F.silu(raw + conv.bias[None, :, None, None])
+    verified = _SANA_CONV_SILU.verified
+    if not verified and not _SANA_CONV_SILU.can_attempt_once():
+        return F.silu(raw + conv.bias[None, :, None, None])
+    try:
+        out = fused_bias_silu(raw, conv.bias)
+    except Exception as exc:
+        _SANA_CONV_SILU.on_exception(exc, logger=logger)
+        return F.silu(raw + conv.bias[None, :, None, None])
+    if verified:
+        return out
+    return _SANA_CONV_SILU.accept_or_fallback(
+        out,
+        F.silu(raw + conv.bias[None, :, None, None]),
+        logger=logger,
+        mismatch_msg=(
+            "Sana fused conv bias-SiLU path is not bit-exact on this "
+            "platform; falling back to eager"
+        ),
+    )
+
+
+def sana_conv_bias_glu(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
+    if conv.bias is None or not _use_sana_bcg_fast_path(x):
+        hidden_states = _mps_safe_conv2d(conv, x)
+        hidden_states, gate = torch.chunk(hidden_states, 2, dim=1)
+        return hidden_states * F.silu(gate)
+
+    raw = _conv2d_without_bias(conv, x)
+    if not can_use_fused_bias_glu(raw, conv.bias):
+        hidden_states, gate = torch.chunk(
+            raw + conv.bias[None, :, None, None], 2, dim=1
+        )
+        return hidden_states * F.silu(gate)
+    verified = _SANA_CONV_GLU.verified
+    if not verified and not _SANA_CONV_GLU.can_attempt_once():
+        hidden_states, gate = torch.chunk(
+            raw + conv.bias[None, :, None, None], 2, dim=1
+        )
+        return hidden_states * F.silu(gate)
+    try:
+        out = fused_bias_glu(raw, conv.bias)
+    except Exception as exc:
+        _SANA_CONV_GLU.on_exception(exc, logger=logger)
+        hidden_states, gate = torch.chunk(
+            raw + conv.bias[None, :, None, None], 2, dim=1
+        )
+        return hidden_states * F.silu(gate)
+    if verified:
+        return out
+    biased = raw + conv.bias[None, :, None, None]
+    hidden_states, gate = torch.chunk(biased, 2, dim=1)
+    return _SANA_CONV_GLU.accept_or_fallback(
+        out,
+        hidden_states * F.silu(gate),
+        logger=logger,
+        mismatch_msg=(
+            "Sana fused conv bias-GLU path is not bit-exact on this "
+            "platform; falling back to eager"
+        ),
+    )
+
+
+def sana_residual_gate_add(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor:
+    if torch.compiler.is_compiling():
+        return residual + gate * update
+    return residual_gate_add(residual, update, gate)
+
+
 def _mps_match_dtype(tensor: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     if ref.device.type == "mps" and tensor.dtype != ref.dtype:
         return tensor.to(dtype=ref.dtype)
@@ -203,7 +307,7 @@ class SanaModulatedNorm(nn.Module):
     def forward(self, x, temb, scale_shift_table):
         scale_shift_table = _mps_match_dtype(scale_shift_table, temb)
         shift, scale = (scale_shift_table[None] + temb[:, None]).chunk(2, dim=1)
-        return _sana_ln_modulate(self.norm, x, scale, shift)
+        return sana_ln_modulate(self.norm, x, scale, shift)
 
 
 class GLUMBConv(nn.Module):
@@ -225,11 +329,8 @@ class GLUMBConv(nn.Module):
         self.conv_point = nn.Conv2d(hidden_channels, out_channels, 1, 1, 0, bias=False)
 
     def forward(self, hidden_states):
-        hidden_states = _mps_safe_conv2d(self.conv_inverted, hidden_states)
-        hidden_states = self.nonlinearity(hidden_states)
-        hidden_states = _mps_safe_conv2d(self.conv_depth, hidden_states)
-        hidden_states, gate = torch.chunk(hidden_states, 2, dim=1)
-        hidden_states = hidden_states * self.nonlinearity(gate)
+        hidden_states = sana_conv_bias_silu(self.conv_inverted, hidden_states)
+        hidden_states = sana_conv_bias_glu(self.conv_depth, hidden_states)
         hidden_states = _mps_safe_conv2d(self.conv_point, hidden_states)
         return hidden_states
 
@@ -374,20 +475,20 @@ class SanaTransformerBlock(nn.Module):
             scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
         ).chunk(6, dim=1)
 
-        norm_hidden = _sana_ln_modulate(self.norm1, hidden_states, scale_msa, shift_msa)
+        norm_hidden = sana_ln_modulate(self.norm1, hidden_states, scale_msa, shift_msa)
         attn_output = self.attn1(norm_hidden)
-        hidden_states = hidden_states + gate_msa * attn_output
+        hidden_states = sana_residual_gate_add(hidden_states, attn_output, gate_msa)
 
         attn_output = self.attn2(
             hidden_states, encoder_hidden_states, encoder_attention_mask
         )
         hidden_states = hidden_states + attn_output
 
-        norm_hidden = _sana_ln_modulate(self.norm2, hidden_states, scale_mlp, shift_mlp)
+        norm_hidden = sana_ln_modulate(self.norm2, hidden_states, scale_mlp, shift_mlp)
         norm_hidden = norm_hidden.unflatten(1, (height, width)).permute(0, 3, 1, 2)
         ff_output = self.ff(norm_hidden)
         ff_output = ff_output.flatten(2, 3).permute(0, 2, 1)
-        hidden_states = hidden_states + gate_mlp * ff_output
+        hidden_states = sana_residual_gate_add(hidden_states, ff_output, gate_mlp)
 
         return hidden_states
 
@@ -484,7 +585,9 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         post_patch_width = width // p
 
         hidden_states = _mps_safe_conv2d(self.patch_embed["proj"], hidden_states)
-        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        # One layout conversion here prevents every downstream LayerNorm from
+        # copying the transposed patch view independently.
+        hidden_states = hidden_states.flatten(2).transpose(1, 2).contiguous()
 
         timestep_emb, embedded_timestep = self.time_embed(
             timestep, hidden_dtype=hidden_states.dtype

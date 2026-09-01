@@ -8,10 +8,10 @@ from typing import Dict, List, Optional, Union
 import aiohttp
 import requests
 
-from sglang.global_config import global_config
 from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
 from sglang.lang.choices import ChoicesDecision, ChoicesSamplingMethod
+from sglang.lang.global_config import global_config
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import (
     REGEX_BOOL,
@@ -393,6 +393,10 @@ class Runtime:
             if is_port_available(port):
                 break
         self.server_args = ServerArgs(*args, log_level=log_level, port=port, **kwargs)
+        # The spawned server gets a copy of this record, and this object keeps
+        # reading it afterwards -- `get_tokenizer` wants the downloaded GGUF
+        # file and the rewritten ModelScope path, not what the caller typed.
+        self.server_args.resolve_once()
 
         self.url = self.server_args.url()
         self.generate_url = self.url + "/generate"
@@ -439,7 +443,9 @@ class Runtime:
         from sglang.srt.utils import kill_process_tree
 
         if self.pid is not None:
-            kill_process_tree(self.pid)
+            # Note(kpham-sgl): __del__ routes here, so the reap wait has to stay
+            # off -- blocking inside GC stalls whichever thread is allocating.
+            kill_process_tree(self.pid, wait_timeout=None)
             self.pid = None
 
     def start_profile(self):
@@ -452,13 +458,15 @@ class Runtime:
         self.endpoint.cache_prefix(prefix)
 
     def get_tokenizer(self):
+        from sglang.srt.arg_groups.overrides import resolving_view
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
+        cfg = resolving_view(self.server_args)
         return get_tokenizer(
-            self.server_args.tokenizer_path,
-            tokenizer_mode=self.server_args.tokenizer_mode,
-            trust_remote_code=self.server_args.trust_remote_code,
-            revision=self.server_args.revision,
+            cfg.tokenizer_path or cfg.model_path,
+            tokenizer_mode=cfg.tokenizer_mode,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.revision,
         )
 
     async def async_generate(

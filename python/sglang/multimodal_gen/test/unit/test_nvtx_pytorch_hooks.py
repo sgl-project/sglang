@@ -16,9 +16,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentResidencyManager,
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentOffloadStrategy,
     ResidentStrategy,
-    VanillaD2HStrategy,
 )
 from sglang.multimodal_gen.runtime.utils import nvtx_pytorch_hooks
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
@@ -209,9 +209,6 @@ class _NoOpResidencyStrategy:
     def prefetch_for_use(self, module, use, state) -> bool:
         return False
 
-    def prepare_after_request(self, module, use, state) -> None:
-        pass
-
 
 def _test_manager(
     modules: dict[str, torch.nn.Module],
@@ -239,7 +236,9 @@ class TestComponentResidencyNvtxHooks(unittest.TestCase):
         manager.strategy_for = lambda _component_name, _module: ResidentStrategy()
         self.assertTrue(manager._should_keep_single_dit("transformer", module))
 
-        manager.strategy_for = lambda _component_name, _module: VanillaD2HStrategy()
+        manager.strategy_for = (
+            lambda _component_name, _module: ComponentOffloadStrategy()
+        )
         self.assertFalse(manager._should_keep_single_dit("transformer", module))
 
     def test_disabled_flag_is_noop(self) -> None:
