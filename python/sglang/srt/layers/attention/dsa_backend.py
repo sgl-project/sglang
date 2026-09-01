@@ -349,6 +349,7 @@ class DeepseekSparseAttnBackend(
             # Keep original head count if it exceeds current padded variants.
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
+        self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
@@ -2439,15 +2440,12 @@ class DeepseekSparseAttnBackend(
 
         sink_input = attn_sink
         if need_padding and attn_sink is not None:
-            cache = getattr(self, "_sink_pad_cache", None)
-            if cache is None:
-                cache = self._sink_pad_cache = {}
             key = (attn_sink.data_ptr(), required_padding)
-            sink_input = cache.get(key)
+            sink_input = self._sink_pad_cache.get(key)
             if sink_input is None:
                 sink_input = attn_sink.new_zeros(required_padding)
-                sink_input[:num_heads] = attn_sink
-                cache[key] = sink_input
+                self._sink_pad_cache[key] = sink_input
+            sink_input[:num_heads].copy_(attn_sink)
 
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
@@ -3467,6 +3465,7 @@ class DeepseekSparseAttnMultiStepBackend:
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
