@@ -1718,7 +1718,7 @@
                 "LatentPreparationStage": 0.14,
                 "TimestepPreparationStage": 1.36,
                 "DenoisingStage": 81747.14,
-                "DecodingStage": 784.99
+                "DecodingStage": 2146.55
             },
             "denoise_step_ms": {
                 "0": 1453.25,
@@ -2794,7 +2794,7 @@
             },
             "expected_e2e_ms": 15974.21,
             "expected_avg_denoise_ms": 802.06,
-            "expected_median_denoise_ms": 747.62,
+            "expected_median_denoise_ms": 946.4,
             "load_peak_vram_mb": 56048.0,
             "runtime_peak_vram_mb": 68712.0,
             "estimated_full_test_time_s": 363.2
