@@ -662,11 +662,11 @@ def _fused_moe_kernel_sequence(
 
     if not fuse_swiglu_interleaved:
         if not _enable_fused_silu_quant_fp8:
-        intermediate_cache2 = torch.empty(
-            (total_tokens, N // 2),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
+            intermediate_cache2 = torch.empty(
+                (total_tokens, N // 2),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
 
     # Activation function with multiplication
     if fuse_swiglu_interleaved:
