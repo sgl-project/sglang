@@ -1,6 +1,10 @@
 """DeepSeek-V4 attention kernels (RFC #29630, Phase 2.5)."""
 
 # --- merged from sglang.kernels.ops.attention.dsv4 (RFC #29630 Phase 4) ---
+from sgl_kernel_npu.activation.silu_and_mul_clamp_triton import (
+    silu_and_mul_clamp_triton,
+)
+
 from .attn import (
     fused_store_cache,
     get_paged_mqa_logits_metadata,
@@ -32,7 +36,6 @@ from .moe import (
     silu_and_mul_contig_post_quant,
     silu_and_mul_masked_post_quant,
 )
-from .silu_and_mul_clamp_triton import silu_and_mul_clamp_triton
 from .topk import plan_topk_v2, topk_transform_512, topk_transform_512_v2
 from .utils import make_name
 
