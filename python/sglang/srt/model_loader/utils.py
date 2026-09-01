@@ -16,6 +16,7 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.model_loader.runai_utils import RUNAI_STREAMER_TENSOR_ATTR
 
 logger = logging.getLogger(__name__)
 
@@ -296,7 +297,7 @@ def should_async_load(weight: torch.Tensor) -> bool:
     RunAI-streamed tensors are zero-copy views into a reused CPU buffer. They
     must be consumed synchronously before the streamer fills its next batch.
     """
-    if getattr(weight, "_sglang_runai_streamer_tensor", False):
+    if getattr(weight, RUNAI_STREAMER_TENSOR_ATTR, False):
         return False
 
     device = getattr(weight, "device", None)

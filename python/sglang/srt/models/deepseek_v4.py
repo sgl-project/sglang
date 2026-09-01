@@ -134,11 +134,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
+from sglang.srt.model_loader.runai_utils import _clone_if_runai_streamed_tensor
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
-from sglang.srt.model_loader.weight_utils import (
-    RUNAI_STREAMER_TENSOR_ATTR,
-    default_weight_loader,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
@@ -3951,12 +3949,6 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     )
 
     return result.to(torch.bfloat16)
-
-
-def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
-        return tensor.clone().detach()
-    return tensor
 
 
 def _dequant_fp8_wo_a_streaming(
