@@ -72,7 +72,7 @@ paths:
 | Component path | Quantized checkpoint behavior |
 | --- | --- |
 | `transformer`, `transformer_2`, `unconditional_transformer`, `audio_dit`, `video_dit` | Uses the SGLang transformer quantization adapters documented below. |
-| `text_encoder*`, `image_encoder*` | Passes detected metadata to the registered native encoder. Loading continues only when that implementation constructs compatible quantized layers; unknown or incompatible combinations fail closed. |
+| `text_encoder*`, `image_encoder*` | Prefers a compatible registered native encoder. Otherwise, a standard top-level `quantization_config` recognized by the installed Transformers version is delegated to its `from_pretrained` path; unsupported formats and metadata locations fail closed. |
 | `vae`, `video_vae`, `audio_vae` | A standard top-level Diffusers `quantization_config` is delegated to `AutoModel.from_pretrained`. Native-only VAEs and nested/compression metadata fail closed. |
 | Library-managed Transformers or Diffusers components | Delegates to the upstream `from_pretrained` path and inherits its format support and validation behavior. The local PE model uses this path; compatible formats remain model-specific. |
 | Native auxiliary components that load raw state dicts | Quantized checkpoints are rejected before model construction until that component has a quantized materialization implementation. This includes connectors, duration heads, bridges, diffusion decoders, sound tokenizers, spatial upsamplers, and vocoders. |
@@ -466,13 +466,15 @@ sglang generate \
 
 Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.to_q`). A layer is skipped and left unquantized if its prefix contains any of the given patterns.
 
-## Transformers Component BnB4
+## Transformers-managed Quantized Components
 
-Model components that already have a native Transformers loading path can load
-serialized BitsAndBytes 4-bit checkpoints with a standard top-level
-`quantization_config`. Plain checkpoints keep using an available native SGLang
-implementation. For example, replace FLUX's T5 component with the official
-Diffusers checkpoint:
+Model components that already have a native Transformers loading path delegate
+self-describing checkpoints whose standard top-level `quantization_config` is
+recognized by the installed Transformers version. Successful loading still
+depends on that backend's optional dependencies, platform, and model/checkpoint
+compatibility. An available native SGLang implementation remains preferred when
+it can restore the same format. For example, replace FLUX's T5 component with
+the official BitsAndBytes checkpoint:
 
 ```bash Command
 sglang serve \
@@ -481,11 +483,12 @@ sglang serve \
     diffusers/FLUX.1-dev-bnb-4bit/text_encoder_2
 ```
 
-The quantized component must stay resident. SGLang rejects component or
-layerwise offload, nonstandard metadata locations, and native-only component
-fallbacks for this path instead of silently changing the checkpoint contract.
-Diffusion DiT components declared under the Diffusers library use the separate
-quantization backends documented above.
+Transformers owns format validation and places the quantized component directly
+on its resident device. SGLang rejects component/layerwise offload, FSDP,
+nonstandard metadata locations, unsupported upstream formats, and native-only
+fallbacks instead of silently changing the checkpoint contract. Diffusion DiT
+components declared under the Diffusers library use the separate quantization
+backends documented above.
 
 ## Validated ModelOpt Checkpoints
 

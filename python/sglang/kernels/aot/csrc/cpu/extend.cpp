@@ -63,6 +63,7 @@ void extend_attention_kernel_impl(
     int64_t sliding_window_size,
     bool is_prefix_skipped,
     bool is_cross_attn,
+    bool is_causal,
     bool kv_from_cache,
     bool has_encoder_lens,
     bool has_sink) {
@@ -236,8 +237,8 @@ void extend_attention_kernel_impl(
             /* C     */ v_prime);
       }  // loop with seq_len_prefix
       if (!is_cross_attn && !kv_from_cache) {
-        // stage 2: compute the triangle part
-        int num_keys = std::min(seq_len_extend, m + BLOCK_M);
+        // stage 2: compute the triangle part (or, when !is_causal, the full square)
+        int num_keys = is_causal ? std::min(seq_len_extend, m + BLOCK_M) : seq_len_extend;
         for (int n = 0; n < num_keys; n += BLOCK_N) {
           int n_size = std::min(BLOCK_N, num_keys - n);
 
@@ -286,7 +287,7 @@ void extend_attention_kernel_impl(
                 }
               }
             }
-          } else if (n + n_size - 1 > m) {
+          } else if (is_causal && n + n_size - 1 > m) {
             // apply causal mask
             // [Note] condition to apply causal mask.
             // Mask any block whose last key (n + n_size - 1) is strictly after the first query position (m), i.e. n +
@@ -421,6 +422,7 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
         sliding_window_size,                                                               \
         is_prefix_skipped,                                                                 \
         is_cross_attn,                                                                     \
+        is_causal,                                                                         \
         kv_from_cache,                                                                     \
         has_encoder_lens,                                                                  \
         has_sink);                                                                         \
@@ -463,7 +465,8 @@ void extend_attention_cpu(
     int64_t sliding_window_size,
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks,
-    std::optional<at::Tensor> tree_mask) {
+    std::optional<at::Tensor> tree_mask,
+    bool is_causal = true) {
   TORCH_CHECK(k_extend_opt.has_value() == v_extend_opt.has_value(), "k_extend and v_extend must be given together");
   // A KV-shared layer (Gemma 4) passes no extend K/V - the layer it shares with
   // already wrote them to the cache, so this kernel masks causally itself. Cross
