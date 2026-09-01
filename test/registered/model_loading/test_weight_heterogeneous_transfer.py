@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import argparse
 import threading
 import unittest
 from types import SimpleNamespace
@@ -1242,7 +1243,8 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             tp_rank=0,
             pp_rank=0,
             daemon_args=WeightCacheDaemonArgs(
-                enable_weight_heterogeneous_copy=True,
+                enable_weight_heterogeneous_transfer=True,
+                weight_heterogeneous_transfer_server_host="0.0.0.0",
                 weight_heterogeneous_transfer_registry_url="tcp://source:31999",
                 weight_cache_socket_rank=4,
             ),
@@ -1281,27 +1283,84 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         )
         self.assertEqual(daemon_load_config.weight_cache_socket, get_socket_path(0))
 
-    def test_source_and_target_gates_are_mutually_exclusive(self):
-        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-            WeightCacheDaemon(
-                server_args=_daemon_server_args(),
-                gpu_id=0,
-                tp_rank=0,
-                pp_rank=0,
-                daemon_args=WeightCacheDaemonArgs(
-                    enable_weight_heterogeneous_copy=True,
-                    weight_heterogeneous_copy=True,
-                    weight_heterogeneous_transfer_registry_url="tcp://source:31999",
-                ),
+    def test_heterogeneous_transfer_role_is_inferred_from_host(self):
+        disabled = WeightCacheDaemonArgs()
+        source = WeightCacheDaemonArgs(
+            enable_weight_heterogeneous_transfer=True,
+            weight_heterogeneous_transfer_server_host="0.0.0.0",
+        )
+        target = WeightCacheDaemonArgs(
+            enable_weight_heterogeneous_transfer=True,
+            weight_heterogeneous_transfer_source_host="source",
+            weight_heterogeneous_transfer_source_port=31999,
+        )
+        self.assertIsNone(disabled.weight_heterogeneous_transfer_role)
+        self.assertEqual(source.weight_heterogeneous_transfer_role, "source")
+        self.assertTrue(source.is_weight_heterogeneous_transfer_source)
+        self.assertEqual(target.weight_heterogeneous_transfer_role, "target")
+        self.assertTrue(target.is_weight_heterogeneous_transfer_target)
+
+        invalid_cases = (
+            (
+                {
+                    "enable_weight_heterogeneous_transfer": True,
+                },
+                "exactly one",
+            ),
+            (
+                {
+                    "enable_weight_heterogeneous_transfer": True,
+                    "weight_heterogeneous_transfer_server_host": "0.0.0.0",
+                    "weight_heterogeneous_transfer_source_host": "source",
+                    "weight_heterogeneous_transfer_source_port": 31999,
+                },
+                "exactly one",
+            ),
+            (
+                {
+                    "weight_heterogeneous_transfer_server_host": "0.0.0.0",
+                },
+                "require --enable",
+            ),
+            (
+                {
+                    "enable_weight_heterogeneous_transfer": True,
+                    "weight_heterogeneous_transfer_source_host": "source",
+                },
+                "positive source port",
+            ),
+        )
+        for kwargs, error in invalid_cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(ValueError, error):
+                    WeightCacheDaemonArgs(**kwargs)
+
+    def test_heterogeneous_transfer_cli_uses_single_enable_flag(self):
+        parser = argparse.ArgumentParser()
+        WeightCacheDaemonArgs.add_cli_args(parser)
+
+        source = WeightCacheDaemonArgs.from_cli_args(
+            parser.parse_args(
+                [
+                    "--enable-weight-heterogeneous-transfer",
+                    "--weight-heterogeneous-transfer-server-host",
+                    "0.0.0.0",
+                ]
             )
-        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-            launch_weight_cache_daemons(
-                _daemon_server_args(),
-                daemon_args=WeightCacheDaemonArgs(
-                    enable_weight_heterogeneous_copy=True,
-                    weight_heterogeneous_copy=True,
-                ),
+        )
+        target = WeightCacheDaemonArgs.from_cli_args(
+            parser.parse_args(
+                [
+                    "--enable-weight-heterogeneous-transfer",
+                    "--weight-heterogeneous-transfer-source-host",
+                    "source",
+                    "--weight-heterogeneous-transfer-source-port",
+                    "31999",
+                ]
             )
+        )
+        self.assertTrue(source.is_weight_heterogeneous_transfer_source)
+        self.assertTrue(target.is_weight_heterogeneous_transfer_target)
 
     def test_daemon_socket_does_not_serve_weight_manifests(self):
         daemon = object.__new__(WeightCacheDaemon)
@@ -1347,7 +1406,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                         _prepare_weight_heterogeneous_transfer(
                             _daemon_server_args(),
                             WeightCacheDaemonArgs(
-                                enable_weight_heterogeneous_copy=True,
+                                enable_weight_heterogeneous_transfer=True,
                                 weight_heterogeneous_transfer_server_host=bind_host,
                                 weight_heterogeneous_transfer_server_port=31999,
                             ),
@@ -1378,7 +1437,8 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                     _daemon_server_args(tp_size=2),
                     dist_init_method="tcp://127.0.0.1:12345",
                     daemon_args=WeightCacheDaemonArgs(
-                        enable_weight_heterogeneous_copy=True
+                        enable_weight_heterogeneous_transfer=True,
+                        weight_heterogeneous_transfer_server_host="0.0.0.0",
                     ),
                 )
 
@@ -1409,8 +1469,8 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                     _daemon_server_args(base_gpu_id=4),
                     timeout=1,
                     daemon_args=WeightCacheDaemonArgs(
-                        weight_heterogeneous_copy=True,
-                        weight_heterogeneous_transfer_source_ip="source",
+                        enable_weight_heterogeneous_transfer=True,
+                        weight_heterogeneous_transfer_source_host="source",
                         weight_heterogeneous_transfer_source_port=31999,
                     ),
                 )
@@ -1421,7 +1481,11 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         self.assertEqual(call.kwargs["socket_rank"], 4)
         self.assertEqual(call.kwargs["gpu_id"], 4)
         child_args = call.kwargs["daemon_args"]
-        self.assertTrue(child_args.weight_heterogeneous_copy)
+        self.assertTrue(child_args.is_weight_heterogeneous_transfer_target)
+        self.assertEqual(
+            child_args.weight_heterogeneous_transfer_source_host,
+            "source",
+        )
         self.assertEqual(
             child_args.weight_heterogeneous_transfer_registry_url,
             "tcp://source:31999",
