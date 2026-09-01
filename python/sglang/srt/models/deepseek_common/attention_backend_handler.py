@@ -19,7 +19,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     is_gfx95_supported,
-    is_sm100_or_sm110_supported,
     use_intel_amx_backend,
 )
 
