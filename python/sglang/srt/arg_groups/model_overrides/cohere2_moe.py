@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 def _is_nvfp4_pack_quantized(hf_config: Any) -> bool:
+    # Note(mmangkad): nvfp4-pack-quantized is llm-compressor's output format.
     qc = getattr(hf_config, "quantization_config", None)
     if not isinstance(qc, dict):
         return False
