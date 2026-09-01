@@ -202,6 +202,20 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Fused in-place QK RMS-norm + RoPE.",
     ),
     (
+        "diffusion.flux2_qkv_epilogue",
+        KernelBackend.JIT,
+        "rope.flux2_qkv_epilogue_jit:try_fused_flux2_qkv_epilogue",
+        _CUDA,
+        "FLUX.2 QK RMS-norm + RoPE + joint QKV packing.",
+    ),
+    (
+        "diffusion.flux2_token_cat_fp8",
+        KernelBackend.TRITON,
+        "layout.flux2_token_cat_fp8_triton:try_flux2_token_cat_fp8",
+        _CUDA,
+        "FLUX.2 single-block token concatenation + static FP8 quantization.",
+    ),
+    (
         "diffusion.qwen_qkv_epilogue",
         KernelBackend.JIT,
         "rope.qwen_qkv_epilogue_jit:try_fused_qwen_qkv_epilogue",
@@ -398,6 +412,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_fused_layernorm_modulate": "norm.layernorm_modulate_triton",
     "can_use_fused_qk_head_layernorm": "norm.layernorm_modulate_triton",
     "fused_layernorm_modulate": "norm.layernorm_modulate_triton",
+    "fused_layernorm_modulate_fp8_quant_raw": "norm.layernorm_modulate_triton",
     "fused_layernorm_modulate_raw": "norm.layernorm_modulate_triton",
     "fused_qk_head_layernorm": "norm.layernorm_modulate_triton",
     "is_plain_layer_norm": "norm.layernorm_modulate_triton",
@@ -443,6 +458,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_fused_temb_table_slices": "modulate.wan_temb_table_slices_triton",
     "fused_temb_table_slices": "modulate.wan_temb_table_slices_triton",
     # Rotary embeddings and the QK-norm chains fused around them
+    "try_fused_flux2_qkv_epilogue": "rope.flux2_qkv_epilogue_jit",
     "hunyuan_qkv_rope_pack": "rope.hunyuan_qkv_pack_triton",
     "can_use_ltx2_qknorm_split_rope_cuda": "rope.ltx2_qknorm_split_rope_jit",
     "ltx2_qknorm_split_rope_cuda": "rope.ltx2_qknorm_split_rope_jit",
@@ -460,6 +476,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_helios_qk_rope": "rope.helios_qk_rope_jit",
     "fused_inplace_helios_qk_rope": "rope.helios_qk_rope_jit",
     "apply_rotary_embedding": "rope.rotary_triton",
+    # Tensor layout transformations fused with downstream quantization
+    "try_flux2_token_cat_fp8": "layout.flux2_token_cat_fp8_triton",
     # Activation-function fusions
     "can_use_fused_bias_glu": "activation.sana_conv_post_triton",
     "can_use_fused_bias_silu": "activation.sana_conv_post_triton",

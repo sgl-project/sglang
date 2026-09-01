@@ -311,7 +311,10 @@ sglang serve \
 The [`nvidia/DeepSeek-V4-Pro-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Pro-NVFP4) and
 [`nvidia/DeepSeek-V4-Flash-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Flash-NVFP4) checkpoints
 quantize MoE experts to **NVFP4** while keeping attention and dense layers in
-**FP8**. It requires `--moe-runner-backend flashinfer_trtllm_routed` which will be automatically selected if not provided.
+**FP8**. The official releases have matching NVFP4 checkpoints at
+[`nvidia/DeepSeek-V4-Flash-0731-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Flash-0731-NVFP4) and
+[`nvidia/DeepSeek-V4-Pro-0813-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Pro-0813-NVFP4).
+All of them require `--moe-runner-backend flashinfer_trtllm_routed` which will be automatically selected if not provided.
 
 ```bash Command
 sglang serve \
@@ -330,6 +333,11 @@ sglang serve \
 Requires Blackwell (SM100+). The MTP layer in this checkpoint stays
 MXFP4-packed and is routed through the `Mxfp4FlashinferTrtllmMoEMethod` path
 automatically.
+
+The official (0731 / 0813) NVFP4 checkpoints preserve the bundled DSpark draft
+head, so their low-latency recipes use `--speculative-algorithm DSPARK` instead
+of the EAGLE/MTP shape flags — same as the corresponding original-precision
+official checkpoints.
 
 <a id="hopper-note" />
 

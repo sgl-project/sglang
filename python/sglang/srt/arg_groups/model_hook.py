@@ -309,6 +309,14 @@ def handle_model_specific_adjustments(server_args: Any):
                 # here for the rest of the DSA family (DeepSeek-V3.2 /
                 # GLM-5.x) that shares the same decode top-k path.
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+            if model_arch == "GlmMoeDsaForCausalLM":
+                # Open the fused top-k v2 kernel for the GLM-5.x DSA
+                # family on ROCm: it shares this decode top-k path, and
+                # the kernel's ROCm build compiles the streaming levels
+                # on gfx9xx. Order is load-bearing: the blanket disable
+                # above `set`s the variable unconditionally, so this has
+                # to follow it.
+                envs.SGLANG_OPT_USE_TOPK_V2.set(True)
             if not resolved_view(server_args).enable_dp_attention and cfg.nnodes == 1:
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True
