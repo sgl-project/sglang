@@ -434,7 +434,9 @@ class TestLoadWeightsFromRemoteInstance(CustomTestCase):
                 checking_parameters,
                 "127.0.0.1",
                 DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000,
-                60010,
+                # See the CUDA variant: below the ephemeral range, clear of the
+                # DEFAULT_PORT_FOR_SRT_TEST_RUNNER band.
+                9010,
                 remote_instance_loader_backend,
             )
 
