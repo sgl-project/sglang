@@ -193,20 +193,3 @@ def test_fasth3_gates_stay_bf16_under_runtime_quantization(quant_name: str) -> N
     assert isinstance(attn.to_gate_compress.quant_method, UnquantizedLinearMethod)
     assert attn.to_gate_compress.weight.dtype == torch.bfloat16
     assert model.token_refiner.blocks[0].attn.to_gate_compress is None
-
-
-def test_cache_dit_is_a_declared_noop_at_four_forwards() -> None:
-    from types import SimpleNamespace
-
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
-        _cache_dit_noop_reason,
-    )
-
-    batch = SimpleNamespace(sampling_params=SimpleNamespace(cache_dit_params=None))
-    reason = _cache_dit_noop_reason(4, batch)
-    assert reason is not None and "4 DiT forwards" in reason
-    assert _cache_dit_noop_reason(49, batch) is None
-    lowered = SimpleNamespace(
-        sampling_params=SimpleNamespace(cache_dit_params={"max_warmup_steps": 1})
-    )
-    assert _cache_dit_noop_reason(4, lowered) is None

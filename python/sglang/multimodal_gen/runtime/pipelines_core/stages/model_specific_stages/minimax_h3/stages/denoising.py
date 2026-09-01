@@ -12,11 +12,9 @@ from typing import Any
 
 import torch
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
-    resolve_cache_dit_request_overrides,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
@@ -439,11 +437,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             desired_mode = "high"
         else:
             desired_mode = "generic" if generic_requested else None
-        if desired_mode == "generic":
-            noop_reason = _cache_dit_noop_reason(num_inference_steps, batch)
-            if noop_reason is not None:
-                logger.warning_once(noop_reason)
-                desired_mode = None
         current_mode = getattr(self, "_minimax_h3_cache_mode", None)
         self._minimax_h3_quality = quality
 
@@ -932,30 +925,6 @@ def _assemble_condition_rows(ctx: _FullLoopContext) -> None:
         ctx.keyframe_frame_count = int(ctx.keyframe["frame_count"])
 
 
-def _cache_dit_noop_reason(
-    num_inference_steps: int | tuple[int, int], batch: Req
-) -> str | None:
-    """Why generic Cache-DiT cannot hit on this request, or None if it can."""
-    forwards = (
-        min(num_inference_steps)
-        if isinstance(num_inference_steps, tuple)
-        else int(num_inference_steps)
-    )
-    overrides = resolve_cache_dit_request_overrides(
-        batch.sampling_params.cache_dit_params
-    )
-    warmup = int(overrides.get("max_warmup_steps", envs.SGLANG_CACHE_DIT_WARMUP))
-    if forwards > warmup:
-        return None
-    return (
-        f"Cache-DiT is a no-op for this request: {forwards} DiT forwards do not "
-        f"exceed max_warmup_steps={warmup}, so every step is computed in full. "
-        "Not mounting Cache-DiT. Lower SGLANG_CACHE_DIT_WARMUP or "
-        "cache_dit_params.max_warmup_steps if caching a distilled schedule is "
-        "intended."
-    )
-
-
 def _maybe_prepare_vsa_h3_step_metadata(
     *,
     model: Any,
@@ -1000,16 +969,6 @@ def _maybe_prepare_vsa_h3_step_metadata(
     cond_rows = int(packed["img_pos"].numel()) - video_rows
     audio_rows = int(packed["audio_pos"].numel())
     patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
-    dit_rows = (
-        (ctx.latent_t // patch_size[0])
-        * (ctx.latent_h // patch_size[1])
-        * (ctx.latent_w // patch_size[2])
-    )
-    if dit_rows != video_rows:
-        raise ValueError(
-            "VSA-H3 packed layout drift: the video target holds "
-            f"{video_rows} rows but the latent canvas patchifies to {dit_rows}"
-        )
 
     from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
         VideoSparseAttentionH3MetadataBuilder,

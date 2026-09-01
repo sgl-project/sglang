@@ -705,8 +705,7 @@ latency for peak memory.
 FastH3 rejects deployment options that do not apply to the distilled preview
 instead of silently ignoring them: `--model-variant`, `quality: "high"`,
 `fl2va` / `ref2va` requests, and, with VSA-H3, `--ring-degree` greater than 1,
-`torch.compile`, and breakable CUDA graph execution. Generic Cache-DiT logs
-that it is a no-op at four forwards and is not mounted.
+`torch.compile`, and breakable CUDA graph execution.
 
 <Warning>
 The sibling `FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA` adapters carry
