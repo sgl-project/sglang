@@ -3553,7 +3553,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             )
         return self.k_scale_buffer[idx][loc], self.v_scale_buffer[idx][loc]
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         # The scales travel with their fp8 payload; a restored slot dequantizes
         # against mismatched exponents without them.
         assert not self.use_hnd, (
@@ -3583,7 +3583,9 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         current_platform.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         assert not self.use_hnd, (
             "CPU KV offload indexes by slot (NHD); HND KV cache "
             "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."

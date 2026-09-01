@@ -1021,7 +1021,11 @@ class HybridLinearAttnBackend(AttentionBackend):
             full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
         self.supports_overlap_plan_stream_graph_load = bool(
-            linear_attn_backend.supports_overlap_plan_stream_graph_load
+            getattr(
+                linear_attn_backend,
+                "supports_overlap_plan_stream_graph_load",
+                False,
+            )
         )
 
     @property
