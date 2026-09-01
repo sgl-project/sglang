@@ -115,6 +115,7 @@ POST_ADJUSTMENT_REGRESSION_FRACTION = 0.05
 # before the optimizer runs. Keep a deterministic, resource-safe sampling of
 # the frontier; every retained state still uses its exact byte accounting.
 MAX_LAYERWISE_RESIDENT_TARGETS = 64
+MAX_LAYERWISE_POLICY_TARGETS = 64
 MAX_LAYERWISE_PIN_TARGETS = 64
 MAX_LAYERWISE_COMPONENT_TARGETS = 4096
 
@@ -1780,7 +1781,45 @@ def _layerwise_policy_targets(
         )
         for manager, count in zip(managers, resident_layers)
     )
-    return list(dict.fromkeys([current, *product(*choices)]))
+    tunable_indices = tuple(
+        index for index, policy_choices in enumerate(choices) if len(policy_choices) > 1
+    )
+    target_count = 1 << len(tunable_indices)
+    if target_count <= MAX_LAYERWISE_POLICY_TARGETS:
+        return list(dict.fromkeys([current, *product(*choices)]))
+
+    # A component may own many independently managed layer stacks. Expanding
+    # every leading/strided combination is exponential and can consume the
+    # whole server-startup timeout before the bounded resident and HostPin
+    # frontiers are considered. Sample the binary policy space directly by
+    # mask, retaining both extremes and evenly spaced deterministic layouts.
+    denominator = MAX_LAYERWISE_POLICY_TARGETS - 1
+    masks = {
+        (sample_index * (target_count - 1) + denominator // 2) // denominator
+        for sample_index in range(MAX_LAYERWISE_POLICY_TARGETS)
+    }
+    targets = []
+    seen = set()
+
+    def add(target: tuple[str, ...]) -> None:
+        if target in seen or len(targets) >= MAX_LAYERWISE_POLICY_TARGETS:
+            return
+        targets.append(target)
+        seen.add(target)
+
+    add(current)
+    ordered_masks = [0, target_count - 1, *sorted(masks - {0, target_count - 1})]
+    for mask in ordered_masks:
+        bit_index = 0
+        target = []
+        for policy_choices in choices:
+            if len(policy_choices) == 1:
+                target.append(policy_choices[0])
+                continue
+            target.append(policy_choices[(mask >> bit_index) & 1])
+            bit_index += 1
+        add(tuple(target))
+    return targets
 
 
 def _policy_affects_layerwise_layout(

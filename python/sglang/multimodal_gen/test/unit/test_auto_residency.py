@@ -16,6 +16,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     ACTIVATION_EXTRAPOLATION_MARGIN,
     GIB_BYTES,
+    MAX_LAYERWISE_POLICY_TARGETS,
     MAX_LAYERWISE_RESIDENT_TARGETS,
     MIN_VRAM_RESERVE_BYTES,
     PAGEABLE_H2D_COST_MULTIPLIER,
@@ -27,6 +28,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     ResidencyTarget,
     WarmupMemoryRecord,
     _layerwise_pin_targets,
+    _layerwise_policy_targets,
     _layerwise_resident_targets,
     apply_residency_changes,
     collect_residency_targets,
@@ -3235,6 +3237,22 @@ class TestCollectResidencyTargets:
         assert (70, 0) in targets
         assert (0, 70) in targets
         assert (13, 17) in targets
+
+    def test_large_policy_frontier_is_bounded_and_keeps_extremes(self):
+        managers = [
+            SimpleNamespace(num_layers=4, residency_policy=RESIDENCY_POLICY_LEADING)
+            for _ in range(80)
+        ]
+
+        targets = _layerwise_policy_targets(
+            managers=managers,
+            resident_layers=tuple(2 for _ in managers),
+            tune_policy=True,
+        )
+
+        assert len(targets) == MAX_LAYERWISE_POLICY_TARGETS
+        assert tuple(RESIDENCY_POLICY_LEADING for _ in managers) in targets
+        assert tuple(RESIDENCY_POLICY_STRIDED for _ in managers) in targets
 
     def test_host_pin_frontier_includes_non_prefix_packings(self):
         manager = SimpleNamespace(
