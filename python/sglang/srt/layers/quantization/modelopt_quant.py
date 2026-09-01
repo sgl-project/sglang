@@ -140,13 +140,21 @@ def fp4_gemm(
     out_features: int,
     quant_mode: str = "w4a4",
 ) -> torch.Tensor:
-    if envs.SGLANG_ENABLE_KDA_NVFP4_GEMM.get():
-        from sglang.kernels.ops.gemm import (
-            can_dispatch_kda_nvfp4_gemm,
-            kda_nvfp4_gemm,
-        )
+    from sglang.kernels.ops.gemm import (
+        can_dispatch_kda_nvfp4_gemm,
+        kda_nvfp4_gemm,
+    )
 
-        if can_dispatch_kda_nvfp4_gemm(
+    if can_dispatch_kda_nvfp4_gemm(
+        input,
+        weight,
+        input_sf,
+        weight_sf,
+        alpha,
+        out_dtype,
+        out_features,
+    ):
+        return kda_nvfp4_gemm(
             input,
             weight,
             input_sf,
@@ -154,16 +162,7 @@ def fp4_gemm(
             alpha,
             out_dtype,
             out_features,
-        ):
-            return kda_nvfp4_gemm(
-                input,
-                weight,
-                input_sf,
-                weight_sf,
-                alpha,
-                out_dtype,
-                out_features,
-            )
+        )
 
     if not enable_flashinfer_fp4_gemm:
         raise RuntimeError(

@@ -22,10 +22,9 @@ M=4369 prefill.
 
 M=1 is normal decode, M=9 is DSpark verification with block size 8, and
 M=4369 is the captured 4K-prompt prefill after chat-template expansion. The
-opt-in ModelOpt dispatch is guarded by `SGLANG_ENABLE_KDA_NVFP4_GEMM=1` and is
-deliberately narrower than the low-level API: it enables the E2E-qualified
-Qwen3.5-4B/9B MLP shapes at M in {1, 2, 4, 8} and the Qwen3.8-27B down
-projection at M=9. Every other call falls back to FlashInfer.
+ModelOpt dispatch is deliberately narrower than the low-level API: it enables
+the E2E-qualified Qwen3.5-4B/9B MLP shapes at M in {1, 2, 4, 8} and the
+Qwen3.8-27B down projection at M=9. Every other call falls back to FlashInfer.
 
 The imported decode kernel was adapted for serving by streaming both FP4
 weights and weight scales through L2. The source task's isolated-GEMM policy
@@ -74,9 +73,7 @@ through the low-level API but is not production-dispatched for Qwen3.5.
 End-to-end serving used 32 fixed-seed `random-ids` requests per round, 2048
 input tokens, 512 output tokens, concurrency in {1, 2, 4, 8}, and a cache flush
 before every round. Each concurrency ran three baseline rounds and three KDA
-rounds; one adjacent baseline round followed the candidate sweep. KDA was
-enabled only through
-`SGLANG_ENABLE_KDA_NVFP4_GEMM=1`.
+rounds; one adjacent baseline round followed the candidate sweep.
 
 | Model | Concurrency | Baseline tok/s | KDA tok/s | Adjacent baseline | Throughput | TPOT | E2E latency |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -90,8 +87,8 @@ enabled only through
 | Qwen3.5-9B | 8 | 1022.864 | 1050.453 | 1024.721 | +2.70% | +2.78% | +2.62% |
 
 Every formal round completed all 32 requests (65,536 input and 16,384 output
-tokens). The candidate server logs must contain the KDA fast-path message; the
-E2E runner treats a missing dispatch as a failure. The adjacent baselines
+tokens). Candidate server logs contained the KDA fast-path message. The adjacent
+baselines
 reproduce the original throughput means within 0.32%, which bounds run-order
 drift. TTFT changes range from -1.93% to +3.57% across both models, while TPOT
 and total E2E latency improve at every concurrency, consistent with a

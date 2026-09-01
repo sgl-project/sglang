@@ -10,6 +10,6 @@ still be CUDA, Triton, or CuTe DSL; `KDA` records how the candidate was
 produced and qualified rather than which compiler built it.
 
 Each kernel package must document its source task, exact source revision,
-target hardware, supported shapes, and validation evidence. Generated kernels
-remain opt-in until correctness and end-to-end serving performance have been
-validated on their target GPU.
+target hardware, supported shapes, and validation evidence. After that
+qualification, ModelOpt selects them by capability and shape allowlist rather
+than a separate environment-variable switch.

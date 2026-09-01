@@ -8,7 +8,6 @@ from sglang.kernels.ops.gemm import (
     can_use_kda_nvfp4_gemm,
     kda_nvfp4_gemm,
 )
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -106,8 +105,7 @@ class TestKdaNvfp4GemmSm120(CustomTestCase):
         self.assertFalse(can_dispatch_kda_nvfp4_gemm(*args_m1, torch.bfloat16, 5120))
 
         expected = _reference(args)
-        with envs.SGLANG_ENABLE_KDA_NVFP4_GEMM.override(True):
-            actual = fp4_gemm(*args, torch.bfloat16, 5120)
+        actual = fp4_gemm(*args, torch.bfloat16, 5120)
         torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.02)
 
         for k, n in _QWEN35_DECODE_SHAPES:
