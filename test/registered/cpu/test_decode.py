@@ -1,5 +1,6 @@
 import unittest
 
+import sgl_kernel  # noqa: F401
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 

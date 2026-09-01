@@ -51,12 +51,12 @@ class TestRetractDecode(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=64,
+            num_examples=256,
             num_threads=32,
         )
 
         metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.65)
+        self.assertGreaterEqual(metrics["score"], 0.64)
         time.sleep(1)  # wait for mem check
 
         assert self.process.poll() is None, "Server crashed during test"

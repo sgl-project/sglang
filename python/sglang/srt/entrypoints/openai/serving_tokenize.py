@@ -45,6 +45,11 @@ class OpenAIServingTokenize(OpenAIServingBase):
         try:
             tokenizer = self.tokenizer_manager.tokenizer
             max_model_len = getattr(tokenizer, "model_max_length", -1)
+            # ORJSON accepts signed negative and unsigned positive 64-bit integers.
+            if isinstance(max_model_len, int) and not (
+                -(2**63) <= max_model_len < 2**64
+            ):
+                max_model_len = self.tokenizer_manager.model_config.context_len
 
             if request.messages is not None:
                 token_ids = self._tokenize_chat_request(request)

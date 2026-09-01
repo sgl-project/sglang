@@ -8,7 +8,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-namespace {
+namespace sglang {
 
 // ======================= Memory Utilities =======================
 // Adapted from DeepEP: https://github.com/deepseek-ai/DeepEP/blob/main/csrc/kernels/utils.cuh
@@ -329,4 +329,4 @@ struct ConcatMlaAbsorbQKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

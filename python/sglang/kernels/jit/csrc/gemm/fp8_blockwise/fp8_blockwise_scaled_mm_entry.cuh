@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "fp8_blockwise_scaled_mm_sm120.cuh"
 
+namespace sglang {
+
 void fp8_blockwise_scaled_mm(
     tvm::ffi::TensorView out,
     tvm::ffi::TensorView mat_a,
@@ -23,3 +25,5 @@ void fp8_blockwise_scaled_mm(
     tvm::ffi::TensorView scales_b) {
   fp8_blockwise_scaled_mm_sm120(out, mat_a, mat_b, scales_a, scales_b);
 }
+
+}  // namespace sglang

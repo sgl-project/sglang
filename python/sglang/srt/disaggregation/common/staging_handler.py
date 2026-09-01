@@ -17,6 +17,10 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.runtime_context import (
+    get_schedule,
+)
+
 logger = logging.getLogger(__name__)
 
 # Bounded wait for a watermark advance before re-enqueueing a deferred staging
@@ -104,15 +108,28 @@ class DecodeStagingHandler:
         if receiver is None or not receiver.bootstrap_infos:
             return
         key = tuple(str(bi) for bi in receiver.bootstrap_infos)
-        if key not in self._wm_subscribers:
-            self._wm_subscribers[key] = (receiver, session_id)
+        if key in self._wm_subscribers:
+            return
+
+        self._wm_subscribers[key] = (receiver, session_id)
+        # Watermark state is per prefill session. Send the current value so a
+        # new session's first allocation cannot wait on a missed update.
+        self._send_watermark(
+            receiver,
+            session_id,
+            self.staging_allocator.get_watermark(),
+        )
 
     def num_writers_for(self, receiver) -> int:
-        """Compute num_writers for a specific request based on its prefill TP."""
-        prefill_tp = receiver.prefill_info.attn_tp_size
+        """Compute all TP and PP writers expected for a staging chunk."""
+        prefill_info = receiver.prefill_info
+        prefill_tp = prefill_info.attn_tp_size
         if prefill_tp > self.decode_tp:
-            return prefill_tp // max(1, self.decode_tp)
-        return 1
+            tp_writers = prefill_tp // max(1, self.decode_tp)
+        else:
+            tp_writers = 1
+        pp_writers = prefill_info.pp_size // self.kv_manager.pp_size
+        return tp_writers * pp_writers
 
     @classmethod
     def create(cls, kv_manager, scheduler, tp_rank: int) -> DecodeStagingHandler:
@@ -163,12 +180,12 @@ class DecodeStagingHandler:
         # exact only when the prefix is page-aligned. Fail just this request on a
         # mismatch instead of raising, which would kill the prefill scheduler.
         page_size = self.kv_buffer_info["page_size"]
-        if decode_req.req.cache_protected_len % page_size != 0:
+        if decode_req.req.kv.cache_protected_len % page_size != 0:
             logger.error(
                 "[STAGING] decode prefix length %s is not page-aligned "
                 "(page_size=%s); failing room=%s (staging scatter offsets "
                 "would be wrong).",
-                decode_req.req.cache_protected_len,
+                decode_req.req.kv.cache_protected_len,
                 page_size,
                 room,
             )
@@ -403,10 +420,10 @@ class DecodeStagingHandler:
 
         staging_view = self.staging_allocator.buffer.buffer[staging_offset:]
 
-        req_pool_idx = decode_req.req.req_pool_idx
+        req_pool_idx = decode_req.req.kv.req_pool_idx
         # page_start is suffix-relative (pages after the decode-side cached
         # prefix); req_to_token rows are absolute.
-        prefix_tokens = decode_req.req.cache_protected_len
+        prefix_tokens = decode_req.req.kv.cache_protected_len
         token_start = prefix_tokens + page_start * page_size
         token_end = token_start + num_pages * page_size
         prefill_tp = receiver.prefill_info.attn_tp_size
@@ -435,26 +452,28 @@ class DecodeStagingHandler:
         return True
 
     def _free_and_send_watermark(
-        self, alloc_id: int, decode_req: DecodeRequest
+        self, alloc_id: int, _decode_req: DecodeRequest
     ) -> None:
         """Free a staging allocation and broadcast watermark to all prefills."""
         self.staging_allocator.free(alloc_id)
         post_wm = self.staging_allocator.get_watermark()
-        room = decode_req.req.bootstrap_room
-        wm_round, wm_tail = post_wm
+        for receiver, session_id in list(self._wm_subscribers.values()):
+            self._send_watermark(receiver, session_id, post_wm)
+
+    @staticmethod
+    def _send_watermark(receiver, session_id: str, watermark) -> None:
+        """Send one allocator watermark to a registered prefill session."""
+        wm_round, wm_tail = watermark
         wm_round_b = str(wm_round).encode("ascii")
         wm_tail_b = str(wm_tail).encode("ascii")
-        for _key, (receiver, session_id) in list(self._wm_subscribers.items()):
-            sid_b = session_id.encode("ascii")
-            for bootstrap_info in receiver.bootstrap_infos:
-                try:
-                    sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
-                    with lock:
-                        sock.send_multipart(
-                            [b"WATERMARK", wm_round_b, wm_tail_b, sid_b]
-                        )
-                except Exception:
-                    pass
+        sid_b = session_id.encode("ascii")
+        for bootstrap_info in receiver.bootstrap_infos:
+            try:
+                sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart([b"WATERMARK", wm_round_b, wm_tail_b, sid_b])
+            except Exception:
+                pass
 
 
 def is_watermark_ready(
@@ -535,10 +554,13 @@ class StagingRegisterInfo:
 
     base_ptr: int = 0
     total_size: int = 0
+    # Staging slots stay [all K, all V] after draft buffers alter kv_data_ptrs order;
+    # older peers leave this empty and callers fall back to kv_layer_ids.
+    slot_layer_ids: List[int] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_zmq_fields(
-        cls, msg: list, msg_start_offset: int
+        cls, msg: list, msg_start_offset: int, slot_ids_index: Optional[int] = None
     ) -> Optional[StagingRegisterInfo]:
         i = msg_start_offset
         base_ptr = (
@@ -551,7 +573,17 @@ class StagingRegisterInfo:
         )
         if base_ptr == 0 and total_size == 0:
             return None
-        return cls(base_ptr=base_ptr, total_size=total_size)
+        slot_layer_ids: List[int] = []
+        if (
+            slot_ids_index is not None
+            and len(msg) > slot_ids_index
+            and len(msg[slot_ids_index]) > 0
+        ):
+            raw = msg[slot_ids_index]
+            slot_layer_ids = list(struct.unpack(f"{len(raw) // 8}Q", raw))
+        return cls(
+            base_ptr=base_ptr, total_size=total_size, slot_layer_ids=slot_layer_ids
+        )
 
 
 class PrefillStagingStrategy:
@@ -570,7 +602,7 @@ class PrefillStagingStrategy:
         self.staging_buffer = staging_buffer
         page_size = kv_manager.kv_buffer_tensors["page_size"]
         self.full_chunk_pages = (
-            staging_grid_tokens(kv_manager.server_args.chunked_prefill_size, page_size)
+            staging_grid_tokens(get_schedule().chunked_prefill_size, page_size)
             // page_size
         )
 
@@ -643,7 +675,13 @@ class PrefillStagingStrategy:
                 target_info.dst_tp_rank,
                 target_info.dst_attn_tp_size,
                 target_info.dst_kv_item_len,
+                target_info.dst_kv_layer_ids,
                 staging_buffer=self.staging_buffer,
+                dst_slot_layer_ids=(
+                    target_info.staging.slot_layer_ids
+                    if target_info.staging is not None
+                    else None
+                ),
             )
         except Exception as e:
             raise RuntimeError(
@@ -742,6 +780,7 @@ def handle_staging_req(
     chunk_idx = int(msg[2].decode("ascii"))
     chunk_num_pages = int(msg[3].decode("ascii"))
     session_id = msg[4].decode("ascii")
+    requester_pp_rank = int(msg[5].decode("ascii")) if len(msg) > 5 else None
 
     if staging_allocator is None:
         logger.warning(
@@ -824,6 +863,8 @@ def handle_staging_req(
     bootstrap_infos = room_bootstrap.get(room)
     if bootstrap_infos:
         for bi in bootstrap_infos:
+            if requester_pp_rank is not None and bi["pp_rank"] != requester_pp_rank:
+                continue
             try:
                 sock, lock = receiver._connect_to_bootstrap_server(bi)
                 with lock:
@@ -842,6 +883,51 @@ def handle_staging_req(
                 pass
 
 
+class StagingManagerMixin:
+    """Shared STAGING_REQ handling for KV managers that support staging.
+
+    Mixed into the managers whose decode thread receives STAGING_REQ messages
+    (currently Mooncake and NIXL). Expects the concrete manager to provide
+    ``_staging_handler``, ``_staging_ctx``, ``kv_args``, ``attn_tp_size`` and
+    optionally ``kv_buffer_tensors``.
+    """
+
+    def _is_watermark_ready(
+        self, session_id: str, alloc_round: int, alloc_end: int
+    ) -> bool:
+        return is_watermark_ready(self._staging_ctx, session_id, alloc_round, alloc_end)
+
+    def _handle_staging_req(self, msg):
+        room = int(msg[1].decode("ascii"))
+        session_id = msg[4].decode("ascii")
+        handler = self._staging_handler
+        assert (
+            handler is not None
+        ), "STAGING_REQ received before staging handler initialized"
+        decode_req = handler._room_to_decode_req.get(room)
+        if decode_req is None:
+            logger.warning(
+                "STAGING_REQ received for unregistered room=%s, skipping",
+                room,
+            )
+            return
+        prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
+        handle_staging_req(
+            msg,
+            self._staging_ctx.allocator,
+            self.kv_args,
+            self.attn_tp_size,
+            prefill_tp,
+            getattr(self, "kv_buffer_tensors", None),
+            self._staging_ctx.room_receivers,
+            self._staging_ctx.room_bootstrap,
+        )
+
+        receiver = self._staging_ctx.room_receivers.get(room)
+        if receiver is not None:
+            handler.register_wm_subscriber(receiver, session_id)
+
+
 def prefetch_staging_reqs(
     room: int,
     transfer_infos: dict,
@@ -849,6 +935,7 @@ def prefetch_staging_reqs(
     chunked_prefill_size: int,
     staging_requested: set,
     prefetch_sockets: dict,
+    requester_pp_rank: Optional[int] = None,
 ) -> None:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
@@ -894,14 +981,15 @@ def prefetch_staging_reqs(
                         sock.setsockopt(zmq.IPV6, 1)
                     sock.connect(ep)
                     prefetch_sockets[ep] = sock
-                prefetch_sockets[ep].send_multipart(
-                    [
-                        b"STAGING_REQ",
-                        str(room).encode("ascii"),
-                        str(chunk_idx).encode("ascii"),
-                        str(chunk_pages).encode("ascii"),
-                        session_id.encode("ascii"),
-                    ]
-                )
+                request = [
+                    b"STAGING_REQ",
+                    str(room).encode("ascii"),
+                    str(chunk_idx).encode("ascii"),
+                    str(chunk_pages).encode("ascii"),
+                    session_id.encode("ascii"),
+                ]
+                if requester_pp_rank is not None:
+                    request.append(str(requester_pp_rank).encode("ascii"))
+                prefetch_sockets[ep].send_multipart(request)
             except Exception:
                 staging_requested.discard(stg_key)

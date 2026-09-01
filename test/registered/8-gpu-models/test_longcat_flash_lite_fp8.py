@@ -6,7 +6,7 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cuda_ci(est_time=1200, suite="nightly-8-gpu-h200", nightly=True)
+register_cuda_ci(est_time=1200, stage="nightly", runner_config="8-gpu-h200")
 
 # LongCat-Flash-Lite-FP8 is the smallest member of the LongCat family
 # (~138 GB FP8 weights, hidden=3072, 14 layers, 256 routed + 128 zero

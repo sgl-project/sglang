@@ -16,11 +16,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.flashinfer_backend import (
-    WrapperDispatch,
-    _is_supported_dflash_fast_plan_topology,
-    fast_prefill_plan,
-)
+from sglang.srt.layers.attention.flashinfer_backend import fast_prefill_plan
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -42,28 +38,6 @@ NUM_QO_HEADS = 8
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
 DTYPE = torch.float16
-
-
-class TestDFlashFastPrefillPlanTopology(unittest.TestCase):
-    def test_supported_wrapper_layouts(self):
-        cases = (
-            ("draft", None, True),
-            ("draft", WrapperDispatch.SLIDING_WINDOW, True),
-            ("draft", WrapperDispatch.CROSS_ATTENTION, False),
-            ("target_verify", None, True),
-            ("target_verify", WrapperDispatch.SLIDING_WINDOW, False),
-            ("target_verify", WrapperDispatch.CROSS_ATTENTION, False),
-            ("unknown", None, False),
-        )
-        for plan_kind, dispatch_reason, expected in cases:
-            with self.subTest(
-                plan_kind=plan_kind,
-                dispatch_reason=dispatch_reason,
-            ):
-                self.assertEqual(
-                    _is_supported_dflash_fast_plan_topology(plan_kind, dispatch_reason),
-                    expected,
-                )
 
 
 @unittest.skipUnless(_HAS_FLASHINFER, "requires flashinfer")

@@ -198,7 +198,6 @@ jobs:
             --build-arg CUDA_VERSION=13.0.3 \
             --build-arg BUILD_TYPE=all \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
-            --build-arg GRACE_BLACKWELL=1 \
             --build-arg BRANCH_TYPE=local \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             --no-cache \

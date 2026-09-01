@@ -6,7 +6,12 @@ import pybase64
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig, get_num_indexer_layers
-from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_resources,
+    get_schedule,
+)
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 logger = logging.getLogger(__name__)
@@ -21,8 +26,6 @@ class IndexerTopkCapturer(BaseTopkCapturer):
         max_running_requests: int,
         device: str,
     ):
-        from sglang.srt.runtime_context import get_server_args
-
         self.num_indexer_layers = num_indexer_layers
         self.index_topk = index_topk
 
@@ -31,7 +34,6 @@ class IndexerTopkCapturer(BaseTopkCapturer):
 
         # DP-attention capture is per-rank-local: each rank writes [:local_batch, ...]
         # to its own device_cache, so the buffer only needs to fit one rank's batch.
-        server_args = get_server_args()
         max_batch_size = max(get_schedule().chunked_prefill_size, max_running_requests)
 
         super().__init__(
@@ -45,13 +47,11 @@ class IndexerTopkCapturer(BaseTopkCapturer):
 
 
 def get_global_indexer_capturer() -> Optional[IndexerTopkCapturer]:
-    from sglang.srt.runtime_context import get_resources
 
     return get_resources().indexer_capturer
 
 
 def set_global_indexer_capturer(capturer: Optional[IndexerTopkCapturer]):
-    from sglang.srt.runtime_context import get_resources
 
     get_resources().indexer_capturer = capturer
 

@@ -15,6 +15,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.model_loader.loader import PreshardedModelLoader
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -786,13 +787,6 @@ class TestShardConfig(unittest.TestCase):
         # `_collect_shard_config` is the exact failure mode that left
         # moe_dense_tp_size / LM-head flags out of the cache key before.
         loader = object.__new__(PreshardedModelLoader)
-        server_args = SimpleNamespace(
-            moe_dp_size=2,
-            enable_fp32_lm_head=True,
-            ep_num_redundant_experts=4,
-            enable_eplb=True,
-            init_expert_location="trivial",
-        )
         model_config = SimpleNamespace(quantization="fp8", dtype=torch.bfloat16)
         required = {
             "tp",
@@ -810,20 +804,23 @@ class TestShardConfig(unittest.TestCase):
             "init_expert_location",
             "structural_signature",
         }
-        parallel = SimpleNamespace(
+        # The sizes go through both channels: some entries read the published
+        # leaf, others the live property. `get_moe_cp_size` is imported inside
+        # `_collect_shard_config`, so it is patched where it is defined.
+        override = get_context().override_server_args(
             tp_size=8,
-            moe_dp_size=2,
-            moe_ep_size=4,
             pp_size=1,
+            moe_dp_size=2,
             moe_dense_tp_size=1,
             enable_dp_lm_head=True,
         )
-        with mock.patch(
-            "sglang.srt.model_loader.loader.get_server_args",
-            return_value=server_args,
+        override.install()
+        self.addCleanup(override.restore)
+        with get_parallel().override(
+            tp_size=8, pp_size=1, moe_dp_size=2, moe_ep_size=4
         ), mock.patch(
-            "sglang.srt.model_loader.loader.get_parallel",
-            return_value=parallel,
+            "sglang.srt.layers.dp_attention.get_moe_cp_size",
+            return_value=2,
         ), mock.patch(
             "sglang.srt.model_loader.loader.get_exec",
             return_value=SimpleNamespace(

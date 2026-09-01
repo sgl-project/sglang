@@ -43,22 +43,23 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    get_parallel,
+    mamba_cache_chunk_size,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 import logging
-
-from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,8 @@ class TreeNode:
         self.host_value = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
+        # Namespace-aware hashes used only for external KV events.
+        self.event_hash_value: Optional[List[str]] = None
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -437,7 +440,7 @@ class LRUList:
                 raise Exception(msg)
 
 
-class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+class MambaRadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         assert (
             isinstance(params.token_to_kv_pool_allocator, TokenToKVPoolAllocator)
@@ -450,14 +453,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
-        self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        self.mamba_cache_chunk_size = mamba_cache_chunk_size()
 
         self.page_size = params.page_size
         self.disable = params.disable
-        self.enable_kv_cache_events = params.enable_kv_cache_events
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
-        self.kv_event_queue = []
+        self.kv_events = KVCacheEventRecorder(
+            enabled=params.enable_kv_cache_events, page_size=self.page_size
+        )
 
         if not self.enable_mamba_extra_buffer:
             assert (
@@ -493,7 +497,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(mamba=False)
         self.mamba_lru_list = LRUList(mamba=True)
-        self._record_all_cleared_event()
+        self.kv_events.record_all_cleared()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -544,7 +548,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         """Cache request when it finishes."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_len_to_handle
+                req.kv.req_pool_idx, :kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
             self.req_to_token_pool.free_mamba_cache(req)
@@ -552,12 +556,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_len_to_handle
+            req.kv.req_pool_idx, :kv_len_to_handle
         ]
 
         if is_insert:
             if self.enable_mamba_extra_buffer:
-                cache_len = req.mamba_last_track_seqlen
+                cache_len = req.kv.mamba_last_track_seqlen
             else:
                 cache_len = len(token_ids)
                 # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by
@@ -567,12 +571,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # with its key length. page_size is asserted == 1, so no realign.
                 write_pos_buf = self.req_to_token_pool.mamba_pool.replayssm_write_pos
                 if write_pos_buf is not None:
-                    cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
-                    write_pos_buf[req.mamba_pool_idx] = 0
+                    cache_len -= int(write_pos_buf[req.kv.mamba_pool_idx].item())
+                    write_pos_buf[req.kv.mamba_pool_idx] = 0
             if cache_len is None:
                 cache_len = 0
             if cache_len != len(token_ids):
-                cache_end_idx = max(cache_len, req.cache_protected_len)
+                cache_end_idx = max(cache_len, req.kv.cache_protected_len)
                 self.token_to_kv_pool_allocator.free_segment(
                     kv_indices[cache_end_idx:], start_pos=cache_end_idx
                 )
@@ -598,16 +602,16 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 mamba_ping_pong_track_buffer_to_keep = (
                     self.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
                 )
-                src_active = req.mamba_ping_pong_track_buffer[
+                src_active = req.kv.mamba_ping_pong_track_buffer[
                     mamba_ping_pong_track_buffer_to_keep
                 ].unsqueeze(-1)
                 if _MAMBA_DEBUG_ASSERTS:
                     # .item() forces a cudaStreamSynchronize; only pay it when debugging.
                     assert src_active.item() != -1, (
                         f"Cached mamba slot is -1: keep_idx={mamba_ping_pong_track_buffer_to_keep}, "
-                        f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
-                        f"next_track_idx={req.mamba_next_track_idx}, "
-                        f"last_track_seqlen={req.mamba_last_track_seqlen}, "
+                        f"buf={req.kv.mamba_ping_pong_track_buffer.tolist()}, "
+                        f"next_track_idx={req.kv.mamba_next_track_idx}, "
+                        f"last_track_seqlen={req.kv.mamba_last_track_seqlen}, "
                         f"rid={req.rid}"
                     )
                 if self.int8_ckpt_pool is not None:
@@ -619,18 +623,22 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             else:
                 if self.int8_ckpt_pool is not None:
                     mamba_value = self._commit_int8_checkpoint(
-                        req.mamba_pool_idx.unsqueeze(-1)
+                        req.kv.mamba_pool_idx.unsqueeze(-1)
                     )
                 else:
-                    mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
+                    mamba_value = req.kv.mamba_pool_idx.unsqueeze(-1).clone()
                 mamba_ping_pong_track_buffer_to_keep = None
 
             result = self.insert(
                 InsertParams(
-                    key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                    key=RadixKey(
+                        token_ids[:page_aligned_len],
+                        req.extra_key,
+                        cache_salt=req.cache_salt,
+                    ),
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
-                    prev_prefix_len=req.cache_protected_len,
+                    prev_prefix_len=req.kv.cache_protected_len,
                 )
             )
             mamba_exist = result.mamba_exist
@@ -639,8 +647,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.int8_ckpt_pool.free(mamba_value)
         else:
             self.token_to_kv_pool_allocator.free_segment(
-                kv_indices[req.cache_protected_len :],
-                start_pos=req.cache_protected_len,
+                kv_indices[req.kv.cache_protected_len :],
+                start_pos=req.kv.cache_protected_len,
             )
             mamba_exist = True
 
@@ -668,7 +676,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         def _skip_cache_unfinished_req(req: Req) -> None:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.extend_range.end
+                req.kv.req_pool_idx, : req.extend_range.end
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
@@ -677,7 +685,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         token_ids = req.get_fill_ids()
         cache_len = (
-            req.mamba_last_track_seqlen
+            req.kv.mamba_last_track_seqlen
             if self.enable_mamba_extra_buffer
             else len(token_ids)
         )
@@ -685,7 +693,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             return _skip_cache_unfinished_req(req)
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, : len(token_ids)
         ]
         # kv_indices is the kv indices to be cached
         kv_indices = kv_indices_orig[:cache_len]
@@ -718,7 +726,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.req_to_token_pool.mamba_allocator.free(src_active)
             else:
                 mamba_value_donated = self._commit_int8_checkpoint(
-                    req.mamba_pool_idx.view(-1)
+                    req.kv.mamba_pool_idx.view(-1)
                 )
         elif self.enable_mamba_extra_buffer:
             new_slot = self._alloc_mamba_slot()
@@ -731,16 +739,20 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             # virtual->physical (identity for the non-unified memory pool) before the copy.
             translate = self.req_to_token_pool.translate_mamba_indices
             self.req_to_token_pool.mamba_pool.copy_from(
-                translate(req.mamba_pool_idx.unsqueeze(0)),
+                translate(req.kv.mamba_pool_idx.unsqueeze(0)),
                 translate(mamba_value_donated),
             )
 
         result = self.insert(
             InsertParams(
-                key=RadixKey(page_aligned_token_ids, req.extra_key),
+                key=RadixKey(
+                    page_aligned_token_ids,
+                    req.extra_key,
+                    cache_salt=req.cache_salt,
+                ),
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_donated,
-                prev_prefix_len=req.cache_protected_len,
+                prev_prefix_len=req.kv.cache_protected_len,
                 chunked=chunked,
             )
         )
@@ -750,7 +762,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
-            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
+            MatchPrefixParams(
+                key=RadixKey(
+                    page_aligned_token_ids,
+                    req.extra_key,
+                    cache_salt=req.cache_salt,
+                )
+            )
         )
         new_indices, new_last_node = (
             match_result.device_indices,
@@ -761,15 +779,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             assert torch.equal(new_last_node.mamba_value, mamba_value_donated)
 
         assert (
-            req.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {len(page_aligned_token_ids)=}, {mamba_exist=}"
+            req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1
+        ), f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {len(page_aligned_token_ids)=}, {mamba_exist=}"
         assert new_prefix_len <= len(
             new_indices
         ), f"{new_prefix_len=}, {len(new_indices)=}"
 
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
+            (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
+            new_indices[req.kv.cache_protected_len :],
         )
 
         self.dec_lock_ref(req.last_node)
@@ -780,8 +798,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.prefix_indices = torch.cat(
             [new_indices, kv_indices_orig[len(new_indices) :]]
         )
-        req.cache_protected_len = len(new_indices)
-        req.mamba_last_track_seqlen = None
+        req.kv.cache_protected_len = len(new_indices)
+        req.kv.mamba_last_track_seqlen = None
         req.last_node = new_last_node
 
     def pretty_print(self) -> None:
@@ -801,7 +819,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
         # 1. a leaf node, free full tokens and mamba
-        self._record_remove_event(x)
+        self.kv_events.record_remove(x)
         # Tree values are page-aligned copies of a kv row: page-exact segment.
         self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
         full_num_evicted = len(x.value)
@@ -1161,7 +1179,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Defer COW to forward stream: record source index, allocate destination
         if cow_mamba and last_node.mamba_value is not None:
-            if req.mamba_pool_idx is None:
+            if not req.kv.holds_mamba:
                 dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
                 if dst_index is None:
                     self.inc_lock_ref(last_node)
@@ -1169,9 +1187,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
                     self.dec_lock_ref(last_node)
                     assert dst_index is not None, "Can not alloc mamba cache"
-                req.mamba_pool_idx = dst_index[0]
-            req.mamba_cow_src_index = last_node.mamba_value
-            req.mamba_needs_clear = False
+                req.kv.mamba_pool_idx = dst_index[0]
+            req.kv.mamba_cow_src_index = last_node.mamba_value
+            req.kv.mamba_needs_clear = False
 
         value = value[:best_value_len]
         if value:
@@ -1211,6 +1229,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.parent.children[key.child_key(self.page_size)] = new_node
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
+        )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
         )
 
         # insert the new node and child into the full lru list, insert
@@ -1280,7 +1301,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
-            self._record_store_event(new_node)
+            self.kv_events.record_store(new_node)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
@@ -1309,7 +1330,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node.parent.mamba_lock_ref == 0
             ), f"tombstone mamba_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.mamba_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
-            self._record_remove_event(node.parent)
+            self.kv_events.record_remove(node.parent)
             self.token_to_kv_pool_allocator.free_segment(node.parent.value, start_pos=0)
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)

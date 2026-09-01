@@ -13,10 +13,6 @@ Attention (DSA) and multi-token prediction (MTP), and supports high-throughput i
 This document demonstrates the deployment of GLM-5.2 on Ascend NPUs using SGLang, including single-node deployment,
 multi-node deployment, prefill-decode disaggregation, feature configuration, and performance optimization.
 
-> GLM-5.2 currently uses a daily build image because 0Day support was released before the related code was merged into
-> the SGLang main branch. The deployment commands and image tags in this document will be updated to a stable release
-> once the support lands in a stable SGLang release.
-
 ## Supported features
 
 | Feature                       | Example usage                                                                     |
@@ -85,16 +81,11 @@ Ensure sufficient disk space before pulling images. The Docker image requires at
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
 online platform. You can directly pull it.
 
-<Note>
-The GLM-5.2 images below use daily build tags because 0Day support was released before the related code was merged into
-the main branch. These tags will be switched to stable release images after the support lands in a stable release.
-</Note>
-
 <Tabs>
   <Tab title="Atlas 800I A3">
 
 ```bash Command
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-a3-glm5.2-20260615
+docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
 
 docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
@@ -122,14 +113,14 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-a3-glm5.2-20260615
+quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
 ```
 
   </Tab>
   <Tab title="Atlas 800I A2">
 
 ```bash Command
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-910b-glm5.2-20260615
+docker pull quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
 
 docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
@@ -157,7 +148,7 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-910b-glm5.2-20260615
+quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
 ```
 
   </Tab>
@@ -503,10 +494,10 @@ For performance data and benchmark commands, see [Performance Testing on Ascend 
 
 ### Best practice configuration reference
 
-GLM-5.2 has no standalone best practice page yet, as 0Day support is still on daily build images and tuning parameters
-are not finalized. Instead, the [Online service deployment](#online-service-deployment) section above provides
-ready-to-use scripts for single-node, multi-node, and PD disaggregation, each embedding the recommended feature
-combinations and tuning parameters (e.g., DeepEP mode, speculative decoding, overlap schedule).
+GLM-5.2 has no standalone best practice page yet, as tuning parameters are not finalized. Instead, the
+[Online service deployment](#online-service-deployment) section above provides ready-to-use scripts for single-node,
+multi-node, and PD disaggregation, each embedding the recommended feature combinations and tuning parameters (e.g.,
+DeepEP mode, speculative decoding, overlap schedule).
 
 For the full catalog of optimization features and their parameter and compatibility details,
 see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning).

@@ -298,9 +298,10 @@ class TinyDualChunkModelConfig:
     def get_max_num_attention_heads(self) -> int:
         return self.num_attention_heads
 
-    def get_num_kv_heads(self, tp_size: int) -> int:
-        assert self.num_key_value_heads % tp_size == 0
-        return self.num_key_value_heads // tp_size
+    def get_num_kv_heads(self, tp_size: int, dcp_size: int = 1) -> int:
+        kv_tp_size = tp_size // dcp_size
+        assert self.num_key_value_heads % kv_tp_size == 0
+        return self.num_key_value_heads // kv_tp_size
 
 
 class DualChunkMockModelRunner(ModelRunner):
@@ -383,6 +384,7 @@ class DualChunkMockModelRunner(ModelRunner):
             enable_alt_stream=False,
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.init_kv_index_translator()
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None

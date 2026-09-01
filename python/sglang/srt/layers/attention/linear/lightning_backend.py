@@ -15,7 +15,10 @@ from sglang.srt.layers.attention.linear.linear_metadata import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_parallel,
+    mamba_cache_chunk_size,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,14 +74,20 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             if hasattr(model_runner.model_config, "block")
             else 256
         )
-        total_num_heads = model_runner.model_config.hf_config.num_attention_heads
-        num_hidden_layers = model_runner.model_config.hf_config.num_hidden_layers
+        config = model_runner.model_config.hf_config
+        total_num_heads = getattr(
+            config, "num_linear_key_value_heads", config.num_attention_heads
+        )
+        layerwise_decay = getattr(config, "lightning_layerwise_decay", True)
+        assert total_num_heads % get_parallel().attn_tp_size == 0
+        num_hidden_layers = config.num_hidden_layers
         self.tp_slope = LightningAttentionBackend._build_slope_tensor(
-            total_num_heads, num_hidden_layers, self.device
+            total_num_heads,
+            num_hidden_layers,
+            self.device,
+            layerwise_decay=layerwise_decay,
         )
-        self.linear_backend = getattr(
-            model_runner.model_config.hf_config, "linear_backend", "seg_la"
-        )
+        self.linear_backend = getattr(config, "linear_backend", "seg_la")
         logger.info(
             f"linear_backend for linear attention in hybrid_linear_backend: {self.linear_backend}"
         )
@@ -127,7 +136,10 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
     @staticmethod
     def _build_slope_tensor(
-        n_attention_heads: int, num_hidden_layers: int, device="cuda"
+        n_attention_heads: int,
+        num_hidden_layers: int,
+        device="cuda",
+        layerwise_decay: bool = True,
     ):
         def get_slopes(n):
             def get_slopes_power_of_2(n):
@@ -150,7 +162,9 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
         tp_heads = n_attention_heads // get_parallel().attn_tp_size
         tp_rank = get_parallel().attn_tp_rank
-        if num_hidden_layers <= 1:
+        if not layerwise_decay:
+            slope_rate_list = [slopes] * num_hidden_layers
+        elif num_hidden_layers <= 1:
             slope_rate_list = [slopes * (1 + 1e-5)]
         else:
             slope_rate_list = [
@@ -282,6 +296,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             cache_indices=intermediate_state_indices,
             track_lens=track_lens,
             track_state_indices=track_state_indices,
+            softmax_scale=layer.scaling,
             decouple=True,
         )
         return hidden
@@ -299,7 +314,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         if h_dst is None or h_dst.numel() == 0:
             return None, None
 
-        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        chunk_size = mamba_cache_chunk_size()
         num_prefills = metadata.num_prefills
         track_mask = forward_batch.mamba_track_mask[:num_prefills]
         extend_lens = forward_batch.extend_seq_lens[:num_prefills]
@@ -307,9 +322,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         track_seqlens = forward_batch.mamba_track_seqlens[:num_prefills]
 
         lens_to_track = track_seqlens - prefix_lens
-        boundary_lens = (
-            lens_to_track // mamba_cache_chunk_size
-        ) * mamba_cache_chunk_size
+        boundary_lens = (lens_to_track // chunk_size) * chunk_size
         track_rows = (track_mask & (boundary_lens < extend_lens)).nonzero(
             as_tuple=True
         )[0]

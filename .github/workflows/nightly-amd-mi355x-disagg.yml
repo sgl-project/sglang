@@ -6,7 +6,7 @@ name: Nightly Test (AMD MI355X 2N 1P1D Disagg)
 # scripts/ci/slurm/launch_mi355x.sh.
 on:
   schedule:
-    - cron: '17 3 * * *'  # 03:17 UTC
+    - cron: '0 7 * * *'
   workflow_dispatch:
     inputs:
       image:
