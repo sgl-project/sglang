@@ -16,6 +16,7 @@ from sglang.srt.layers.quantization.utils import all_close_1d
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     round_up,
     set_weight_attrs,
@@ -35,7 +36,19 @@ __all__ = ["QuarkW4A8MXFp4MoE"]
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-if _use_aiter:
+# gfx1250 (RDNA / gfx12): the aiter CK/ASM fused_moe MXFP4 W4A8 path produces
+# incorrect results, so route through aiter's triton ``moe_gemm_a8w4`` kernel
+# instead. This uses an unpadded, contraction-major weight layout (no aiter
+# shuffle) prepared in ``process_weights_after_loading``.
+_use_gfx1250_w4a8 = (
+    _is_hip
+    and is_gfx1250_supported()
+    and get_bool_env_var("SGLANG_GFX1250_W4A8_MOE", "true")
+)
+# Whether to use the aiter CK/ASM shuffled weight layout (gfx950 etc.). Disabled
+# on gfx1250, which uses the triton moe_gemm_a8w4 layout.
+_use_aiter_shuffle_layout = _use_aiter and not _use_gfx1250_w4a8
+if _use_aiter and not _use_gfx1250_w4a8:
     from aiter.ops.shuffle import (
         shuffle_scale,
         shuffle_scale_a16w4,
@@ -101,7 +114,7 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
 
         self.num_experts = num_experts
         self.with_bias = extra_weight_attrs.get("with_bias", False)
-        if _use_aiter:
+        if _use_aiter_shuffle_layout:
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, 256
             )
@@ -112,13 +125,16 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                 - layer.intermediate_size_per_partition
             )
         else:
+            # Non-shuffled layout (gfx1250 triton moe_gemm_a8w4 path and the
+            # generic non-aiter path): keep buffers unpadded so they match the
+            # HF checkpoint shape exactly.
             intermediate_size_per_partition_after_pad = intermediate_size_per_partition
             self.hidden_pad = 0
             self.intermediate_pad = 0
 
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition_after_pad,
-            is_aiter_moe=_use_aiter,
+            is_aiter_moe=_use_aiter_shuffle_layout,
             is_concat=True,
             is_packed=True,
         )
@@ -240,7 +256,61 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         set_weight_attrs(w13_input_scale, extra_weight_attrs)
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
+    def _process_weights_gfx1250(self, layer: torch.nn.Module) -> None:
+        """gfx1250: reshape MXFP4 W4A8 weights into the contraction-major,
+        gate/up-interleaved layout consumed by aiter's triton ``moe_gemm_a8w4``
+        (no CK/ASM shuffle)."""
+        from sglang.srt.layers.moe.fused_moe_triton.aiter_mxfp4_w4a8_moe import (
+            prepare_w4a8_gfx1250_weights,
+        )
+
+        (
+            w13_weight,
+            w13_weight_scale,
+            w13_weight_bias,
+            w2_weight,
+            w2_weight_scale,
+            w2_weight_bias,
+        ) = prepare_w4a8_gfx1250_weights(
+            layer.w13_weight.data,
+            layer.w13_weight_scale.data,
+            layer.w13_weight_bias.data,
+            layer.w2_weight.data,
+            layer.w2_weight_scale.data,
+            layer.w2_weight_bias.data,
+        )
+
+        layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+        layer.w13_weight_scale = torch.nn.Parameter(
+            w13_weight_scale, requires_grad=False
+        )
+        layer.w13_weight_bias = torch.nn.Parameter(w13_weight_bias, requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+        layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
+        layer.w2_weight_bias = torch.nn.Parameter(w2_weight_bias, requires_grad=False)
+
+        # Static FP8 MoE kernels consume a single activation scale. Use the
+        # maximum if expert-local checkpoint scales differ.
+        if layer.w13_input_scale is None or layer.w2_input_scale is None:
+            raise ValueError("W4A8 MXFP4-FP8 MoE requires static input scales.")
+        if not all_close_1d(layer.w13_input_scale) or not all_close_1d(
+            layer.w2_input_scale
+        ):
+            logger.warning(
+                "Found input_scales that are not equal for W4A8 MXFP4-FP8 "
+                "MoE layer. Using the maximum across experts for each layer."
+            )
+        layer.w13_input_scale = torch.nn.Parameter(
+            layer.w13_input_scale.max().to(torch.float32), requires_grad=False
+        )
+        layer.w2_input_scale = torch.nn.Parameter(
+            layer.w2_input_scale.max().to(torch.float32), requires_grad=False
+        )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _use_gfx1250_w4a8:
+            self._process_weights_gfx1250(layer)
+            return
         # Mirror native MXFP4 post-load shuffling. The default
         # `SGLANG_USE_AITER_MOE_GU_ITLV=1` path uses the gate-up-aware
         # a16w4 layout; the `=0` fallback keeps the separated gate/up layout.
@@ -334,6 +404,10 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         )
 
         self.moe_runner_config = moe_runner_config
+        if _use_gfx1250_w4a8:
+            # gfx1250 bypasses the MoeRunner and calls aiter's triton
+            # moe_gemm_a8w4 directly in ``apply_weights``.
+            return
         moe_runner_backend = get_moe_runner_backend()
         if _use_aiter and get_moe_a2a_backend().supports_aiter():
             moe_runner_backend = MoeRunnerBackend.AITER
@@ -353,6 +427,40 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if _use_gfx1250_w4a8:
+            from sglang.srt.layers.moe.fused_moe_triton.aiter_mxfp4_w4a8_moe import (
+                aiter_w4a8_gfx1250_forward,
+            )
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+            topk_weights, topk_ids, router_logits = dispatch_output.topk_output
+            x = dispatch_output.hidden_states
+            if x.shape[-1] != self.hidden_size:
+                x = x[..., : self.hidden_size]
+
+            cfg = self.moe_runner_config
+            alpha = cfg.gemm1_alpha if cfg.gemm1_alpha is not None else 1.702
+            limit = cfg.gemm1_clamp_limit or cfg.swiglu_limit or 7.0
+
+            output = aiter_w4a8_gfx1250_forward(
+                hidden_states=x,
+                router_logits=router_logits,
+                topk=topk_ids.shape[-1],
+                w13_weight=layer.w13_weight,
+                w13_weight_scale=layer.w13_weight_scale,
+                w13_weight_bias=layer.w13_weight_bias,
+                a13_scale=layer.w13_input_scale,
+                w2_weight=layer.w2_weight,
+                w2_weight_scale=layer.w2_weight_scale,
+                w2_weight_bias=layer.w2_weight_bias,
+                a2_scale=layer.w2_input_scale,
+                gemm1_alpha=alpha,
+                gemm1_limit=limit,
+                renormalize=True,
+                apply_router_weight_on_input=cfg.apply_router_weight_on_input,
+            )
+            return StandardCombineInput(hidden_states=output)
+
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterMoeQuantInfo,
             AiterQuantType,
