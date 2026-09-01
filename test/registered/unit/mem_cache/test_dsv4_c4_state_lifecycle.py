@@ -18,9 +18,13 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 def _request(req_pool_idx=None, *, reused=False):
     return SimpleNamespace(
-        req_pool_idx=req_pool_idx,
+        kv=SimpleNamespace(
+            req_pool_idx=req_pool_idx,
+            kv_committed_len=1 if reused else 0,
+            kv_allocated_len=1 if reused else 0,
+            holds_kv=reused,
+        ),
         inflight_middle_chunks=1 if reused else 0,
-        kv_committed_len=0,
     )
 
 
@@ -90,7 +94,10 @@ class TestUnifiedC4StateLifecycle(unittest.TestCase):
         # Chunked continuation reuses the same slot -- clearing it here would
         # wipe the state captured by the previous chunk.
         token_pool.clear_c4_req_states.reset_mock()
-        reused.req_pool_idx = reused_idx
+        reused.kv.req_pool_idx = reused_idx
+        reused.kv.kv_committed_len = 1
+        reused.kv.kv_allocated_len = 1
+        reused.kv.holds_kv = True
         reused.inflight_middle_chunks = 1
         self.assertEqual(
             alloc_req_slots(req_pool, [reused], None, token_to_kv_pool=token_pool),
