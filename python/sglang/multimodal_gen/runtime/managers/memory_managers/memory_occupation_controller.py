@@ -20,7 +20,16 @@ def _module_to_pinned_cpu(module: torch.nn.Module) -> None:
     # Async D2H into pinned host memory; caller synchronizes once after the batch.
     for t in list(module.parameters()) + list(module.buffers()):
         if t.device.type == "cuda":
-            pin = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
+            # Mirror stride/layout like srt/utils/offloader.py: torch.empty() would force
+            # contiguous and silently drop channels_last_3d VAE weights.
+            pin = torch.empty_strided(
+                size=t.size(),
+                stride=t.stride(),
+                dtype=t.dtype,
+                layout=t.layout,
+                device="cpu",
+                pin_memory=True,
+            )
             pin.copy_(t.data, non_blocking=True)
             t.data = pin
 

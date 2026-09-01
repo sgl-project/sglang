@@ -11,6 +11,8 @@ from sglang.kernels.ops.gemm.sgemm_lora_b import sgemm_lora_b_fwd
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import (
     LoRABatchInfo,
+    generate_sequence_lengths,
+    get_batch_token_counts,
     get_lm_head_pruned_lens,
     merge_and_chunk_segments,
 )
@@ -32,6 +34,13 @@ class TritonLoRABackend(BaseLoRABackend):
         **kwargs,
     ):
         super().__init__(max_loras_per_batch, device)
+        # Merged-segment variant of batch_info; set alongside it in
+        # prepare_lora_batch and cleared together in reset_batch_state.
+        self.sgemm_batch_info: Optional[LoRABatchInfo] = None
+
+    def reset_batch_state(self):
+        super().reset_batch_state()
+        self.sgemm_batch_info = None
 
     def run_lora_a_embedding(
         self,
@@ -55,7 +64,12 @@ class TritonLoRABackend(BaseLoRABackend):
         """Return the sgemm batch_info (merged segments when available)."""
         if pruned_batch_info is not None:
             return pruned_batch_info
-        return getattr(self, "sgemm_batch_info", None) or self.batch_info
+        assert self.batch_info is not None, (
+            "LoRA kernel invoked with no prepared batch (DP-attention idle "
+            "forward?). Gate the caller on lora_active, as in "
+            "sglang/srt/lora/layers.py forwards."
+        )
+        return self.sgemm_batch_info or self.batch_info
 
     def run_lora_a_sgemm(
         self,
@@ -277,6 +291,15 @@ class TritonLoRABackend(BaseLoRABackend):
                 self.cuda_graph_batch_info is not None
             ), "CUDA Graph batch info is not initialized."
             batch_info = self.cuda_graph_batch_info
+            if forward_batch.forward_mode.is_target_verify():
+                # seg_lens were pre-filled at the captured per-request width
+                # (stored as max_len); another width would silently
+                # mis-segment adapters onto the wrong token rows.
+                assert forward_batch.spec_info.draft_token_num == batch_info.max_len, (
+                    "target-verify width "
+                    f"{forward_batch.spec_info.draft_token_num} does not match "
+                    f"the captured LoRA cuda-graph width {batch_info.max_len}"
+                )
             batch_info.bs = forward_batch.batch_size
             batch_info.num_segments = forward_batch.batch_size
         elif use_prefill_cuda_graph:
@@ -291,17 +314,9 @@ class TritonLoRABackend(BaseLoRABackend):
             batch_info.seg_lens[bs:].zero_()
             torch.cumsum(batch_info.seg_lens, dim=0, out=batch_info.seg_indptr[1:])
         else:
-            max_len = (
-                # Calculate max_len from the CPU copy to avoid D2H transfer.
-                max(forward_batch.extend_seq_lens_cpu)
-                if forward_batch.forward_mode.is_extend()
-                else 1
-            )
-            seg_lens = (
-                forward_batch.extend_seq_lens
-                if forward_batch.forward_mode.is_extend()
-                else torch.ones(bs, dtype=torch.int32, device=self.device)
-            )
+            # max_len comes from the CPU-side counts to avoid a D2H transfer.
+            _, max_len = get_batch_token_counts(forward_batch)
+            seg_lens = generate_sequence_lengths(forward_batch, device=self.device)
             seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
             seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
 

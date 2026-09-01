@@ -32,7 +32,11 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPDraftInput
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
@@ -41,6 +45,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
@@ -88,15 +93,15 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.device_module = torch.get_device_module(self.device)
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
-        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
-        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
-        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        self.require_gathered_buffer = require_gathered_buffer()
+        self.require_mlp_tp_gather = require_mlp_tp_gather()
+        self.require_mlp_sync = require_mlp_sync()
+        self.require_attn_tp_gather = require_attn_tp_gather()
         self.tp_size = self.model_runner.ps.tp_size
         self.attn_dp_size = self.model_runner.ps.attn_dp_size
-        self.pp_size = model_runner.server_args.pp_size
-        self.speculative_num_steps = model_runner.server_args.speculative_num_steps
-        self.topk = model_runner.server_args.speculative_eagle_topk
+        self.pp_size = get_parallel().pp_size
+        self.speculative_num_steps = get_spec().speculative_num_steps
+        self.topk = get_spec().speculative_eagle_topk
         self.draft_attn_backend = frozen_kv_mtp_worker.draft_attn_backend
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
@@ -115,16 +120,16 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_hidden_mode = CaptureHiddenMode.LAST
 
         # Static capture width.
-        self.captured_req_width = resolve_num_tokens_per_req(
-            phase="draft_decode", server_args=model_runner.server_args
-        )
+        self.captured_req_width = resolve_num_tokens_per_req(phase="draft_decode")
         self.capture_bs, _ = get_batch_sizes_to_capture(
             model_runner, self.captured_req_width
         )
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
 
-        self.draft_attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        self.draft_attn_backend.init_cuda_graph_state(
+            self.max_bs * self.topk, self.max_num_token
+        )
         self.seq_len_fill_value = (
             self.draft_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
@@ -232,7 +237,9 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             else cuda_graph_bs <= self.max_bs
         )
         if self.require_mlp_sync:
-            is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
+            is_bs_supported = (
+                is_bs_supported and forward_batch.can_run_decode_cuda_graph
+            )
         return is_bs_supported
 
     def capture_one_shape(
@@ -360,7 +367,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
                     self,
                     run_once,
                     post_warmup_hook=post_warmup_hook,
-                    skip_logits=False,
+                    run_lm_head=True,
                 )
                 self.backend.capture_one(
                     shape_key,
@@ -446,11 +453,12 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         shape_key = self._make_graph_key(bs)
         # NVTX span: the graph bypasses `model_runner.forward`'s record_function.
         span_name = f"step[DRAFT_LOOP raw_bs={raw_bs} bs={bs} topk={self.topk}]"
-        if torch.autograd._profiler_enabled():
-            with torch.profiler.record_function(span_name):
+        with device_timer_ctx(self.model_runner.device_timer, "frozen_kv_draft"):
+            if torch.autograd._profiler_enabled():
+                with torch.profiler.record_function(span_name):
+                    out = self._replay_graph(shape_key, forward_batch)
+            else:
                 out = self._replay_graph(shape_key, forward_batch)
-        else:
-            out = self._replay_graph(shape_key, forward_batch)
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)

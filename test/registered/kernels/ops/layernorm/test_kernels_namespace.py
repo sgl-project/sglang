@@ -1,6 +1,7 @@
 """GPU-free import / registry / selector tests for ``sglang.kernels`` (RFC #29630)."""
 
 import importlib
+import importlib.util
 import subprocess
 import sys
 
@@ -16,24 +17,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-GROUPS = [
-    "activation",
-    "attention",
-    "communication",
-    "diffusion",
-    "elementwise",
-    "embeddings",
-    "gemm",
-    "grammar",
-    "kvcache",
-    "layernorm",
-    "mamba",
-    "memory",
-    "moe",
-    "quantization",
-    "sampling",
-    "speculative",
-]
+GROUPS = K.ops.__all__
 
 # Representative ops checked as a subset (the registry holds many more).
 EXPECTED = {
@@ -41,10 +25,11 @@ EXPECTED = {
     "activation.relu2": {"jit", "torch", "torch_compile"},
     "layernorm.rmsnorm": {"aot", "jit", "aiter", "torch_npu", "torch", "torch_compile"},
     "layernorm.gemma_rmsnorm": {"aot", "jit", "torch_npu", "torch", "torch_compile"},
-    "gemm.fp8_scaled_mm": {"aot"},
+    "gemm.fp8_scaled_mm": {"aot", "torch", "torch_compile"},
     "moe.moe_align_block_size": {"aot", "jit"},
     "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
     "kvcache.reshape_and_cache_flash": {"triton"},
+    "diffusion.apply_group_norm_silu": {"triton"},
 }
 
 _CPU = PlatformInfo(device_type="cpu")
@@ -69,7 +54,7 @@ def test_top_level_exports():
 
 @pytest.mark.parametrize("group", GROUPS)
 def test_group_importable(group):
-    assert hasattr(importlib.import_module(f"sglang.kernels.ops.{group}"), "__all__")
+    assert importlib.import_module(f"sglang.kernels.ops.{group}") is not None
 
 
 @pytest.mark.parametrize("op, backends", list(EXPECTED.items()))
@@ -84,8 +69,35 @@ def test_specs_well_formed():
         assert sep == ":" and mod and attr, spec.target
 
 
+def test_internal_registry_target_modules_exist():
+    for spec in K.registry.all_specs():
+        module, _, _ = spec.target.partition(":")
+        if module.startswith("sglang.kernels."):
+            assert importlib.util.find_spec(module) is not None, spec.target
+
+
+def test_sparse_linear_attention_registry_targets_forward_kernel():
+    spec = K.registry.get_backend(
+        "diffusion.sparse_linear_attn_fwd", KernelBackend.TRITON
+    )
+    assert spec.target.endswith(":_attn_fwd")
+
+
 def test_single_backend_resolves_without_backend():
-    assert K.select_kernel("gemm.fp8_scaled_mm").backend is KernelBackend.AOT
+    assert (
+        K.select_kernel("kvcache.reshape_and_cache_flash").backend
+        is KernelBackend.TRITON
+    )
+
+
+def test_fp8_scaled_mm_requires_explicit_registry_backend(monkeypatch):
+    monkeypatch.setattr(sel, "_platform", lambda: _SM90)
+    with pytest.raises(ValueError, match="multiple backends"):
+        K.select_kernel("gemm.fp8_scaled_mm")
+    assert (
+        K.select_kernel("gemm.fp8_scaled_mm", backend=KernelBackend.AOT).backend
+        is KernelBackend.AOT
+    )
 
 
 def test_unknown_op_or_backend_raises():
@@ -112,7 +124,7 @@ def test_activation_default_backend(monkeypatch, device, expect):
     from sglang.kernels.ops.activation import _SILU_AND_MUL
 
     monkeypatch.setattr(fo, "_platform", lambda: PlatformInfo(device_type=device))
-    assert _SILU_AND_MUL._resolve_backend().value == expect
+    assert _SILU_AND_MUL.auto_selected_backend().value == expect
 
 
 @pytest.mark.parametrize(
@@ -131,7 +143,7 @@ def test_layernorm_default_backend(monkeypatch, op_attr, device, expect):
     # CUDA-only, so HIP falls to aiter and NPU to torch_npu.
     ln = importlib.import_module("sglang.kernels.ops.layernorm")
     monkeypatch.setattr(fo, "_platform", lambda: PlatformInfo(device_type=device))
-    assert getattr(ln, op_attr)._resolve_backend().value == expect
+    assert getattr(ln, op_attr).auto_selected_backend().value == expect
 
 
 def test_per_op_backend_subset():
@@ -180,6 +192,44 @@ def test_capability_shortcuts():
 
 def test_platform_detect_does_not_raise():
     assert PlatformInfo.detect().device_type in ("cpu", "cuda", "hip", "npu")
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "srt/utils/common.py",
+        "multimodal_gen/runtime/utils/common.py",
+    ),
+)
+def test_amx_backend_probe_is_lazy(relative_path):
+    loader = (
+        "package = importlib.util.find_spec('sglang'); "
+        "path = pathlib.Path(next(iter(package.submodule_search_locations))) / "
+        f"{relative_path!r}; "
+        "spec = importlib.util.spec_from_file_location('_common_under_test', path); "
+        "module = importlib.util.module_from_spec(spec); "
+        "sys.modules[spec.name] = module; "
+        "spec.loader.exec_module(module)"
+    )
+    code = "; ".join(
+        (
+            "import builtins, importlib.util, pathlib, sys",
+            "from unittest import mock",
+            "real_import = builtins.__import__",
+            "import_mock = mock.Mock(wraps=real_import)",
+            "builtins.__import__ = import_mock",
+            loader,
+            "builtins.__import__ = real_import",
+            "attempted = any(call.args and call.args[0] == 'sgl_kernel' "
+            "for call in import_mock.call_args_list)",
+            "print('DIRTY' if attempted else 'CLEAN')",
+        )
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert "CLEAN" in result.stdout
 
 
 def test_import_stays_metadata_only():

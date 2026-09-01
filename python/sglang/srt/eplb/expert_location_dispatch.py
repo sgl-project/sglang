@@ -18,12 +18,12 @@ from typing import Literal, Optional
 import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec
 
 
 @dataclass
 class ExpertLocationDispatchInfo:
-    ep_dispatch_algorithm: Literal["static", "random"]
+    ep_dispatch_algorithm: Literal["static", "dynamic", "fake", "lp"]
     # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # (num_logical_experts, X)
@@ -31,10 +31,16 @@ class ExpertLocationDispatchInfo:
     # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
+    # Whether every rank must pick the same physical expert for a token. True
+    # without an a2a backend: all EP ranks then run the MoE over the same tokens
+    # and sum their partial outputs, so a rank-dependent pick counts a replicated
+    # logical expert several times. With one, each rank dispatches only its own
+    # tokens and is free to disagree.
+    rank_invariant: bool = False
 
     @classmethod
     def init_new(cls, layer_id: int):
-        ep_dispatch_algorithm = get_server_args().ep_dispatch_algorithm
+        ep_dispatch_algorithm = get_exec().moe.ep_dispatch_algorithm
         expert_location_metadata = get_global_expert_location_metadata()
         assert expert_location_metadata is not None
 
@@ -43,6 +49,7 @@ class ExpertLocationDispatchInfo:
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
+            rank_invariant=get_exec().moe.moe_a2a_backend == "none",
             partial_logical_to_rank_dispatch_physical_map=(
                 expert_location_metadata.logical_to_rank_dispatch_physical_map[
                     layer_id, :
@@ -107,15 +114,37 @@ def _topk_ids_logical_to_physical_static(
 def _topk_ids_logical_to_physical_dynamic(
     topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
+    """Spread each (token, logical expert) over that logical expert's replicas.
+
+    Under ``rank_invariant`` the replica is picked by token row rather than at
+    random: ``torch.randint`` reads the default CUDA generator, so agreement
+    across ranks would rest on their philox offsets staying aligned, which
+    nothing asserts, and it would make greedy requests non-reproducible. Both
+    pick evenly, which is the load split EPLB's placement solver assumes.
+
+    Row indexing leaves replicas unused for a single-row batch, where there is no
+    imbalance to fix anyway.
+    """
     topk_ids_original_shape = topk_ids.shape
     original_dtype = topk_ids.dtype
     device = topk_ids.device
     topk_ids = topk_ids.flatten()
 
-    chosen_dispatch_index = (
-        torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)
-        % info.partial_logical_to_all_physical_map_num_valid[topk_ids]
-    )
+    num_valid = info.partial_logical_to_all_physical_map_num_valid[topk_ids]
+    if info.rank_invariant:
+        slots_per_token = (
+            topk_ids_original_shape[-1] if len(topk_ids_original_shape) > 1 else 1
+        )
+        row_index = (
+            torch.arange(topk_ids.shape[0], dtype=num_valid.dtype, device=device)
+            // slots_per_token
+        )
+        chosen_dispatch_index = row_index % num_valid
+    else:
+        chosen_dispatch_index = (
+            torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)
+            % num_valid
+        )
     topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
     if topk_ids.dtype != original_dtype:
         topk_ids = topk_ids.to(original_dtype)

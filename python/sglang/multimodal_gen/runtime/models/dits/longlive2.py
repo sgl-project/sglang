@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.nn.attention.flex_attention import BlockMask
 
 from sglang.multimodal_gen.configs.models.dits.longlive2 import LongLive2VideoConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalSelfAttentionKVCache,
     CrossAttentionKVCache,
@@ -151,9 +152,8 @@ class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
 
 
 class LongLive2Transformer3DModel(CausalWanTransformer3DModel):
-    _fsdp_shard_conditions = LongLive2VideoConfig()._fsdp_shard_conditions
-    _compile_conditions = LongLive2VideoConfig()._compile_conditions
-    _supported_attention_backends = LongLive2VideoConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = LongLive2VideoConfig().param_names_mapping
     reverse_param_names_mapping = LongLive2VideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = LongLive2VideoConfig().lora_param_names_mapping

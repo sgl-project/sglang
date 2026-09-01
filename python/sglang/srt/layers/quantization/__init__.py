@@ -19,7 +19,12 @@ class DummyConfig:
 CompressedTensorsConfig = DummyConfig
 
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
-from sglang.srt.layers.quantization.awq import AWQConfig, AWQCPUConfig, AWQMarlinConfig
+from sglang.srt.layers.quantization.awq import (
+    AWQConfig,
+    AWQCPUConfig,
+    AWQMarlinConfig,
+    AWQXPUConfig,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
@@ -33,6 +38,7 @@ from sglang.srt.layers.quantization.gptq import (
     GPTQAscendConfig,
     GPTQConfig,
     GPTQMarlinConfig,
+    GPTQXPUConfig,
 )
 from sglang.srt.layers.quantization.humming import HummingConfig
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
@@ -58,13 +64,13 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
-    is_hip,
+    is_gfx95_supported,
     is_mps,
     is_npu,
-    mxfp_supported,
+    is_xpu,
 )
 
-_is_mxfp_supported = mxfp_supported()
+_is_gfx95_supported = is_gfx95_supported()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
@@ -102,7 +108,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 }
 
 
-if is_cpu() or is_cuda() or (_is_mxfp_supported and is_hip()):
+if is_cpu() or is_cuda() or _is_gfx95_supported:
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,
@@ -118,6 +124,15 @@ if is_npu():
             # upstream `Mxfp4Config` OCP-MoE path is only registered on
             # cpu/cuda/hip above, so there is no collision here).
             "mxfp4": Mxfp4W4A4Config,
+        }
+    )
+
+
+if is_xpu():
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "gptq": GPTQXPUConfig,
+            "awq": AWQXPUConfig,
         }
     )
 
@@ -138,6 +153,7 @@ CPU_QUANTIZATION_METHODS = {
     "awq": AWQCPUConfig,
     "gptq": CPUGPTQConfig,
     "mxfp4": Mxfp4Config,
+    "auto-round": AutoRoundConfig,
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}

@@ -1,16 +1,22 @@
+import glob
+import inspect
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import sys
 import threading
 import time
+from datetime import datetime
 from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     SERVICE_PORT,
     check_role,
+    kill_process_group,
     launch_pd_mix_node,
     launch_pd_separation_node,
     launch_router,
@@ -56,6 +62,7 @@ DATASET_FLUCTUATION = {
     "aime25": 2,
     "aime26": 2,
     "gpqa_diamond": 5,
+    "gsm8k": 3,
 }
 
 MAX_RETRY_COUNT = 3
@@ -171,6 +178,12 @@ def run_evalscope(
         text=True,
         bufsize=1,
         shell=True,
+        start_new_session=True,
+    )
+
+    logger.info(
+        f"run_evalscope spawned: pid={process.pid} "
+        f"pgid={os.getpgid(process.pid)} cmd={cmd}"
     )
 
     output_lines = []
@@ -181,6 +194,13 @@ def run_evalscope(
             output_lines.append(line.strip())
 
         process.wait()
+
+        logger.info(
+            f"run_evalscope finished: pid={process.pid} "
+            f"returncode={process.returncode}"
+        )
+
+        kill_process_group(process)
 
         if process.returncode != 0:
             logger.error(f"Command failed with return code: {process.returncode}")
@@ -198,28 +218,33 @@ def run_evalscope(
             try:
                 with open(report_path, "r") as rf:
                     report_data = json.load(rf)
-                for item in report_data:
-                    score = item.get("score")
-                    if score is not None:
-                        metrics["accuracy"] = float(score)
-                        logger.info(f"The Final Accuracy from report: {score}")
-                        break
+                score = report_data.get("score")
+                if score is not None:
+                    metrics["accuracy"] = float(score)
+                    logger.info(f"The Final Accuracy from report: {score}")
             except Exception as e:
                 logger.warning(f"Failed to read report file {report_path}: {e}")
 
         if "accuracy" not in metrics:
             accuracy_patterns = [
+                # Add adaptation for evalscope 1.11+ table format
+                r"Accuracy\s*[↑↓]?\s*│\s*[^│]*│\s*\d+\s*│\s*([\d.]+)%?\s*│",
                 r"mean_acc\s*.*?│\s*\d+\s*│\s*([\d.]+)\s*│",
                 r"│\s+([\d.]+)\s+│\s+\S+\s+│\s*$",
                 r"accuracy\s*[:=]?\s*([\d.]+)",
+                # Keep compatibility with legacy evalscope 1.10 table format
                 r"Accuracy\s*[:=]?\s*([\d.]+)",
                 r"score\s*[:=]?\s*([\d.]+)",
             ]
 
             for pattern in accuracy_patterns:
-                matches = re.findall(pattern, full_output)
+                matches = list(re.finditer(pattern, full_output))
                 if matches:
-                    final_accuracy = float(matches[-1])
+                    final_accuracy = float(matches[-1].group(1))
+                    # evalscope 1.11+ reports accuracy as a percentage (e.g. 66.67%);
+                    # normalize it to a 0-1 fraction to compare against the baseline.
+                    if "%" in matches[-1].group(0):
+                        final_accuracy /= 100.0
                     metrics["accuracy"] = final_accuracy
                     logger.info(f"The Final Accuracy from output: {final_accuracy}")
                     break
@@ -239,11 +264,14 @@ def run_evalscope(
             logger.warning("Process did not terminate gracefully, killing it...")
             process.kill()
             logger.info("Process killed")
+        kill_process_group(process)
         raise
+
     except Exception as e:
         logger.error(f"Error executing command: {e}")
         process.terminate()
         process.wait(timeout=5)
+        kill_process_group(process)
         raise
 
 
@@ -286,12 +314,136 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
-    max_attempts = 2
-    n_runs = 3
     accuracy = 0.1
+    test_type = "accuracy"
+
+    @classmethod
+    def _get_tc_name(cls):
+        """Derive the test case name from the test file (filename without
+        extension). Mirrors the workflow's ``tc_name=${test_case##*/}`` logic
+        so each case in a suite writes to its own output path."""
+        try:
+            tc_file = inspect.getfile(cls)
+        except (TypeError, OSError):
+            tc_file = getattr(sys.modules.get(cls.__module__), "__file__", "")
+        return os.path.splitext(os.path.basename(tc_file))[0]
+
+    @classmethod
+    def _setup_per_case_output(cls):
+        """Set up per-case output directories and env vars.
+
+        When the workflow sets METRICS_DATA_FILE to a suite-level directory
+        (e.g. .../output/{branch_label}-{create_date}-{run_id}-{run_attempt}/
+        {workflow_name}/{test_type}/{suite}), each case in the suite
+        writes to its own subdirectory under it, so results stay in the
+        structured layout and are keyed by the case id. Falls back to the
+        legacy per-case layout when the env var is not set.
+        """
+        cls.tc_name = cls._get_tc_name()
+        suite_output = os.environ.get("METRICS_DATA_FILE")
+        if suite_output:
+            # Append the case id under the suite output prefix.
+            cls.metrics_data_file = os.path.join(suite_output, cls.tc_name)
+            # Mirror the output prefix to the plog location (drop the test_type/suite tail).
+            suite_plog = suite_output.replace("/output/", "/logs/plog/", 1)
+            cls.plog_base = os.path.dirname(os.path.dirname(suite_plog))
+        else:
+            current_date = datetime.now().strftime("%Y%m%d")
+            test_type = getattr(cls, "test_type", "accuracy")
+            base_output = f"/root/.cache/tests/output/{test_type}/{current_date}"
+            cls.metrics_data_file = os.path.join(base_output, cls.tc_name)
+            cls.plog_base = f"/root/.cache/tests/logs/plog"
+        os.makedirs(cls.metrics_data_file, exist_ok=True)
+        # Override env vars so evalscope/dump_metric write to per-case paths.
+        os.environ["METRICS_DATA_FILE"] = cls.metrics_data_file
+        os.environ["SGLANG_TEST_METRICS_OUTPUT"] = os.path.join(
+            cls.metrics_data_file, "metrics"
+        )
+        logger.info(
+            "Per-case output: tc_name=%s metrics_data_file=%s",
+            cls.tc_name,
+            cls.metrics_data_file,
+        )
+
+    @classmethod
+    def _save_metrics_json(cls):
+        """Write per-case ``metrics.json`` from ``dump_metric`` JSONL files.
+
+        Replaces the workflow's stdout-parsing + ``dump_metrics.py`` logic so
+        each case in a suite persists its own metrics snapshot.
+        """
+        if not getattr(cls, "metrics_data_file", None):
+            return
+        metrics = {}
+        baselines = {}
+        pattern = os.path.join(cls.metrics_data_file, "metrics.*.jsonl")
+        for jsonl_path in glob.glob(pattern):
+            try:
+                with open(jsonl_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        record = json.loads(line)
+                        name = record.get("metric_name")
+                        value = record.get("value")
+                        if name is None:
+                            continue
+                        if name.endswith("_baseline"):
+                            baselines[name[: -len("_baseline")]] = value
+                        else:
+                            metrics[name] = value
+            except Exception as e:
+                logger.warning("Failed to read %s: %s", jsonl_path, e)
+        out_path = os.path.join(cls.metrics_data_file, "metrics.json")
+        payload = {
+            "test_case": cls.tc_name,
+            "test_type": getattr(cls, "test_type", "accuracy"),
+            "metrics": metrics,
+            "baselines": baselines,
+        }
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            logger.info("Saved per-case metrics to %s", out_path)
+        except Exception as e:
+            logger.warning("Failed to write metrics.json: %s", e)
+        # Remove the intermediate JSONL records, keeping only the final metrics.json.
+        for jsonl_path in glob.glob(pattern):
+            try:
+                os.remove(jsonl_path)
+            except Exception as e:
+                logger.warning("Failed to remove %s: %s", jsonl_path, e)
+
+    @classmethod
+    def _backup_plog(cls):
+        """Backup Ascend plog files to a per-case path.
+
+        Replaces the workflow's ``Backup plog`` step so each case in a suite
+        gets its own plog snapshot instead of all cases sharing the suite name.
+        """
+        plog_path = "/root/ascend/log/debug/plog"
+        if not os.path.isdir(plog_path):
+            return
+        tc_name = getattr(cls, "tc_name", None)
+        if not tc_name:
+            return
+        hostname = os.getenv("HOSTNAME", "unknown")
+        plog_base = getattr(cls, "plog_base", "/root/.cache/tests/logs/plog")
+        target = os.path.join(plog_base, tc_name, hostname)
+        os.makedirs(target, exist_ok=True)
+        for name in os.listdir(plog_path):
+            src = os.path.join(plog_path, name)
+            if os.path.isfile(src):
+                try:
+                    shutil.copy2(src, os.path.join(target, name))
+                except Exception as e:
+                    logger.warning("Failed to copy plog %s: %s", name, e)
+        logger.info("Backed up plog to %s", target)
 
     @classmethod
     def setUpClass(cls):
+        cls._setup_per_case_output()
         cls.base_url = DEFAULT_URL_FOR_TEST
         env = os.environ.copy()
         for key, value in env.items():
@@ -318,6 +470,8 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+        cls._save_metrics_json()
+        cls._backup_plog()
 
     def run_accuracy(self):
         parsed_url = urlparse(self.base_url)
@@ -356,67 +510,6 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                     )
             assert_metrics(self, best_metrics)
 
-    def run_accuracy_multiple(self, n_runs=None):
-        if n_runs is None:
-            n_runs = self.n_runs
-
-        parsed_url = urlparse(self.base_url)
-        host = parsed_url.hostname
-        port = parsed_url.port
-
-        if self.benchmark_tool != EVALSCOPE:
-            raise Exception(
-                "run_accuracy_multiple only supports evalscope benchmark tool"
-            )
-
-        model_name = os.path.basename(self.model)
-        all_metrics = []
-
-        for i in range(n_runs):
-            logger.info(f"=== Accuracy run {i + 1}/{n_runs} ===")
-            metrics = run_evalscope(
-                host=host,
-                port=port,
-                model=model_name,
-                datasets=self.datasets,
-                dataset_args=self.dataset_args,
-                eval_batch_size=self.eval_batch_size,
-                limit=self.limit,
-                generation_config=self.generation_config,
-                dataset_dir=self.dataset_dir,
-                stream=self.stream,
-                timeout=self.timeout,
-                eval_type=self.eval_type,
-            )
-            all_metrics.append(metrics)
-            if metrics and "accuracy" in metrics:
-                logger.info(f"Run {i + 1} accuracy: {metrics['accuracy']}")
-            else:
-                logger.warning(f"Run {i + 1} failed to get accuracy metric")
-
-        valid_metrics = [m for m in all_metrics if m and "accuracy" in m]
-        if not valid_metrics:
-            raise Exception("No valid accuracy metrics obtained from any run")
-
-        avg_accuracy = sum(float(m["accuracy"]) for m in valid_metrics) / len(
-            valid_metrics
-        )
-
-        logger.info("=" * 60)
-        logger.info("Multiple Run Accuracy Results:")
-        for i, m in enumerate(valid_metrics):
-            logger.info(f"  Run {i + 1}: {m['accuracy']}")
-        logger.info(f"  Average: {avg_accuracy}")
-        logger.info("=" * 60)
-
-        avg_metrics = {"accuracy": avg_accuracy}
-        dump_metric(
-            "accuracy_avg",
-            avg_accuracy,
-            labels={"test_case": self.__class__.__name__, "type": "accuracy"},
-        )
-        assert_metrics(self, avg_metrics)
-
 
 class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     model_config = None
@@ -434,7 +527,6 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
-    max_attempts = 2
     accuracy = 0.1
 
     @classmethod
@@ -536,7 +628,6 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     eval_type = "openai_api"
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-    max_attempts = 2
     accuracy = 0.1
 
     @classmethod

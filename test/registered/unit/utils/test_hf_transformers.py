@@ -25,6 +25,7 @@ from sglang.srt.utils.hf_transformers.common import (
     get_context_length,
     get_hf_text_config,
     get_rope_config,
+    resolve_hf_gguf_reference,
 )
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
@@ -39,6 +40,72 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestGetProcessor(unittest.TestCase):
+    def test_does_not_forward_backend_to_auto_processor(self):
+        config = SimpleNamespace(model_type="test_vlm", auto_map={})
+        loaded_processor = MagicMock()
+        loaded_processor.image_processor.backend = "torchvision"
+        loaded_processor.tokenizer.chat_template = "template"
+        auto_config = MagicMock()
+        auto_config.from_pretrained.return_value = config
+        auto_processor = MagicMock()
+        auto_processor.from_pretrained.return_value = loaded_processor
+        auto_image_processor = MagicMock()
+
+        with patch.multiple(
+            processor_utils,
+            AutoConfig=auto_config,
+            AutoProcessor=auto_processor,
+            AutoImageProcessor=auto_image_processor,
+        ):
+            processor_utils.get_processor(
+                "test-model", image_processor_backend="torchvision"
+            )
+
+        call_kwargs = auto_processor.from_pretrained.call_args.kwargs
+        self.assertNotIn("backend", call_kwargs)
+        self.assertNotIn("use_fast", call_kwargs)
+        auto_image_processor.from_pretrained.assert_not_called()
+
+    def test_applies_pil_backend_only_to_image_processor(self):
+        config = SimpleNamespace(model_type="test_vlm", auto_map={})
+
+        for processor_kwargs in (
+            {"image_processor_backend": "pil"},
+            {"use_fast": False},
+        ):
+            with self.subTest(processor_kwargs=processor_kwargs):
+                loaded_processor = MagicMock()
+                loaded_processor.image_processor.backend = "torchvision"
+                loaded_processor.tokenizer.chat_template = "template"
+                pil_processor = MagicMock(backend="pil")
+                auto_config = MagicMock()
+                auto_config.from_pretrained.return_value = config
+                auto_processor = MagicMock()
+                auto_processor.from_pretrained.return_value = loaded_processor
+                auto_image_processor = MagicMock()
+                auto_image_processor.from_pretrained.return_value = pil_processor
+
+                with patch.multiple(
+                    processor_utils,
+                    AutoConfig=auto_config,
+                    AutoProcessor=auto_processor,
+                    AutoImageProcessor=auto_image_processor,
+                ):
+                    processor = processor_utils.get_processor(
+                        "test-model", **processor_kwargs
+                    )
+
+                call_kwargs = auto_processor.from_pretrained.call_args.kwargs
+                self.assertNotIn("backend", call_kwargs)
+                self.assertNotIn("use_fast", call_kwargs)
+                auto_image_processor.from_pretrained.assert_called_once_with(
+                    "test-model",
+                    trust_remote_code=False,
+                    revision=None,
+                    backend="pil",
+                )
+                self.assertIs(processor.image_processor, pil_processor)
+
     def test_resolves_model_name_before_loading_config(self):
         remote_model = "s3://bucket/model"
         local_model = "/cache/model"
@@ -294,6 +361,43 @@ class TestCheckGgufFile(unittest.TestCase):
     def test_directory(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertFalse(check_gguf_file(d))
+
+
+class TestResolveHfGgufReference(unittest.TestCase):
+    @patch("huggingface_hub.hf_hub_download", return_value="/cache/model-Q4_K.gguf")
+    @patch("huggingface_hub.HfApi")
+    def test_resolves_quant_type(self, api_cls, download):
+        api_cls.return_value.repo_info.return_value.siblings = [
+            SimpleNamespace(rfilename="model-Q4_K.gguf"),
+            SimpleNamespace(rfilename="model-Q8_0.gguf"),
+        ]
+
+        resolved = resolve_hf_gguf_reference("owner/repo:Q4_K", revision="revision")
+
+        self.assertEqual(resolved, "/cache/model-Q4_K.gguf")
+        download.assert_called_once_with(
+            "owner/repo", "model-Q4_K.gguf", revision="revision"
+        )
+
+    @patch("huggingface_hub.HfApi")
+    def test_rejects_ambiguous_quant_type(self, api_cls):
+        api_cls.return_value.repo_info.return_value.siblings = [
+            SimpleNamespace(rfilename="fl2va-Q4_K.gguf"),
+            SimpleNamespace(rfilename="ref2va-Q4_K.gguf"),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            resolve_hf_gguf_reference("owner/repo:Q4_K")
+
+    @patch("huggingface_hub.HfApi")
+    def test_reports_available_files_when_quant_type_is_missing(self, api_cls):
+        api_cls.return_value.repo_info.return_value.siblings = [
+            SimpleNamespace(rfilename="model-Q4_K.gguf"),
+            SimpleNamespace(rfilename="README.md"),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "model-Q4_K.gguf"):
+            resolve_hf_gguf_reference("owner/repo:Q8_0")
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,8 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
     query :attr:`supports_prefill` and fall back to Triton.
     """
 
+    supports_safe_gate: bool = False
+
     def __init__(self):
         self.supports_prefill = _is_blackwell()
         self._extend_fn: Optional[callable] = None
@@ -75,6 +77,11 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        if kwargs.get("lower_bound") is not None:
+            raise NotImplementedError(
+                "KDA safe gate (lower_bound) is not implemented in the CuTe DSL "
+                "decode kernel; use --linear-attn-decode-backend triton."
+            )
         return cutedsl_fused_sigmoid_gating_kda_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -108,6 +115,10 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         **kwargs,
     ) -> torch.Tensor:
         if kwargs.get("return_intermediate_states"):
+            # The mamba radix extra_buffer track path needs per-chunk states
+            # (h), which chunk_kda_cutedsl does not expose. Refuse instead of
+            # silently skipping the snapshot (that corrupts prefix-cache
+            # restores). Use the Triton prefill backend with extra_buffer.
             raise NotImplementedError(
                 "CuteDSLKDAKernel.extend cannot return intermediate chunk "
                 "states required by mamba_radix_cache_strategy=extra_buffer; "
@@ -152,8 +163,9 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
             h0_indices=ssm_cache_indices,
         )
 
-        # Match chunk_kda's output layout [1, T, HV, V].
-        return o.unsqueeze(0)
+        # CuTeDSL does not emit intermediate chunk states; pairing with None
+        # keeps the upstream extra-buffer radix track contract.
+        return o.unsqueeze(0), None
 
     def target_verify(self, *args, **kwargs):
         raise NotImplementedError("CuteDSLKDAKernel does not support target_verify")
