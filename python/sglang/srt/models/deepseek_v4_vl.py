@@ -138,6 +138,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         **kwargs,
     ) -> torch.Tensor:
+        if forward_batch.contains_mm_inputs():
+            # embed_mm_inputs clamps forward_batch.input_ids in place
+            # (max=vocab_size-1) to embed the placeholder region. The MoE
+            # gate's bias_vl routing keys on the mm pad sentinels in those
+            # ids, so keep a pre-clamp snapshot for it to read.
+            forward_batch.dsv4_routing_input_ids = forward_batch.input_ids.clone()
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -187,6 +193,22 @@ class DeepseekV4ForCausalLM(nn.Module):
     def set_dspark_layers_to_capture(self, layer_ids) -> None:
         # DSPARK aux-hidden capture is configured on the text model.
         self.language_model.set_dspark_layers_to_capture(layer_ids)
+
+    def __getattr__(self, name: str):
+        # The wrapper replaces the text model in the registry for every
+        # DeepseekV4 checkpoint, so it must expose the text model's full
+        # public surface (get_embed_and_head for EAGLE,
+        # routed_experts_weights_of_layer for EPLB, start/end_layer for PP,
+        # get_model_config_for_expert_location, ...). Delegate anything that
+        # is not the wrapper's own parameter/buffer/submodule/attribute.
+        # `language_model` itself is resolved through nn.Module machinery so
+        # a miss before __init__ assigns it raises AttributeError instead of
+        # recursing.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            language_model = super().__getattr__("language_model")
+            return getattr(language_model, name)
 
 
 EntryClass = [DeepseekV4ForCausalLM]

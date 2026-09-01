@@ -54,10 +54,13 @@ def _iter_visible_window_spans(
 
     - spans fully contained in the extend; or
     - spans partially covered by the cached prefix (span_start < prefix) whose
-      early raw KV is guaranteed present: ``span_start >= prefix - swa_window``.
-      The radix match validator guarantees the trailing ``swa_window`` tokens
-      of a matched prefix keep their raw SWA KV, so the extend's visible
-      window (which reaches back to span_start) can be served from the pool.
+      early raw KV is guaranteed present: ``span_start >= prefix - (swa_window
+      - 1)``. The radix match validator guarantees the trailing ``swa_window``
+      tokens of a matched prefix keep their raw SWA KV, and the sparse-prefill
+      workspace gathers ``extend + (swa_window - 1)`` positions back, so the
+      extend's visible window (which reaches back to span_start) can be served
+      from the pool. ``swa_window - 1`` rather than ``swa_window``: at exactly
+      one window of depth the sparse workspace coordinate would underflow.
 
     Spans partially overlapping the extend/prefix without that guarantee are
     genuine cuts (a radix hit deeper than ``swa_window`` into the span, or a
@@ -76,9 +79,8 @@ def _iter_visible_window_spans(
             for span_start, span_end_incl in item.offsets:
                 if span_start >= prefix and span_end_incl < extend_end:
                     yield req_idx, int(span_start), int(span_end_incl) + 1
-                elif (
-                    span_start < prefix <= span_end_incl
-                    and span_start >= prefix - swa_window
+                elif span_start < prefix <= span_end_incl and span_start >= prefix - (
+                    swa_window - 1
                 ):
                     yield req_idx, int(span_start), int(span_end_incl) + 1
                 elif span_start < extend_end and span_end_incl >= prefix:
@@ -188,8 +190,9 @@ def image_span_cut_point(mm_input, position: int, swa_window: int) -> Optional[i
     truncated to that start, else None.
 
     A match ending inside an image span is only a problem when it ends deeper
-    than ``swa_window`` into the span: the match validator guarantees the
-    trailing ``swa_window`` tokens of the prefix keep their raw SWA KV, so a
+    than ``swa_window - 1`` into the span: the match validator guarantees the
+    trailing ``swa_window`` tokens of the prefix keep their raw SWA KV and the
+    sparse-prefill workspace gathers ``swa_window - 1`` positions back, so a
     shallow mid-span match leaves the span's early KV readable and the
     visible window can still be served (see _iter_visible_window_spans). A
     deeper match must be re-issued capped to the span start, fully
@@ -201,6 +204,6 @@ def image_span_cut_point(mm_input, position: int, swa_window: int) -> Optional[i
         if not item.is_image() or not item.offsets:
             continue
         for span_start, span_end_incl in item.offsets:
-            if span_start < position - swa_window and position <= span_end_incl:
+            if span_start < position - (swa_window - 1) and position <= span_end_incl:
                 return int(span_start)
     return None

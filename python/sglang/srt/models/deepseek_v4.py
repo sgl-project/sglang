@@ -3063,9 +3063,14 @@ class DeepseekV4Model(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         # Multimodal prefill embeds tokens outside and calls this with
         # input_ids=None; the hash-MoE routing and the dp gather below still
-        # need the real (padded) ids, which forward_batch always carries.
+        # need the real (padded) ids. Read the pre-embedding snapshot when
+        # present: embed_mm_inputs clamps forward_batch.input_ids in place
+        # (max=vocab_size-1), which would erase the mm pad sentinels the
+        # bias_vl routing keys on.
         if input_ids is None:
-            input_ids = forward_batch.input_ids
+            input_ids = getattr(forward_batch, "dsv4_routing_input_ids", None)
+            if input_ids is None:
+                input_ids = forward_batch.input_ids
         cp_v2_active = is_cp_v2_active(forward_batch)
         use_prefill_cp = dsa_use_prefill_cp(forward_batch)
         if self.pp_group.is_first_rank:

@@ -259,6 +259,8 @@ logger = logging.getLogger(__name__)
 # One-time SGLANG_OPT_MOE_QUANT_ONCE engagement log (see _moe_quant_once_enabled).
 _moe_quant_once_logged = False
 
+_bias_vl_route_logged = [False]
+
 _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
 )
@@ -1107,6 +1109,11 @@ class DeepseekV2MoE(nn.Module):
 
             image_mask = input_ids >= MM_PAD_SHIFT_VALUE
             if image_mask.any():
+                if not _bias_vl_route_logged[0]:
+                    _bias_vl_route_logged[0] = True
+                    logger.info(
+                        "DSV4-Vision: routing image tokens with gate bias_vl (MoE gate)."
+                    )
                 correction_bias = self.gate.e_score_correction_bias
                 text_bias = (
                     torch.zeros_like(bias_vl)

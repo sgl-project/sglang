@@ -27,6 +27,8 @@ from sglang.srt.utils import is_hip, is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
 
+_bias_vl_route_logged = [False]
+
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
@@ -50,7 +52,10 @@ class HashTopK(nn.Module):
         # DeepSeek-V4-Vision only: image tokens bypass the tid2eid hash table
         # and are selected by (scores + bias_vl). Reference to the gate's
         # parameter (not a submodule); None keeps text-only behavior exact.
-        self.bias_vl = bias_vl
+        # object.__setattr__ because plain assignment would auto-register the
+        # shared tensor as mlp.topk.bias_vl, duplicating mlp.gate.bias_vl in
+        # named_parameters and tripping name-based weight audits.
+        object.__setattr__(self, "bias_vl", bias_vl)
 
         self.enable_waterfill = (
             num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
@@ -260,6 +265,11 @@ class HashTopK(nn.Module):
         if image_mask is not None:
             # The fused kernels know nothing about bias_vl and their tid2eid
             # gather would index out of vocab on pad sentinels.
+            if not _bias_vl_route_logged[0]:
+                _bias_vl_route_logged[0] = True
+                logger.info(
+                    "DSV4-Vision: routing image tokens with gate bias_vl (hash layer)."
+                )
             topk_weights, topk_ids = self._forward_torch(
                 router_logits, input_ids, image_mask=image_mask
             )
