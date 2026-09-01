@@ -4116,6 +4116,11 @@ class MLATokenToKVPool(KVCache):
         """How many logical ids one stored row spans in the write-loc space."""
         return 1 if self.write_loc_is_dcp_resolved else get_parallel().attn_dcp_size
 
+    @property
+    def _write_loc_dcp_rank(self) -> int:
+        """This rank's share of the write-loc space; 0 once it is resolved."""
+        return 0 if self.write_loc_is_dcp_resolved else get_parallel().attn_dcp_rank
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -4164,13 +4169,13 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
-        *,
-        dcp_resolved: bool = False,
     ) -> None:
-        # `dcp_resolved`: `loc` already addresses this rank's rows (the unified
-        # pool's dense-id contract), so the write kernel must not re-apply the
-        # DCP owner rule. The DSA branches below have no such kernel argument.
-        assert not (dcp_resolved and (self.use_dsa or self.dsa_kv_cache_store_fp8))
+        # Every branch below writes at this pool's own write-loc space, so each
+        # passes the owner rule that space still carries (`1, 0` once resolved).
+        assert not (
+            self.write_loc_is_dcp_resolved
+            and (self.use_dsa or self.dsa_kv_cache_store_fp8)
+        ), "the DSA write paths have no resolved-loc variant"
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
@@ -4197,6 +4202,8 @@ class MLATokenToKVPool(KVCache):
                 loc,
                 cache_k_nope_fp8,
                 cache_k_rope_fp8,
+                dcp_world_size=self._write_loc_dcp_span,
+                dcp_rank=self._write_loc_dcp_rank,
             )
         else:
             if cache_k_nope.dtype != self.dtype:
@@ -4211,7 +4218,8 @@ class MLATokenToKVPool(KVCache):
                 loc,
                 cache_k_nope,
                 cache_k_rope,
-                dcp_resolved=dcp_resolved,
+                dcp_world_size=self._write_loc_dcp_span,
+                dcp_rank=self._write_loc_dcp_rank,
             )
 
     def set_mla_kv_buffer(
@@ -4241,7 +4249,6 @@ class MLATokenToKVPool(KVCache):
             loc,
             cache_k_nope,
             cache_k_rope,
-            dcp_resolved=self.write_loc_is_dcp_resolved,
         )
 
     def get_mla_kv_buffer(
@@ -4440,6 +4447,8 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 loc,
                 cache_k_nope_fp4,
                 cache_k_rope_fp4,
+                dcp_world_size=self._write_loc_dcp_span,
+                dcp_rank=self._write_loc_dcp_rank,
             )
             set_mla_kv_scale_buffer_triton(
                 self.kv_scale_buffer[layer_id - self.start_layer],

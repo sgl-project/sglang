@@ -5,7 +5,6 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.runtime_context import get_parallel
 
 
 @triton.jit
@@ -95,7 +94,8 @@ def set_mla_kv_buffer_triton(
     cache_k_rope: torch.Tensor,
     *,
     reserved_skip_index: int = 0,
-    dcp_resolved: bool = False,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
 ):
     """Dispatch MLA paged-KV scatter writes to the fastest available path.
 
@@ -123,10 +123,11 @@ def set_mla_kv_buffer_triton(
     Writes targeting ``reserved_skip_index`` are skipped. Slot 0 is reserved
     for CUDA-graph padding by default; pass -1 to disable skipping.
 
-    ``dcp_resolved``: ``loc`` already addresses this rank's rows and the ids it
-    does not own are already tombstoned onto ``reserved_skip_index`` (the
-    unified pool's dense-id contract), so the DCP owner rule must NOT be applied
-    a second time here.
+    ``dcp_world_size`` / ``dcp_rank``: the owner rule to apply to ``loc``, which
+    the CALLER owns -- a pool whose write loc is still widened passes the live
+    topology, one that resolved it beforehand passes the default ``1, 0``.
+    Reading the process-global topology here instead would make this kernel's
+    semantics depend on which pool happens to be calling it.
     """
     from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
         can_use_set_mla_kv_buffer,
@@ -138,8 +139,6 @@ def set_mla_kv_buffer_triton(
     n_loc = loc.numel()
     nope_bytes = cache_k_nope.shape[-1] * cache_k_nope.element_size()
     rope_bytes = cache_k_rope.shape[-1] * cache_k_rope.element_size()
-    dcp_rank = 0 if dcp_resolved else get_parallel().attn_dcp_rank
-    dcp_world_size = 1 if dcp_resolved else get_parallel().attn_dcp_size
     if (
         n_loc >= _TMA_BULK_STORE_MIN_LOCS
         and is_arch_support_pdl()
