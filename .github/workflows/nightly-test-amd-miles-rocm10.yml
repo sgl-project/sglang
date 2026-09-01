@@ -1,13 +1,10 @@
-name: Nightly Test Miles (AMD ROCm 7.2)
+name: Nightly Test Miles (AMD ROCm 10)
 
 on:
-  schedule:
-    # Runs after the 12:00 UTC miles image build has pushed the dated image.
-    - cron: "30 17 * * *"
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Override miles image tag (e.g. miles-rocm720-mi35x-20260621); empty = newest by date"
+        description: "Override miles image tag (e.g. miles-rocm10-mi35x-20260901); empty = newest by date"
         required: false
         type: string
         default: ""
@@ -46,10 +43,10 @@ jobs:
           username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
           password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
-      - name: Resolve newest miles ROCm 7.2 image
+      - name: Resolve newest miles ROCm 10 image
         run: |
           repo="rocm/sgl-dev"
-          base="miles-rocm720-mi35x"
+          base="miles-rocm10-mi35x"
           tag="${{ inputs.image_tag }}"
           if [ -z "${tag}" ]; then
             # Walk back from today; the build job pushes a dated tag at 12:00 UTC.

@@ -1,9 +1,7 @@
-name: Release Docker Images Nightly Miles ROCm7.0 (AMD)
+name: Release Docker Images Nightly Miles ROCm10 (AMD)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 12 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
@@ -20,14 +18,13 @@ jobs:
       fail-fast: false
       matrix:
         variant:
-          - rocm700-mi35x
-          - rocm700-mi30x
+          - rocm10-mi35x
     steps:
       - name: Checkout miles repository
         uses: actions/checkout@v4
         with:
-          repository: radixark/miles
-          ref: main
+          repository: XinyuJiangCMU/miles
+          ref: pr/rocm10-variant-20260901
           fetch-depth: 0
           persist-credentials: false
 
