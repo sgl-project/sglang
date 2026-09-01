@@ -194,9 +194,7 @@ class TestBufferModeSidecar(unittest.TestCase):
                 comp_xfers={ComponentType.SWA: [swa]},
             )
         )
-        self.assertEqual(
-            pipeline.ongoing_write_through[7].aux_xfers, [swa, *sidecars]
-        )
+        self.assertEqual(pipeline.ongoing_write_through[7].aux_xfers, [swa, *sidecars])
 
         pipeline.finish_backup_ack(7)
 
@@ -206,22 +204,16 @@ class TestBufferModeSidecar(unittest.TestCase):
         }
         self.assertEqual(storage_transfers[PoolName.SWA].keys, [hashes[-1]])
         self.assertTrue(
-            torch.equal(
-                storage_transfers[PoolName.SWA].host_indices, swa_host_indices
-            )
+            torch.equal(storage_transfers[PoolName.SWA].host_indices, swa_host_indices)
         )
         for spec in self._dsv4_specs():
             storage_sidecar = storage_transfers[spec.pool_name]
             expected_keys = (
-                hashes
-                if spec.indices_from_pool == PoolName.KV
-                else [hashes[-1]]
+                hashes if spec.indices_from_pool == PoolName.KV else [hashes[-1]]
             )
             self.assertEqual(storage_sidecar.keys, expected_keys)
             self.assertEqual(storage_sidecar.hit_policy, spec.hit_policy)
-            self.assertEqual(
-                storage_sidecar.indices_from_pool, spec.indices_from_pool
-            )
+            self.assertEqual(storage_sidecar.indices_from_pool, spec.indices_from_pool)
             self.assertIsNone(storage_sidecar.host_indices)
         self.assertIn(99, pipeline.ongoing_backup)
 
