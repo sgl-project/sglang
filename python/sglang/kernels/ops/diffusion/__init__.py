@@ -37,6 +37,7 @@ from sglang.kernels.spec import (
 )
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
+_CUDA_SM100_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))})
 _HIP = frozenset({CapabilityRequirement.HIP})
 
 # ---------------------------------------------------------------------------
@@ -194,6 +195,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Fused in-place QK RMS-norm + RoPE.",
     ),
     (
+        "diffusion.qwen_qkv_epilogue",
+        KernelBackend.JIT,
+        "rope.qwen_qkv_epilogue_jit:try_fused_qwen_qkv_epilogue",
+        _CUDA_SM100_PLUS,
+        "Qwen-Image QK RMS-norm, RoPE, and joint QKV writes.",
+    ),
+    (
         "diffusion.ltx2_qknorm_split_rope",
         KernelBackend.JIT,
         "rope.ltx2_qknorm_split_rope_jit:ltx2_qknorm_split_rope_cuda",
@@ -333,6 +341,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         _CUDA,
         "Wan causal VAE main + DupUp3D(src).",
     ),
+    (
+        "diffusion.flux2_token_cat_nvfp4",
+        KernelBackend.JIT,
+        "layout.flux2_token_cat_nvfp4_jit:try_flux2_token_cat_nvfp4",
+        _CUDA,
+        "FLUX.2 single-block token concatenation + NVFP4 quantization.",
+    ),
 )
 
 for _op, _backend, _target, _caps, _description in _SPECS:
@@ -354,6 +369,9 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 _EXPORTS: dict[str, str] = {
     "load_extension_with_recovery": "ext.loader",
     # Normalization: RMSNorm / LayerNorm / GroupNorm and their fused epilogues
+    "can_defer_flux2_gated_residual": "norm.flux2_gated_resnorm_jit",
+    "can_use_flux2_gated_resnorm": "norm.flux2_gated_resnorm_jit",
+    "flux2_gated_resnorm_raw": "norm.flux2_gated_resnorm_jit",
     "FLYDSL_NORM_MIN_ALIGNED_DIM": "norm.fused_residual_norm_flydsl",
     "flydsl_fused_residual_norm_scale_shift": "norm.fused_residual_norm_flydsl",
     "flydsl_norm_scale_shift": "norm.fused_residual_norm_flydsl",
@@ -382,6 +400,10 @@ _EXPORTS: dict[str, str] = {
     "fused_scale_residual_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",
     "fused_norm_scale_shift": "norm.scale_residual_norm_cutedsl",
     "fused_scale_residual_norm_scale_shift": "norm.scale_residual_norm_cutedsl",
+    "fused_norm_scale_shift_fp8": "norm.norm_scale_shift_jit",
+    "fused_scale_residual_norm_scale_shift_fp8": "norm.norm_scale_shift_jit",
+    "try_fused_norm_scale_shift_fp8": "norm.norm_scale_shift_jit",
+    "try_fused_scale_residual_norm_scale_shift_fp8": "norm.norm_scale_shift_jit",
     "validate_scale_shift": "norm.scale_residual_norm_cutedsl",
     "can_use_wan_rmsnorm_silu": "norm.wan_rmsnorm_silu_triton",
     "wan_rmsnorm_silu": "norm.wan_rmsnorm_silu_triton",
@@ -415,6 +437,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
     "fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
     "fused_qknorm_rope_pack_kv": "rope.qknorm_rope_jit",
+    "try_fused_qwen_qkv_epilogue": "rope.qwen_qkv_epilogue_jit",
     "can_use_fused_rope_rotate_half": "rope.rope_rotate_half_bitexact",
     "fused_rope_rotate_half_bitexact": "rope.rope_rotate_half_bitexact",
     "can_use_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
@@ -449,6 +472,7 @@ _EXPORTS: dict[str, str] = {
     "fused_scatter_to_padded": "layout.varlen_pack_pad_triton",
     "cat_pad_channels_last_3d": "layout.wan_causal_cache_triton",
     "dup_up3d_add": "layout.wan_causal_cache_triton",
+    "try_flux2_token_cat_nvfp4": "layout.flux2_token_cat_nvfp4_jit",
     # Fusion-site policy: quality gate, first-sight verification, mount
     "BitExactFusionGate": "sites.bitexact_gate",
     "flashinfer_rmsnorm_diagnostic_hint": "sites.bitexact_gate",

@@ -89,6 +89,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
@@ -856,6 +857,18 @@ class ModelRunner:
             return
         self.pre_model_load_memory += preloaded_weights_bytes / (1 << 30)
 
+    def init_kv_index_translator(self):
+        """The one object that converts KV ids for this runner: attention
+        backends build their read indices from the table it hands them instead
+        of probing the pool's id spaces themselves."""
+        self.kv_index_translator = KVIndexTranslator(
+            req_to_token=self.req_to_token_pool.req_to_token,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            token_to_kv_pool=self.token_to_kv_pool,
+            page_size=self.page_size or 1,
+            device=self.device,
+        )
+
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
@@ -882,6 +895,8 @@ class ModelRunner:
     def _init_post_memory_pool_components(self):
         """Post-pool component wiring, split out of alloc_memory_pool so forks
         that build bespoke memory pools can reuse it after allocating them."""
+        self.init_kv_index_translator()
+
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
@@ -1130,13 +1145,8 @@ class ModelRunner:
             weight_cache_socket=get_model().weight_cache_socket,
         )
 
-        # If the weight cache is enabled, override the load format to IPC_CACHE
-        # and derive the per-rank daemon socket. Idempotent across reloads.
         maybe_enable_ipc_weight_cache(
             load_config=self.load_config,
-            tp_size=self.ps.tp_size,
-            pp_rank=self.ps.pp_rank,
-            tp_rank=self.ps.tp_rank,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
