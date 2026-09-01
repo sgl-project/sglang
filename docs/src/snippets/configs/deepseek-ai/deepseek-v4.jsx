@@ -50,11 +50,13 @@ export const config = {
     "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|nvfp4": "nvidia/DeepSeek-V4-Flash-NVFP4",
     "flash-official|fp4": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "flash-official|nvfp4": "nvidia/DeepSeek-V4-Flash-0731-NVFP4",
     "flash-vision|fp4": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
     "pro|fp4":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|fp8":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|nvfp4": "nvidia/DeepSeek-V4-Pro-NVFP4",
     "pro-official|fp4": "deepseek-ai/DeepSeek-V4-Pro-0813",
+    "pro-official|nvfp4": "nvidia/DeepSeek-V4-Pro-0813-NVFP4",
     // H200 FP8 needs the sgl-project repackaging (Hopper can't run FP4-mixed Instruct).
     "h200|flash|fp8": "sgl-project/DeepSeek-V4-Flash-FP8",
     "h200|pro|fp8":   "sgl-project/DeepSeek-V4-Pro-FP8",
@@ -190,6 +192,13 @@ sgl-eval run mmmu_pro \\
     // (sgl-project/sglang#37253) — until it does, the variant needs this
     // preview build on every hardware.
     "flash-vision|fp4": "lmsysorg/sglang:dev-dsv4-flash-vision",
+    // NVFP4 checkpoints crash at weight load on v0.5.18 (the MXFP4-packed MTP
+    // layer's FP8 delegate needs the #36275 guard, merged 2026-08-26) — route
+    // every NVFP4 cell to the nightly until a release contains that fix.
+    "b200|nvfp4":  "lmsysorg/sglang:dev",
+    "b300|nvfp4":  "lmsysorg/sglang:dev",
+    "gb200|nvfp4": "lmsysorg/sglang:dev",
+    "gb300|nvfp4": "lmsysorg/sglang:dev",
     h100:  "lmsysorg/sglang:latest",
     h200:  "lmsysorg/sglang:latest",
     b200:  "lmsysorg/sglang:latest",
@@ -313,8 +322,6 @@ sgl-eval run mmmu_pro \\
           flags: ["--speculative-algorithm DSPARK"],
           hide: { variant: ["flash", "pro"] },
           disable: [
-            { when: { variant: ["flash-vision"] },
-              reason: "The Flash Vision checkpoint bundles a DSpark head, but speculative decoding is not yet verified with image inputs — the cookbook recipes run target-only for now." },
             { when: { dpAttnOn: [true] },
               reason: "DSpark is not compatible with DP Attention on the current release." },
             { when: { hw: ["mi300x", "mi355x"] },
@@ -852,6 +859,46 @@ sgl-eval run mmmu_pro \\
       ],
     },
     // ====================================================================
+    // B200 + NVFP4 — Official (0731 / 0813)
+    // Mirrors the Flash/Pro NVFP4 cells; the official checkpoints bundle a
+    // DSpark draft head, so low-latency uses `--speculative-algorithm DSPARK`
+    // instead of the EAGLE shape flags. Verified on 8xB200 (GSM8K + AIME25,
+    // sgl-eval; see the benchmarks entries).
+    // ====================================================================
+    {
+      match: { hw: "b200", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
     // B300 + NVFP4
     // ====================================================================
     {
@@ -886,6 +933,46 @@ sgl-eval run mmmu_pro \\
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
+        "--chunked-prefill-size 8192",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // B300 + NVFP4 — Official (0731 / 0813)
+    // Mirrors the Flash/Pro NVFP4 cells; the official checkpoints bundle a
+    // DSpark draft head, so low-latency uses `--speculative-algorithm DSPARK`
+    // instead of the EAGLE shape flags. NOT yet run end-to-end on this hardware.
+    // ====================================================================
+    {
+      match: { hw: "b300", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verificationStatus: "in-progress",
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verificationStatus: "in-progress",
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
         "--chunked-prefill-size 8192",
         "--disable-flashinfer-autotune",
         "--swa-full-tokens-ratio 0.1",
@@ -1112,6 +1199,46 @@ sgl-eval run mmmu_pro \\
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
+        "--chunked-prefill-size 8192",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // GB200 + NVFP4 — Official (0731 / 0813)
+    // Mirrors the Flash/Pro NVFP4 cells; the official checkpoints bundle a
+    // DSpark draft head, so low-latency uses `--speculative-algorithm DSPARK`
+    // instead of the EAGLE shape flags. NOT yet run end-to-end on this hardware.
+    // ====================================================================
+    {
+      match: { hw: "gb200", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verificationStatus: "in-progress",
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb200", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
+      verificationStatus: "in-progress",
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
         "--chunked-prefill-size 8192",
         "--disable-flashinfer-autotune",
         "--swa-full-tokens-ratio 0.1",
@@ -1724,7 +1851,7 @@ sgl-eval run mmmu_pro \\
     },
 
     // ====================================================================
-    // GB200 + NVFP4
+    // GB300 + NVFP4
     // ====================================================================
     {
       match: { hw: "gb300", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
@@ -1758,6 +1885,46 @@ sgl-eval run mmmu_pro \\
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
+        "--chunked-prefill-size 8192",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // GB300 + NVFP4 — Official (0731 / 0813)
+    // Mirrors the Flash/Pro NVFP4 cells; the official checkpoints bundle a
+    // DSpark draft head, so low-latency uses `--speculative-algorithm DSPARK`
+    // instead of the EAGLE shape flags. NOT yet run end-to-end on this hardware.
+    // ====================================================================
+    {
+      match: { hw: "gb300", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verificationStatus: "in-progress",
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verificationStatus: "in-progress",
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
         "--chunked-prefill-size 8192",
         "--disable-flashinfer-autotune",
         "--swa-full-tokens-ratio 0.1",
@@ -1906,13 +2073,17 @@ sgl-eval run mmmu_pro \\
 
     {
       match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: true,
+      // W4A8 (MXFP4 weights x FP8 activations, FlashInfer Humming kernels);
+      // requires FlashInfer >= 0.6.18. Falls back: drop the precision flag
+      // for the W4A16 path, or use --moe-runner-backend marlin.
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--moe-runner-backend marlin",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--flashinfer-mxfp4-moe-precision fp8",
         "--speculative-algorithm DSPARK",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -1920,13 +2091,15 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: true,
+      // W4A8 Humming path -- see the flash-official cell above.
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--moe-runner-backend marlin",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--flashinfer-mxfp4-moe-precision fp8",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1995,13 +2168,15 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: true,
+      // W4A8 Humming path -- see the flash-official cell above.
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--moe-runner-backend flashinfer_mxfp4",
+        "--flashinfer-mxfp4-moe-precision fp8",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2849,11 +3024,12 @@ sgl-eval run mmmu_pro \\
     //
     // DeepSeek-V4-Flash-Vision-Exp (sgl-project/sglang#37253): the 0731
     // Flash base plus a vision encoder + aligner. The checkpoint bundles a
-    // DSpark head, but speculative decoding is not yet verified with image
-    // batches, so every recipe runs target-only. Low-latency is the serving
-    // shape the MMMU-Pro round ran on (4×B200); balanced / high-throughput
-    // mirror the Flash Official recipes on the same 4-GPU topology — final
-    // verification in progress.
+    // DSpark head; low-latency recipes enable it (--speculative-algorithm
+    // DSPARK, no other spec flags — the draft ships in the main checkpoint),
+    // verified on B200 via the MMMU-Pro round (4×B200, image batches).
+    // Balanced / high-throughput stay target-only: those recipes run DP
+    // attention, which DSpark is incompatible with on the current release.
+    // Non-B200 hardware — final verification in progress.
     // ====================================================================
     {
       match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
@@ -2863,6 +3039,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
+        "--speculative-algorithm DSPARK",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -2870,8 +3047,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
@@ -2888,8 +3064,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -2918,6 +3093,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
+        "--speculative-algorithm DSPARK",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -2969,6 +3145,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
+        "--speculative-algorithm DSPARK",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -3020,6 +3197,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
+        "--speculative-algorithm DSPARK",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -3076,6 +3254,7 @@ sgl-eval run mmmu_pro \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--moe-runner-backend marlin",
+        "--speculative-algorithm DSPARK",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",

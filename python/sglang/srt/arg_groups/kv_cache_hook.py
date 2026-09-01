@@ -253,12 +253,8 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "full-attention slots are VIRTUAL — the host-offload path does not "
         "translate them to physical."
     )
-    assert cfg.dcp_size == 1, (
-        "--enable-unified-memory is not yet compatible with decode context "
-        "parallelism (--dcp-size > 1): the pool has no DCP-aware masked write "
-        "path (UnifiedMHATokenToKVPool.set_kv_buffer asserts dcp_kv_mask is None), "
-        "so a DCP run would boot and then fail on the first KV write."
-    )
+    if cfg.dcp_size > 1:
+        _validate_unified_memory_dcp(server_args)
     # Only monolithic decode cuda-graph capture is wired; piecewise prefill
     # capture is not. Guard when the user opts into it.
     _cg_cfg = cfg.cuda_graph_config
@@ -278,6 +274,53 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "capture (not wired for the unified pool's loc rebind); "
             "decode capture is unaffected."
         )
+
+
+def _validate_unified_memory_dcp(server_args: Any) -> None:
+    """Gate --enable-unified-memory + --dcp-size > 1 to the audited path.
+
+    Under DCP the unified allocator hands out a WIDENED virtual id space
+    (dcp_size logical ids per stored row) and every read index reaches
+    `translate_kv_loc*` already collapsed by a DCP index kernel. Only the
+    pieces below have been converted to that two-stage contract.
+    """
+    assert use_mla_backend(server_args), (
+        "--enable-unified-memory with decode context parallelism "
+        "(--dcp-size > 1) supports MLA models only (e.g. kimi-linear): the "
+        "MHA unified pool has no DCP-aware masked write path "
+        "(UnifiedMHATokenToKVPool.set_kv_buffer asserts dcp_kv_mask is None)."
+    )
+    assert not model_config_of(server_args).is_hybrid_swa, (
+        "--enable-unified-memory with decode context parallelism "
+        "(--dcp-size > 1) does not support hybrid sliding-window models: "
+        "UnifiedSWATokenToKVPoolAllocator does not widen its virtual id "
+        "space, and the full->swa mapping is not DCP-sharded."
+    )
+    cfg = resolving_view(server_args)
+    assert cfg.disaggregation_mode == "null", (
+        "--enable-unified-memory with decode context parallelism "
+        "(--dcp-size > 1) does not support PD disaggregation: the transfer "
+        "ships whole page envelopes, which under DCP hold only this rank's "
+        "shard of each widened page. Rejected here rather than at the first KV "
+        "transfer, where translate_kv_indices_for_transfer would abort a "
+        "server that had already booted."
+    )
+    # trtllm_mla (and its cutedsl_mla / tokenspeed_mla subclasses) build the
+    # MLA block table straight from req_to_token with
+    # create_flashmla_kv_indices_triton, whose v2p gather assumes UNWIDENED
+    # page ids; the DCP variant (create_mla_kv_page_table_for_dcp) has no v2p
+    # gather at all. Wire one of them through the other to add those here.
+    dcp_allowed = {"flashinfer"}
+    backends = set(attention_backends_of(resolved_view(server_args)))
+    backends.discard(None)
+    assert backends <= dcp_allowed, (
+        "--enable-unified-memory with decode context parallelism "
+        f"(--dcp-size > 1) requires {sorted(dcp_allowed)} for the "
+        f"full-attention layers; got {sorted(backends)}. The other paged MLA "
+        "backends build their block table from raw (widened) req_to_token "
+        "page ids and do not translate them through the unified pool's "
+        "virtual->physical page table."
+    )
 
 
 def handle_page_major_kv_layout(server_args: Any):
