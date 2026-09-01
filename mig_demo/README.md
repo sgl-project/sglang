@@ -180,6 +180,97 @@ Notes: the EAGLE3 draft's acceptance is modest on this prompt family
 SM contention. Both servers stayed healthy with byte-coherent outputs;
 KV splits land where the fraction formula predicts.
 
+## Case 5 — Qwen3.8-27B + DSPARK speculative decoding (`spec_dspark.sh`)
+
+`Qwen/Qwen3.8-27B` (27.8B BF16, ~56 GB) with `RadixArk/Qwen3.8-27B-DSpark`
+(1.9B draft) via `--speculative-algorithm DSPARK
+--speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark`. The DSpark
+draft runs **in-process** (`DSparkWorkerV2`, num_steps forced to 1, block
+size auto-read from the checkpoint). A split topology with the draft in its
+own engine process does not exist in sglang: the `--decoupled-spec-*`
+flags + ZMQ schema (`speculative/decoupled_spec_io.py`) are parse-only
+scaffolding with no runtime consumer as of 0.5.18.
+
+Spec-dec effect (27B alone on the whole H200, spec on vs off):
+
+| | c=1 | c=8 |
+|---|---:|---:|
+| DSPARK on (accept len 2.0-2.4) | 107.6 tok/s | 620.5 tok/s |
+| spec off | 68.7 tok/s | 497.6 tok/s |
+| delta | **+56.6%** | **+24.7%** |
+
+Co-located with a Qwen3-0.6B tenant (fractions 0.65 / 0.73, both c=8
+concurrently): 27B+DSPARK held 651.9 tok/s (~= alone, KV 239,698 tokens)
+while the 0.6B served 2,637 tok/s (KV 276,620 tokens).
+
+Notes: the draft checkpoint was trained against the NVFP4 target
+(`RadixArk/Qwen3.8-27B-NVFP4`); we pair it with the BF16 target instead
+(H200 is SM90, no HW fp4) — acceptance is unaffected in practice
+(accept len ~2). DSPARK pays at both c=1 and c=8, unlike the EAGLE3 chain
+in Case 4, because one DSpark step proposes a whole block (gamma ~7) at
+accept len ~2 vs EAGLE3's 3 serial steps at accept len ~1.3.
+
+## Case 6 — PD-disaggregated Qwen3.8-27B + DSPARK decode on one GPU (`pd_disagg_dspark.sh`)
+
+The two "nodes" are a prefill engine and a decode engine, three processes
+total co-located on the single H200; KV moves over `mooncake_tcp` through
+the loopback interface:
+
+```
+client -> mini_lb :8000 -> prefill :30000 (0.40 x 141 GB) --KV/mamba state--> decode :30001 (0.90 x 141 GB, DSPARK in-process)
+                            bootstrap registry :8998
+```
+
+Spec-dec effect through the PD pair (decode with vs without DSPARK flags,
+`--max-running-requests 6` on both):
+
+| | c=1 | c=6 |
+|---|---:|---:|
+| decode + DSPARK (accept len 1.9-2.0) | 99.8 tok/s | 411.3 tok/s |
+| decode no-spec | 67.2 tok/s | 333.3 tok/s |
+| delta | **+48.5%** | **+23.4%** |
+
+vs Case 5 in-process at c=1 (107.6 tok/s): the PD split costs ~7% single-
+stream latency (extra transfer + no radix on decode) while keeping the
+same DSpark acceptance.
+
+Making it fit (all discovered by tracing `mem_cache/kv_cache_configurator.py`,
+not trial and error). Qwen3.8-27B is a **hybrid** model: 48 linear-attention
+(GDN) layers with per-request persistent state slots of 150.5 MB (fp32 SSM)
+plus 16 full-attention layers at 64.3 KB KV/token, and it is a VL model.
+Four knobs were required:
+
+1. `SGLANG_VLM_CACHE_SIZE_MB=0` — VL models reserve a multimodal cache out
+   of the post-sizing rest memory even for text-only serving; zero it.
+2. `--mamba-ssm-dtype bfloat16` on BOTH engines — halves the persistent GDN
+   slot to ~73 MB and both sides must agree since GDN state is transferred
+   prefill->decode. Caveat: SSM recurrence state in bf16 is an
+   accuracy-affecting knob (fine for a throughput demo; validate outputs
+   before using in production).
+3. `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1` — drops the mamba pool ratio from
+   5 to 4 slots/request, shrinking the persistent pool.
+4. Pinned pools: `--max-running-requests 6 --max-mamba-cache-size 24`
+   (spec-dec otherwise force-resets `max_running_requests` to 48 and the
+   auto-fit solver then sizes pools you cannot afford).
+
+The binding constraint on the decode engine is the spec-verify scratch:
+`intermediate_ssm_state_cache = (mrr+1) x D x ~195 MB` — D=8 draft tokens
+and the intermediate stays **fp32** regardless of `--mamba-ssm-dtype` (the
+configurator's accounting charges it at the bf16 rate, so the real
+consumption is ~2x what the solver budgets — `--mem-fraction-static 0.90`
+leaves slack for this plus CUDA-graph workspace; 0.95+ OOMs). Final
+layout: prefill 43,607 KV tokens + 24 mamba slots; decode 139,208 KV
+tokens (309,423 in the no-spec phase) + 24 slots + 10.6 GB verify scratch.
+
+Operational gotcha: engines take ~10 s to release the bootstrap port
+after SIGTERM; a relaunch that races teardown kills the new prefill's
+bootstrap server with `Errno 98 address already in use` (it does not
+retry) and every request then hangs in the LB. The script's `kill_all`
+waits for actual process exit before relaunching. PD rules that still
+apply: distinct `--nccl-port` per engine, spec flags on the decode engine
+only, client talks to the LB only, and never combine
+`--disaggregation-decode-enable-radix-cache` with spec (hard error).
+
 ## Files
 
 - `launch_emulated_tp2.sh` — canonical TP=2 emulated launch + health wait
@@ -187,6 +278,9 @@ KV splits land where the fraction formula predicts.
 - `dp_like.sh` — Case 3 runner
 - `bench_single.sh` — single-instance baseline at the same loads (c=1/8/16/32)
 - `spec_coloc.sh` — Case 4: spec-dec (Qwen3-8B+EAGLE3) co-located with Qwen3-32B
+- `spec_dspark.sh` — Case 5: Qwen3.8-27B + DSPARK draft, alone then co-located
+- `pd_disagg_dspark.sh` — Case 6: PD-disaggregated pair (mooncake_tcp +
+  mini_lb) with DSPARK on the decode engine, then a no-spec control
 - `profile_dp.sh` — Case 3 torch-profiler capture (`/start_profile` on both
   instances under concurrent load; traces in `traces/`, open in Perfetto)
 - `traces/dp-instance-{A,B}.trace.json.gz` — Chrome traces of both instances
