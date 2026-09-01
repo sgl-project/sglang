@@ -102,16 +102,33 @@ Greedy output again byte-identical to baseline.
 No collectives at all: two `launch_server` processes, `--mem-fraction-static`
 caps emulating MIG-style memory partitioning, benched concurrently.
 
-| case | KV tokens | throughput (concurrency 1) | throughput (concurrency 16 x 32 req) |
-|---|---:|---:|---:|
-| instance A (:30000), `--mem-fraction-static 0.42` | 517,529 | 319.7 tok/s | 4,945.9 tok/s |
-| instance B (:30001), `--mem-fraction-static 0.84` | 540,798 | 325.2 tok/s | 4,973.8 tok/s |
-| **aggregate on one H200** | ~1.06M | ~645 tok/s | **~9,920 tok/s** |
+| case | KV tokens | c=1 per engine | c=8 per engine | c=16 per engine |
+|---|---:|---:|---:|---:|
+| instance A (:30000), `--mem-fraction-static 0.42` | 517,529 | 319.7 | 4,732.6 | 4,945.9 |
+| instance B (:30001), `--mem-fraction-static 0.84` | 540,798 | 325.2 | 4,687.0 | 4,973.8 |
+| **aggregate** | **1,058,327** | **645.0** | **9,419.6** | **9,919.7** |
 
-The aggregate beats the 576 tok/s single-server baseline at concurrency 1,
-and batched decode makes both engines fly under load. (All 32 requests share
-one prompt, so RadixCache prefix caching amortizes prefill; the number is a
-decode-throughput measurement.)
+### vs a single instance on the whole GPU (`bench_single.sh`)
+
+Equal-total-concurrency comparison, tok/s:
+
+| total concurrency | single instance | DP-like aggregate | winner |
+|---:|---:|---:|---|
+| 2 (1/engine) | 582.7 | 645.0 | DP +10.7% |
+| 16 (8/engine) | 8,955.3 | 9,419.6 | DP +5.2% |
+| 32 (16/engine) | **15,499.2** | 9,919.7 | **single +56%** |
+| KV capacity | 1,164,732 | 1,058,327 | single +9% |
+
+Verdict: co-location wins only at low concurrency (two schedulers overlap
+CPU-side overheads). At high load a single engine batches all 32 requests
+into one efficient decode step while the two co-located engines run two
+batch-16 decodes on contending SMs — single instance wins by 56% and also
+holds 9% more KV. The real value of the DP-like shape is isolation
+(separate KV pools, independent restart/failure domains, per-tenant QoS),
+not peak throughput.
+
+(All requests share one prompt, so RadixCache prefix caching amortizes
+prefill; these are decode-throughput measurements.)
 
 Mem-fraction pitfall: the second server computes its minimum viable fraction
 *after* the first server's pool exists, so it must be strictly greater than
@@ -140,6 +157,7 @@ emulate them coarsely.
 - `launch_emulated_tp2.sh` — canonical TP=2 emulated launch + health wait
 - `run_case.sh` — parameterized case runner (`PP=2 ./run_case.sh ...` for PP)
 - `dp_like.sh` — Case 3 runner
+- `bench_single.sh` — single-instance baseline at the same loads (c=1/8/16/32)
 - `profile_dp.sh` — Case 3 torch-profiler capture (`/start_profile` on both
   instances under concurrent load; traces in `traces/`, open in Perfetto)
 - `traces/dp-instance-{A,B}.trace.json.gz` — Chrome traces of both instances
