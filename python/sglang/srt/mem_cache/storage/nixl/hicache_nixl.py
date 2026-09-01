@@ -503,9 +503,7 @@ class HiCacheNixl(HiCacheStorage):
                     host_pool_name,
                 )
         if is_zero_copy and is_doca_memos:
-            is_zero_copy = all(
-                tensor_uses_hugepage(buf) for buf in buffers
-            )
+            is_zero_copy = all(tensor_uses_hugepage(buf) for buf in buffers)
             if not is_zero_copy:
                 logger.warning(
                     "HiCacheNixl: DOCA_MEMOS zero-copy pool %s is not "

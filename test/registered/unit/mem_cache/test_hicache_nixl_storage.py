@@ -1228,18 +1228,20 @@ class TestDocaMemosNixl(unittest.TestCase):
             plugin="DOCA_MEMOS",
             nixlconfig=NixlBackendConfig({}),
         )
-        with envs.SGLANG_HUGEPAGE_MODE.override(
-            "prefer"
-        ), envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+        ):
             self.assertFalse(selector.create_backend(agent))
 
         selector = NixlBackendSelection(
             plugin="DOCA_MEMOS",
             nixlconfig=NixlBackendConfig({}),
         )
-        with envs.SGLANG_HUGEPAGE_MODE.override(
-            "required"
-        ), envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("required"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+        ):
             selector.create_backend(agent)
         agent.create_backend.assert_called_once_with(
             "DOCA_MEMOS", {"query_mem_mode": "actual"}
