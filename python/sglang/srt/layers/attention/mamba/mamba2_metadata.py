@@ -62,6 +62,13 @@ class ForwardMetadata:
     is_target_verify: bool = False
     draft_token_num: int = 1
 
+    # KDA fused-accept: the [N, T] slot-indexed scratch rows and the per-request
+    # accept length that seed the verify kernel. Every KDA layer of a forward
+    # sees the same slots and draft window, so these are built once and shared:
+    # a cuda-graph capture then holds one build instead of one per layer.
+    fused_accept_state_indices: Optional[torch.Tensor] = None
+    fused_accept_num_accepted: Optional[torch.Tensor] = None
+
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None
     conv_states_mask_indices: Optional[torch.Tensor] = None
@@ -240,7 +247,7 @@ class Mamba2Metadata(ForwardMetadata):
         batch_size = getattr(forward_batch, "_original_batch_size", None)
         if batch_size is None:
             batch_size = len(forward_batch.seq_lens)
-        num_decodes = batch_size - num_prefills
+        num_decodes = max(0, batch_size - num_prefills)
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
         has_initial_states = context_lens_tensor > 0
@@ -275,6 +282,16 @@ class Mamba2Metadata(ForwardMetadata):
             if forward_batch.spec_info is not None
             else 1
         )
+        # Resolve the tracked-row selection once per forward
+        mamba_track_mask_indices = None
+        conv_states_mask_indices = None
+        if forward_metadata.has_mamba_track_mask:
+            mamba_track_mask_indices = forward_batch.mamba_track_mask.nonzero(
+                as_tuple=True
+            )[0]
+            conv_states_mask_indices = forward_batch.mamba_track_indices[
+                mamba_track_mask_indices
+            ]
         return Mamba2Metadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
@@ -288,6 +305,8 @@ class Mamba2Metadata(ForwardMetadata):
             track_ssm_final_src=forward_metadata.track_ssm_final_src,
             track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
+            mamba_track_mask_indices=mamba_track_mask_indices,
+            conv_states_mask_indices=conv_states_mask_indices,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,

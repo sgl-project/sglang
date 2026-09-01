@@ -12,7 +12,7 @@ from sglang.test.kits.radix_cache_server_kit import (
     gen_radix_tree,
     run_radix_attention_test,
 )
-from sglang.test.kits.spec_server_kits import SpecGrammarKit
+from sglang.test.kits.spec_server_kits import SpecGrammarKit, SpecLogprobKit
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
     DEFAULT_TARGET_MODEL_DFLASH,
@@ -32,6 +32,7 @@ class TestDFlashServerBase(
     GSM8KMixin,
     JSONConstrainedMixin,
     SpecGrammarKit,
+    SpecLogprobKit,
 ):
     max_running_requests = 64
     attention_backend = "triton" if is_hip() else "flashinfer"
@@ -132,10 +133,6 @@ class TestDFlashServerBase(
         self.assertEqual(outputs[0], outputs[1])
         assert self.process.poll() is None
 
-    @unittest.skip("DFLASH rejects return_logprob at admission")
-    def test_grammar_logprob_count_matches_completion_tokens(self):
-        pass
-
 
 class TestDFlashServerPage256(TestDFlashServerBase):
     page_size = 256
@@ -164,7 +161,7 @@ class TestDFlashServerNoCudaGraph(TestDFlashServerBase):
     other_launch_args = ["--disable-cuda-graph"]
 
 
-class TestDFlashServerSpecV2(TestDFlashServerBase):
+class TestDFlashServerOverlap(TestDFlashServerBase):
     disable_overlap = False
 
     def test_radix_attention(self):
@@ -172,7 +169,7 @@ class TestDFlashServerSpecV2(TestDFlashServerBase):
         assert self.process.poll() is None
 
 
-class TestDFlashServerSpecV2PlanStream(TestDFlashServerSpecV2):
+class TestDFlashServerOverlapPlanStream(TestDFlashServerOverlap):
     overlap_plan_stream = True
 
 

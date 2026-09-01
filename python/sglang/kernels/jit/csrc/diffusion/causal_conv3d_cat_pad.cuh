@@ -19,9 +19,9 @@
 
 #include <cstdint>
 
-namespace sglang_causal_conv3d_cat_pad {
+namespace sglang {
 
-namespace {
+namespace causal_conv3d_cat_pad {
 
 constexpr int kBlockSize = 256;
 
@@ -151,8 +151,6 @@ void launch_cat_pad_flat(
       pad_w_left);
 }
 
-}  // namespace
-
 template <typename T>
 struct CausalConv3dCatPadKernel {
   static void
@@ -250,4 +248,6 @@ struct CausalConv3dCatPadKernel {
   }
 };
 
-}  // namespace sglang_causal_conv3d_cat_pad
+}  // namespace causal_conv3d_cat_pad
+
+}  // namespace sglang

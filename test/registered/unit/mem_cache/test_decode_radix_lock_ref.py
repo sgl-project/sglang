@@ -20,10 +20,9 @@ Usage:
     python -m pytest test/registered/unit/mem_cache/test_decode_radix_lock_ref.py -v
 """
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
 from array import array
@@ -35,6 +34,7 @@ import torch
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
     InsertParams,
     MatchPrefixParams,
 )
@@ -75,14 +75,17 @@ class MockReq:
             "q", fill_ids[:-1] if len(fill_ids) > 1 else fill_ids
         )
         self.output_ids = array("q", [fill_ids[-1]] if len(fill_ids) > 1 else [])
-        self.req_pool_idx = req_pool_idx
-        self.cache_protected_len = cache_protected_len
         self.last_node = last_node
         self.extra_key = None
+        self.cache_salt = None
         self.prefix_indices = torch.empty(0, dtype=torch.int64)
         self.priority = 0
-        self.kv_committed_len = len(fill_ids)
-        self.kv = SimpleNamespace(kv_allocated_len=len(fill_ids))
+        self.kv = SimpleNamespace(
+            req_pool_idx=req_pool_idx,
+            kv_committed_len=len(fill_ids),
+            kv_allocated_len=len(fill_ids),
+            cache_protected_len=cache_protected_len,
+        )
 
     def get_fill_ids(self):
         return self.full_untruncated_fill_ids[: self.extend_range.end]
@@ -94,6 +97,71 @@ def _make_req(fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
 
 class TestDecodeLockRefScenarios(unittest.TestCase):
     """Test lock_ref balance across decode transfer scenarios."""
+
+    def test_swa_tail_len_keeps_page_aligned_matchable_window(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
+        queue.scheduler = SimpleNamespace(
+            sliding_window_size=127,
+            server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=True),
+        )
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
+
+        tail_len = queue._swa_tail_len(895)
+
+        self.assertEqual(tail_len, 191)
+        swa_start = 895 - tail_len
+        radix_key_len = (895 // 64) * 64
+        self.assertGreaterEqual(radix_key_len - swa_start, 127)
+
+    def test_swa_admission_counts_evictable_capacity(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.scheduler = MagicMock()
+        queue.scheduler.running_batch.reqs = []
+        queue.scheduler.sliding_window_size = 128
+        queue.scheduler.last_batch = None
+        queue.retracted_queue = []
+        queue._need_space_for_single_req = MagicMock(return_value=0)
+        queue._active_req_count = MagicMock(return_value=1)
+        queue.token_to_kv_pool_allocator = MagicMock()
+        queue.token_to_kv_pool_allocator.size_swa = 256
+        queue.token_to_kv_pool_allocator.swa_available_size.return_value = 0
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.swa_evictable_size.return_value = 192
+
+        budget = queue._swa_tail_allocatable_token_budget(
+            count_retracted=False,
+            reserved_tokens=64,
+        )
+
+        # 192 reclaimable tokens minus 64 reserved for active-request growth.
+        self.assertEqual(budget, 128)
+
+    def test_reclaim_swa_tail_capacity_page_rounds(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
+        queue.token_to_kv_pool_allocator.swa_available_size.side_effect = [64, 192]
+        queue.tree_cache = MagicMock()
+
+        error = queue._reclaim_swa_tail_capacity(129, "req-1")
+
+        self.assertIsNone(error)
+        params = queue.tree_cache.evict_for_alloc.call_args.args[0]
+        self.assertEqual(params.num_tokens, 0)
+        self.assertEqual(params.swa_num_tokens, 128)
+
+    def test_reclaim_swa_tail_capacity_fails_before_allocation(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
+        queue.token_to_kv_pool_allocator.swa_available_size.side_effect = [64, 128]
+        queue.tree_cache = MagicMock()
+
+        error = queue._reclaim_swa_tail_capacity(129, "req-1")
+
+        self.assertEqual(
+            error,
+            "SWA eviction insufficient: needed=192, available=128, req=req-1",
+        )
 
     def _populate_prefix(self, cache, prefix_ids, prefix_values):
         """Insert a prefix into the tree so future requests can match it."""
@@ -144,7 +212,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         cache.cache_unfinished_req(req)
 
         # Step 3: cache_finished_req with is_insert=True (dec lock)
-        cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
+        cache.cache_finished_req(req, kv_len_to_handle=req.kv.kv_committed_len)
 
         # Verify: all non-root nodes should have lock_ref == 0
         # (root always has lock_ref == 1)
@@ -193,7 +261,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         cache.cache_unfinished_req(req)
 
         # Step 3: cache_finished_req (dec leaf)
-        cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
+        cache.cache_finished_req(req, kv_len_to_handle=req.kv.kv_committed_len)
 
         # Root lock unchanged, all nodes unlocked
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
@@ -237,7 +305,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         # Transfer fails -> cache_finished_req with is_insert=False
         # This frees delta tokens and dec_lock_ref on last_node
         cache.cache_finished_req(
-            req, is_insert=False, kv_len_to_handle=req.kv_committed_len
+            req, is_insert=False, kv_len_to_handle=req.kv.kv_committed_len
         )
 
         # The prefix node should be unlocked (back to evictable)
@@ -284,7 +352,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         # Transfer fails -> cache_finished_req with is_insert=False
         # dec_lock_ref(root) is a no-op
         cache.cache_finished_req(
-            req, is_insert=False, kv_len_to_handle=req.kv_committed_len
+            req, is_insert=False, kv_len_to_handle=req.kv.kv_committed_len
         )
 
         # Root lock unchanged, nothing protected or evictable
@@ -302,7 +370,10 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.output_ids = [99]
         req.last_node = object()
         req.finished_reason = None
-        req.cache_protected_len = 0
+        req.kv.cache_protected_len = 0
+        req.swa_uuid_for_lock = 123
+        req.swa_prefix_lock_released = False
+        req.pd_rebootstrap_in_progress = False
         req.sampling_params.max_new_tokens = 16
 
         decode_req = MagicMock()
@@ -319,6 +390,10 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue.num_reserved_decode_tokens = 0
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
+        queue._swa_tail_len = MagicMock(return_value=8)
+        queue._swa_aware_allocatable_token_budgets = MagicMock(return_value=(8, 8))
+        queue._swa_tail_allocatable_token_budget = MagicMock(return_value=8)
         queue._match_prefix_and_lock = MagicMock(
             return_value=DecodePrefixMatch(
                 prefix_indices=torch.arange(4, dtype=torch.int64),
@@ -349,21 +424,32 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         scheduler.running_batch = running_batch
         scheduler.server_args = server_args
         scheduler.enable_hisparse = False
+        scheduler.enable_decode_hicache = False
+        scheduler.enable_priority_scheduling = False
         scheduler.waiting_queue = []
         scheduler.last_batch = None
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
-        # Initial budget says the request fits; post-lock budget says it does not.
-        queue._allocatable_token_budgets = MagicMock(side_effect=[8, 3])
+        # The 4-token match is locked, then capped to zero because the whole
+        # 8-token request is inside the SWA window. Admission rejection must
+        # still release the original matched-node lock.
+        queue._allocatable_token_budgets = MagicMock(return_value=3)
 
         preallocated, failed = queue.pop_preallocated()
 
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
         queue._pre_alloc.assert_not_called()
-        queue.tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
-        self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
+        queue.tree_cache.dec_swa_lock_only.assert_called_once_with(req.last_node, 123)
+        queue.tree_cache.dec_lock_ref.assert_called_once_with(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=123),
+            skip_swa=True,
+        )
+        self.assertFalse(req.swa_prefix_lock_released)
+        queue._swa_tail_len.assert_called_once_with(8)
+        queue._allocatable_token_budgets.assert_called_once()
 
     def test_repeated_incremental_no_leak(self):
         """Multiple incremental transfers shouldn't leak lock_refs."""
@@ -397,7 +483,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             )
 
             cache.cache_unfinished_req(req)
-            cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
+            cache.cache_finished_req(req, kv_len_to_handle=req.kv.kv_committed_len)
 
         # After all iterations, root lock should be 1, no protected nodes
         self.assertEqual(cache.root_node.lock_ref, 1)

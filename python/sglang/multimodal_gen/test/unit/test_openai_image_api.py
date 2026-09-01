@@ -1,13 +1,31 @@
 import os
+from dataclasses import fields
 
 from fastapi import HTTPException
+from PIL import Image
 
+from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
+from sglang.multimodal_gen.configs.sample.ernie_image import (
+    ErnieImageSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
+from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParams
+from sglang.multimodal_gen.configs.sample.longcat_image import (
+    LongCatImageSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _build_image_response_kwargs,
     _fallback_image_urls,
+    _get_response_resize,
+    _image_request_model_kwargs,
     _raise_if_image_variant_not_found,
+    _runtime_sampling_quality,
     _select_image_variant_cloud_url,
     _select_image_variant_path,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    ImageGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
@@ -34,6 +52,137 @@ def test_url_response_returns_one_item_per_output_path():
         os.path.abspath("first.png"),
         os.path.abspath("second.png"),
     ]
+
+
+def test_runtime_sampling_quality_preserves_the_openai_default():
+    assert _runtime_sampling_quality(None) is None
+    assert _runtime_sampling_quality("auto") is None
+    assert _runtime_sampling_quality("lossless") == "lossless"
+    assert _runtime_sampling_quality("high") == "high"
+
+
+def test_longcat_image_fields_remain_model_specific():
+    field_values = {
+        "enable_cfg_renorm": False,
+        "cfg_renorm_min": 0.25,
+        "enable_prompt_rewrite": False,
+    }
+    request = ImageGenerationsRequest(prompt="a lantern", **field_values)
+    base_fields = {field.name for field in fields(SamplingParams)}
+    longcat_fields = {field.name for field in fields(LongCatImageSamplingParams)}
+
+    for field_name, value in field_values.items():
+        assert field_name not in ImageGenerationsRequest.model_fields
+        assert field_name not in base_fields
+        assert field_name in longcat_fields
+        assert getattr(request, field_name) == value
+
+    assert _image_request_model_kwargs(request, LongCatImageSamplingParams) == (
+        field_values
+    )
+    assert _image_request_model_kwargs(request, SamplingParams) == {}
+
+
+def test_longcat_image_fields_accept_nested_extra_body():
+    request = ImageGenerationsRequest(
+        prompt="a lantern",
+        enable_prompt_rewrite=True,
+        extra_body={
+            "enable_prompt_rewrite": False,
+            "enable_cfg_renorm": False,
+            "cfg_renorm_min": 0.5,
+        },
+    )
+
+    assert _image_request_model_kwargs(request, LongCatImageSamplingParams) == {
+        "enable_prompt_rewrite": True,
+        "enable_cfg_renorm": False,
+        "cfg_renorm_min": 0.5,
+    }
+
+
+def test_other_image_extensions_remain_model_specific():
+    cases = (
+        (Cosmos3SamplingParams, "guidance_interval", [400.0, 1000.0]),
+        (Cosmos3SamplingParams, "use_guardrails", False),
+        (ErnieImageSamplingParams, "use_pe", False),
+        (Ideogram4SamplingParams, "preset", "V4_TURBO_12"),
+    )
+    base_fields = {field.name for field in fields(SamplingParams)}
+
+    for sampling_params_cls, field_name, value in cases:
+        request = ImageGenerationsRequest(
+            prompt="a lantern",
+            extra_body={field_name: value},
+        )
+        model_fields = {field.name for field in fields(sampling_params_cls)}
+
+        assert field_name not in ImageGenerationsRequest.model_fields
+        assert field_name not in base_fields
+        assert field_name in model_fields
+        assert _image_request_model_kwargs(request, sampling_params_cls) == {
+            field_name: value
+        }
+        assert _image_request_model_kwargs(request, SamplingParams) == {}
+
+
+def test_cosmos_image_guardrails_alias_is_preserved():
+    request = ImageGenerationsRequest(
+        prompt="a lantern",
+        extra_body={"guardrails": False},
+    )
+
+    assert _image_request_model_kwargs(request, Cosmos3SamplingParams) == {
+        "use_guardrails": False
+    }
+
+
+def test_image_response_includes_resize_for_every_output():
+    response = _build_image_response_kwargs(
+        ["first.png", "second.png"],
+        "b64_json",
+        "a lantern",
+        "req-123",
+        OutputBatch(),
+        b64_list=["first", "second"],
+        resize="1280x736",
+    )
+
+    assert [item.resize for item in response["data"]] == [
+        "1280x736",
+        "1280x736",
+    ]
+
+
+def test_response_resize_is_only_populated_for_glm_image():
+    glm_sampling = GlmImageSamplingParams(width=1280, height=736)
+
+    assert _get_response_resize(glm_sampling) == "1280x736"
+    assert _get_response_resize(SamplingParams(width=1280, height=736)) is None
+
+
+def test_response_resize_prefers_requested_size_over_generation_canvas():
+    glm_sampling = GlmImageSamplingParams(width=1280, height=736)
+    glm_sampling.requested_width = 1280
+    glm_sampling.requested_height = 720
+
+    assert _get_response_resize(glm_sampling) == "1280x720"
+
+
+def test_response_resize_uses_actual_generated_image_size(tmp_path):
+    output_path = tmp_path / "output.png"
+    Image.new("RGB", (1280, 736)).save(output_path)
+    glm_sampling = GlmImageSamplingParams(image_path="input.png")
+
+    assert _get_response_resize(glm_sampling, str(output_path)) == "1280x736"
+
+
+def test_response_resize_prefers_final_output_over_sampling_canvas(tmp_path):
+    output_path = tmp_path / "upscaled.png"
+    Image.new("RGB", (2560, 1472)).save(output_path)
+    glm_sampling = GlmImageSamplingParams(width=1280, height=736)
+
+    assert _get_response_resize(glm_sampling, str(output_path)) == "2560x1472"
 
 
 def test_url_response_uses_variant_fallback_urls_for_multiple_persistent_outputs():

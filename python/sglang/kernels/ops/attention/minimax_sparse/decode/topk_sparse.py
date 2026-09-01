@@ -6,7 +6,12 @@ import torch
 import triton
 import triton.language as tl
 
-from ..common.utils import check_sparse_kv_fp8, robust_allocator
+from ..common.utils import (
+    check_sparse_kv_fp8,
+    robust_allocator,
+    sparse_out_dtype,
+    unit_scale,
+)
 
 
 @triton.heuristics(
@@ -49,6 +54,9 @@ def _gqa_share_sparse_decode_kernel(
     max_kv_len,
     # sm_scale
     sm_scale,
+    # per-tensor KV dequant scales (1.0 when the cache is unit-scaled)
+    k_scale,
+    v_scale,
     # stride
     stride_q_b,
     stride_q_h,
@@ -178,10 +186,12 @@ def _gqa_share_sparse_decode_kernel(
             other=0.0,
         )
         if IS_FP8:
-            # fp8 KV cache is unit-scaled (set_kv_buffer casts bf16->fp8 with no
-            # scale), so dequant is just a widening cast to the Q compute dtype
-            # before the tl.dot. Matches the bf16 path bit-for-bit when the cache
-            # is bf16 (IS_FP8 False -> this branch is compiled out).
+            # fp8 KV cache: with bf16/fp16 Q this widens K to the compute dtype
+            # (unit-scaled cache -> exact inverse dequant; k_scale covers
+            # calibrated caches). With fp8 Q (fp8 attn-GEMM mode) the cast is a
+            # no-op and tl.dot below runs fp8x8 on tensor cores. Matches the
+            # bf16 path bit-for-bit when the cache is bf16 (IS_FP8 False ->
+            # this branch is compiled out).
             k = k.to(q.dtype)
         # load V as (BLOCK_SIZE_N, head_dim) via indirect addressing
         v_off = (
@@ -195,15 +205,16 @@ def _gqa_share_sparse_decode_kernel(
             other=0.0,
         )
         if IS_FP8:
-            # Widen V before the P@V dot. This also makes the `p.to(v.dtype)`
-            # below cast P to the compute dtype (not to fp8, which would be
-            # catastrophic precision loss on the attention weights).
+            # Cast V to the compute dtype. With bf16/fp16 Q this widens (so the
+            # `p.to(v.dtype)` below keeps P in the compute dtype); with fp8 Q it
+            # is a no-op and P is quantized to e4m3 for the fp8 PV MMA — the
+            # same accuracy contract as fmha_sm100's fp8 kernel.
             v = v.to(q.dtype)
         # compute qk
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
         qk += tl.where(off_n[None, :] < seq_len - c, 0, float("-inf"))
         # [H, D], [D, N] -> [H, N]
-        qk += tl.dot(q, k) * sm_scale
+        qk += tl.dot(q, k) * (sm_scale * k_scale)
         # compute m_ij and l_ij
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
         p = tl.exp(qk - m_ij[:, None])
@@ -212,9 +223,8 @@ def _gqa_share_sparse_decode_kernel(
         acc_o_scale = tl.exp(m_i - m_ij)
         acc_o = acc_o * acc_o_scale[:, None]
         # load v and update acc_o
-        p = p.to(v.dtype)
         # [H, N], [N, D] -> [H, D]
-        acc_o += tl.dot(p.to(v.dtype), v)
+        acc_o += tl.dot(p.to(v.dtype), v) * v_scale
         # update statistics
         m_i = m_ij
         lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
@@ -308,9 +318,14 @@ def flash_decode_with_gqa_share_sparse(
     topk_idx: torch.Tensor,  # [num_kv_heads, batch_size, topk]
     sm_scale: Optional[float] = None,
     use_tma: bool = True,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor:
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")
+    k_scale = unit_scale(k_scale)
+    v_scale = unit_scale(v_scale)
     # shape
     batch_size, num_q_heads, head_dim = q.shape
     max_slots, num_kv_heads, _ = k_cache.shape
@@ -328,6 +343,9 @@ def flash_decode_with_gqa_share_sparse(
     # sm scale
     if sm_scale is None:
         sm_scale = head_dim**-0.5
+    # q_scale multiplies every Q-side logit (QK dot and sink), so it folds into
+    # sm_scale; k_scale must not touch the sink term and stays a kernel arg.
+    sm_scale = sm_scale * unit_scale(q_scale)
     # Pick NUM_TOPK_CHUNKS so total grid ≈ TARGET_GRID. Same constraints as
     # flash_decode_with_topk_idx: must be power of 2 (Triton arange) and must
     # only depend on shape constants (so grid is fixed within a cuda graph).
@@ -345,7 +363,7 @@ def flash_decode_with_gqa_share_sparse(
         batch_size,
         num_q_heads,
         head_dim,
-        dtype=q.dtype,
+        dtype=sparse_out_dtype(q),
         device=q.device,
     )
     lse_partial = torch.empty(
@@ -375,6 +393,8 @@ def flash_decode_with_gqa_share_sparse(
         max_topk,
         max_kv_len,
         sm_scale,
+        k_scale,
+        v_scale,
         q.stride(0),
         q.stride(1),
         q.stride(2),

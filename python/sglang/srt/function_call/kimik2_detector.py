@@ -15,6 +15,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import get_schema_properties
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,7 @@ class KimiK2Detector(BaseFormatDetector):
         best_score = -1
         for tool in tools:
             params = tool.function.parameters or {}
-            props = set(params.get("properties", {}).keys())
+            props = set(get_schema_properties(params).keys())
             if not props:
                 continue
             overlap = len(arg_keys & props)
@@ -430,12 +431,16 @@ class KimiK2Detector(BaseFormatDetector):
         tools: Union[List[Tool], None] = None,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
         thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
     ) -> Optional[StructuralTag]:
         if not (
             tools and (tool_choice == "required" or isinstance(tool_choice, ToolChoice))
         ):
             return super().get_structural_tag(
-                tools=tools, tool_choice=tool_choice, thinking_mode=thinking_mode
+                tools=tools,
+                tool_choice=tool_choice,
+                thinking_mode=thinking_mode,
+                parallel_tool_calls=parallel_tool_calls,
             )
         if get_model_structural_tag is None:
             return None

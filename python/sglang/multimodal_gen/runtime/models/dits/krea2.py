@@ -28,6 +28,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -70,9 +73,7 @@ def _fused_qknorm_rope_enabled() -> bool:
 
 
 def _can_use_fused_qknorm_rope(head_dim: int, dtype: torch.dtype) -> bool:
-    from sglang.kernels.ops.diffusion.qknorm_rope import (
-        can_use_fused_inplace_qknorm_rope,
-    )
+    from sglang.kernels.ops.diffusion import can_use_fused_inplace_qknorm_rope
 
     return can_use_fused_inplace_qknorm_rope(head_dim, head_dim, False, dtype)
 
@@ -116,9 +117,7 @@ def norm_scale_shift(
     pass ``scale + 1``), kept off the checkpoint so the identity load is unaffected.
     """
     if x.is_cuda and x.shape[-1] % 256 == 0 and x.shape[-1] <= 8192:
-        from sglang.kernels.ops.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-            fused_norm_scale_shift,
-        )
+        from sglang.kernels.ops.diffusion import fused_norm_scale_shift
 
         return fused_norm_scale_shift(
             x.contiguous(),
@@ -201,18 +200,42 @@ class RMSNorm(nn.Module):
 
 class SwiGLU(nn.Module):
     def __init__(
-        self, features: int, multiplier: int, bias: bool = False, multiple: int = 128
+        self,
+        features: int,
+        multiplier: int,
+        bias: bool = False,
+        multiple: int = 128,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         mlpdim = int(2 * features / 3) * multiplier
         mlpdim = multiple * ((mlpdim + multiple - 1) // multiple)
         # Tensor-parallel: gate/up shard the hidden dim by column, down all-reduces.
         self.gate = ColumnParallelLinear(
-            features, mlpdim, bias=bias, gather_output=False
+            features,
+            mlpdim,
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate",
         )
-        self.up = ColumnParallelLinear(features, mlpdim, bias=bias, gather_output=False)
+        self.up = ColumnParallelLinear(
+            features,
+            mlpdim,
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.up",
+        )
+
         self.down = RowParallelLinear(
-            mlpdim, features, bias=bias, input_is_parallel=True
+            mlpdim,
+            features,
+            bias=bias,
+            input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down",
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -223,7 +246,15 @@ class SwiGLU(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim: int, heads: int, kvheads: int = None, bias: bool = False):
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        kvheads: int = None,
+        bias: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.heads = heads
         self.kvheads = kvheads if kvheads is not None else heads
@@ -240,21 +271,52 @@ class Attention(nn.Module):
         self.local_kvheads = self.kvheads // tp
 
         self.to_q = ColumnParallelLinear(
-            dim, self.headdim * self.heads, bias=bias, gather_output=False
+            dim,
+            self.headdim * self.heads,
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_q",
         )
         self.to_k = ColumnParallelLinear(
-            dim, self.headdim * self.kvheads, bias=bias, gather_output=False
+            dim,
+            self.headdim * self.kvheads,
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_k",
         )
         self.to_v = ColumnParallelLinear(
-            dim, self.headdim * self.kvheads, bias=bias, gather_output=False
+            dim,
+            self.headdim * self.kvheads,
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_v",
         )
-        self.to_gate = ColumnParallelLinear(dim, dim, bias=bias, gather_output=False)
+        self.to_gate = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_gate",
+        )
         self.norm_q = RMSNorm(self.headdim)
         self.norm_k = RMSNorm(self.headdim)
         # to_out is a ModuleList ([linear]) so the param is to_out.0.weight, matching
         # the diffusers Attention layout in the released checkpoint.
         self.to_out = nn.ModuleList(
-            [RowParallelLinear(dim, dim, bias=bias, input_is_parallel=True)]
+            [
+                RowParallelLinear(
+                    dim,
+                    dim,
+                    bias=bias,
+                    input_is_parallel=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0",
+                )
+            ]
         )
         # Native GQA flash via the platform backend; parameterless.
         self.attn = USPAttention(
@@ -292,9 +354,7 @@ class Attention(nn.Module):
             and _fused_qknorm_rope_enabled()
             and _can_use_fused_qknorm_rope(hd, q.dtype)
         ):
-            from sglang.kernels.ops.diffusion.qknorm_rope import (
-                fused_inplace_qknorm_rope,
-            )
+            from sglang.kernels.ops.diffusion import fused_inplace_qknorm_rope
 
             b, s = qkv.shape[0], qkv.shape[1]
             q = q.view(b, s, self.local_heads, hd)
@@ -371,12 +431,27 @@ class TextFusionBlock(nn.Module):
         multiplier: int,
         bias: bool = False,
         kvheads: int = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.norm1 = RMSNorm(features)
         self.norm2 = RMSNorm(features)
-        self.attn = Attention(dim=features, heads=heads, bias=bias, kvheads=kvheads)
-        self.ff = SwiGLU(features, multiplier, bias)
+        self.attn = Attention(
+            dim=features,
+            heads=heads,
+            bias=bias,
+            kvheads=kvheads,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
+        )
+        self.ff = SwiGLU(
+            features,
+            multiplier,
+            bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.ff",
+        )
 
     def forward(
         self,
@@ -410,19 +485,37 @@ class TextFusionTransformer(nn.Module):
         multiplier: int,
         bias: bool = False,
         kvheads: int = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.layerwise_blocks = nn.ModuleList(
             [
-                TextFusionBlock(txt_dim, heads, multiplier, bias, kvheads)
-                for _ in range(2)
+                TextFusionBlock(
+                    txt_dim,
+                    heads,
+                    multiplier,
+                    bias,
+                    kvheads,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.layerwise_blocks.{i}",
+                )
+                for i in range(2)
             ]
         )
         self.projector = nn.Linear(num_txt_layers, 1, bias=False)
         self.refiner_blocks = nn.ModuleList(
             [
-                TextFusionBlock(txt_dim, heads, multiplier, bias, kvheads)
-                for _ in range(2)
+                TextFusionBlock(
+                    txt_dim,
+                    heads,
+                    multiplier,
+                    bias,
+                    kvheads,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.refiner_blocks.{i}",
+                )
+                for i in range(2)
             ]
         )
 
@@ -452,6 +545,8 @@ class SingleStreamBlock(nn.Module):
         multiplier: int,
         bias: bool = False,
         kvheads: int = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         # (6, features) modulation table added to the timestep projection (AdaLN-single),
@@ -459,8 +554,21 @@ class SingleStreamBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.zeros(6, features))
         self.norm1 = RMSNorm(features)
         self.norm2 = RMSNorm(features)
-        self.attn = Attention(dim=features, heads=heads, bias=bias, kvheads=kvheads)
-        self.ff = SwiGLU(features, multiplier, bias)
+        self.attn = Attention(
+            dim=features,
+            heads=heads,
+            bias=bias,
+            kvheads=kvheads,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
+        )
+        self.ff = SwiGLU(
+            features,
+            multiplier,
+            bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.ff",
+        )
 
     def forward(
         self,
@@ -519,10 +627,10 @@ class Krea2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self,
         config: Krea2DitConfig,
         hf_config: dict[str, Any],
-        quant_config: Optional[Any] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
-        ac = config.arch_config
+        ac = self.config
         self.arch_config = ac
 
         self.hidden_size = ac.features
@@ -542,9 +650,15 @@ class Krea2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.transformer_blocks = nn.ModuleList(
             [
                 SingleStreamBlock(
-                    ac.features, ac.heads, ac.multiplier, ac.bias, ac.kvheads
+                    ac.features,
+                    ac.heads,
+                    ac.multiplier,
+                    ac.bias,
+                    ac.kvheads,
+                    quant_config=quant_config,
+                    prefix=f"transformer_blocks.{i}",
                 )
-                for _ in range(ac.layers)
+                for i in range(ac.layers)
             ]
         )
         self.time_embed = TimeEmbed(ac.tdim, ac.features)
@@ -555,6 +669,8 @@ class Krea2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             ac.multiplier,
             ac.bias,
             ac.txtkvheads,
+            quant_config=quant_config,
+            prefix="text_fusion",
         )
         self.txt_in = TxtIn(ac.txtdim, ac.features)
         self.final_layer = LastLayer(ac.features, ac.patch, ac.channels)

@@ -117,6 +117,10 @@ class FlashKDAKernel(LinearAttnKernelBase):
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        # The fused kernel cannot expose per-chunk states (h), which the mamba
+        # radix extra_buffer track path needs; route tracked batches through
+        # the Triton chunk_kda fallback instead of silently skipping the
+        # snapshot (that would corrupt prefix-cache restores).
         if return_intermediate_states or self._should_fall_back(
             lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
         ):
@@ -135,18 +139,21 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 return_intermediate_states=return_intermediate_states,
             )
 
-        return self._flashkda_extend(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            lower_bound=lower_bound,
+        return (
+            self._flashkda_extend(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+            ),
+            None,
         )
 
     @staticmethod

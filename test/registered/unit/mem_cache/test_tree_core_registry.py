@@ -3,6 +3,8 @@
 import unittest
 from unittest import mock
 
+from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
+
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -65,6 +67,15 @@ class _StubFullComponent(TreeComponent):
     def _evict_device_end(self) -> None:
         pass
 
+    def _dec_session_coverage(self, session_id, leaf) -> None:
+        pass
+
+    def _advance_session_coverage(self, session_id, leaf, old_ancestor) -> None:
+        pass
+
+    def _recede_session_coverage(self, session_id, leaf, fallback) -> None:
+        pass
+
 
 class _StubMambaComponent(_StubFullComponent):
     component_type = ComponentType.MAMBA
@@ -89,6 +100,7 @@ class TreeCoreRegistryTest(CustomTestCase):
             components={ComponentType.FULL: component},
         )
         self.assertIsInstance(core, UnifiedTreeCore)
+        self.assertNotIsInstance(core, UnifiedTreeCoreInspectionInterface)
         self.assertIs(component.tree_core, core)
 
     def test_unknown_backend_raises_naming_the_known_backends(self):

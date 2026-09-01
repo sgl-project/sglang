@@ -35,6 +35,7 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, U
 
 import aiohttp
 import numpy as np
+import orjson
 import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
@@ -710,12 +711,18 @@ async def async_request_sglang_generate(
                         if not chunk_bytes:
                             continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        # Cumulative chunks make parsing O(n^2) per request on this
+                        # single asyncio thread; orjson on raw bytes is ~2.2x cheaper.
+                        sse_data = (
+                            chunk_bytes[6:]
+                            if chunk_bytes.startswith(b"data: ")
+                            else chunk_bytes
+                        )
                         latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
+                        if sse_data == b"[DONE]":
                             pass
                         else:
-                            data = json.loads(chunk)
+                            data = orjson.loads(sse_data)
 
                             _meta_info = data.get("meta_info") or {}
                             if _meta_info.get("spec_accept_length") is not None:
@@ -964,13 +971,27 @@ _BACKEND_API_PATHS = {
 
 _EMBEDDING_BACKENDS = frozenset(("sglang-embedding", "vllm-embedding"))
 
+_DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT = 60.0
 
-def flush_server_cache(base_url: str, backend: str) -> None:
+
+def flush_server_cache(
+    base_url: str,
+    backend: str,
+    flush_cache_timeout: float = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
+) -> None:
     """Flush an engine's prefix cache after benchmark warmup."""
-    cache_endpoint = (
-        "/reset_prefix_cache" if backend.startswith("vllm") else "/flush_cache"
-    )
-    response = requests.post(base_url + cache_endpoint, headers=get_auth_headers())
+    if backend.startswith("vllm"):
+        response = requests.post(
+            base_url + "/reset_prefix_cache", headers=get_auth_headers()
+        )
+    elif backend.startswith("sglang"):
+        response = requests.post(
+            base_url + "/flush_cache",
+            headers=get_auth_headers(),
+            params={"timeout": flush_cache_timeout},
+        )
+    else:
+        response = requests.post(base_url + "/flush_cache", headers=get_auth_headers())
     response.raise_for_status()
 
 
@@ -1319,7 +1340,7 @@ async def benchmark(
     base_url: str,
     model_id: str,
     tokenizer: PreTrainedTokenizerBase,
-    input_requests: List[DatasetRow],
+    input_requests: List[Union[DatasetRow, Dict[str, Any]]],
     request_rate: float,
     max_concurrency: Optional[int],
     disable_tqdm: bool,
@@ -1330,6 +1351,7 @@ async def benchmark(
     profile: bool,
     pd_separated: bool = False,
     flush_cache: bool = False,
+    flush_cache_timeout: float = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
     warmup_requests: int = 1,
     use_trace_timestamps: bool = False,
     mooncake_slowdown_factor=1.0,
@@ -1342,14 +1364,20 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
+    is_mooncake = args.dataset_name == "mooncake"
     # Multi-turn iff prompt[0] is a valid per-round payload. Single-shot
     # OpenAI messages (List[Dict]) is excluded since its first element is a dict.
-    first_prompt = input_requests[0].prompt
-    is_multi_turn = (
-        isinstance(first_prompt, list)
-        and bool(first_prompt)
-        and _normalize_round_messages(first_prompt[0]) is not None
-    )
+    if is_mooncake:
+        # Mooncake dataset rows are raw trace dictionaries. They are converted
+        # into DatasetRow objects by get_mooncake_request_over_time below.
+        is_multi_turn = False
+    else:
+        first_prompt = input_requests[0].prompt
+        is_multi_turn = (
+            isinstance(first_prompt, list)
+            and bool(first_prompt)
+            and _normalize_round_messages(first_prompt[0]) is not None
+        )
     if is_multi_turn:
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)
 
@@ -1367,7 +1395,7 @@ async def benchmark(
     print(f"Starting warmup with {warmup_requests} sequences...")
 
     # Handle the data structure difference for the warmup request
-    if args.dataset_name == "mooncake":
+    if is_mooncake:
         # For mooncake, input_requests is a list of dicts.
         # We need to build a temporary DatasetRow for the warmup phase.
         warmup_record = input_requests[0]
@@ -1439,7 +1467,7 @@ async def benchmark(
         "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
     ) or flush_cache
     if should_flush_cache:
-        flush_server_cache(base_url, backend)
+        flush_server_cache(base_url, backend, flush_cache_timeout)
 
     time.sleep(1.0)
 
@@ -1471,7 +1499,7 @@ async def benchmark(
     tasks: List[asyncio.Task] = []
     pbar_total = len(input_requests)
     if (
-        backend == "sglang" and args.dataset_name == "mooncake"
+        backend == "sglang" and is_mooncake
     ):  # Assuming mooncake is mainly for sglang or similar backends
         print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
         request_generator = get_mooncake_request_over_time(
@@ -1495,7 +1523,9 @@ async def benchmark(
         lora_probs = None
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
+    benchmark_requests: List[DatasetRow] = []
     async for request in request_generator:
+        benchmark_requests.append(request)
         if lora_names is not None and len(lora_names) != 0:
             if lora_request_distribution == "uniform":
                 lora_name = random.choice(lora_names)
@@ -1581,7 +1611,7 @@ async def benchmark(
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
-        input_requests=None if is_multi_turn else input_requests,
+        input_requests=None if is_multi_turn else benchmark_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
@@ -2086,6 +2116,8 @@ def run_benchmark(args_: argparse.Namespace):
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
+    if not hasattr(args, "flush_cache_timeout"):
+        args.flush_cache_timeout = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT
 
     # Prepare LoRA arguments
     lora_request_distribution = (
@@ -2116,6 +2148,7 @@ def run_benchmark(args_: argparse.Namespace):
             profile=args.profile,
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
+            flush_cache_timeout=args.flush_cache_timeout,
             warmup_requests=args.warmup_requests,
             use_trace_timestamps=args.use_trace_timestamps,
             mooncake_slowdown_factor=args.mooncake_slowdown_factor,
@@ -2563,6 +2596,12 @@ def cli_main():
         "--flush-cache",
         action="store_true",
         help="Flush the cache before running the benchmark",
+    )
+    parser.add_argument(
+        "--flush-cache-timeout",
+        type=_finite_positive_float,
+        default=_DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
+        help="Maximum seconds to wait for an SGLang server to become idle before flushing the cache",
     )
     parser.add_argument(
         "--warmup-requests",
