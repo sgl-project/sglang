@@ -1,5 +1,6 @@
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
     TextEncoderLoader,
+    _resolve_and_configure_encoder_quantization,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import finalize_encoder_folding
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -15,6 +16,13 @@ class ImageEncoderLoader(TextEncoderLoader):
     component_names = ["image_encoder"]
     expected_library = "transformers"
 
+    def component_load_precision(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return server_args.component_precisions.get(
+            component_name, server_args.pipeline_config.image_encoder_precision
+        )
+
     def load_customized(
         self,
         component_model_path: str,
@@ -22,6 +30,11 @@ class ImageEncoderLoader(TextEncoderLoader):
         component_name: str = "image_encoder",
     ):
         """Load the text encoders based on the model path, and inference args."""
+        component_weights_path = self.resolve_model_weights_path(
+            component_model_path,
+            server_args,
+            component_name,
+        )
         # model_config: PretrainedConfig = get_hf_config(
         #     model=model_path,
         #     trust_remote_code=server_args.trust_remote_code,
@@ -34,6 +47,14 @@ class ImageEncoderLoader(TextEncoderLoader):
 
         encoder_config = server_args.pipeline_config.image_encoder_config
         encoder_config.update_model_arch(model_config)
+        _resolve_and_configure_encoder_quantization(
+            encoder_config,
+            model_config,
+            component_model_path,
+            component_weights_path,
+            component_name,
+            server_args.component_quantizations.get(component_name),
+        )
         # real dims are populated now; resolve fold vs replicate
         finalize_encoder_folding(
             encoder_config,
@@ -42,10 +63,12 @@ class ImageEncoderLoader(TextEncoderLoader):
 
         # Always start with local device; load_model will adjust for offload if needed
         # TODO(will): add support for other dtypes
+        image_encoder_dtype = self.component_load_precision(server_args, component_name)
+        assert image_encoder_dtype is not None
         return self.load_model(
-            component_model_path,
+            component_weights_path,
             encoder_config,
             server_args,
-            server_args.pipeline_config.image_encoder_precision,
+            image_encoder_dtype,
             component_name=component_name,
         )

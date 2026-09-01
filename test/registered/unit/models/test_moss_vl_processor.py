@@ -1,4 +1,7 @@
+import asyncio
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -79,6 +82,64 @@ def test_moss_vl_accepts_matching_vision_metadata_and_tokens():
     assert vision_positions.shape == (3, 1, 16)
     assert updated_positions.shape == position_ids.shape
     assert rope_deltas.shape == (1,)
+
+
+def test_video_normalization_cleans_sibling_temp_file_on_failure(tmp_path):
+    processor = _processor()
+    processor.io_executor = ThreadPoolExecutor(max_workers=2)
+    temp_path = tmp_path / "normalized.mp4"
+    created = threading.Event()
+
+    def normalize(value):
+        if value == "good":
+            temp_path.write_bytes(b"video")
+            created.set()
+            return str(temp_path), [str(temp_path)]
+        assert created.wait(timeout=5)
+        raise ValueError("invalid video")
+
+    processor._normalize_single_video_input = normalize
+    try:
+        with pytest.raises(ValueError, match="invalid video"):
+            asyncio.run(processor._normalize_video_inputs_async(["good", "bad"]))
+    finally:
+        processor.io_executor.shutdown()
+
+    assert not temp_path.exists()
+
+
+def test_video_normalization_waits_for_worker_cleanup_when_cancelled(tmp_path):
+    processor = _processor()
+    processor.io_executor = ThreadPoolExecutor(max_workers=1)
+    temp_path = tmp_path / "cancelled.mp4"
+    created = threading.Event()
+    finish = threading.Event()
+
+    def normalize(_value):
+        temp_path.write_bytes(b"video")
+        created.set()
+        assert finish.wait(timeout=5)
+        return str(temp_path), [str(temp_path)]
+
+    processor._normalize_single_video_input = normalize
+
+    async def run():
+        task = asyncio.create_task(
+            processor._normalize_video_inputs_async(["cancelled"])
+        )
+        assert await asyncio.to_thread(created.wait, 5)
+        task.cancel()
+        finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(run())
+    finally:
+        finish.set()
+        processor.io_executor.shutdown()
+
+    assert not temp_path.exists()
 
 
 if __name__ == "__main__":

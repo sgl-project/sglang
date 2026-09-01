@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_
 from sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator import (
     CpuCommunicator,
 )
+from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
@@ -40,6 +41,13 @@ except ModuleNotFoundError:
 logger = init_logger(__name__)
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+
+# Diffusion image tokens make the output of a TP row-parallel projection much
+# larger than the token batches typically seen by the SRT custom all-reduce.
+# Qwen-Image at 1024x1024, for example, reduces 24 MiB tensors. Keep those on
+# the tuned CUDA kernel instead of falling back to NCCL at the default 16 MiB
+# workspace limit.
+_DIFFUSION_CUSTOM_AR_MAX_SIZE = 32 * 1024 * 1024
 
 
 _group_name_counter: dict[str, int] = {}
@@ -123,6 +131,18 @@ class GraphCaptureContext:
     stream: torch.cuda.Stream | None
 
 
+def new_device_group(ranks, backend=None):
+    """Create a process group for device collectives.
+
+    A single-rank group never runs one: every collective short-circuits on
+    world_size == 1. NCCL would still allocate its per-channel device buffers
+    for it, which costs ~390 MiB a group.
+    """
+    return torch.distributed.new_group(
+        ranks, backend="gloo" if len(ranks) == 1 else backend
+    )
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -169,9 +189,7 @@ class GroupCoordinator:
         self.cpu_group = None
 
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
+            device_group = new_device_group(ranks, torch_distributed_backend)
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             with suppress_stdout():
@@ -228,14 +246,33 @@ class GroupCoordinator:
         self.use_custom_op_call = False
 
     def _init_srt_custom_allreduce(self) -> None:
-        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-            CustomAllreduce,
-        )
+        custom_allreduce_kwargs = {
+            "group": self.cpu_group,
+            "device": self.device,
+        }
+        if current_platform.is_cuda():
+            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                dispatch_custom_allreduce,
+            )
+            from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+                CustomAllReduceV2,
+            )
 
-        self.srt_custom_allreduce = CustomAllreduce(
-            group=self.cpu_group,
-            device=self.device,
-        )
+            custom_allreduce_cls = dispatch_custom_allreduce(
+                group=self.cpu_group,
+                device=self.device,
+            )
+            if custom_allreduce_cls is CustomAllReduceV2:
+                custom_allreduce_kwargs["max_size"] = _DIFFUSION_CUSTOM_AR_MAX_SIZE
+        else:
+            # Preserve the existing ROCm and MUSA implementation selection.
+            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                CustomAllreduce,
+            )
+
+            custom_allreduce_cls = CustomAllreduce
+
+        self.srt_custom_allreduce = custom_allreduce_cls(**custom_allreduce_kwargs)
 
     @property
     def first_rank(self):
@@ -363,9 +400,9 @@ class GroupCoordinator:
                 and not custom_ar.disabled
                 and custom_ar.should_custom_ar(input_)
             ):
-                if custom_ar._IS_CAPTURING:
-                    return custom_ar.custom_all_reduce(input_)
-                return custom_ar._all_reduce_impl(input_, registered=False)
+                output = custom_ar.custom_all_reduce(input_)
+                if output is not None:
+                    return output
             if (
                 current_platform.is_cpu()
                 and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
@@ -407,9 +444,7 @@ class GroupCoordinator:
         ):
             return torch.ops.sgl_kernel.shm_allgather(input_, dim)
         else:
-            torch.distributed.all_gather_into_tensor(
-                output_tensor, input_, group=self.device_group
-            )
+            all_gather_single(output_tensor, input_, group=self.device_group)
 
         if dim != 0:
             input_size[0] //= world_size
@@ -863,9 +898,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.device_groups = []
         if len(group_ranks[0]) > 2 or len(group_ranks[0]) == 1:
             for ranks in group_ranks:
-                device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
-                )
+                device_group = new_device_group(ranks, torch_distributed_backend)
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
                 with suppress_stdout():
@@ -927,9 +960,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         ] = None
         self.skip_device_group = None
         for ranks in group_ranks:
-            skip_device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
+            skip_device_group = new_device_group(ranks, torch_distributed_backend)
             if self.rank in ranks:
                 self.skip_device_group = skip_device_group
         assert self.skip_device_group is not None

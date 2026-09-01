@@ -696,6 +696,28 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
+    def test_fp8_pb_wo_dispatches_to_native_block_fp8(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.self_attn.q_proj": {"quant_algo": "FP8_PB_WO"},
+                },
+                "packed_modules_mapping": {},
+            }
+        )
+
+        # Type dispatch only needs a LinearBase instance; skip GPU weight setup.
+        linear = ReplicatedLinear.__new__(ReplicatedLinear)
+        method = quant_config.get_quant_method(
+            linear, "model.layers.0.self_attn.q_proj"
+        )
+
+        self.assertIsInstance(method, Fp8LinearMethod)
+        self.assertEqual(method.quant_config.weight_block_size, [128, 128])
+        self.assertTrue(method.quant_config.is_checkpoint_fp8_serialized)
+        self.assertEqual(method.quant_config.activation_scheme, "dynamic")
+
     def test_incomplete_inline_config_falls_back_to_hf_quant_config_file(self):
         packed_modules_mapping = {
             "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -939,6 +961,20 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
                 lm_head, ModelOptNvFp4A16LinearMethod(ModelOptFp4Config())
             )
         )
+
+    def test_lm_head_guard_accepts_modelopt_fp4_cutedsl_w4a16_runtime_state(self):
+        lm_head = nn.Module()
+        lm_head.weight = nn.Parameter(
+            torch.empty(128, 1024, dtype=torch.uint8), requires_grad=False
+        )
+        lm_head.weight_scale_interleaved = nn.Parameter(torch.empty(1))
+        lm_head.alpha = nn.Parameter(torch.empty(1))
+        lm_head.input_size_per_partition = 2048
+        lm_head.output_size_per_partition = 128
+        quant_method = ModelOptFp4LinearMethod(ModelOptFp4Config())
+        quant_method.quant_mode = "w4a16"
+
+        self.assertTrue(should_apply_lm_head_quant_method(lm_head, quant_method))
 
     def test_lm_head_guard_rejects_stale_modelopt_fp4_method_on_dense_head(self):
         lm_head = nn.Module()
