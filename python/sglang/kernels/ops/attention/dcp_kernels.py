@@ -496,6 +496,8 @@ def _dcp_lse_combine_kernel(
     out_stride_B,
     out_stride_H,
     out_stride_D,
+    out_lse_stride_B,
+    out_lse_stride_H,
     N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_BASE_E: tl.constexpr,
@@ -567,7 +569,11 @@ def _dcp_lse_combine_kernel(
             global_lse = tl.log(weight_sum) + lse_max
         else:
             global_lse = tl.log2(weight_sum) + lse_max
-        out_lse_offset = batch_idx * recv_lse_stride_B + head_idx * recv_lse_stride_H
+        # NOTE: out_lse is a distinct (contiguous) buffer, NOT a strided view
+        # into the recv transport, so it needs its OWN strides here. Reusing
+        # recv_lse_stride_{B,H} silently corrupts / overruns out_lse whenever
+        # the a2a caller hands in a strided recv_lse (last-dim stride == D+lpd).
+        out_lse_offset = batch_idx * out_lse_stride_B + head_idx * out_lse_stride_H
         tl.store(out_lse_ptr + out_lse_offset, global_lse)
 
 
@@ -599,6 +605,12 @@ def dcp_lse_combine_triton(
         else recv_lse.new_empty(0)
     )
 
+    # out_lse is a 0-sized placeholder when return_lse is False; its strides are
+    # never read by the kernel then, so pass harmless zeros.
+    out_lse_stride_B, out_lse_stride_H = (
+        (out_lse.stride(0), out_lse.stride(1)) if return_lse else (0, 0)
+    )
+
     grid = (B, H_local)
     _dcp_lse_combine_kernel[grid](
         recv_output,
@@ -615,6 +627,8 @@ def dcp_lse_combine_triton(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        out_lse_stride_B,
+        out_lse_stride_H,
         N=N,
         HEAD_DIM=D,
         IS_BASE_E=is_lse_base_on_e,

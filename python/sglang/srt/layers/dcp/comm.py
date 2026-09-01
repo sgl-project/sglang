@@ -456,18 +456,22 @@ def dcp_a2a_lse_reduce(
     is_lse_base_on_e: bool = True,
     cuda_graph_buffers: Optional[dict] = None,
     comm_backend: str = "a2a",
-) -> torch.Tensor:
+    return_lse: bool = False,
+):
     """A2A DCP reduce: all-to-all exchange of head partials, then local Triton
     combine. Output + fp32 LSE are packed into ONE all_to_all (LSE reinterpreted
     as output-dtype columns along D) -> 1 NCCL call/layer instead of 2.
     is_lse_base_on_e: True=base-e (FlashAttention), False=base-2 (FlashInfer-MLA).
+    return_lse: also return the merged global LSE (needed by callers that fold an
+    attention sink over the cross-rank denom, e.g. DeepSeek-V4). The returned LSE
+    is in the same log base as the inputs (``is_lse_base_on_e``).
     """
     if cp_group.world_size == 1:
-        return cp_attn_out
+        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
 
     if comm_backend == "fi_a2a":
         return _dcp_fi_a2a_lse_reduce(
-            cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
+            cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e, return_lse=return_lse
         )
 
     N = cp_group.world_size
@@ -509,10 +513,10 @@ def dcp_a2a_lse_reduce(
     recv_output = recv_combined[:, :B, :, :D]
     recv_lse = recv_combined.view(torch.float32)[:, :B, :, D // lpd]
 
-    combined, _ = dcp_lse_combine_triton(
-        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
+    combined, global_lse = dcp_lse_combine_triton(
+        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e, return_lse=return_lse
     )
-    return combined
+    return (combined, global_lse) if return_lse else combined
 
 
 def _dcp_fi_a2a_lse_reduce(
@@ -520,7 +524,8 @@ def _dcp_fi_a2a_lse_reduce(
     cp_attn_lse: torch.Tensor,
     cp_group: "GroupCoordinator",
     is_lse_base_on_e: bool = True,
-) -> torch.Tensor:
+    return_lse: bool = False,
+):
     """fi_a2a: delegate only the cross-rank exchange to FlashInfer's MNNVL kernel,
     then reuse the local Triton LSE combine. FlashInfer takes output + LSE as
     separate tensors: partial_o [B, H_per_rank, cp_size, D] (peer axis 2nd-to-last),
@@ -566,7 +571,7 @@ def _dcp_fi_a2a_lse_reduce(
     recv_output = o_out.permute(2, 0, 1, 3)
     recv_lse = stats_out[..., 0].permute(2, 0, 1)
 
-    combined, _ = dcp_lse_combine_triton(
-        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
+    combined, global_lse = dcp_lse_combine_triton(
+        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e, return_lse=return_lse
     )
-    return combined
+    return (combined, global_lse) if return_lse else combined

@@ -1017,6 +1017,7 @@ class ModelRunner:
 
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
+            self._prepare_replicated_q_proj_dsv4()
 
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
@@ -1055,6 +1056,32 @@ class ModelRunner:
             n_prepared += 1
         logger.info(
             "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
+            n_prepared,
+        )
+
+    def _prepare_replicated_q_proj_dsv4(self) -> None:
+        # --dcp-replicate-q-proj for DeepSeek-V4 (MqaAttentionBase). V4 uses a
+        # fused wq_b (q_lora_rank -> n_heads*head_dim, ColumnParallel-sharded on
+        # attn_tp) rather than DeepseekV2AttentionMLA's q_b_proj/w_kc absorb, and
+        # the V4-Pro checkpoint is fp8 block-quantized, so the bf16-only path in
+        # _prepare_replicated_q_proj skips it. Here we all-gather each rank's
+        # wq_b weight (and its block scale) along the output/head dim across the
+        # DCP group, so a rank can project the full DCP-group head range locally
+        # and the decode path can skip the per-layer Q all-gather.
+        from sglang.srt.models.deepseek_v4 import MqaAttentionBase
+
+        dcp_group = get_parallel().dcp_group
+        if dcp_group.world_size <= 1:
+            return
+        n_prepared = 0
+        for m in self.model.modules():
+            if not isinstance(m, MqaAttentionBase):
+                continue
+            if m.maybe_prepare_dcp_replicated_q_proj(dcp_group):
+                n_prepared += 1
+        logger.info(
+            "dcp_replicate_q_proj (DSV4): prepared full-head Q weights for "
+            "%d MQA layers",
             n_prepared,
         )
 

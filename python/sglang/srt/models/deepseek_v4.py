@@ -955,6 +955,81 @@ class MQALayer(MqaAttentionBase):
         fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
         return q_out
 
+    # ------------------------------------------------------------------
+    # DCP: --dcp-replicate-q-proj (see model_runner._prepare_replicated_q_proj_dsv4)
+    #
+    # When active, each DCP rank holds the wq_b weight (and block scale) of the
+    # WHOLE DCP-group head range, all-gathered once at load time along the output
+    # dim. The decode path then projects all ``n_local_heads * dcp_size`` group
+    # heads locally and the backend skips the per-layer Q all-gather -- trading a
+    # latency-bound collective (~30us/layer) for a dcp_size-larger local GEMM.
+    # No-op unless the flag is on AND the fp8 gather succeeded at load time.
+    # ------------------------------------------------------------------
+    def maybe_prepare_dcp_replicated_q_proj(self, dcp_group) -> bool:
+        """Gather this rank's wq_b weight/scale across the DCP group (dim=0).
+
+        Returns True when the replicated weights were prepared. Only the fp8
+        block-quantized wq_b (the V4-Pro checkpoint) is supported; other quant
+        schemes keep the per-layer Q all-gather (returns False).
+        """
+        import types
+
+        self.wq_b_qrep_weight = None
+        self.wq_b_qrep_weight_scale_inv = None
+        self._wq_b_qrep_shim = None
+        self.dcp_qrep_group_heads = None
+        self._dcp_qrep_world = int(dcp_group.world_size)
+
+        qb = self.wq_b
+        qm = getattr(qb, "quant_method", None)
+        scale = getattr(qb, "weight_scale_inv", None)
+        # fp8 block-quant only: apply() reads exactly layer.weight and
+        # layer.weight_scale_inv on this path, so a tiny shim is enough.
+        if qm is None or not getattr(qm, "block_quant", False) or scale is None:
+            return False
+
+        # Output/head dim is the leading dim of both weight and block scale, and
+        # each rank's shard is 128-block aligned (n_local_heads*head_dim), so a
+        # plain dim=0 all-gather + concat reconstructs the group-head weight even
+        # when the checkpoint was bpreshuffle'd (tiles never cross the boundary).
+        w = dcp_group.all_gather(qb.weight.data.contiguous(), dim=0)
+        s = dcp_group.all_gather(scale.data.contiguous(), dim=0)
+        if getattr(scale, "format_ue8m0", False):
+            s.format_ue8m0 = True
+
+        self.wq_b_qrep_weight = w
+        self.wq_b_qrep_weight_scale_inv = s
+        self._wq_b_qrep_shim = types.SimpleNamespace(
+            weight=w, weight_scale_inv=s
+        )
+        self.dcp_qrep_group_heads = self.n_local_heads * self._dcp_qrep_world
+        return True
+
+    def _dcp_q_replicate_active(self, forward_batch) -> bool:
+        """True when this decode step should project the full DCP-group heads."""
+        if getattr(self, "wq_b_qrep_weight", None) is None:
+            return False
+        if not get_parallel().dcp_replicate_q_proj:
+            return False
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return False
+        # maybe_use_decode_attn_tp can resize n_local_heads at decode; the
+        # gathered weight assumes the capture-time shard, so fall back to the
+        # all-gather path if the head count no longer matches.
+        if self.n_local_heads * self._dcp_qrep_world != self.dcp_qrep_group_heads:
+            return False
+        return True
+
+    def _project_wq_b(self, x, replicate_active: bool) -> torch.Tensor:
+        """wq_b projection, full DCP-group heads when replicate is active."""
+        if replicate_active:
+            # Same fp8 block-GEMM apply() the real wq_b uses (handles both the
+            # plain and pre-quantized (fp8, scale) tuple input), but over the
+            # gathered group-head weight.
+            return self.wq_b.quant_method.apply(self._wq_b_qrep_shim, x, bias=None)
+        q, _ = self.wq_b(x)
+        return q
+
     def _compute_kv_to_cache(
         self,
         x: torch.Tensor,
@@ -1225,16 +1300,17 @@ class MQALayer(MqaAttentionBase):
             qkv_a = None
 
         if self.use_fused_qk_norm_rope:
+            q_replicate = self._dcp_q_replicate_active(forward_batch)
             if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
                     self.q_norm.variance_epsilon,
                 )
-                q, _ = self.wq_b(q_for_wqb)
+                q = self._project_wq_b(q_for_wqb, q_replicate)
             else:
                 q_lora = self.q_norm(q_lora)
-                q, _ = self.wq_b(q_lora)
+                q = self._project_wq_b(q_lora, q_replicate)
 
             kv = (
                 qkv_a[..., self.q_lora_rank :]
@@ -1342,16 +1418,17 @@ class MQALayer(MqaAttentionBase):
         )
 
         if do_fused_qk_norm_rope:
+            q_replicate = self._dcp_q_replicate_active(forward_batch)
             if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
                     self.q_norm.variance_epsilon,
                 )
-                q, _ = self.wq_b(q_for_wqb)
+                q = self._project_wq_b(q_for_wqb, q_replicate)
             else:
                 q_lora = self.q_norm(q_lora)
-                q, _ = self.wq_b(q_lora)
+                q = self._project_wq_b(q_lora, q_replicate)
 
             kv = (
                 qkv_a[..., self.q_lora_rank :]
@@ -1572,7 +1649,17 @@ class MQALayer(MqaAttentionBase):
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
-        if self.attn_tp_size > 1:
+        if self._dcp_q_replicate_active(forward_batch):
+            # --dcp-replicate-q-proj: project the whole DCP-group head range
+            # locally (n_local_heads * dcp_size heads) so the backend can skip
+            # the per-layer Q all-gather. Every head is written by the GEMM, so
+            # no TP padding/slicing is needed; the DCP decode merge slices this
+            # rank's head block back out of the group-head output.
+            q_padded = x.new_empty(
+                x.shape[0], self.dcp_qrep_group_heads, self.head_dim
+            )
+            q_out = q_padded
+        elif self.attn_tp_size > 1:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
