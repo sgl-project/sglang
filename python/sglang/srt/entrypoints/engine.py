@@ -1433,7 +1433,7 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
     def register_lora_adapter(
-        self, lora_name: str, config_dict: Dict, pinned: bool = True
+        self, lora_name: str, config_dict: Dict, pinned: bool = False
     ):
         """Create-or-refresh a LoRA adapter's identity and config. Weights are
         untouched by the caller (new adapters start zeroed); the bytes arrive as
