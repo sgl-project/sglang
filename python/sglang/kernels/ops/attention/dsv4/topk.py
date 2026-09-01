@@ -47,7 +47,7 @@ def _jit_topk_v2_module():
     )
 
 
-def topk_transform_512(
+def topk_transform_paged(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
     page_tables: torch.Tensor,
@@ -80,7 +80,7 @@ def plan_topk_v2(
     static_threshold: int = 0,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Preprocess the per-batch routing plan for :func:`topk_transform_512_v2`.
+    """Preprocess the per-batch routing plan for :func:`topk_transform_paged_v2`.
 
     IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE. The device
     kernel reads the int32 buffer as ``uint32_t``, so a negative length (e.g.
@@ -117,7 +117,7 @@ def topk_transform_ragged_v2(
     With the production convention ``out_offsets == row_starts`` that is the
     column index itself, i.e. the token's slot in the batch's flattened KV.
 
-    Unlike :func:`topk_transform_512_v2` this needs no page table and no plan
+    Unlike :func:`topk_transform_paged_v2` this needs no page table and no plan
     (the cluster path only pays off for very few rows, and prefill has many).
 
     IMPORTANT: ``scores`` is written in place -- the <= 3 columns ahead of each
@@ -138,7 +138,7 @@ def topk_transform_ragged_v2(
     module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
 
 
-def topk_transform_512_v2(
+def topk_transform_paged_v2(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
     page_tables: Optional[torch.Tensor],
