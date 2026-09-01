@@ -1237,20 +1237,30 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 _all_gather_rank_local_phase("pull", fail)
 
     def test_heterogeneous_socket_paths_use_physical_gpu_rank(self):
-        daemon = WeightCacheDaemon(
-            server_args=_daemon_server_args(tp_size=2),
-            gpu_id=4,
-            tp_rank=0,
-            pp_rank=0,
-            daemon_args=WeightCacheDaemonArgs(
-                enable_weight_heterogeneous_transfer=True,
-                weight_heterogeneous_transfer_server_host="0.0.0.0",
-                weight_heterogeneous_transfer_registry_url="tcp://source:31999",
-                weight_cache_socket_rank=4,
-            ),
-        )
-        self.assertEqual(daemon.socket_path, get_socket_path(4))
-        self.assertEqual(daemon.ready_path, get_ready_path(4))
+        for mode, expected_rank in (("source", 4), ("target", 4), (None, 0)):
+            with self.subTest(mode=mode):
+                daemon_args = WeightCacheDaemonArgs()
+                if mode is not None:
+                    daemon_args = WeightCacheDaemonArgs(
+                        weight_heterogeneous_transfer_mode=mode,
+                        weight_heterogeneous_transfer_host="host",
+                        weight_heterogeneous_transfer_registry_url=(
+                            "tcp://host:31999"
+                        ),
+                    )
+                daemon = WeightCacheDaemon(
+                    server_args=_daemon_server_args(tp_size=2),
+                    gpu_id=4,
+                    tp_rank=0,
+                    pp_rank=0,
+                    daemon_args=daemon_args,
+                )
+                self.assertEqual(
+                    daemon.socket_path, get_socket_path(expected_rank)
+                )
+                self.assertEqual(
+                    daemon.ready_path, get_ready_path(expected_rank)
+                )
 
     @patch(
         "sglang.srt.model_executor.model_runner_components.load_model_utils.get_model",
@@ -1283,51 +1293,54 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         )
         self.assertEqual(daemon_load_config.weight_cache_socket, get_socket_path(0))
 
-    def test_heterogeneous_transfer_role_is_inferred_from_host(self):
+    def test_weight_heterogeneous_transfer_mode_contract(self):
         disabled = WeightCacheDaemonArgs()
         source = WeightCacheDaemonArgs(
-            enable_weight_heterogeneous_transfer=True,
-            weight_heterogeneous_transfer_server_host="0.0.0.0",
+            weight_heterogeneous_transfer_mode="source",
+            weight_heterogeneous_transfer_host="0.0.0.0",
         )
         target = WeightCacheDaemonArgs(
-            enable_weight_heterogeneous_transfer=True,
-            weight_heterogeneous_transfer_source_host="source",
-            weight_heterogeneous_transfer_source_port=31999,
+            weight_heterogeneous_transfer_mode="target",
+            weight_heterogeneous_transfer_host="source",
         )
-        self.assertIsNone(disabled.weight_heterogeneous_transfer_role)
-        self.assertEqual(source.weight_heterogeneous_transfer_role, "source")
-        self.assertTrue(source.is_weight_heterogeneous_transfer_source)
-        self.assertEqual(target.weight_heterogeneous_transfer_role, "target")
-        self.assertTrue(target.is_weight_heterogeneous_transfer_target)
+        self.assertIsNone(disabled.weight_heterogeneous_transfer_mode)
+        self.assertEqual(source.weight_heterogeneous_transfer_mode, "source")
+        self.assertEqual(target.weight_heterogeneous_transfer_mode, "target")
 
         invalid_cases = (
             (
                 {
-                    "enable_weight_heterogeneous_transfer": True,
+                    "weight_heterogeneous_transfer_mode": "invalid",
+                    "weight_heterogeneous_transfer_host": "host",
                 },
-                "exactly one",
+                "mode must be",
             ),
             (
                 {
-                    "enable_weight_heterogeneous_transfer": True,
-                    "weight_heterogeneous_transfer_server_host": "0.0.0.0",
-                    "weight_heterogeneous_transfer_source_host": "source",
-                    "weight_heterogeneous_transfer_source_port": 31999,
+                    "weight_heterogeneous_transfer_host": "host",
                 },
-                "exactly one",
+                "require an active mode",
             ),
             (
                 {
-                    "weight_heterogeneous_transfer_server_host": "0.0.0.0",
+                    "weight_heterogeneous_transfer_mode": "source",
                 },
-                "require --enable",
+                "requires a host",
             ),
             (
                 {
-                    "enable_weight_heterogeneous_transfer": True,
-                    "weight_heterogeneous_transfer_source_host": "source",
+                    "weight_heterogeneous_transfer_mode": "target",
+                    "weight_heterogeneous_transfer_host": "",
                 },
-                "positive source port",
+                "requires a host",
+            ),
+            (
+                {
+                    "weight_heterogeneous_transfer_mode": "target",
+                    "weight_heterogeneous_transfer_host": "source",
+                    "weight_heterogeneous_transfer_port": 0,
+                },
+                "port must be positive",
             ),
         )
         for kwargs, error in invalid_cases:
@@ -1335,15 +1348,17 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, error):
                     WeightCacheDaemonArgs(**kwargs)
 
-    def test_heterogeneous_transfer_cli_uses_single_enable_flag(self):
+    def test_weight_heterogeneous_transfer_cli_args(self):
         parser = argparse.ArgumentParser()
         WeightCacheDaemonArgs.add_cli_args(parser)
 
+        disabled = WeightCacheDaemonArgs.from_cli_args(parser.parse_args([]))
         source = WeightCacheDaemonArgs.from_cli_args(
             parser.parse_args(
                 [
-                    "--enable-weight-heterogeneous-transfer",
-                    "--weight-heterogeneous-transfer-server-host",
+                    "--weight-heterogeneous-transfer-mode",
+                    "source",
+                    "--weight-heterogeneous-transfer-host",
                     "0.0.0.0",
                 ]
             )
@@ -1351,16 +1366,18 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         target = WeightCacheDaemonArgs.from_cli_args(
             parser.parse_args(
                 [
-                    "--enable-weight-heterogeneous-transfer",
-                    "--weight-heterogeneous-transfer-source-host",
+                    "--weight-heterogeneous-transfer-mode",
+                    "target",
+                    "--weight-heterogeneous-transfer-host",
                     "source",
-                    "--weight-heterogeneous-transfer-source-port",
+                    "--weight-heterogeneous-transfer-port",
                     "31999",
                 ]
             )
         )
-        self.assertTrue(source.is_weight_heterogeneous_transfer_source)
-        self.assertTrue(target.is_weight_heterogeneous_transfer_target)
+        self.assertIsNone(disabled.weight_heterogeneous_transfer_mode)
+        self.assertEqual(source.weight_heterogeneous_transfer_mode, "source")
+        self.assertEqual(target.weight_heterogeneous_transfer_mode, "target")
 
     def test_daemon_socket_does_not_serve_weight_manifests(self):
         daemon = object.__new__(WeightCacheDaemon)
@@ -1406,15 +1423,39 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                         _prepare_weight_heterogeneous_transfer(
                             _daemon_server_args(),
                             WeightCacheDaemonArgs(
-                                enable_weight_heterogeneous_transfer=True,
-                                weight_heterogeneous_transfer_server_host=bind_host,
-                                weight_heterogeneous_transfer_server_port=31999,
+                                weight_heterogeneous_transfer_mode="source",
+                                weight_heterogeneous_transfer_host=bind_host,
+                                weight_heterogeneous_transfer_port=31999,
                             ),
                             expected_rank_count=1,
                         )
                     )
                 self.assertIs(actual_server, manifest_server)
                 self.assertEqual(registry_url, expected_url)
+
+    def test_resolved_registry_url_does_not_change_mode(self):
+        for mode in ("source", "target"):
+            with self.subTest(mode=mode):
+                daemon_args = WeightCacheDaemonArgs(
+                    weight_heterogeneous_transfer_mode=mode,
+                    weight_heterogeneous_transfer_host="host",
+                    weight_heterogeneous_transfer_registry_url=(
+                        "tcp://resolved:31999"
+                    ),
+                )
+                manifest_server, registry_url = (
+                    _prepare_weight_heterogeneous_transfer(
+                        _daemon_server_args(),
+                        daemon_args,
+                        expected_rank_count=1,
+                    )
+                )
+                self.assertIsNone(manifest_server)
+                self.assertEqual(registry_url, "tcp://resolved:31999")
+                self.assertEqual(
+                    daemon_args.weight_heterogeneous_transfer_mode,
+                    mode,
+                )
 
     def test_launcher_cleans_up_after_partial_spawn_failure(self):
         manifest_server = MagicMock()
@@ -1437,8 +1478,8 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                     _daemon_server_args(tp_size=2),
                     dist_init_method="tcp://127.0.0.1:12345",
                     daemon_args=WeightCacheDaemonArgs(
-                        enable_weight_heterogeneous_transfer=True,
-                        weight_heterogeneous_transfer_server_host="0.0.0.0",
+                        weight_heterogeneous_transfer_mode="source",
+                        weight_heterogeneous_transfer_host="0.0.0.0",
                     ),
                 )
 
@@ -1469,9 +1510,9 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                     _daemon_server_args(base_gpu_id=4),
                     timeout=1,
                     daemon_args=WeightCacheDaemonArgs(
-                        enable_weight_heterogeneous_transfer=True,
-                        weight_heterogeneous_transfer_source_host="source",
-                        weight_heterogeneous_transfer_source_port=31999,
+                        weight_heterogeneous_transfer_mode="target",
+                        weight_heterogeneous_transfer_host="source",
+                        weight_heterogeneous_transfer_port=31999,
                     ),
                 )
 
@@ -1481,11 +1522,15 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         self.assertEqual(call.kwargs["socket_rank"], 4)
         self.assertEqual(call.kwargs["gpu_id"], 4)
         child_args = call.kwargs["daemon_args"]
-        self.assertTrue(child_args.is_weight_heterogeneous_transfer_target)
         self.assertEqual(
-            child_args.weight_heterogeneous_transfer_source_host,
+            child_args.weight_heterogeneous_transfer_mode,
+            "target",
+        )
+        self.assertEqual(
+            child_args.weight_heterogeneous_transfer_host,
             "source",
         )
+        self.assertEqual(child_args.weight_heterogeneous_transfer_port, 31999)
         self.assertEqual(
             child_args.weight_heterogeneous_transfer_registry_url,
             "tcp://source:31999",

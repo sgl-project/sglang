@@ -97,68 +97,29 @@ class WeightCacheDaemonArgs:
     dist_init_method: Optional[str] = None
     timeout: int = 1800
     force: bool = False
-    enable_weight_heterogeneous_transfer: bool = False
-    weight_heterogeneous_transfer_server_host: Optional[str] = None
-    weight_heterogeneous_transfer_server_port: int = 31999
-    weight_heterogeneous_transfer_source_host: Optional[str] = None
-    weight_heterogeneous_transfer_source_port: Optional[int] = None
+    weight_heterogeneous_transfer_mode: Optional[str] = None
+    weight_heterogeneous_transfer_host: Optional[str] = None
+    weight_heterogeneous_transfer_port: int = 31999
     weight_heterogeneous_transfer_registry_url: Optional[str] = None
     weight_cache_socket_rank: Optional[int] = None
 
     def __post_init__(self) -> None:
-        has_server_host = self.weight_heterogeneous_transfer_server_host is not None
-        has_source_host = self.weight_heterogeneous_transfer_source_host is not None
-
-        if not self.enable_weight_heterogeneous_transfer:
-            if (
-                has_server_host
-                or has_source_host
-                or self.weight_heterogeneous_transfer_source_port is not None
-                or self.weight_heterogeneous_transfer_registry_url is not None
+        if self.weight_heterogeneous_transfer_mode not in (None, "source", "target"):
+            raise ValueError(
+                "weight heterogeneous transfer mode must be None, 'source', or 'target'"
+            )
+        if self.weight_heterogeneous_transfer_mode is None:
+            if self.weight_heterogeneous_transfer_host is not None or (
+                self.weight_heterogeneous_transfer_registry_url is not None
             ):
                 raise ValueError(
-                    "heterogeneous transfer role arguments require "
-                    "--enable-weight-heterogeneous-transfer"
+                    "heterogeneous transfer host/registry URL require an active mode"
                 )
             return
-
-        if has_server_host == has_source_host:
-            raise ValueError(
-                "enabled heterogeneous transfer requires exactly one of "
-                "server-host (source role) or source-host (target role)"
-            )
-        if has_server_host:
-            if self.weight_heterogeneous_transfer_server_port <= 0:
-                raise ValueError("weight manifest server port must be positive")
-            if self.weight_heterogeneous_transfer_source_port is not None:
-                raise ValueError("source role must not set source-port")
-            return
-
-        if not self.weight_heterogeneous_transfer_source_host:
-            raise ValueError("target heterogeneous transfer requires a source host")
-        if (
-            self.weight_heterogeneous_transfer_source_port is None
-            or self.weight_heterogeneous_transfer_source_port <= 0
-        ):
-            raise ValueError("target heterogeneous transfer requires a positive source port")
-
-    @property
-    def weight_heterogeneous_transfer_role(self) -> Optional[str]:
-        if not self.enable_weight_heterogeneous_transfer:
-            return None
-        return (
-            "source"
-            if self.weight_heterogeneous_transfer_server_host is not None
-            else "target"
-        )
-
-    @property
-    def is_weight_heterogeneous_transfer_source(self) -> bool:
-        return self.weight_heterogeneous_transfer_role == "source"
-
-    @property
-    def is_weight_heterogeneous_transfer_target(self) -> bool:
-        return self.weight_heterogeneous_transfer_role == "target"
+        if not self.weight_heterogeneous_transfer_host:
+            raise ValueError("active heterogeneous transfer mode requires a host")
+        if self.weight_heterogeneous_transfer_port <= 0:
+            raise ValueError("heterogeneous transfer port must be positive")
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -183,31 +144,21 @@ class WeightCacheDaemonArgs:
         parser.add_argument("--timeout", type=int, default=1800)
         parser.add_argument("--force", action="store_true")
         parser.add_argument(
-            "--enable-weight-heterogeneous-transfer",
-            action="store_true",
-            help="Enable daemon-to-daemon heterogeneous weight transfer.",
-        )
-        parser.add_argument(
-            "--weight-heterogeneous-transfer-server-host",
+            "--weight-heterogeneous-transfer-mode",
+            choices=("source", "target"),
             default=None,
-            help="Source role: manifest TCP registry bind host.",
+            help="Heterogeneous transfer role. Omit to disable transfer.",
         )
         parser.add_argument(
-            "--weight-heterogeneous-transfer-server-port",
+            "--weight-heterogeneous-transfer-host",
+            default=None,
+            help="Source bind host or target source-registry host.",
+        )
+        parser.add_argument(
+            "--weight-heterogeneous-transfer-port",
             type=int,
             default=31999,
-            help="Source manifest TCP registry port.",
-        )
-        parser.add_argument(
-            "--weight-heterogeneous-transfer-source-host",
-            default=None,
-            help="Target role: source manifest registry host.",
-        )
-        parser.add_argument(
-            "--weight-heterogeneous-transfer-source-port",
-            type=int,
-            default=None,
-            help="Source manifest TCP registry port for a target daemon launcher.",
+            help="Manifest registry bind/connect port.",
         )
         parser.add_argument(
             "--weight-heterogeneous-transfer-registry-url",
@@ -230,20 +181,14 @@ class WeightCacheDaemonArgs:
             dist_init_method=args.dist_init_method,
             timeout=args.timeout,
             force=args.force,
-            enable_weight_heterogeneous_transfer=(
-                args.enable_weight_heterogeneous_transfer
+            weight_heterogeneous_transfer_mode=(
+                args.weight_heterogeneous_transfer_mode
             ),
-            weight_heterogeneous_transfer_server_host=(
-                args.weight_heterogeneous_transfer_server_host
+            weight_heterogeneous_transfer_host=(
+                args.weight_heterogeneous_transfer_host
             ),
-            weight_heterogeneous_transfer_server_port=(
-                args.weight_heterogeneous_transfer_server_port
-            ),
-            weight_heterogeneous_transfer_source_host=(
-                args.weight_heterogeneous_transfer_source_host
-            ),
-            weight_heterogeneous_transfer_source_port=(
-                args.weight_heterogeneous_transfer_source_port
+            weight_heterogeneous_transfer_port=(
+                args.weight_heterogeneous_transfer_port
             ),
             weight_heterogeneous_transfer_registry_url=(
                 args.weight_heterogeneous_transfer_registry_url
@@ -293,20 +238,14 @@ class WeightCacheDaemon:
         self.trust_remote_code = server_args.trust_remote_code
         self.revision = server_args.revision
         self.dist_init_method = dist_init_method
-        self.enable_weight_heterogeneous_transfer = (
-            self.daemon_args.enable_weight_heterogeneous_transfer
-        )
-        self.is_weight_heterogeneous_transfer_source = (
-            self.daemon_args.is_weight_heterogeneous_transfer_source
-        )
-        self.is_weight_heterogeneous_transfer_target = (
-            self.daemon_args.is_weight_heterogeneous_transfer_target
+        self.weight_heterogeneous_transfer_mode = (
+            self.daemon_args.weight_heterogeneous_transfer_mode
         )
         self.weight_heterogeneous_transfer_registry_url = (
             self.daemon_args.weight_heterogeneous_transfer_registry_url
         )
         if (
-            self.enable_weight_heterogeneous_transfer
+            self.weight_heterogeneous_transfer_mode is not None
             and not self.weight_heterogeneous_transfer_registry_url
         ):
             raise ValueError(
@@ -318,7 +257,7 @@ class WeightCacheDaemon:
         if socket_rank is None:
             socket_rank = (
                 self.gpu_id
-                if self.enable_weight_heterogeneous_transfer
+                if self.weight_heterogeneous_transfer_mode is not None
                 else compute_global_rank(self.tp_size, pp_rank, tp_rank)
             )
         self.socket_path = get_socket_path(socket_rank)
@@ -455,7 +394,7 @@ class WeightCacheDaemon:
         if not quant_method and quant_config is not None:
             quant_method = get_quant_method_name(quant_config)
 
-        if self.enable_weight_heterogeneous_transfer:
+        if self.weight_heterogeneous_transfer_mode is not None:
             from .weight_heterogeneous_transfer import (
                 validate_weight_heterogeneous_transfer_configuration,
             )
@@ -513,18 +452,18 @@ class WeightCacheDaemon:
         load_config = LoadConfig(
             load_format=(
                 "dummy"
-                if self.is_weight_heterogeneous_transfer_target
+                if self.weight_heterogeneous_transfer_mode == "target"
                 else self.load_format
             ),
             model_loader_extra_config=(
                 {}
-                if self.is_weight_heterogeneous_transfer_target
+                if self.weight_heterogeneous_transfer_mode == "target"
                 else self.model_loader_extra_config
             ),
             tp_rank=self.tp_rank,
         )
 
-        if self.is_weight_heterogeneous_transfer_target:
+        if self.weight_heterogeneous_transfer_mode == "target":
             logger.info(
                 f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
                 f"Allocating target parallel layout: {self.model_path}"
@@ -539,7 +478,7 @@ class WeightCacheDaemon:
         # Load model using DefaultModelLoader (includes TP sharding + quant post-process)
         loader = get_model_loader(load_config=load_config, model_config=model_config)
         source_load_capture = None
-        if self.is_weight_heterogeneous_transfer_source:
+        if self.weight_heterogeneous_transfer_mode == "source":
             from .weight_load_recorder import capture_weight_load_plan
 
             with capture_weight_load_plan(loader) as source_load_capture:
@@ -556,7 +495,7 @@ class WeightCacheDaemon:
             )
 
         elapsed = time.perf_counter() - tic
-        if self.is_weight_heterogeneous_transfer_target:
+        if self.weight_heterogeneous_transfer_mode == "target":
             logger.info(
                 f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
                 f"Model allocated in {elapsed:.2f}s"
@@ -572,7 +511,7 @@ class WeightCacheDaemon:
         # risk observing half-written weights.
         current_platform.synchronize()
 
-        if self.enable_weight_heterogeneous_transfer:
+        if self.weight_heterogeneous_transfer_mode is not None:
             from .weight_heterogeneous_transfer import WeightsManifestState
 
             self.weights_manifest_state = WeightsManifestState.create(
@@ -590,7 +529,9 @@ class WeightCacheDaemon:
                     or getattr(model_config.hf_config, "_commit_hash", None)
                     or "local"
                 ),
-                is_source_daemon=self.is_weight_heterogeneous_transfer_source,
+                is_source_daemon=(
+                    self.weight_heterogeneous_transfer_mode == "source"
+                ),
                 load_plan=(
                     source_load_capture.plan
                     if source_load_capture is not None
@@ -598,7 +539,7 @@ class WeightCacheDaemon:
                 ),
             )
 
-        if self.is_weight_heterogeneous_transfer_source:
+        if self.weight_heterogeneous_transfer_mode == "source":
             from .weight_heterogeneous_transfer import (
                 register_source_weights_manifest,
             )
@@ -621,7 +562,7 @@ class WeightCacheDaemon:
                 self.weight_heterogeneous_transfer_registry_url,
             )
 
-        if self.is_weight_heterogeneous_transfer_target:
+        if self.weight_heterogeneous_transfer_mode == "target":
             from .weight_heterogeneous_transfer import (
                 transfer_weights_from_source_daemons,
             )
@@ -958,7 +899,7 @@ def _prepare_weight_heterogeneous_transfer(
     expected_rank_count: int,
 ):
     """Validate the phase-one contract and resolve the manifest registry."""
-    if not daemon_args.enable_weight_heterogeneous_transfer:
+    if daemon_args.weight_heterogeneous_transfer_mode is None:
         return None, None
 
     from .weight_heterogeneous_transfer import (
@@ -979,24 +920,23 @@ def _prepare_weight_heterogeneous_transfer(
 
     if daemon_args.weight_heterogeneous_transfer_registry_url:
         return None, daemon_args.weight_heterogeneous_transfer_registry_url
-    if daemon_args.is_weight_heterogeneous_transfer_source:
+    if daemon_args.weight_heterogeneous_transfer_mode == "source":
         from .weight_manifest_server import WeightManifestServer
 
         manifest_server = WeightManifestServer(
-            host=daemon_args.weight_heterogeneous_transfer_server_host,
-            port=daemon_args.weight_heterogeneous_transfer_server_port,
+            host=daemon_args.weight_heterogeneous_transfer_host,
+            port=daemon_args.weight_heterogeneous_transfer_port,
             expected_rank_count=expected_rank_count,
         )
         from sglang.srt.utils.network import NetworkAddress
 
         try:
             connect_host = {
-                "": "127.0.0.1",
                 "0.0.0.0": "127.0.0.1",
                 "::": "::1",
-            }.get(daemon_args.weight_heterogeneous_transfer_server_host)
+            }.get(daemon_args.weight_heterogeneous_transfer_host)
             if connect_host is None:
-                connect_host = daemon_args.weight_heterogeneous_transfer_server_host
+                connect_host = daemon_args.weight_heterogeneous_transfer_host
             registry_address = NetworkAddress(connect_host, manifest_server.port)
         except BaseException:
             manifest_server.close()
@@ -1008,8 +948,8 @@ def _prepare_weight_heterogeneous_transfer(
     from sglang.srt.utils.network import NetworkAddress
 
     source_address = NetworkAddress(
-        daemon_args.weight_heterogeneous_transfer_source_host,
-        daemon_args.weight_heterogeneous_transfer_source_port,
+        daemon_args.weight_heterogeneous_transfer_host,
+        daemon_args.weight_heterogeneous_transfer_port,
     )
     return None, f"tcp://{source_address.to_host_port_str()}"
 
@@ -1269,7 +1209,7 @@ if __name__ == "__main__":
             if socket_rank is None:
                 socket_rank = (
                     gpu_id
-                    if daemon_args.enable_weight_heterogeneous_transfer
+                    if daemon_args.weight_heterogeneous_transfer_mode is not None
                     else compute_global_rank(
                         server_args.tp_size, daemon_args.pp_rank, tp_rank
                     )
