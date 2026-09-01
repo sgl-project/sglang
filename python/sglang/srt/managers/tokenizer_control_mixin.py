@@ -773,7 +773,9 @@ class TokenizerControlMixin:
                         "never evicted; unload one or raise the cap."
                     )
                 obj.lora_id = new_adapter.lora_id
-                result = (await self.update_lora_adapter_communicator(obj))[0]
+                result = _merge_lora_update_results(
+                    await self.update_lora_adapter_communicator(obj)
+                )
 
                 if result.success:
                     if reused:
