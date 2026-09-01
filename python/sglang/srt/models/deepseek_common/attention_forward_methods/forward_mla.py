@@ -118,6 +118,18 @@ def should_defer_dsa_cp_kv_gather(
     return dsa_prefill_cp and fuse_rope_for_trtllm_mla
 
 
+def _apply_attention_output_gate(module, attn_output, gate):
+    apply_gate = getattr(module, "apply_attention_output_gate", None)
+    if apply_gate is not None:
+        return apply_gate(attn_output, gate)
+    if hasattr(module, "_apply_gated"):
+        return module._apply_gated(attn_output, gate)
+    raise RuntimeError(
+        "Prepared MLA attention gates are unsigmoided and require a "
+        "model-specific application hook"
+    )
+
+
 class DeepseekMLAForwardMixin:
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
@@ -928,17 +940,9 @@ class DeepseekMLAForwardMixin:
                 self, attn_output, attn_bmm_output
             )
         if attention_output_gate is not None:
-            # HYV4 owns gate construction/application; Bailing's pre-sigmoided
-            # gate continues through its existing _apply_gated path.
-            apply_gate = getattr(self, "apply_attention_output_gate", None)
-            if apply_gate is not None:
-                attn_bmm_output = apply_gate(attn_bmm_output, attention_output_gate)
-            elif hasattr(self, "_apply_gated"):
-                attn_bmm_output = self._apply_gated(
-                    attn_bmm_output, attention_output_gate
-                )
-            else:
-                attn_bmm_output = attn_bmm_output * torch.sigmoid(attention_output_gate)
+            attn_bmm_output = _apply_attention_output_gate(
+                self, attn_bmm_output, attention_output_gate
+            )
         output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:

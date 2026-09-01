@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from sglang.srt.models import hunyuan_v4, hunyuan_v4_nextn
+from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mla
 from sglang.srt.runtime_context import get_context, get_flags, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -128,6 +129,13 @@ def test_attention_gate_non_bf16_model_fallback_parity():
     )
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_prepared_attention_gate_requires_model_application_hook():
+    with pytest.raises(RuntimeError, match="unsigmoided"):
+        forward_mla._apply_attention_output_gate(
+            SimpleNamespace(), torch.ones(1), torch.ones(1)
+        )
 
 
 def test_hpc_attention_gate_is_bf16_only(monkeypatch):
