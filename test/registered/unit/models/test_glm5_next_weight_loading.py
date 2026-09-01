@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.model_loader.weight_utils import RUNAI_STREAMER_TENSOR_ATTR
+from sglang.srt.model_loader.runai_utils import RUNAI_STREAMER_TENSOR_ATTR
 from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.test.ci.ci_register import register_cpu_ci
 

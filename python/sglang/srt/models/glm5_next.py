@@ -93,13 +93,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
+from sglang.srt.model_loader.runai_utils import _clone_if_runai_streamed_tensor
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
-    _clone_if_runai_streamed_tensor,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,

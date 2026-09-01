@@ -56,6 +56,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
 )
+from sglang.srt.model_loader.runai_utils import RUNAI_STREAMER_TENSOR_ATTR
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     BAR_FORMAT,
@@ -73,9 +74,6 @@ except ImportError:
     SafeTensorsFileLoader = SingleGroup = None
 
 logger = logging.getLogger(__name__)
-
-RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
-
 
 # Matches routed-expert weight keys in both HF-style layouts
 # (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepSeek V4
