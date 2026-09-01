@@ -79,6 +79,11 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.aiter_mla_gluon import (
+    log_mla_gluon_capability,
+    mla_gluon_decode,
+    prefer_mla_gluon_decode,
+)
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
@@ -398,10 +403,13 @@ class AiterAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         if self.use_mla:
-            _valid_heads = self.num_head in (4, 8) or (
-                self.num_head % 16 == 0 and 16 <= self.num_head <= 128
+            _mla_low_head_repeat = (4, 8)
+            _mla_low_head_zero_pad = (12,)
+            _valid_heads = (
+                self.num_head in _mla_low_head_repeat
+                or self.num_head in _mla_low_head_zero_pad
+                or (self.num_head % 16 == 0 and 16 <= self.num_head <= 128)
             )
-
             may_run_mla_decode = self.may_run_mla_decode_kernel(
                 decode_attention_backend=model_runner.decode_attention_backend_str,
                 speculative_algorithm=get_spec().speculative_algorithm,
@@ -411,13 +419,22 @@ class AiterAttnBackend(AttentionBackend):
             # by repetition when it divides 16 and by tiling otherwise.
             _pad_heads_to_16 = self.num_head < 16
             assert _valid_heads or _pad_heads_to_16 or not may_run_mla_decode, (
-                f"Aiter MLA supports num_head of 4, 8, or multiples of 16 "
+                f"Aiter MLA supports num_head of 4, 8, 12, or multiples of 16 "
                 f"in [16, 128].\n"
                 f"Provided {self.num_head} number of heads.\n"
                 "Try adjusting tensor_parallel_size value, or run decode on "
                 "another backend (--decode-attention-backend)."
             )
             self.num_head_padded = 16 if self.num_head < 16 else self.num_head
+            if self.num_head in _mla_low_head_repeat:
+                self.head_pad_mode = "repeat"
+                self.head_repeat_factor = 16 // self.num_head
+            elif self.num_head in _mla_low_head_zero_pad:
+                self.head_pad_mode = "zero"
+                self.head_repeat_factor = 1
+            else:
+                self.head_pad_mode = "none"
+                self.head_repeat_factor = 1
 
             self.enable_dp_attention = is_dp_attention_enabled()
             self.qo_indptr_ = torch.zeros(
@@ -438,12 +455,21 @@ class AiterAttnBackend(AttentionBackend):
             # only use mla_ps_kernel when fp8 kv_cache
             # for non-fp8 kv_cache on tp8, use non-persist kernel to avoid performance degradation
             # head_num=16 (tp8 perf issue), head_num=128 (unsupported, like tp1 or --enable-dp-attention with tp8-dp8)
+            # Native 16-head persist is slow on TP8; keep disabled unless zero-pad
+            # (e.g. Kimi K3 h12 -> qh16) where persist ASM is the fast path.
             if (
-                self.num_head_padded == 16 or self.num_head_padded == 128
+                (self.num_head_padded == 16 and self.head_pad_mode != "zero")
+                or self.num_head_padded == 128
             ) and self.kv_cache_dtype is not fp8_dtype:
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
+            # Zero-pad topology (h12->qh16): prefer Gluon decode over PS kernel.
+            if self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
+                _use_mla_ps_kernel = False
+                fast_mode = False
+                intra_batch_mode = False
+                log_mla_gluon_capability(logger)
 
             self.max_split_per_batch = 32 if _use_mla_ps_kernel else None
 
@@ -906,11 +932,15 @@ class AiterAttnBackend(AttentionBackend):
         **kwargs,
     ):
         """Wrap mla_decode_fwd with head-dimension padding for num_head < 16.
-        The kernel only accepts 4, 8, or a multiple of 16 heads; any other
-        count crashes it. So we repeat q's heads to reach 16, real heads first.
+
+        repeat (4/8): tile q heads to 16, slice back to num_head.
+        zero (12): pad four zero-valued dummy heads to 16 (vLLM #50371 style).
         q / o must already be shaped (..., num_head, head_dim).
         """
-        if self.num_head_padded != self.num_head:
+        num_head = layer.tp_q_head_num
+        if self.head_pad_mode == "repeat" or (
+            self.head_pad_mode == "none" and self.num_head_padded != self.num_head
+        ):
             q_in = self.pad_heads(q, self.num_head_padded)
             o = q.new_empty(
                 (q.shape[0], self.num_head_padded, layer.v_head_dim),
@@ -918,13 +948,127 @@ class AiterAttnBackend(AttentionBackend):
             )
             mla_decode_fwd(q_in, k_buffer_flat, o, **kwargs)
             return o[:, : self.num_head, :]
-        else:
+        if self.head_pad_mode == "zero":
+            q_in = q.new_zeros(
+                (q.shape[0], self.num_head_padded, q.shape[-1]),
+                dtype=q.dtype,
+            )
+            q_in[:, :num_head, :] = q
             o = q.new_empty(
-                (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                (q.shape[0], self.num_head_padded, layer.v_head_dim),
                 dtype=self.input_dtype,
             )
-            mla_decode_fwd(q, k_buffer_flat, o, **kwargs)
-            return o
+            mla_decode_fwd(q_in, k_buffer_flat, o, **kwargs)
+            return o[:, :num_head, :]
+        o = q.new_empty(
+            (q.shape[0], num_head, layer.v_head_dim),
+            dtype=self.input_dtype,
+        )
+        mla_decode_fwd(q, k_buffer_flat, o, **kwargs)
+        return o
+
+    def _zero_pad_mla_q_heads(
+        self, q: torch.Tensor, layer: RadixAttention
+    ) -> torch.Tensor:
+        """Zero-pad q heads num_head -> num_head_padded (12 -> 16) for the
+        aiter MLA prefill kernels. Input/return are 3-D (T, H, D); the extra
+        heads compute garbage outputs that are sliced away after the kernel."""
+        q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_pad = q3.new_zeros((q3.shape[0], self.num_head_padded, q3.shape[-1]))
+        q_pad[:, : layer.tp_q_head_num, :] = q3
+        return q_pad
+
+    def _resolve_fp8_kv_scale_float(self, layer: RadixAttention, k_descale) -> float:
+        cached = getattr(layer, "_aiter_kv_scale_float", None)
+        if cached is not None:
+            return cached
+        if k_descale is None:
+            val = 1.0
+        elif isinstance(k_descale, torch.Tensor):
+            val = float(k_descale.item())
+        else:
+            val = float(k_descale)
+        layer._aiter_kv_scale_float = val
+        return val
+
+    def _resolve_mla_gluon_min_kv_seq_len(self, forward_batch: ForwardBatch) -> int:
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return int(self.max_context_len)
+        except Exception:
+            pass
+        if forward_batch.seq_lens_cpu is not None:
+            return int(forward_batch.seq_lens_cpu.max())
+        seq_lens = forward_batch.seq_lens
+        if seq_lens is None or seq_lens.numel() == 0:
+            return 1
+        return int(seq_lens.max().item())
+
+    def _forward_mla_decode(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        k_descale,
+    ):
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        q_mla = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        max_q_len = self.forward_metadata.max_q_len or 1
+
+        if (
+            prefer_mla_gluon_decode(
+                head_pad_mode=getattr(self, "head_pad_mode", "none"),
+                num_head=getattr(self, "num_head", layer.tp_q_head_num),
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
+            and max_q_len == 1
+        ):
+            kv_scale = self._resolve_fp8_kv_scale_float(layer, k_descale)
+            min_kv_seq_len = self._resolve_mla_gluon_min_kv_seq_len(forward_batch)
+            gluon_out = mla_gluon_decode(
+                q=q_mla,
+                k_buffer=k_buffer,
+                layer=layer,
+                kv_indices=self.forward_metadata.kv_indices,
+                kv_indptr=self.forward_metadata.kv_indptr,
+                seq_lens=forward_batch.seq_lens,
+                sm_scale=layer.scaling,
+                kv_scale=kv_scale,
+                min_kv_seq_len=min_kv_seq_len,
+            )
+            if gluon_out is not None:
+                return gluon_out
+
+        work_metadata = self.forward_metadata.work_metadata
+        work_indptr = self.forward_metadata.work_indptr
+        work_info_set = self.forward_metadata.work_info_set
+        reduce_indptr = self.forward_metadata.reduce_indptr
+        reduce_final_map = self.forward_metadata.reduce_final_map
+        reduce_partial_map = self.forward_metadata.reduce_partial_map
+        num_kv_splits = self.forward_metadata.num_kv_splits
+
+        return self._mla_decode_fwd_with_head_pad(
+            q_mla,
+            k_buffer.view(-1, 1, 1, layer.qk_head_dim),
+            layer,
+            qo_indptr=self.forward_metadata.qo_indptr,
+            kv_indptr=self.forward_metadata.kv_indptr,
+            kv_indices=self.forward_metadata.kv_indices,
+            kv_last_page_lens=self.forward_metadata.kv_last_page_len,
+            max_seqlen_q=max_q_len,
+            sm_scale=layer.scaling,
+            logit_cap=layer.logit_cap,
+            work_meta_data=work_metadata,
+            work_indptr=work_indptr,
+            work_info_set=work_info_set,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+            q_scale=k_descale,
+            kv_scale=k_descale,
+            intra_batch_mode=intra_batch_mode,
+            num_kv_splits=num_kv_splits,
+        )
 
     def mla_fp8_prefill_attn(
         self,
@@ -1030,7 +1174,6 @@ class AiterAttnBackend(AttentionBackend):
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             seq_lens_sum=None if in_capture else forward_batch.seq_lens_sum,
-            encoder_lens=forward_batch.encoder_lens,
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             seq_lens_cpu=seq_lens_cpu,
@@ -1365,8 +1508,8 @@ class AiterAttnBackend(AttentionBackend):
                     run_graph=False,
                 )
             else:
-                draft_num = forward_batch.input_ids.shape[0] // bs
                 bs = len(forward_batch.req_pool_indices)
+                draft_num = spec_info.draft_token_num
 
                 if self._use_unified_verify:
                     page_table, qo_indptr, max_q_len, swa_page_table = (
@@ -1461,7 +1604,9 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map = None
                 fp8_prefill_kv_indices = None
 
-                if self.use_fp8_prefill_attn:
+                # fp8 PS-ASM prefill memory-faults on gfx950 for 12-head
+                # (zero-pad) models; keep it off and use flash-attn fallback.
+                if self.use_fp8_prefill_attn and self.head_pad_mode != "zero":
                     tile_q = 256
                     qlen_granularity = tile_q // (
                         self.fp8_prefill_num_head // self.fp8_prefill_num_kv_head
@@ -1667,7 +1812,6 @@ class AiterAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
@@ -2187,7 +2331,7 @@ class AiterAttnBackend(AttentionBackend):
             ):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
-                    if self.use_fp8_prefill_attn:
+                    if self.use_fp8_prefill_attn and self.head_pad_mode != "zero":
                         output = self.mla_fp8_prefill_attn(
                             q,
                             k,
@@ -2221,6 +2365,7 @@ class AiterAttnBackend(AttentionBackend):
 
                     if (
                         self.use_fp8_prefill_attn
+                        and self.head_pad_mode != "zero"
                         and layer.kv_b_proj.weight.dtype == torch.uint8
                     ):
                         # MXFP4 weights + FP8 prefill: fuse GEMM, nope/v split, and k_pe cat
@@ -2260,7 +2405,7 @@ class AiterAttnBackend(AttentionBackend):
                         == forward_batch.extend_seq_lens.shape
                     )
 
-                    if self.use_fp8_prefill_attn:
+                    if self.use_fp8_prefill_attn and self.head_pad_mode != "zero":
                         return self.mla_fp8_prefill_attn(q, k, v, layer)
                     else:
                         return flash_attn_varlen_func(
@@ -2276,17 +2421,30 @@ class AiterAttnBackend(AttentionBackend):
                         )
 
                 else:
-                    if layer.qk_head_dim != layer.v_head_dim:
+                    if self.head_pad_mode == "zero":
+                        # 12 heads/rank (Kimi-K3 TP8): zero-pad q to 16 heads,
+                        # run the aiter MLA prefill kernel, slice 12 back.
+                        q_in = self._zero_pad_mla_q_heads(q, layer)
                         o = q.new_empty(
-                            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                            (q.shape[0], self.num_head_padded, layer.v_head_dim)
                         )
                     else:
-                        o = torch.empty_like(q)
+                        q_in = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                        if layer.qk_head_dim != layer.v_head_dim:
+                            o = q.new_empty(
+                                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                            )
+                        else:
+                            o = torch.empty_like(q)
 
                     mla_prefill_fwd(
-                        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        q_in,
                         K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
-                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        (
+                            o.view(-1, self.num_head_padded, layer.v_head_dim)
+                            if self.head_pad_mode == "zero"
+                            else o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                        ),
                         qo_indptr,
                         kv_indptr,
                         kv_indices,
@@ -2296,6 +2454,12 @@ class AiterAttnBackend(AttentionBackend):
                         layer.logit_cap,
                     )
                     K_Buffer = K_Buffer.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                    if self.head_pad_mode == "zero":
+                        return (
+                            o[:, : layer.tp_q_head_num, :]
+                            .contiguous()
+                            .view(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                        )
                     return o
             elif forward_batch.forward_mode.is_target_verify():
                 work_metadata = self.forward_metadata.work_metadata
@@ -2505,9 +2669,7 @@ class AiterAttnBackend(AttentionBackend):
                         v=v_unified,
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         cu_seqlens_q=self.forward_metadata.qo_indptr,
-                        seqused_k=(
-                            forward_batch.seq_lens + self.forward_metadata.max_q_len
-                        ),
+                        seqused_k=forward_batch.seq_lens + self.num_draft_tokens,
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
@@ -2720,7 +2882,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 if o.dtype != self.input_dtype:
                     o = o.to(self.input_dtype)
-                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             if self.kv_cache_is_vectorized_5d:
                 return forward_extend_vectorized_5d(
@@ -2880,40 +3042,8 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
         if self.use_mla:
-            k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-
-            work_metadata = self.forward_metadata.work_metadata
-            work_indptr = self.forward_metadata.work_indptr
-            work_info_set = self.forward_metadata.work_info_set
-
-            reduce_indptr = self.forward_metadata.reduce_indptr
-            reduce_final_map = self.forward_metadata.reduce_final_map
-            reduce_partial_map = self.forward_metadata.reduce_partial_map
-
-            num_kv_splits = self.forward_metadata.num_kv_splits
-
-            o = self._mla_decode_fwd_with_head_pad(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k_buffer.view(-1, 1, 1, layer.qk_head_dim),
-                layer,
-                qo_indptr=self.forward_metadata.qo_indptr,
-                kv_indptr=self.forward_metadata.kv_indptr,
-                kv_indices=self.forward_metadata.kv_indices,
-                kv_last_page_lens=self.forward_metadata.kv_last_page_len,
-                max_seqlen_q=self.forward_metadata.max_q_len,
-                sm_scale=layer.scaling,
-                logit_cap=layer.logit_cap,
-                work_meta_data=work_metadata,
-                work_indptr=work_indptr,
-                work_info_set=work_info_set,
-                reduce_indptr=reduce_indptr,
-                reduce_final_map=reduce_final_map,
-                reduce_partial_map=reduce_partial_map,
-                q_scale=k_descale,
-                kv_scale=k_descale,
-                intra_batch_mode=intra_batch_mode,
-                num_kv_splits=num_kv_splits,
-            )
+            o = self._forward_mla_decode(q, layer, forward_batch, k_descale)
+            return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
             self.logits_soft_cap = layer.logit_cap
 
