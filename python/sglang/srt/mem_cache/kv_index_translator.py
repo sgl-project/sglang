@@ -63,6 +63,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.runtime_context import get_parallel
 
 
 class KVReadTables(msgspec.Struct, frozen=True):
@@ -108,6 +109,7 @@ class KVIndexTranslator:
         self.req_to_token = req_to_token
         self.page_size = page_size
         self.device = device
+        self.dcp_size = get_parallel().dcp_size
 
         self.is_translating = (
             isinstance(
@@ -127,10 +129,11 @@ class KVIndexTranslator:
             # carries the owner rule in `loc % dcp_size`. Identity with the read
             # translate when dcp_size == 1.
             self._translate_write_full = alloc.translate_write_loc_for_kernel
-            # DCP: every DCP index kernel collapses `loc // dcp_size` itself, so
-            # the read tables must hand it VIRTUAL ids and the consumer
-            # translates AFTER sharding. `is_translated=False` on the table it
-            # gets back is the contract; the write loc is unaffected.
+            # DCP: read ids reach their consumer WIDENED, because selecting this
+            # rank's share changes the tensor's length and only the production
+            # site can do it. The table therefore stays virtual
+            # (`is_translated=False`) and the consumer calls
+            # `translate_dcp_read_ids` once, after selecting.
             self.defer_read_translate = alloc.dcp_size > 1
             if isinstance(alloc, UnifiedSWATokenToKVPoolAllocator):
                 self._swa_v2p_table = alloc.swa_v2p_page_table
@@ -320,20 +323,26 @@ class KVIndexTranslator:
         self._index_table_memo = (weakref.ref(forward_batch), view)
         return view
 
-    def assert_backends_carry_translator(self, backends) -> None:
-        """Boot guard: under the unified pool every backend a forward can reach
-        must carry THIS translator."""
-        if not self.is_translating:
-            return
+    def bind_and_verify_backends(self, backends) -> None:
+        """Boot: make every reachable backend carry THIS translator.
+
+        Model-layer read-index producers (the DCP planner, the DeepSeek MHA
+        paths) reach the translator off `get_attn_backend()`, the same way they
+        reach the pools, so an unset attribute there is not "no translation
+        needed" -- it is an unreachable hook. Bind rather than assert for that
+        case; assert only when a backend carries a DIFFERENT translator, which
+        can only be a wiring bug.
+        """
         for backend in backends:
             if backend is None:
                 continue
+            if backend.kv_index_translator is None:
+                backend.kv_index_translator = self
+                continue
             assert backend.kv_index_translator is self, (
-                f"{type(backend).__name__} does not carry the runner's "
-                "KVIndexTranslator. A backend (or wrapper) reachable under "
-                "--enable-unified-memory must forward `kv_index_translator`, or "
-                "read-index producers silently skip the virtual->kernel-facing "
-                "translation."
+                f"{type(backend).__name__} carries a KVIndexTranslator that is "
+                "not this runner's. A wrapper must forward the inner backend's "
+                "copy, not build its own."
             )
 
     # -- write loc (phase 1; phase 2 lives in build_index_table) ----------------
@@ -376,6 +385,25 @@ class KVIndexTranslator:
         return (self._swa_v2p_table[virt_page] * swa_stride + offset).clamp_(min=0)
 
     # -- token-level translate surface (the mixin / local-attn consumers) ------
+
+    @property
+    def needs_read_translate(self) -> bool:
+        """Whether `translate_dcp_read_ids` is anything but the identity, so a
+        hot path can skip the call rather than round-trip a no-op copy."""
+        return self.is_translating or self.dcp_size > 1
+
+    def translate_dcp_read_ids(self, widened_ids: torch.Tensor) -> torch.Tensor:
+        """Widened logical READ ids -> kernel-facing ids, for either pool.
+
+        The single hook every DCP read-index production site calls. Selecting
+        this rank's share stays at the production site because it changes the
+        tensor's length; the collapse does not, so there is no second transform
+        to get out of order. On a static pool `widened // dcp_size` IS the whole
+        virtual->physical translation, which is why one hook serves both.
+        """
+        if self.dcp_size > 1:
+            widened_ids = widened_ids // self.dcp_size
+        return self.translate_full_attn_ids(widened_ids)
 
     def translate_full_attn_ids(
         self, kv_indices: torch.Tensor, *, out: Optional[torch.Tensor] = None

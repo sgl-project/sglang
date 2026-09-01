@@ -111,17 +111,11 @@ def prepare_decode_context_parallel_metadata(
         parallel.dcp_size,
     )
     # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
-    dcp_local_prefix_kv_indices = (
+    # `get_mla_kv_buffer` is a read door with the caller-translates contract.
+    translator = get_attn_backend().kv_index_translator
+    dcp_local_prefix_kv_indices = translator.translate_dcp_read_ids(
         dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
-        // parallel.dcp_size
     )
-    # Third read-index production site, beside the two the MHA mixin owns: the
-    # pool's read door never translates, so collapse then translate here.
-    src = get_attn_backend().kv_index_translator
-    if src is not None:
-        dcp_local_prefix_kv_indices = src.translate_full_attn_ids(
-            dcp_local_prefix_kv_indices
-        )
     dcp_kv_buffer = torch.empty(
         (
             seq_lens_sum,
@@ -151,9 +145,9 @@ def plan_dcp_decode_metadata(
     """Shard `kv_indices` to this DCP rank in place; return the shard's length.
 
     `kv_lens` / `kv_indptr` are rewritten to the per-rank lengths, and this
-    rank's ids (`loc % dcp_size == dcp_rank`, collapsed by `// dcp_size`) are
-    compacted into `kv_indices[:total_local_len]`. The returned length bounds
-    the prefix a caller may post-process (e.g. the unified pool's dense translate).
+    rank's ids (`loc % dcp_size == dcp_rank`) are compacted into
+    `kv_indices[:total_local_len]`, still WIDENED. The returned length bounds the
+    prefix the caller hands to `KVIndexTranslator.translate_dcp_read_ids`.
     """
     parallel = get_parallel()
     local_kv_lens = kv_lens.clone()

@@ -312,10 +312,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # alloc/free surface speak, matching PagedTokenToKVPoolAllocator's
         # widened DCP contract), `pool_page_size` is the PHYSICAL rows one page
         # occupies here. Under DCP a virtual page holds dcp_size logical ids per
-        # stored row, of which this rank owns `loc % dcp_size == dcp_rank`; the
-        # backends' DCP index kernels collapse `loc // dcp_size` before calling
-        # `translate_kv_loc*`, so everything at or below the v2p table -- byte
-        # budget, compaction moves, translate -- stays on `pool_page_size`.
+        # stored row, of which this rank owns `loc % dcp_size == dcp_rank`;
+        # `KVIndexTranslator.translate_dcp_read_ids` collapses `loc // dcp_size`
+        # before reaching `translate_kv_loc*`, so everything at or below the v2p
+        # table -- byte budget, compaction moves, translate -- stays on
+        # `pool_page_size`.
         # Page ids are invariant under the widening, so v2p/p2v are unchanged.
         self.dcp_size = dcp_size
         self.dcp_rank = dcp_rank
@@ -1004,7 +1005,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """Translate token-granular virtual ids to physical ids.
 
         Under DCP the input is the DCP-collapsed id (`widened // dcp_size`, what
-        every DCP index kernel emits), so this works on `pool_page_size`.
+        `KVIndexTranslator.translate_dcp_read_ids` hands down), so this works on
+        `pool_page_size`.
 
         ``out=`` writes in-place into a caller-owned buffer — required under
         cuda-graph capture for buffer-stability (the captured graph records the

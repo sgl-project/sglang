@@ -930,11 +930,9 @@ class FlashInferMLAIndicesUpdaterDecode:
                 ENTRY_PAGE_SIZE=kv_view.entry_page_size,
             )
 
-            # SHARD BEFORE TRANSLATE. Under DCP the table above is deliberately
-            # VIRTUAL (`is_translated=False`): `plan_dcp_decode_metadata` applies
-            # the owner rule and collapses `loc // dcp_size`, so it must not see
-            # kernel-facing ids. It compacts this rank's shard to the front and
-            # returns its length.
+            # SELECT BEFORE TRANSLATE. Under DCP the table above is deliberately
+            # VIRTUAL (`is_translated=False`): the planner picks this rank's
+            # share, which changes the length, and compacts it to the front.
             n_kernel_ids = paged_kernel_lens_sum
             if get_parallel().dcp_enabled:
                 n_kernel_ids = plan_dcp_decode_metadata(
@@ -949,11 +947,14 @@ class FlashInferMLAIndicesUpdaterDecode:
             # capture-stable buffer the captured wrapper reads, so rebinding the
             # local name would leave the graph on virtual ids. Only the prefix
             # just filled is translated; the stale tail never indexes v2p.
-            if not kv_view.is_translated and n_kernel_ids > 0:
-                translator = self.attn_backend.kv_index_translator
-                if translator.is_translating:
-                    valid = kv_indices[:n_kernel_ids]
-                    valid.copy_(translator.translate_full_attn_ids(valid))
+            translator = self.attn_backend.kv_index_translator
+            if (
+                not kv_view.is_translated
+                and n_kernel_ids > 0
+                and translator.needs_read_translate
+            ):
+                valid = kv_indices[:n_kernel_ids]
+                valid.copy_(translator.translate_dcp_read_ids(valid))
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
