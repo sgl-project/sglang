@@ -801,17 +801,15 @@ class XPUAttentionBackend(AttentionBackend):
     def _forward_encoder_decoder_mha(
         self, *, q, key_cache, value_cache, layer, metadata, decode
     ):
-        """Encoder-decoder MHA on XPU via the non-paged varlen kernel.
+        """Encoder-decoder MHA on XPU via flash_attn_with_kvcache page_size=1.
 
         Whisper/Mllama/MossVL store encoder KV token-granularly in req_to_token
-        (page_size=1 semantics), but the intel_xpu backend forces page_size 64/128
-        and the paged flash_attn_with_kvcache has no page_size==1 variant. Cross-
-        attention (encoder KV) and decoder self-attention (its region begins at a
-        non-page-aligned slot) both misread that layout, so gather the scattered
-        token-slots densely and run flash_attn_varlen_func instead. Eager-only.
+        (page_size=1 semantics). sgl-kernel-xpu PR #454 makes the paged
+        flash_attn_with_kvcache detect a page_size==1 k_cache + page_table and
+        gather + run varlen internally, so the backend just calls it like the FA
+        (CUDA) path. Eager-only. The kernel returns NaN (not zeros) for an empty
+        KV, so the encoder_lens==0 warmup case is still guarded here.
         """
-        k_flat = key_cache.reshape(-1, layer.tp_k_head_num, layer.head_dim)
-        v_flat = value_cache.reshape(-1, layer.tp_v_head_num, layer.head_dim)
         q_rows = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         if layer.is_cross_attention:
             page_table = metadata.encoder_page_table
@@ -821,72 +819,25 @@ class XPUAttentionBackend(AttentionBackend):
             page_table = metadata.page_table
             cache_seqlens = metadata.cache_seqlens_int32
             causal = True
-        return self._varlen_gather_attn(
+        if int(cache_seqlens.max().item()) == 0:
+            return q_rows.new_zeros(
+                (q_rows.shape[0], q_rows.shape[1], value_cache.shape[-1])
+            )
+        # page_size=1 view of the KV pool: PR #454 detects k_cache.shape[1] == 1
+        # and routes flash_attn_with_kvcache to the varlen gather internally.
+        k_cache = key_cache.reshape(-1, 1, layer.tp_k_head_num, layer.head_dim)
+        v_cache = value_cache.reshape(-1, 1, layer.tp_v_head_num, layer.head_dim)
+        return flash_attn_with_kvcache(
             q=q_rows,
-            k_flat=k_flat,
-            v_flat=v_flat,
+            k_cache=k_cache,
+            v_cache=v_cache,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=metadata.cu_seqlens_q,
             max_seqlen_q=1 if decode else metadata.max_seq_len_q,
-            scale=layer.scaling,
+            softmax_scale=layer.scaling,
+            causal=causal,
             softcap=layer.logit_cap,
-            causal=causal,
-        )
-
-    def _varlen_gather_attn(
-        self,
-        *,
-        q,
-        k_flat,
-        v_flat,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        max_seqlen_q,
-        scale,
-        softcap,
-        causal,
-    ):
-        """Dense-gather + non-paged varlen attention (page_size=1 semantics).
-
-        q: (num_rows, Hq, D). k_flat/v_flat: (total_slots, Hk, D) token-slot-indexed
-        KV cache. page_table: (num_reqs, m) token-slot indices, valid entries packed
-        first per row and capped by cache_seqlens. GQA is handled inside the kernel
-        (native Hk, no repeat_interleave). Eager-only: the .item() sync below is
-        never valid under graph capture.
-        """
-        seqlens = cache_seqlens.to(torch.long)
-        max_seqlen_k = int(seqlens.max().item())
-        if max_seqlen_k == 0:
-            # Zero-length keys (e.g. Whisper text-only warmup, encoder_lens==0):
-            # the varlen kernel's empty-key behavior is unreliable on XPU, so
-            # short-circuit to a zero context instead of launching it.
-            return q.new_zeros((q.shape[0], q.shape[1], v_flat.shape[-1]))
-
-        m = page_table.shape[1]
-        valid = torch.arange(m, device=page_table.device).unsqueeze(
-            0
-        ) < seqlens.unsqueeze(1)
-        flat_slots = page_table.to(torch.long)[valid]
-        k_ragged = k_flat.index_select(0, flat_slots).contiguous()
-        v_ragged = v_flat.index_select(0, flat_slots).contiguous()
-        cu_seqlens_k = torch.nn.functional.pad(
-            torch.cumsum(cache_seqlens.to(torch.int32), dim=0, dtype=torch.int32),
-            (1, 0),
-        )
-        return flash_attn_varlen_func(
-            q=q.contiguous(),
-            k=k_ragged,
-            v=v_ragged,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=scale,
-            causal=causal,
-            softcap=softcap,
-            return_softmax_lse=False,
         )
 
     def forward_decode(

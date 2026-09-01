@@ -1,14 +1,16 @@
-"""Real-device XPU tests for the encoder-decoder varlen attention path.
+"""Real-device XPU tests for the encoder-decoder attention path.
 
-Unlike test_encoder_decoder_varlen_gather.py (CPU, kernel mocked), these run the
-actual sgl-kernel-xpu flash_attn_varlen_func on an XPU. They guard two things the
-mocked test cannot:
-  1. the dense gather + varlen kernel produce correct attention on hardware, and
-  2. encoder_lens == 0 short-circuits to zeros WITHOUT faulting the device
-     (an empty-KV varlen call is UR_RESULT_ERROR_DEVICE_LOST on XPU).
+The backend calls flash_attn_with_kvcache with a page_size=1 view; sgl-kernel-xpu
+PR #454 detects that and gathers + runs varlen inside the kernel. These run on an
+actual XPU and guard two things a mocked CPU test cannot:
+  1. our _forward_encoder_decoder_mha + the real kernel produce correct attention
+     for a scattered (non-page-aligned) token-slot layout, and
+  2. encoder_lens == 0 short-circuits to zeros WITHOUT reaching the kernel (whose
+     page_size=1 path returns NaN for an empty KV).
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -56,10 +58,9 @@ class TestXPUEncoderDecoderVarlen(CustomTestCase):
         torch.manual_seed(0)
         self.dev = torch.device("xpu")
         self.backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
-        self.backend.num_splits = 0
         self.backend.is_encoder_decoder = True
         # Deliberately scattered (non-page-aligned) slot indices: a paged kernel
-        # would mis-read these; the dense gather must be alignment-agnostic.
+        # would mis-read these; the page_size=1 gather must be alignment-agnostic.
         perm = torch.randperm(self.TOTAL_SLOTS)
         self.k_flat = torch.randn(
             self.TOTAL_SLOTS, self.H, self.D, dtype=torch.bfloat16, device=self.dev
@@ -86,21 +87,38 @@ class TestXPUEncoderDecoderVarlen(CustomTestCase):
             .to(self.dev)
         )
         q = torch.randn(num_rows, self.H, self.D, dtype=torch.bfloat16, device=self.dev)
-        scale = 0.5
-        max_seqlen_q = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max())
-
-        got = self.backend._varlen_gather_attn(
-            q=q,
-            k_flat=self.k_flat,
-            v_flat=self.v_flat,
+        # causal=True is decoder self-attn (page_table); causal=False is cross-attn
+        # (encoder_page_table). Point both metadata pairs at the same test tensors
+        # so _forward_encoder_decoder_mha's dispatch reads the intended one.
+        metadata = SimpleNamespace(
+            encoder_page_table=page_table,
+            encoder_lens_int32=cache_seqlens,
             page_table=page_table,
-            cache_seqlens=cache_seqlens,
+            cache_seqlens_int32=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            scale=scale,
-            softcap=0.0,
-            causal=causal,
+            max_seq_len_q=1,
         )
+        layer = SimpleNamespace(
+            is_cross_attention=not causal,
+            tp_q_head_num=self.H,
+            tp_k_head_num=self.H,
+            tp_v_head_num=self.H,
+            head_dim=self.D,
+            scaling=0.5,
+            logit_cap=0.0,
+        )
+        key_cache = self.k_flat.view(-1, 1, self.H, self.D)
+        value_cache = self.v_flat.view(-1, 1, self.H, self.D)
+
+        got = self.backend._forward_encoder_decoder_mha(
+            q=q,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            layer=layer,
+            metadata=metadata,
+            decode=True,
+        )
+        torch.xpu.synchronize()
         want = _sdpa_ref(
             q=q,
             k_flat=self.k_flat,
@@ -108,7 +126,7 @@ class TestXPUEncoderDecoderVarlen(CustomTestCase):
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
-            scale=scale,
+            scale=layer.scaling,
             causal=causal,
         )
         self.assertEqual(tuple(got.shape), (num_rows, self.H, self.D))
@@ -132,10 +150,9 @@ class TestXPUEncoderDecoderVarlen(CustomTestCase):
 
     def test_encoder_lens_zero_no_device_loss(self):
         # The exact Whisper text-only warmup path: a cross-attention layer with
-        # encoder_lens == 0. Launching the empty-KV kernel here would fault the XPU
-        # (UR_RESULT_ERROR_DEVICE_LOST); the guard must return zeros instead.
-        from types import SimpleNamespace
-
+        # encoder_lens == 0. PR #454's page_size=1 kernel returns NaN for an empty
+        # KV, so _forward_encoder_decoder_mha must short-circuit to zeros and never
+        # reach the kernel.
         metadata = SimpleNamespace(
             encoder_page_table=torch.zeros(1, 0, dtype=torch.int32, device=self.dev),
             encoder_lens_int32=torch.zeros(1, dtype=torch.int32, device=self.dev),
@@ -170,7 +187,7 @@ class TestXPUEncoderDecoderVarlen(CustomTestCase):
         self.assertTrue(bool((out == 0).all()))
 
         # Device must still be alive: a subsequent real op would raise
-        # UR_RESULT_ERROR_DEVICE_LOST if the empty-KV call had faulted it.
+        # UR_RESULT_ERROR_DEVICE_LOST if an empty-KV kernel call had faulted it.
         probe = (torch.ones(4, device=self.dev) * 2).sum()
         torch.xpu.synchronize()
         self.assertEqual(int(probe.item()), 8)
