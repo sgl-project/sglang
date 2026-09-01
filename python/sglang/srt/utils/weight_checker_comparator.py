@@ -6,6 +6,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
+    unshuffle_aiter_fp8_weight,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
@@ -43,27 +44,6 @@ class ComparableWeight:
 
     def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         raise NotImplementedError
-
-
-def _unshuffle_aiter_fp8_weight(w_q: torch.Tensor) -> torch.Tensor:
-    """Undo AITER shuffle_weight with layout=(16, 16) for FP8 weights."""
-    if w_q.element_size() != 1:
-        raise ValueError("AITER FP8 unshuffle requires a one-byte element type")
-
-    shape = w_q.shape
-    n, k = shape[-2:]
-    if n % 16 != 0 or k % 32 != 0:
-        raise ValueError(
-            "AITER (16, 16) FP8 layout requires N % 16 == 0 and K % 32 == 0, "
-            f"got shape {tuple(shape)}"
-        )
-
-    return (
-        w_q.reshape(-1, n // 16, k // 32, 2, 16, 16)
-        .permute(0, 1, 4, 2, 3, 5)
-        .contiguous()
-        .reshape(shape)
-    )
 
 
 class Fp8BlockComparable(ComparableWeight):
@@ -121,7 +101,7 @@ class Fp8BlockComparable(ComparableWeight):
         for q, s_chunk in self._iter_quant_chunks(self.w_q, s, block_size[0]):
             q, s_chunk = q.cuda(), s_chunk.cuda()
             if self.is_shuffled:
-                q = _unshuffle_aiter_fp8_weight(q)
+                q = unshuffle_aiter_fp8_weight(q)
             yield (
                 block_quant_dequant(q, s_chunk, block_size, dtype=torch.bfloat16),
                 block_quant_dequant(
@@ -133,7 +113,7 @@ class Fp8BlockComparable(ComparableWeight):
         s, block_size = self._scale_and_block_size()
         w_q = self.w_q
         if self.is_shuffled:
-            w_q = _unshuffle_aiter_fp8_weight(w_q)
+            w_q = unshuffle_aiter_fp8_weight(w_q)
         return block_quant_dequant(w_q, s, block_size, dtype=dtype)
 
 
