@@ -5,7 +5,9 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.entrypoints import engine as engine_module
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.environ import envs
-from sglang.srt.managers.rust_server import RustServer
+from sglang.srt.runtime_context import reset_context
+from sglang.srt.rust_server.server import RustServer
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -15,13 +17,7 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 class TestRustServerDpLocalPorts(CustomTestCase):
     def test_two_nodes_reuse_the_same_http_ports(self):
         server_cls = MagicMock()
-        server_args = SimpleNamespace(
-            host="0.0.0.0",
-            port=30000,
-            nnodes=2,
-            preferred_sampling_params=None,
-            mm_processor_worker_num=0,
-        )
+        server_args = SimpleNamespace(nnodes=2)
 
         with (
             patch(
@@ -29,49 +25,42 @@ class TestRustServerDpLocalPorts(CustomTestCase):
                 return_value=SimpleNamespace(Server=server_cls),
             ),
             patch(
-                "sglang.srt.managers.rust_server.get_serving",
+                "sglang.srt.rust_server.server.get_serving",
                 return_value=SimpleNamespace(
-                    host="0.0.0.0", preferred_sampling_params=None
+                    host="0.0.0.0", port=30000, preferred_sampling_params=None
                 ),
             ),
-            patch.object(RustServer, "_partition_cores", return_value=(None, None)),
-            patch.object(RustServer, "_build_server_args", return_value="{}"),
+            patch(
+                "sglang.srt.rust_server.server._partition_cores",
+                return_value=(None, None),
+            ),
+            patch(
+                "sglang.srt.rust_server.server._build_server_args",
+                return_value="{}",
+            ),
         ):
-            for global_rank in range(8):
+            for global_rank in range(4):
                 scheduler = SimpleNamespace(
                     server_args=server_args,
-                    ps=SimpleNamespace(attn_dp_rank=global_rank, dp_size=8),
+                    ps=SimpleNamespace(attn_dp_rank=global_rank, dp_size=4),
                     model_config=SimpleNamespace(is_multimodal=False),
                 )
                 RustServer.launch(scheduler)
 
-        ports = [call.kwargs["http_addr"] for call in server_cls.call_args_list]
-        self.assertEqual(
-            ports,
-            [
-                "0.0.0.0:30000",
-                "0.0.0.0:30001",
-                "0.0.0.0:30002",
-                "0.0.0.0:30003",
-            ]
-            * 2,
-        )
+        offsets = [call.kwargs["port_offset"] for call in server_cls.call_args_list]
+        self.assertEqual(offsets, [0, 1, 0, 1])
 
     def test_nonzero_node_does_not_start_dummy_server_for_rust_dp(self):
-        server_args = SimpleNamespace(
-            check_server_args=MagicMock(),
-            remote_instance_weight_loader_start_seed_via_transfer_engine=False,
-            reasoning_parser=None,
-            tool_call_parser=None,
-            weight_cache_mode=None,
-            enable_elastic_expert_backup=False,
-            elastic_ep_backend=None,
+        server_args = ServerArgs(
+            model_path="dummy",
+            nnodes=2,
             node_rank=1,
-            host="0.0.0.0",
-            port=30000,
-            enable_metrics=False,
-            dp_size=8,
+            tp_size=4,
+            dp_size=4,
+            enable_dp_attention=True,
         )
+        server_args.check_server_args = MagicMock()
+        self.addCleanup(reset_context)
         scheduler_init_result = SimpleNamespace(
             all_child_pids=[],
             scheduler_infos=[],

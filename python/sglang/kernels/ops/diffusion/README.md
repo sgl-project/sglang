@@ -140,7 +140,8 @@ tensor copy per residual site.
 ### Data movement (all bit-exact by construction)
 
 `usp_merge_heads`, `pack_qkv_destination_major`, `fused_pack_qkv`,
-`fused_scatter_to_padded`, `fused_causal_conv3d_cat_pad_cuda`,
+`fused_pack_segmented_qkv`, `fused_scatter_to_padded`,
+`fused_causal_conv3d_cat_pad_cuda`,
 `cat_pad_channels_last_3d`, `dup_up3d_add`, `fused_temb_table_slices`,
 `ltx2_ada_values9`.
 

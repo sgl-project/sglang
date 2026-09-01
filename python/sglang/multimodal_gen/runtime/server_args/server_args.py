@@ -81,6 +81,7 @@ from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
 )
 from sglang.multimodal_gen.utils import (
+    PRECISION_TO_TYPE,
     FlexibleArgumentParser,
     StoreBoolean,
     expand_path_fields,
@@ -108,6 +109,23 @@ def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
 
 def is_ltx2_two_stage_pipeline_name(pipeline_class_name: str | None) -> bool:
     return pipeline_class_name in LTX2_TWO_STAGE_PIPELINE_NAMES
+
+
+def _normalize_component_precisions(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError("component_precisions must be a mapping")
+
+    normalized: dict[str, str] = {}
+    for component, precision in value.items():
+        component_name = str(component).strip().replace("-", "_")
+        precision_name = str(precision).strip().lower()
+        if not component_name or precision_name not in PRECISION_TO_TYPE:
+            raise ValueError(
+                "Component precision entries require a component and one of "
+                f"{sorted(PRECISION_TO_TYPE)}"
+            )
+        normalized[component_name] = precision_name
+    return normalized
 
 
 class Backend(str, Enum):
@@ -233,6 +251,9 @@ class ServerArgs(DisaggServerArgsMixin):
     component_attention_backends: dict[str, str] | str | None = field(
         default_factory=dict
     )
+    _requested_component_attention_backends: dict[str, str] | None = field(
+        default=None, repr=False, compare=False
+    )
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
@@ -312,6 +333,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # Explicit quantization override for one component. Self-describing
     # checkpoints remain auto-detected and do not need this override.
     component_quantizations: dict[str, str] = field(default_factory=dict)
+    # Exact load and execution precision overrides for components whose native
+    # loader advertises this capability.
+    component_precisions: dict[str, str] = field(default_factory=dict)
     # Component-local layer name patterns to skip during online quantization.
     component_quantization_ignored_layers: dict[str, list[str]] = field(
         default_factory=dict
@@ -937,6 +961,16 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.component_attention_backends
             )
         )
+        if self._requested_component_attention_backends is None:
+            self._requested_component_attention_backends = dict(
+                self.component_attention_backends
+            )
+        else:
+            self._requested_component_attention_backends = (
+                self._normalize_component_attention_backends(
+                    self._requested_component_attention_backends
+                )
+            )
 
         # attention_backend_config
         if self.attention_backend_config is None:
@@ -1165,6 +1199,13 @@ class ServerArgs(DisaggServerArgsMixin):
                 if backend is not None:
                     return AttentionBackendEnum[backend.upper()], backend_key
         return None, None
+
+    def requested_component_attention_backend(self, component_name: str) -> str | None:
+        assert self._requested_component_attention_backends is not None
+        return self._requested_component_attention_backends.get(component_name)
+
+    def has_requested_component_attention_backends(self) -> bool:
+        return bool(self._requested_component_attention_backends)
 
     def is_component_attention_backend_automatic(
         self, component_name: str | None
@@ -1768,6 +1809,9 @@ class ServerArgs(DisaggServerArgsMixin):
             component_weights_paths[component] = path
         self.component_paths = component_paths
         self.component_weights_paths = component_weights_paths
+        self.component_precisions = _normalize_component_precisions(
+            self.component_precisions
+        )
         normalized_direct_gpu_loading: dict[str, bool] = {}
         for component, enabled in self.component_direct_gpu_weight_loading.items():
             component_name = str(component).strip().replace("-", "_")
@@ -2873,7 +2917,8 @@ class ServerArgs(DisaggServerArgsMixin):
         unknown_args: list[str],
         *,
         option_prefixes: tuple[str, ...],
-        alias_suffix: str,
+        alias_suffix: str | None,
+        expand_values: bool = True,
     ) -> tuple[dict[str, str], list[str]]:
         component_values: dict[str, str] = {}
         remaining: list[str] = []
@@ -2888,6 +2933,7 @@ class ServerArgs(DisaggServerArgsMixin):
                     break
             if (
                 component is None
+                and alias_suffix is not None
                 and key_part.startswith("--")
                 and key_part.endswith(alias_suffix)
             ):
@@ -2909,10 +2955,12 @@ class ServerArgs(DisaggServerArgsMixin):
                 remaining.append(arg)
             i += 1
 
-        return {
-            component: os.path.expanduser(value)
-            for component, value in component_values.items()
-        }, remaining
+        if expand_values:
+            component_values = {
+                component: os.path.expanduser(value)
+                for component, value in component_values.items()
+            }
+        return component_values, remaining
 
     @classmethod
     def _extract_component_paths(
@@ -3000,6 +3048,19 @@ class ServerArgs(DisaggServerArgsMixin):
                 "--component_quantizations.",
             ),
             alias_suffix="-quantization",
+        )
+
+    @classmethod
+    def _extract_component_precisions(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract exact component precision overrides."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=("--component-precisions.", "--component_precisions."),
+            alias_suffix=None,
+            expand_values=False,
         )
 
     @staticmethod
@@ -3092,6 +3153,7 @@ class ServerArgs(DisaggServerArgsMixin):
         dynamic_quantizations, remaining = cls._extract_component_quantizations(
             unknown_args
         )
+        dynamic_precisions, remaining = cls._extract_component_precisions(remaining)
         dynamic_direct_gpu_loading, remaining = (
             cls._extract_component_direct_gpu_weight_loading(remaining)
         )
@@ -3138,6 +3200,11 @@ class ServerArgs(DisaggServerArgsMixin):
             existing.update(dynamic_quantizations)
             provided_args["component_quantizations"] = existing
             explicit_arg_names.add("component_quantizations")
+        if dynamic_precisions:
+            existing = dict(provided_args.get("component_precisions") or {})
+            existing.update(dynamic_precisions)
+            provided_args["component_precisions"] = existing
+            explicit_arg_names.add("component_precisions")
         if dynamic_direct_gpu_loading:
             existing = dict(
                 provided_args.get("component_direct_gpu_weight_loading") or {}
