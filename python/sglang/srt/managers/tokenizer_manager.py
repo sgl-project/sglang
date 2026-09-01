@@ -1857,18 +1857,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.mm_inputs.mm_items = [
                         copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                     ]
-                tokenized_obj.rid = tmp_obj.regenerate_rid()
+                # This request only warms the radix cache. It is named under the
+                # first sample of its prompt, the one rid reachable from here, so
+                # that it still falls inside the family a prefix abort covers.
+                tmp_obj.rid = f"{objs[i].rid}_prime"
+                tokenized_obj.rid = tmp_obj.rid
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
+                # _tokenize_one_request pointed time_stats at the first sample's
+                # state; warmup timings belong to this request instead.
+                tokenized_obj.time_stats = self.rid_to_state[tmp_obj.rid].time_stats
                 self._send_one_request(tokenized_obj)
                 await self._wait_one_response(tmp_obj, request).__anext__()
 
-            # Expand requests, assign new rids for them, and send them
+            # Send one request per sample, consuming the rids normalization already
+            # derived. Their states were created up front by _init_req_state.
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
-                    tmp_obj = copy.copy(objs[i])
+                for j in range(obj.parallel_sample_num):
+                    sub_obj = obj[i + batch_size * j]
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
                     if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
@@ -1876,18 +1884,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         tokenized_obj.mm_inputs.mm_items = [
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
-                    tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    self._init_req_state(tmp_obj)
-                    state = self.rid_to_state[tmp_obj.rid]
+                    tokenized_obj.rid = sub_obj.rid
+                    state = self.rid_to_state[sub_obj.rid]
                     tokenized_obj.time_stats = state.time_stats
-                    if tmp_obj.return_prompt_token_ids:
+                    if sub_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
                     self._send_one_request(tokenized_obj)
-                    generators.append(self._wait_one_response(tmp_obj, request))
-                    rids.append(tmp_obj.rid)
-
-                self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
-                del self.rid_to_state[objs[i].rid]
+                    generators.append(self._wait_one_response(sub_obj, request))
+                    rids.append(sub_obj.rid)
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream

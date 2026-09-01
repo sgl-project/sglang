@@ -12,6 +12,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.entrypoints.request_headers import resolve_rid_from_headers
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
@@ -297,18 +298,13 @@ class OpenAIServingBase(ABC):
         raw_request: Request,
         body_rid: Optional[Union[List[str], str]] = None,
     ) -> Optional[Union[List[str], str]]:
-        """Extract rid from the x-request-id header, taking precedence over the body rid.
+        """Resolve the rid, preferring the x-request-id header over the body rid.
 
-        A single rid is returned as a string; "rid_0, rid_1" yields a list of two.
+        One header value labels the whole request and a batch expands it into
+        per-item rids; several values label the items directly.
         """
         if raw_request is None:
             return body_rid
 
-        header_value = raw_request.headers.get("x-request-id")
-        if header_value is None:
-            return body_rid
-
-        rids = [segment.strip() for segment in header_value.split(",") if segment.strip()]
-        if not rids:
-            return body_rid
-        return rids[0] if len(rids) == 1 else rids
+        header_rid = resolve_rid_from_headers(raw_request.headers)
+        return header_rid if header_rid is not None else body_rid

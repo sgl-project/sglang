@@ -49,6 +49,7 @@ if "sgl_kernel" not in sys.modules:
     sys.meta_path.insert(0, _SglKernelMockFinder())
 
 from fastapi import Request
+from starlette.datastructures import Headers
 
 from sglang.srt.entrypoints.openai.protocol import (
     EmbeddingRequest,
@@ -365,85 +366,34 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         )
 
     # ---------- x-request-id header passthrough ----------
-    def test_rid_from_header_single_value(self):
-        """A single x-request-id header value maps to a plain string rid."""
-        raw = Mock(spec=Request)
-        raw.headers = {"x-request-id": "single-rid"}
-        self.assertEqual(
-            self.serving_embedding.extract_rid_from_header(raw, None), "single-rid"
-        )
+    def test_batch_expands_one_header_rid_per_item(self):
+        """One header rid labels a batch, expanded into per-item rids.
 
-    def test_rid_from_header_comma_separated_list(self):
-        """Comma-separated header values map to a stripped rid list."""
-        raw = Mock(spec=Request)
-        raw.headers = {"x-request-id": "a, b ,c"}
-        self.assertEqual(
-            self.serving_embedding.extract_rid_from_header(raw, None),
-            ["a", "b", "c"],
-        )
-
-    def test_rid_from_header_trailing_comma_ignored(self):
-        """An empty trailing segment is dropped, leaving the single rid."""
-        raw = Mock(spec=Request)
-        raw.headers = {"x-request-id": "abc,"}
-        self.assertEqual(
-            self.serving_embedding.extract_rid_from_header(raw, None), "abc"
-        )
-
-    def test_rid_from_header_falls_back_to_body(self):
-        """Missing or blank headers fall back to the body rid field."""
-        raw = Mock(spec=Request)
-        raw.headers = {}
-        self.assertEqual(
-            self.serving_embedding.extract_rid_from_header(raw, "body-rid"),
-            "body-rid",
-        )
-
-        raw.headers = {"x-request-id": ", "}
-        self.assertEqual(
-            self.serving_embedding.extract_rid_from_header(raw, "body-rid"),
-            "body-rid",
-        )
-
-        self.assertEqual(
-            self.serving_embedding.extract_rid_from_header(None, "body-rid"),
-            "body-rid",
-        )
-
-    def test_batch_rid_list_from_header_normalizes_per_item(self):
-        """A comma-separated header rid maps to each item of a batch."""
-        batch_req = EmbeddingRequest(
-            model="test-model",
-            input=["first", "second"],
-            encoding_format="float",
-        )
-        raw = Mock(spec=Request)
-        raw.headers = {"x-request-id": "batch_0, batch_1"}
-
-        adapted, _ = self.serving_embedding._convert_to_internal_request(
-            batch_req, raw
-        )
-        adapted.normalize_batch_and_arguments()
-
+        A gateway emits a single x-request-id per HTTP request and cannot know the
+        batch size, so a batch must not require one rid per item.
+        """
+        adapted = self._adapt_batch({"x-request-id": "batch"})
         self.assertEqual(adapted.rid, ["batch_0", "batch_1"])
-        self.assertEqual(adapted[0].rid, "batch_0")
-        self.assertEqual(adapted[1].rid, "batch_1")
+        self.assertEqual([adapted[0].rid, adapted[1].rid], ["batch_0", "batch_1"])
 
-    def test_batch_with_single_header_rid_is_rejected(self):
-        """One header rid for a batch is a ValueError (400), not an assertion crash."""
+    def test_batch_takes_per_item_rids_from_the_header(self):
+        """Several header values label the batch items directly, in wire order."""
+        adapted = self._adapt_batch({"x-request-id": "first, second"})
+        self.assertEqual(adapted.rid, ["first", "second"])
+        self.assertEqual([adapted[0].rid, adapted[1].rid], ["first", "second"])
+
+    def _adapt_batch(self, headers: dict):
         batch_req = EmbeddingRequest(
             model="test-model",
             input=["first", "second"],
             encoding_format="float",
         )
         raw = Mock(spec=Request)
-        raw.headers = {"x-request-id": "batch"}
+        raw.headers = Headers(headers)
 
-        adapted, _ = self.serving_embedding._convert_to_internal_request(
-            batch_req, raw
-        )
-        with self.assertRaisesRegex(ValueError, "requires 2 rids"):
-            adapted.normalize_batch_and_arguments()
+        adapted, _ = self.serving_embedding._convert_to_internal_request(batch_req, raw)
+        adapted.normalize_batch_and_arguments()
+        return adapted
 
 
 if __name__ == "__main__":

@@ -677,11 +677,112 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         )
         batch.normalize_batch_and_arguments()
 
-        self.assertEqual(batch.rid, ["batch_0", "batch_1", "batch_2", "batch_3"])
+        self.assertEqual(
+            batch.rid, ["batch_0_0", "batch_1_0", "batch_0_1", "batch_1_1"]
+        )
         self.assertEqual(
             [batch[i].rid for i in range(4)],
-            ["batch_0", "batch_1", "batch_2", "batch_3"],
+            ["batch_0_0", "batch_1_0", "batch_0_1", "batch_1_1"],
         )
+
+    def test_rid_expansion_pairs_each_rid_with_its_prompt(self):
+        """A derived rid must sit at the index of the prompt it labels.
+
+        The expanded arrays are sample-major (`text * parallel_sample_num`), so a
+        rid array built prompt-major would attach every rid to the wrong prompt
+        from the second sample onwards, and nothing else would notice.
+        """
+        req = GenerateReqInput(text=["p0", "p1"], rid="R", sampling_params={"n": 3})
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(
+            [(req[k].text, req[k].rid) for k in range(6)],
+            [
+                ("p0", "R_0_0"),
+                ("p1", "R_1_0"),
+                ("p0", "R_0_1"),
+                ("p1", "R_1_1"),
+                ("p0", "R_0_2"),
+                ("p1", "R_1_2"),
+            ],
+        )
+
+    def test_rid_suffix_is_added_only_for_dimensions_that_expand(self):
+        """A single prompt sampled n times gets one suffix level, not two."""
+        single = GenerateReqInput(text="hi", rid="R", sampling_params={"n": 3})
+        single.normalize_batch_and_arguments()
+        self.assertEqual(single.rid, ["R_0", "R_1", "R_2"])
+
+        no_sampling = GenerateReqInput(text=["p0", "p1"], rid="R")
+        no_sampling.normalize_batch_and_arguments()
+        self.assertEqual(no_sampling.rid, ["R_0", "R_1"])
+
+    def test_caller_rids_become_prefixes_of_their_samples(self):
+        """Per-prompt rids stay the prefix of the samples derived from them.
+
+        The scheduler aborts a family by prefix, so a caller-supplied rid has to
+        remain a prefix of every request it expands into.
+        """
+        req = GenerateReqInput(
+            text=["p0", "p1"], rid=["a", "b"], sampling_params={"n": 3}
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req.rid, ["a_0", "b_0", "a_1", "b_1", "a_2", "b_2"])
+        self.assertTrue(all(rid.startswith(("a_", "b_")) for rid in req.rid))
+
+    def test_caller_may_name_every_sample_itself(self):
+        """Per-sample rids are grouped by prompt, the way choices come back.
+
+        Choices are ordered prompt-major (`idx // n`) while the expanded lists are
+        sample-major, so the two orders must not be confused: reading the caller's
+        list positionally would attach every rid past the first sample to the
+        wrong prompt.
+        """
+        req = GenerateReqInput(
+            text=["p0", "p1"],
+            rid=["a", "b", "c", "d", "e", "f"],
+            sampling_params={"n": 3},
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(
+            [(req[k].text, req[k].rid) for k in range(6)],
+            [
+                ("p0", "a"),
+                ("p1", "d"),
+                ("p0", "b"),
+                ("p1", "e"),
+                ("p0", "c"),
+                ("p1", "f"),
+            ],
+        )
+
+    def test_rid_list_length_must_match_requests_or_samples(self):
+        req = GenerateReqInput(
+            text=["p0", "p1"], rid=["a", "b", "c"], sampling_params={"n": 3}
+        )
+        with self.assertRaisesRegex(
+            ValueError, "either 2 rids, one per request, or 6 rids, one per sample"
+        ):
+            req.normalize_batch_and_arguments()
+
+        without_sampling = GenerateReqInput(text=["p0", "p1"], rid=["a", "b", "c"])
+        with self.assertRaisesRegex(ValueError, "takes 2 rids, but got 3"):
+            without_sampling.normalize_batch_and_arguments()
+
+    def test_per_item_n_is_rejected(self):
+        """rid derivation lays out a rectangle, which a per-item n would break.
+
+        `_normalize_rid` emits one full pass over the prompts per sample. That
+        layout only lines up with the other expanded lists while every item of
+        the batch shares one n.
+        """
+        req = GenerateReqInput(text=["p0", "p1"], sampling_params=[{"n": 2}, {"n": 3}])
+        with self.assertRaisesRegex(
+            ValueError, "parallel_sample_num should be the same"
+        ):
+            req.normalize_batch_and_arguments()
 
     def test_audio_data_handling(self):
         """Test handling of audio_data."""
@@ -1062,17 +1163,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertTrue(req[0].return_prompt_token_ids)
         self.assertTrue(req[1].return_prompt_token_ids)
 
-    def test_regenerate_rid(self):
-        """Test the regenerate_rid method."""
-        req = GenerateReqInput(text="Hello")
-        req.normalize_batch_and_arguments()
-
-        original_rid = req.rid
-        new_rid = req.regenerate_rid()
-
-        self.assertNotEqual(original_rid, new_rid)
-        self.assertEqual(req.rid, new_rid)
-
     def test_error_cases(self):
         """Test various error cases."""
         # Test when neither text, input_ids, nor input_embeds is provided
@@ -1164,11 +1254,28 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "must match batch size"):
             req.normalize_batch_and_arguments()
 
-    def test_batch_requires_one_rid_per_item(self):
-        """A single rid cannot label a batch: each item is an independent request."""
+    def test_batch_expands_a_single_rid_per_item(self):
+        """One rid labels a whole batch, suffixed per item as GenerateReqInput does.
+
+        Before, a string rid hit `assert isinstance(self.rid, list)`, so any batch
+        embedding carrying an x-request-id header failed as a 500.
+        """
         req = EmbeddingReqInput(text=["first", "second"], rid="batch")
-        with self.assertRaisesRegex(ValueError, "requires 2 rids"):
-            req.normalize_batch_and_arguments()
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.rid, ["batch_0", "batch_1"])
+        self.assertEqual([req[0].rid, req[1].rid], ["batch_0", "batch_1"])
+
+    def test_single_request_rejects_a_rid_list(self):
+        """A non-batch request must not carry several rids.
+
+        rid keys `rid_to_state`, so a list reaches the dict and raises an
+        unhashable-type TypeError, which surfaces as a 500 rather than a 400.
+        """
+        for cls in (GenerateReqInput, EmbeddingReqInput):
+            with self.subTest(cls=cls.__name__):
+                req = cls(text="only one", rid=["a", "b"])
+                with self.assertRaisesRegex(ValueError, "takes one rid"):
+                    req.normalize_batch_and_arguments()
 
     def test_batch_rid_list_must_match_item_count(self):
         """Exact rid lists are preserved per item; a wrong length is rejected."""

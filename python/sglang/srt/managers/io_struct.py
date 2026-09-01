@@ -339,14 +339,6 @@ class GenerateReqInput:
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
 
-    def regenerate_rid(self):
-        """Generate a new request ID and return it."""
-        if isinstance(self.rid, list):
-            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
-        else:
-            self.rid = uuid.uuid4().hex
-        return self.rid
-
     def _validate_rid_uniqueness(self):
         """Validate that request IDs within a batch are unique."""
         if isinstance(self.rid, list) and len(set(self.rid)) != len(self.rid):
@@ -490,6 +482,9 @@ class GenerateReqInput:
             self.sampling_params = {}
         if self.rid is None:
             self.rid = uuid.uuid4().hex
+        elif not isinstance(self.rid, str):
+            # rid keys rid_to_state, so a list here reaches the dict unhashable.
+            raise ValueError(f"A single request takes one rid, got {self.rid!r}.")
         if self.return_logprob is None:
             self.return_logprob = False
         if self.logprob_start_len is None:
@@ -511,16 +506,13 @@ class GenerateReqInput:
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
-        # Calculate expanded batch size
-        if self.parallel_sample_num == 1:
-            num = self.batch_size
-        else:
-            # Expand parallel_sample_num
-            num = self.batch_size * self.parallel_sample_num
+        batch_size = self.batch_size
+        n = self.parallel_sample_num
+        num = batch_size * n
 
         # Expand input based on type
-        self._expand_inputs(num)
-        self._normalize_rid(num)
+        self._expand_inputs(n=n)
+        self._normalize_rid(batch_size=batch_size, n=n)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
         self._normalize_mm_hashes(num)
@@ -534,12 +526,17 @@ class GenerateReqInput:
         self._normalize_cache_salt(num)
         self._normalize_bootstrap_params(num)
 
-    def _expand_inputs(self, num):
-        """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
+    def _expand_inputs(self, n: int):
+        """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling.
+
+        Repeating the whole list makes one full pass over the prompts per sample,
+        so index ``k`` is prompt ``k % batch_size`` and sample ``k // batch_size``.
+        Every other expanded list, `_normalize_rid` included, follows this layout.
+        """
         if self.text is not None:
             if not isinstance(self.text, list):
                 raise ValueError("Text should be a list for batch processing.")
-            self.text = self.text * self.parallel_sample_num
+            self.text = self.text * n
         elif self.input_ids is not None:
             if not isinstance(self.input_ids, list) or not isinstance(
                 self.input_ids[0], list
@@ -547,11 +544,11 @@ class GenerateReqInput:
                 raise ValueError(
                     "input_ids should be a list of lists for batch processing."
                 )
-            self.input_ids = self.input_ids * self.parallel_sample_num
+            self.input_ids = self.input_ids * n
         elif self.input_embeds is not None:
             if not isinstance(self.input_embeds, list):
                 raise ValueError("input_embeds should be a list for batch processing.")
-            self.input_embeds = self.input_embeds * self.parallel_sample_num
+            self.input_embeds = self.input_embeds * n
 
     def _normalize_lora_paths(self, num):
         """Normalize LoRA paths for batch processing."""
@@ -667,22 +664,59 @@ class GenerateReqInput:
         else:  # Already a list
             self.sampling_params = self.sampling_params * self.parallel_sample_num
 
-    def _normalize_rid(self, num):
-        """Normalize request IDs for batch processing."""
+    def _normalize_rid(self, batch_size: int, n: int):
+        """Assign one rid per sub-request, keeping the caller's rid as the prefix.
+
+        A suffix level is added only for a dimension that expands, so one prompt
+        sampled n times yields ``rid_0 .. rid_{n-1}``. The shared prefix is what
+        lets the scheduler abort a whole family at once. A caller may name every
+        sample instead, in which case nothing is derived.
+
+        Ordering follows `_expand_inputs`, so index ``k`` labels the same
+        sub-request in every normalized list.
+        """
         if self.rid is None:
-            self.rid = [uuid.uuid4().hex for _ in range(num)]
+            parents = [uuid.uuid4().hex for _ in range(batch_size)]
         elif isinstance(self.rid, str):
-            new_rids = [f"{self.rid}_{i}" for i in range(num)]
-            self.rid = new_rids
+            parents = (
+                [self.rid]
+                if batch_size == 1
+                else [f"{self.rid}_{i}" for i in range(batch_size)]
+            )
         elif isinstance(self.rid, list):
-            # Note: the length of rid shall be the same as the batch_size,
-            # as the rid would be expanded for parallel sampling in tokenizer_manager
-            if len(self.rid) != self.batch_size:
+            if n > 1 and len(self.rid) == batch_size * n:
+                # Every sub-request is named already. Callers group by prompt, the
+                # way choices come back, so reorder into the sample-major layout
+                # the expanded lists use.
+                per_sample = self.rid
+                self.rid = [
+                    per_sample[prompt * n + sample]
+                    for sample in range(n)
+                    for prompt in range(batch_size)
+                ]
+                return
+            if len(self.rid) != batch_size:
+                if n == 1:
+                    raise ValueError(
+                        f"A batch of {batch_size} requests takes {batch_size} "
+                        f"rids, but got {len(self.rid)}."
+                    )
                 raise ValueError(
-                    "The specified rids length mismatch with the batch_size for batch processing."
+                    f"A batch of {batch_size} requests sampled {n} times takes "
+                    f"either {batch_size} rids, one per request, or "
+                    f"{batch_size * n} rids, one per sample, "
+                    f"but got {len(self.rid)}."
                 )
+            parents = self.rid
         else:
             raise ValueError("The rid should be a string or a list of strings.")
+
+        if n == 1:
+            self.rid = parents
+        else:
+            self.rid = [
+                f"{parent}_{sample}" for sample in range(n) for parent in parents
+            ]
 
     def _normalize_logprob_params(self, num):
         """Normalize logprob-related parameters for batch processing."""
@@ -1135,14 +1169,6 @@ class EmbeddingReqInput:
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
-    def regenerate_rid(self):
-        """Generate a new request ID and return it."""
-        if isinstance(self.rid, list):
-            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
-        else:
-            self.rid = uuid.uuid4().hex
-        return self.rid
-
     def _validate_rid_uniqueness(self):
         """Validate that request IDs within a batch are unique."""
         if isinstance(self.rid, list) and len(set(self.rid)) != len(self.rid):
@@ -1187,6 +1213,9 @@ class EmbeddingReqInput:
         if self.is_single:
             if self.rid is None:
                 self.rid = uuid.uuid4().hex
+            elif not isinstance(self.rid, str):
+                # rid keys rid_to_state, so a list here reaches the dict unhashable.
+                raise ValueError(f"A single request takes one rid, got {self.rid!r}.")
             if self.sampling_params is None:
                 self.sampling_params = {}
             self.sampling_params["max_new_tokens"] = 0
@@ -1194,11 +1223,9 @@ class EmbeddingReqInput:
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
             elif isinstance(self.rid, str):
-                # A batch cannot be labeled by a single rid; require one per item.
-                raise ValueError(
-                    f"Batch of {self.batch_size} requests requires {self.batch_size} "
-                    f"rids, but got a single rid {self.rid!r}."
-                )
+                # One rid labels the whole batch, expanded per item with the same
+                # prefix scheme as GenerateReqInput._normalize_rid.
+                self.rid = [f"{self.rid}_{i}" for i in range(self.batch_size)]
             elif isinstance(self.rid, list):
                 if len(self.rid) != self.batch_size:
                     raise ValueError(
