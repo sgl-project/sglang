@@ -364,11 +364,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.page_size == 1:
             mapping_indices = free_index
         else:
-            # Cover the whole page of every listed slot: the paged full side
-            # frees whole pages, and a HiCache-rebuilt page can hold both
-            # mapped and unmapped slots. Duplicates are kept -- deduplicating
-            # here would be a data-dependent torch.unique -- and collapse in
-            # the paged free's own page dedup at release time.
+            # The paged full side frees whole pages, so cover every listed
+            # slot's whole page. Duplicates collapse in the paged free's own
+            # dedup; deduplicating here would cost a torch.unique sync.
             base = (free_index // self.page_size) * self.page_size
             offsets = torch.arange(
                 self.page_size, dtype=free_index.dtype, device=free_index.device
@@ -380,18 +378,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.free_group is not None:
             # Resolve ownership now. A cache action later in this group may
-            # install a new mapping for the same full index. The gather above
-            # is a copy, so the clear cannot disturb what was enqueued.
+            # install a new mapping for the same full index.
             self.swa_free_group.append(swa_indices)
             return
 
         self._release_swa(swa_indices)
 
     def _release_swa(self, swa_indices: torch.Tensor):
-        """Drop the entries that read as the padding slot, then release. Kept
-        out of free_swa so a group filters once: the filter's output shape is
-        data-dependent, which costs a device-to-host sync, and one filter over
-        the batch selects the same slots as one per call."""
+        """One filter per group: its data-dependent shape costs a sync, and
+        filtering the batch selects the same slots as filtering per call."""
         self.swa_attn_allocator.free(swa_indices[swa_indices > 0])
 
     def free_full(self, free_index: torch.Tensor):
@@ -529,8 +524,7 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
-        # The identity mapping is registered with the KV pool and read by the
-        # attention kernels; editing it resolves a slot to the padding row.
+        # Registered with the KV pool and read by the attention kernels.
         raise NotImplementedError(
             "PureSWATokenToKVPoolAllocator has no full->SWA mapping to rewrite"
         )
