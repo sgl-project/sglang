@@ -23,11 +23,11 @@ logger = logging.getLogger(__name__)
 
 
 def _is_blackwell() -> bool:
-    """True iff running on SM100+ (Blackwell) where the ported kernel is valid."""
+    """True iff running on the SM100/SM103 family supported by this prefill kernel."""
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability()
-    return major >= 10
+    return major == 10
 
 
 class CuteDSLGDNKernel(LinearAttnKernelBase):
@@ -35,9 +35,9 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
 
     Decode: ``cutedsl_fused_sigmoid_gating_delta_rule_update`` (SM90+).
     Extend (prefill): chunkwise ``chunk_gated_delta_rule_cutedsl``
-    (SM100+ only, ``head_k_dim`` must be 128). On SM90 the prefill path is
-    unsupported; callers should query :attr:`supports_prefill` and fall back
-    to another backend (e.g. Triton).
+    (SM100/SM103 only, ``head_k_dim`` must be 128). On other architectures the
+    prefill path is unsupported; callers should query :attr:`supports_prefill`
+    and fall back to another backend (e.g. Triton).
     """
 
     def __init__(self):
@@ -61,7 +61,7 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
                 else -1
             )
             raise RuntimeError(
-                f"CuTe DSL GDN prefill requires SM100+ (Blackwell); got SM{major}."
+                f"CuTe DSL GDN prefill requires SM100/SM103; got SM{major}."
             )
         if head_k_dim != 128:
             raise RuntimeError(
