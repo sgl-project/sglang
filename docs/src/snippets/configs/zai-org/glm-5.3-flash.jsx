@@ -57,13 +57,8 @@ export const config = {
         {
           id: "fp8-trtllm",
           label: "FP8 + TRT-LLM",
-          disabled: (s) =>
-            ["h100", "h200", "mi300x", "mi325x", "mi355x"].includes(s.hw) ||
-            s.quant === "nvfp4",
-          disableReason: (s) =>
-            s.quant === "nvfp4"
-              ? "FP8 KV + TRT-LLM DSA crashes with this NVFP4 checkpoint on the current image; the validated pairing is BF16 KV + TileLang DSA."
-              : "This recipe uses BF16 KV cache with TileLang DSA on Hopper and AMD ROCm GPUs.",
+          disabled: (s) => ["h100", "h200", "mi300x", "mi325x", "mi355x"].includes(s.hw),
+          disableReason: "This recipe uses BF16 KV cache with TileLang DSA on Hopper and AMD ROCm GPUs.",
           stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
           flags: [
             "--kv-cache-dtype fp8_e4m3",
@@ -416,14 +411,16 @@ sgl-eval run gsm8k \\
     // RadixArk NVFP4 W4A4 checkpoint (ModelOpt 0.46.0, abs-max, group size
     // 16): routed and shared experts plus the dense MLPs are FP4; attention,
     // router, MTP, embeddings, and the vision tower stay BF16. Validated on
-    // 4x GB300 with BF16 KV + TileLang DSA and the flashinfer_cutlass MoE
-    // runner, so the FP8 + TRT-LLM overlay is disabled for this quant.
+    // 4x GB300 on the stock image with both KV/DSA pairings: the speed rows
+    // were measured with BF16 KV + TileLang DSA, while FP8 KV + TRT-LLM DSA
+    // passed smoke, a 200-example GSM8K check, a 600-request soak, and the
+    // TB2.1 run without separate speed measurements.
     {
       match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
-        s.kvDsaPair === "bf16-tilelang" &&
+        ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
         s.hicache === "off" &&
         s.dcp === "off"
@@ -456,7 +453,7 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
-        s.kvDsaPair === "bf16-tilelang" &&
+        ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
         s.hicache === "off" &&
         s.dcp === "off"
