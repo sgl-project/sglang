@@ -104,6 +104,7 @@ def run_sm90_mega_routed(
         buf.topk_idx,
         buf.topk_weights,
         quant_group_size=128,
+        scale_ue8m0=False,
     )
 
     y = torch.empty(

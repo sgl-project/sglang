@@ -28,7 +28,7 @@ struct MegaMoEPreDispatchParams {
   const float* __restrict__ topk_weights;  // [num_tokens, top_k]
 
   fp8_e4m3_t* __restrict__ buf_x;        // [padded_max, hidden]
-  int32_t* __restrict__ buf_x_sf;        // contiguous int32 [P, G/4]; see layout comment
+  void* __restrict__ buf_x_sf;           // packed UE8M0 [P,G/4] or FP32 [P,G]
   int64_t* __restrict__ buf_topk_idx;    // [padded_max, top_k]
   float* __restrict__ buf_topk_weights;  // [padded_max, top_k]
 
@@ -43,7 +43,7 @@ struct MegaMoEPreDispatchParams {
 // kMultiChunk covers rows too wide for one chunk per thread. It is a template
 // parameter rather than a runtime check because this kernel is issue-bound: the
 // loop bookkeeping alone costs ~10% on the rows that fit a single chunk.
-template <uint32_t kGroupSize, bool kUsePDL, bool kMultiChunk>
+template <uint32_t kGroupSize, bool kScaleUE8M0, bool kUsePDL, bool kMultiChunk>
 __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     mega_moe_pre_dispatch_kernel(const MegaMoEPreDispatchParams __grid_constant__ params) {
   using namespace device;
@@ -86,8 +86,9 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
       const float absmax = fmaxf(local_max, 1e-10f);
       const float raw_scale = absmax / math::FP8_E4M3_MAX;
       const uint32_t ue8m0_exp = cast_to_ue8m0(raw_scale);
-      // 2^-ue8m0_exp as fp32 (equivalent to 1 / __uint_as_float(ue8m0 << 23)).
-      const float inv_scale = __uint_as_float((127u + 127u - ue8m0_exp) << 23);
+      const float stored_scale =
+          kScaleUE8M0 ? __uint_as_float(ue8m0_exp << 23) : raw_scale;
+      const float inv_scale = 1.0f / stored_scale;
 
       OutputVec out_vec;
 #pragma unroll
@@ -96,14 +97,17 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
       }
       out_vec.store(token_out, chunk);
 
-      // One thread per group writes its UE8M0 byte into the contiguous
-      // row-major int32-packed layout: byte address = t*num_groups + g
-      // (see layout comment at the top of the file).
+      // One thread per group writes either a packed UE8M0 byte (SM100) or a
+      // float scale (SM90) into the caller-provided row-major buffer.
       const uint32_t group_id = chunk / kThreadsPerGroup;
       const uint32_t within_group_id = chunk % kThreadsPerGroup;
       if (within_group_id == 0 && group_id < params.num_groups) {
-        const uint32_t byte_off = token_id * params.num_groups + group_id;
-        reinterpret_cast<uint8_t*>(params.buf_x_sf)[byte_off] = static_cast<uint8_t>(ue8m0_exp);
+        const uint32_t off = token_id * params.num_groups + group_id;
+        if constexpr (kScaleUE8M0) {
+          static_cast<uint8_t*>(params.buf_x_sf)[off] = static_cast<uint8_t>(ue8m0_exp);
+        } else {
+          static_cast<float*>(params.buf_x_sf)[off] = raw_scale;
+        }
       }
     };
 
@@ -144,13 +148,13 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
 // ---- Host wrapper
 // ------------------------------------------------------------------------------------------------------------------------
 
-template <int64_t kGroupSize, bool kUsePDL>
+template <int64_t kGroupSize, bool kScaleUE8M0, bool kUsePDL>
 struct MegaMoEPreDispatchKernel {
   static_assert(kGroupSize == 32 || kGroupSize == 64 || kGroupSize == 128, "unsupported group_size");
   static constexpr auto kernel_one_chunk =
-      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false>;
+      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kScaleUE8M0, kUsePDL, false>;
   static constexpr auto kernel_multi_chunk =
-      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, true>;
+      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kScaleUE8M0, kUsePDL, true>;
 
   static void
   run(const tvm::ffi::TensorView x,
@@ -167,7 +171,7 @@ struct MegaMoEPreDispatchKernel {
     auto P = SymbolicSize{"padded_max"};
     auto H = SymbolicSize{"hidden"};
     auto K = SymbolicSize{"top_k"};
-    auto G4 = SymbolicSize{"num_groups_div_4"};
+    auto GS = SymbolicSize{"scale_columns"};
     device.set_options<kDLCUDA>();
 
     TensorMatcher({M, H})  // input x
@@ -188,14 +192,11 @@ struct MegaMoEPreDispatchKernel {
         .with_dtype<int8_t, fp8_e4m3_t>()
         .with_device(device)
         .verify(buf_x);
-    // buf.x_sf is the contiguous row-major int32 view from DeepGEMM's mega
-    // symm buffer (DeepGEMM/csrc/apis/mega.hpp): shape (P, G/4), strides
-    // (G/4, 1). No explicit strides required -> TensorMatcher enforces
-    // is_contiguous().
-    TensorMatcher({P, G4})  // buf_x_sf
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(buf_x_sf);
+    if constexpr (kScaleUE8M0) {
+      TensorMatcher({P, GS}).with_dtype<int32_t>().with_device(device).verify(buf_x_sf);
+    } else {
+      TensorMatcher({P, GS}).with_dtype<float>().with_device(device).verify(buf_x_sf);
+    }
     TensorMatcher({P, K})  // buf.topk_idx
         .with_dtype<int64_t>()
         .with_device(device)
@@ -209,12 +210,16 @@ struct MegaMoEPreDispatchKernel {
     const auto padded_max = static_cast<uint32_t>(P.unwrap());
     const auto hidden = static_cast<uint32_t>(H.unwrap());
     const auto top_k = static_cast<uint32_t>(K.unwrap());
-    const auto num_groups_div_4 = static_cast<uint32_t>(G4.unwrap());
+    const auto scale_columns = static_cast<uint32_t>(GS.unwrap());
 
     RuntimeCheck(num_tokens <= padded_max, "num_tokens must not exceed padded_max");
     RuntimeCheck(hidden % kGroupSize == 0, "hidden must be a multiple of group_size");
     const auto num_groups = hidden / static_cast<uint32_t>(kGroupSize);
-    RuntimeCheck(num_groups == num_groups_div_4 * 4u, "num_groups must be a multiple of 4");
+    if constexpr (kScaleUE8M0) {
+      RuntimeCheck(num_groups == scale_columns * 4u, "packed scale columns must equal num_groups / 4");
+    } else {
+      RuntimeCheck(num_groups == scale_columns, "FP32 scale columns must equal num_groups");
+    }
     RuntimeCheck(hidden % 8u == 0, "hidden must be a multiple of 8 (16B bf16 loads)");
     const auto num_chunks = hidden / 8u;
     const auto block_size = std::min(num_chunks, kMaxBlockThreads);
@@ -235,7 +240,7 @@ struct MegaMoEPreDispatchKernel {
         .topk_idx = static_cast<const int32_t*>(topk_idx.data_ptr()),
         .topk_weights = static_cast<const float*>(topk_weights.data_ptr()),
         .buf_x = static_cast<fp8_e4m3_t*>(buf_x.data_ptr()),
-        .buf_x_sf = static_cast<int32_t*>(buf_x_sf.data_ptr()),
+        .buf_x_sf = buf_x_sf.data_ptr(),
         .buf_topk_idx = static_cast<int64_t*>(buf_topk_idx.data_ptr()),
         .buf_topk_weights = static_cast<float*>(buf_topk_weights.data_ptr()),
         .num_tokens = num_tokens,

@@ -37,8 +37,10 @@ def _jit_hash_topk_module():
 
 
 @cache_once
-def _jit_mega_moe_pre_dispatch_module(quant_group_size: int):
-    args = make_cpp_args(quant_group_size, is_arch_support_pdl())
+def _jit_mega_moe_pre_dispatch_module(
+    quant_group_size: int, scale_ue8m0: bool
+):
+    args = make_cpp_args(quant_group_size, scale_ue8m0, is_arch_support_pdl())
     return load_jit(
         make_name("mega_moe_pre_dispatch"),
         *args,
@@ -160,8 +162,9 @@ def mega_moe_pre_dispatch(
     buf_topk_idx: torch.Tensor,
     buf_topk_weights: torch.Tensor,
     quant_group_size: int = 32,
+    scale_ue8m0: bool = True,
 ) -> None:
-    module = _jit_mega_moe_pre_dispatch_module(quant_group_size)
+    module = _jit_mega_moe_pre_dispatch_module(quant_group_size, scale_ue8m0)
     module.run(
         x,
         topk_idx,

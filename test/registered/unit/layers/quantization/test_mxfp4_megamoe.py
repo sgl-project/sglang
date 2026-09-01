@@ -634,6 +634,8 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
 
         self.assertEqual(output.shape, (1, 4))
         pre_dispatch.assert_called_once()
+        self.assertEqual(pre_dispatch.call_args.kwargs["quant_group_size"], 128)
+        self.assertFalse(pre_dispatch.call_args.kwargs["scale_ue8m0"])
         fp8_fp4.assert_called_once()
         fp8.assert_not_called()
 
