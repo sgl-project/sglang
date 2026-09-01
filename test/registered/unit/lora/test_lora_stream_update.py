@@ -19,6 +19,10 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     _sha256_tensor,
     _split_lora_named_tensors,
 )
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    LocalSerializedTensor,
+)
+from sglang.srt.utils import MultiprocessingSerializer
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -82,6 +86,21 @@ class TestLoraStash(CustomTestCase):
         mgr = _make_manager()
         mgr._stash_lora_tensors([("name:with:colon.lora_A.weight", torch.zeros(1))])
         self.assertIn("with:colon.lora_A.weight", mgr._lora_stash["name"])
+
+    def test_per_rank_payload_is_unwrapped(self):
+        """A LoRA tensor never reaches the base loader, so the stash is the last
+        place a per-rank payload can be reduced to this rank's tensor."""
+        tp_worker = MagicMock()
+        tp_worker.ps.tp_rank = 1
+        mgr = _make_manager(tp_worker=tp_worker)
+        rank_tensors = [torch.zeros(2), torch.ones(2)]
+        payload = LocalSerializedTensor(
+            values=[MultiprocessingSerializer.serialize(t) for t in rank_tensors]
+        )
+        mgr._stash_lora_tensors([(f"miles_lora:{LORA_A}", payload)])
+        self.assertTrue(
+            torch.equal(mgr._lora_stash["miles_lora"][LORA_A], rank_tensors[1])
+        )
 
 
 class TestApplyLoraStash(CustomTestCase):

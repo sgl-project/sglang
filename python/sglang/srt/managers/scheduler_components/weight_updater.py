@@ -47,6 +47,9 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    LocalSerializedTensor,
+)
 from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.utils.weight_checker import overall_checksum
@@ -425,6 +428,8 @@ class SchedulerWeightUpdaterManager:
     def _stash_lora_tensors(self, lora_tensors) -> None:
         for prefixed_name, tensor in lora_tensors:
             lora_name, hf_key = prefixed_name.split(":", 1)
+            if isinstance(tensor, LocalSerializedTensor):
+                tensor = tensor.get(self.tp_worker.ps.tp_rank)
             assert isinstance(
                 tensor, torch.Tensor
             ), f"streamed LoRA tensor {prefixed_name!r} must arrive as a plain tensor"
