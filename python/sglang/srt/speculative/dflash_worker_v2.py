@@ -68,6 +68,16 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
+from sglang.srt.speculative.lilicorr_components.lilicorr_candidates import (
+    publish_anchor,
+    target_input_embeddings,
+)
+from sglang.srt.speculative.lilicorr_components.lilicorr_draft_sampler import (
+    build_lilicorr_draft_sampler,
+)
+from sglang.srt.speculative.lilicorr_components.lilicorr_select import (
+    propose_lilicorr_block,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -325,6 +335,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
         self.selector = self.draft_model.candidate_selector
+        # Set by LiLiCorrDraftModel; None for every other DFLASH draft. Assigned
+        # unconditionally because __getattr__ delegates unknown names to the
+        # target worker, which would turn a missing attribute into an error that
+        # names the wrong object.
+        self.lilicorr = getattr(self.draft_model, "lilicorr", None)
+        # The head's context: each request's last committed target row, already
+        # fc-projected. Written by _append_target_hidden_to_draft_kv_by_loc,
+        # consumed by the next draft forward.
+        self._lilicorr_anchor: Optional[torch.Tensor] = None
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -653,6 +672,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not is_dense_head_weight(lm_head.weight):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
+        if self.lilicorr is not None:
+            return build_lilicorr_draft_sampler(worker=self, lm_head=lm_head)
         tp_group = get_tp_group()
         if not hasattr(lm_head, "shard_indices"):
             if tp_group.world_size != 1:
@@ -1502,6 +1523,13 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            if self.lilicorr is not None:
+                self._lilicorr_anchor = publish_anchor(
+                    draft_sampler=self._draft_sampler,
+                    ctx_hidden=ctx_hidden,
+                    positions=positions,
+                    commit_lens=commit_lens,
+                )
 
             if cache_loc_2d is not None:
                 bs = int(commit_lens.shape[0])
@@ -2154,6 +2182,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 lm_head=lm_head,
                 anchor_token_ids=block_ids[:, 0],
                 sampling_info=batch.sampling_info,
+            )
+        elif self.lilicorr is not None:
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("DFLASH draft model returned no hidden states.")
+            draft_next = propose_lilicorr_block(
+                head=self.lilicorr,
+                draft_hidden=draft_hidden.view(bs, int(self.block_size), -1),
+                lm_head=lm_head,
+                embed_tokens=target_input_embeddings(self),
+                anchor=self._lilicorr_anchor,
             )
         else:
             draft_hidden = draft_logits_output.hidden_states
