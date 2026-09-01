@@ -1890,12 +1890,22 @@ class DFlashWorkerV2(BaseSpecWorker):
             # [DBG-DP] reset per-request iteration counter at prefill.
             self._dbg_dp_iter = 0
             if len(batch.extend_lens) > 0:
+                nt_logits = logits_output.next_token_logits
+                if nt_logits is not None and nt_logits.numel() > 0:
+                    top3 = torch.topk(nt_logits[0], k=3, dim=-1)
+                    top3_str = str(
+                        list(zip(top3.indices.tolist(), top3.values.tolist()))
+                    )
+                else:
+                    top3_str = "N/A"
                 logger.info(
-                    "[DBG-DP-PREFILL] extend_lens=%s bonus0=%s hidden=%s cache_loc=%s",
+                    "[DBG-DP-PREFILL] extend_lens=%s bonus0=%s top3=%s "
+                    "hidden_sum=%.4f hidden_last_sum=%.4f",
                     batch.extend_lens[:4],
                     next_token_ids[:2].tolist(),
-                    list(logits_output.hidden_states.shape),
-                    list(batch.out_cache_loc.shape),
+                    top3_str,
+                    float(logits_output.hidden_states.float().sum().item()),
+                    float(logits_output.hidden_states[-1].float().sum().item()),
                 )
 
             # Materialize prompt tokens into the draft KV cache immediately. This is required
@@ -2266,8 +2276,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         # output may be DP-padded/gathered; hidden must be exactly bs*block_size
         # rows or the view(bs, block_size) below silently misaligns.
         if bs > 0 and self._dbg_dp_iter <= 8:
+            nt_logits = logits_output.next_token_logits
+            if nt_logits is not None and nt_logits.numel() > 0:
+                v_top3 = torch.topk(nt_logits[0], k=3, dim=-1)
+                verify_top3_str = str(
+                    list(zip(v_top3.indices.tolist(), v_top3.values.tolist()))
+                )
+            else:
+                verify_top3_str = "N/A"
             logger.info(
-                "[DBG-DP-VERIFY] iter=%d bs=%d block=%d logits=%s hidden=%s",
+                "[DBG-DP-VERIFY] iter=%d bs=%d block=%d logits=%s hidden=%s "
+                "top3_pos0=%s",
                 self._dbg_dp_iter,
                 bs,
                 int(self.block_size),
@@ -2277,6 +2296,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     if logits_output.hidden_states is not None
                     else None
                 ),
+                verify_top3_str,
             )
 
         grammar_mask = None
