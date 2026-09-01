@@ -230,7 +230,7 @@ jobs:
   multimodal-gen-test-2-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.multimodal_gen == 'true' }}
-    runs-on: linux-aarch64-a3-800t-16
+    runs-on: linux-aarch64-a3-800t-2
     strategy:
       fail-fast: false
       matrix:
