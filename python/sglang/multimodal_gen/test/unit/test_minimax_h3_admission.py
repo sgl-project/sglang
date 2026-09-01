@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MiniMaxH3DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+    MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES,
     partition_for_task,
 )
 from sglang.multimodal_gen.runtime.platforms import (
@@ -286,6 +287,11 @@ class _HopperCapability:
         return 90
 
 
+class _SM100Capability:
+    def to_int(self) -> int:
+        return 100
+
+
 def _quality_server_args():
     return SimpleNamespace(
         attention_backend=None,
@@ -322,6 +328,48 @@ def test_high_quality_deployment_rejects_transformer_weight_override():
             return_value=_HopperCapability(),
         ),
         pytest.raises(ValueError, match="transformer_weights_path"),
+    ):
+        config.validate_quality_deployment(server_args)
+
+
+@pytest.mark.parametrize("capability", [_HopperCapability(), _SM100Capability()])
+@pytest.mark.parametrize("model_variant", ["fl2va", "ref2va"])
+def test_high_quality_deployment_accepts_sm90_and_sm100(capability, model_variant):
+    config = MiniMaxH3PipelineConfig()
+    server_args = _quality_server_args()
+    server_args.model_variant = model_variant
+    server_args.num_gpus = 2
+    server_args.sp_degree = 2
+    server_args.ulysses_degree = 2
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name", return_value="NVIDIA GPU"),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=capability,
+        ),
+    ):
+        config.validate_quality_deployment(server_args)
+
+
+def test_high_quality_deployment_rejects_sm100_without_full_ulysses():
+    config = MiniMaxH3PipelineConfig()
+    server_args = _quality_server_args()
+    server_args.num_gpus = 8
+    server_args.sp_degree = 4
+    server_args.ulysses_degree = 4
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name", return_value="NVIDIA B200"),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_SM100Capability(),
+        ),
+        pytest.raises(ValueError, match="sp_degree"),
     ):
         config.validate_quality_deployment(server_args)
 
@@ -409,6 +457,149 @@ def test_quality_admission_fails_closed_outside_validated_request():
     server_args.attention_backend = None
     with pytest.raises(ValueError, match="quality must be one of"):
         stage.forward(batch, server_args)
+
+
+@pytest.mark.parametrize("frame_indices", MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES)
+def test_fl2va_high_quality_admits_first_last_and_both_keyframes(frame_indices):
+    metadata = MiniMaxH3ReleaseMetadata.from_model_index(
+        {
+            "_minimax_h3": {
+                "schema_version": 1,
+                "partition": "fl2va",
+                "tasks": ["t2va", "fl2va"],
+                "task_aliases": {},
+                "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+            }
+        }
+    )
+    canonical = minimax_h3_validate_canonical_request(
+        task="fl2va",
+        prompt="quality",
+        conditions=[
+            {
+                "type": "image",
+                "uri": f"file:///keyframe-{frame_index}.png",
+                "role": "keyframe",
+                "frame_index": frame_index,
+            }
+            for frame_index in frame_indices
+        ],
+        target=TARGET,
+        seed=0,
+    )
+    plan = minimax_h3_resolve_plan(canonical)
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(task="fl2va", quality="high"),
+        num_inference_steps=50,
+        is_warmup=False,
+    )
+    stage = MiniMaxH3PartitionAdmissionStage(metadata)
+    server_args = _quality_server_args()
+    server_args.pipeline_config = MiniMaxH3PipelineConfig()
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name", return_value="NVIDIA B200"),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_SM100Capability(),
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
+            "minimax_h3.release_metadata.minimax_h3_plan_from_batch",
+            return_value=plan,
+        ),
+    ):
+        assert stage.forward(batch, server_args) is batch
+
+
+def test_fl2va_high_quality_keeps_h200_request_scope_unchanged():
+    config = MiniMaxH3PipelineConfig()
+    server_args = _quality_server_args()
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name", return_value="NVIDIA H200"),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_HopperCapability(),
+        ),
+        pytest.raises(ValueError, match="task"),
+    ):
+        config.validate_quality_deployment(server_args, task="fl2va")
+
+
+def test_ref2va_high_quality_admits_only_single_video_audio_reference():
+    metadata = MiniMaxH3ReleaseMetadata.from_model_index(
+        {
+            "_minimax_h3": {
+                "schema_version": 1,
+                "partition": "ref2va",
+                "tasks": ["ref2va"],
+                "task_aliases": {},
+                "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+            }
+        }
+    )
+    conditions = [
+        {
+            "type": "video_audio",
+            "uri": "file:///ref2va.mp4",
+            "role": "reference",
+        }
+    ]
+    canonical = minimax_h3_validate_canonical_request(
+        task="ref2va",
+        prompt="quality",
+        conditions=conditions,
+        target=TARGET,
+        seed=0,
+    )
+    plan = minimax_h3_resolve_plan(canonical)
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(task="ref2va", quality="high"),
+        num_inference_steps=50,
+        is_warmup=False,
+    )
+    stage = MiniMaxH3PartitionAdmissionStage(metadata)
+    server_args = _quality_server_args()
+    server_args.model_variant = "ref2va"
+    server_args.pipeline_config = MiniMaxH3PipelineConfig()
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name", return_value="NVIDIA B200"),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_SM100Capability(),
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
+            "minimax_h3.release_metadata.minimax_h3_plan_from_batch",
+            return_value=plan,
+        ) as plan_from_batch,
+    ):
+        assert stage.forward(batch, server_args) is batch
+
+        image_canonical = minimax_h3_validate_canonical_request(
+            task="ref2va",
+            prompt="quality",
+            conditions=[
+                {
+                    "type": "image",
+                    "uri": "file:///reference.png",
+                    "role": "reference",
+                }
+            ],
+            target=TARGET,
+            seed=0,
+        )
+        plan_from_batch.return_value = minimax_h3_resolve_plan(image_canonical)
+        with pytest.raises(ValueError, match="material_signature"):
+            stage.forward(batch, server_args)
 
 
 def test_validate_server_args_requires_packed_varlen_backend():
