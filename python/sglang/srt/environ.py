@@ -409,6 +409,14 @@ class Envs:
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
 
     # ===================================================================
+    # CI reporting: per-model metrics jsonl for nightly XPU dashboard
+    # ===================================================================
+    # When set, XPU nightly tests append one JSON record per model to this file
+    # so xpu-ci-job-monitor.yml can render per-model ref/actual/status/duration
+    # tables. Unset (the default) is a full no-op — pre-existing CI unaffected.
+    SGLANG_TEST_METRICS_FILE = EnvStr(None)
+
+    # ===================================================================
     # PD and scripted-runtime tests
     # ===================================================================
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -530,8 +538,6 @@ class Envs:
     # fall back to the per-free eager compaction. Used for production
     # A/B and quick rollback. Default False (lazy compaction on).
     SGLANG_DISABLE_LAZY_COMPACTION = EnvBool(False)
-    # Sort the multi-ended allocator's free list after a merge (perf A/B knob).
-    SGLANG_SORT_FREE_LIST_AFTER_MERGE = EnvBool(False)
     # Periodically log lazy-compaction stats per sub-pool (observability only).
     SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
     SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)
@@ -852,6 +858,18 @@ class Envs:
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
+    # Above 8192 tokens of context, aiter's non-static workspace is large enough
+    # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
+    # honor an explicitly passed --mem-fraction-static instead. Off by default:
+    # the reserve is load-bearing, and skipping it OOMs long-context aiter serving
+    # that fits comfortably with it (67.32 GiB request against 47.40 GiB free on a
+    # 288 GB MI355 in nightly-4-gpu-mi35x-minimax-m3). Worth setting only when the
+    # scaled fraction is itself too small to hold the model weights.
+    SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION = EnvBool(False)
+    # Route Kimi-K3-style h12 + fp8 MLA decode through aiter Triton Gluon when
+    # import and Triton cga_layout prerequisites hold. Set to 0 to force the
+    # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
+    SGLANG_AITER_MLA_GLUON = EnvBool(True)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
@@ -947,6 +965,8 @@ class Envs:
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
     # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+    # Use BF16 activations with FlashInfer CuTe DSL NVFP4 dense and MoE weights.
+    SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
@@ -1724,6 +1744,9 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
     "SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT": _DeprecatedEnv(),
     "SGLANG_MASKED_GEMM_FAST_ACT": _DeprecatedEnv(),
+    # The unified free list is kept unsorted between flushes by design; the
+    # sort-after-merge A/B knob never left its off default and is gone.
+    "SGLANG_SORT_FREE_LIST_AFTER_MERGE": _DeprecatedEnv(),
     "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN": _DeprecatedEnv(),
     # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
     "SGLANG_OPT_USE_CUDA_SCONV": _DeprecatedEnv(),
