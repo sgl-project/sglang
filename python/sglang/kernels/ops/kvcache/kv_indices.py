@@ -4,6 +4,19 @@ import triton.language as tl
 _FLASHMLA_CREATE_KV_BLOCK_SIZE = 4096
 FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SIZE)
 
+# Token-block parallelism for the index-copy kernels below: aim for about
+# _TARGET_PROGRAMS programs in total, one extra block per
+# _MIN_TOKENS_PER_BLOCK of table width at most, and fall back to the
+# historical single-block grid when the base grid is already wide.
+_MIN_TOKENS_PER_BLOCK = 8192
+_TARGET_PROGRAMS = 512
+
+
+def kv_indices_num_token_blocks(table_width: int, base_programs: int) -> int:
+    cap = (table_width + _MIN_TOKENS_PER_BLOCK - 1) // _MIN_TOKENS_PER_BLOCK
+    want = _TARGET_PROGRAMS // max(1, base_programs)
+    return max(1, min(cap, want))
+
 
 @triton.jit
 def create_flashinfer_kv_indices_triton(
@@ -31,6 +44,14 @@ def create_flashinfer_kv_indices_triton(
     """
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
+    # Optional token-block parallelism: with a 2D launch grid
+    # (batch, num_blocks), the programs of a request stride over its copy
+    # loop together instead of one program crawling the whole context
+    # serially (which bottlenecks long-context spec decode, where this
+    # kernel runs every iteration). A 1D grid keeps the historical
+    # one-program-per-request behavior bit-for-bit.
+    blk = tl.program_id(axis=1)
+    num_blk = tl.num_programs(axis=1)
 
     # find the req pool idx, this is for batch to token
     req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
@@ -44,7 +65,9 @@ def create_flashinfer_kv_indices_triton(
     kv_end += tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
 
     num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
-    for i in range(num_loop):
+    if blk >= num_loop and blk > 0:
+        return
+    for i in range(blk, num_loop, num_blk):
         # index into req_to_token_ptr needs to be int64
         offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
         mask = offset < kv_end - kv_start
