@@ -310,19 +310,4 @@ export const benchmarks = [
   { match: { hw: "b200", strategy: "high-throughput", quant: "nvfp4" } },
   { match: { hw: "b300", strategy: "low-latency", quant: "nvfp4" } },
   { match: { hw: "b300", strategy: "high-throughput", quant: "nvfp4" } },
-  {
-    match: { hw: "mi300x", strategy: "high-throughput" },
-    sglang_version: "9e692c9216",
-    accuracy: { gsm8k_pct: 97.35 },
-    notes:
-      "Accuracy-only validation on 8x MI300X (gfx942, TP8) with zai-org/GLM-5.3-Flash revision 3f1971b7b5f7a528c9c4ef6212c8785298a8c24a, SGLang PR #36607 head 9e692c9216c3b5e5c443fecf6b995700eb68d2e4 (validated source manifest 2c240e0e01d5fdf04acc485ebfa25f8a1793ba45fb07f165eecedfba7ec1db80), and lmsysorg/sglang:v0.5.18-rocm720-mi30x with the PR source mounted over the image tree. Full GSM8K scored 1,284/1,319 with a 100% stop rate and zero request errors, empty generations, or truncations. No throughput or latency benchmark was run.",
-  },
-  { match: { hw: "mi325x", strategy: "high-throughput" } },
-  {
-    match: { hw: "mi355x", strategy: "high-throughput" },
-    sglang_version: "9e692c9216",
-    accuracy: { gsm8k_pct: 97.65 },
-    notes:
-      "Accuracy-only validation on 8x MI355X (gfx950, TP8) with zai-org/GLM-5.3-Flash revision 3f1971b7b5f7a528c9c4ef6212c8785298a8c24a, SGLang PR #36607 head 9e692c9216c3b5e5c443fecf6b995700eb68d2e4 (validated source manifest 2c240e0e01d5fdf04acc485ebfa25f8a1793ba45fb07f165eecedfba7ec1db80), and lmsysorg/sglang:v0.5.18-rocm720-mi35x with the PR source mounted over the image tree. Full GSM8K scored 1,288/1,319 with a 100% stop rate and zero request errors, empty generations, or truncations. No throughput or latency benchmark was run.",
-  },
 ];
