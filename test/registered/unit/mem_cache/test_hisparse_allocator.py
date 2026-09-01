@@ -106,7 +106,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
             def alloc(self, reqs):
                 for item in reqs:
-                    item.req_pool_idx = 0
+                    item.kv.req_pool_idx = 0
                 return torch.tensor([0], dtype=torch.int64)
 
             def write(self, indices, values):
@@ -153,14 +153,14 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(kwargs["swa_tail_len"], swa_tail_len)
         self.assertEqual(req.kv.swa_evicted_seqlen, fill_len - swa_tail_len)
         self.assertEqual(req.kv.kv_allocated_len, fill_len)
-        self.assertEqual(req.kv_committed_len, fill_len)
+        self.assertEqual(req.kv.kv_committed_len, fill_len)
         self.assertEqual(req.extend_range.length, fill_len)
         self.assertEqual(len(req_to_token_pool.writes), 1)
         coordinator.host_token_len.assert_called_once_with(fill_len)
         regular_host_alloc.assert_called_once_with(
             coordinator.req_to_host_pool,
             coordinator.req_to_host_pool_allocated_len,
-            req.req_pool_idx,
+            req.kv.req_pool_idx,
             0,
             len(host_indices),
         )
