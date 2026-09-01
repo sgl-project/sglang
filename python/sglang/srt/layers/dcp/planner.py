@@ -26,6 +26,7 @@ from sglang.kernels.ops.attention.dcp_kernels import (
 )
 from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_device, get_parallel
 
 
@@ -114,6 +115,13 @@ def prepare_decode_context_parallel_metadata(
         dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
         // parallel.dcp_size
     )
+    # Third read-index production site, beside the two the MHA mixin owns: the
+    # pool's read door never translates, so collapse then translate here.
+    src = get_attn_backend().kv_index_translator
+    if src is not None:
+        dcp_local_prefix_kv_indices = src.translate_full_attn_ids(
+            dcp_local_prefix_kv_indices
+        )
     dcp_kv_buffer = torch.empty(
         (
             seq_lens_sum,
