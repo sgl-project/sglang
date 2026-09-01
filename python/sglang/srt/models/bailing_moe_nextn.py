@@ -44,7 +44,9 @@ from sglang.srt.models.bailing_moe_linear import (
 from sglang.srt.models.bailing_moe_v3 import (
     BailingMoELinearDecoderLayer as BailingMoeV3DecoderLayer,
 )
-from sglang.srt.models.bailing_moe_v3 import BailingMoeV3ForCausalLM
+from sglang.srt.models.bailing_moe_v3 import (
+    BailingMoeV3ForCausalLM,
+)
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator, add_prefix
