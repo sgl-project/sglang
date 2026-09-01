@@ -231,6 +231,51 @@ class TestGlm5NextNextNWeightLoading(unittest.TestCase):
         )
         mock_pad_helper.assert_not_called()
 
+    def test_delegated_load_weights_direct_call_vision_present(self):
+        head_param = _FakeParam()
+        visual_param = _FakeParam()
+        params = {
+            "model.shared_head.norm.weight": head_param,
+            "visual.blocks.0.attn.qkv_proj.weight": visual_param,
+        }
+        vision_present_self = SimpleNamespace(
+            config=SimpleNamespace(
+                num_hidden_layers=1,
+                num_nextn_predict_layers=0,
+                n_routed_experts=0,
+                q_lora_rank=None,
+            ),
+            encoder_only=True,
+            language_only=False,
+            visual=object(),
+            mm_config=SimpleNamespace(
+                vision_config=SimpleNamespace(num_dummy_heads=2, head_dim=64)
+            ),
+            num_fused_shared_experts=0,
+            quant_config=None,
+            named_parameters=lambda: list(params.items()),
+        )
+
+        raw_weight = torch.randn(6, 64)
+        padded_weight = torch.randn(8, 64)
+        weights = [("visual.blocks.0.attn.qkv.weight", raw_weight)]
+
+        with patch(
+            "sglang.srt.models.glm5_next.vision_utils.pad_vit_attn_dummy_heads",
+            return_value=padded_weight,
+        ) as mock_pad_helper:
+            Glm5NextForConditionalGeneration.load_weights(
+                vision_present_self, weights, is_nextn=False
+            )
+
+        mock_pad_helper.assert_called_once_with(
+            vision_present_self.mm_config,
+            "visual.blocks.0.attn.qkv_proj.weight",
+            raw_weight,
+        )
+        self.assertIsNotNone(visual_param.loaded)
+        self.assertIs(visual_param.loaded[1], padded_weight)
+
 
 if __name__ == "__main__":
     unittest.main()
