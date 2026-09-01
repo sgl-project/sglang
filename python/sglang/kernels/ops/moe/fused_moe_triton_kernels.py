@@ -818,52 +818,6 @@ def invoke_fused_moe_kernel(
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
-    if _is_cuda and B.shape[0] == 32 and not is_batch_invariant_mode_enabled():
-        from sglang.kernels.ops.moe.lfm25_fused_moe_sm103 import (
-            can_use_lfm25_fused_moe_sm103,
-            invoke_lfm25_fused_moe_sm103,
-        )
-
-        fast_path_args = (
-            A,
-            B,
-            bias,
-            C,
-            A_scale,
-            B_scale,
-            B_zp,
-            topk_weights,
-            topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            mul_routed_weight,
-            top_k,
-            config,
-            compute_type,
-            use_fp8_w8a8,
-            use_int8_w8a8,
-            use_int8_w8a16,
-            use_int4_w4a16,
-            per_channel_quant,
-            block_shape,
-            no_combine,
-            a_use_tma,
-            b_use_tma,
-            c_sorted,
-            filter_expert,
-            fuse_sum_all_reduce,
-            router_topk,
-            fuse_add_to_output,
-            add_output_mask,
-            mask_output,
-            lora_preserve_base,
-            fuse_swiglu,
-        )
-        if can_use_lfm25_fused_moe_sm103(*fast_path_args):
-            invoke_lfm25_fused_moe_sm103(*fast_path_args)
-            return
-
     if fuse_swiglu:
         # The epilogue assumes an interleaved-gate/up bf16 up-GEMM writing a
         # plain half-width output; every other output flavor is out of scope.
