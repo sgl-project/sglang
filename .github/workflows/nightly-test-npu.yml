@@ -366,7 +366,7 @@ jobs:
   nightly-poc-multi-node-tests:
     name: multi-node-poc
     if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3]
+    needs: [set-image-config]
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -428,7 +428,7 @@ jobs:
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
     if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
+    needs: [set-image-config, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
       max-parallel: 1
