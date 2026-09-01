@@ -10,6 +10,13 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=1800, suite="nightly-perf-16-npu-a3", nightly=True)
 
+# only debug
+register_npu_ci(
+    est_time=1800,
+    suite="debug-nightly-perf-16-npu-a3",
+    nightly=True,
+)
+
 # Environment variables for DSV4-Flash single-node PD-mix deployment.
 DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -73,7 +80,8 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     "--watchdog-timeout",
     9000,
     "--mem-fraction-static",
-    0.7,
+    # 0.7 -> 0.65: leave headroom to avoid NPU OOM during debugging.
+    0.65,
     "--chunked-prefill-size",
     131072,
     "--max-running-requests",

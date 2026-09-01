@@ -271,6 +271,10 @@ jobs:
             export SGLANG_TEST_METRICS_OUTPUT=${test_data_output_path}/metrics
             echo "METRICS_DATA_FILE=${METRICS_DATA_FILE}"
             echo "SGLANG_TEST_METRICS_OUTPUT=${SGLANG_TEST_METRICS_OUTPUT}"
+
+            # Export the per-run plog prefix (mirrors _backup_plog's plog_base
+            # layout) so the Upload plog artifacts step can scope to this run.
+            echo "PLOG_UPLOAD_DIR=/root/.cache/tests/logs/plog/${branch_label}-${create_time}-${run_id}-${run_attempt}" >> "$GITHUB_ENV"
           fi
 
           export TRANSFORMERS_VERSION_FOR_SGLANG="${{ inputs.transformers_version }}"
@@ -426,3 +430,14 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           exit ${test_exit_code}
+
+      - name: Upload plog artifacts
+        # Nightly-only: PLOG_UPLOAD_DIR is exported by the Run test step
+        # only when is_nightly_pipeline_job is true.
+        if: ${{ always() && inputs.is_nightly_pipeline_job && env.PLOG_UPLOAD_DIR != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: plog-${{ inputs.test_suite }}-p${{ matrix.partition }}-${{ github.run_attempt }}
+          path: ${{ env.PLOG_UPLOAD_DIR }}
+          if-no-files-found: ignore
+          retention-days: 7
