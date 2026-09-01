@@ -84,7 +84,8 @@ class CompressedTensorsW4A8Mxfp4MoE(CompressedTensorsMoEScheme):
         effective_format = quant_format or self.quant_config.quant_format
         if effective_format != MXFP4_PACK_QUANTIZED_FORMAT:
             raise ValueError(
-                "MXFP4 MoE requires mxfp4-pack-quantized format, got " f"{effective_format}"
+                "MXFP4 MoE requires mxfp4-pack-quantized format, got "
+                f"{effective_format}"
             )
         if not (
             weight_quant.num_bits == 4
@@ -146,7 +147,10 @@ class CompressedTensorsW4A8Mxfp4MoE(CompressedTensorsMoEScheme):
                 f"hidden_size {hidden_size} must be divisible by "
                 f"{self.group_size * self.packed_factor}"
             )
-        if intermediate_size_per_partition % (self.group_size * self.packed_factor) != 0:
+        if (
+            intermediate_size_per_partition % (self.group_size * self.packed_factor)
+            != 0
+        ):
             raise ValueError(
                 f"intermediate_size_per_partition {intermediate_size_per_partition} must "
                 f"be divisible by {self.group_size * self.packed_factor}"
@@ -382,15 +386,13 @@ class CompressedTensorsW4A8Mxfp4MoE(CompressedTensorsMoEScheme):
                 dispatch_output._replace(hidden_states=hidden_states),
                 quant_info,
             )
-            hidden_states = combine_input.hidden_states
-            # The MXFP4 Marlin kernel sums the top-k expert outputs without
-            # applying the routed scaling factor (unlike the non-MXFP4 path,
-            # which folds it into moe_sum_reduce). The mega-MoE path applies it
-            # explicitly too (`forward_mega_moe`), so match that here.
-            scale = self.moe_runner_config.routed_scaling_factor
-            if scale is not None:
-                hidden_states = hidden_states * scale
-            return StandardCombineInput(hidden_states=hidden_states)
+            # This quant method leaves
+            # ``should_fuse_routed_scaling_factor_in_topk`` false. The MXFP4
+            # Marlin path uses the unscaled top-k weights and its final reduce
+            # does not consume ``MoeRunnerConfig.routed_scaling_factor``; the
+            # GLM MoE block therefore owns the single post-MoE scale. Applying
+            # it here as well would scale every routed MoE block twice.
+            return StandardCombineInput(hidden_states=combine_input.hidden_states)
 
         # Reaching here means the mega-MoE path declined this batch (e.g. the
         # token count exceeded its cap). There is no SM90 MXFP4 grouped GEMM to

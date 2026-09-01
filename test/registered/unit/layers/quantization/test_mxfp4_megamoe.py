@@ -33,7 +33,9 @@ except (ImportError, RuntimeError):
     _torchvision = types.ModuleType("torchvision")
     _torchvision_io = types.ModuleType("torchvision.io")
     _torchvision.__spec__ = importlib.util.spec_from_loader("torchvision", loader=None)
-    _torchvision_io.__spec__ = importlib.util.spec_from_loader("torchvision.io", loader=None)
+    _torchvision_io.__spec__ = importlib.util.spec_from_loader(
+        "torchvision.io", loader=None
+    )
     _torchvision_io.decode_jpeg = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         RuntimeError("torchvision decode_jpeg is unavailable in CPU contract tests")
     )
@@ -44,17 +46,20 @@ except (ImportError, RuntimeError):
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.mega_moe import (
     _MEGA_MOE_SYMM_BUFFER,
     _get_mega_moe_symm_buffer,
 )
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.mega_moe_sm90 import (
     _resolve_sm90_fp4_weight_transform,
     build_sm90_fp4_mega_moe_experts_weights,
     is_sm90_fp4_mega_moe_available,
     run_sm90_mega_routed,
 )
+from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
     CompressedTensorsFusedMoEMethod,
@@ -132,7 +137,9 @@ class TestMxfp4SchemeSelection(CustomTestCase):
         group = dict(MXFP4_GROUP)
         group["scale_dtype"] = None
         config = _config(group)
-        self.assertEqual(config.target_scheme_map["Linear"]["format"], "mxfp4-pack-quantized")
+        self.assertEqual(
+            config.target_scheme_map["Linear"]["format"], "mxfp4-pack-quantized"
+        )
         self.assertIsNone(config.target_scheme_map["Linear"]["weights"].scale_dtype)
         self.assertIsNotNone(config.target_scheme_map["Linear"]["input_activations"])
 
@@ -255,6 +262,41 @@ class TestMxfp4SchemeSelection(CustomTestCase):
 
 
 class TestMxfp4PackedLoaderContract(CustomTestCase):
+    def test_marlin_apply_does_not_scale_runner_output_twice(self):
+        scheme = _scheme()
+        scheme.hidden_size = 4
+        scheme.moe_runner_config = MoeRunnerConfig(routed_scaling_factor=2.5)
+        runner_output = torch.tensor([[1.0, -2.0, 3.0, -4.0]])
+        scheme.runner = SimpleNamespace(
+            run=mock.Mock(return_value=SimpleNamespace(hidden_states=runner_output))
+        )
+        layer = SimpleNamespace(
+            w13_weight=torch.empty(0),
+            w2_weight=torch.empty(0),
+            w13_weight_scale=torch.empty(0),
+            w2_weight_scale=torch.empty(0),
+        )
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=torch.zeros((1, 4)),
+            hidden_states_scale=None,
+            topk_output=StandardTopKOutput(
+                topk_weights=torch.ones((1, 1)),
+                topk_ids=torch.zeros((1, 1), dtype=torch.int64),
+                router_logits=torch.zeros((1, 1)),
+            ),
+        )
+        backend = SimpleNamespace(is_marlin=lambda: True, value="marlin")
+
+        with mock.patch(
+            "sglang.srt.layers.quantization.compressed_tensors.schemes."
+            "compressed_tensors_w4a8_mxfp4_moe.get_moe_runner_backend",
+            return_value=backend,
+        ):
+            result = scheme.apply_weights(layer, dispatch_output)
+
+        self.assertIs(result.hidden_states, runner_output)
+        scheme.runner.run.assert_called_once()
+
     def test_loader_mapping_hits_registered_gate_and_down_params(self):
         layer = torch.nn.Module()
         scheme = _scheme()
@@ -384,14 +426,12 @@ class TestMxfp4PackedLoaderContract(CustomTestCase):
         for expert_id in range(2):
             self.assertTrue(
                 torch.all(
-                    layer.w13_weight_packed[expert_id, :64]
-                    == values[(expert_id, "w1")]
+                    layer.w13_weight_packed[expert_id, :64] == values[(expert_id, "w1")]
                 )
             )
             self.assertTrue(
                 torch.all(
-                    layer.w13_weight_packed[expert_id, 64:]
-                    == values[(expert_id, "w3")]
+                    layer.w13_weight_packed[expert_id, 64:] == values[(expert_id, "w3")]
                 )
             )
             self.assertTrue(
@@ -408,14 +448,12 @@ class TestMxfp4PackedLoaderContract(CustomTestCase):
             )
             self.assertTrue(
                 torch.all(
-                    layer.w2_weight_packed[expert_id]
-                    == values[(expert_id, "w2")]
+                    layer.w2_weight_packed[expert_id] == values[(expert_id, "w2")]
                 )
             )
             self.assertTrue(
                 torch.all(
-                    layer.w2_weight_scale[expert_id]
-                    == values[(expert_id, "w2")] + 100
+                    layer.w2_weight_scale[expert_id] == values[(expert_id, "w2")] + 100
                 )
             )
 
@@ -582,9 +620,7 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
         )
         with (
             mock.patch.dict("sys.modules", {"deep_gemm": deep_gemm}),
-            mock.patch(
-                "sglang.srt.layers.moe.mega_moe_sm90._device_sm", 90
-            ),
+            mock.patch("sglang.srt.layers.moe.mega_moe_sm90._device_sm", 90),
         ):
             self.assertFalse(is_sm90_fp4_mega_moe_available(experts))
             deep_gemm._C.fp8_fp4_mega_moe_sm90 = mock.Mock()
@@ -598,7 +634,12 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
 
         with mock.patch.dict("sys.modules", {"deep_gemm": deep_gemm}):
             result = _get_mega_moe_symm_buffer(
-                group, 256, 8192, 8, 6144, 2048,
+                group,
+                256,
+                8192,
+                8,
+                6144,
+                2048,
                 use_sm90_fp4_buffer=True,
             )
 
@@ -621,7 +662,10 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
             fp8_fp4_mega_moe=mock.Mock(),
             _C=SimpleNamespace(fp8_fp4_mega_moe_sm90=mock.Mock()),
             transform_weights_for_mega_moe_sm90_fp4=mock.Mock(
-                return_value=((torch.ones(1), torch.ones(1)), (torch.ones(1), torch.ones(1)))
+                return_value=(
+                    (torch.ones(1), torch.ones(1)),
+                    (torch.ones(1), torch.ones(1)),
+                )
             ),
         )
         with (
