@@ -70,8 +70,7 @@ class MiniMaxH3VideoModelAdapter:
     def validate_task_gate(self, task: Any, *, provided: bool) -> None:
         if not provided or task is None:
             raise ValueError(
-                "task is required for MiniMax H3; supported tasks: "
-                "fl2va, ref2va, t2va"
+                "task is required for MiniMax H3; supported tasks: fl2va, ref2va, t2va"
             )
         if not isinstance(task, str):
             raise ValueError("task must be a non-empty string for MiniMax H3")
@@ -185,6 +184,11 @@ class MiniMaxH3VideoModelAdapter:
                 ),
             }
         )
+        reference_resize_mode = _parse_extra_value(
+            _extra_value(request, "reference_resize_mode")
+        )
+        if reference_resize_mode is not None:
+            kwargs["reference_resize_mode"] = reference_resize_mode
         if quality is not None:
             kwargs["quality"] = quality
         return kwargs
