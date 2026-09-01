@@ -14,6 +14,7 @@ from sglang.srt.beam_search.fork import (
     neutral_member_sampling_params,
     remap_kv_mapping,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -119,8 +120,9 @@ class _FakeAllocator:
 class TestFreeMemberRows(CustomTestCase):
     def _make_group(self, req_to_token, allocated_len):
         leader = SimpleNamespace(
-            kv=SimpleNamespace(kv_allocated_len=allocated_len),
-            kv_committed_len=allocated_len,
+            kv=ReqKvInfo(
+                kv_allocated_len=allocated_len, kv_committed_len=allocated_len
+            ),
         )
         return SimpleNamespace(
             leader=leader,
@@ -146,7 +148,7 @@ class TestFreeMemberRows(CustomTestCase):
         # Leader rewound to the prompt: its own release must not free the
         # decode region a second time.
         self.assertEqual(leader.kv.kv_allocated_len, 5)
-        self.assertEqual(leader.kv_committed_len, 5)
+        self.assertEqual(leader.kv.kv_committed_len, 5)
         self.assertEqual(sorted(pool.freed), [1, 2])
         self.assertIsNone(group.member_rows)
         self.assertIsNone(group.member_rows_cpu)
@@ -207,7 +209,7 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
         allocator = _FakeAllocator()
         group = SimpleNamespace(
             leader=SimpleNamespace(
-                kv=SimpleNamespace(kv_allocated_len=8), kv_committed_len=8
+                kv=ReqKvInfo(kv_allocated_len=8, kv_committed_len=8),
             ),
             prompt_len=5,
             member_rows=torch.tensor([1, 2], dtype=torch.int64),

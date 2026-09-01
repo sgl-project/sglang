@@ -49,6 +49,7 @@ class ExpertPackConfig(GGUFConfig):
 
     is_fp4_experts = True
     supports_kimi_k3_quantized_latent_projections = True
+    supports_kimi_k3_split_gguf_kv_b = True
 
     def __init__(self, store: ExpertPackStore) -> None:
         super().__init__()
