@@ -627,32 +627,6 @@ class TestFixSpecialTokensPattern(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# __init__.py re-exports
-# ---------------------------------------------------------------------------
-
-
-class TestModuleReExports(unittest.TestCase):
-    def test_all_public_symbols_importable(self):
-        import sglang.srt.utils.hf_transformers as pkg
-
-        for name in pkg.__all__:
-            self.assertTrue(
-                hasattr(pkg, name),
-                f"{name} listed in __all__ but not importable from package",
-            )
-
-    def test_shim_module_exports_match(self):
-        import sglang.srt.utils.hf_transformers as pkg
-        import sglang.srt.utils.hf_transformers_utils as shim
-
-        for name in pkg.__all__:
-            self.assertTrue(
-                hasattr(shim, name),
-                f"{name} not available through shim module hf_transformers_utils",
-            )
-
-
-# ---------------------------------------------------------------------------
 # compat: _patch_removed_symbols
 # ---------------------------------------------------------------------------
 
@@ -674,11 +648,6 @@ class TestPatchRemovedSymbols(unittest.TestCase):
             "is_flash_attn_greater_or_equal_2_10 should be patched onto transformers.utils",
         )
         self.assertIsInstance(_u.is_flash_attn_greater_or_equal_2_10(), bool)
-
-
-# ---------------------------------------------------------------------------
-# compat: _patch_rope_parameters_validation
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------

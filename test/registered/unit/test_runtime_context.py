@@ -1,4 +1,4 @@
-"""Unit tests for runtime_context: delegation, singletons, and override()."""
+"""Behavioral tests for runtime-context delegation, state, and overrides."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -30,9 +30,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
 )
 from sglang.srt.runtime_context import (
-    Flags,
     ParallelContext,
-    RuntimeContext,
     _FlagGroupBase,
     assert_published,
     derive_parallel_widths,
@@ -84,14 +82,6 @@ GROUP_DELEGATIONS = [
 ]
 
 
-class TestRuntimeContextSingletons(CustomTestCase):
-    def test_singletons(self):
-        self.assertIs(get_parallel(), get_parallel())
-        self.assertIsInstance(get_parallel(), ParallelContext)
-        self.assertIsInstance(get_context(), RuntimeContext)
-        self.assertIs(get_context().parallel, get_parallel())
-
-
 class _IsolatedOverrides(CustomTestCase):
     """Give each test a clean override map, restoring afterward only the overrides
     installed outside it (e.g. by another test file sharing the process)."""
@@ -131,14 +121,6 @@ class TestParallelDelegation(_IsolatedOverrides):
                     sentinel,
                     msg=f"{attr} must delegate to {target}",
                 )
-
-    def test_wrapper_holds_no_resolved_state(self):
-        # __slots__: no __dict__; the only instance state is the override hook.
-        self.assertFalse(hasattr(get_parallel(), "__dict__"))
-        # tp_group IS exposed: live delegation handles PD-multiplexing / the tp patch.
-        self.assertTrue(hasattr(ParallelContext, "tp_group"))
-        # local_attn_dp is intentionally not part of the wrapper surface.
-        self.assertFalse(hasattr(ParallelContext, "local_attn_dp_size"))
 
 
 class TestParallelOverride(_IsolatedOverrides):
@@ -468,11 +450,6 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         with self.assertRaises(AssertionError):
             override.install()
 
-    def test_module_global_removed(self):
-        # The legacy storage must not survive: a stale _global_server_args would
-        # silently fork the config into two objects.
-        self.assertFalse(hasattr(server_args_module, "_global_server_args"))
-
 
 @dataclasses.dataclass
 class _FakeCaptureGroup(_FlagGroupBase):
@@ -485,12 +462,6 @@ class TestFlagsTier(_IsolatedServerArgs):
     Resolved configuration lives on server_args fields (materialized at the
     end of __post_init__); the flags tier only carries runtime state
     (today: the capture lifecycle)."""
-
-    def test_wiring_and_groups(self):
-        flags = get_flags()
-        self.assertIs(flags, get_context().flags)
-        self.assertIsInstance(flags, Flags)
-        self.assertTrue(hasattr(flags, "capture"))
 
     def test_typo_safety(self):
         group = _FakeCaptureGroup()

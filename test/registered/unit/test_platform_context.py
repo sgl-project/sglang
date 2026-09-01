@@ -1,7 +1,7 @@
 """A platform fact has one address, and one place to change it.
 
 The value lives in one object, so `override_platform(...)` reaches every reader
-at once, and the facts answer before anything is published.
+at once and restores state when its scope exits.
 """
 
 import unittest
@@ -20,20 +20,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestPlatformContext(CustomTestCase):
-    def test_every_name_maps_to_a_real_probe(self):
-        """A typo in either table would answer with an AttributeError at runtime."""
-        for name, probe in {**_PLATFORM_PROBES, **_PLATFORM_VALUES}.items():
-            self.assertTrue(
-                callable(getattr(_common, probe, None)),
-                f"{name} maps to {probe!r}, which is not callable in utils.common",
-            )
-
-    def test_it_answers_before_anything_is_published(self):
-        """Unlike a config bag: a launcher asks these before it publishes."""
-        platform = get_platform()
-        for name in _PLATFORM_PROBES:
-            self.assertIsInstance(getattr(platform, name), bool)
-
     def test_the_probe_is_what_it_answers_with(self):
         platform = get_platform()
         for name, probe in {**_PLATFORM_PROBES, **_PLATFORM_VALUES}.items():

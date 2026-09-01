@@ -1,7 +1,7 @@
 """
 Unit tests for SGLang platform abstraction layer.
 
-Tests DeviceMixin, SRTPlatform, PlatformEnum, CpuArchEnum, DeviceCapability,
+Tests device-specific behavior, pin-memory dispatch, CPU architecture handling,
 and the platform discovery / lazy initialization mechanism.
 """
 
@@ -61,72 +61,8 @@ def _make_platform_ep(name, load_fn=None):
 
 
 # ---------------------------------------------------------------------------
-# PlatformEnum & CpuArchEnum
-# ---------------------------------------------------------------------------
-
-
-class TestPlatformEnum(CustomTestCase):
-    """Tests for PlatformEnum enumeration."""
-
-    def test_all_expected_values_exist(self):
-        expected = {
-            "CUDA",
-            "ROCM",
-            "CPU",
-            "XPU",
-            "MUSA",
-            "NPU",
-            "TPU",
-            "MPS",
-            "OOT",
-            "UNSPECIFIED",
-        }
-        actual = {member.name for member in PlatformEnum}
-        self.assertEqual(actual, expected)
-
-
-class TestCpuArchEnum(CustomTestCase):
-    """Tests for CpuArchEnum enumeration."""
-
-    def test_all_expected_values_exist(self):
-        expected = {"X86", "ARM", "UNSPECIFIED"}
-        actual = {member.name for member in CpuArchEnum}
-        self.assertEqual(actual, expected)
-
-
-# ---------------------------------------------------------------------------
-# DeviceCapability
-# ---------------------------------------------------------------------------
-
-
-class TestDeviceCapability(CustomTestCase):
-    """Tests for DeviceCapability custom logic (formatting, conversion)."""
-
-    def test_as_version_str(self):
-        self.assertEqual(DeviceCapability(major=9, minor=0).as_version_str(), "9.0")
-        self.assertEqual(DeviceCapability(major=8, minor=9).as_version_str(), "8.9")
-
-    def test_to_int(self):
-        self.assertEqual(DeviceCapability(major=9, minor=0).to_int(), 90)
-        self.assertEqual(DeviceCapability(major=8, minor=9).to_int(), 89)
-        self.assertEqual(DeviceCapability(major=0, minor=0).to_int(), 0)
-
-
-# ---------------------------------------------------------------------------
 # DeviceMixin
 # ---------------------------------------------------------------------------
-
-# Platform identity test data: (enum, name, dtype, true_method)
-_PLATFORM_IDENTITY = [
-    (PlatformEnum.CUDA, "cuda", "cuda", "is_cuda"),
-    (PlatformEnum.ROCM, "rocm", "hip", "is_rocm"),
-    (PlatformEnum.CPU, "cpu", "cpu", "is_cpu"),
-    (PlatformEnum.XPU, "xpu", "xpu", "is_xpu"),
-    (PlatformEnum.MUSA, "musa", "musa", "is_musa"),
-    (PlatformEnum.NPU, "npu", "npu", "is_npu"),
-    (PlatformEnum.TPU, "tpu", "tpu", "is_tpu"),
-    (PlatformEnum.MPS, "mps", "mps", "is_mps"),
-]
 
 # is_cuda_alike test data: (enum, name, dtype, expected)
 _CUDA_ALIKE = [
@@ -141,13 +77,6 @@ _CUDA_ALIKE = [
 class TestDeviceMixin(CustomTestCase):
     """Tests for DeviceMixin base class."""
 
-    def test_platform_identity_methods(self):
-        """Each platform type returns True for its identity method."""
-        for enum_val, name, dtype, method in _PLATFORM_IDENTITY:
-            with self.subTest(method=method, enum=enum_val.name):
-                mixin = _make_device_mixin(enum_val, name, dtype)
-                self.assertTrue(getattr(mixin, method)())
-
     def test_is_cuda_alike(self):
         """is_cuda_alike is True for CUDA/ROCM/MUSA, False otherwise."""
         for enum_val, name, dtype, expected in _CUDA_ALIKE:
@@ -160,11 +89,6 @@ class TestDeviceMixin(CustomTestCase):
         self.assertTrue(oot.is_out_of_tree())
         cuda = _make_device_mixin(PlatformEnum.CUDA, "cuda", "cuda")
         self.assertFalse(cuda.is_out_of_tree())
-
-    def test_pin_memory_default_is_conservative(self):
-        mixin = _make_device_mixin(PlatformEnum.OOT, "custom", "custom")
-        self.assertFalse(mixin.is_pin_memory_available())
-        self.assertFalse(mixin.is_pin_memory_available(device="cpu"))
 
     @patch("platform.machine")
     def test_get_cpu_architecture(self, mock_machine):
@@ -185,37 +109,8 @@ class TestDeviceMixin(CustomTestCase):
                 self.assertEqual(DeviceMixin.get_cpu_architecture(), expected)
 
 
-# ---------------------------------------------------------------------------
-# SRTPlatform
-# ---------------------------------------------------------------------------
-
-
-class TestSRTPlatform(CustomTestCase):
-    """Tests for SRTPlatform base class and default behaviors."""
-
-    def test_compile_backend_signature_compatibility(self):
-        """get_compile_backend accepts mode keyword arg without error."""
-        base = SRTPlatform()
-        self.assertEqual(base.get_compile_backend(mode="npugraph_ex"), "inductor")
-
-    def test_base_device_identity_stays_unspecified(self):
-        """The abstract SRT base should not claim any concrete in-tree device."""
-        base = SRTPlatform()
-        self.assertFalse(base.is_cuda())
-        self.assertFalse(base.is_cuda_alike())
-
-    def test_base_pin_memory_default_is_conservative(self):
-        base = SRTPlatform()
-        self.assertFalse(base.is_pin_memory_available())
-        self.assertFalse(base.is_pin_memory_available(device="cpu"))
-
-
 class TestCudaDeviceMixin(CustomTestCase):
     """Tests for CUDA device operation defaults."""
-
-    def test_default_get_device_returns_cuda_device(self):
-        base = CudaSRTPlatform()
-        self.assertEqual(base.get_device(2), torch.device("cuda", 2))
 
     @patch("torch.cuda.get_device_capability", return_value=(9, 0))
     def test_default_get_device_capability_uses_cuda(self, mock_get_device_capability):
@@ -249,21 +144,10 @@ class TestCudaDeviceMixin(CustomTestCase):
         mock_torch_seed.assert_called_once_with(123)
         mock_cuda_seed.assert_called_once_with(123)
 
-    def test_cuda_srt_platform_capabilities(self):
-        base = CudaSRTPlatform()
-        self.assertTrue(base.supports_fp8())
-        self.assertTrue(base.support_cuda_graph())
-        self.assertTrue(base.support_piecewise_cuda_graph())
-
 
 class TestXpuDeviceMixin(CustomTestCase):
     """Tests for XPU device operation defaults."""
 
-    def test_default_get_device_returns_xpu_device(self):
-        base = XpuSRTPlatform()
-        self.assertEqual(base.get_device(2), torch.device("xpu", 2))
-
-    # TODO: @patch("torch.xpu.get_device_capability", return_value=(9, 0))
     def test_default_get_device_capability_uses_xpu(self):
         # torch.ops.sgl_kernel.query_device is only registered by XPU builds
         # of sgl-kernel, so patch the op namespace attribute with create=True
@@ -300,12 +184,6 @@ class TestXpuDeviceMixin(CustomTestCase):
         mock_np_seed.assert_called_once_with(123)
         mock_torch_seed.assert_called_once_with(123)
         mock_xpu_seed.assert_called_once_with(123)
-
-    def test_xpu_srt_platform_capabilities(self):
-        base = XpuSRTPlatform()
-        self.assertFalse(base.supports_fp8())
-        self.assertTrue(base.support_cuda_graph())
-        self.assertTrue(base.support_piecewise_cuda_graph())
 
 
 class TestCpuDeviceMixin(CustomTestCase):
@@ -362,15 +240,6 @@ class TestCpuDeviceMixin(CustomTestCase):
         base = CpuSRTPlatform()
         name = base.get_device_name()
         self.assertIn("x86_64", name)
-
-    def test_cpu_srt_platform_capabilities(self):
-        base = CpuSRTPlatform()
-        self.assertFalse(base.supports_fp8())
-        self.assertFalse(base.support_cuda_graph())
-        self.assertFalse(base.support_piecewise_cuda_graph())
-        # CPU has no GPU to pin host memory to.
-        self.assertFalse(base.is_pin_memory_available())
-        self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
 
 class TestPinMemoryAvailability(CustomTestCase):

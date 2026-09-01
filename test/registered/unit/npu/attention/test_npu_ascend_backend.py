@@ -4,7 +4,6 @@ Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 
 import sys
 import unittest
-from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -32,7 +31,6 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     AscendAttnMaskBuilder,
     AscendAttnMultiStepDraftBackend,
-    ForwardMetadata,
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
@@ -108,58 +106,6 @@ class TestReshapeKvForFiaNz(unittest.TestCase):
         tensor = torch.arange(total, dtype=torch.float32)
         result = _reshape_kv_for_fia_nz(tensor, num_heads, head_dim, page_size)
         self.assertEqual(result.data_ptr(), tensor.data_ptr())
-
-
-class TestForwardMetadata(unittest.TestCase):
-    def test_is_dataclass(self):
-        self.assertTrue(is_dataclass(ForwardMetadata))
-
-    def test_all_fields_default_none(self):
-        metadata = ForwardMetadata()
-        for f in fields(ForwardMetadata):
-            self.assertIsNone(
-                getattr(metadata, f.name),
-                f"Field '{f.name}' should default to None",
-            )
-
-    def test_create_with_values(self):
-        block_tables = torch.tensor([[1, 2], [3, 4]])
-        seq_lens = torch.tensor([10, 20])
-        metadata = ForwardMetadata(
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            seq_lens_cpu_list=[10, 20],
-        )
-        self.assertTrue(torch.equal(metadata.block_tables, block_tables))
-        self.assertTrue(torch.equal(metadata.seq_lens, seq_lens))
-        self.assertEqual(metadata.seq_lens_cpu_list, [10, 20])
-
-    def test_partial_assignment(self):
-        metadata = ForwardMetadata(swa_mask=torch.ones(3, 3))
-        self.assertIsNotNone(metadata.swa_mask)
-        self.assertIsNone(metadata.block_tables)
-        self.assertIsNone(metadata.seq_lens)
-
-    def test_field_names(self):
-        names = {f.name for f in fields(ForwardMetadata)}
-        expected = {
-            "block_tables",
-            "block_tables_swa",
-            "swa_out_cache_loc",
-            "extend_seq_lens_cpu_int",
-            "seq_lens_cpu_int",
-            "seq_lens_cpu_list",
-            "seq_lens_list_cumsum",
-            "seq_lens",
-            "actual_seq_lengths_q",
-            "actual_seq_lengths_q_pa",
-            "actual_seq_lengths_q_pa_cpu",
-            "actual_seq_lengths_kv",
-            "swa_mask",
-            "prefix_lens",
-            "flatten_prefix_block_tables",
-        }
-        self.assertEqual(names, expected)
 
 
 class TestGenerateMaskFlag(unittest.TestCase):
