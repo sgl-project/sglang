@@ -10,7 +10,7 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Use an SGLang build that includes GLM-5.3-Flash support. The AMD ROCm recipes also require [the ROCm engine changes in PR #36607](https://github.com/sgl-project/sglang/pull/36607) until they are available in a published SGLang image.
+Use an SGLang build that includes GLM-5.3-Flash support. The optimized MI355X recipe also requires [the ROCm engine changes in SGLang PR #36607](https://github.com/sgl-project/sglang/pull/36607) and [the gfx950 BF16 GEMM tuning in AITER PR #5060](https://github.com/ROCm/aiter/pull/5060) until both are available in published packages.
 
 ```bash Command
 docker pull lmsysorg/sglang:glm-5.3-flash
@@ -69,7 +69,7 @@ GLM-5.3-Flash is a natively multimodal Mixture-of-Experts model built around a h
     </tr>
     <tr>
       <td style={{padding: "9px 12px"}}>Precision</td>
-      <td style={{padding: "9px 12px"}}>FP8 weights; FP8 KV cache by default on Blackwell, BF16 KV cache on H100, H200, and the AMD ROCm recipes</td>
+      <td style={{padding: "9px 12px"}}>FP8 weights; FP8 KV cache by default on Blackwell and MI355X, BF16 KV cache on H100, H200, MI300X, and MI325X</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Context</td>
@@ -110,7 +110,7 @@ Neither algorithm runs with DP-Attention, and neither is available on the AMD RO
 
 GLM-5.3-Flash maintains a paged KV pool for attention and a separate KDA state pool. The KDA state pool can limit concurrency before the KV pool is full. If startup reduces `max_running_requests` because of KDA state capacity, increase `--mamba-full-memory-ratio` or set `--max-mamba-cache-size` for the expected concurrency, then tune `--max-running-requests` to the workload.
 
-Keep the prefix cache enabled for every strategy.
+Keep the prefix cache enabled for production workloads that reuse prefixes. The published MI355X speed rows pass `--disable-radix-cache` to isolate model execution under the requested random-data benchmark protocol; remove that flag when prefix reuse is part of your workload.
 
 Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not override `linear_lower_bound` through `--json-model-override-args`.
 
@@ -118,7 +118,11 @@ Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not o
 
 On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination.
 
-On AMD ROCm, use BF16 KV cache with TileLang DSA, set `SGLANG_USE_AITER=1`, keep the MoE runner on Triton, and disable CUDA graphs. The ROCm recipe uses TP8 on a single eight-GPU node. MI300X and MI325X both use gfx942, but the MI325X entry remains explicitly unverified because it is inferred from MI300X rather than measured directly. AMD validation covers text generation and GSM8K only; multimodal serving remains unverified.
+On AMD ROCm, set `SGLANG_USE_AITER=1` and use TileLang DSA. MI300X and MI325X retain the correctness-validated BF16 KV, Triton MoE, graph-disabled path; MI325X remains explicitly unverified because it is inferred from MI300X rather than measured directly. The optimized MI355X recipe uses TP8/EP1, FP8 KV, AITER MoE, the AITER mHC pre/post dispatch added by SGLang PR #36607, shared-expert fusion, the HIP fused k-pool path, and full decode graphs for batch sizes 1 and 32. Its small BF16 decode GEMMs require the model-specific gfx950 rows in AITER PR #5060. The graph batch list matches the measured workload; tune it for other production concurrency ranges. AMD multimodal serving remains unverified.
+
+### Reproduce the MI355X speed rows
+
+The MI355X rows use the random dataset with seed 42, ignored EOS, 1,024 input tokens, and 1,024 output tokens. Concurrency 1 uses 10 prompts and concurrency 32 uses 320 prompts. Radix caching is disabled, every completed request has exactly 1,024 input and output tokens, and the results report median TTFT and TPOT. Total throughput includes input and output tokens; the deployment table divides aggregate throughput by eight GPUs. Median interactivity is `1,000 / median TPOT`: 145.61 tok/s/user at concurrency 1 and 93.72 tok/s/user at concurrency 32.
 
 ### Decode context parallelism
 

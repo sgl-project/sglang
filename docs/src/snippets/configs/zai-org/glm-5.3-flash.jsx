@@ -24,9 +24,12 @@ export const config = {
   ],
 
   isRecommendedSelection(s) {
-    const pairing = ["h100", "h200", "mi300x", "mi325x", "mi355x"].includes(s.hw)
-      ? "bf16-tilelang"
-      : "fp8-trtllm";
+    const pairing =
+      s.hw === "mi355x"
+        ? "fp8-tilelang"
+        : ["h100", "h200", "mi300x", "mi325x"].includes(s.hw)
+          ? "bf16-tilelang"
+          : "fp8-trtllm";
     return (
       s.kvDsaPair === pairing &&
       s.mmTransport === "auto" &&
@@ -45,7 +48,7 @@ export const config = {
           id: "fp8-trtllm",
           label: "FP8 + TRT-LLM",
           disabled: (s) => ["h100", "h200", "mi300x", "mi325x", "mi355x"].includes(s.hw),
-          disableReason: "This recipe uses BF16 KV cache with TileLang DSA on Hopper and AMD ROCm GPUs.",
+          disableReason: "Hopper and gfx942 use BF16 + TileLang; MI355X uses FP8 + TileLang because TRT-LLM DSA is CUDA-only.",
           stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
           flags: [
             "--kv-cache-dtype fp8_e4m3",
@@ -63,6 +66,19 @@ export const config = {
             "--dsa-prefill-backend tilelang",
             "--dsa-decode-backend tilelang",
           ],
+        },
+        {
+          id: "fp8-tilelang",
+          label: "FP8 + TileLang",
+          disabled: (s) => s.hw !== "mi355x",
+          disableReason: "This pairing is validated only on MI355X/gfx950.",
+          stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
+          flags: [
+            "--kv-cache-dtype fp8_e4m3",
+            "--dsa-prefill-backend tilelang",
+            "--dsa-decode-backend tilelang",
+          ],
+          hints: ["Validated on 8x MI355X with AITER MoE and full decode graphs."],
         },
       ],
     },
@@ -629,11 +645,10 @@ sgl-eval run gsm8k \\
         "--port {{PORT}}",
       ],
     },
-    // AMD ROCm — one non-speculative TP8 operating point. The explicit BF16
-    // KV and TileLang DSA flags match the resolved defaults observed in the
-    // validation server logs. AITER remains enabled for the ROCm kernel paths,
-    // while Triton owns the MoE runner. CUDA graphs stay disabled because that
-    // is the architecture-gated configuration used for correctness validation.
+    // AMD ROCm — non-speculative TP8 operating points. gfx942 retains the
+    // correctness-validated BF16 KV, Triton MoE, graph-disabled path. MI355X
+    // uses the performance-validated FP8 KV, AITER MoE, shared-expert fusion,
+    // HIP fused k-pool path, and full decode graphs from PR #36607.
     {
       match: { hw: "mi300x", strategy: "high-throughput" },
       nnodes: 1,
@@ -683,12 +698,16 @@ sgl-eval run gsm8k \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
+        "--ep-size 1",
         "--trust-remote-code",
-        "--disable-cuda-graph",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
-        "--moe-runner-backend triton",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend aiter",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-backend-prefill disabled",
+        "--cuda-graph-bs-decode 1 32",
+        "--disable-radix-cache",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
