@@ -318,6 +318,21 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
 
         self.assertIn(rid, tm.rid_to_state)
 
+    def test_token_only_row_ignores_text_from_mixed_batch(self):
+        tm = _make_tokenizer_manager(self)
+        rid = "token_only_mixed_batch"
+        state = _make_req_state(rid)
+        state.obj._output_text_required = False
+        tm.rid_to_state[rid] = state
+        batch_output = _make_batch_str_output(rid)
+        batch_output.output_strs = ["must not be returned"]
+        batch_output.output_ids = [[7]]
+
+        asyncio.run(tm._handle_batch_output(batch_output))
+
+        self.assertEqual(state.out_list[0]["output_ids"], [7])
+        self.assertNotIn("text", state.out_list[0])
+
 
 class TestInitReqStateDuplicateDetection(CustomTestCase):
     """Test that _init_req_state raises ValueError for duplicate rids."""

@@ -298,13 +298,19 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             results[i] = text
         return results
 
-    def _decode_batch_token_id_output(self, recv_obj: BatchTokenIDOutput):
+    def _decode_batch_token_id_output(
+        self,
+        recv_obj: BatchTokenIDOutput,
+        decode_indices: Optional[List[int]] = None,
+    ):
         bs = len(recv_obj.rids)
         vocab_size = self.vocab_size
+        if decode_indices is None:
+            decode_indices = list(range(bs))
 
         # Initialize decode status
         read_ids, surr_ids = [], []
-        for i in range(bs):
+        for i in decode_indices:
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
                 s = DecodeStatus(
@@ -335,13 +341,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         if not self.disable_tokenizer_batch_decode:
             surr_texts = self._grouped_batch_decode(
                 surr_ids,
-                recv_obj.skip_special_tokens,
-                recv_obj.spaces_between_special_tokens,
+                [recv_obj.skip_special_tokens[i] for i in decode_indices],
+                [recv_obj.spaces_between_special_tokens[i] for i in decode_indices],
             )
             read_texts = self._grouped_batch_decode(
                 read_ids,
-                recv_obj.skip_special_tokens,
-                recv_obj.spaces_between_special_tokens,
+                [recv_obj.skip_special_tokens[i] for i in decode_indices],
+                [recv_obj.spaces_between_special_tokens[i] for i in decode_indices],
             )
         else:
             # Do not use batch decode to prevent some detokenization edge cases (e.g., gpt-oss).
@@ -351,8 +357,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 )
                 for surr, skip, space in zip(
                     surr_ids,
-                    recv_obj.skip_special_tokens,
-                    recv_obj.spaces_between_special_tokens,
+                    (recv_obj.skip_special_tokens[i] for i in decode_indices),
+                    (recv_obj.spaces_between_special_tokens[i] for i in decode_indices),
                 )
             ]
             read_texts = [
@@ -361,14 +367,14 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 )
                 for read, skip, space in zip(
                     read_ids,
-                    recv_obj.skip_special_tokens,
-                    recv_obj.spaces_between_special_tokens,
+                    (recv_obj.skip_special_tokens[i] for i in decode_indices),
+                    (recv_obj.spaces_between_special_tokens[i] for i in decode_indices),
                 )
             ]
 
         # Incremental decoding
-        output_strs = []
-        for i in range(bs):
+        output_strs = [""] * bs
+        for decoded_i, i in enumerate(decode_indices):
             rid = recv_obj.rids[i]
             try:
                 s = self.decode_status[rid]
@@ -381,7 +387,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     f"The current value is {DETOKENIZER_MAX_STATES}. "
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
                 )
-            new_text = read_texts[i][len(surr_texts[i]) :]
+            new_text = read_texts[decoded_i][len(surr_texts[decoded_i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming. Invariant: sent_offset >= decoded_text_len. The
                 # gap (`pending`) is "printable but uncommitted" text emitted
@@ -394,14 +400,14 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)
                     s.sent_offset = s.decoded_text_len
-                    output_strs.append(new_text[pending:] if pending else new_text)
+                    output_strs[i] = new_text[pending:] if pending else new_text
                 else:
                     # Incomplete UTF-8: emit the printable prefix only; do not
                     # commit (token offsets stay so the next iteration retries
                     # with more tokens).
                     printable = find_printable_text(new_text)
                     s.sent_offset = s.decoded_text_len + len(printable)
-                    output_strs.append(printable[pending:] if pending else printable)
+                    output_strs[i] = printable[pending:] if pending else printable
                 continue
 
             if rid in self.decode_status:
@@ -415,9 +421,32 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             )
             incremental_output = output_str[s.sent_offset :]
             s.sent_offset = len(output_str)
-            output_strs.append(incremental_output)
+            output_strs[i] = incremental_output
 
         return output_strs
+
+    @staticmethod
+    def _get_output_text_required(
+        recv_obj: BatchTokenIDOutput,
+    ) -> Optional[List[bool]]:
+        """Return a valid aligned mask, or None for the safe decode fallback."""
+        mask = recv_obj.output_text_required
+        if (
+            not isinstance(mask, list)
+            or len(mask) != len(recv_obj.rids)
+            or any(type(value) is not bool for value in mask)
+        ):
+            return None
+        return mask
+
+    def _cleanup_token_only_decode_status(
+        self, recv_obj: BatchTokenIDOutput, mask: List[bool]
+    ) -> None:
+        # Normally token-only rows never have DecodeStatus. Cleanup also makes
+        # recovery safe if an earlier malformed mask used the decode fallback.
+        for i, output_text_required in enumerate(mask):
+            if not output_text_required and recv_obj.finished_reasons[i] is not None:
+                self.decode_status.pop(recv_obj.rids[i], None)
 
     @staticmethod
     def _b64_encode_per_request(
@@ -441,19 +470,45 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # Beam decoding is additive: a batch may mix beam leaders with normal
         # requests, so every item still goes through the standard decode.
-        if is_beam_search_batch(recv_obj):
+        is_beam_batch = is_beam_search_batch(recv_obj)
+        if is_beam_batch:
             decode_beam_search_output(
                 recv_obj,
                 tokenizer=self.tokenizer,
                 disable_batch_decode=self.disable_tokenizer_batch_decode,
                 trim_matched_stop=self.trim_matched_stop,
             )
+
+        output_text_required = self._get_output_text_required(recv_obj)
+        if is_beam_batch:
+            # Keep the established beam decode path until token-only beam
+            # output has its own explicit response contract.
+            output_text_required = None
+        elif (
+            len(recv_obj.rids) > 0
+            and output_text_required is not None
+            and not any(output_text_required)
+        ):
+            self._cleanup_token_only_decode_status(recv_obj, output_text_required)
+            return recv_obj
+
         # If handling idle batch, set output_strs to [].
         output_strs = (
-            self._decode_batch_token_id_output(recv_obj)
+            self._decode_batch_token_id_output(
+                recv_obj,
+                (
+                    None
+                    if output_text_required is None or all(output_text_required)
+                    else [
+                        i for i, required in enumerate(output_text_required) if required
+                    ]
+                ),
+            )
             if len(recv_obj.rids) > 0
             else []
         )
+        if output_text_required is not None:
+            self._cleanup_token_only_decode_status(recv_obj, output_text_required)
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(

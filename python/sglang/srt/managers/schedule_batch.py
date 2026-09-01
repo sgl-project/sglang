@@ -950,6 +950,7 @@ class Req(ReqDllmMixin):
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        output_text_required: bool = True,
     ):
         # Input and output info
         self.rid = rid
@@ -1041,6 +1042,7 @@ class Req(ReqDllmMixin):
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_finish: Optional[BaseFinishReason] = None
         self.stream = stream
+        self.output_text_required = output_text_required
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
         self.priority = priority

@@ -123,6 +123,26 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
         )
         return decoded.mm_inputs
 
+    def test_output_text_required_round_trip(self):
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1]),
+                input_embeds=None,
+                mm_inputs=None,
+                token_type_ids=None,
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=True,
+                output_text_required=False,
+            )
+        )
+
+        self.assertFalse(decoded.output_text_required)
+
     def test_generate_mm_inputs_round_trip_without_pickle_wrapper(self):
         decoded = self._round_trip(
             TokenizedGenerateReqInput(
@@ -392,7 +412,20 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
 
 
 class TestGenerateReqInputNormalization(CustomTestCase):
-    """Test the normalization of GenerateReqInput for batch processing and different input formats."""
+    """Test GenerateReqInput normalization for batches and input formats."""
+
+    def test_parallel_sampling_preserves_output_text_required(self):
+        req = GenerateReqInput(
+            text="Hello",
+            rid="token-only",
+            sampling_params={"n": 2},
+        )
+        req._output_text_required = False
+
+        req.normalize_batch_and_arguments()
+
+        self.assertFalse(req[0]._output_text_required)
+        self.assertFalse(req[1]._output_text_required)
 
     @classmethod
     def setUpClass(cls):

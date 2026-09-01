@@ -183,6 +183,16 @@ impl PyBridge {
         req_type: &str,
         req_dict: HashMap<String, serde_json::Value>,
     ) -> PyResult<Receiver<ResponseChunk>> {
+        self.submit_request_with_output_mode(rid, req_type, req_dict, true)
+    }
+
+    pub(crate) fn submit_request_with_output_mode(
+        &self,
+        rid: &str,
+        req_type: &str,
+        req_dict: HashMap<String, serde_json::Value>,
+        output_text_required: bool,
+    ) -> PyResult<Receiver<ResponseChunk>> {
         let receiver = self.create_channel(rid)?;
         let rid_owned = rid.to_string();
 
@@ -194,6 +204,7 @@ impl PyBridge {
             kwargs.set_item("req_type", req_type)?;
             kwargs.set_item("req_dict", py_req_dict)?;
             kwargs.set_item("chunk_callback", callback)?;
+            kwargs.set_item("output_text_required", output_text_required)?;
 
             self.runtime_handle
                 .call_method(py, "submit_request", (), Some(&kwargs))?;
