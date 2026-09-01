@@ -30,6 +30,19 @@ EXPECTED = {
     "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
     "kvcache.reshape_and_cache_flash": {"triton"},
     "diffusion.apply_group_norm_silu": {"triton"},
+    "diffusion.norm_scale_shift": {"KDA", "cute_dsl", "flydsl"},
+    "diffusion.scale_residual_norm_scale_shift": {
+        "KDA",
+        "triton",
+        "cute_dsl",
+        "flydsl",
+    },
+    "diffusion.residual_gate_add": {"KDA"},
+    "diffusion.ltx2_qknorm_split_rope": {"KDA"},
+    "diffusion.causal_conv3d_cat_pad": {"KDA", "triton"},
+    "diffusion.flux2_layernorm_modulate_fp8_quant": {"KDA"},
+    "diffusion.flux2_qkv_epilogue": {"KDA"},
+    "diffusion.flux2_token_cat_fp8": {"KDA"},
 }
 
 _CPU = PlatformInfo(device_type="cpu")
@@ -81,6 +94,30 @@ def test_sparse_linear_attention_registry_targets_forward_kernel():
         "diffusion.sparse_linear_attn_fwd", KernelBackend.TRITON
     )
     assert spec.target.endswith(":_attn_fwd")
+
+
+@pytest.mark.parametrize(
+    "op, target_suffix",
+    (
+        ("diffusion.norm_scale_shift", ":kda_norm_scale_shift"),
+        (
+            "diffusion.scale_residual_norm_scale_shift",
+            ":kda_scale_residual_norm_scale_shift",
+        ),
+        ("diffusion.residual_gate_add", ":residual_gate_add"),
+        (
+            "diffusion.ltx2_qknorm_split_rope",
+            ":ltx2_qknorm_split_rope_cuda",
+        ),
+        (
+            "diffusion.causal_conv3d_cat_pad",
+            ":fused_causal_conv3d_cat_pad_cuda",
+        ),
+    ),
+)
+def test_merged_diffusion_kda_provenance_backend(op, target_suffix):
+    spec = K.registry.get_backend(op, KernelBackend.KDA)
+    assert spec.target.endswith(target_suffix)
 
 
 def test_single_backend_resolves_without_backend():
