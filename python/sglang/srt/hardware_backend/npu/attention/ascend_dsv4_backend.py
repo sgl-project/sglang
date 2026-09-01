@@ -1222,21 +1222,6 @@ class DeepseekV4AscendAttnBackend(
                             live_seq_lens_cpu[:num_live_rows].copy_(
                                 explicit_live_cpu[:num_live_rows]
                             )
-            elif explicit_live_cpu is not None:
-                # DFlash also carries its committed/live prefix separately from
-                # the temporarily expanded target-verify seq_lens_cpu.
-                final_seq_lens_cpu = raw_seq_lens_cpu
-                explicit_live_cpu = torch.as_tensor(
-                    explicit_live_cpu,
-                    dtype=final_seq_lens_cpu.dtype,
-                    device=final_seq_lens_cpu.device,
-                ).flatten()
-                live_seq_lens_cpu = torch.zeros_like(final_seq_lens_cpu)
-                num_live_rows = min(bs, explicit_live_cpu.numel())
-                if num_live_rows > 0:
-                    live_seq_lens_cpu[:num_live_rows].copy_(
-                        explicit_live_cpu[:num_live_rows]
-                    )
             else:
                 # EAGLE and the other uniform verify callers keep
                 # seq_lens_cpu at the committed/live prefix length.
