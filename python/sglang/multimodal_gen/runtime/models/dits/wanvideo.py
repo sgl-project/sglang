@@ -1273,7 +1273,12 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
-            self.maybe_record_calibration(timestep_proj, hidden_states)
+            # Record the signal the decision diffs (see should_skip).
+            _tp = forward_batch.teacache_params if forward_batch is not None else None
+            _record_inp = (
+                timestep_proj if (_tp is not None and _tp.use_ret_steps) else temb
+            )
+            self.maybe_record_calibration(_record_inp, hidden_states)
             if enable_spectrum:
                 self.spectrum_record_features(hidden_states)
         self.cnt += 1

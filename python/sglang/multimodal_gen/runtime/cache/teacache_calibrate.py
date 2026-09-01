@@ -96,7 +96,8 @@ def calculate_threshold(y_data: np.ndarray, slope_threshold: float = 0.01) -> fl
         max_group = current_group
 
     if max_group:
-        longest_y = y_data[max_group[0] : max_group[-1] + 1]
+        # slope i spans y[i..i+1], so the flat run ends at index max_group[-1]+1.
+        longest_y = y_data[max_group[0] : max_group[-1] + 2]
         return float(np.mean(longest_y) * 2)
     return 0.2
 
@@ -136,7 +137,8 @@ class TeaCacheCalibrator:
         """
         state = self._expert(expert)
         branch_key = "neg" if is_cfg_negative else "pos"
-        prev = state["prev"].get(branch_key)
+        # step 0 starts a new sample: ignore the prior sample's last step.
+        prev = None if step_index == 0 else state["prev"].get(branch_key)
 
         e = modulated_inp.detach()
         x = output.detach()

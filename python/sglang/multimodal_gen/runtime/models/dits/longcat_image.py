@@ -53,6 +53,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -873,6 +874,10 @@ class LongCatImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         cos, sin = image_rotary_emb
         cos_sin_cache = torch.cat((cos, sin), dim=-1).contiguous()
         positions = torch.arange(cos.shape[0], device=cos.device, dtype=torch.int64)
+
+        # Bind TeaCache to this request (the DiT flag defaults on and is sticky).
+        _fb = get_forward_context().forward_batch
+        self.enable_teacache = _fb is not None and _fb.enable_teacache
 
         # TeaCache: reuse the cached residual when temb barely changed.
         if self.should_skip_forward_for_cached_states(temb=temb):

@@ -539,7 +539,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._maybe_override_attention_backend(batch)
         self._maybe_toggle_quality_fusions(batch)
         self._maybe_enable_cache_dit(num_inference_steps, batch)
+        # Reset per request: the MoE low-noise expert never sees step 0 to self-reset.
         for transformer in filter(None, [self.transformer, self.transformer_2]):
+            reset = getattr(transformer, "reset_teacache_state", None)
+            if reset is not None:
+                reset()
             self._maybe_torch_compile(transformer)
 
     def _maybe_override_attention_backend(self, batch: Req) -> None:

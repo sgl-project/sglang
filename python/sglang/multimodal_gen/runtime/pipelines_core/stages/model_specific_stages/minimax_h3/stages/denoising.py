@@ -709,8 +709,15 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     start, end = tcp.get_skip_boundaries(num_steps, do_cfg=False)
                 else:
                     start, end = 1, num_steps - 1
+                # TeaCache is an explicit lossy opt-in; honor it, warn under lossless.
+                enabled = bool(getattr(sampling, "enable_teacache", False))
+                if enabled and getattr(sampling, "quality", "lossless") == "lossless":
+                    logger.warning(
+                        "MiniMax-H3 TeaCache is lossy: output will not be "
+                        "bit-exact despite quality='lossless'."
+                    )
                 model.h3_teacache_configure(
-                    enabled=bool(getattr(sampling, "enable_teacache", False)),
+                    enabled=enabled,
                     coefficients=(tcp.get_coefficients() if tcp is not None else None),
                     thresh=(tcp.get_thresh() if tcp is not None else 0.0),
                     start_skipping=start,

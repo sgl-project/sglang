@@ -301,8 +301,8 @@ class TeaCacheMixin:
         do_cfg = forward_batch.do_classifier_free_guidance
         is_cfg_negative = forward_batch.is_cfg_negative
 
-        # Reset at first timestep
-        if current_timestep == 0 and not self.is_cfg_negative:
+        # Use the fresh is_cfg_negative (self.is_cfg_negative lags one request).
+        if current_timestep == 0 and not is_cfg_negative:
             self.reset_teacache_state()
 
         return TeaCacheContext(
@@ -333,6 +333,11 @@ class TeaCacheMixin:
         forward_context = get_forward_context()
         forward_batch = forward_context.forward_batch
         if forward_batch is None:
+            return
+        # Rank 0 only: output is sharded and one writer avoids racing the file.
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
             return
 
         calibrator = get_active_calibrator()
