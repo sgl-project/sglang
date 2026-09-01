@@ -366,9 +366,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.page_size == 1:
-            # Every slot here still owns its peer: a caller that knows otherwise
-            # says so with free_full. Filtering instead would make the output
-            # shape data-dependent, which costs a device-to-host sync.
+            # A filter here would make the output shape data-dependent,
+            # which costs a device-to-host sync.
             mapping_indices = free_index
             swa_indices = self.full_to_swa_index_mapping[mapping_indices]
             expect(_SWA_PEER_MAPPED, swa_indices > 0, msg="caller wants free_full")
