@@ -276,7 +276,7 @@ def _ensure_flashinfer_megamoe_layer(
     world_size, rank = _layer_ep_world_rank(layer)
 
     max_tokens_per_rank = _resolve_max_tokens_per_rank()
-    logger.info(
+    logger.debug(
         "FlashInfer MegaMOE layer[%s] build: megakernel_config=%s "
         "(world_size=%d, num_experts=%d, max_tokens_per_rank=%d, hidden_size=%d)",
         layer.layer_id,
