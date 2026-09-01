@@ -1065,6 +1065,10 @@ class Envs:
     # DeepGEMM Mega MoE
     # ===================================================================
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
+    # Replace checkpoint-layout SM90 MegaMoE weights/scales with their native
+    # transformed layout after loading. This avoids retaining two full expert
+    # copies and is required for memory-constrained TP8 deployments.
+    SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels

@@ -43,6 +43,7 @@ except (ImportError, RuntimeError):
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.mega_moe import (
     _MEGA_MOE_SYMM_BUFFER,
     _get_mega_moe_symm_buffer,
@@ -504,6 +505,49 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
         self.assertIs(experts.mega_l2_weights[1], l2[1])
         self.assertTrue(experts._mega_moe_sm90_fp4_weights)
         self.assertTrue(experts._mega_moe_weights_built)
+
+    def test_weight_builder_can_reclaim_checkpoint_layout_buffers(self):
+        experts = self._experts()
+        original_w13 = experts.w13_weight.data
+        original_w2 = experts.w2_weight.data
+        original_w13_scale = experts.w13_weight_scale_inv.data
+        original_w2_scale = experts.w2_weight_scale_inv.data
+        l1 = (
+            torch.ones_like(experts.w13_weight),
+            torch.ones((2, 128, 1), dtype=torch.int32),
+        )
+        l2 = (
+            torch.ones_like(experts.w2_weight),
+            torch.ones((2, 64, 1), dtype=torch.int32),
+        )
+        deep_gemm = SimpleNamespace(
+            fp8_fp4_mega_moe=mock.Mock(),
+            _C=SimpleNamespace(fp8_fp4_mega_moe_sm90=mock.Mock()),
+            transform_weights_for_mega_moe_sm90_fp4=mock.Mock(return_value=(l1, l2)),
+        )
+
+        with (
+            mock.patch.dict("sys.modules", {"deep_gemm": deep_gemm}),
+            envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.override(True),
+        ):
+            build_sm90_fp4_mega_moe_experts_weights(experts)
+
+        self.assertEqual(experts.w13_weight.data.data_ptr(), l1[0].data_ptr())
+        self.assertEqual(experts.w2_weight.data.data_ptr(), l2[0].data_ptr())
+        self.assertEqual(experts.w13_weight_scale_inv.data.data_ptr(), l1[1].data_ptr())
+        self.assertEqual(experts.w2_weight_scale_inv.data.data_ptr(), l2[1].data_ptr())
+        self.assertEqual(experts.mega_l1_weights[0].data_ptr(), l1[0].data_ptr())
+        self.assertEqual(experts.mega_l1_weights[1].data_ptr(), l1[1].data_ptr())
+        self.assertEqual(experts.mega_l2_weights[0].data_ptr(), l2[0].data_ptr())
+        self.assertEqual(experts.mega_l2_weights[1].data_ptr(), l2[1].data_ptr())
+        self.assertNotEqual(experts.w13_weight.data.data_ptr(), original_w13.data_ptr())
+        self.assertNotEqual(experts.w2_weight.data.data_ptr(), original_w2.data_ptr())
+        self.assertNotEqual(
+            experts.w13_weight_scale_inv.data.data_ptr(), original_w13_scale.data_ptr()
+        )
+        self.assertNotEqual(
+            experts.w2_weight_scale_inv.data.data_ptr(), original_w2_scale.data_ptr()
+        )
 
     def test_weight_builder_rejects_missing_native_transform(self):
         experts = self._experts()

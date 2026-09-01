@@ -98,6 +98,15 @@ class TestEnvField(unittest.TestCase):
             self.assertIs(envs.SGLANG_TEST_RETRACT.get(), False)
         self.assertIn("Invalid value", str(caught[0].message))
 
+    def test_fix_mega_moe_memory_is_opt_in(self):
+        field = envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY
+        field.clear()
+        self.addCleanup(field.clear)
+        self.assertIs(field.get(), False)
+        with field.override(True):
+            self.assertIs(field.get(), True)
+        self.assertIs(field.get(), False)
+
 
 class TestDeprecatedEnvRegistry(unittest.TestCase):
     def _apply(self, old_name, deprecation):
