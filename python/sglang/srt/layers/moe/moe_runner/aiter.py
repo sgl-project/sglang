@@ -136,6 +136,8 @@ def _aiter_fused_moe_supports_output() -> bool:
     from aiter.fused_moe import fused_moe
 
     return "output" in inspect.signature(fused_moe).parameters
+
+
 _RECV_BOUND_LOGGED: set[int] = set()
 _RECV_BOUND_WARNED = False
 
