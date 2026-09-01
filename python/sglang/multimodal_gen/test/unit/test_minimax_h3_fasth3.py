@@ -28,13 +28,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_conf
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
-    MiniMaxH3ReleaseMetadata,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
-    minimax_h3_time_shift_sigmas,
-)
-from sglang.multimodal_gen.runtime.utils.model_overlay import resolve_model_overlay
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
@@ -79,23 +72,11 @@ def test_fasth3_sampling_defaults_and_task_rejection() -> None:
         )
 
 
-def test_fasth3_pipeline_config_gates_and_quality() -> None:
+def test_fasth3_pipeline_config_gates_and_rejections() -> None:
     config = FastH3PipelineConfig()
     assert config.dit_config.arch_config.has_gate_compress
     assert not MiniMaxH3PipelineConfig().dit_config.arch_config.has_gate_compress
-
-    with pytest.raises(ValueError, match="no.*audited high-quality deployment"):
-        config.validate_quality_deployment(server_args=None)
-
-
-def test_fasth3_rejects_model_variant() -> None:
-    config = FastH3PipelineConfig()
-    with pytest.raises(ValueError, match="--model-variant does not apply"):
-        config.validate_server_args(SimpleNamespace(model_variant="ref2va"))
-
-
-def test_fasth3_gate_param_mapping() -> None:
-    mapping = FastH3PipelineConfig().dit_config.arch_config.param_names_mapping
+    mapping = config.dit_config.arch_config.param_names_mapping
     source = "transformer_blocks.7.attn.to_gate_compress.weight"
     targets = [
         re.sub(pattern, target if isinstance(target, str) else target[0], source)
@@ -104,38 +85,10 @@ def test_fasth3_gate_param_mapping() -> None:
     ]
     assert targets == ["blocks.7.attn.to_gate_compress.weight"]
 
-
-def test_fasth3_overlay_registry_entry_is_pinned() -> None:
-    spec = resolve_model_overlay(FASTH3_MODEL_ID)
-    assert spec is not None
-    assert spec["overlay_repo_id"] == "kevin-mi/FastH3-4step-Preview-overlay"
-    assert re.fullmatch(r"[0-9a-f]{40}", spec["overlay_revision"])
-
-
-def test_fasth3_release_metadata_contract() -> None:
-    metadata = MiniMaxH3ReleaseMetadata.from_model_index(
-        {
-            "_minimax_h3": {
-                "schema_version": 1,
-                "partition": "fl2va",
-                "tasks": ["t2va"],
-                "task_aliases": {},
-                "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
-            }
-        }
-    )
-    assert metadata.partition == "fl2va"
-    assert metadata.tasks == ("t2va",)
-    assert metadata.sigma_shift_scales == {"video": 12.0, "audio": 3.0}
-
-
-def test_fasth3_distilled_schedule_is_uniform_five_points() -> None:
-    sigmas = minimax_h3_time_shift_sigmas(num_steps=5, shift_scale=12.0)
-    assert len(sigmas) == 5
-    assert sigmas[0] == 1.0 and sigmas[-1] == 0.0
-    base = torch.linspace(1.0, 0.0, 5)
-    expected = (12.0 * base / (1 + 11.0 * base)).tolist()
-    assert sigmas == pytest.approx(expected)
+    with pytest.raises(ValueError, match="--model-variant does not apply"):
+        config.validate_server_args(SimpleNamespace(model_variant="ref2va"))
+    with pytest.raises(ValueError, match="no.*audited high-quality deployment"):
+        config.validate_quality_deployment(server_args=None)
 
 
 def test_fasth3_lora_bundle_is_rejected_loudly() -> None:

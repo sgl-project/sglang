@@ -125,7 +125,7 @@ def test_zero_gate_is_noop_and_trained_gate_activates() -> None:
 
 
 @requires_cuda
-def test_dense_layer_optout_matches_dense() -> None:
+def test_dense_overrides() -> None:
     device = torch.device("cuda")
     meta = _build_metadata(0.9, device, dense_layers=(3,))
     used, total, (q, k, v) = _packed_qkv(device)
@@ -134,22 +134,8 @@ def test_dense_layer_optout_matches_dense() -> None:
     diff = (out[:used].float() - reference).abs().max().item()
     assert diff < 2e-2, f"dense-layer opt-out vs dense max diff {diff}"
 
-
-@requires_cuda
-def test_dense_first_n_steps_disables_sparsity() -> None:
-    device = torch.device("cuda")
-    sparse_meta = _build_metadata(0.9, device, dense_first_n_steps=0)
-    dense_meta = VideoSparseAttentionH3MetadataBuilder().build(
-        current_timestep=1,
-        raw_latent_shape=VIDEO_SHAPE,
-        patch_size=(1, 1, 1),
-        VSA_sparsity=0.9,
-        prefix_segments=PREFIX_SEGMENTS,
-        device=device,
-        dense_first_n_steps=2,
-    )
-    assert sparse_meta.VSA_sparsity == 0.9
-    assert dense_meta.VSA_sparsity == 0.0
+    assert _build_metadata(0.9, device, dense_first_n_steps=0).VSA_sparsity == 0.9
+    assert _build_metadata(0.9, device, dense_first_n_steps=1).VSA_sparsity == 0.0
 
 
 def _lists_to_mask(lists: torch.Tensor, n_tiles: int) -> torch.Tensor:
