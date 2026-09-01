@@ -97,9 +97,10 @@ def _load_fused_indexer_wk(
     param: wk fills the top head_dim rows (dequantized from block-fp8 if needed),
     weights_proj the bottom n_heads rows.
 
-    Returns False when there is no fused param (non-CUDA, or CUDA with
-    SGLANG_DISABLE_DSA_INDEXER_FUSION set, where wk and weights_proj are
-    separate) so the caller falls through to per-tensor loading.
+    Returns False when there is no fused param (fusion disabled, e.g. via
+    SGLANG_DISABLE_DSA_INDEXER_FUSION on CUDA/CPU, or non-neox models on
+    other backends where wk and weights_proj stay separate) so the caller
+    falls through to per-tensor loading.
     """
     fused_name = name.rsplit(".indexer.", 1)[0] + ".indexer.wk_weights_proj.weight"
     fused_param = params_dict.get(fused_name)
@@ -289,7 +290,7 @@ class DeepseekV2WeightLoaderMixin:
                 ):
                     continue
 
-                # CUDA fuses wk + weights_proj into one bf16 wk_weights_proj; the
+                # CUDA/CPU fuses wk + weights_proj into one bf16 wk_weights_proj; the
                 # helper returns True once it has consumed the shard.
                 if (
                     ".indexer.wk." in name or ".indexer.weights_proj." in name

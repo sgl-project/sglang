@@ -257,6 +257,7 @@ def register_fake_ops(tp_size: int):
         kv_a_proj_scale,
         is_vnni,
         block_size,
+        need_q_lora,
     ):
         num_seqs = hidden_states.shape[0]
         num_heads = w_kc.shape[0]
@@ -277,7 +278,17 @@ def register_fake_ops(tp_size: int):
             device=hidden_states.device,
         )
         v_input = k_input.narrow(-1, 0, kv_lora_rank)
-        return q_input, k_input, v_input
+        if need_q_lora:
+            q_lora_rank = q_a_proj_weight.shape[0]
+            q_lora = torch.empty(
+                num_seqs,
+                q_lora_rank,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        else:
+            q_lora = torch.empty(0, dtype=hidden_states.dtype, device=hidden_states.device)
+        return q_input, k_input, v_input, q_lora
 
     @register_cpu_compile_fake("rotary_embedding_cpu")
     def _(positions, query, key, head_size, cos_sin_cache, is_neox):
@@ -310,6 +321,7 @@ def register_fake_ops(tp_size: int):
         q_lora_rank,
         kv_lora_rank,
         qk_rope_head_dim,
+        need_q_lora,
     ):
         num_seqs = hidden_states.shape[0]
         num_heads = w_kc.shape[0]
@@ -333,7 +345,16 @@ def register_fake_ops(tp_size: int):
             device=hidden_states.device,
         )
         v_input = k_input.narrow(-1, 0, kv_lora_rank)
-        return q_input, k_input, v_input
+        if need_q_lora:
+            q_lora = torch.empty(
+                num_seqs,
+                q_lora_rank,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        else:
+            q_lora = torch.empty(0, dtype=hidden_states.dtype, device=hidden_states.device)
+        return q_input, k_input, v_input, q_lora
 
     def get_n_size(mat2, is_vnni):
         tile_n = 16

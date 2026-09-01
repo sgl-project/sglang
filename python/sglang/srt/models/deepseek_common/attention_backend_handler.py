@@ -206,7 +206,7 @@ def handle_attention_dsa(attn, forward_batch):
         backend = backend.primary
     if hasattr(backend, "use_mha") and backend.use_mha:
         return AttnForwardMethod.MHA_ONE_SHOT
-    return AttnForwardMethod.MLA
+    return _dispatch_mla_subtype(attn, forward_batch)
 
 
 def handle_attention_triton(attn, forward_batch):

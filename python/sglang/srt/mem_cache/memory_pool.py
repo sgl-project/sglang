@@ -4179,13 +4179,26 @@ class MLATokenToKVPool(KVCache):
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
-        assert not self.dsa_kv_cache_store_fp8
         parallel = get_parallel()
         if parallel.dcp_enabled:
             valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
             if not valid_mask.all():
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]
+        if self.dsa_kv_cache_store_fp8:
+            # Fused-rope CPU/AMX path (MLA_FUSED_ROPE_CPU): cache_k already
+            # holds the combined kv_lora_rank+qk_rope_head_dim latent; split it
+            # back into nope/rope so the fp8 write path in
+            # `_write_mla_kv_buffer` (nope quantized, rope raw bf16) applies.
+            cache_k_nope = cache_k[..., : self.kv_lora_rank]
+            cache_k_rope = cache_k[..., self.kv_lora_rank :]
+            self._write_mla_kv_buffer(
+                self.kv_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+            )
+            return
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -4221,15 +4234,24 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope, cache_k_rope
             )
 
-            # Reuse existing two-tensor write kernel (works with FP8 byte layout)
             # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
             # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
-            set_mla_kv_buffer_triton(
-                dst_buffer,
-                loc,
-                cache_k_nope_fp8,
-                cache_k_rope_fp8,
-            )
+            if _is_cpu:
+                nope_bytes = cache_k_nope_fp8.shape[-1]
+                rope_bytes = cache_k_rope_fp8.shape[-1]
+                dst_view = dst_buffer.view(torch.uint8)
+                dst_view[loc, :, :nope_bytes] = cache_k_nope_fp8
+                dst_view[loc, :, nope_bytes : nope_bytes + rope_bytes] = (
+                    cache_k_rope_fp8
+                )
+            else:
+                # Reuse existing two-tensor write kernel (works with FP8 byte layout)
+                set_mla_kv_buffer_triton(
+                    dst_buffer,
+                    loc,
+                    cache_k_nope_fp8,
+                    cache_k_rope_fp8,
+                )
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
@@ -4238,12 +4260,17 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            set_mla_kv_buffer_triton(
-                dst_buffer,
-                loc,
-                cache_k_nope,
-                cache_k_rope,
-            )
+            if _is_cpu:
+                nope_dim = cache_k_nope.shape[-1]
+                dst_buffer[loc, :, :nope_dim] = cache_k_nope
+                dst_buffer[loc, :, nope_dim:] = cache_k_rope
+            else:
+                set_mla_kv_buffer_triton(
+                    dst_buffer,
+                    loc,
+                    cache_k_nope,
+                    cache_k_rope,
+                )
 
     def set_mla_kv_buffer(
         self,

@@ -15,6 +15,7 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
+from sglang.srt.utils import is_cpu
 
 
 class ForwardBatchDeepSeekMHAMixin:
@@ -226,14 +227,23 @@ class ForwardBatchDeepSeekMHAMixin:
         )
         kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
         req_to_token = get_req_to_token_pool().req_to_token
-        create_flashinfer_kv_indices_triton[(self.batch_size,)](
-            req_to_token,
-            self.req_pool_indices,
-            self.seq_lens,
-            kv_indptr,
-            None,
-            kv_indices,
-            req_to_token.shape[1],
-        )
+        if is_cpu():
+            kv_indices = torch.ops.sgl_kernel.create_flashinfer_kv_indices_cpu(
+                req_to_token,
+                self.req_pool_indices,
+                self.seq_lens,
+                kv_indptr,
+                None,
+            )
+        else:
+            create_flashinfer_kv_indices_triton[(self.batch_size,)](
+                req_to_token,
+                self.req_pool_indices,
+                self.seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                req_to_token.shape[1],
+            )
         self.mha_one_shot_kv_indices = kv_indices
         return kv_indices

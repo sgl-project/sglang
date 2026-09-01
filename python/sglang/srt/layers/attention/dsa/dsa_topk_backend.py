@@ -118,7 +118,8 @@ class DSATopKBackend(Enum):
         # matches we commit to v2 and never silently fall back to the legacy
         # page_size=1 path from here.
         if (
-            self.should_use_topk_v2()
+            logits.is_cuda  # the v2 kernel is a CUDA JIT kernel; no CPU counterpart exists
+            and self.should_use_topk_v2()
             and topk_transform_method == TopkTransformMethod.PAGED
             and row_starts is None
             and batch_idx_list is None

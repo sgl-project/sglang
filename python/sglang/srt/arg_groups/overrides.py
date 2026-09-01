@@ -797,10 +797,12 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
         # Set attention backend for DeepSeek
-        if server_args.is_attention_backend_not_set():
+        if server_args.is_attention_backend_not_set() or (
+            server_args.device == "cpu" and server_args.attention_backend == "intel_amx"
+        ):
             overrides["attention_backend"] = "dsa"
             logger.info("Use dsa attention backend for DeepSeek with DSA.")
-        if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
+        if not is_npu() and not is_xpu():  # CUDA or ROCm GPU or CPU
             if cfg.enable_prefill_cp:
                 logger.warning(
                     "Context parallel feature is still under experiment. It has only been verified on Hopper platform."

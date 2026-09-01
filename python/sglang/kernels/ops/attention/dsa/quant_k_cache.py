@@ -7,6 +7,44 @@ def quantize_k_cache(cache_k):
     return _quantize_k_cache_fast_wrapped(cache_k)
 
 
+def _quantize_k_cache_ref_separate(
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    group_size: int = 128,
+):
+    """
+    :param k_nope: (num_tokens, dim_nope 512) bfloat16
+    :param k_rope: (num_tokens, dim_rope 64) bfloat16
+    :return: same (nope_part_u8, rope_part_u8) byte layout as
+        ``_quantize_k_cache_fast_separate``.
+    """
+    num_tokens, dim_nope = k_nope.shape
+    _, dim_rope = k_rope.shape
+    assert dim_nope % group_size == 0
+    num_tiles = dim_nope // group_size
+
+    k_nope = k_nope.contiguous()
+    k_rope = k_rope.contiguous()
+
+    nope_part = torch.empty(
+        (num_tokens, dim_nope + num_tiles * 4),
+        dtype=torch.float8_e4m3fn,
+        device=k_nope.device,
+    )
+    nope_q = nope_part[:, :dim_nope]
+    nope_s = nope_part[:, dim_nope:].view(torch.float32)
+
+    k_nope_tiled = k_nope.view(num_tokens, num_tiles, group_size)
+    scale = k_nope_tiled.abs().amax(dim=-1).float() / 448.0
+    nope_s[:] = scale
+    quantized = (k_nope_tiled.float() / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    nope_q.view(num_tokens, num_tiles, group_size)[:] = quantized
+
+    rope_part_u8 = k_rope.view(torch.uint8).view(num_tokens, dim_rope * k_rope.element_size())
+
+    return nope_part.view(torch.uint8).unsqueeze(1), rope_part_u8.unsqueeze(1)
+
+
 def quantize_k_cache_separate(
     k_nope: torch.Tensor,
     k_rope: torch.Tensor,
@@ -48,6 +86,11 @@ def quantize_k_cache_separate(
     if k_rope_2d.shape[0] != num_tokens:
         raise ValueError(
             f"k_nope and k_rope must have same num_tokens, got {num_tokens} vs {k_rope_2d.shape[0]}"
+        )
+
+    if k_nope_2d.device.type == "cpu":
+        return _quantize_k_cache_ref_separate(
+            k_nope=k_nope_2d, k_rope=k_rope_2d, group_size=tile_size
         )
 
     return _quantize_k_cache_fast_separate(

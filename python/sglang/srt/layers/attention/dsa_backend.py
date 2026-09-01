@@ -75,7 +75,9 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils import (
+    cpu_has_amx_support,
     get_bool_env_var,
+    is_cpu,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -135,6 +137,8 @@ def materialize_full_kv_cp(
 
 
 _is_hip = is_hip()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_hip:
     from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
@@ -283,6 +287,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "fa3",
     "tilelang",
     "trtllm",
+    "flashmla_cpu",
 ]
 
 
@@ -340,6 +345,9 @@ class DeepseekSparseAttnBackend(
         self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        if _is_cpu:
+            self.dsa_prefill_impl = self.dsa_prefill_impl or "flashmla_cpu"
+            self.dsa_decode_impl = self.dsa_decode_impl or "flashmla_cpu"
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
@@ -400,9 +408,27 @@ class DeepseekSparseAttnBackend(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
             )
 
-        self.device_capability = torch.cuda.get_device_capability()
+        self.device_capability = (0, 0) if _is_cpu else torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+
+        if _is_cpu:
+            assert (
+                model_runner.server_args.speculative_algorithm is None
+            ), "DSA CPU backend does not support speculative decoding."
+            assert (
+                not is_dsa_enable_prefill_cp()
+            ), "DSA CPU backend does not support context parallel."
+            assert (
+                self.hisparse_coordinator is None
+            ), "DSA CPU backend does not support HiSparse."
+            assert (
+                not model_runner.server_args.enable_two_batch_overlap
+            ), "DSA CPU backend does not support two-batch overlap."
+            assert self.kv_cache_dtype in (
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+            ), "DSA CPU backend only supports a bfloat16 or fp8_e4m3 KV cache."
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
@@ -700,7 +726,7 @@ class DeepseekSparseAttnBackend(
         # target-verify / draft-extend, whose expanded row count is exactly what v2
         # sees -- otherwise the helper's plan-present assertion fires. None only
         # when the SGL v2 path is disabled; such metadata is never dispatched to v2.
-        if not self.dsa_topk_backend.should_use_topk_v2():
+        if not is_cuda() or not self.dsa_topk_backend.should_use_topk_v2():
             return None
         from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
@@ -1927,12 +1953,18 @@ class DeepseekSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
-                    layer,
-                    cache_loc,
-                    k,
-                    k_rope,
-                )
+                if k_rope is None:
+                    # CPU fused qkv+rope prepare path (MLA_FUSED_ROPE_CPU): k
+                    # already holds the combined kv_lora_rank+qk_rope_head_dim
+                    # latent.
+                    self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                else:
+                    self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                    )
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
@@ -1951,7 +1983,6 @@ class DeepseekSparseAttnBackend(
             )
 
         # Do absorbed multi-latent attention (MLA path)
-        assert q_rope is not None
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
@@ -2176,6 +2207,16 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 layer=layer,
             )
+        elif dsa_impl == "flashmla_cpu":
+            return self._forward_flashmla_cpu(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=layer.v_head_dim,
+                page_table_1=page_table_1,
+                topk_length=metadata.dsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+            )
         else:
             raise ValueError(
                 f"Unsupported {dsa_impl = } for forward_extend. Consider using an other attention backend."
@@ -2227,12 +2268,18 @@ class DeepseekSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
-                    layer,
-                    cache_loc,
-                    k,
-                    k_rope,
-                )
+                if k_rope is None:
+                    # CPU fused qkv+rope prepare path (MLA_FUSED_ROPE_CPU): k
+                    # already holds the combined kv_lora_rank+qk_rope_head_dim
+                    # latent, same convention intel_amx uses.
+                    self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                else:
+                    self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                    )
 
         # Do absorbed multi-latent attention
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -2347,7 +2394,16 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 bs=forward_batch.batch_size,
             )
-
+        elif self.dsa_decode_impl == "flashmla_cpu":
+            return self._forward_flashmla_cpu(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=layer.v_head_dim,
+                page_table_1=page_table_1,
+                topk_length=metadata.dsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+            )
         else:
             assert False, f"Unsupported {self.dsa_decode_impl = }"
 
@@ -2451,6 +2507,45 @@ class DeepseekSparseAttnBackend(
             o = o[:, :num_heads, :]
 
         return o
+
+    def _forward_flashmla_cpu(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        topk_length: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        """CPU sparse-MLA path: same contract as ``_forward_flashmla_sparse``
+        (physical top-k KV-slot indices already resolved by the fused topk
+        transform);
+        q is always cast to bf16, the kernel's only supported query dtype.
+        """
+        from sgl_kernel.flash_mla import flash_mla_with_kvcache_cpu
+
+        num_tokens, num_heads, _ = q_nope.shape
+        q_all = torch.cat([q_nope, q_rope], dim=-1)
+        if q_all.dtype != torch.bfloat16:
+            q_all = q_all.to(torch.bfloat16)
+        q_view = q_all.view(num_tokens, 1, num_heads, q_all.shape[-1])
+
+        k_cache = kv_cache.unsqueeze(0).contiguous()  # [1, capacity, 1, head_dim_qk]
+
+        out, _ = flash_mla_with_kvcache_cpu(
+            q=q_view,
+            k_cache=k_cache,
+            block_table=None,
+            cache_seqlens=None,
+            head_dim_v=v_head_dim,
+            softmax_scale=sm_scale,
+            is_fp8_kvcache=k_cache.dtype == torch.float8_e4m3fn,
+            fp8_layout=1,  # V32FP8Sparse; unused when is_fp8_kvcache=False
+            indices=page_table_1.unsqueeze(1),
+            topk_length=topk_length,
+        )
+        return out.view(num_tokens, num_heads, v_head_dim)
 
     def q8kv8_born_fp8_q_eligible(
         self, forward_batch: ForwardBatch, num_heads: int
@@ -2879,6 +2974,9 @@ class DeepseekSparseAttnBackend(
             f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
         )
 
+        if _is_cpu:
+            return self._forward_standard_mha_cpu(q, k, v, layer, forward_batch, metadata)
+
         # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues.
         # gfx950 reports device capability sm_(9,5), so it never enters this SM100+
         # branch and falls through to the aiter flash_attn_varlen_func path below.
@@ -2918,6 +3016,71 @@ class DeepseekSparseAttnBackend(
             max_seqlen_k=max_seqlen_k,
             softmax_scale=layer.scaling,
             causal=causal,
+        )
+
+    def _forward_standard_mha_cpu(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        metadata: DSAMetadata,
+    ) -> torch.Tensor:
+        """CPU MHA_ONE_SHOT dispatch: q/k/v are already the fully materialized
+        (prefix + extend) dense tensors built by forward_mha.py."""
+        assert q.dtype == torch.bfloat16, "CPU MHA_ONE_SHOT only supports bf16"
+        assert not layer.is_cross_attention, "MHA_ONE_SHOT is never cross-attention"
+
+        if sum(forward_batch.extend_prefix_lens_cpu) == 0:
+            """
+            k_buffer/v_buffer come from the MLA latent pool (num_heads_kv=1)
+            """
+            k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            assert k_buffer.shape[1] != layer.tp_q_head_num
+
+            req_to_token = self.req_to_token_pool.req_to_token
+            assert forward_batch.extend_seq_lens.dtype == req_to_token.dtype
+            assert forward_batch.extend_start_loc.dtype == req_to_token.dtype
+
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
+            torch.ops.sgl_kernel.extend_attention_cpu(
+                q,
+                k,
+                v,
+                o,
+                k_buffer,
+                v_buffer,
+                req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens.to(torch.int64),
+                forward_batch.extend_seq_lens,
+                forward_batch.extend_start_loc,
+                metadata.max_seq_len_q,
+                layer.scaling,
+                layer.logit_cap,
+                layer.is_cross_attention,
+                layer.sliding_window_size + 1,
+                forward_batch.encoder_lens,
+                None,  # sinks
+                None,  # tree_mask
+            )
+            return o
+        # prefix>0 path: q/k/v are already the fully materialized dense
+        # tensors, so this is plain ragged/varlen attention (no KV-cache
+        # indirection); the kernel bottom-right-aligns causal masking when
+        # seqlen_k > seqlen_q.
+        return torch.ops.sgl_kernel.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            metadata.cu_seqlens_q,
+            metadata.cu_seqlens_k,
+            metadata.max_seq_len_q,
+            metadata.max_seq_len_k,
+            True,  # causal
+            layer.scaling,
         )
 
     def _forward_tilelang(
@@ -3324,22 +3487,30 @@ class DeepseekSparseAttnBackend(
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
-            # Requirements: H200/B200/MI355X, short sequences, supported dtype, fits in chunk
-            self.use_mha = (
-                self.supports_mha_one_shot
-                and (
-                    device_sm == 90
-                    or (device_sm >= 100 and device_sm < 110)
-                    or _IS_GFX95
-                )  # SM90/SM100 (NVIDIA) or gfx95x (MI355X)
-                and max_kv_len
+            fits_chunk_and_cp = (
+                max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
-                and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_dsa_enable_prefill_cp())  # CP not enabled
                 and (self.hisparse_coordinator is None)
             )
+
+            # Requirements: H200/B200/MI355X, short sequences, supported dtype, fits in chunk
+            gpu_eligible = (
+                (
+                    device_sm == 90
+                    or (device_sm >= 100 and device_sm < 110)
+                    or _IS_GFX95
+                )  # SM90/SM100 (NVIDIA) or gfx95x (MI355X)
+                and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
+            )
+            cpu_eligible = (
+                _is_cpu
+                and _is_cpu_amx_available
+                and self.token_to_kv_pool.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+            )
+            self.use_mha = self.supports_mha_one_shot and fits_chunk_and_cp and (gpu_eligible or cpu_eligible)
         else:
             self.use_mha = False  # Decode/verify always use MLA
 
