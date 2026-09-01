@@ -26,6 +26,21 @@ DEFAULT_KEEP_DAYS = 14.0
 # mid-extract otherwise leaves a partial tree that the next run treats as a hit.
 MARKER_NAME = ".complete"
 
+# case id -> (num_gpus, is_video), mirroring the consistency-checked cases in
+# python/sglang/multimodal_gen/test/server/ascend/testcase_configs_npu.py. That
+# module cannot be imported here: building its cases resolves every model's
+# model_index.json, so a host missing any model checkout could not verify six
+# GT files. output_format is omitted on purpose -- it only reorders the
+# candidate extensions, never changes which ones are accepted.
+CONSISTENCY_CASES: dict[str, tuple[int, bool]] = {
+    "flux_image_t2i_npu": (1, False),
+    "wan2_1_t2v_1.3b_1_npu": (1, True),
+    "flux_2_image_t2i_2npu": (2, False),
+    "qwen_image_t2i_2npu": (2, False),
+    "wan2_2_t2v_14b_w8a8_2npu": (2, True),
+    "minimax_h3_t2va_2npu": (2, True),
+}
+
 
 def _resolve_gt_source() -> tuple[str, str, str]:
     """Return (repo, revision, in-repo GT path) from the constants the tests use."""
@@ -152,18 +167,6 @@ def _fetch_tarball(repo: str, revision: str, repo_path: str, dest: Path) -> None
     archive.unlink()
 
 
-def _iter_consistency_cases():
-    from sglang.multimodal_gen.test.server.ascend.testcase_configs_npu import (
-        PARAMETRIZED_CASE_GROUPS,
-    )
-
-    for suite, case_groups in PARAMETRIZED_CASE_GROUPS.items():
-        for _, case_group in case_groups:
-            for case in case_group:
-                if case.run_consistency_check:
-                    yield suite, case
-
-
 def _verify_gt_dir(gt_dir: Path) -> list[str]:
     """Return one problem line per case whose GT is missing from the directory."""
     from sglang.multimodal_gen.test.test_utils import (
@@ -176,21 +179,15 @@ def _verify_gt_dir(gt_dir: Path) -> list[str]:
     os.environ["SGLANG_CONSISTENCY_GT_DIR"] = str(gt_dir)
 
     problems: list[str] = []
-    checked = 0
-    for suite, case in _iter_consistency_cases():
-        checked += 1
-        num_gpus = case.server_args.num_gpus
-        is_video = case.server_args.modality == "video"
-        output_format = case.sampling_params.output_format
-        candidates = get_consistency_gt_candidates(
-            case.id, num_gpus, is_video, output_format
-        )
-        if not gt_exists(
-            case.id, num_gpus, is_video=is_video, output_format=output_format
-        ):
-            problems.append(f"{suite}/{case.id}: no GT among {', '.join(candidates)}")
+    for case_id, (num_gpus, is_video) in CONSISTENCY_CASES.items():
+        if not gt_exists(case_id, num_gpus, is_video=is_video):
+            candidates = get_consistency_gt_candidates(case_id, num_gpus, is_video)
+            problems.append(f"{case_id}: no GT among {', '.join(candidates)}")
 
-    print(f"Verified GT for {checked} consistency-checked case(s)", flush=True)
+    print(
+        f"Verified GT for {len(CONSISTENCY_CASES)} consistency-checked case(s)",
+        flush=True,
+    )
     return problems
 
 
