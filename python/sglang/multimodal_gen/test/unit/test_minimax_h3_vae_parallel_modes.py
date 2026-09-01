@@ -71,7 +71,13 @@ def test_vit_attention_uses_local_usp_backend_dispatch():
     ):
         Attention(heads=2, dim_head=64)
 
-    assert usp_attention.call_args.kwargs["skip_sequence_parallel"] is True
+    kwargs = usp_attention.call_args.kwargs
+    assert kwargs["skip_sequence_parallel"] is True
+    assert kwargs["default_attention_backend"] == AttentionBackendEnum.TORCH_SDPA
+    assert kwargs["supported_attention_backends"] == {
+        AttentionBackendEnum.FA,
+        AttentionBackendEnum.TORCH_SDPA,
+    }
 
 
 def test_vit_qk_norm_supports_affine_free_rmsnorm():

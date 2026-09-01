@@ -7,12 +7,20 @@ metatags:
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["video", "text-to-video"]} />
+<DiffusionModelTags tags={["video", "text-to-video", "480p", "2B lightweight"]} />
 
-## 1. Model introduction
+## 1. Model Introduction
 
 [SANA-Video 2B 480p](https://huggingface.co/Efficient-Large-Model/SANA-Video_2B_480p_diffusers)
-is a text-to-video model with a native SGLang Diffusion pipeline.
+is a lightweight text-to-video model served through a native SGLang Diffusion
+pipeline. Its main advantage is deployment cost: at 2B parameters it serves
+480p video from a single GPU with a plain `sglang serve` invocation, no
+parallelism flags required.
+
+The released generation profile produces 832×480 output at 81 frames and
+16 FPS over 50 inference steps; a compact 17-frame, 8-step profile is covered
+by server CI for quick validation. Motion strength can be steered directly
+from the prompt with an optional `motion score: N.` suffix.
 
 | Model ID | Task | Default output |
 | --- | --- | --- |

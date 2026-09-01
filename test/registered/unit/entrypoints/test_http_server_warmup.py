@@ -57,7 +57,6 @@ class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
 
         with patch("sglang.srt.entrypoints.http_server.aiohttp.ClientSession", Session):
             status_codes = await _send_disaggregation_warmup_requests(
-                server_args=server_args,
                 url="http://localhost:30000",
                 headers={"Authorization": "Bearer token"},
                 ssl_verify=False,

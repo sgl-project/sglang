@@ -194,6 +194,9 @@ class Qwen2_5_VLAttention(nn.Module):
     def __init__(self, config: Qwen2_5_VLTextConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
+        self.honor_cache_free_padding_mask = getattr(
+            config, "honor_cache_free_padding_mask", False
+        )
         self.layer_idx = layer_idx
         if layer_idx is None:
             logger.warning(
@@ -315,14 +318,14 @@ class Qwen2_5_VLAttention(nn.Module):
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
-        # Diffusion text encoding is cache-free and historically uses the native
-        # causal kernel; its trailing padding is removed during postprocessing.
-        # Cached generation still needs the explicit mask for padded batches.
+        # LongCat masks padding on the cache-free path too; others keep the
+        # original mask-free fast path unchanged.
+        honor_mask = use_cache or self.honor_cache_free_padding_mask
         attn_output = self.attn(
             query_states,
             key_states,
             value_states,
-            attn_mask=attention_mask if use_cache else None,
+            attn_mask=attention_mask if honor_mask else None,
         )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
@@ -425,10 +428,27 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
         return hidden_states
 
 
+def _build_causal_padding_mask(
+    attention_mask: torch.Tensor, inputs_embeds: torch.Tensor
+) -> torch.Tensor:
+    """Build a causal+padding bool mask ``[batch, 1, q_len, kv_len]``; True attends."""
+    q_len = inputs_embeds.shape[1]
+    kv_len = attention_mask.shape[-1]
+    device = inputs_embeds.device
+    q_idx = torch.arange(kv_len - q_len, kv_len, device=device).unsqueeze(-1)
+    kv_idx = torch.arange(kv_len, device=device).unsqueeze(0)
+    causal = (kv_idx <= q_idx).unsqueeze(0)
+    padding = attention_mask.to(device=device, dtype=torch.bool).unsqueeze(1)
+    return (causal & padding).unsqueeze(1)
+
+
 class Qwen2_5_VLTextModel(nn.Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
+        self.honor_cache_free_padding_mask = getattr(
+            config, "honor_cache_free_padding_mask", False
+        )
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -550,6 +570,19 @@ class Qwen2_5_VLTextModel(nn.Module):
             if self.has_sliding_layers:
                 causal_mask_mapping["sliding_attention"] = (
                     create_sliding_window_causal_mask(**mask_kwargs)
+                )
+
+            # create_causal_mask returns None for this _attn_implementation, so
+            # build the causal+padding mask here. LongCat-only.
+            if (
+                self.honor_cache_free_padding_mask
+                and causal_mask_mapping["full_attention"] is None
+                and isinstance(attention_mask, torch.Tensor)
+                and attention_mask.dim() == 2
+                and not bool(attention_mask.all())
+            ):
+                causal_mask_mapping["full_attention"] = _build_causal_padding_mask(
+                    attention_mask, inputs_embeds
                 )
 
         hidden_states = inputs_embeds
@@ -1123,7 +1156,12 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
         super().__init__(config)
         enable_image_understanding = config.enable_image_understanding
         generation_config = config.generation_config
+        # LongCat-only; propagate to the text config (see TextEncoderLoader).
+        honor_cache_free_padding_mask = getattr(
+            config, "honor_cache_free_padding_mask", False
+        )
         config = config.arch_config
+        config.text_config.honor_cache_free_padding_mask = honor_cache_free_padding_mask
         self.model = Qwen2_5_VLModel(
             config, enable_image_understanding=enable_image_understanding
         )

@@ -296,7 +296,7 @@
     "UNIDY2002": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 60,
+        "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
     "Ubospica": {
@@ -399,6 +399,12 @@
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
+    "akhilg-nv": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
     "alexnails": {
@@ -558,6 +564,12 @@
         "reason": "custom override"
     },
     "elfiegg": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
+    },
+    "elvischenv": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 60,
@@ -833,6 +845,12 @@
         "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
+    "leejnau": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
     "liangan1": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -939,6 +957,12 @@
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
+    "nvjullin": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
     "nvpohanh": {
@@ -1244,7 +1268,7 @@
     "wenscarl": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 60,
+        "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
     "whybeyoung": {
