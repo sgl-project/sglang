@@ -1438,9 +1438,13 @@ class Req(ReqDllmMixin):
             # early raw KV is not retained beyond the sliding window, so the
             # re-prefilled tail could not read it. Re-match capped to the span
             # start, which fully re-prefills the span in one extend.
+            # HiCache: the effective match after load-back is deeper than the
+            # device-resident anchor, so include the host-hit length —
+            # otherwise a deep host hit into a span would bypass the cut and
+            # silently degrade the span to a causal window.
             cut_point = image_span_cut_point(
                 self.multimodal_inputs,
-                len(match_result.device_indices),
+                len(match_result.device_indices) + match_result.host_hit_length,
                 getattr(tree_cache, "sliding_window_size", None) or 128,
             )
             if cut_point is not None:
