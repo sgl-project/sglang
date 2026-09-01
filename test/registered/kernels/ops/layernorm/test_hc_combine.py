@@ -51,3 +51,9 @@ def test_hc_combine_strided_pre():
     ref = _reference(x_flat, pre, hc, torch.bfloat16)
     scale = ref.float().abs().max().clamp(min=1e-6)
     assert (got.float() - ref.float()).abs().max() / scale < 5e-2
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
