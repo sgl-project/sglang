@@ -62,6 +62,13 @@ class ForwardMetadata:
     is_target_verify: bool = False
     draft_token_num: int = 1
 
+    # KDA fused-accept: the [N, T] slot-indexed scratch rows and the per-request
+    # accept length that seed the verify kernel. Every KDA layer of a forward
+    # sees the same slots and draft window, so these are built once and shared:
+    # a cuda-graph capture then holds one build instead of one per layer.
+    fused_accept_state_indices: Optional[torch.Tensor] = None
+    fused_accept_num_accepted: Optional[torch.Tensor] = None
+
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None
     conv_states_mask_indices: Optional[torch.Tensor] = None

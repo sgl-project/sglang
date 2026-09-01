@@ -40,11 +40,13 @@ as tests.
 
 import os
 import random
+import re
 import shutil
 import tempfile
 import unittest
 
-from sglang.srt.utils import kill_process_tree
+import requests
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_multiturn_utils import (
     _extract_output_logprobs,
@@ -73,9 +75,11 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
+    unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=1650, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=2800, stage="base-b", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
@@ -126,7 +130,10 @@ def _random_suffixes(n: int, length: int, seed: int) -> list[list[int]]:
 
 
 def _base_args(
-    mamba_strategy: str = "extra_buffer", swa_full_tokens_ratio: str = "0.1"
+    mamba_strategy: str = "extra_buffer",
+    swa_full_tokens_ratio: str = "0.1",
+    *,
+    mem_fraction_static: float = 0.6,
 ) -> list[str]:
     return [
         "--trust-remote-code",
@@ -144,11 +151,22 @@ def _base_args(
         # the static pool leaves ~19 GB for the prefill graphs, the fa4 workspace
         # and the chunked-prefill activations, which is what this config needs.
         "--mem-fraction-static",
-        "0.6",
+        str(mem_fraction_static),
         "--mamba-track-interval",
         str(TRACK_INTERVAL),
         "--enable-deterministic-inference",
     ]
+
+
+def _prefill_graph_count(base_url: str) -> float:
+    metrics = requests.get(base_url + "/metrics", timeout=30).text
+    matches = re.findall(
+        r'^sglang:cuda_graph_passes_total\{[^}]*mode="prefill_cuda_graph"[^}]*\}'
+        r"\s+([0-9.eE+-]+)$",
+        metrics,
+        re.MULTILINE,
+    )
+    return sum(map(float, matches), 0.0)
 
 
 class TestUnifiedHybridBitExact(CustomTestCase):
@@ -162,6 +180,8 @@ class TestUnifiedHybridBitExact(CustomTestCase):
     test_decode_cache_hit stays 0.0 even with the fix reverted, so it covers
     decode-region state reuse in general rather than that regression.
     """
+
+    tree_core_backend = "python"
 
     @classmethod
     def setUpClass(cls):
@@ -182,13 +202,13 @@ class TestUnifiedHybridBitExact(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
 
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def _run(self, helper):
         helper(
@@ -240,7 +260,7 @@ class TestUnifiedHybridLazyBitExact(TestUnifiedHybridBitExact):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
 
 
@@ -256,6 +276,8 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     Runs the multi-turn branching harness because the single-turn helpers above
     cannot produce a non-aligned hit length, which this regression needs.
     """
+
+    tree_core_backend = "python"
 
     @classmethod
     def setUpClass(cls):
@@ -291,7 +313,7 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
         cls.input_ids = get_input_ids(
             tokenizer_path=cls.model, num_samples=9, trust_remote_code=True
@@ -300,7 +322,7 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_multiturn_decode_cache_hit_branching(self):
         groups, branches = 3, 3
@@ -347,11 +369,15 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
     environment override; a regression there surfaces here as a nonzero KL.
     """
 
+    tree_core_backend = "python"
+
     @classmethod
     def setUpClass(cls):
         cls.model = _MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = _base_args() + [
+        # Target FullCG and both MTP draft workers retain graph pools, so this
+        # class needs more dynamic-memory headroom than the non-spec tests.
+        other_args = _base_args(mem_fraction_static=0.58) + [
             "--speculative-algorithm",
             "EAGLE",
             "--enable-multi-layer-eagle",
@@ -363,6 +389,7 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
             "3",
             "--chunked-prefill-size",
             "16384",
+            "--enable-metrics",
         ]
         if _MODEL_REVISION:
             other_args += ["--revision", _MODEL_REVISION]
@@ -371,18 +398,18 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={
-                **os.environ,
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
-            },
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
 
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def _run(self, helper):
+        server_info = requests.get(self.base_url + "/server_info", timeout=30).json()
+        self.assertEqual(server_info["cuda_graph_config"]["prefill"]["backend"], "full")
+        graph_count = _prefill_graph_count(self.base_url)
         helper(
             self.base_url,
             {self.model: {"kl_div": KL_DIV_THRESHOLD}},
@@ -391,12 +418,33 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
             max_new_tokens=MAX_NEW_TOKENS,
             trust_remote_code=True,
         )
+        self.assertGreater(
+            _prefill_graph_count(self.base_url),
+            graph_count,
+            "MTP target prefill did not replay the configured Full CUDA graph.",
+        )
 
     def test_logprobs_match(self):
         self._run(assert_logprobs_match)
 
     def test_decode_cache_hit(self):
         self._run(assert_decode_cache_hit)
+
+
+class TestRustUnifiedHybridBitExact(TestUnifiedHybridBitExact):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedHybridLazyBitExact(TestUnifiedHybridLazyBitExact):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedHybridHiCacheBitExact(TestUnifiedHybridHiCacheBitExact):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedHybridMTPBitExact(TestUnifiedHybridMTPBitExact):
+    tree_core_backend = "rust"
 
 
 class TestUnifiedHybridBufferOnlyBitExact(CustomTestCase):
@@ -491,7 +539,7 @@ class TestUnifiedHybridBufferOnlyBitExact(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
         shutil.rmtree(cls.storage_dir, ignore_errors=True)
 
     def test_prefill_cache_hit_from_storage(self):
