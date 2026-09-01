@@ -5,6 +5,12 @@ members = [
     "sglang-mm",
     "sglang-server"
 ]
+exclude = ["mem-cache"]
+
+[workspace.metadata.sglang]
+# Extension crates that intentionally cannot share this workspace's dependency
+# graph (mem-cache currently uses the tch-compatible PyO3 0.22 API).
+extension-manifests = ["mem-cache/Cargo.toml"]
 
 [workspace.package]
 version = "0.1.0"

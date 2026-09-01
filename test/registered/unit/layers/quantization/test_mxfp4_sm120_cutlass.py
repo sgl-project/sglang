@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
@@ -81,10 +82,12 @@ def test_cutlass_adapter_import_does_not_require_flashinfer(monkeypatch):
             sys.modules[module_name] = cached_module
 
 
-def test_dsv4_sm120_load_contract(monkeypatch):
+def test_dsv4_sm120_load_contract(monkeypatch, request):
     import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as adapter_module
 
-    monkeypatch.setattr(adapter_module, "is_sm120_supported", lambda: True)
+    platform = override_platform(is_sm120=True)
+    platform.install()
+    request.addfinalizer(platform.restore)
 
     captured = {}
 
