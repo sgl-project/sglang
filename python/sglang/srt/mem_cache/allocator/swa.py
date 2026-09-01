@@ -407,11 +407,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_full(torch.cat(full_free_group))
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
-        pages = torch.unique(indices // self.page_size)
+        # Duplicates are kept: deduplicating would be a torch.unique whose
+        # data-dependent output shape synchronizes the scheduler stream, and
+        # every consumer ends in the paged free's own page dedup anyway.
+        base = (indices // self.page_size) * self.page_size
         page_offsets = torch.arange(
             self.page_size, dtype=indices.dtype, device=indices.device
         )
-        return (pages[:, None] * self.page_size + page_offsets[None, :]).reshape(-1)
+        return (base[:, None] + page_offsets[None, :]).reshape(-1)
 
     def resize(self, config) -> None:
         size_full = int(config.full_max_total_num_tokens)
