@@ -29,7 +29,6 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_gguf_to_load,
     resolve_transformer_quant_load_spec,
 )
-from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import (
@@ -96,56 +95,60 @@ def _warn_if_expected_param_dtype_missing(
 
 
 def _server_args_for_transformer_component(
-    server_args: ServerArgs, component_name: str
+    server_args: ServerArgs,
+    component_name: str,
+    structural_component_name: str | None = None,
 ) -> ServerArgs:
     """Mask global quantized override flags for secondary transformer components."""
+    structural_component_name = structural_component_name or component_name
+    _, separator, suffix = structural_component_name.rpartition("_")
+    is_secondary = structural_component_name == "unconditional_transformer" or (
+        bool(separator) and suffix.isdigit() and int(suffix) >= 2
+    )
     component_weights_path = server_args.component_weights_paths.get(component_name)
     component_quantization = server_args.component_quantizations.get(component_name)
     component_ignored_layers = server_args.component_quantization_ignored_layers.get(
         component_name
     )
-    if (
+    has_exact_override = (
         component_weights_path is not None
         or component_quantization is not None
         or component_ignored_layers is not None
-    ):
-        component_server_args = copy.copy(server_args)
-        if component_weights_path is not None:
-            component_server_args.transformer_weights_path = component_weights_path
-            component_server_args.nunchaku_config = None
-            logger.info(
-                "Using transformer_weights_path override for %s: %s",
-                component_name,
-                component_weights_path,
-            )
-        if component_quantization is not None:
-            component_server_args.quantization = component_quantization
-            logger.info(
-                "Using quantization override %s for %s",
-                component_quantization,
-                component_name,
-            )
-        if component_ignored_layers is not None:
-            component_server_args.quantization_ignored_layers = component_ignored_layers
-        return component_server_args
-
-    if component_name not in ("transformer_2", "unconditional_transformer"):
-        return server_args
-
-    if (
-        server_args.transformer_weights_path is None
-        and server_args.nunchaku_config is None
-    ):
+    )
+    has_global_weights = (
+        server_args.transformer_weights_path is not None
+        or server_args.nunchaku_config is not None
+    )
+    if not has_exact_override and not (is_secondary and has_global_weights):
         return server_args
 
     component_server_args = copy.copy(server_args)
-    component_server_args.transformer_weights_path = None
-    component_server_args.nunchaku_config = None
-    logger.info(
-        "Ignoring global transformer_weights_path for %s; keep it on the base "
-        "checkpoint unless a per-component override path is provided.",
-        component_name,
-    )
+    if is_secondary:
+        component_server_args.transformer_weights_path = None
+        component_server_args.nunchaku_config = None
+        if has_global_weights:
+            logger.info(
+                "Ignoring global transformer weight overrides for %s; keep them "
+                "on the primary component unless an exact override is provided.",
+                component_name,
+            )
+    if component_weights_path is not None:
+        component_server_args.transformer_weights_path = component_weights_path
+        component_server_args.nunchaku_config = None
+        logger.info(
+            "Using transformer_weights_path override for %s: %s",
+            component_name,
+            component_weights_path,
+        )
+    if component_quantization is not None:
+        component_server_args.quantization = component_quantization
+        logger.info(
+            "Using quantization override %s for %s",
+            component_quantization,
+            component_name,
+        )
+    if component_ignored_layers is not None:
+        component_server_args.quantization_ignored_layers = component_ignored_layers
     return component_server_args
 
 
@@ -183,7 +186,9 @@ class TransformerLoader(ComponentLoader):
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
         component_server_args = _server_args_for_transformer_component(
-            server_args, component_name
+            server_args,
+            component_name,
+            self.structural_component_name(component_name),
         )
         # Don't let a quantized load quietly fall back to the unquantized native
         # model. That would drop the requested precision and bury the real error.
@@ -238,7 +243,9 @@ class TransformerLoader(ComponentLoader):
     ):
         """Load the transformer based on the model path, and inference args."""
         component_server_args = _server_args_for_transformer_component(
-            server_args, component_name
+            server_args,
+            component_name,
+            self.structural_component_name(component_name),
         )
 
         # 1. hf config
@@ -261,7 +268,7 @@ class TransformerLoader(ComponentLoader):
 
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
-        component_type = _normalize_component_type(component_name)
+        component_type = self.structural_component_type(component_name)
         server_args.model_paths[component_name] = component_model_path
         if component_type in (
             "transformer",
@@ -327,6 +334,7 @@ class TransformerLoader(ComponentLoader):
             gguf_file=gguf_file,
             checkpoint_quant_config=checkpoint_quant_config,
             transformer_override_config_path=transformer_override_config_path,
+            arch_config=dit_config.arch_config,
         )
         if quant_spec.gguf_file is not None and is_minimax_h3:
             assert quant_spec.quant_config is not None

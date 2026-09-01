@@ -185,6 +185,23 @@ def _resolve_transformer_layer_model(model: torch.nn.Module) -> torch.nn.Module:
     return layer_model
 
 
+def _build_layer_model_forward_kwargs(
+    layer_model: torch.nn.Module,
+    forward_batch: ForwardBatch,
+    pp_proxy_tensors: Optional[PPProxyTensors],
+) -> Dict[str, Any]:
+    """Bind optional transformer inputs by name across model signatures."""
+    parameters = inspect.signature(layer_model.forward).parameters
+    kwargs = {}
+    for embeds_name in ("input_embeds", "inputs_embeds"):
+        if embeds_name in parameters:
+            kwargs[embeds_name] = forward_batch.input_embeds
+            break
+    if pp_proxy_tensors is not None and "pp_proxy_tensors" in parameters:
+        kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+    return kwargs
+
+
 def _slice_output_rows(output: Any, num_tokens: int) -> Any:
     """Slice every tensor leaf in a transformer-body output by token rows.
 
@@ -333,6 +350,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
             pp_size=self.pp_size,
+            is_first_pp_rank=self.model_runner.pp_group.is_first_rank,
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
@@ -653,12 +671,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         return forward_batch.positions
 
-    def _static_pp_proxy_tensors(self, num_tokens: int) -> Optional[PPProxyTensors]:
+    def _capture_pp_proxy_tensors(self, num_tokens: int) -> Optional[PPProxyTensors]:
         buffers = self.buffers.pp_proxy_tensors
-        if buffers is None:
+        if buffers is None or self.model_runner.pp_group.is_first_rank:
             return None
         return PPProxyTensors(
-            {key: value[:num_tokens] for key, value in buffers.items()}
+            {name: buffer[:num_tokens] for name, buffer in buffers.items()}
         )
 
     @contextmanager
@@ -717,20 +735,28 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         set_is_extend_in_batch(False)
 
         with self._prefill_forward_context(forward_batch):
-            pp_kwargs = self.model_runner._pp_kwargs(
-                self._static_pp_proxy_tensors(num_tokens)
-            )
+            pp_proxy_tensors = self._capture_pp_proxy_tensors(num_tokens)
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
+                input_ids = forward_batch.input_ids
+                kwargs = _build_layer_model_forward_kwargs(
+                    self.layer_model, forward_batch, pp_proxy_tensors
+                )
+                if pp_proxy_tensors is not None:
+                    input_ids = None
+                    for embeds_name in ("input_embeds", "inputs_embeds"):
+                        if embeds_name in kwargs:
+                            kwargs[embeds_name] = None
+                            break
                 return self.layer_model.forward(
-                    forward_batch.input_ids,
+                    input_ids,
                     positions,
                     forward_batch,
-                    forward_batch.input_embeds,
-                    **pp_kwargs,
+                    **kwargs,
                 )
             # tc_piecewise: compile/capture the outer model.forward path.
+            pp_kwargs = self.model_runner._pp_kwargs(pp_proxy_tensors)
             return self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -1765,6 +1791,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # uses real request metadata instead of padded slots. BCG has no
         # request-slot padding, so static_forward_batch is already the serving batch.
         tail_batch = forward_batch if full_path else static_forward_batch
+        if not full_path:
+            # MTP consumes the target model's live multimodal embeddings in its
+            # eager wrapper before the captured transformer body is replayed.
+            tail_batch.mm_input_embeds = forward_batch.mm_input_embeds
         try:
             with self._prefill_forward_context(
                 static_forward_batch,
@@ -1836,7 +1866,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if isinstance(output, EmbeddingPoolerOutput):
             return output
         assert isinstance(output, PPProxyTensors)
-        return output[: self.raw_num_tokens]
+        return _slice_output_rows(output, self.raw_num_tokens)
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:

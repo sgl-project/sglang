@@ -56,6 +56,9 @@ class _FakeServerArgs:
     def resolve_component_attention_backend(self, _component_name):
         return None, None
 
+    def requested_component_attention_backend(self, _component_name):
+        return None
+
     def should_start_component_on_cpu(self, _component_name):
         return False
 
