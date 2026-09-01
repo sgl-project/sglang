@@ -43,6 +43,18 @@ def _warn_degraded_span_once() -> None:
     _degraded_span_warned = True
 
 
+def _is_dsv4_sentinel_item(item) -> bool:
+    """True iff an mm item is a DeepSeek-V4 sentinel block.
+
+    Only the DSV4 mm processor emits these keys; other VLMs' items never
+    carry them, which makes the span machinery in this module a no-op for
+    every other model (they keep their previous chunked-prefill / radix
+    behavior).
+    """
+    data = item.model_specific_data
+    return data is not None and "perm" in data and "types" in data
+
+
 def _iter_visible_window_spans(
     mm_inputs,
     prefix_lens: Sequence[int],
@@ -75,6 +87,8 @@ def _iter_visible_window_spans(
         extend_end = prefix + int(extend_lens[req_idx])
         for item in mm_input.mm_items:
             if not item.is_image() or not item.offsets:
+                continue
+            if not _is_dsv4_sentinel_item(item):
                 continue
             for span_start, span_end_incl in item.offsets:
                 if span_start >= prefix and span_end_incl < extend_end:
@@ -178,6 +192,8 @@ def image_span_aligned_extend_end(mm_input, extend_end: int) -> int:
     for item in mm_input.mm_items:
         if not item.is_image() or not item.offsets:
             continue
+        if not _is_dsv4_sentinel_item(item):
+            continue
         for span_start, span_end_incl in item.offsets:
             span_end = span_end_incl + 1
             if span_start < extend_end < span_end:
@@ -202,6 +218,8 @@ def image_span_cut_point(mm_input, position: int, swa_window: int) -> Optional[i
         return None
     for item in mm_input.mm_items:
         if not item.is_image() or not item.offsets:
+            continue
+        if not _is_dsv4_sentinel_item(item):
             continue
         for span_start, span_end_incl in item.offsets:
             if span_start < position - (swa_window - 1) and position <= span_end_incl:

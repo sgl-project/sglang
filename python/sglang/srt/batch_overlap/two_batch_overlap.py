@@ -856,6 +856,13 @@ class TboForwardBatchPreparer:
             child.dsv4_routing_input_ids = routing_ids[
                 start_token_index:end_token_index
             ]
+        # Also carry the hoisted image-token mask and its host-side flag (the
+        # child's mask may have no sentinel left; inheriting the parent's flag
+        # is a conservative superset and only costs the eager fallback).
+        image_mask = getattr(batch, "dsv4_image_mask", None)
+        if image_mask is not None:
+            child.dsv4_image_mask = image_mask[start_token_index:end_token_index]
+            child.dsv4_has_image_tokens = getattr(batch, "dsv4_has_image_tokens", False)
         return child
 
     @classmethod

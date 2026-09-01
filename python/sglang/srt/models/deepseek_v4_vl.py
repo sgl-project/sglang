@@ -26,6 +26,7 @@ NOT YET IMPLEMENTED (phase 2, required for correct outputs):
   image-span-aware topk construction in layers/attention/deepseek_v4_backend.py.
 """
 
+import logging
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -48,6 +49,8 @@ from sglang.srt.models.deepseek_v4_vit import (
     DeepseekV4VisionTower,
 )
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 # Sentinel type ids, matching the reference image_processor.py and
 # multimodal/processors/deepseek_v4_vl.py.
@@ -142,8 +145,18 @@ class DeepseekV4ForCausalLM(nn.Module):
             # embed_mm_inputs clamps forward_batch.input_ids in place
             # (max=vocab_size-1) to embed the placeholder region. The MoE
             # gate's bias_vl routing keys on the mm pad sentinels in those
-            # ids, so keep a pre-clamp snapshot for it to read.
-            forward_batch.dsv4_routing_input_ids = forward_batch.input_ids.clone()
+            # ids, so keep a pre-clamp snapshot for it to read. Also hoist
+            # the image-token mask + host flag here: the routine nulls
+            # forward_batch.mm_inputs before the LM runs, so the mask must be
+            # computed now, and the flag lets MoE layers skip their per-layer
+            # GPU->CPU check on text-only batches.
+            from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+
+            routing_ids = forward_batch.input_ids.clone()
+            forward_batch.dsv4_routing_input_ids = routing_ids
+            image_mask = routing_ids >= MM_PAD_SHIFT_VALUE
+            forward_batch.dsv4_image_mask = image_mask
+            forward_batch.dsv4_has_image_tokens = bool(image_mask.any())
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -164,16 +177,34 @@ class DeepseekV4ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
         llm_weights = []
+        loaded_vision_names = set()
         for name, loaded_weight in weights:
             if name.startswith(("vision.", "aligner.")):
                 param = params_dict[name]
                 default_weight_loader(param, loaded_weight)
+                loaded_vision_names.add(name)
             elif name in self._SENTINEL_NAMES:
                 param = params_dict[name]
                 default_weight_loader(param, loaded_weight)
+                loaded_vision_names.add(name)
             else:
                 llm_weights.append((name, loaded_weight))
         self.language_model.load_weights(llm_weights)
+        if self.is_multimodal:
+            # The vision params are created with torch.empty; a checkpoint
+            # missing them would silently serve garbage, so audit loudly.
+            expected_vision = {
+                n for n in params_dict if n.startswith(("vision.", "aligner."))
+            }
+            missing = sorted(expected_vision - loaded_vision_names)
+            missing += sorted(set(self._SENTINEL_NAMES) - loaded_vision_names)
+            if missing:
+                logger.warning(
+                    "DeepSeek-V4-Vision checkpoint did not provide %d vision "
+                    "weights (e.g. %s); they hold uninitialized values.",
+                    len(missing),
+                    missing[:4],
+                )
 
     # ------------------------------------------------------------------
     # delegations expected by the framework / engine

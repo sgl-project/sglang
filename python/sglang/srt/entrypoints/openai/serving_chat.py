@@ -1262,14 +1262,18 @@ class OpenAIServingChat(OpenAIServingBase):
             # DeepSeek-V4-Vision: keep image content blocks for the encoder —
             # it replaces them with <｜deepseek_image｜> placeholders and
             # returns the image records in prompt order (see below).
-            dsv4_with_images = self.chat_encoding_spec == "dsv4" and any(
-                isinstance(m.get("content"), list)
+            dsv4_with_images = (
+                is_multimodal
+                and self.chat_encoding_spec == "dsv4"
                 and any(
-                    isinstance(c, dict)
-                    and c.get("type") in ("image", "image_url", "input_image")
-                    for c in m["content"]
+                    isinstance(m.get("content"), list)
+                    and any(
+                        isinstance(c, dict)
+                        and c.get("type") in ("image", "image_url", "input_image")
+                        for c in m["content"]
+                    )
+                    for m in messages
                 )
-                for m in messages
             )
 
             if not dsv4_with_images:

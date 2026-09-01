@@ -952,6 +952,7 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
+                    forward_batch=forward_batch,
                 )
             else:
                 return self.forward_normal(
@@ -960,6 +961,7 @@ class DeepseekV2MoE(nn.Module):
                     input_ids,
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
+                    forward_batch=forward_batch,
                 )
         else:
             return self.forward_deepep(
@@ -972,6 +974,7 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
@@ -1009,6 +1012,12 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 router_logits,
                 input_ids=input_ids_global,
+                image_mask=(
+                    getattr(forward_batch, "dsv4_image_mask", None)
+                    if forward_batch is not None
+                    else None
+                ),
+                forward_batch=forward_batch,
                 expert_location_dispatch_info=dispatch_info,
             )
         deferred_finalize = (
@@ -1079,6 +1088,8 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
+        image_mask: Optional[torch.Tensor] = None,
+        forward_batch=None,
         **kwargs,
     ):
         """self.topk(...) plus the DeepSeek-V4-Vision bias_vl fallback.
@@ -1089,15 +1100,28 @@ class DeepseekV2MoE(nn.Module):
         containing image tokens falls back to an eager per-token-bias top-k.
         Text-only batches and non-vision models keep the fused path
         bit-identical.
+
+        The image check uses the host-side batch flag
+        (forward_batch.dsv4_has_image_tokens) when available, so text-only
+        batches pay no GPU->CPU sync per layer.
         """
+        skip_image_check = forward_batch is not None and not getattr(
+            forward_batch, "dsv4_has_image_tokens", False
+        )
         if getattr(self, "is_hash", False):
             return self.topk(
-                hidden_states, router_logits, input_ids=input_ids, **kwargs
+                hidden_states,
+                router_logits,
+                input_ids=input_ids,
+                image_mask=image_mask,
+                skip_image_check=skip_image_check,
+                **kwargs,
             )
         bias_vl = self.gate.bias_vl
         if (
             bias_vl is not None
             and input_ids is not None
+            and not skip_image_check
             and not torch.cuda.is_current_stream_capturing()
         ):
             # The .any() below syncs, which is illegal under CUDA graph
@@ -1105,10 +1129,13 @@ class DeepseekV2MoE(nn.Module):
             # batches never replay graphs (prefill-with-image runs eager;
             # decode input_ids never contain pad sentinels), so skipping the
             # check during capture is exact.
-            from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+            if image_mask is None:
+                from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 
-            image_mask = input_ids >= MM_PAD_SHIFT_VALUE
-            if image_mask.any():
+                image_mask = input_ids >= MM_PAD_SHIFT_VALUE
+                if not image_mask.any():
+                    image_mask = None
+            if image_mask is not None:
                 if not _bias_vl_route_logged[0]:
                     _bias_vl_route_logged[0] = True
                     logger.info(
@@ -1141,6 +1168,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1180,6 +1208,12 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 router_logits,
                 input_ids=input_ids_global,
+                image_mask=(
+                    getattr(forward_batch, "dsv4_image_mask", None)
+                    if forward_batch is not None
+                    else None
+                ),
+                forward_batch=forward_batch,
                 expert_location_dispatch_info=dispatch_info,
             )
         else:
@@ -1364,6 +1398,8 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 router_logits,
                 input_ids=input_ids_global,
+                image_mask=getattr(forward_batch, "dsv4_image_mask", None),
+                forward_batch=forward_batch,
                 num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=(
                     ExpertLocationDispatchInfo.init_new(
@@ -1721,7 +1757,9 @@ class DeepseekV2MoE(nn.Module):
                     (0, hidden_states.shape[0] - routing_ids.shape[0]),
                 )
             elif routing_ids.shape[0] > hidden_states.shape[0]:
-                routing_ids = None
+                # Symmetric with the pad above; never fall back to the
+                # (possibly clamped) batch ids.
+                routing_ids = routing_ids[: hidden_states.shape[0]]
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
@@ -1734,6 +1772,8 @@ class DeepseekV2MoE(nn.Module):
                         if routing_ids is not None
                         else state.forward_batch.input_ids
                     ),
+                    image_mask=getattr(state.forward_batch, "dsv4_image_mask", None),
+                    forward_batch=state.forward_batch,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
                     expert_location_dispatch_info=(
                         ExpertLocationDispatchInfo.init_new(

@@ -244,13 +244,19 @@ class HashTopK(nn.Module):
         input_ids: torch.Tensor,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        image_mask: Optional[torch.Tensor] = None,
+        skip_image_check: bool = False,
     ):
         assert (
             input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0]
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
 
-        image_mask = None
-        if self.bias_vl is not None and not torch.cuda.is_current_stream_capturing():
+        if (
+            image_mask is None
+            and self.bias_vl is not None
+            and not skip_image_check
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             # The .any() below syncs, which is illegal under CUDA graph
             # capture. Capture only sees dummy (pad-free) input_ids, and image
             # batches never replay graphs (prefill-with-image runs eager;

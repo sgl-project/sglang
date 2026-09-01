@@ -3071,6 +3071,10 @@ class DeepseekV4Model(nn.Module):
             input_ids = getattr(forward_batch, "dsv4_routing_input_ids", None)
             if input_ids is None:
                 input_ids = forward_batch.input_ids
+        # Note: the image-token mask + host flag for the bias_vl routing are
+        # hoisted by the VL wrapper (deepseek_v4_vl.py) before the mm embed
+        # routine — by the time this forward runs, forward_batch.mm_inputs
+        # has been nulled by embed_mm_inputs.
         cp_v2_active = is_cp_v2_active(forward_batch)
         use_prefill_cp = dsa_use_prefill_cp(forward_batch)
         if self.pp_group.is_first_rank:
@@ -3338,11 +3342,18 @@ class DeepseekV4ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         # input_ids is None for multimodal prefill (tokens are embedded by
-        # the VL wrapper); CP metadata prep needs the length, so skip it then.
-        if self.dsa_enable_prefill_cp and input_ids is not None:
-            if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+        # the VL wrapper); CP metadata prep only needs the length, so resolve
+        # the ids the same way DeepseekV4Model.forward does — the pre-clamp
+        # snapshot first, then the (possibly clamped) batch ids.
+        if self.dsa_enable_prefill_cp:
+            cp_input_ids = input_ids
+            if cp_input_ids is None:
+                cp_input_ids = getattr(forward_batch, "dsv4_routing_input_ids", None)
+            if cp_input_ids is None:
+                cp_input_ids = forward_batch.input_ids
+            if can_dsa_cp_split(len(cp_input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len(input_ids),
+                    len(cp_input_ids),
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),

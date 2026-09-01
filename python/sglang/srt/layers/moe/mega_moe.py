@@ -194,6 +194,12 @@ def _run_mega_routed(
             hidden_states,
             router_logits,
             input_ids=input_ids_global,
+            image_mask=(
+                getattr(forward_batch, "dsv4_image_mask", None)
+                if forward_batch is not None
+                else None
+            ),
+            forward_batch=forward_batch,
             num_token_non_padded=(
                 forward_batch.num_token_non_padded
                 if forward_batch is not None
