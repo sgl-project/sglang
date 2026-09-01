@@ -595,8 +595,13 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
         ring_buffer = SimpleNamespace(
             num_ring_tokens=256,
             x=torch.zeros((2, 4), dtype=torch.uint8),
+            x_sf=torch.zeros((2, 4), dtype=torch.uint8),
+            topk_idx=torch.zeros((2, 4), dtype=torch.uint8),
+            topk_weights=torch.zeros((2, 4), dtype=torch.uint8),
             l1_acts=torch.zeros((2, 4), dtype=torch.uint8),
+            l1_acts_sf=torch.zeros((2, 4), dtype=torch.uint8),
             l2_acts=torch.zeros((2, 4), dtype=torch.uint8),
+            l2_acts_sf=torch.zeros((2, 4), dtype=torch.uint8),
         )
         ring_constructor = mock.Mock(return_value=ring_buffer)
         deep_gemm = SimpleNamespace(
@@ -615,8 +620,16 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
 
         self.assertIs(result, ring_buffer)
         self.assertEqual(result.x.dtype, torch.float8_e4m3fn)
+        self.assertEqual(result.x_sf.dtype, torch.float32)
+        self.assertEqual(result.topk_idx.dtype, torch.int32)
+        self.assertEqual(result.topk_weights.dtype, torch.float32)
         self.assertEqual(result.l1_acts.dtype, torch.float8_e4m3fn)
+        self.assertEqual(result.l1_acts_sf.dtype, torch.float32)
         self.assertEqual(result.l2_acts.dtype, torch.float8_e4m3fn)
+        self.assertEqual(result.l2_acts_sf.dtype, torch.float32)
+        self.assertEqual(result.x.shape, (2, 4))
+        self.assertEqual(result.x_sf.shape, (2, 1))
+        self.assertEqual(result.topk_idx.shape, (2, 1))
         ring_constructor.assert_called_once_with(
             group,
             256,
@@ -634,11 +647,34 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
         buf = SimpleNamespace(
             num_ring_tokens=256,
             x=torch.zeros((2, 4), dtype=torch.float32),
+            x_sf=torch.zeros((2, 1), dtype=torch.float32),
+            topk_idx=torch.zeros((2, 1), dtype=torch.int32),
+            topk_weights=torch.zeros((2, 1), dtype=torch.float32),
             l1_acts=torch.zeros((2, 4), dtype=torch.uint8),
+            l1_acts_sf=torch.zeros((2, 1), dtype=torch.float32),
             l2_acts=torch.zeros((2, 4), dtype=torch.uint8),
+            l2_acts_sf=torch.zeros((2, 1), dtype=torch.float32),
         )
         with self.assertRaisesRegex(TypeError, "one-byte storage"):
             normalize_sm90_fp4_symm_buffer_views(buf)
+
+    def test_fp4_buffer_views_fail_closed_without_partial_mutation(self):
+        x = torch.zeros((2, 4), dtype=torch.uint8)
+        buf = SimpleNamespace(
+            num_ring_tokens=256,
+            x=x,
+            x_sf=torch.zeros((2, 3), dtype=torch.uint8),
+            topk_idx=torch.zeros((2, 4), dtype=torch.uint8),
+            topk_weights=torch.zeros((2, 4), dtype=torch.uint8),
+            l1_acts=torch.zeros((2, 4), dtype=torch.uint8),
+            l1_acts_sf=torch.zeros((2, 4), dtype=torch.uint8),
+            l2_acts=torch.zeros((2, 4), dtype=torch.uint8),
+            l2_acts_sf=torch.zeros((2, 4), dtype=torch.uint8),
+        )
+        with self.assertRaisesRegex(TypeError, "x_sf.*view-compatible"):
+            normalize_sm90_fp4_symm_buffer_views(buf)
+        self.assertIs(buf.x, x)
+        self.assertEqual(buf.x.dtype, torch.uint8)
 
     def test_native_transform_output_contract_is_checked(self):
         experts = self._experts()

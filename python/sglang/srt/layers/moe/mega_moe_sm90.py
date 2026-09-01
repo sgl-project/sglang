@@ -86,30 +86,55 @@ def _resolve_sm90_fp4_symm_buffer_constructor(deep_gemm) -> Callable:
 
 
 def normalize_sm90_fp4_symm_buffer_views(buf):
-    """Restore FP8 views lost by mixed TVM-FFI/PyTorch DeepGEMM builds.
+    """Restore tensor views lost by mixed TVM-FFI/PyTorch DeepGEMM builds.
 
     The ring-buffer slicer in affected builds returns byte tensors through
-    DLPack, while the SM90 pre-dispatch and FP8xFP4 kernel require the three
-    activation regions to be typed as E4M3.  Re-viewing one-byte storage does
-    not alter its shape, strides, address, or underlying allocation.
+    DLPack, while the SM90 pre-dispatch and FP8xFP4 kernel require typed views
+    for all eight regions.  Re-viewing byte storage does not alter its address
+    or underlying allocation; four-byte views recover the logical last
+    dimension encoded by the slicer.
     """
     num_ring_tokens = getattr(buf, "num_ring_tokens", None)
     if not isinstance(num_ring_tokens, int) or num_ring_tokens <= 0:
         raise RuntimeError(
             "DeepGEMM SM90 FP4 buffer is missing a positive num_ring_tokens"
         )
-    for name in ("x", "l1_acts", "l2_acts"):
+    required_dtypes = {
+        "x": torch.float8_e4m3fn,
+        "x_sf": torch.float32,
+        "topk_idx": torch.int32,
+        "topk_weights": torch.float32,
+        "l1_acts": torch.float8_e4m3fn,
+        "l1_acts_sf": torch.float32,
+        "l2_acts": torch.float8_e4m3fn,
+        "l2_acts_sf": torch.float32,
+    }
+    normalized = {}
+    for name, required_dtype in required_dtypes.items():
         tensor = getattr(buf, name, None)
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"DeepGEMM SM90 FP4 buffer {name} must be a tensor")
-        if tensor.dtype == torch.float8_e4m3fn:
+        if tensor.dtype == required_dtype:
+            normalized[name] = tensor
             continue
         if tensor.element_size() != 1:
             raise TypeError(
                 f"DeepGEMM SM90 FP4 buffer {name} must use one-byte storage, "
                 f"got {tensor.dtype}"
             )
-        setattr(buf, name, tensor.view(torch.float8_e4m3fn))
+        try:
+            normalized[name] = tensor.view(required_dtype)
+        except RuntimeError as exc:
+            raise TypeError(
+                f"DeepGEMM SM90 FP4 buffer {name} byte storage is not "
+                f"view-compatible with {required_dtype}: shape={tuple(tensor.shape)}, "
+                f"stride={tuple(tensor.stride())}"
+            ) from exc
+
+    # Validate every view before mutating the buffer so a malformed field does
+    # not leave a partially normalized object in the process-wide cache.
+    for name, tensor in normalized.items():
+        setattr(buf, name, tensor)
     return buf
 
 
