@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     get_hash_str,
@@ -300,18 +300,19 @@ class TreeNode:
         return self.last_access_time < other.last_access_time
 
 
-class RadixCache(KVCacheEventMixin, BasePrefixCache):
+class RadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
-        self.enable_kv_cache_events = params.enable_kv_cache_events
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
 
-        self.kv_event_queue = []
+        self.kv_events = KVCacheEventRecorder(
+            enabled=params.enable_kv_cache_events, page_size=self.page_size
+        )
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -371,7 +372,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             last_host_node=self.root_node,
             best_match_node=self.root_node,
         )
-        self._record_all_cleared_event()
+        self.kv_events.record_all_cleared()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
@@ -466,16 +467,16 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             # The protected prefix is not this req's to free.
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
+                req.kv.req_pool_idx, req.kv.cache_protected_len : kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free_segment(
-                kv_indices, start_pos=req.cache_protected_len
+                kv_indices, start_pos=req.kv.cache_protected_len
             )
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, : len(token_ids)
         ]
 
         radix_key = RadixKey(
@@ -501,8 +502,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.token_to_kv_pool_allocator.free_segments(
             [
                 (
-                    kv_indices[req.cache_protected_len : freed_end],
-                    req.cache_protected_len,
+                    kv_indices[req.kv.cache_protected_len : freed_end],
+                    req.kv.cache_protected_len,
                 ),
                 (kv_indices[key_len:], key_len),
             ]
@@ -519,7 +520,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, : len(token_ids)
         ]
 
         radix_key = RadixKey(
@@ -542,8 +543,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         new_prefix_len = result.prefix_len
 
         self.token_to_kv_pool_allocator.free_segment(
-            kv_indices[req.cache_protected_len : new_prefix_len],
-            start_pos=req.cache_protected_len,
+            kv_indices[req.kv.cache_protected_len : new_prefix_len],
+            start_pos=req.kv.cache_protected_len,
         )
 
         # The prefix indices could be updated, reuse it
@@ -557,15 +558,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         ), f"{len(new_indices)=}, {len(radix_key)=}"
 
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
+            (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
+            new_indices[req.kv.cache_protected_len :],
         )
 
         # The cache_protected_len is not always equal to len(req.prefix_indices)
         # since for page_size > 1, the partial part is added to req.prefix_indices, but that part of kv indices is not added to the tree.
         # It should be freed in the next cache_unfinished_req and final cache_finished_req to avoid memory leak.
         # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
-        req.cache_protected_len = len(new_indices)
+        req.kv.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
@@ -614,7 +615,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
-            self._record_remove_event(x)
+            self.kv_events.record_remove(x)
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
@@ -785,7 +786,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
-            self._record_store_event(new_node)
+            self.kv_events.record_store(new_node)
             node = new_node
         return total_prefix_length, node
 

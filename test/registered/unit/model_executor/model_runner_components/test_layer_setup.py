@@ -31,6 +31,20 @@ class TestComputeAttentionAndMoeLayers(unittest.TestCase):
         self.assertEqual(mha_companion_layers, [attn_mha])
         self.assertNotIn("_pcg_mha_companion", vars(attn_mqa))
 
+    def test_pipeline_placeholders_preserve_global_layer_ids(self):
+        local_attention = SimpleNamespace()
+        layer_model = SimpleNamespace(
+            layers=[SimpleNamespace(), SimpleNamespace()]
+            + [SimpleNamespace(self_attn=SimpleNamespace(attn=local_attention))]
+        )
+
+        attention_layers, _, _, _, mha_companion_layers = (
+            compute_attention_and_moe_layers(layer_model)
+        )
+
+        self.assertEqual(attention_layers, [None, None, local_attention])
+        self.assertEqual(mha_companion_layers, [None, None, None])
+
 
 if __name__ == "__main__":
     unittest.main()

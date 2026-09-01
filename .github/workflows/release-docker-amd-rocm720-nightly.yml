@@ -10,6 +10,17 @@ on:
         options:
           - 'all'
           - publish
+      gpu_arch:
+        description: 'Select which ROCm 7.2 GPU arch to build'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - gfx942-rocm724
+          - gfx950-rocm724
+          - gfx942-rocm720
+          - gfx950-rocm720
   schedule:
     - cron: '0 12 * * *'
 
@@ -29,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx942-rocm720', 'gfx950-rocm720']
+        gpu_arch: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.gpu_arch != 'all' && inputs.gpu_arch != '') && format('["{0}"]', inputs.gpu_arch) || '["gfx942-rocm720", "gfx950-rocm720", "gfx942-rocm724", "gfx950-rocm724"]') }}
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -50,7 +61,7 @@ jobs:
         id: version
         run: |
           # Use the shared helper so stable/post releases sort above rc tags.
-          VERSION=$(python3 python/tools/get_version_tag.py --tag-only | sed 's/^v//')
+          VERSION=$(python3 scripts/release/get_version_tag.py --tag-only | sed 's/^v//')
 
           if [ -z "$VERSION" ]; then
             echo "::error::Could not determine version from git tags"
@@ -81,7 +92,11 @@ jobs:
           echo "Version: ${version}"
           echo "Pretend version: ${pretend_version}"
 
-          if [ "${{ matrix.gpu_arch }}" = "gfx942-rocm720" ]; then
+          if [ "${{ matrix.gpu_arch }}" = "gfx942-rocm724" ]; then
+            rocm_tag="rocm724-mi30x"
+          elif [ "${{ matrix.gpu_arch }}" = "gfx950-rocm724" ]; then
+            rocm_tag="rocm724-mi35x"
+          elif [ "${{ matrix.gpu_arch }}" = "gfx942-rocm720" ]; then
             rocm_tag="rocm720-mi30x"
           elif [ "${{ matrix.gpu_arch }}" = "gfx950-rocm720" ]; then
             rocm_tag="rocm720-mi35x"
@@ -141,7 +156,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx942-rocm720', 'gfx950-rocm720']
+        gpu_arch: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.gpu_arch != 'all' && inputs.gpu_arch != '') && format('["{0}"]', inputs.gpu_arch) || '["gfx942-rocm720", "gfx950-rocm720", "gfx942-rocm724", "gfx950-rocm724"]') }}
     steps:
       - name: Download image tag artifact
         uses: actions/download-artifact@v4

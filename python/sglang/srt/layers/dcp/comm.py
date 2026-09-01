@@ -491,7 +491,13 @@ def dcp_a2a_lse_reduce(
         )
         recv_combined = torch.empty_like(send_combined)
 
-    dcp_pack_a2a_send(cp_attn_out, cp_attn_lse, send_combined)
+    send_words = send_combined.view(torch.float32)
+    dcp_pack_a2a_send(
+        cp_attn_out,
+        cp_attn_lse,
+        send_combined[:, :, :, :D],
+        send_words[:, :, :, D // lpd],
+    )
 
     # Transport as raw bytes (uint8): the output may be fp8 (fp8 KV cache),
     # which pynccl's dtype enum can't send; byte a2a is exact for equal chunks.
@@ -533,16 +539,21 @@ def _dcp_fi_a2a_lse_reduce(
     assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
     H_per_rank = H // N
 
-    # FlashInfer sends partial_o[..., peer, :] to `peer`; head h -> peer h//H_per_rank,
-    # so the peer axis is the outer head split: [B,N,H_pr,D] -> [B,H_pr,N,D].
-    partial_o = cp_attn_out.view(B, N, H_per_rank, D).permute(0, 2, 1, 3).contiguous()
-    # softmax_stats: fp32 [B, H_per_rank, N, S=2] (FI requires S>=2 & even);
-    # carry the LSE in lane 0, lane 1 is ignored by the combine.
-    lse_view = cp_attn_lse.view(B, N, H_per_rank).permute(0, 2, 1)  # [B,H_pr,N]
-    softmax_stats = torch.zeros(
+    # Note(kpham-sgl): empty(), not zeros() -- the pack below fills partial_o and
+    # stats slot 0, and slot 1 is never read by anyone. The a2a moves the stats
+    # field as opaque bytes and we only ever read slot 0 back off the wire.
+    partial_o = torch.empty(
+        B, H_per_rank, N, D, dtype=cp_attn_out.dtype, device=cp_attn_out.device
+    )
+    softmax_stats = torch.empty(
         B, H_per_rank, N, 2, dtype=torch.float32, device=cp_attn_out.device
     )
-    softmax_stats[..., 0] = lse_view
+    dcp_pack_a2a_send(
+        cp_attn_out,
+        cp_attn_lse,
+        partial_o.permute(2, 0, 1, 3),
+        softmax_stats[..., 0].permute(2, 0, 1),
+    )
 
     o_out, stats_out = decode_cp_a2a_alltoall(
         partial_o,
@@ -552,9 +563,8 @@ def _dcp_fi_a2a_lse_reduce(
         N,
     )
 
-    # o_out[b,hpr,src] = rank src's partial for local head hpr -> combine layout.
-    recv_output = o_out.permute(2, 0, 1, 3).contiguous()  # [N, B, H_per_rank, D]
-    recv_lse = stats_out[..., 0].permute(2, 0, 1).contiguous()  # [N, B, H_per_rank]
+    recv_output = o_out.permute(2, 0, 1, 3)
+    recv_lse = stats_out[..., 0].permute(2, 0, 1)
 
     combined, _ = dcp_lse_combine_triton(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
