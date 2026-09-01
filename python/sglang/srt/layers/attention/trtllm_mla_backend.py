@@ -906,9 +906,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     or forward_batch.forward_mode.is_decode_or_idle()
                     or forward_batch.forward_mode.is_draft_extend_v2()
                 ) and metadata.seq_lens_k is not None:
-                    # super() stored the global lengths in seq_lens_k; keep
-                    # them as global_seq_lens_k and derive the rank-local view
-                    # once per step rather than per MLA layer.
+                    # The branches above stored the global lengths in
+                    # seq_lens_k; keep them as global_seq_lens_k and derive the
+                    # rank-local view once per step rather than per MLA layer.
                     metadata.global_seq_lens_k = metadata.seq_lens_k
                     metadata.seq_lens_k = self._get_dcp_local_seq_lens(
                         metadata.global_seq_lens_k
