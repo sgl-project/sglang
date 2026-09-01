@@ -41,6 +41,8 @@ blocks every step no matter how short the sequences actually are.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -85,6 +87,119 @@ def build_kv_read_table_kernel(
         phys = tl.load(v2p_ptr + page, mask=mask, other=0)
         entry = tl.maximum(phys * mult, 0).to(tl.int32)
         tl.store(row_out + cols, entry, mask=mask)
+
+
+@triton.jit
+def build_kv_read_table_packed_kernel(
+    req_to_token_ptr,  # in: [max_reqs, max_context] -- VIRTUAL token ids
+    req_pool_indices_ptr,  # in: [bs] -- row per batch lane
+    seq_lens_ptr,  # in: [bs]
+    v2p_ptr,  # in: [num_pages + 1] int64 -- virtual->physical page table
+    indptr_ptr,  # in: [bs + 1] -- CSR row starts into `out`
+    kv_start_idx_ptr,  # in: [bs] or null -- first token of each row's window
+    out_ptr,  # out: [>= indptr[bs]] int32 -- the packed token stream
+    req_stride,  # runtime: req_to_token row stride (elements)
+    mult,  # runtime: kernel_page_multiplier of the target sub-pool
+    tok_stride,  # runtime: tokens one program advances per loop trip
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    req = tl.load(req_pool_indices_ptr + bid).to(tl.int64)
+    n_tokens = tl.load(seq_lens_ptr + bid)
+    kv_start = 0
+    if kv_start_idx_ptr:
+        kv_start = tl.load(kv_start_idx_ptr + bid).to(tl.int32)
+    row_in = req_to_token_ptr + req * req_stride
+    row_out = out_ptr + tl.load(indptr_ptr + bid).to(tl.int64)
+
+    for start in range(tl.program_id(1) * BLOCK, n_tokens, tok_stride):
+        col = start + tl.arange(0, BLOCK)
+        mask = col < n_tokens
+        pos = kv_start + col
+        tok = tl.load(
+            row_in + (pos // PAGE_SIZE).to(tl.int64) * PAGE_SIZE, mask=mask, other=0
+        ).to(tl.int64)
+        # Triton's `//` truncates toward zero, so `-1 // ps` is 0 for ps > 1 but
+        # -1 at ps == 1, which would read one element BEFORE `v2p`.
+        vpage = tl.where(tok < 0, 0, tok // PAGE_SIZE)
+        phys = tl.load(v2p_ptr + vpage, mask=mask, other=0)
+        entry = tl.maximum(phys * mult, 0)
+        # Converting an id keeps its offset inside the page, so the token id is
+        # exact: the same rebuild `create_flashinfer_kv_indices_triton` does.
+        token = entry * PAGE_SIZE + pos % PAGE_SIZE
+        tl.store(row_out + col, token.to(tl.int32), mask=mask)
+
+
+def build_kv_read_table_packed(
+    *,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    v2p: torch.Tensor,
+    indptr: torch.Tensor,
+    multiplier: int,
+    page_size: int,
+    max_tokens: int,
+    out: torch.Tensor,
+    kv_start_idx: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fill ``out``'s CSR rows with kernel-facing TOKEN ids.
+
+    The rectangle form above feeds consumers that read a page table directly;
+    this one writes the indptr-addressed stream the flashinfer wrappers plan
+    over, skipping the rectangle they would otherwise repack. ``out`` holds
+    ``sum(seq_lens)`` entries, which the pool bounds -- one id per resident
+    token -- rather than the ``bs x max_context_len`` a rectangle needs.
+    """
+    bs = int(req_pool_indices.numel())
+    assert (
+        out.dtype == torch.int32
+    ), f"build_kv_read_table_packed: out must be int32, got {out.dtype}"
+    assert out.dim() == 1 and out.numel() >= max_tokens, (
+        f"build_kv_read_table_packed: out {tuple(out.shape)} cannot hold "
+        f"max_tokens={max_tokens}"
+    )
+    assert indptr.numel() > bs, (
+        f"build_kv_read_table_packed: indptr holds {indptr.numel()} entries, "
+        f"need {bs + 1}"
+    )
+    if bs == 0 or max_tokens == 0:
+        return out
+
+    if not req_to_token.is_cuda:
+        starts = indptr[: bs + 1].tolist()
+        cols = torch.arange(max_tokens, device=req_to_token.device)
+        for b in range(bs):
+            n = int(seq_lens[b])
+            pos = cols[:n] + (0 if kv_start_idx is None else int(kv_start_idx[b]))
+            tok = req_to_token[int(req_pool_indices[b]), (pos // page_size) * page_size]
+            vpage = torch.where(tok < 0, 0, tok.to(torch.int64) // page_size)
+            entry = (v2p[vpage] * multiplier).clamp(min=0)
+            out[starts[b] : starts[b] + n] = (entry * page_size + pos % page_size).to(
+                torch.int32
+            )
+        return out
+
+    tok_programs = min(
+        triton.cdiv(_TARGET_BLOCKS, bs), triton.cdiv(max_tokens, _BLOCK_COLS)
+    )
+    build_kv_read_table_packed_kernel[(bs, tok_programs)](
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        v2p,
+        indptr,
+        kv_start_idx,
+        out,
+        req_to_token.stride(0),
+        multiplier,
+        tok_programs * _BLOCK_COLS,
+        PAGE_SIZE=page_size,
+        BLOCK=_BLOCK_COLS,
+        num_warps=_NUM_WARPS,
+    )
+    return out
 
 
 def build_kv_read_table(

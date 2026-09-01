@@ -57,7 +57,13 @@ from typing import Optional, Tuple
 import msgspec
 import torch
 
-from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
+from sglang.kernels.ops.kvcache.kv_indices import (
+    create_flashinfer_kv_indices_triton,
+)
+from sglang.kernels.ops.kvcache.kv_read_table import (
+    build_kv_read_table,
+    build_kv_read_table_packed,
+)
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
     UnifiedSWATokenToKVPoolAllocator,
@@ -186,6 +192,54 @@ class KVIndexTranslator:
         )
 
     # -- per-batch view --------------------------------------------------------
+
+    def fill_packed_read_stream(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        indptr: torch.Tensor,
+        total_tokens: int,
+        out: torch.Tensor,
+        kv_start_idx: Optional[torch.Tensor] = None,
+    ) -> bool:
+        """Fill ``out``'s CSR rows with the ids a paged wrapper plans over, and
+        report whether they came out translated.
+
+        Non-unified: the historical gather straight from ``req_to_token``.
+        Unified: one fused gather-and-translate, so no caller needs a
+        ``[bs, max_pages]`` rectangle to repack from -- ``out`` holds one id per
+        resident token, a length the pool bounds.
+
+        A ``False`` return means the ids are still VIRTUAL: the DCP path defers
+        translation to ``translate_dcp_read_ids`` over the filled prefix.
+        """
+        if not self.is_translating or self.defer_read_translate:
+            create_flashinfer_kv_indices_triton[(int(req_pool_indices.numel()),)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                indptr,
+                kv_start_idx,
+                out,
+                self.req_to_token.stride(0),
+                ENTRY_PAGE_SIZE=1,
+            )
+            return False
+
+        build_kv_read_table_packed(
+            req_to_token=self.req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            v2p=self._full_v2p_table,
+            indptr=indptr,
+            multiplier=self._full_page_multiplier,
+            page_size=self.page_size,
+            max_tokens=total_tokens,
+            out=out,
+            kv_start_idx=kv_start_idx,
+        )
+        return True
 
     def build_index_table(
         self,

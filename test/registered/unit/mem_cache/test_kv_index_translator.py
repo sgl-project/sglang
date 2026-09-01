@@ -235,6 +235,40 @@ class TestReadTableBuild(unittest.TestCase):
                     f"swa read table off-formula (ps={ps}, mult={swa_mult})",
                 )
 
+    def test_packed_stream_equals_the_rectangle_it_replaces(self):
+        """The packed builder and the rectangle must agree element for element:
+        packed[indptr[b] + p] == ids[b, p // ps] * ps + p % ps. Consumers that
+        plan over the stream and consumers that read the page table have to see
+        the same KV, so a change to either builder alone turns this red."""
+        for ps in (1, 4):
+            allocator = _build_composite(ps)
+            req_to_token, rows, seq_lens = _alloc_and_fill(
+                allocator, ps, lens=[5 * ps, 2 * ps, 3 * ps - 1]
+            )
+            src = _make_source(allocator, req_to_token, ps)
+            view = src.build_index_table(
+                req_pool_indices=rows, seq_lens=seq_lens, max_pages=6
+            )
+            indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32)
+            indptr[1:] = torch.cumsum(seq_lens, dim=0)
+            total = int(indptr[-1])
+            packed = torch.zeros(total, dtype=torch.int32)
+            translated = src.fill_packed_read_stream(
+                req_pool_indices=rows,
+                seq_lens=seq_lens,
+                indptr=indptr,
+                total_tokens=total,
+                out=packed,
+            )
+            self.assertTrue(translated)
+            for b, n in enumerate(seq_lens.tolist()):
+                for pos in range(n):
+                    self.assertEqual(
+                        int(packed[int(indptr[b]) + pos]),
+                        int(view.ids[b, pos // ps]) * ps + pos % ps,
+                        f"packed stream off the page table (ps={ps}, b={b}, {pos=})",
+                    )
+
     def test_sink_routing(self):
         """Dead lanes (seq_len 0), -1 slots inside the live prefix, and
         tombstoned v2p pages must ALL read entry 0 -- one wild entry is a
