@@ -433,14 +433,6 @@ class KVCacheConfigurator:
                     unified_total_bytes=sizes.unified_total_bytes,
                 )
             elif self.mambaish_config is not None:
-                if pd_enabled and not self.use_mla_backend:
-                    raise ValueError(
-                        "--enable-unified-memory with PD disaggregation "
-                        "currently supports only MLA hybrid-Mamba models "
-                        "(e.g. kimi-linear); this model uses the MHA full-"
-                        "attention pool. Drop --enable-unified-memory or run "
-                        "without PD disaggregation."
-                    )
                 bundle = self._init_unified_mamba_pools(
                     max_num_reqs=sizes.max_running_requests,
                     max_total_num_tokens=sizes.max_total_num_tokens,
