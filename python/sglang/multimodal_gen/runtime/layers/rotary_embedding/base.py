@@ -35,6 +35,7 @@ class RotaryEmbedding(CustomOp):
         is_neox_style: bool = False,
         dtype: Optional[torch.dtype] = torch.float16,
         use_precomputed_cache: Optional[bool] = True,
+        complex_dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -44,6 +45,7 @@ class RotaryEmbedding(CustomOp):
         self.is_neox_style = is_neox_style
         self.dtype = dtype
         self.use_precomputed_cache = use_precomputed_cache
+        self._complex_dtype = complex_dtype
         self._is_full_rotation = rotary_dim == head_size
         self._is_complex_style = not is_neox_style
         self._is_npu_rotary_mul = (
@@ -145,8 +147,12 @@ class RotaryEmbedding(CustomOp):
         )
         if support_complex_style:
             return (
-                _apply_rotary_emb_complex(query, complex_freqs),
-                _apply_rotary_emb_complex(key, complex_freqs),
+                _apply_rotary_emb_complex(
+                    query, complex_freqs, dtype=self._complex_dtype
+                ),
+                _apply_rotary_emb_complex(
+                    key, complex_freqs, dtype=self._complex_dtype
+                ),
             )
 
         is_complex_derivable = (
@@ -164,8 +170,12 @@ class RotaryEmbedding(CustomOp):
                 cos.to(torch.float32), sin.to(torch.float32)
             ).unsqueeze(-2)
             return (
-                _apply_rotary_emb_complex(query, derived_complex_freqs),
-                _apply_rotary_emb_complex(key, derived_complex_freqs),
+                _apply_rotary_emb_complex(
+                    query, derived_complex_freqs, dtype=self._complex_dtype
+                ),
+                _apply_rotary_emb_complex(
+                    key, derived_complex_freqs, dtype=self._complex_dtype
+                ),
             )
 
         if cos is not None and sin is not None:
@@ -357,8 +367,12 @@ class RotaryEmbedding(CustomOp):
                 cos.to(torch.float32), sin.to(torch.float32)
             ).unsqueeze(-2)
             return (
-                _apply_rotary_emb_complex(query, derived_complex_freqs),
-                _apply_rotary_emb_complex(key, derived_complex_freqs),
+                _apply_rotary_emb_complex(
+                    query, derived_complex_freqs, dtype=self._complex_dtype
+                ),
+                _apply_rotary_emb_complex(
+                    key, derived_complex_freqs, dtype=self._complex_dtype
+                ),
             )
 
         if cos is not None and sin is not None:
@@ -427,8 +441,12 @@ class RotaryEmbedding(CustomOp):
 
         if complex_freqs is not None:
             return (
-                _apply_rotary_emb_complex(query, complex_freqs),
-                _apply_rotary_emb_complex(key, complex_freqs),
+                _apply_rotary_emb_complex(
+                    query, complex_freqs, dtype=self._complex_dtype
+                ),
+                _apply_rotary_emb_complex(
+                    key, complex_freqs, dtype=self._complex_dtype
+                ),
             )
 
         if cos_sin_cache is not None:

@@ -135,6 +135,7 @@ class SelfAttention(nn.Module):
             rotary_dim=self.head_dim,
             use_precomputed_cache=False,
             is_neox_style=False,
+            complex_dtype=torch.float64,
         )
 
         self.attn = USPAttention(
