@@ -42,9 +42,6 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
         "overlay_repo_id": "AgainstEntropy/SANA-WM_streaming-overlay",
         "overlay_revision": "62c6840871ecc3559189047513ba0670e1bf62e7",
     },
-    # FastH3 ships a flat native-Diffusers repo without model_index.json; the
-    # overlay materializes it into the base-H3 partition layout
-    # (vae/ -> video_vae/) and declares the t2va-only release contract.
     "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree": {
         "overlay_repo_id": "kevin-mi/FastH3-4step-Preview-overlay",
         "overlay_revision": "f769cb8001dae335089de7b250364335bc7cb183",
