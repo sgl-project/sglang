@@ -21,7 +21,8 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.utils.common import is_cuda, parse_connector_type
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.common import parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +140,7 @@ def handle_dcp_validation(server_args: Any):
             "requires --dcp-size / --decode-context-parallel-size > 1, but "
             f"got dcp_size={cfg.dcp_size}."
         )
-    if cfg.dcp_comm_backend == "fi_a2a" and not is_cuda():
+    if cfg.dcp_comm_backend == "fi_a2a" and not get_platform().is_cuda:
         raise ValueError(
             "--dcp-comm-backend fi_a2a delegates the exchange to FlashInfer's "
             "MNNVL All-to-All kernel, which requires an NVIDIA CUDA platform "

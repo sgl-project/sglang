@@ -30,7 +30,11 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
-from sglang.srt.runtime_context import get_exec, get_flags
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_parallel,
+)
 from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
@@ -1077,7 +1081,6 @@ def pre_permute_flashinfer_to_deep_gemm(
     """Feed one-sided A2A output into DeepGEMM with fused expert remapping."""
 
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
-    from sglang.srt.runtime_context import get_parallel
 
     if dispatch_output.hidden_states.dtype != torch.bfloat16:
         raise TypeError(
