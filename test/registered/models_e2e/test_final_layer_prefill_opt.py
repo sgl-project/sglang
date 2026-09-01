@@ -1,3 +1,7 @@
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, stage="base-a", runner_config="1-gpu-small")
+
 import unittest
 
 from sglang.benchmark.one_batch import (
@@ -6,9 +10,10 @@ from sglang.benchmark.one_batch import (
     ServerArgs,
     correctness_test,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestFinalLayerPrefillOptimization(unittest.TestCase):
+class TestFinalLayerPrefillOptimization(CustomTestCase):
     def test_correctness_and_logit_parity(self):
         """Verify exact token match and logit parity on LLaMA architecture."""
         server_args = ServerArgs(
@@ -30,3 +35,4 @@ class TestFinalLayerPrefillOptimization(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
