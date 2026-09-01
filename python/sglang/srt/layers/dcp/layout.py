@@ -68,7 +68,6 @@ def filter_dcp_local_chunk_kv_indices(
         first = (parallel.dcp_rank - start) % dcp_size
         parts.append(kv_indices[offset + first : offset + length : dcp_size])
         offset += length
-    # WIDENED out; see filter_dcp_local_kv_indices.
     return torch.cat(parts)
 
 

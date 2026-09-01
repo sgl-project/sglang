@@ -67,8 +67,6 @@ def create_triton_kv_indices_for_dcp_triton(
             req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + abs_pos,
             mask=mask,
         )
-        # COLLAPSED ids out, unlike update_kv_lens_and_indices below: this
-        # consumer has no host-side shard length to bound a later translate.
         tl.store(
             kv_indices_ptr + kv_indices_offset + offset, data // dcp_size, mask=mask
         )
@@ -176,8 +174,6 @@ def update_kv_lens_and_indices(
     local_kv_indices_offsets = local_kv_indices_start + offsets
 
     kv_values = tl.load(kv_indices + kv_indice_offsets, mask=mask)
-    # WIDENED ids out; the caller collapses via translate_dcp_read_ids.
-    # Contrast create_triton_kv_indices_for_dcp_triton above.
     tl.store(local_kv_indices + local_kv_indices_offsets, kv_values, mask=mask)
 
 

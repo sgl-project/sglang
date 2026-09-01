@@ -930,8 +930,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 ENTRY_PAGE_SIZE=kv_view.entry_page_size,
             )
 
-            # Under DCP the table above is deliberately VIRTUAL: the planner
-            # selects this rank's share and compacts it to the front.
+            # The table above is deliberately VIRTUAL under DCP.
             n_kernel_ids = paged_kernel_lens_sum
             if get_parallel().dcp_enabled:
                 n_kernel_ids = plan_dcp_decode_metadata(

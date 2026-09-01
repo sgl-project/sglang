@@ -1555,8 +1555,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         v_moved = self.physical_to_virtual[src_pages].clone()  # read pre-wipe
 
-        # Expand to PHYSICAL token granularity, as the lazy `_flush` path does:
-        # these are physical page ids, and `page_size` is dcp_size times larger.
+        # Expand to PHYSICAL token granularity (the move kernel is
+        # token-granular over pool rows).
         if self.pool_page_size == 1:
             src_t, dst_t = src_pages, dst_pages
         else:
