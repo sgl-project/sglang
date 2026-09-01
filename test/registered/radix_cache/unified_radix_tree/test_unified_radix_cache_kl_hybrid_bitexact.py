@@ -70,9 +70,10 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
     terminate_and_kill_process_tree,
+    unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=1150, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=2300, stage="base-b", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
@@ -149,6 +150,8 @@ class TestUnifiedHybridBitExact(CustomTestCase):
     decode-region state reuse in general rather than that regression.
     """
 
+    tree_core_backend = "python"
+
     @classmethod
     def setUpClass(cls):
         cls.model = _MODEL_PATH
@@ -168,7 +171,7 @@ class TestUnifiedHybridBitExact(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
 
     @classmethod
@@ -226,7 +229,7 @@ class TestUnifiedHybridLazyBitExact(TestUnifiedHybridBitExact):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
 
 
@@ -242,6 +245,8 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     Runs the multi-turn branching harness because the single-turn helpers above
     cannot produce a non-aligned hit length, which this regression needs.
     """
+
+    tree_core_backend = "python"
 
     @classmethod
     def setUpClass(cls):
@@ -277,7 +282,7 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
         cls.input_ids = get_input_ids(
             tokenizer_path=cls.model, num_samples=9, trust_remote_code=True
@@ -333,6 +338,8 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
     environment override; a regression there surfaces here as a nonzero KL.
     """
 
+    tree_core_backend = "python"
+
     @classmethod
     def setUpClass(cls):
         cls.model = _MODEL_PATH
@@ -360,10 +367,7 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={
-                **os.environ,
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
-            },
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
 
     @classmethod
@@ -394,6 +398,22 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
 
     def test_decode_cache_hit(self):
         self._run(assert_decode_cache_hit)
+
+
+class TestRustUnifiedHybridBitExact(TestUnifiedHybridBitExact):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedHybridLazyBitExact(TestUnifiedHybridLazyBitExact):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedHybridHiCacheBitExact(TestUnifiedHybridHiCacheBitExact):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedHybridMTPBitExact(TestUnifiedHybridMTPBitExact):
+    tree_core_backend = "rust"
 
 
 if __name__ == "__main__":

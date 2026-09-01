@@ -1,6 +1,6 @@
 """Flatten ragged (nested, variable-length) structures into flat value buffers
 plus per-position length vectors — the columnar wire layout used by the embedded
-Rust server's egress path (see ``managers/rust_server.py``).
+Rust server's egress path (see ``rust_server/server.py``).
 
 The ``*Columns`` classes accumulate one batch column-family each: feed them one
 request cell at a time (``accept``), then read the header contribution (length

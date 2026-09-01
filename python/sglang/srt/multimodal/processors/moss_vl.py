@@ -582,14 +582,7 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             if mm_items and vision_token_info:
                 mm_items[0].set("vision_token_info", vision_token_info[0])
 
-            if self.use_cuda_ipc:
-                for item in mm_items:
-                    if isinstance(item.feature, torch.Tensor):
-                        item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
-                    if isinstance(item.precomputed_embeddings, torch.Tensor):
-                        item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
-                            item.precomputed_embeddings
-                        )
+            mm_items = self._prepare_mm_items_for_transport(mm_items)
 
             return MultimodalProcessorOutput(
                 input_ids=input_ids.tolist(),
