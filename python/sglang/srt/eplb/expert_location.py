@@ -25,17 +25,25 @@ import torch
 import torch.distributed
 import torch.nn.functional as F
 
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_parallel,
+    get_resources,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
 
-def _prefer_same_node_experts(server_args: ServerArgs) -> bool:
+def _prefer_same_node_experts() -> bool:
     from sglang.srt.elastic_ep.elastic_ep import elastic_expanded_world_enabled
 
-    return server_args.ep_join_mode != "scale" and not elastic_expanded_world_enabled()
+    return (
+        get_exec().moe.ep_join_mode != "scale" and not elastic_expanded_world_enabled()
+    )
 
 
 def _compute_elastic_expert_layout(
@@ -97,11 +105,9 @@ class ExpertLocationMetadata:
     # -------------------------------- construction ------------------------------------
 
     @staticmethod
-    def init_trivial(
-        server_args: ServerArgs, model_config: ModelConfig, moe_ep_rank: int
-    ):
+    def init_trivial(model_config: ModelConfig, moe_ep_rank: int):
         """Trivial location - logical expert i corresponds to physical expert i"""
-        common = ExpertLocationMetadata._init_common(server_args, model_config)
+        common = ExpertLocationMetadata._init_common(model_config)
 
         if common is None:
             return None
@@ -123,7 +129,6 @@ class ExpertLocationMetadata:
         )
 
         return ExpertLocationMetadata.init_by_mapping(
-            server_args,
             model_config,
             physical_to_logical_map=physical_to_logical_map,
             moe_ep_rank=moe_ep_rank,
@@ -131,16 +136,15 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def init_by_mapping(
-        server_args: ServerArgs,
         model_config: ModelConfig,
         physical_to_logical_map,
         moe_ep_rank: int = None,
     ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
-        physical_to_logical_map = physical_to_logical_map.to(server_args.device)
+        physical_to_logical_map = physical_to_logical_map.to(get_device().device)
 
-        common = ExpertLocationMetadata._init_common(server_args, model_config)
+        common = ExpertLocationMetadata._init_common(model_config)
 
         if common is None:
             return None
@@ -156,7 +160,6 @@ class ExpertLocationMetadata:
                 )
             assert physical_to_logical_map.shape[-1] == common["num_physical_experts"]
         logical_to_all_physical_map = _compute_logical_to_all_physical_map(
-            server_args=server_args,
             physical_to_logical_map=physical_to_logical_map,
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
             ep_size=common["ep_size"],
@@ -164,7 +167,6 @@ class ExpertLocationMetadata:
         )
 
         return ExpertLocationMetadata._init_raw(
-            server_args=server_args,
             ep_size=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
@@ -173,15 +175,18 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def init_by_eplb(
-        server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor
+        model_config: ModelConfig,
+        logical_count: torch.Tensor,
+        *,
+        use_flat_topology: bool = False,
     ):
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
         if len(logical_count.shape) == 2:
             logical_count = logical_count.unsqueeze(0)
-        logical_count = logical_count.to(server_args.device)
+        logical_count = logical_count.to(get_device().device)
 
-        common = ExpertLocationMetadata._init_common(server_args, model_config)
+        common = ExpertLocationMetadata._init_common(model_config)
 
         if common is None:
             return None
@@ -189,7 +194,7 @@ class ExpertLocationMetadata:
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_physical_experts = common["num_physical_experts"]
         num_groups = model_config_for_expert_location.num_groups
-        num_nodes = server_args.nnodes
+        num_nodes = 1 if use_flat_topology else get_parallel().nnodes
 
         from sglang.srt.eplb import eplb_algorithms
 
@@ -201,7 +206,7 @@ class ExpertLocationMetadata:
                 num_groups=num_groups,
                 num_nodes=num_nodes,
                 algorithm=eplb_algorithms.compute_algorithm(
-                    raw_algorithm=server_args.eplb_algorithm,
+                    raw_algorithm=get_exec().moe.eplb_algorithm,
                     num_groups=num_groups,
                     num_nodes=num_nodes,
                 ),
@@ -209,16 +214,16 @@ class ExpertLocationMetadata:
         )
 
         return ExpertLocationMetadata._init_raw(
-            server_args=server_args,
             ep_size=common["ep_size"],
-            physical_to_logical_map=physical_to_logical_map.to(server_args.device),
+            physical_to_logical_map=physical_to_logical_map.to(get_device().device),
             logical_to_all_physical_map=logical_to_all_physical_map.to(
-                server_args.device
+                get_device().device
             ),
         )
 
     @staticmethod
-    def _init_common(server_args: ServerArgs, model_config: ModelConfig):
+    def _init_common(model_config: ModelConfig):
+
         model_config_for_expert_location = (
             ModelConfigForExpertLocation.from_model_config(model_config)
         )
@@ -228,16 +233,17 @@ class ExpertLocationMetadata:
 
         base_num_physical_experts = (
             model_config_for_expert_location.num_logical_experts
-            + server_args.ep_num_redundant_experts
+            + get_exec().moe.ep_num_redundant_experts
         )
-        ep_size = server_args.ep_size
+        # elastic-EP scale-up rewrites ep_size on the published config
+        ep_size = get_parallel().ep_size
         num_physical_experts = base_num_physical_experts
-        initial_ep_size = server_args.elastic_ep_initial_size
+        initial_ep_size = get_parallel().elastic_ep_initial_size
         if initial_ep_size is not None:
-            if server_args.ep_join_mode == "scale":
+            if get_exec().moe.ep_join_mode == "scale":
                 ep_size = max(
                     ep_size,
-                    server_args.ep_join_rank_offset + server_args.tp_size,
+                    get_parallel().ep_join_rank_offset + get_parallel().tp_size,
                 )
             num_physical_experts, num_local_physical_experts = (
                 _compute_elastic_expert_layout(
@@ -260,12 +266,12 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def _init_raw(
-        server_args: ServerArgs,
         ep_size: int,
         physical_to_logical_map: torch.Tensor,
         logical_to_all_physical_map: torch.Tensor,
         moe_ep_rank: Optional[int] = None,
     ):
+
         _, num_physical_experts = physical_to_logical_map.shape
 
         logical_to_all_physical_map_padded = F.pad(
@@ -287,7 +293,6 @@ class ExpertLocationMetadata:
             ep_size=ep_size,
             logical_to_rank_dispatch_physical_map=(
                 compute_logical_to_rank_dispatch_physical_map(
-                    server_args=server_args,
                     logical_to_all_physical_map=logical_to_all_physical_map,
                     ep_size=ep_size,
                     num_physical_experts=num_physical_experts,
@@ -297,7 +302,7 @@ class ExpertLocationMetadata:
                         else torch.distributed.get_rank() % ep_size
                     ),
                 )
-                if server_args.ep_dispatch_algorithm == "static"
+                if get_exec().moe.ep_dispatch_algorithm == "static"
                 else None
             ),
         )
@@ -473,13 +478,11 @@ def _normalize_layer_ids(
 
 
 def get_global_expert_location_metadata():
-    from sglang.srt.runtime_context import get_resources
 
     return get_resources().expert_location_metadata
 
 
 def set_global_expert_location_metadata(value, allow_overwrite=False):
-    from sglang.srt.runtime_context import get_resources
 
     resources = get_resources()
     if not allow_overwrite:
@@ -511,9 +514,6 @@ def broadcast_global_expert_location_metadata(
     src_rank: int = 0,
     group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> ExpertLocationMetadata:
-    from sglang.srt.runtime_context import get_server_args
-
-    server_args = get_server_args()
     metadata = get_global_expert_location_metadata()
     assert metadata is not None
 
@@ -522,7 +522,6 @@ def broadcast_global_expert_location_metadata(
         metadata.physical_to_logical_map, src=src_rank, group=group
     )
     metadata = ExpertLocationMetadata.init_by_mapping(
-        server_args,
         model_config,
         metadata.physical_to_logical_map,
         moe_ep_rank=moe_ep_rank,
@@ -532,12 +531,12 @@ def broadcast_global_expert_location_metadata(
 
 
 def _compute_logical_to_all_physical_map(
-    server_args: ServerArgs,
     physical_to_logical_map: torch.Tensor,
     num_logical_experts: int,
     ep_size: int,
     moe_ep_rank: int,
 ):
+
     # This is rarely called, so we use for loops for maximum clarity
 
     num_layers, num_physical_experts = physical_to_logical_map.shape
@@ -556,12 +555,17 @@ def _compute_logical_to_all_physical_map(
                 physical_expert_id
             )
 
-    # Replace by the physical expert on local GPU or node if possible
-    if moe_ep_rank is not None:
+    # Replace by the physical expert on local GPU or node if possible. Skipped
+    # without an a2a backend, where all EP ranks must agree on the pick: this
+    # collapse is per-rank, and the full candidate list is what lets the dispatch
+    # spread a hot expert over its replicas. See ExpertLocationDispatchInfo.
+    if moe_ep_rank is not None and get_exec().moe.moe_a2a_backend != "none":
         num_local_gpu_physical_experts = num_physical_experts // ep_size
-        prefer_same_node = _prefer_same_node_experts(server_args)
+        prefer_same_node = _prefer_same_node_experts()
         num_gpus_per_node = (
-            server_args.ep_size // server_args.nnodes if prefer_same_node else None
+            get_parallel().ep_size // get_parallel().nnodes
+            if prefer_same_node
+            else None
         )
         num_local_node_physical_experts = (
             num_local_gpu_physical_experts * num_gpus_per_node
@@ -607,22 +611,22 @@ def _pad_nested_array(arr, pad_value):
 
 # TODO optimize performance (rewrite and/or run in separate process with overlap)
 def compute_logical_to_rank_dispatch_physical_map(
-    server_args: ServerArgs,
     logical_to_all_physical_map: torch.Tensor,
     ep_size: int,
     num_physical_experts: int,
     ep_rank: int,
     seed: int = 42,
 ):
+
     r = random.Random(seed)
 
     device = logical_to_all_physical_map.device
     logical_to_all_physical_map = logical_to_all_physical_map.cpu()
 
     num_local_gpu_physical_experts = num_physical_experts // ep_size
-    prefer_same_node = _prefer_same_node_experts(server_args)
+    prefer_same_node = _prefer_same_node_experts()
     num_gpus_per_node = (
-        server_args.ep_size // server_args.nnodes if prefer_same_node else None
+        get_parallel().ep_size // get_parallel().nnodes if prefer_same_node else None
     )
     num_local_node_physical_experts = (
         num_local_gpu_physical_experts * num_gpus_per_node
@@ -761,15 +765,12 @@ class ModelConfigForExpertLocation:
 
 
 def compute_initial_expert_location_metadata(
-    server_args: ServerArgs,
     model_config: ModelConfig,
     moe_ep_rank: int,
 ) -> Optional[ExpertLocationMetadata]:
-    data = server_args.init_expert_location
+    data = get_exec().moe.init_expert_location
     if data == "trivial":
-        return ExpertLocationMetadata.init_trivial(
-            server_args, model_config, moe_ep_rank
-        )
+        return ExpertLocationMetadata.init_trivial(model_config, moe_ep_rank)
 
     # TODO unify with the utils function
     if data.endswith(".pt"):
@@ -784,7 +785,6 @@ def compute_initial_expert_location_metadata(
             "init_expert_location from init_by_mapping using ServerArgs.init_expert_location"
         )
         return ExpertLocationMetadata.init_by_mapping(
-            server_args,
             model_config,
             **data_dict,
             moe_ep_rank=moe_ep_rank,
@@ -794,7 +794,7 @@ def compute_initial_expert_location_metadata(
             "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
         )
         return ExpertLocationMetadata.init_by_eplb(
-            server_args, model_config, logical_count=data_dict["logical_count"]
+            model_config, logical_count=data_dict["logical_count"]
         )
     else:
         raise NotImplementedError(

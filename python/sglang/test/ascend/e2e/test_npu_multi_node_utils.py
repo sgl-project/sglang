@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import signal
 import socket
 import subprocess
 import threading
@@ -426,7 +427,12 @@ def check_role(allowed_roles: Union[str, Iterable[str]]):
 def launch_pd_mix_node(model_config):
     logger.info(f"Launch pd mix node start ......")
     host_name = get_host_name()
-    pod_index = int(host_name.rsplit("-", 1)[-1])
+    last_part = host_name.rsplit("-", 1)[-1]
+    if not last_part.isdigit():
+        raise RuntimeError(
+            f"Unexpected hostname format, expected numeric suffix: {host_name}"
+        )
+    pod_index = int(last_part)
 
     # Monitor ConfigMap to generate dist-init-addr and node-rank
     is_ready = False
@@ -497,7 +503,12 @@ def launch_pd_mix_node(model_config):
 def launch_pd_separation_node(model_config):
     logger.info(f"Launch pd separation node start ......")
     host_name = get_host_name()
-    pod_index = int(host_name.rsplit("-", 1)[-1])
+    last_part = host_name.rsplit("-", 1)[-1]
+    if not last_part.isdigit():
+        raise RuntimeError(
+            f"Unexpected hostname format, expected numeric suffix: {host_name}"
+        )
+    pod_index = int(last_part)
     role = "prefill" if "prefill" in host_name else "decode"
 
     bootstrap_init_port = BOOTSTRAP_INIT_PORT
@@ -717,7 +728,14 @@ def launch_router(model_config):
         node_ip_list.clear()
 
         for pod_name, pod_ip in configmap.data.items():
-            pod_index = int(pod_name.rsplit("-", 1)[-1])
+            # Skip unexpected entries that don't end with a numeric index
+            last_part = pod_name.rsplit("-", 1)[-1]
+            if not last_part.isdigit():
+                logger.info(
+                    "Skipping ConfigMap entry with non-numeric suffix: %s", pod_name
+                )
+                continue
+            pod_index = int(last_part)
 
             if "prefill" in pod_name:
                 if is_multi_node_prefill_instance:
@@ -1062,3 +1080,22 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
             expect_accuracy,
             f'Accuracy is {str(metrics["accuracy"])}, is lower than {expect_accuracy}',
         )
+
+
+def kill_process_group(process):
+    """SIGKILL the whole process group led by ``process.pid`` (== pgid).
+
+    ``process`` is a ``subprocess.Popen`` launched with ``start_new_session=True``,
+    so its pid equals the process-group id. A ``None`` process is ignored.
+    """
+    if process is None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+        logger.info(f"killed process group pgid={process.pid}")
+    except ProcessLookupError:
+        logger.info(f"process group pgid={process.pid} already gone")
+    except PermissionError:
+        logger.warning(f"no permission to kill process group pgid={process.pid}")
+    except OSError as e:
+        logger.warning(f"failed to kill process group pgid={process.pid}: {e}")

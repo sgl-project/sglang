@@ -28,15 +28,20 @@ import torch
 
 from sglang.kernels.ops.attention import flash_mla_sm120 as fmod
 from sglang.kernels.ops.attention.flash_mla_sm120 import (
+    _BYTES_PER_DST_PAGE,
+    _BYTES_PER_DST_PAGE_PADDED,
     _D,
     _NOPE_DIM,
     _NOPE_ROPE_STRIDE,
     _NUM_TILES,
+    _PBS_DST,
+    _PBS_SRC,
     _ROPE_DIM,
     _SCALE_STRIDE,
     _TILE_SIZE,
     _gather_and_dequant,
     _sm120_sparse_decode_fwd,
+    _split_kv_pages_to_64,
     flash_mla_with_kvcache_sm120,
 )
 from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
@@ -44,6 +49,7 @@ from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
     _merge_partial_attn,
     flash_mla_sparse_decode_triton,
 )
+from sglang.srt.runtime_context import get_resources
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -496,6 +502,130 @@ class TestEntryPointDispatch(CustomTestCase):
             out_triton.to(torch.float32),
             atol=5e-2,
             rtol=5e-2,
+        )
+
+
+@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
+class TestTouchedPageSplit(CustomTestCase):
+    """The pbs=256 -> pbs=64 split must rewrite only referenced source pages.
+
+    The destination buffer is persistent across decode steps, so the masked
+    split is only correct if it (a) copies every byte of the data and scale
+    regions of a marked page's sub-pages and (b) leaves everything else alone
+    -- the per-sub-page alignment tail and all sub-pages of an unmarked source
+    page. A widened copy or a dropped mask check violates the persistent-buffer
+    contract, which checking only the copied regions would not catch.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA required")
+        cls.device = torch.device("cuda")
+
+    def test_only_marked_pages_are_split(self):
+        num_pages = 3
+        ratio = _PBS_SRC // _PBS_DST
+        sentinel = 0xA5
+
+        k_cache, _ = _build_kvcache(num_pages, _PBS_SRC, device=self.device, seed=17)
+        # Production takes the raw 2D byte view of the (N, pbs, 1, bpt) cache.
+        src_stride0 = k_cache.stride(0)
+        src_2d = torch.as_strided(
+            k_cache.view(torch.uint8), (num_pages, src_stride0), (src_stride0, 1)
+        )
+
+        # Seed the exact persistent buffers production reuses, so the sentinel
+        # bytes below are the ones the kernel writes into.
+        dev = k_cache.device
+        buffers = get_resources().buffers
+        split_key = f"flash_mla_sm120_split:{dev}"
+        mask_key = f"flash_mla_sm120_mask:{dev}"
+        missing = object()
+        for key in (split_key, mask_key):
+            old = buffers.get(key, missing)
+
+            def _restore(key=key, old=old):
+                if old is missing:
+                    buffers.pop(key, None)
+                else:
+                    buffers[key] = old
+
+            self.addCleanup(_restore)
+
+        dst = torch.full(
+            (num_pages * ratio, _BYTES_PER_DST_PAGE_PADDED),
+            sentinel,
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        buffers[split_key] = dst
+        # The mask is deliberately not preseeded: production allocates it on the
+        # first call, which happens during inference-mode autotune.
+
+        # Two tokens in source page 0, one in page 2, one invalid; page 1 idle.
+        token_ids = torch.tensor(
+            [0, 5, 2 * _PBS_SRC + 3, -1], dtype=torch.int32, device=self.device
+        )
+
+        # Autotune-like first call: allocates the persistent mask under
+        # inference mode. It must still be a normal tensor, or the later
+        # zero_() (CUDA graph capture, outside inference mode) would fail.
+        with torch.inference_mode():
+            _split_kv_pages_to_64(
+                k_cache.view(torch.uint8), _PBS_SRC, touched_indices=token_ids
+            )
+        torch.cuda.synchronize()
+        self.assertFalse(
+            buffers[mask_key].is_inference(),
+            "persistent mask must not be an inference tensor",
+        )
+
+        # Restore the pre-step state: sentinel destination and nonzero mask
+        # storage that the call must zero before marking.
+        dst.fill_(sentinel)
+        buffers[mask_key].fill_(-7)
+
+        out_pages = _split_kv_pages_to_64(
+            k_cache.view(torch.uint8), _PBS_SRC, touched_indices=token_ids
+        )
+        torch.cuda.synchronize()
+
+        self.assertEqual(
+            out_pages.shape, (num_pages * ratio, _PBS_DST, 1, _BYTES_PER_TOKEN)
+        )
+        self.assertEqual(buffers[mask_key].tolist(), [1, 0, 1])
+
+        data_per_sub = _PBS_DST * _NOPE_ROPE_STRIDE
+        scale_per_sub = _PBS_DST * _SCALE_STRIDE
+        src_scale_off = _PBS_SRC * _NOPE_ROPE_STRIDE
+        for page in (0, 2):
+            for sub in range(ratio):
+                dst_page = page * ratio + sub
+                out = dst[dst_page]
+                torch.testing.assert_close(
+                    out[:data_per_sub],
+                    src_2d[page, sub * data_per_sub : (sub + 1) * data_per_sub],
+                    atol=0,
+                    rtol=0,
+                    msg=f"data region mismatch for dst page {dst_page}",
+                )
+                scale_off = src_scale_off + sub * scale_per_sub
+                torch.testing.assert_close(
+                    out[data_per_sub:_BYTES_PER_DST_PAGE],
+                    src_2d[page, scale_off : scale_off + scale_per_sub],
+                    atol=0,
+                    rtol=0,
+                    msg=f"scale region mismatch for dst page {dst_page}",
+                )
+                self.assertTrue(
+                    bool((out[_BYTES_PER_DST_PAGE:] == sentinel).all()),
+                    f"alignment padding of dst page {dst_page} was overwritten",
+                )
+
+        self.assertTrue(
+            bool((dst[ratio : 2 * ratio] == sentinel).all()),
+            "sub-pages of untouched source page 1 were rewritten",
         )
 
 

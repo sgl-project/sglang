@@ -22,9 +22,7 @@ from diffusers.models.embeddings import (
     get_timestep_embedding as timestep_embedding_diffusers,
 )
 
-from sglang.kernels.ops.diffusion.timestep_embedding import (
-    timestep_embedding as timestep_embedding_cuda,
-)
+from sglang.kernels.ops.diffusion import timestep_embedding as timestep_embedding_cuda
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP

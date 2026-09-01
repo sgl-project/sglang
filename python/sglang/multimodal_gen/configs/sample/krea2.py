@@ -19,11 +19,3 @@ class Krea2SamplingParams(SamplingParams):
     width: int = 1024
     guidance_scale: float = 1.0
     num_inference_steps: int = 8
-
-
-@dataclass
-class Krea2RawSamplingParams(Krea2SamplingParams):
-    """Base `oss_raw` defaults: full sampler with CFG."""
-
-    guidance_scale: float = 4.5
-    num_inference_steps: int = 52

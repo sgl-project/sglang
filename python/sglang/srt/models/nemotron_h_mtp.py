@@ -38,7 +38,7 @@ from sglang.srt.models.nemotron_h import (
     NemotronHMoEDecoderLayer,
 )
 from sglang.srt.models.nemotron_h_utils import is_attn_layer
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 
@@ -288,13 +288,14 @@ class NemotronHMultiTokenPredictor(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings(input_ids)
 
+        hidden_states = forward_batch.spec_info.hidden_states
         residual = None
 
         for i in range(self.pattern_len):
@@ -338,7 +339,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
             self.config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
 
         self.logits_processor = LogitsProcessor(config)
@@ -352,11 +353,9 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         input_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = forward_batch.spec_info.hidden_states
-
         hidden_states = self.model(
             input_ids,
-            hidden_states,
+            positions,
             forward_batch,
             input_embeds,
         )

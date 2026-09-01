@@ -856,6 +856,62 @@ def test_launch_server_process_and_cleanup(monkeypatch):
     assert (p1.pid, _sig.SIGTERM) in calls and (p2.pid, _sig.SIGTERM) in calls
     assert (p2.pid, _sig.SIGKILL) in calls
 
+
+def test_launch_server_process_declares_on_a_resolved_record(monkeypatch):
+    """A record that carries its resolution takes the declaration channel.
+
+    The stub above has no `replace_resolved`, so it exercises the older wheels'
+    path. A current `ServerArgs` refuses plain assignment once resolution has
+    finished; the per-worker values reach the child as a declaration on a copy,
+    and the parent keeps what the operator passed.
+    """
+    _install_sglang_stubs(monkeypatch)
+    import importlib
+
+    ls = importlib.import_module("sglang_router.launch_server")
+
+    created = {}
+
+    class FakeProcess:
+        def __init__(self, target, args):
+            created["target"] = target
+            created["args"] = args
+            self.pid = 4243
+
+        def start(self):
+            created["started"] = True
+
+    monkeypatch.setattr(ls.mp, "Process", FakeProcess)
+
+    calls = []
+
+    class ResolvedServerArgs:
+        def __init__(self, **fields):
+            self.port = fields.get("port", 30000)
+            self.base_gpu_id = fields.get("base_gpu_id", 0)
+            self.dp_size = fields.get("dp_size", 4)
+            self.tp_size = fields.get("tp_size", 2)
+
+        def replace_resolved(self, source, **changes):
+            calls.append((source, dict(changes)))
+            fields = dict(vars(self))
+            fields.update(changes)
+            return ResolvedServerArgs(**fields)
+
+    parent = ResolvedServerArgs()
+    proc = ls.launch_server_process(parent, worker_port=31002, dp_id=3)
+
+    assert created.get("started") is True
+    assert proc.pid == 4243
+    assert len(calls) == 1
+    source, changes = calls[0]
+    assert source == "sglang_router.launch_server_process"
+    assert changes == {"port": 31002, "base_gpu_id": 6, "dp_size": 1}
+
+    worker = created["args"][0]
+    assert (worker.port, worker.base_gpu_id, worker.dp_size) == (31002, 6, 1)
+    assert (parent.port, parent.base_gpu_id, parent.dp_size) == (30000, 0, 4)
+
     def test_validation_error_handling(self):
         """Test error handling when validation fails."""
         args = RouterArgs(

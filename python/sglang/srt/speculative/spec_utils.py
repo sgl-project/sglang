@@ -35,6 +35,8 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
+    get_self_pp_group,
+    patch_pipeline_parallel_group,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
@@ -46,7 +48,13 @@ from sglang.srt.mem_cache.allocation import (
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    get_spec,
+    mamba_extra_buffer_enabled,
+    mamba_extra_buffer_lazy_enabled,
+    mamba_track_grid,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -72,7 +80,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.server_args import ServerArgs
 
 
 if _is_cuda:
@@ -92,7 +99,6 @@ logger = logging.getLogger(__name__)
 def resolve_num_tokens_per_req(
     *,
     phase: Literal["draft_decode", "draft_extend", "target_verify"],
-    server_args: ServerArgs,
     spec_algorithm=None,
     is_draft_worker: bool = False,
     num_draft_tokens: Optional[int] = None,
@@ -101,14 +107,19 @@ def resolve_num_tokens_per_req(
     width (sizes capture shapes / buffers); the per-forward dynamic width
     lives on ``SpecInput.num_tokens_per_req``. Draft phases are
     EAGLE-family-only; "target_verify" is algorithm-generic via the hook.
+
+    The widths come from the bags: adaptive spec captures each candidate step
+    config with that config's leaves overridden, so the buffers being sized
+    must follow the override rather than the startup values.
     """
+    spec = get_spec()
     if phase == "draft_decode":
-        return server_args.speculative_eagle_topk
+        return spec.speculative_eagle_topk
     if phase == "draft_extend":
-        return server_args.speculative_num_draft_tokens
+        return spec.speculative_num_draft_tokens
     if phase == "target_verify":
         if num_draft_tokens is None:
-            num_draft_tokens = server_args.speculative_num_draft_tokens
+            num_draft_tokens = spec.speculative_num_draft_tokens
         return spec_algorithm.get_num_tokens_per_req_for_target_verify(
             num_draft_tokens, is_draft_worker
         )
@@ -250,16 +261,14 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
     record_stream_each(candidates, fwd_stream)
 
 
-def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
-    if server_args is None:
-        server_args = get_server_args()
-
+def spec_need_hidden_states() -> bool:
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
     # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through FutureMap.
     # TODO(lsyin): also skip when step == 1.
-    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
+    spec = get_spec()
+    if spec.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
         return False
-    return not server_args.enable_multi_layer_eagle
+    return not spec.enable_multi_layer_eagle
 
 
 @torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
@@ -348,7 +357,7 @@ def select_top_k_tokens(
     )
 
 
-def _sample_simulated_acc_len(
+def sample_simulated_acc_len(
     simulate_acc_len: float,
     simulate_acc_method: str,
     max_len: int,
@@ -401,7 +410,7 @@ def generate_simulated_accept_index(
     use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
 
     assert simulate_acc_len > 0.0
-    simulate_acc_len = _sample_simulated_acc_len(
+    simulate_acc_len = sample_simulated_acc_len(
         simulate_acc_len, simulate_acc_method, spec_steps + 1
     )
 
@@ -670,6 +679,14 @@ def load_token_map(token_map_path: str) -> List[int]:
 
 
 @contextmanager
+def draft_pp_context():
+    # The draft model is one layer and never spans pipeline stages; give it a
+    # single-member pp group so it initializes as if pp were off.
+    with patch_pipeline_parallel_group(get_self_pp_group()):
+        yield
+
+
+@contextmanager
 def draft_tp_context(tp_group: GroupCoordinator):
     # Draft model doesn't use dp and has its own tp group.
     # We disable mscclpp now because it doesn't support 2 comm groups.
@@ -761,11 +778,10 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs
     inside forward isolation, so it must not mutate req/pool state.
     """
-    server_args = get_server_args()
-    if not server_args.enable_mamba_extra_buffer():
+    if not mamba_extra_buffer_enabled():
         return
     track_positions = None
-    if server_args.enable_mamba_extra_buffer_lazy():
+    if mamba_extra_buffer_lazy_enabled():
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
         assert track_positions is not None and len(track_positions) == len(
             batch.reqs
@@ -776,6 +792,51 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     set_mamba_track_indices_from_reqs(batch, track_positions)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
+
+
+def _verify_commit_step_indices(
+    *,
+    batch: ScheduleBatch,
+    accept_index: torch.Tensor,
+    accept_lens: torch.Tensor,
+    draft_token_num: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Step indices for a post-verify state commit: per req, the tree step of
+    the last accepted node (reduces to accept_lens - 1 for topk == 1), and the
+    mamba-track interval-crossing step (-1 = no crossing; None when tracking
+    is off)."""
+    bs = accept_lens.shape[0]
+    accept_indices_offset = torch.arange(
+        0,
+        bs * draft_token_num,
+        step=draft_token_num,
+        dtype=accept_lens.dtype,
+        device=accept_lens.device,
+    )
+    req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+    last_correct_step_indices = (
+        accept_index[req_idx, (accept_lens - 1).to(torch.int64)] - accept_indices_offset
+    )
+    if batch.mamba_track_indices is None:
+        return last_correct_step_indices, None
+    seq_lens_pre_verify = batch.seq_lens
+    seq_lens_post_verify = batch.seq_lens + accept_lens
+    mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
+    to_track_mask = (
+        seq_lens_pre_verify // mamba_track_interval
+        != seq_lens_post_verify // mamba_track_interval
+    )
+    tracking_point = seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+    to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0).to(
+        torch.int64
+    )
+    candidate_track_steps = accept_index[req_idx, to_track_ith] - accept_indices_offset
+    mamba_steps_to_track = torch.where(
+        to_track_mask,
+        candidate_track_steps,
+        torch.full_like(candidate_track_steps, -1),
+    )
+    return last_correct_step_indices, mamba_steps_to_track
 
 
 def commit_mamba_states_after_verify(
@@ -810,6 +871,40 @@ def commit_mamba_states_after_verify(
     # ring is allocated only then; KDA never allocates the cursors.
     req_pool = model_runner.req_to_token_pool
     mamba_pool = getattr(req_pool, "mamba_pool", None)
+
+    # Fold-every-commit: replay the accepted prefix from the ring into
+    # `temporal`; the same fold stores the interval-crossing state to the
+    # track slot, so no SSM scatter or force-flush is needed here.
+    if (
+        mamba_pool is not None
+        and getattr(mamba_pool, "replayssm_spec_fold", False)
+        and not getattr(mamba_pool, "replayssm_is_kda", False)
+    ):
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+            commit_gdn_replayssm_fold_after_verify,
+        )
+
+        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
+            batch=batch,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+            draft_token_num=draft_token_num,
+        )
+        commit_gdn_replayssm_fold_after_verify(
+            spec_state=spec_state,
+            state_batch_indices=state_batch_indices,
+            accept_lens=accept_lens,
+            last_correct_step_indices=last_correct_step_indices,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=-1,
+        )
+        return
+
     if (
         mamba_pool is not None
         and getattr(mamba_pool, "replayssm_cache_base", None) is not None
@@ -841,17 +936,11 @@ def commit_mamba_states_after_verify(
         )
         # Roll back / commit the conv state to the last accepted draft step
         # (same logic as the recurrent commit, but conv-only).
-        accept_indices_offset = torch.arange(
-            0,
-            bs * draft_token_num,
-            step=draft_token_num,
-            dtype=accept_lens.dtype,
-            device=accept_lens.device,
-        )
-        req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
-        last_correct_step_indices = (
-            accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
-            - accept_indices_offset
+        last_correct_step_indices, _ = _verify_commit_step_indices(
+            batch=batch,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+            draft_token_num=draft_token_num,
         )
         fused_conv_window_scatter_with_mask(
             spec_state.conv[0],
@@ -862,15 +951,30 @@ def commit_mamba_states_after_verify(
         # NOTE: radix mamba prefix-caching (mamba_track / extra_buffer) would need
         # a device-side force-flush so `temporal` reflects the ring before a
         # snapshot; not wired for Part B (server_args forbids extra_buffer with
-        # --enable-gdn-replayssm-spec), so the per-track scatters are intentionally
+        # --enable-linear-replayssm-spec), so the per-track scatters are intentionally
         # skipped here.
         return
 
-    attn_backend = model_runner.attn_backend
+    # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel
+    # for the OUTPUT, so we replay the accepted window into the fp32 checkpoint
+    # (`temporal`) here on commit -- `temporal` is always the current committed
+    # state. The draft window's raw inputs were written to the ring during verify
+    # by the KDA backend. Gate on the fold flag + is_kda (the cursor tensors are
+    # never allocated under fold, so they cannot serve as the signal).
+    if (
+        mamba_pool is not None
+        and getattr(mamba_pool, "replayssm_spec_fold", False)
+        and getattr(mamba_pool, "replayssm_is_kda", False)
+    ):
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+            commit_kda_replayssm_after_verify,
+        )
 
-    bs = accept_lens.shape[0]
-    # `accept_lens` already includes the bonus token (drafts + 1 per req).
-    if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
+        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        bs = accept_lens.shape[0]
+        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         accept_indices_offset = torch.arange(
             0,
             bs * draft_token_num,
@@ -879,39 +983,51 @@ def commit_mamba_states_after_verify(
             device=accept_lens.device,
         )
         req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
-        # Per-req tree step of the last accepted node, i.e. the step whose
-        # mamba state to commit; reduces to accept_lens - 1 for topk == 1.
         last_correct_step_indices = (
             accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
             - accept_indices_offset
         )
-
-        if batch.mamba_track_indices is not None:
-            # If after verify, the request's seq_lens has crossed a mamba track interval,
-            # we need to update the mamba state for the request at the crossing point.
-            seq_lens_pre_verify = batch.seq_lens
-            seq_lens_post_verify = batch.seq_lens + accept_lens
-            mamba_track_interval = get_server_args().mamba_track_interval
-            to_track_mask = (
-                seq_lens_pre_verify // mamba_track_interval
-                != seq_lens_post_verify // mamba_track_interval
+        # extra_buffer: the interval-crossing step whose state must snapshot into
+        # the track ping-pong slot (mirrors the regular commit's
+        # mamba_steps_to_track); commit_kda_replayssm_spec folds it in one pass, so
+        # `temporal` stays current and no device-side force-flush is needed.
+        mamba_track_indices = batch.mamba_track_indices
+        mamba_steps_to_track = None
+        if mamba_track_indices is not None:
+            ti = mamba_track_grid(batch.tree_cache.page_size)
+            seq_pre = batch.seq_lens
+            seq_post = batch.seq_lens + accept_lens
+            to_track_mask = seq_pre // ti != seq_post // ti
+            tracking_point = seq_post // ti * ti
+            to_track_ith = torch.clamp(tracking_point - seq_pre - 1, min=0).to(
+                torch.int64
             )
-            tracking_point = (
-                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
-            )
-            to_track_ith = torch.clamp(
-                tracking_point - seq_lens_pre_verify - 1, min=0
-            ).to(torch.int64)
-            candidate_track_steps = (
-                accept_index[req_idx, to_track_ith] - accept_indices_offset
-            )
+            candidate = accept_index[req_idx, to_track_ith] - accept_indices_offset
             mamba_steps_to_track = torch.where(
-                to_track_mask,
-                candidate_track_steps,
-                torch.full_like(candidate_track_steps, -1),
+                to_track_mask, candidate, torch.full_like(candidate, -1)
             )
-        else:
-            mamba_steps_to_track = None
+        commit_kda_replayssm_after_verify(
+            spec_state=spec_state,
+            state_batch_indices=state_batch_indices,
+            accept_lens=accept_lens,  # incl. bonus token
+            last_correct_step_indices=last_correct_step_indices,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+        )
+        return
+
+    attn_backend = model_runner.attn_backend
+
+    bs = accept_lens.shape[0]
+    # `accept_lens` already includes the bonus token (drafts + 1 per req).
+    if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
+        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
+            batch=batch,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+            draft_token_num=draft_token_num,
+        )
 
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             attn_backend.update_mamba_state_after_mtp_verify(
@@ -919,16 +1035,7 @@ def commit_mamba_states_after_verify(
                 mamba_track_indices=batch.mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=model_runner.model,
-            )
-        elif hasattr(model_runner.model, "update_conv_state_after_mtp_verify"):
-            # Models whose conv layers bypass the attention-backend wrapper
-            # (Inkling) own the commit themselves.
-            model_runner.model.update_conv_state_after_mtp_verify(
-                req_to_token_pool=model_runner.req_to_token_pool,
                 req_pool_indices=batch.req_pool_indices[:bs],
-                last_correct_step_indices=last_correct_step_indices,
-                mamba_track_indices=batch.mamba_track_indices,
-                mamba_steps_to_track=mamba_steps_to_track,
             )
 
 
@@ -936,12 +1043,11 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    server_args = get_server_args()
-    if server_args.enable_mamba_extra_buffer_lazy():
+    if mamba_extra_buffer_lazy_enabled():
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
-            server_args.mamba_track_interval,
-            server_args.max_speculative_num_draft_tokens,
+            mamba_track_grid(batch.tree_cache.page_size),
+            max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
         batch.spec_info.prepare_for_decode(batch)
