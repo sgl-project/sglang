@@ -216,16 +216,16 @@ register_kernel(
     KernelSpec(
         op="gemm.kda_nvfp4_gemm",
         backend=KernelBackend.KDA,
-        target=("sglang.kernels.kda_kernels.qwen38_nvfp4_gemm_sm120:" "kda_nvfp4_gemm"),
+        target="sglang.kernels.kda_kernels.qwen38_nvfp4_gemm_sm120:kda_nvfp4_gemm",
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))}
         ),
         format_signature=FormatSignature(
             supported_dtypes=("uint8", "float8_e4m3fn", "bfloat16"),
-            description="Qwen3.8 block-scaled NVFP4 GEMM for captured SM120 shapes",
+            description="Qwen3.x block-scaled NVFP4 GEMM for captured SM120 shapes",
         ),
         description=(
-            "Qwen3.8 NVFP4 GEMM automatically optimized with Humanize2 and "
+            "Qwen3.x NVFP4 GEMM automatically optimized with Humanize2 and "
             "Kernel Design Agents."
         ),
     )
@@ -280,23 +280,6 @@ def dsv3_router_gemm(
     return impl(hidden_states, router_weights, out_dtype, output)
 
 
-def can_use_kda_nvfp4_gemm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    input_sf: torch.Tensor,
-    weight_sf: torch.Tensor,
-    alpha: torch.Tensor,
-    out_dtype: torch.dtype,
-    out_features: int,
-) -> bool:
-    """Check the exact SM120/Qwen3.8 shape and layout contract."""
-    from sglang.kernels.kda_kernels.qwen38_nvfp4_gemm_sm120 import (
-        can_use_kda_nvfp4_gemm as can_use,
-    )
-
-    return can_use(input, weight, input_sf, weight_sf, alpha, out_dtype, out_features)
-
-
 def can_dispatch_kda_nvfp4_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -306,7 +289,7 @@ def can_dispatch_kda_nvfp4_gemm(
     out_dtype: torch.dtype,
     out_features: int,
 ) -> bool:
-    """Check the E2E-validated SM120/Qwen3.8 serving fast path."""
+    """Check the E2E-validated SM120/Qwen3.x serving fast path."""
     from sglang.kernels.kda_kernels.qwen38_nvfp4_gemm_sm120 import (
         can_dispatch_kda_nvfp4_gemm as can_dispatch,
     )
@@ -335,7 +318,6 @@ __all__ = [
     "Fp8ScaledMMOp",
     "bmm_fp8",
     "can_dispatch_kda_nvfp4_gemm",
-    "can_use_kda_nvfp4_gemm",
     "dsv3_fused_a_gemm",
     "dsv3_router_gemm",
     "fp8_scaled_mm",

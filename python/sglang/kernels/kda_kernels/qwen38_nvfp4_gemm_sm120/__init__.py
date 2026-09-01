@@ -8,11 +8,7 @@
 
 from __future__ import annotations
 
-import logging
-
 import torch
-
-logger = logging.getLogger(__name__)
 
 _QWEN35_DECODE_KN = frozenset(
     {
@@ -50,7 +46,6 @@ _E2E_VALIDATED_MKN = frozenset(
         (9, 17408, 5120),
     }
 )
-_logged_fast_path = False
 
 
 def can_use_kda_nvfp4_gemm(
@@ -136,7 +131,6 @@ def kda_nvfp4_gemm(
     out_features: int,
 ) -> torch.Tensor:
     """Run the KDA-generated Qwen3.x ModelOpt NVFP4 GEMM."""
-    global _logged_fast_path
     if not can_use_kda_nvfp4_gemm(
         input, weight, input_sf, weight_sf, alpha, out_dtype, out_features
     ):
@@ -144,12 +138,6 @@ def kda_nvfp4_gemm(
 
     from .gemm import decode_fp4_gemm, large_fp4_gemm
 
-    if not _logged_fast_path:
-        logger.info(
-            "Using the Humanize2/KDA ModelOpt NVFP4 GEMM on SM120 "
-            "for qualified Qwen3.x shapes (BBuf/KDA-Pilot#195)"
-        )
-        _logged_fast_path = True
     if input.shape[0] <= 9:
         return decode_fp4_gemm(input, weight, input_sf, weight_sf, alpha)
     return large_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
