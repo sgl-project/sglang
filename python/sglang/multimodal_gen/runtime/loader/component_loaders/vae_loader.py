@@ -15,8 +15,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
-    ComponentLoader,
     NativeComponentLoaderRequired,
+    WeightOverrideComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
@@ -41,10 +41,6 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled,
     resolve_component_precision,
     resolve_decode_precision,
-)
-from sglang.multimodal_gen.runtime.weights.source import (
-    materialize_weight,
-    resolve_weight,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.model_loader.checkpoint_quantization import (
@@ -393,16 +389,11 @@ def _assign_direct_gpu_vae_state(
         )
 
 
-class VAELoader(ComponentLoader):
+class VAELoader(WeightOverrideComponentLoader):
     """Shared loader for (video/audio) VAE modules."""
 
     component_names = ["vae", "audio_vae", "video_vae"]
     expected_library = "diffusers"
-
-    def resolve_component_weight_override(
-        self, server_args: ServerArgs, component_name: str
-    ) -> str | None:
-        return server_args.component_weights_paths.get(component_name)
 
     def resolve_component_direct_gpu_loading(
         self, server_args: ServerArgs, component_name: str
@@ -434,25 +425,6 @@ class VAELoader(ComponentLoader):
     ) -> str | None:
         return server_args.component_precisions.get(component_name)
 
-    def resolve_model_weights_path(
-        self,
-        component_model_path: str,
-        server_args: ServerArgs,
-        component_name: str,
-    ) -> str:
-        weights_override = self.resolve_component_weight_override(
-            server_args, component_name
-        )
-        if weights_override is None:
-            return component_model_path
-        model_weights_path = materialize_weight(resolve_weight(weights_override))
-        logger.info(
-            "Using weight-file override for %s: %s",
-            component_name,
-            model_weights_path,
-        )
-        return model_weights_path
-
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
     ) -> dict[str, bool]:
@@ -479,7 +451,7 @@ class VAELoader(ComponentLoader):
         direct_gpu_weight_loading = self.resolve_component_direct_gpu_loading(
             server_args, component_name
         )
-        component_weights_path = self.resolve_model_weights_path(
+        component_weights_path = self.resolve_component_weights_path(
             component_model_path,
             server_args,
             component_name,

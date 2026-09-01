@@ -13,7 +13,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
     get_global_forced_attn_backend,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    ComponentLoader,
+    OnlineQuantizationComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.gguf_weights import gguf_weights_iterator
@@ -152,7 +152,7 @@ def _server_args_for_transformer_component(
     return component_server_args
 
 
-class TransformerLoader(ComponentLoader):
+class TransformerLoader(OnlineQuantizationComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
     component_names = [
@@ -162,16 +162,6 @@ class TransformerLoader(ComponentLoader):
         "video_dit",
     ]
     expected_library = "diffusers"
-
-    def resolve_component_weight_override(
-        self, server_args: ServerArgs, component_name: str
-    ) -> str | None:
-        return server_args.component_weights_paths.get(component_name)
-
-    def resolve_component_quantization_override(
-        self, server_args: ServerArgs, component_name: str
-    ) -> str | None:
-        return server_args.component_quantizations.get(component_name)
 
     def component_attention_backend_context(
         self,

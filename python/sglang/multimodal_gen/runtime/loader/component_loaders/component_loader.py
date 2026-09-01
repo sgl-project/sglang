@@ -675,18 +675,48 @@ class ComponentLoader(ABC):
         return loader
 
 
-class PlainStateDictComponentLoader(ComponentLoader):
+class WeightOverrideComponentLoader(ComponentLoader):
+    """Base for loaders that consume an exact weights-only override."""
+
+    def resolve_component_weight_override(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return server_args.component_weights_paths.get(component_name)
+
+    def validate_component_weight_override(self, _override: str) -> None:
+        pass
+
+    def resolve_component_weights_path(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+    ) -> str:
+        override = self.resolve_component_weight_override(server_args, component_name)
+        if override is None:
+            return component_model_path
+        self.validate_component_weight_override(override)
+        weights_path = materialize_weight(resolve_weight(override))
+        logger.info("Using weight override for %s: %s", component_name, weights_path)
+        return weights_path
+
+
+class OnlineQuantizationComponentLoader(WeightOverrideComponentLoader):
+    """Base for loaders that also consume an online quantization override."""
+
+    def resolve_component_quantization_override(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return server_args.component_quantizations.get(component_name)
+
+
+class PlainStateDictComponentLoader(WeightOverrideComponentLoader):
     """Base for native loaders whose current materializer expects plain weights."""
 
     def component_load_precision(
         self, server_args: ServerArgs, component_name: str
     ) -> str | None:
         return server_args.component_precisions.get(component_name)
-
-    def resolve_component_weight_override(
-        self, server_args: ServerArgs, component_name: str
-    ) -> str | None:
-        return server_args.component_weights_paths.get(component_name)
 
     @staticmethod
     def ensure_plain_state_dict_checkpoint(config: object, component_name: str) -> None:
@@ -713,19 +743,6 @@ class PlainStateDictComponentLoader(ComponentLoader):
         config = get_diffusers_component_config(component_path=component_model_path)
         self.ensure_plain_state_dict_checkpoint(config, component_name)
         return config
-
-    def resolve_component_weights_path(
-        self,
-        component_model_path: str,
-        server_args: ServerArgs,
-        component_name: str,
-    ) -> str:
-        override = self.resolve_component_weight_override(server_args, component_name)
-        if override is None:
-            return component_model_path
-        weights_path = materialize_weight(resolve_weight(override))
-        logger.info("Using weight override for %s: %s", component_name, weights_path)
-        return weights_path
 
 
 class ImageProcessorLoader(ComponentLoader):
