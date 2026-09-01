@@ -92,5 +92,6 @@ class TestSolAttnBackend(unittest.TestCase):
         ):
             self.assertFalse(impl._should_use_dense())
 
+
 if __name__ == "__main__":
     unittest.main()
