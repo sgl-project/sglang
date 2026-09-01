@@ -29,9 +29,7 @@ class TestShouldIgnoreLayer(CustomTestCase):
 
     def test_minimax_dsa_index_qkv_ignored_when_v_absent(self):
         # Must not raise; fused layer stays bf16 like its present excluded shards.
-        self.assertTrue(
-            should_ignore_layer(self._LAYER, self._IGNORE, self._MAPPING)
-        )
+        self.assertTrue(should_ignore_layer(self._LAYER, self._IGNORE, self._MAPPING))
 
     def test_all_shards_agree_still_works(self):
         layer = "model.layers.0.self_attn.qkv_proj"
