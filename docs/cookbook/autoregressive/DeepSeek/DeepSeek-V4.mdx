@@ -1,6 +1,6 @@
 ---
 title: DeepSeek-V4
-description: "Deploy DeepSeek-V4 with SGLang — verified launch commands, benchmarks, and tuning for Flash Official (0731), Flash, Pro, and Pro Official (0813)."
+description: "Deploy DeepSeek-V4 with SGLang — verified launch commands, benchmarks, and tuning for Flash Official (0731), Flash, Flash Vision (Exp), Pro, and Pro Official (0813)."
 tag: NEW
 ---
 
@@ -32,7 +32,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 **NVIDIA GPUs**
 
-A single image — `lmsysorg/sglang:latest` — covers the **datacenter GPUs** in this cookbook (B200 / B300 / GB200 / GB300 / H100 / H200 / RTX PRO 6000).
+A single image — `lmsysorg/sglang:latest` — covers the **datacenter GPUs** in this cookbook (B200 / B300 / GB200 / GB300 / H100 / H200 / RTX PRO 6000). The one exception is **Flash Vision (Exp)**, whose support has not shipped in a release yet: its cells use the preview image `lmsysorg/sglang:dev-dsv4-flash-vision` (the command panel picks it automatically — see the [Flash Vision notes](#vision-note)).
 
 ```bash Command
 docker pull lmsysorg/sglang:latest
@@ -86,6 +86,10 @@ import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/deepseek-ai/deepseek-v4.jsx";
 import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4-benchmarks.jsx";
 
+<Note>
+  The **Flash Vision (Exp)** variant runs on a dedicated preview Docker image, `lmsysorg/sglang:dev-dsv4-flash-vision` — its support ([sgl-project/sglang#37253](https://github.com/sgl-project/sglang/pull/37253)) has not shipped in a release yet. The command panel's Docker mode emits that image automatically for Flash Vision cells; see the [Flash Vision notes](#vision-note).
+</Note>
+
 <Deployment config={config} benchmarks={benchmarks} />
 
 <Note>
@@ -127,7 +131,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**DeepSeek-V4** is the next-generation Mixture-of-Experts model from DeepSeek, released 2026-04-24 under an **MIT License**. The 0731 Flash and 0813 Pro refreshes add checkpoints with a bundled DSpark draft head:
+**DeepSeek-V4** is the next-generation Mixture-of-Experts model from DeepSeek, released 2026-04-24 under an **MIT License**. The 0731 Flash and 0813 Pro refreshes add checkpoints with a bundled DSpark draft head, and the experimental Flash Vision checkpoint builds image understanding on top of the 0731 Flash base:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -158,6 +162,12 @@ import { Playground } from "/src/snippets/_playground.jsx";
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Flash Official (0731), with a bundled DSpark draft head; verified on 8×B200, 4×GB300, and 4×H200</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp">DeepSeek-V4-Flash-Vision-Exp</a></strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>305B</strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>13B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Flash Vision (Exp) — experimental multimodal (image-text-to-text): the 0731 Flash base + vision encoder & aligner; verified on 4×B200 (TP=4), requires the <a href="#vision-note">preview build</a></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro">DeepSeek-V4-Pro</a></strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>1.6T</strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>49B</td>
@@ -178,7 +188,7 @@ The Instruct checkpoints ship as **FP4 MoE experts + FP8 attention / dense** (on
 
 **Recommended generation:** `temperature=1.0`, `top_p=1.0`.
 
-**Resources:** HuggingFace · [Flash Official (0731)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) · [Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) · [Pro Official (0813)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813)  ·  ModelScope · [Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro).
+**Resources:** HuggingFace · [Flash Official (0731)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) · [Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) · [Flash Vision (Exp)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) · [Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) · [Pro Official (0813)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813)  ·  ModelScope · [Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro).
 
 ## 2. Configuration Tips
 
@@ -205,6 +215,18 @@ For the original Flash and Pro checkpoints:
 - `high-throughput`: MTP disabled — at saturation the verify step costs more than it saves.
 - MTP runs on the v2 speculative path.
 
+<a id="vision-note" />
+
+**DeepSeek-V4-Flash-Vision-Exp (Experimental)**
+
+[`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) is DeepSeek's first experimental multimodal V4 checkpoint: the 0731 Flash base plus a vision encoder and aligner, served through the same `sglang serve` flow with OpenAI-style `image_url` inputs (see [Vision](#3-5-vision-image-inputs) below). Select the **Flash Vision** variant in the Deploy panel for its recipes.
+
+- **Preview build required** — support lands via [sgl-project/sglang#37253](https://github.com/sgl-project/sglang/pull/37253) and has not shipped in a release. Docker mode on the Flash Vision cells already emits the preview image `lmsysorg/sglang:dev-dsv4-flash-vision`; for a Python environment, install SGLang from that PR's branch.
+- **Verified matrix** — MMMU-Pro via sgl-eval at `temperature 1.0`, `top-p 0.95`, `--reasoning-effort max`.
+- **Engine auto-configuration** — the engine picks the `flashinfer_mxfp4` MoE runner and auto-disables shared-experts fusion for this checkpoint (its HashTopK routing rejects fused shared experts); don't pass `--enforce-shared-experts-fusion`.
+- **Chunked prefill & radix cache stay enabled** — the scheduler keeps image spans consistent automatically: chunked-prefill truncation points are span-aligned (an image span always prefills within a single extend, overshooting the chunk budget by at most one span), and a radix-cache prefix match ending deep inside an image span is re-issued from the span start.
+- **Speculative decoding** — the checkpoint bundles a DSpark head, and the low-latency recipes enable it with `--speculative-algorithm DSPARK` (verified with image batches on B200 via the MMMU-Pro round; the other hardware rows are pending verification). The balanced and high-throughput recipes run target-only: they use DP Attention, which DSpark is incompatible with on current releases. As on the 0731/0813 checkpoints, do not pass the EAGLE flags.
+
 **Shared experts fusion (Blackwell, flashinfer_mxfp4)**
 
 On the Blackwell fp4 recipes (`--moe-runner-backend flashinfer_mxfp4`), the shared expert runs as a separate FP8 MLP on an alternate stream by default. Adding:
@@ -215,7 +237,7 @@ On the Blackwell fp4 recipes (`--moe-runner-backend flashinfer_mxfp4`), the shar
 
 routes it as one extra MXFP4 expert through the same trtllm-gen MoE kernel, so the whole MoE runs on a single stream (~4 fewer kernel launches and 2 fewer stream syncs per MoE layer). The shared expert is requantized from FP8 to MXFP4 at load time. Measured on GB200 tp4: gsm8k and AIME25 accuracy on par with the unfused baseline; Mean TTFT -13% to -21% and P99 ITL -15% to -53% at QPS 1-8 with neutral throughput.
 
-Only for deployments without expert parallelism (e.g. the single-node low-latency recipes): with `moe_ep_size > 1` the flag is rejected at startup, unless the DeepEP/MegaMOE per-rank shared-slot path is in use.
+Only for deployments without expert parallelism (e.g. the single-node low-latency recipes): with `moe_ep_size > 1` the flag is rejected at startup, unless the DeepEP/MegaMOE per-rank shared-slot path is in use. Not applicable to [Flash Vision (Exp)](#vision-note) — the engine auto-disables the fusion on that checkpoint.
 
 **Compressed attention state dtype**
 
@@ -289,7 +311,10 @@ sglang serve \
 The [`nvidia/DeepSeek-V4-Pro-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Pro-NVFP4) and
 [`nvidia/DeepSeek-V4-Flash-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Flash-NVFP4) checkpoints
 quantize MoE experts to **NVFP4** while keeping attention and dense layers in
-**FP8**. It requires `--moe-runner-backend flashinfer_trtllm_routed` which will be automatically selected if not provided.
+**FP8**. The official releases have matching NVFP4 checkpoints at
+[`nvidia/DeepSeek-V4-Flash-0731-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Flash-0731-NVFP4) and
+[`nvidia/DeepSeek-V4-Pro-0813-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Pro-0813-NVFP4).
+All of them require `--moe-runner-backend flashinfer_trtllm_routed` which will be automatically selected if not provided.
 
 ```bash Command
 sglang serve \
@@ -309,13 +334,18 @@ Requires Blackwell (SM100+). The MTP layer in this checkpoint stays
 MXFP4-packed and is routed through the `Mxfp4FlashinferTrtllmMoEMethod` path
 automatically.
 
+The official (0731 / 0813) NVFP4 checkpoints preserve the bundled DSpark draft
+head, so their low-latency recipes use `--speculative-algorithm DSPARK` instead
+of the EAGLE/MTP shape flags — same as the corresponding original-precision
+official checkpoints.
+
 <a id="hopper-note" />
 
 **Hopper (H100 / H200) note**
 
 Two options are available for running DeepSeek-V4 on Hopper:
 
-- **Original FP4 checkpoints** — apply the W4A16 MoE kernels (Marlin) as the command generator picks for Hopper cells. This path works on both H100 and H200 and is the only option for H100 (no FP8 path). It is TP-only; on H200 the Pro variant fits on a single 8-GPU node, while H100 Pro needs 2 nodes (TP=16).
+- **Original FP4 checkpoints** — run the MoE experts with W4A16 kernels (Marlin or the FlashInfer SM90 CUTLASS runner) as the command generator picks for Hopper cells. With FlashInfer >= 0.6.18 you can instead select the **W4A8** path — MXFP4 weights with FP8 activations via FlashInfer's Humming kernels — by adding `--flashinfer-mxfp4-moe-precision fp8` to `--moe-runner-backend flashinfer_mxfp4`; the low-latency Hopper cells now generate this form. Both work on H100 and H200; FP4 is the only option for H100 (no FP8 path). It is TP-only; on H200 the Pro variant fits on a single 8-GPU node, while H100 Pro needs 2 nodes (TP=16).
 - **Converted FP8 checkpoints** (H100 and H200 only) — pre-repackaged FP8 weights at [`sgl-project/DeepSeek-V4-Flash-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8) and [`sgl-project/DeepSeek-V4-Pro-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Pro-FP8) unlock DP-attention + DeepEP and richer parallelism (e.g. Pro TP=16 across 2 nodes).
 
 On these FP8 checkpoints you can additionally enable the all-FP8 **MegaMoE** path on SM90 for higher long-context / large-decode throughput — see the **SM90 (Hopper) FP8 MegaMoE** note in Configuration Tips below.
@@ -603,6 +633,8 @@ For more details, see the [HiCache documentation](../../../docs/advanced_feature
 
 Flash Official (0731) and Pro Official (0813) bundle a DSpark draft head in `deepseek-ai/DeepSeek-V4-Flash-0731` and `deepseek-ai/DeepSeek-V4-Pro-0813`. The target and draft weights therefore come from the same checkpoint: enable DSpark with `--speculative-algorithm DSPARK` and do not set a separate `--speculative-draft-model-path`.
 
+The experimental [Flash Vision checkpoint](#vision-note) also bundles a DSpark head, enabled the same way: the Flash Vision low-latency recipes ship with `--speculative-algorithm DSPARK` (verified with image batches on B200 via the MMMU-Pro round; other hardware rows pending). The balanced and high-throughput Flash Vision recipes stay target-only because they run DP Attention.
+
 Unlike the EAGLE recipes for the original Flash and Pro checkpoints, this recipe omits `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`. SGLang reads the DSpark shape from the checkpoint.
 
 <Note>
@@ -634,3 +666,44 @@ Larger blocks can improve decode latency when acceptance stays high, but they al
 For every candidate, compare with the same recipe without `--speculative-algorithm DSPARK`. Restart the server between the DSpark and non-speculative legs, keep the request corpus, sampling, concurrency, and warmup identical, and give each `bench_serving` leg its own `--flush-cache`. Leave `--speculative-draft-attention-backend` unset unless a separate profiling run justifies an override.
 
 DSpark currently requires CUDA, `pp_size == 1`, and DP Attention disabled. It is not compatible with PD disaggregation on current SGLang releases; selecting a prefill or decode role in the Playground automatically removes the inherited DSpark flags. The DP-Attention and MI355X Flash Official recipes therefore run target-only. If a larger draft block or concurrency causes graph-capture OOM, lower `--mem-fraction-static`, the draft block size, or the configured maximum running requests, then rerun both performance and accuracy gates.
+
+### 3.5 Vision (Image Inputs)
+
+The experimental [`DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) checkpoint (the **Flash Vision** variant in the Deploy panel — see the [configuration notes](#vision-note)) takes images via the OpenAI-compatible `image_url` content type, as public URLs or base64 `data:` URIs; text and images mix freely in one message. Vision input works with the same server the Deploy panel produces — no extra model-specific flags needed.
+
+<Accordion title="Image Understanding (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "image_url",
+             "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"}},
+            {"type": "text", "text": "Describe this image in a few sentences."},
+        ],
+    }],
+)
+
+message = response.choices[0].message
+if getattr(message, "reasoning_content", None):
+    print("=============== Thinking =================")
+    print(message.reasoning_content)
+print("=============== Content =================")
+print(message.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update...
+```
+
+</Accordion>
