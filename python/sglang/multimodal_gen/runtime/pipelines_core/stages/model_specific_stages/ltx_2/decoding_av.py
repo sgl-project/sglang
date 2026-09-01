@@ -79,13 +79,9 @@ class LTX2AVDecodingStage(DecodingStage):
         It is a diffusion model in its own right, so it needs a generator; the
         request's seed keeps a decode reproducible.
         """
-        # Untiled, every stage attends over the whole volume -- minutes at a
-        # full-length 121-frame grid.
+        # Untiled, every stage attends over the whole volume
         decoder.use_tiling = bool(server_args.pipeline_config.diffusion_decoder_tiling)
-        # Splitting the tiles is a collective over the decode-parallel group, so
-        # it is only safe when every rank of that group runs this stage. Under
-        # CFG parallel the stage can be main-rank-only, and the others would
-        # never reach the gather.
+        # Splitting the tiles is a collective over the decode-parallel group
         decoder.use_parallel_tiling = (
             bool(server_args.pipeline_config.diffusion_decoder_parallel_tiling)
             and self.parallelism_type == StageParallelismType.REPLICATED

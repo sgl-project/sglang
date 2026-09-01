@@ -403,10 +403,7 @@ class LTX2VideoVaeNeighborhoodAttention(nn.Module):
         key = self.norm_k(key)
         query = query * self.scale
         query, key = self.rope.forward_pair(query, key)
-        # RMSNorm promotes to fp32 under autocast while the value projection
-        # stays in the autocast dtype, and the attention below -- NATTEN
-        # especially -- requires one dtype for all three. Off autocast the
-        # three already agree, so this only restores that.
+
         return query.to(value.dtype), key.to(value.dtype), value
 
     def build_block_mask(self, hidden_states: torch.Tensor):
