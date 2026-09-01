@@ -46,9 +46,7 @@ def _load_tlx_ops() -> ModuleType | None:
         errors = []
         for package in ("fbtriton", "triton"):
             try:
-                _TLX_OPS = importlib.import_module(
-                    f"{package}.language.extra.tlx.ops"
-                )
+                _TLX_OPS = importlib.import_module(f"{package}.language.extra.tlx.ops")
                 _TLX_IMPORT_ERROR = None
                 return _TLX_OPS
             except ImportError as error:

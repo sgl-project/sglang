@@ -65,8 +65,7 @@ class TestTlxPagedDecodeAmd(unittest.TestCase):
                 os.environ["SGLANG_AITER_5D_DECODE_BACKEND"] = previous
 
     def test_gluon_mode_does_not_import_fbtriton(self):
-        source = textwrap.dedent(
-            """
+        source = textwrap.dedent("""
             import sys
             from sglang.srt.layers.attention import tlx_utils
 
@@ -75,8 +74,7 @@ class TestTlxPagedDecodeAmd(unittest.TestCase):
                 "gluon", None, None, None, None, None, None, None
             )
             assert "fbtriton" not in sys.modules
-            """
-        )
+            """)
         subprocess.run([sys.executable, "-c", source], check=True)
 
     def test_tlx_matches_gluon_and_supports_graph_capture(self):
@@ -152,9 +150,7 @@ class TestTlxPagedDecodeAmd(unittest.TestCase):
                 flat_actual = self._run_wrapper(
                     "tlx", backend, q, layer, forward_batch, k_cache, v_cache
                 )
-                torch.testing.assert_close(
-                    flat_actual, expected, rtol=2e-2, atol=2e-2
-                )
+                torch.testing.assert_close(flat_actual, expected, rtol=2e-2, atol=2e-2)
                 workspaces = list(backend._tlx_pa_decode_workspaces.values())
                 self.assertEqual(len(workspaces), 1)
                 self.assertEqual(workspaces[0][0].stride(-2), head_dim + 4)
