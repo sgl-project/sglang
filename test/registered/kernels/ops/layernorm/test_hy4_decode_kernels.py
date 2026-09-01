@@ -1,11 +1,14 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 import triton
 import triton.language as tl
+from torch import nn
 
 import sglang.kernels.ops.layernorm.hy4_ihc as hy4_ihc
+from sglang.srt.models import hunyuan_v4
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -159,6 +162,67 @@ class TestHy4DecodeKernels(CustomTestCase):
 
                 self.assertTrue(torch.equal(actual[0], expected[0]))
                 self.assertTrue(torch.equal(actual[1], expected[1]))
+
+    def test_fused_ihc_failure_disables_each_path(self):
+        class TupleLinear(nn.Module):
+            def __init__(self, input_size, output_size):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(output_size, input_size))
+
+            def forward(self, inputs):
+                return nn.functional.linear(inputs, self.weight), None
+
+        config = SimpleNamespace(
+            hidden_size=8,
+            hc_mult=2,
+            hc_magnitude=2.0,
+            hc_eps=1e-6,
+            rms_norm_eps=1e-5,
+        )
+        counts = {"pre": 0, "post": 0, "post_pre": 0, "head": 0}
+
+        def fail(name):
+            def raise_error(*args, **kwargs):
+                counts[name] += 1
+                raise RuntimeError(name)
+
+            return raise_error
+
+        def make_linear(input_size, output_size, **kwargs):
+            return TupleLinear(input_size, output_size)
+
+        with patch.object(hunyuan_v4, "ReplicatedLinear", make_linear):
+            pre_layer = hunyuan_v4.HYV4HCPreLayer(config, "pre").cuda()
+            layer = hunyuan_v4.HYV4HCLayer(config, "layer").cuda()
+            next_layer = hunyuan_v4.HYV4HCLayer(config, "next").cuda()
+            head_layer = hunyuan_v4.HYV4HCHeadLayer(config, "head").cuda()
+
+        next_layer.hc_pre._fused_ihc_pre_disabled = True
+        norm = hunyuan_v4.RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, force_native=True
+        ).cuda()
+        hidden_states = torch.randn(3, 2, 8, device="cuda")
+        output = torch.randn(3, 8, device="cuda")
+        residual = torch.randn(3, 2, 8, device="cuda")
+        post = torch.randn(3, 2, device="cuda")
+
+        with (
+            patch.object(hy4_ihc, "fused_hy4_ihc_pre", fail("pre")),
+            patch.object(hy4_ihc, "fused_hy4_ihc_post", fail("post")),
+            patch.object(hy4_ihc, "fused_hy4_ihc_post_pre", fail("post_pre")),
+            patch.object(hy4_ihc, "fused_hy4_ihc_head", fail("head")),
+            patch.object(hunyuan_v4, "_hpc_ihc_available", return_value=True),
+            self.assertLogs(hunyuan_v4.logger, level="WARNING") as logs,
+        ):
+            for _ in range(2):
+                pre_layer(hidden_states)
+                layer.post(output, residual, post)
+                layer.post_pre(output, residual, post, next_layer, norm)
+                head_layer(hidden_states)
+
+        self.assertEqual(counts, {"pre": 1, "post": 1, "post_pre": 1, "head": 1})
+        self.assertEqual(len(logs.records), 4)
+        self.assertTrue(all(record.exc_info is not None for record in logs.records))
 
 
 if __name__ == "__main__":

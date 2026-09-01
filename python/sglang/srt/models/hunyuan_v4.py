@@ -92,6 +92,7 @@ class HYV4HCPreLayer(nn.Module):
         self.hc_base = nn.Parameter(
             torch.empty(2 * config.hc_mult, dtype=torch.float32)
         )
+        self._fused_ihc_pre_disabled = False
 
     def forward(
         self,
@@ -99,7 +100,7 @@ class HYV4HCPreLayer(nn.Module):
         rms_weight: torch.Tensor | None = None,
         rms_eps: float = 0.0,
     ):
-        if hidden_states.is_cuda:
+        if hidden_states.is_cuda and not self._fused_ihc_pre_disabled:
             try:
                 from sglang.kernels.ops.layernorm.hy4_ihc import fused_hy4_ihc_pre
             except ImportError:
@@ -118,7 +119,11 @@ class HYV4HCPreLayer(nn.Module):
                         rms_eps,
                     )
                 except Exception:
-                    logger.warning("fused_hy4_ihc_pre failed, using eager path")
+                    self._fused_ihc_pre_disabled = True
+                    logger.warning(
+                        "fused_hy4_ihc_pre failed, disabling fused path",
+                        exc_info=True,
+                    )
         shape = hidden_states.shape
         flat = hidden_states.flatten(1).float()
         scale = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.rms_norm_eps)
@@ -158,6 +163,8 @@ class HYV4HCLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.hc_mult = config.hc_mult
         self.hc_pre = HYV4HCPreLayer(config, f"{prefix}.hc_pre")
+        self._fused_ihc_post_disabled = False
+        self._fused_ihc_post_pre_disabled = False
 
     def prepare_input(self, hidden_states: torch.Tensor):
         if hidden_states.ndim == 3:
@@ -190,7 +197,7 @@ class HYV4HCLayer(nn.Module):
         return reduced, post, hidden_states
 
     def post(self, output, residual, post):
-        if output.is_cuda:
+        if output.is_cuda and not self._fused_ihc_post_disabled:
             try:
                 from sglang.kernels.ops.layernorm.hy4_ihc import fused_hy4_ihc_post
             except ImportError:
@@ -199,13 +206,19 @@ class HYV4HCLayer(nn.Module):
                 try:
                     return fused_hy4_ihc_post(output, residual, post)
                 except Exception:
-                    logger.warning("fused_hy4_ihc_post failed, using eager path")
+                    self._fused_ihc_post_disabled = True
+                    logger.warning(
+                        "fused_hy4_ihc_post failed, disabling fused path",
+                        exc_info=True,
+                    )
         result = post.float().unsqueeze(-1) * output.float().unsqueeze(1)
         return (result + residual.float()).to(output.dtype)
 
     def post_pre(self, output, residual, post, next_layer, norm):
-        if output.is_cuda and _hpc_ihc_available(
-            "fuse_ihc_post_pre", self.hc_mult, self.hidden_size
+        if (
+            output.is_cuda
+            and not self._fused_ihc_post_pre_disabled
+            and _hpc_ihc_available("fuse_ihc_post_pre", self.hc_mult, self.hidden_size)
         ):
             try:
                 from sglang.kernels.ops.layernorm.hy4_ihc import (
@@ -230,7 +243,11 @@ class HYV4HCLayer(nn.Module):
                     )
                     return reduced, next_post, next_residual
                 except Exception:
-                    logger.warning("fused_hy4_ihc_post_pre failed, using fallback")
+                    self._fused_ihc_post_pre_disabled = True
+                    logger.warning(
+                        "fused_hy4_ihc_post_pre failed, disabling fused path",
+                        exc_info=True,
+                    )
         next_residual = self.post(output, residual, post)
         next_residual = next_layer.prepare_input(next_residual)
         return next_layer.pre(next_residual, norm)
@@ -251,10 +268,15 @@ class HYV4HCHeadLayer(nn.Module):
         self.hc_head_base = nn.Parameter(
             torch.empty(config.hc_mult, dtype=torch.float32)
         )
+        self._fused_ihc_head_disabled = False
 
     def forward(self, hidden_states: torch.Tensor, norm: RMSNorm | None = None):
-        if hidden_states.is_cuda and _hpc_ihc_available(
-            "fuse_ihc_head", self.config.hc_mult, self.config.hidden_size
+        if (
+            hidden_states.is_cuda
+            and not self._fused_ihc_head_disabled
+            and _hpc_ihc_available(
+                "fuse_ihc_head", self.config.hc_mult, self.config.hidden_size
+            )
         ):
             try:
                 from sglang.kernels.ops.layernorm.hy4_ihc import fused_hy4_ihc_head
@@ -273,7 +295,11 @@ class HYV4HCHeadLayer(nn.Module):
                         0.0 if norm is None else norm.variance_epsilon,
                     )
                 except Exception:
-                    logger.warning("fused_hy4_ihc_head failed, using eager path")
+                    self._fused_ihc_head_disabled = True
+                    logger.warning(
+                        "fused_hy4_ihc_head failed, disabling fused path",
+                        exc_info=True,
+                    )
         shape = hidden_states.shape
         flat = hidden_states.flatten(1).float()
         scale = torch.rsqrt(
