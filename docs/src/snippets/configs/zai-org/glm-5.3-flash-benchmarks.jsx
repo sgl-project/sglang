@@ -302,6 +302,12 @@ export const benchmarks = [
   },
   { match: { hw: "gb200", strategy: "low-latency" } },
   { match: { hw: "gb200", strategy: "high-throughput" } },
+  { match: { hw: "gb200", strategy: "low-latency", quant: "nvfp4" } },
+  { match: { hw: "gb200", strategy: "high-throughput", quant: "nvfp4" } },
+  { match: { hw: "b200", strategy: "low-latency", quant: "nvfp4" } },
+  { match: { hw: "b200", strategy: "high-throughput", quant: "nvfp4" } },
+  { match: { hw: "b300", strategy: "low-latency", quant: "nvfp4" } },
+  { match: { hw: "b300", strategy: "high-throughput", quant: "nvfp4" } },
   {
     match: { hw: "mi300x", strategy: "high-throughput" },
     sglang_version: "9e692c9216",
