@@ -319,8 +319,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         # NOTE: the API is not idempotent.
-        # SWA first: it reads the mapping, and a cache action later in this
-        # group can re-point free_index at a different SWA slot.
+        # SWA first: it reads the mapping, and a cache action later in this group
+        # can re-point free_index at a different SWA slot.
         self.free_swa(free_index)
         self.free_full(free_index)
 
