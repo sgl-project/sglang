@@ -419,6 +419,228 @@ class TestResolveCandidateSteps(unittest.TestCase):
             steps = resolve_candidate_steps_from_config(cfg_path=f.name)
         self.assertEqual(steps, [1, 3, 5, 7])
 
+    def test_unions_and_dedups_across_ctx_buckets(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "8": {
+                        "ctx_buckets": {
+                            "1-2047": {"candidate_steps": [0, 1]},
+                            "2048-32768": {"candidate_steps": [3, 7]},
+                        },
+                    },
+                },
+                f,
+            )
+            f.flush()
+            steps = resolve_candidate_steps_from_config(cfg_path=f.name)
+        self.assertEqual(steps, [0, 1, 3, 7])
+
+
+class TestTwoDSchemaParsing(unittest.TestCase):
+    def _params(self, cfg):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(cfg, f)
+            f.flush()
+            return AdaptiveSpeculativeParams(initial_steps=3, cfg_path=f.name)
+
+    def test_2d_schema_loads(self):
+        params = self._params(
+            {
+                "1": {"candidate_steps": [1, 3, 7]},
+                "8": {
+                    "ctx_buckets": {
+                        "1-2047": {"candidate_steps": [0, 1, 3]},
+                        "2048-32768": {"candidate_steps": [1, 3]},
+                    },
+                },
+            }
+        )
+        self.assertEqual(params._bs_list, [1, 8])
+        self.assertEqual(params._slots[1].candidate_steps, [1, 3, 7])
+        self.assertEqual(params._slots[8].candidate_steps, [0, 1, 3])
+
+    def test_2d_bucket_gap_raises(self):
+        with self.assertRaises(ValueError):
+            self._params(
+                {
+                    "8": {
+                        "ctx_buckets": {
+                            "1-1023": {"candidate_steps": [3]},
+                            "2048-32768": {"candidate_steps": [1]},
+                        },
+                    },
+                }
+            )
+
+    def test_2d_bucket_must_start_at_one(self):
+        with self.assertRaises(ValueError):
+            self._params(
+                {
+                    "8": {
+                        "ctx_buckets": {
+                            "512-2047": {"candidate_steps": [3]},
+                            "2048-32768": {"candidate_steps": [1]},
+                        },
+                    },
+                }
+            )
+
+    def test_2d_bucket_zero_lo_rejected(self):
+        with self.assertRaises(ValueError):
+            self._params(
+                {
+                    "8": {
+                        "ctx_buckets": {
+                            "0-2047": {"candidate_steps": [3]},
+                            "2048-32768": {"candidate_steps": [1]},
+                        },
+                    },
+                }
+            )
+
+    def test_2d_bucket_key_must_be_lo_hi_ints(self):
+        with self.assertRaises(ValueError):
+            self._params({"8": {"ctx_buckets": {"0_2047": {"candidate_steps": [3]}}}})
+
+    def test_2d_bucket_empty_dict_raises(self):
+        with self.assertRaises(ValueError):
+            self._params({"8": {"ctx_buckets": {}}})
+
+    def test_2d_bucket_empty_steps_raises(self):
+        with self.assertRaises(ValueError):
+            self._params(
+                {
+                    "8": {
+                        "ctx_buckets": {"1-32768": {"candidate_steps": []}},
+                    },
+                }
+            )
+
+
+class TestTwoDRouting(unittest.TestCase):
+    def _params(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [1, 3, 7]},
+                    "8": {
+                        "ctx_buckets": {
+                            "1-2047": {"candidate_steps": [0, 1, 3]},
+                            "2048-32768": {"candidate_steps": [1, 3]},
+                        },
+                    },
+                    "32": {
+                        "ctx_buckets": {
+                            "1-767": {"candidate_steps": [0]},
+                            "768-32768": {"candidate_steps": [1, 3]},
+                        },
+                    },
+                    "64": {"candidate_steps": [0]},
+                },
+                f,
+            )
+            f.flush()
+            return AdaptiveSpeculativeParams(initial_steps=3, cfg_path=f.name)
+
+    def test_ctx_switches_slot_within_bs(self):
+        params = self._params()
+        low = params._route(8, 500)
+        high = params._route(8, 3000)
+        self.assertEqual(low.candidate_steps, [0, 1, 3])
+        self.assertEqual(high.candidate_steps, [1, 3])
+        self.assertIsNot(low, high)
+
+    def test_ctx_bucket_boundary_inclusive_upper(self):
+        params = self._params()
+        self.assertEqual(params._route(8, 2047).candidate_steps, [0, 1, 3])
+        self.assertEqual(params._route(8, 2048).candidate_steps, [1, 3])
+
+    def test_ctx_beyond_last_hi_uses_last_bucket(self):
+        params = self._params()
+        self.assertEqual(params._route(8, 10**9).candidate_steps, [1, 3])
+
+    def test_legacy_bs_ignores_ctx(self):
+        params = self._params()
+        for ctx in (0, 500, 3000, 10**9):
+            self.assertEqual(params._route(1, ctx).candidate_steps, [1, 3, 7])
+            self.assertEqual(params._route(64, ctx).candidate_steps, [0])
+
+    def test_default_ctx_matches_first_bucket(self):
+        params = self._params()
+        self.assertEqual(params._route(8).candidate_steps, [0, 1, 3])
+        self.assertEqual(params._route(32).candidate_steps, [0])
+
+    def test_get_steps_for_batch_differs_by_ctx(self):
+        params = self._params()
+        self.assertNotEqual(
+            params.get_steps_for_batch(32, 100),
+            params.get_steps_for_batch(32, 5000),
+        )
+
+    def test_on_verify_complete_isolates_ctx_slots(self):
+        params = self._params()
+        low_slot = params._route(8, 500)
+        high_slot = params._route(8, 3000)
+        untouched_ema = high_slot.ema_accept_len
+        for _ in range(40):
+            params.on_verify_complete([3, 3, 3], batch_size=8, ctx_repr=500)
+        self.assertGreaterEqual(low_slot.ema_accept_len, 1.0)
+        self.assertEqual(high_slot.ema_accept_len, untouched_ema)
+
+    def test_cuda_graph_bs_for_step_uses_union_of_2d_buckets(self):
+        params = self._params()
+        params.set_cuda_graph_bs([4, 8, 16, 32])
+        self.assertEqual(params.cuda_graph_bs_for_step(3), [4, 8, 16, 32])
+
+    def test_capture_set_identical_to_1d_union(self):
+        # "capture set stays BS-only": for any 2D config, cuda_graph_bs_for_step
+        # returns the same list as the 1D config whose candidate_steps at each
+        # BS is the union of that BS's 2D bucket palettes. Proves no new K
+        # regime is introduced by the ctx axis.
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [1, 3, 7]},
+                    "8": {
+                        "ctx_buckets": {
+                            "1-2047": {"candidate_steps": [0, 1, 3]},
+                            "2048-32768": {"candidate_steps": [1, 3]},
+                        },
+                    },
+                    "32": {
+                        "ctx_buckets": {
+                            "1-767": {"candidate_steps": [0]},
+                            "768-32768": {"candidate_steps": [1, 3]},
+                        },
+                    },
+                    "64": {"candidate_steps": [0]},
+                },
+                f,
+            )
+            f.flush()
+            params_2d = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=f.name)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [1, 3, 7]},
+                    "8": {"candidate_steps": [0, 1, 3]},
+                    "32": {"candidate_steps": [0, 1, 3]},
+                    "64": {"candidate_steps": [0]},
+                },
+                f,
+            )
+            f.flush()
+            params_1d = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=f.name)
+        params_2d.set_cuda_graph_bs([4, 8, 16, 32])
+        params_1d.set_cuda_graph_bs([4, 8, 16, 32])
+        for step in (0, 1, 3, 7):
+            self.assertEqual(
+                params_2d.cuda_graph_bs_for_step(step),
+                params_1d.cuda_graph_bs_for_step(step),
+            )
+        self.assertEqual(params_2d.candidate_steps, params_1d.candidate_steps)
+
 
 if __name__ == "__main__":
     unittest.main()
