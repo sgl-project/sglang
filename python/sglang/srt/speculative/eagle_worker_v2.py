@@ -138,35 +138,30 @@ logger = logging.getLogger(__name__)
 _EMBED_TENSOR_NAMES = ("model.embed_tokens.weight", "embed.weight")
 
 
-def _load_checkpoint_tensor(model_path: str, tensor_names: tuple) -> torch.Tensor:
-    """Load one tensor from a local safetensors checkpoint (PP+spec path)."""
-    import glob
-    import json
-    import os
-
-    from safetensors import safe_open
-
-    # The standard loader may have resolved a HF hub id into its own cache;
-    # this simplified reader only handles local checkpoint directories.
-    assert os.path.isdir(model_path), (
-        "PP+spec draft embedding loading requires --model-path to be a local "
-        f"checkpoint directory, got {model_path!r}"
+def _load_checkpoint_tensor(
+    model_path: str, revision, tensor_names: tuple
+) -> torch.Tensor:
+    """Load one tensor from a checkpoint via the standard weight loader."""
+    from sglang.srt.configs.load_config import LoadConfig
+    from sglang.srt.model_loader.loader import DefaultModelLoader
+    from sglang.srt.model_loader.weight_utils import (
+        pt_weights_iterator,
+        safetensors_weights_iterator,
     )
-    index_path = os.path.join(model_path, "model.safetensors.index.json")
-    if os.path.exists(index_path):
-        with open(index_path) as f:
-            weight_map = json.load(f)["weight_map"]
-        for tensor_name in tensor_names:
-            if tensor_name in weight_map:
-                shard_path = os.path.join(model_path, weight_map[tensor_name])
-                with safe_open(shard_path, framework="pt", device="cpu") as f:
-                    return f.get_tensor(tensor_name)
-    else:
-        for shard_path in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
-            with safe_open(shard_path, framework="pt", device="cpu") as f:
-                for tensor_name in tensor_names:
-                    if tensor_name in f.keys():
-                        return f.get_tensor(tensor_name)
+
+    # Resolves hub ids into the local cache and picks the weight format, the
+    # same way the model itself was loaded.
+    _, weight_files, use_safetensors = DefaultModelLoader(
+        LoadConfig()
+    )._prepare_weights(model_path, revision, fall_back_to_pt=True)
+    iterator = (
+        safetensors_weights_iterator(weight_files)
+        if use_safetensors
+        else pt_weights_iterator(weight_files)
+    )
+    for name, tensor in iterator:
+        if name in tensor_names:
+            return tensor
     raise ValueError(f"none of {tensor_names} found in checkpoint at {model_path}")
 
 
@@ -325,7 +320,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_lm_head(self):
         from sglang.srt.lora.layers import unwrap_lora_layer
 
-        if envs.SGLANG_ENABLE_PP_SPEC.get() and self.server_args.pp_size > 1:
+        if envs.SGLANG_ENABLE_PP_SPEC.get() and get_parallel().pp_size > 1:
             # This branch skips the hot-token-map / EAGLE3 head wiring below.
             assert self.hot_token_id is None and not (
                 self.speculative_algorithm.is_eagle3()
@@ -337,9 +332,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # — otherwise it stays randomly initialized and accept_length
             # collapses to ~1.
             embed = self.draft_runner.model.model.embed_tokens.weight
-            if self.server_args.load_format != "dummy":
+            if get_model().load_format != "dummy":
+                target_config = self.target_worker.model_runner.model_config
                 loaded_embed = _load_checkpoint_tensor(
-                    model_path=self.draft_runner.model_config.model_path,
+                    model_path=target_config.model_path,
+                    revision=target_config.revision,
                     tensor_names=_EMBED_TENSOR_NAMES,
                 )
                 embed.weight_loader(embed, loaded_embed)
@@ -1345,7 +1342,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
             if (
-                self.server_args.pp_size > 1
+                get_parallel().pp_size > 1
                 and not batch.forward_mode.is_idle()
                 and self.speculative_num_steps > 0
             ):

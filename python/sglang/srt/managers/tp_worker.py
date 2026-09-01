@@ -57,6 +57,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_model,
+    get_parallel,
     get_schedule,
     get_serving,
     get_spec,
@@ -400,7 +401,7 @@ class TpModelWorker(BaseTpWorker):
         elif (
             envs.SGLANG_ENABLE_PP_SPEC.get()
             and is_draft_worker
-            and server_args.pp_size > 1
+            and get_parallel().pp_size > 1
         ):
             # PP+spec: the draft worker exists only on the last PP stage, so a
             # world-group broadcast here would deadlock (first-stage ranks never

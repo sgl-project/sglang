@@ -967,8 +967,8 @@ class Scheduler(
 
         if (
             envs.SGLANG_ENABLE_PP_SPEC.get()
-            and self.server_args.pp_size > 1
-            and self.ps.pp_rank != self.server_args.pp_size - 1
+            and self.ps.pp_size > 1
+            and self.ps.pp_rank != self.ps.pp_size - 1
         ):
             # PP+spec: the draft model (MTP layer) needs final hidden states and
             # the lm_head, both of which live on the last PP stage only.

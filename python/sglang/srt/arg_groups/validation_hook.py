@@ -58,6 +58,21 @@ def check_server_args(server_args: Any):
             assert (
                 cfg.disable_overlap_schedule
             ), "SGLANG_ENABLE_PP_SPEC requires --disable-overlap-schedule"
+            # The relay carries an EAGLE-shaped tree and only EAGLEWorkerV2
+            # tail-drafts; every other algorithm would be mis-rebuilt.
+            assert (
+                cfg.speculative_algorithm == "EAGLE"
+                and not cfg.enable_multi_layer_eagle
+            ), (
+                "SGLANG_ENABLE_PP_SPEC supports single-layer EAGLE/MTP only, "
+                f"got {cfg.speculative_algorithm}"
+            )
+            # PD prefill relays topk_p / topk_index / hidden states through
+            # RelayPayload; the gated flow replaces that relay with its own
+            # and does not carry those fields.
+            assert cfg.disaggregation_mode == "null", (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with " "--disaggregation-mode"
+            )
             # The PP relay slices spec results with the configured
             # num_draft_tokens; adaptive spec changes it at runtime.
             assert not cfg.speculative_adaptive, (

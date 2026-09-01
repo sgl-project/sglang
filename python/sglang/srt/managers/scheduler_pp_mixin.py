@@ -37,7 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
     pop_auxiliary_output_from_pp_tensors,
@@ -1258,7 +1258,7 @@ class SchedulerPPMixin:
                 next_token_ids=pp_outputs["next_token_ids"].cpu(),
                 accept_lens=pp_outputs["spec_accept_lens"].cpu(),
                 new_seq_lens=new_seq_lens,
-                speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
@@ -1303,7 +1303,7 @@ class SchedulerPPMixin:
                     PPSpecRelayInput.degenerate(
                         rids=[req.rid for req in fwd_batch.reqs],
                         bonus_tokens=next_token_ids,
-                        num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                        num_draft_tokens=get_spec().speculative_num_draft_tokens,
                     ),
                 )
         else:
@@ -1360,18 +1360,25 @@ class SchedulerPPMixin:
         are folded in by rid rather than by position."""
         from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
 
+        num_draft_tokens = get_spec().speculative_num_draft_tokens
         chain = pp_outputs.tensors.get("spec_next_chain")
         if chain is None:
-            # The last stage skipped drafting this round (idle / zero steps);
-            # the requests keep the tree they already carry.
-            return
-        num_draft_tokens = self.server_args.speculative_num_draft_tokens
-        relayed = PPSpecRelayInput(
-            rids=fwd_rids,
-            tokens=chain.to(torch.int64).reshape(len(fwd_rids), num_draft_tokens),
-            parents=pp_outputs.tensors.get("spec_next_parents"),
-            top_scores=pp_outputs.tensors.get("spec_next_top_scores"),
-        )
+            # The last stage verified but skipped drafting (num_steps == 0
+            # keeps draft KV warm without proposing). The bonus token it
+            # sampled must still become the next round's root: keeping the
+            # old row would re-verify a token that was already accepted.
+            relayed = PPSpecRelayInput.degenerate(
+                rids=fwd_rids,
+                bonus_tokens=pp_outputs["spec_bonus_tokens"],
+                num_draft_tokens=num_draft_tokens,
+            )
+        else:
+            relayed = PPSpecRelayInput(
+                rids=fwd_rids,
+                tokens=chain.to(torch.int64).reshape(len(fwd_rids), num_draft_tokens),
+                parents=pp_outputs.tensors.get("spec_next_parents"),
+                top_scores=pp_outputs.tensors.get("spec_next_top_scores"),
+            )
         self._pp_spec_set_relay(batch, relayed)
 
     def _pp_spec_set_relay(self: Scheduler, batch: ScheduleBatch, relayed) -> None:
@@ -1394,7 +1401,7 @@ class SchedulerPPMixin:
         """topk=1 chain constants, the shape a not-yet-drafted row implies.
         Mirrors _rebuild_topk1_chain_buffers: a single-step chain has no parent
         entries, and both widths key off num_steps."""
-        num_steps = self.server_args.speculative_num_steps
+        num_steps = get_spec().speculative_num_steps
         parent_width = num_steps if num_steps > 1 else 0
         parent_list = torch.arange(
             -1, parent_width - 1, dtype=torch.long, device=device
@@ -1422,15 +1429,15 @@ class SchedulerPPMixin:
         )
         from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
 
-        sa = self.server_args
-        steps = sa.speculative_num_steps
-        num_draft_tokens = sa.speculative_num_draft_tokens
+        spec = get_spec()
+        steps = spec.speculative_num_steps
+        num_draft_tokens = spec.speculative_num_draft_tokens
         bs = batch.batch_size()
         device = self.device
 
         if batch.forward_mode.is_idle() or bs == 0:
             batch.spec_info = EagleVerifyInput.create_idle_input(
-                topk=sa.speculative_eagle_topk,
+                topk=spec.speculative_eagle_topk,
                 spec_steps=steps,
                 num_verify_tokens=num_draft_tokens,
                 device=device,
@@ -1491,7 +1498,7 @@ class SchedulerPPMixin:
             draft_tokens,
             batch.seq_lens,
             seq_lens_sum,
-            sa.speculative_eagle_topk,
+            spec.speculative_eagle_topk,
             steps,
             num_draft_tokens,
             mask_mode,
@@ -1507,7 +1514,7 @@ class SchedulerPPMixin:
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_cum_len=None,
             spec_steps=steps,
-            topk=sa.speculative_eagle_topk,
+            topk=spec.speculative_eagle_topk,
             draft_token_num=num_draft_tokens,
             capture_hidden_mode=None,
             seq_lens_sum=batch.seq_lens_sum,

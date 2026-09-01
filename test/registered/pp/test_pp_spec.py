@@ -143,7 +143,11 @@ class TestPPSpecGate(CustomTestCase):
             speculative_num_draft_tokens=3,
         )
         args.update(overrides)
-        return ServerArgs(**args)
+        server_args = ServerArgs(**args)
+        # check_server_args reads resolution-filled fields (served_model_name,
+        # chunked_prefill_size); the bare constructor leaves them None.
+        server_args.resolve_once()
+        return server_args
 
     def test_gate_off_keeps_the_ban(self):
         os.environ.pop("SGLANG_ENABLE_PP_SPEC", None)
@@ -166,6 +170,16 @@ class TestPPSpecGate(CustomTestCase):
                 self._server_args(
                     speculative_adaptive=True, speculative_num_steps=3
                 ).check_server_args()
+            # The relay carries an EAGLE-shaped tree; other algorithms would
+            # be mis-rebuilt on the non-last stages.
+            with self.assertRaises(AssertionError):
+                self._server_args(
+                    speculative_algorithm="NGRAM", speculative_draft_model_path=None
+                ).check_server_args()
+            # PD prefill needs the RelayPayload draft fields the gated flow
+            # does not carry.
+            with self.assertRaises(AssertionError):
+                self._server_args(disaggregation_mode="prefill").check_server_args()
         finally:
             os.environ.pop("SGLANG_ENABLE_PP_SPEC", None)
 
