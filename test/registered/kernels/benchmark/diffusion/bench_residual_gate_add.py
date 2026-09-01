@@ -18,6 +18,7 @@ class Workload:
     name: str
     residual_shape: tuple[int, ...]
     gate_shape: tuple[int, ...]
+    transposed_residual: bool = False
 
 
 FULL_WORKLOADS = [
@@ -28,10 +29,22 @@ FULL_WORKLOADS = [
     Workload("flux2_bcast_s4096_c3072", (1, 4096, 3072), (1, 1, 3072)),
     Workload("flux2_bcast_s512_c3072", (1, 512, 3072), (1, 1, 3072)),
     Workload("ltx2_full_s126_c2048", (1, 126, 2048), (1, 126, 2048)),
+    Workload(
+        "sana_video_bcast_s7800_c2240_transposed",
+        (1, 7800, 2240),
+        (1, 1, 2240),
+        transposed_residual=True,
+    ),
 ]
 CI_WORKLOADS = [
     Workload("ltx2_bcast_s1024_c4096", (1, 1024, 4096), (1, 1, 4096)),
     Workload("ltx2_full_s512_c4096", (1, 512, 4096), (1, 512, 4096)),
+    Workload(
+        "sana_video_bcast_s512_c2240_transposed",
+        (1, 512, 2240),
+        (1, 1, 2240),
+        transposed_residual=True,
+    ),
 ]
 
 
@@ -68,31 +81,44 @@ def benchmark() -> None:
     repeats = 5 if is_in_ci() else 20
     rounds = 5 if is_in_ci() else 13
 
-    print("| workload | gate | torch us | triton us | cuda us | cuda/triton |")
-    print("|---|---|---:|---:|---:|---:|")
+    print(
+        "| workload | gate | torch us | triton us | cuda us | reference | " "ref/cuda |"
+    )
+    print("|---|---|---:|---:|---:|---|---:|")
 
     for workload in workloads:
-        residual = torch.randn(
+        if workload.transposed_residual:
+            batch, tokens, hidden_size = workload.residual_shape
+            residual = torch.randn(
+                (batch, hidden_size, tokens), device="cuda", dtype=torch.bfloat16
+            ).transpose(1, 2)
+        else:
+            residual = torch.randn(
+                workload.residual_shape, device="cuda", dtype=torch.bfloat16
+            )
+        update = torch.randn(
             workload.residual_shape, device="cuda", dtype=torch.bfloat16
         )
-        update = torch.randn_like(residual)
         gate = torch.randn(workload.gate_shape, device="cuda", dtype=torch.bfloat16)
 
         ref = residual + update * gate
-        triton_out = fuse_scale_shift_kernel(update, gate, residual, scale_constant=0)
         cuda_out = residual_gate_add_cuda(residual, update, gate)
         torch.cuda.synchronize()
-        torch.testing.assert_close(triton_out, ref, atol=5e-2, rtol=5e-2)
         torch.testing.assert_close(cuda_out, ref, atol=5e-2, rtol=5e-2)
 
         fns = {
             "torch": lambda: residual + update * gate,
-            "triton": lambda: fuse_scale_shift_kernel(
-                update, gate, residual, scale_constant=0
-            ),
             "cuda": lambda: residual_gate_add_cuda(residual, update, gate),
         }
-        order = ["torch", "triton", "cuda"]
+        if not workload.transposed_residual:
+            triton_out = fuse_scale_shift_kernel(
+                update, gate, residual, scale_constant=0
+            )
+            torch.testing.assert_close(triton_out, ref, atol=5e-2, rtol=5e-2)
+            fns["triton"] = lambda: fuse_scale_shift_kernel(
+                update, gate, residual, scale_constant=0
+            )
+        order = list(fns)
         random.shuffle(order)
         times = {
             name: cuda_event_us(fns[name], warmups, repeats, rounds) for name in order
@@ -101,10 +127,12 @@ def benchmark() -> None:
         gate_kind = (
             "bcast" if workload.gate_shape != workload.residual_shape else "full"
         )
+        reference = "torch" if workload.transposed_residual else "triton"
+        triton_us = f"{times['triton']:.2f}" if "triton" in times else "n/a"
         print(
             f"| {workload.name} | {gate_kind} | {times['torch']:.2f} | "
-            f"{times['triton']:.2f} | {times['cuda']:.2f} | "
-            f"{times['triton'] / times['cuda']:.3f}x |"
+            f"{triton_us} | {times['cuda']:.2f} | {reference} | "
+            f"{times[reference] / times['cuda']:.3f}x |"
         )
 
         torch.cuda.empty_cache()
