@@ -217,6 +217,40 @@ class TestMistralDetector(CustomTestCase):
         params = json.loads(full_params)
         self.assertEqual(params["city"], "Tokyo")
 
+    def test_streaming_preserves_brackets_in_plain_prose(self):
+        # A closing bracket in ordinary prose must survive streaming untouched.
+        # Regression: the no-tool-call flush used to run
+        # normal_text.replace(self.eot_token, "") with eot_token == "]", which
+        # deleted every closing bracket ("a[i][j]" -> "a[i[j").
+        for text in (
+            "The list is items[0] and items[1] done.",
+            "See reference [1] and [2] for details.",
+            "Compute a[i][j] = b[k].",
+        ):
+            detector = MistralDetector()
+            streamed = ""
+            for i in range(0, len(text), 4):
+                streamed += detector.parse_streaming_increment(
+                    text[i : i + 4], self.tools
+                ).normal_text
+            self.assertEqual(streamed, text)
+
+    def test_streaming_bracket_prose_then_tool_call(self):
+        # Prose brackets are preserved AND a following real tool call still
+        # parses, with no stray "]" leaking into the normal text.
+        detector = MistralDetector()
+        text = 'Here is data[0]. [TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}'
+        normal = ""
+        calls = []
+        for i in range(0, len(text), 3):
+            result = detector.parse_streaming_increment(text[i : i + 3], self.tools)
+            normal += result.normal_text
+            calls.extend(result.calls)
+        self.assertEqual(normal, "Here is data[0]. ")
+        func_calls = [c for c in calls if c.name]
+        self.assertEqual(len(func_calls), 1)
+        self.assertEqual(func_calls[0].name, "get_weather")
+
 
 if __name__ == "__main__":
     import unittest
