@@ -639,6 +639,11 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
+        # NOTE: seq_lens_cpu_int is intentionally left None for
+        # target_verify/draft_extend_v2 so forward_mtp binds
+        # seq_lens_cpu_list (Python list) to the v2 operator's Host-side
+        # IntArray actual_seq_kvlen — only a list can be rebound by
+        # graph.update on replay; a CPU tensor gets baked as a constant.
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             metadata.actual_seq_lengths_q = torch.arange(
                 self.speculative_num_draft_tokens,
@@ -740,7 +745,23 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables_swa[bs:, :].fill_(0)
 
             # Update SWA mask: True = masked out (don't attend), False = attend
-            seq_lens_int = seq_lens[:bs].int()
+            # [FIX] For DFlash target verify, the main model verifies draft
+            # tokens whose KV (positions [prefix, prefix+block_size)) must
+            # NOT be masked out. seq_lens is prefix only for DFlash verify
+            # (unlike Eagle where speculative_num_draft_tokens is already
+            # added to seq_lens above). Use seq_lens_cpu (= prefix +
+            # block_size) for DFlash verify so the SWA mask covers draft
+            # token KV positions; otherwise the SWA layer masks out the
+            # draft tokens and the main model produces wrong verify output.
+            if (
+                forward_mode.is_target_verify()
+                and _is_dflash_verify(spec_info)
+                and seq_lens_cpu is not None
+            ):
+                seq_lens_for_swa = seq_lens_cpu[:bs]
+            else:
+                seq_lens_for_swa = seq_lens[:bs]
+            seq_lens_int = seq_lens_for_swa.int()
             starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
             indices = self.graph_metadata["swa_indices"]
             start_exp = starts.unsqueeze(1)
@@ -761,7 +782,17 @@ class AscendAttnBackend(AttentionBackend):
         if forward_mode.is_target_verify():
             # [FIX] seq_lens already had speculative_num_draft_tokens added
             # earlier (before SWA mask computation). Just update cpu_list.
-            metadata.seq_lens_cpu_list = seq_lens[:bs].cpu().int().tolist()
+            if _is_dflash_verify(spec_info):
+                # DFlash verify: the draft model just wrote block_size tokens
+                # into the KV pool. actual_seq_kvlen (read from
+                # seq_lens_cpu_list by forward_mtp and fed to graph.update)
+                # must cover those draft tokens, so use seq_lens_cpu
+                # (= prefix + block_size). Do NOT mutate seq_lens itself:
+                # the SWA mask and metadata.seq_lens still use prefix.
+                kv_lens = seq_lens_cpu[:bs]
+            else:
+                kv_lens = seq_lens[:bs]
+            metadata.seq_lens_cpu_list = kv_lens.cpu().int().tolist()
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
@@ -2016,6 +2047,11 @@ class AscendAttnBackend(AttentionBackend):
                 query = query[: forward_batch.num_token_non_padded_cpu]
 
             if self.forward_metadata.seq_lens_cpu_int is None:
+                # Graph-mode target_verify path: seq_lens_cpu_int is None, so
+                # use seq_lens_cpu_list (Python list). The v2 operator's
+                # actual_seq_kvlen is a Host-side IntArray; graph.update can
+                # rebind a list on replay, while a CPU tensor captured at
+                # capture time gets baked as a constant.
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
             else:
                 actual_seq_lengths_kv = (
@@ -2027,6 +2063,10 @@ class AscendAttnBackend(AttentionBackend):
                     np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
                 )
             else:
+                # actual_seq_qlen is static in graph mode ([spec_draft,
+                # 2*spec_draft, ...]): the values never change across
+                # replays, so a numpy array is safe (a device tensor here
+                # would trigger a stream sync during capture).
                 actual_seq_lengths = np.arange(
                     self.speculative_num_draft_tokens,
                     self.speculative_num_draft_tokens + query.shape[0],

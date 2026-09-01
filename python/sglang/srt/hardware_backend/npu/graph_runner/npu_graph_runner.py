@@ -133,6 +133,9 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
             AttentionArch.MLA: [],
             AttentionArch.MHA: torch.Tensor(),
+            # TARGET_VERIFY must use a Python list: the v2 operator's
+            # actual_seq_kvlen is a Host-side IntArray, so graph.update can
+            # only rebind it when it was captured as a list (seq_lens_cpu_list).
             "TARGET_VERIFY": [],
         }
 
@@ -275,6 +278,24 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 forward_batch.req_pool_indices[: self.raw_bs]
             )
             self.buffers.req_pool_indices[self.raw_bs : self.bs].fill_(0)
+            # [FIX] The captured graph binds this static buffer (via
+            # forward_batch.out_cache_loc at capture) for full-pool KV writes
+            # in save_kv_cache. The DFlash verify batch takes this pre-planned
+            # path (load_batch/fill_from is skipped), so without this copy
+            # replay writes verify KV to stale capture-time slots while
+            # block_table points at the real (never-written) slots — logits
+            # drift accumulates per verify iteration. The DFlash draft is
+            # frozen-KV (never writes KV), hence draft outputs were unaffected.
+            # Zero the padded tail to match the registry ZERO padding policy.
+            if forward_batch.out_cache_loc is not None:
+                _padded_num_token = self.bs * self.captured_req_width
+                _n = min(
+                    self.raw_num_token, forward_batch.out_cache_loc.shape[0]
+                )
+                self.buffers.out_cache_loc[:_n].copy_(
+                    forward_batch.out_cache_loc[:_n]
+                )
+                self.buffers.out_cache_loc[_n:_padded_num_token].zero_()
             fb_view = build_replay_fb_view(
                 forward_batch=forward_batch,
                 buffers=self.buffers,
