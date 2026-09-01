@@ -125,19 +125,17 @@ def _returned_field_names(function):
             and node.func.value.id in returned
         ):
             names |= {kw.arg for kw in node.keywords if kw.arg}
-            receiver = node.func.value
-            if isinstance(receiver, ast.Name) and receiver.id == "overrides":
-                # Positional dict literals are collected by the Dict walk;
-                # anything else is invisible.
-                for arg in node.args:
-                    if not isinstance(arg, ast.Dict):
-                        raise AssertionError(
-                            f"opaque overrides.update() argument in {function.name}"
-                        )
-                if any(kw.arg is None for kw in node.keywords):
-                    raise AssertionError(
-                        f"**kwargs overrides.update() in {function.name}"
-                    )
+            # A positional dict literal has to be read here. The Dict walk above
+            # only reaches literals that are *returned* or assigned to a returned
+            # name, so `d.update({"field": value})` was being type-checked and
+            # then dropped -- silently, under a comment claiming otherwise.
+            for arg in node.args:
+                if isinstance(arg, ast.Dict):
+                    top_level_keys(arg)
+                else:
+                    raise AssertionError(f"opaque update() argument in {function.name}")
+            if any(kw.arg is None for kw in node.keywords):
+                raise AssertionError(f"**kwargs update() in {function.name}")
     return names
 
 
@@ -151,12 +149,28 @@ def _declared_by_registry_and_passes():
     `@register_model_override*` sees exactly one of them and reports a healthy
     census over a channel it cannot see.
     """
+    import sys
+
     from sglang.srt.arg_groups import overrides
 
-    tree = ast.parse((_SRT / "arg_groups/overrides.py").read_text(encoding="utf-8-sig"))
-    bodies = {
-        node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
-    }
+    # Resolve each callable's body in the file it actually lives in. The
+    # declarations are spread over `arg_groups/model_overrides/`, one module per
+    # model family, and a scan hard-coded to `overrides.py` would find none of
+    # them -- and, worse, would keep reporting a healthy census while doing it.
+    bodies_by_module = {}
+
+    def _bodies(module_name):
+        if module_name not in bodies_by_module:
+            path = getattr(sys.modules[module_name], "__file__", None)
+            assert path, f"{module_name} has no source file"
+            module_tree = ast.parse(pathlib.Path(path).read_text(encoding="utf-8-sig"))
+            bodies_by_module[module_name] = {
+                node.name: node
+                for node in ast.walk(module_tree)
+                if isinstance(node, ast.FunctionDef)
+            }
+        return bodies_by_module[module_name]
+
     callables = {fn for fns in overrides._MODEL_OVERRIDE_FNS.values() for fn in fns}
     callables |= {
         fn for _predicate, fn in getattr(overrides, "_PREDICATE_OVERRIDE_FNS", ())
@@ -165,11 +179,23 @@ def _declared_by_registry_and_passes():
 
     fields = set()
     for fn in callables:
-        body = bodies.get(getattr(fn, "__name__", ""))
-        if body is not None:
-            fields |= _returned_field_names(body)
+        name = getattr(fn, "__name__", "")
+        body = _bodies(fn.__module__).get(name)
+        # Loud, not silent: a body this scan cannot find is a field census it
+        # is not taking, and a narrower census makes every check downstream of
+        # it quietly vacuous.
+        assert body is not None, f"{fn.__module__}.{name} has no body to scan"
+        fields |= _returned_field_names(body)
+
     # The literal arch -> {field: value} table, which has no callable at all.
-    for node in tree.body:
+    # It lives with the rest of the registry, in `model_override_base`.
+    from sglang.srt.arg_groups import model_override_base
+
+    table_tree = ast.parse(
+        pathlib.Path(model_override_base.__file__).read_text(encoding="utf-8-sig")
+    )
+    seen_table = False
+    for node in table_tree.body:
         target = None
         if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
             target = node.targets[0].id
@@ -186,6 +212,8 @@ def _declared_by_registry_and_passes():
                 if not isinstance(key, ast.Constant):
                     raise AssertionError("non-literal override key")
                 fields.add(key.value)
+        seen_table = True
+    assert seen_table, "MODEL_OVERRIDES is not where this scan looks for it"
     return fields
 
 

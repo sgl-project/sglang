@@ -31,7 +31,7 @@ def _expected_chunks(prompt_len: int, chunk_size: int) -> int:
 def _drain_until_released(t, *handles):
     for _ in range(16):
         if all(
-            h.kv_pages == 0 and (h.req is None or h.req.req_pool_idx is None)
+            h.kv_pages == 0 and (h.req is None or h.req.kv.req_pool_idx is None)
             for h in handles
         ):
             return

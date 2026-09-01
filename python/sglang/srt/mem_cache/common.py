@@ -62,7 +62,7 @@ def free_swa_out_of_window_slots(
     is_chunk_cache: bool = False,
     retain_floor: int | None = None,
 ) -> None:
-    if not req.is_holding_kv:
+    if not req.kv.holds_kv:
         return
 
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
@@ -99,9 +99,23 @@ def free_swa_out_of_window_slots(
 
     if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
         free_slots = req_to_token_pool.req_to_token[
-            req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
+            req.kv.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
-        token_to_kv_pool_allocator.free_swa(free_slots)
+        # Local import: multi_ended_allocator imports this module lazily for
+        # eviction; a module-level import here would be a cycle hazard.
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            UnifiedSWATokenToKVPoolAllocator,
+        )
+
+        if isinstance(token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator):
+            # Contiguous range with host-int bounds: hand the composite its
+            # start position so the free stays host-sync-free (`free_segment`
+            # derives page reps by stride math instead of `torch.unique`).
+            token_to_kv_pool_allocator.free_swa(
+                free_slots, start_pos=req.kv.swa_evicted_seqlen
+            )
+        else:
+            token_to_kv_pool_allocator.free_swa(free_slots)
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
@@ -159,8 +173,8 @@ def retraction_backup(
         return True
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    req.retraction_backup = unified_cache.retraction_backup(req)
-    return req.retraction_backup is not None
+    req.kv.retraction_backup = unified_cache.retraction_backup(req)
+    return req.kv.retraction_backup is not None
 
 
 def retraction_restore(
@@ -179,38 +193,38 @@ def retraction_restore(
         return
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    assert req.retraction_backup is not None
-    unified_cache.retraction_restore(req, req.retraction_backup)
-    req.retraction_backup = None
+    assert req.kv.retraction_backup is not None
+    unified_cache.retraction_restore(req, req.kv.retraction_backup)
+    req.kv.retraction_backup = None
 
 
 def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> None:
     if backend == "cpu_tensor":
-        req.retraction_backup = None
+        req.kv.retraction_backup = None
         return
     if backend != "host_pool":
         raise ValueError(f"Unknown retraction backup backend: {backend}")
-    if req.retraction_backup is None:
+    if req.kv.retraction_backup is None:
         return
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    unified_cache.retraction_discard(req.retraction_backup)
-    req.retraction_backup = None
+    unified_cache.retraction_discard(req.kv.retraction_backup)
+    req.kv.retraction_backup = None
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-    assert (not req.is_holding_kv) == req.kv.is_released
+    assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # MambaRadixCache may alloc mamba state before alloc KV cache
-    if not req.is_holding_kv:
+    if not req.kv.holds_kv:
         assert (
             tree_cache.supports_mamba()
         ), "Only MambaRadixCache allow freeing before alloc"
         # TODO (csy, hanming): clean up this early allocation logic
-        if req.mamba_pool_idx is not None:
+        if req.kv.holds_mamba:
             tree_cache.req_to_token_pool.mamba_allocator.free(
-                req.mamba_pool_idx.unsqueeze(-1)
+                req.kv.mamba_pool_idx.unsqueeze(-1)
             )
-            req.mamba_pool_idx = None
+            req.kv.mamba_pool_idx = None
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
@@ -222,8 +236,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     # StreamingSession.cache_finished_req handles speculative tail trim
     # internally, then sets req_pool_idx = None.
-    assert (not req.is_holding_kv) == req.kv.is_released
-    if not req.is_holding_kv:
+    assert (not req.kv.holds_kv) == req.kv.is_kv_released
+    if not req.kv.holds_kv:
         return
 
     start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
@@ -234,13 +248,13 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         not tree_cache.supports_mamba()
     ):
         assert (
-            req.mamba_pool_idx is not None
+            req.kv.holds_mamba
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     tree_cache.req_to_token_pool.free(req)
-    req.kv.mark_released()
+    req.kv.mark_kv_released()
 
 
 def _release_overallocated_kv_indices(
@@ -255,15 +269,15 @@ def _release_overallocated_kv_indices(
     if spec_algo is None and not get_serving().strip_thinking_cache:
         assert (
             start_p == end_p
-        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
+        ), f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
 
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
 
     if start_p < end_p:
-        indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
-            start_p:end_p
-        ]
+        indices_to_free = tree_cache.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx
+        ][start_p:end_p]
         # start_p is aligned to the allocator's physical page size above, so it
         # never shares a page with cache_finished_req's tail free in this group.
         allocator.free_segment(indices_to_free, start_pos=start_p)

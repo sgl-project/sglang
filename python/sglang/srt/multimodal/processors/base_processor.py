@@ -5,6 +5,7 @@ import dataclasses
 import multiprocessing as mp
 import os
 import re
+import threading
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import (
@@ -40,7 +41,10 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
 )
-from sglang.srt.runtime_context import get_mm, get_serving
+from sglang.srt.runtime_context import (
+    get_mm,
+    get_serving,
+)
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     configure_media_url_security,
@@ -364,13 +368,8 @@ class BaseMultimodalProcessor(ABC):
                 self.mm_processor_worker_num,
                 "auto" if requested_mm_processor_worker_num == 0 else "explicit",
             )
-        cpu_worker_start_method = (
-            "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
-        )
-        self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
-            mp_context=mp.get_context(cpu_worker_start_method),
-            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
-        )
+        self._cpu_executor_lock = threading.Lock()
+        self.cpu_executor = self._create_cpu_executor()
 
         # Mapping from attribute names to modality types
         self.ATTR_NAME_TO_MODALITY = {
@@ -489,6 +488,41 @@ class BaseMultimodalProcessor(ABC):
         self.cpu_executor.shutdown(wait=False, cancel_futures=True)
         if self.mm_processor_executor is not None:
             self.mm_processor_executor.shutdown()
+
+    def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
+        start_method = "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
+        return concurrent.futures.ProcessPoolExecutor(
+            mp_context=mp.get_context(start_method),
+            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+        )
+
+    def _replace_broken_cpu_executor(
+        self, failed_executor: concurrent.futures.ProcessPoolExecutor
+    ) -> None:
+        """Replace a failed preprocess pool once across concurrent requests."""
+        with self._cpu_executor_lock:
+            if self.cpu_executor is not failed_executor:
+                return
+            self.cpu_executor = self._create_cpu_executor()
+        logger.warning("Replaced a broken multimodal CPU preprocess pool")
+        threading.Thread(
+            target=self._shutdown_broken_cpu_executor,
+            args=(failed_executor,),
+            name="sglang-mm-cpu-pool-cleanup",
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _shutdown_broken_cpu_executor(
+        failed_executor: concurrent.futures.ProcessPoolExecutor,
+    ) -> None:
+        try:
+            failed_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            logger.warning(
+                "Failed to shut down a broken multimodal CPU preprocess pool",
+                exc_info=True,
+            )
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.
@@ -663,6 +697,8 @@ class BaseMultimodalProcessor(ABC):
         if _is_xpu:
             return "xpu"
         if not _is_npu:
+            # Per-worker placement travels as a constructor argument, and
+            # this record is that argument.
             return f"cuda:{server_args.base_gpu_id}"
         if processor.__class__.__name__ == "MiniMaxVLProcessor":
             # MiniMax's image/video processors create 10-dim tensors during
@@ -858,11 +894,8 @@ class BaseMultimodalProcessor(ABC):
                 img, _ = load_image(data, cls.gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
-                # PIL decodes lazily; do it here in the io worker so the decode
-                # doesn't run later on the event-loop thread.
                 if discard_alpha_channel and img.mode != "RGB":
                     return img.convert("RGB")
-                img.load()
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
