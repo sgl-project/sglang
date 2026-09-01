@@ -199,8 +199,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
+        self._tree_core_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
         self.tree_core = create_tree_core(
-            name=envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(),
+            name=self._tree_core_backend,
             params=params,
             components=self.components,
         )
@@ -386,6 +387,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
+            # TODO(Jialin): Extend buffer-only state handoff to Mamba in a
+            # follow-up to #34798 and #35769.
             # FULL and FULL+SWA only: Mamba has no state-handoff channel on
             # the admission-time load-back read path and is not layer-gated.
             # Lifting the fence also needs the admission charge: a staged
@@ -839,10 +842,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, :kv_len_to_handle
-            ]
-            self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
+            self.free_kv_row(req.kv, [(0, kv_len_to_handle)])
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
@@ -896,15 +896,12 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.insert(insert_params)
 
             # Free unaligned tail (+ deferred truncation tail)
-            segments = [(kv_indices[page_aligned_len:], page_aligned_len)]
+            ranges = [(page_aligned_len, len(kv_indices))]
             if tail_free_start is not None:
-                segments.append((kv_indices_full[tail_free_start:], tail_free_start))
-            self.token_to_kv_pool_allocator.free_segments(segments)
+                ranges.append((tail_free_start, len(kv_indices_full)))
+            self.free_kv_row(req.kv, ranges)
         else:
-            self.token_to_kv_pool_allocator.free_segment(
-                kv_indices[req.kv.cache_protected_len :],
-                start_pos=req.kv.cache_protected_len,
-            )
+            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
 
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
 
@@ -1340,9 +1337,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # FIFO ordering instead (BackupKV chains are parent-before-child
             # and every pipeline stage drains in order).
             for node_id in action.node_ids:
-                self.buffer_pipeline.enqueue_backup_intent(
-                    self.tree_core.node_by_id(node_id)
-                )
+                self.buffer_pipeline.enqueue_backup_intent(node_id)
             return 0
         written = 0
         for node_id in action.node_ids:
@@ -3120,3 +3115,6 @@ class UnifiedRadixCache(BasePrefixCache):
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
         return self.tree_core.root_node_handle(extra_key)
+
+    def dfs_weight_order(self, node_handles: Sequence[NodeId]) -> list[int]:
+        return self.tree_core.dfs_weight_order(node_handles)

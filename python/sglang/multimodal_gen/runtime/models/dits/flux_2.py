@@ -23,13 +23,20 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
+    can_defer_flux2_gated_residual,
+    can_use_flux2_gated_resnorm,
     can_use_fused_layernorm_modulate,
+    flux2_gated_resnorm_raw,
+    fused_layernorm_modulate_fp8_quant_raw,
     fused_layernorm_modulate_raw,
     fused_packed_silu_mul_bitexact,
     is_plain_layer_norm,
     residual_gate_add,
+    try_flux2_token_cat_fp8,
     try_flux2_token_cat_nvfp4,
+    try_fused_flux2_qkv_epilogue,
 )
+from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -60,6 +67,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
+    ModelOptFp8Config,
+    ModelOptFp8LinearMethod,
     apply_nvfp4_gemm_prequantized,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
@@ -86,6 +95,164 @@ assert _FLUX2_LN_MOD_SIGS is not None
 _FLUX2_SWIGLU = BitExactFusionGate("FLUX.2 fused SwiGLU", per_signature=True)
 _FLUX2_SWIGLU_SIGS = _FLUX2_SWIGLU.verified_sigs
 assert _FLUX2_SWIGLU_SIGS is not None
+_FLUX2_LN_FP8 = BitExactFusionGate(
+    "FLUX.2 fused LN+modulate+FP8 quant", per_signature=True
+)
+_FLUX2_LN_FP8_SIGS = _FLUX2_LN_FP8.verified_sigs
+assert _FLUX2_LN_FP8_SIGS is not None
+
+
+def _valid_modelopt_fp8_linear(linear: nn.Module) -> bool:
+    input_scale = getattr(linear, "input_scale", None)
+    return (
+        isinstance(getattr(linear, "quant_method", None), ModelOptFp8LinearMethod)
+        and isinstance(input_scale, torch.Tensor)
+        and input_scale.is_cuda
+        and input_scale.dtype == torch.float32
+        and input_scale.numel() == 1
+        and input_scale.is_contiguous()
+        and bool(torch.isfinite(input_scale).all().item())
+        and bool((input_scale > 0).all().item())
+    )
+
+
+def _shared_modelopt_fp8_scale(linears: list[nn.Module]) -> bool:
+    if not all(_valid_modelopt_fp8_linear(linear) for linear in linears):
+        return False
+    reference = linears[0].input_scale
+    return all(torch.equal(reference, linear.input_scale) for linear in linears[1:])
+
+
+def _try_flux2_norm_modulate_fp8(
+    norm: nn.Module,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    input_scale: Optional[torch.Tensor],
+    *,
+    enabled: bool,
+) -> Optional[torch.Tensor]:
+    """Return the exact prequantized FP8 projection input when eligible."""
+    if not enabled or torch.compiler.is_compiling():
+        return None
+
+    scale_row = scale.squeeze(1) if scale.dim() == 3 and scale.shape[1] == 1 else scale
+    shift_row = shift.squeeze(1) if shift.dim() == 3 and shift.shape[1] == 1 else shift
+    if (
+        _FLUX2_LN_FP8.disabled
+        or x.shape[-1] != 6144
+        or not is_plain_layer_norm(norm, x.shape[-1])
+        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+    ):
+        return None
+
+    sig = (
+        x.dtype,
+        x.device,
+        x.shape[0],
+        x.shape[-1],
+        x.stride(-1),
+        scale_row.stride(0) if scale_row.shape[0] > 1 else x.shape[-1],
+        shift_row.stride(0) if shift_row.shape[0] > 1 else x.shape[-1],
+        norm.eps,
+    )
+    verified = sig in _FLUX2_LN_FP8_SIGS
+    if not verified and torch.cuda.is_current_stream_capturing():
+        return None
+    try:
+        out = fused_layernorm_modulate_fp8_quant_raw(
+            x, scale_row, shift_row, input_scale, norm.eps
+        )
+    except Exception as exc:
+        _FLUX2_LN_FP8.on_exception(exc, logger=logger)
+        return None
+    if verified:
+        return out
+
+    reference_bf16 = _flux2_norm_modulate(norm, x, scale, shift)
+    reference, _ = static_quant_fp8(reference_bf16, input_scale)
+    return _FLUX2_LN_FP8.accept_or_fallback(
+        out,
+        reference,
+        sig=sig,
+        logger=logger,
+        mismatch_msg=(
+            "FLUX.2 fused LN+modulate+FP8 quant fast path is not bit-exact "
+            "on this platform; falling back to the split path"
+        ),
+    )
+
+
+PendingGatedResidual = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+def _materialize_gated_residual(pending: PendingGatedResidual) -> torch.Tensor:
+    residual, update, gate = pending
+    return residual_gate_add(residual, update, gate)
+
+
+def _defer_gated_residual(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor | PendingGatedResidual:
+    if can_defer_flux2_gated_residual(residual, update, gate):
+        return residual, update, gate
+    return residual_gate_add(residual, update, gate)
+
+
+def _flux2_gated_resnorm(
+    norm: nn.Module,
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if is_plain_layer_norm(norm, residual.shape[-1]) and can_use_flux2_gated_resnorm(
+        residual, update, gate, scale, shift
+    ):
+        return flux2_gated_resnorm_raw(residual, update, gate, scale, shift, norm.eps)
+
+    residual = residual_gate_add(residual, update, gate)
+    return _flux2_norm_modulate(norm, residual, scale, shift), residual
+
+
+def _flux2_norm_maybe_fp8(
+    norm: nn.Module,
+    hidden_states: torch.Tensor | PendingGatedResidual,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    input_scale: Optional[torch.Tensor],
+    *,
+    fp8_enabled: bool,
+    update: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(norm_hidden_states, residual_hidden_states)``.
+
+    Uses fused gated residual-norm when a pending residual is present or when
+    ``update``/``gate`` are supplied. When the FP8 producer is enabled, the
+    residual is materialized first so LN+modulate+FP8 can write the GEMM input.
+    """
+    if isinstance(hidden_states, tuple):
+        residual, pending_update, pending_gate = hidden_states
+        if fp8_enabled:
+            hidden_states = residual_gate_add(residual, pending_update, pending_gate)
+        else:
+            return _flux2_gated_resnorm(
+                norm, residual, pending_update, pending_gate, scale, shift
+            )
+    elif update is not None and gate is not None:
+        if fp8_enabled:
+            hidden_states = residual_gate_add(hidden_states, update, gate)
+        else:
+            return _flux2_gated_resnorm(norm, hidden_states, update, gate, scale, shift)
+
+    norm_hidden_states = _try_flux2_norm_modulate_fp8(
+        norm, hidden_states, scale, shift, input_scale, enabled=fp8_enabled
+    )
+    if norm_hidden_states is None:
+        norm_hidden_states = _flux2_norm_modulate(norm, hidden_states, scale, shift)
+    return norm_hidden_states, hidden_states
 
 
 def _flux2_norm_modulate(
@@ -280,13 +447,22 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
 
-        # Some FLUX.2 NVFP4 checkpoints store Q/K/V packed as a single tensor, while
-        # ModelOpt's standard diffusers export keeps the original to_q/to_k/to_v layout.
-        # Only enable the fused loader path for the packed checkpoint family.
-        self.use_fused_qkv = isinstance(quant_config, ModelOptFp4Config) and getattr(
+        # Packed NVFP4 checkpoints already serialize QKV together. ModelOpt
+        # FP8 exports separate Diffusers tensors, but the loader can merge
+        # those tensors losslessly and execute one channelwise-CUTLASS GEMM.
+        fp4_packed_qkv = isinstance(quant_config, ModelOptFp4Config) and getattr(
             quant_config, "checkpoint_uses_packed_qkv", False
         )
+        capability = current_platform.get_device_capability()
+        fp8_merged_qkv = (
+            isinstance(quant_config, ModelOptFp8Config)
+            and self.tp_size == 1
+            and capability is not None
+            and capability.major >= 10
+        )
+        self.use_fused_qkv = fp4_packed_qkv or fp8_merged_qkv
         self.use_fused_added_qkv = self.use_fused_qkv
+        self.use_fused_qkv_epilogue = fp8_merged_qkv
 
         if self.use_fused_qkv:
             self.to_qkv = MergedColumnParallelLinear(
@@ -344,13 +520,14 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
             if self.use_fused_added_qkv:
-                # txt_attn.qkv is always BF16 in the NVFP4 checkpoint — no quant needed
+                # txt_attn.qkv is BF16 in the packed NVFP4 checkpoint, while
+                # ModelOpt FP8 keeps it quantized like the image projection.
                 self.to_added_qkv = MergedColumnParallelLinear(
                     added_kv_proj_dim,
                     [self.inner_dim] * 3,
                     bias=added_proj_bias,
                     gather_output=False,
-                    quant_config=None,
+                    quant_config=None if fp4_packed_qkv else quant_config,
                     prefix=f"{prefix}.to_added_qkv" if prefix else "to_added_qkv",
                 )
             else:
@@ -412,7 +589,12 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             encoder_query,
             encoder_key,
             encoder_value,
-        ) = _get_qkv_projections(self, hidden_states, encoder_hidden_states)
+        ) = _get_qkv_projections(
+            self,
+            hidden_states,
+            encoder_hidden_states,
+            make_contiguous=not self.use_fused_qkv_epilogue,
+        )
 
         query = query.unflatten(-1, (self.local_heads, -1))
         key = key.unflatten(-1, (self.local_heads, -1))
@@ -429,41 +611,78 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 dim=-1,
             )
 
+        joint_qkv = None
+        sp_txt_pad = 0
         if self.added_kv_proj_dim is not None:
             encoder_query = encoder_query.unflatten(-1, (self.local_heads, -1))
             encoder_key = encoder_key.unflatten(-1, (self.local_heads, -1))
             encoder_value = encoder_value.unflatten(-1, (self.local_heads, -1))
 
             text_seq_len = encoder_query.shape[1]
-            encoder_query, encoder_key = apply_qk_norm_with_optional_rope(
-                q=encoder_query,
-                k=encoder_key,
-                q_norm=self.norm_added_q,
-                k_norm=self.norm_added_k,
-                head_dim=self.head_dim,
-                cos_sin_cache=cos_sin_cache,
-                is_neox=False,
-                allow_inplace=True,
-            )
-            query, key = apply_qk_norm_with_optional_rope(
-                q=query,
-                k=key,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=self.head_dim,
-                cos_sin_cache=cos_sin_cache,
-                is_neox=False,
-                position_offset=text_seq_len,
-                allow_inplace=True,
-            )
-
             # join_seqs relocates any SP text tail-pad behind the image (see
             # sp_shard.join_seqs for why).
             sp_txt_pad = (attn_mask_meta or {}).get("local_pad", 0)
-            query = join_seqs(encoder_query, query, sp_txt_pad)
-            key = join_seqs(encoder_key, key, sp_txt_pad)
-            value = join_seqs(encoder_value, value, sp_txt_pad)
+            if (
+                self.use_fused_qkv_epilogue
+                and cos_sin_cache is not None
+                and sp_txt_pad == 0
+            ):
+                joint_qkv = try_fused_flux2_qkv_epilogue(
+                    query,
+                    key,
+                    value,
+                    encoder_query,
+                    encoder_key,
+                    encoder_value,
+                    self.norm_q.weight,
+                    self.norm_k.weight,
+                    self.norm_added_q.weight,
+                    self.norm_added_k.weight,
+                    cos_sin_cache,
+                    self.norm_q.variance_epsilon,
+                    self.norm_added_q.variance_epsilon,
+                )
+
+            if joint_qkv is None:
+                if self.use_fused_qkv_epilogue:
+                    query, key, value = [
+                        tensor.contiguous() for tensor in (query, key, value)
+                    ]
+                    encoder_query, encoder_key, encoder_value = [
+                        tensor.contiguous()
+                        for tensor in (encoder_query, encoder_key, encoder_value)
+                    ]
+                encoder_query, encoder_key = apply_qk_norm_with_optional_rope(
+                    q=encoder_query,
+                    k=encoder_key,
+                    q_norm=self.norm_added_q,
+                    k_norm=self.norm_added_k,
+                    head_dim=self.head_dim,
+                    cos_sin_cache=cos_sin_cache,
+                    is_neox=False,
+                    allow_inplace=True,
+                )
+                query, key = apply_qk_norm_with_optional_rope(
+                    q=query,
+                    k=key,
+                    q_norm=self.norm_q,
+                    k_norm=self.norm_k,
+                    head_dim=self.head_dim,
+                    cos_sin_cache=cos_sin_cache,
+                    is_neox=False,
+                    position_offset=text_seq_len,
+                    allow_inplace=True,
+                )
+                query = join_seqs(encoder_query, query, sp_txt_pad)
+                key = join_seqs(encoder_key, key, sp_txt_pad)
+                value = join_seqs(encoder_value, value, sp_txt_pad)
+            else:
+                query, key, value = joint_qkv
         else:
+            if self.use_fused_qkv_epilogue:
+                query, key, value = [
+                    tensor.contiguous() for tensor in (query, key, value)
+                ]
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
                 k=key,
@@ -578,6 +797,9 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             quant_config=quant_config,
             prefix=f"{prefix}.to_out" if prefix else "to_out",
         )
+        self._enable_fp8_token_cat = self.tp_size == 1 and isinstance(
+            self.to_out.quant_method, ModelOptFp8LinearMethod
+        )
         self._enable_nvfp4_token_cat = False
         capability = current_platform.get_device_capability()
         if (
@@ -688,25 +910,33 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         # Handle the feedforward (FF) logic
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
 
-        # Concatenate and parallel output projection. On SM103 NVFP4 the
-        # producer writes the concatenated packed values and swizzled scales
-        # directly, avoiding a full-width BF16 cat materialization.
+        # Concatenate and parallel output projection. FP8 writes a packed
+        # GEMM input; SM103 NVFP4 writes packed values and swizzled scales.
+        # Both avoid a full-width BF16 cat materialization.
         output_shape = (*hidden_states.shape[:-1], self.out_dim)
+        quantized = None
         packed = None
-        if self._enable_nvfp4_token_cat:
+        if self._enable_fp8_token_cat:
+            quantized = try_flux2_token_cat_fp8(
+                hidden_states, mlp_hidden_states, self.to_out.input_scale
+            )
+        elif self._enable_nvfp4_token_cat:
             packed = try_flux2_token_cat_nvfp4(
                 hidden_states, mlp_hidden_states, self.to_out.input_scale_inv
             )
-        if packed is None:
-            hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+        if quantized is not None:
+            hidden_states = quantized
             hidden_states, _ = self.to_out(hidden_states)
-        else:
+        elif packed is not None:
             hidden_states = apply_nvfp4_gemm_prequantized(
                 self.to_out,
                 *packed,
                 output_dtype=hidden_states.dtype,
                 bias=self.to_out.bias,
             ).view(*output_shape)
+        else:
+            hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+            hidden_states, _ = self.to_out(hidden_states)
 
         return hidden_states
 
@@ -745,10 +975,14 @@ class Flux2SingleTransformerBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn" if prefix else "attn",
         )
+        self._fp8_norm_quant = False
+
+    def configure_fp8_norm_quant(self) -> None:
+        self._fp8_norm_quant = _valid_modelopt_fp8_linear(self.attn.to_qkv_mlp_proj)
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | PendingGatedResidual,
         encoder_hidden_states: Optional[torch.Tensor],
         temb_mod_params: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -756,17 +990,23 @@ class Flux2SingleTransformerBlock(nn.Module):
         split_hidden_states: bool = False,
         text_seq_len: Optional[int] = None,
         num_replicated_prefix: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | PendingGatedResidual:
         # If encoder_hidden_states is None, hidden_states is assumed to have encoder_hidden_states already
         # concatenated
         if encoder_hidden_states is not None:
+            assert isinstance(hidden_states, torch.Tensor)
             text_seq_len = encoder_hidden_states.shape[1]
             hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         mod_shift, mod_scale, mod_gate = temb_mod_params
 
-        norm_hidden_states = _flux2_norm_modulate(
-            self.norm, hidden_states, mod_scale, mod_shift
+        norm_hidden_states, hidden_states = _flux2_norm_maybe_fp8(
+            self.norm,
+            hidden_states,
+            mod_scale,
+            mod_shift,
+            (self.attn.to_qkv_mlp_proj.input_scale if self._fp8_norm_quant else None),
+            fp8_enabled=self._fp8_norm_quant,
         )
 
         joint_attention_kwargs = joint_attention_kwargs or {}
@@ -777,11 +1017,16 @@ class Flux2SingleTransformerBlock(nn.Module):
             **joint_attention_kwargs,
         )
 
-        hidden_states = residual_gate_add(hidden_states, attn_output, mod_gate)
-        if hidden_states.dtype == torch.float16:
+        hidden_states = _defer_gated_residual(hidden_states, attn_output, mod_gate)
+        if (
+            isinstance(hidden_states, torch.Tensor)
+            and hidden_states.dtype == torch.float16
+        ):
             hidden_states = hidden_states.clip(-65504, 65504)
 
         if split_hidden_states:
+            if isinstance(hidden_states, tuple):
+                hidden_states = _materialize_gated_residual(hidden_states)
             encoder_hidden_states, hidden_states = (
                 hidden_states[:, :text_seq_len],
                 hidden_states[:, text_seq_len:],
@@ -844,11 +1089,41 @@ class Flux2TransformerBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.ff_context" if prefix else "ff_context",
         )
+        self._fp8_img_attn_norm_quant = False
+        self._fp8_txt_attn_norm_quant = False
+        self._fp8_img_ff_norm_quant = False
+        self._fp8_txt_ff_norm_quant = False
+
+    def configure_fp8_norm_quant(self) -> None:
+        if self.attn.use_fused_qkv:
+            self._fp8_img_attn_norm_quant = _valid_modelopt_fp8_linear(self.attn.to_qkv)
+        else:
+            self._fp8_img_attn_norm_quant = _shared_modelopt_fp8_scale(
+                [self.attn.to_q, self.attn.to_k, self.attn.to_v]
+            )
+
+        if self.attn.use_fused_added_qkv:
+            self._fp8_txt_attn_norm_quant = _valid_modelopt_fp8_linear(
+                self.attn.to_added_qkv
+            )
+        else:
+            self._fp8_txt_attn_norm_quant = _shared_modelopt_fp8_scale(
+                [
+                    self.attn.add_q_proj,
+                    self.attn.add_k_proj,
+                    self.attn.add_v_proj,
+                ]
+            )
+
+        self._fp8_img_ff_norm_quant = _valid_modelopt_fp8_linear(self.ff.linear_in)
+        self._fp8_txt_ff_norm_quant = _valid_modelopt_fp8_linear(
+            self.ff_context.linear_in
+        )
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | PendingGatedResidual,
+        encoder_hidden_states: torch.Tensor | PendingGatedResidual,
         temb_mod_params_img: Tuple[
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...
         ],
@@ -858,7 +1133,9 @@ class Flux2TransformerBlock(nn.Module):
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         num_replicated_prefix: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor | PendingGatedResidual, torch.Tensor | PendingGatedResidual
+    ]:
         joint_attention_kwargs = joint_attention_kwargs or {}
 
         # Modulation parameters shape: [1, 1, self.dim]
@@ -880,16 +1157,39 @@ class Flux2TransformerBlock(nn.Module):
         ) = temb_mod_params_txt
 
         # Img stream
-        norm_hidden_states = _flux2_norm_modulate(
-            self.norm1, hidden_states, scale_msa, shift_msa
+        norm_hidden_states, hidden_states = _flux2_norm_maybe_fp8(
+            self.norm1,
+            hidden_states,
+            scale_msa,
+            shift_msa,
+            (
+                (
+                    self.attn.to_qkv.input_scale
+                    if self.attn.use_fused_qkv
+                    else self.attn.to_q.input_scale
+                )
+                if self._fp8_img_attn_norm_quant
+                else None
+            ),
+            fp8_enabled=self._fp8_img_attn_norm_quant,
         )
 
         # Conditioning txt stream
-        norm_encoder_hidden_states = _flux2_norm_modulate(
+        norm_encoder_hidden_states, encoder_hidden_states = _flux2_norm_maybe_fp8(
             self.norm1_context,
             encoder_hidden_states,
             c_scale_msa,
             c_shift_msa,
+            (
+                (
+                    self.attn.to_added_qkv.input_scale
+                    if self.attn.use_fused_added_qkv
+                    else self.attn.add_q_proj.input_scale
+                )
+                if self._fp8_txt_attn_norm_quant
+                else None
+            ),
+            fp8_enabled=self._fp8_txt_attn_norm_quant,
         )
 
         # Attention on concatenated img + txt stream
@@ -904,32 +1204,44 @@ class Flux2TransformerBlock(nn.Module):
         attn_output, context_attn_output = attention_outputs
 
         # Process attention outputs for the image stream (`hidden_states`).
-        hidden_states = residual_gate_add(hidden_states, attn_output, gate_msa)
-
-        norm_hidden_states = _flux2_norm_modulate(
-            self.norm2, hidden_states, scale_mlp, shift_mlp
+        norm_hidden_states, hidden_states = _flux2_norm_maybe_fp8(
+            self.norm2,
+            hidden_states,
+            scale_mlp,
+            shift_mlp,
+            (self.ff.linear_in.input_scale if self._fp8_img_ff_norm_quant else None),
+            fp8_enabled=self._fp8_img_ff_norm_quant,
+            update=attn_output,
+            gate=gate_msa,
         )
 
         ff_output = self.ff(norm_hidden_states)
-        hidden_states = residual_gate_add(hidden_states, ff_output, gate_mlp)
+        hidden_states = _defer_gated_residual(hidden_states, ff_output, gate_mlp)
 
         # Process attention outputs for the text stream (`encoder_hidden_states`).
-        encoder_hidden_states = residual_gate_add(
-            encoder_hidden_states, context_attn_output, c_gate_msa
-        )
-
-        norm_encoder_hidden_states = _flux2_norm_modulate(
+        norm_encoder_hidden_states, encoder_hidden_states = _flux2_norm_maybe_fp8(
             self.norm2_context,
             encoder_hidden_states,
             c_scale_mlp,
             c_shift_mlp,
+            (
+                self.ff_context.linear_in.input_scale
+                if self._fp8_txt_ff_norm_quant
+                else None
+            ),
+            fp8_enabled=self._fp8_txt_ff_norm_quant,
+            update=context_attn_output,
+            gate=c_gate_msa,
         )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
-        encoder_hidden_states = residual_gate_add(
+        encoder_hidden_states = _defer_gated_residual(
             encoder_hidden_states, context_ff_output, c_gate_mlp
         )
-        if encoder_hidden_states.dtype == torch.float16:
+        if (
+            isinstance(encoder_hidden_states, torch.Tensor)
+            and encoder_hidden_states.dtype == torch.float16
+        ):
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
 
         return encoder_hidden_states, hidden_states
@@ -1040,7 +1352,45 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     """
 
-    param_names_mapping = FluxConfig().arch_config.param_names_mapping
+    param_names_mapping = {
+        # ModelOpt FP8 exports separate Diffusers projections. Merge Q/K/V and
+        # their static scales into the runtime MergedColumnParallelLinear.
+        r"^(transformer_blocks\.\d+\.attn)\.to_q\.(weight|bias|weight_scale|input_scale)$": (
+            r"\1.to_qkv.\2",
+            0,
+            3,
+        ),
+        r"^(transformer_blocks\.\d+\.attn)\.to_k\.(weight|bias|weight_scale|input_scale)$": (
+            r"\1.to_qkv.\2",
+            1,
+            3,
+        ),
+        r"^(transformer_blocks\.\d+\.attn)\.to_v\.(weight|bias|weight_scale|input_scale)$": (
+            r"\1.to_qkv.\2",
+            2,
+            3,
+        ),
+        r"^(transformer_blocks\.\d+\.attn)\.add_q_proj\.(weight|bias|weight_scale|input_scale)$": (
+            r"\1.to_added_qkv.\2",
+            0,
+            3,
+        ),
+        r"^(transformer_blocks\.\d+\.attn)\.add_k_proj\.(weight|bias|weight_scale|input_scale)$": (
+            r"\1.to_added_qkv.\2",
+            1,
+            3,
+        ),
+        r"^(transformer_blocks\.\d+\.attn)\.add_v_proj\.(weight|bias|weight_scale|input_scale)$": (
+            r"\1.to_added_qkv.\2",
+            2,
+            3,
+        ),
+        **FluxConfig().arch_config.param_names_mapping,
+    }
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "to_added_qkv": ["add_q_proj", "add_k_proj", "add_v_proj"],
+    }
     scale_shift_swap_params = ("norm_out.linear.weight", "norm_out.linear.bias")
     # FLUX.2 stays closer to the official diffusers output with Torch SDPA.
     # The generic FA path still produces a measurable image-level drift here.
@@ -1052,26 +1402,45 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     }
 
     def post_load_weights(self) -> None:
-        if not isinstance(getattr(self, "quant_config", None), ModelOptFp4Config):
-            return
+        super().post_load_weights()
+        if isinstance(getattr(self, "quant_config", None), ModelOptFp4Config):
+            # BFL/ComfyUI checkpoints store AdaLN modulation params as
+            # [scale, shift], while diffusers expects [shift, scale].
+            for param_name in self.scale_shift_swap_params:
+                parts = param_name.split(".")
+                module = self
+                for part in parts[:-1]:
+                    module = getattr(module, part)
+                param = getattr(module, parts[-1], None)
+                if param is None:
+                    continue
+                half = param.shape[0] // 2
+                with torch.no_grad():
+                    first_half = param[:half].clone()
+                    param[:half] = param[half:]
+                    param[half:] = first_half
+                logger.info(
+                    "Swapped scale/shift order for %s (BFL → diffusers)",
+                    param_name,
+                )
 
-        # BFL/ComfyUI checkpoints store AdaLN modulation params as [scale, shift],
-        # while diffusers expects [shift, scale].
-        for param_name in self.scale_shift_swap_params:
-            parts = param_name.split(".")
-            module = self
-            for part in parts[:-1]:
-                module = getattr(module, part)
-            param = getattr(module, parts[-1], None)
-            if param is None:
-                continue
-            half = param.shape[0] // 2
-            with torch.no_grad():
-                first_half = param[:half].clone()
-                param[:half] = param[half:]
-                param[half:] = first_half
+        for block in self.transformer_blocks:
+            block.configure_fp8_norm_quant()
+        for block in self.single_transformer_blocks:
+            block.configure_fp8_norm_quant()
+        enabled = sum(
+            block._fp8_img_attn_norm_quant
+            + block._fp8_txt_attn_norm_quant
+            + block._fp8_img_ff_norm_quant
+            + block._fp8_txt_ff_norm_quant
+            for block in self.transformer_blocks
+        ) + sum(block._fp8_norm_quant for block in self.single_transformer_blocks)
+        total = 4 * len(self.transformer_blocks) + len(self.single_transformer_blocks)
+        if enabled:
             logger.info(
-                "Swapped scale/shift order for %s (BFL → diffusers)", param_name
+                "Enabled FLUX.2 FP8 norm+quant fusion for %d/%d block paths",
+                enabled,
+                total,
             )
 
     def __init__(
@@ -1284,6 +1653,10 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 joint_attention_kwargs=joint_attention_kwargs,
                 num_replicated_prefix=num_replicated_prefix,
             )
+        if isinstance(encoder_hidden_states, tuple):
+            encoder_hidden_states = _materialize_gated_residual(encoder_hidden_states)
+        if isinstance(hidden_states, tuple):
+            hidden_states = _materialize_gated_residual(hidden_states)
         # Concatenate text and image streams for single-block inference;
         # join_seqs relocates any SP text tail-pad behind the image once for
         # the whole trunk (see sp_shard.join_seqs for why).
@@ -1301,6 +1674,8 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 text_seq_len=txt_real,
                 num_replicated_prefix=num_replicated_prefix,
             )
+        if isinstance(hidden_states, tuple):
+            hidden_states = _materialize_gated_residual(hidden_states)
         # Remove text (and any tail pad) from the concatenated stream
         img_end = hidden_states.shape[1] - sp_txt_pad
         hidden_states = hidden_states[:, txt_real:img_end, ...]

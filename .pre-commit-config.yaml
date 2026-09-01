@@ -151,13 +151,13 @@ repos:
         # cover sglang-mm's PyO3 bindings + rayon fan-out — both sit behind
         # non-default features, so `--workspace` alone never compiles them. protoc
         # is not required: sglang-grpc's build.rs falls back to a vendored binary.
-        entry: bash -c 'cd rust && cargo clippy --workspace --fix --allow-dirty --allow-staged && cargo clippy --workspace -- -D warnings && cargo clippy -p sglang-mm --features python,parallel --lib -- -D warnings'
+        entry: bash -c 'cd rust && cargo clippy --workspace --fix --allow-dirty --allow-staged && cargo clippy --workspace -- -D warnings && cargo clippy -p sglang-mm --features python,parallel --lib -- -D warnings && cargo clippy --manifest-path sglang-radix-tree/Cargo.toml --all-targets --no-default-features --features tch/doc-only -- -D warnings'
         language: system
         files: ^rust/.*\.rs$
         pass_filenames: false
       - id: rustfmt-rust-workspace
         name: rustfmt rust/ workspace
-        entry: bash -c 'cd rust && cargo fmt'
+        entry: bash -c 'cd rust && cargo fmt && cargo fmt --manifest-path sglang-radix-tree/Cargo.toml'
         language: system
         files: ^rust/.*\.rs$
         pass_filenames: false
