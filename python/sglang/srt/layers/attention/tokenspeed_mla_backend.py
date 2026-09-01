@@ -22,10 +22,11 @@ from __future__ import annotations
 
 """Attention backend for the tokenspeed-mla CuTe DSL kernels on Blackwell.
 
-Subclasses :class:`TRTLLMMLABackend` to share its MLA data preparation and
-prefill plumbing. Decode-context parallelism is implemented here because the
-TokenSpeed decode kernel natively accepts CP rank/world metadata and returns
-the partial log-sum-exp needed by the cross-rank merge.
+Subclasses :class:`TRTLLMMLABackend` to share its MLA data preparation, prefill
+plumbing, and DCP metadata (rank-local KV lengths and page table). The decode
+forward lives here because the TokenSpeed decode kernel natively accepts CP
+rank/world metadata and returns the partial log-sum-exp needed by the cross-rank
+merge.
 """
 
 import logging
@@ -34,9 +35,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.ops.attention.dcp_kernels import (
-    create_mla_kv_page_table_for_dcp,
-)
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8,
@@ -45,16 +43,11 @@ from sglang.kernels.ops.attention.utils import (
     mla_quantize_and_rope_for_fp8,
     mla_quantize_without_rope_for_fp8,
 )
-from sglang.kernels.ops.kvcache.kv_indices import (
-    get_num_kv_index_blocks_flashmla,
-    get_num_page_per_block_flashmla,
-)
 from sglang.kernels.ops.quantization.fp8_quantize import fp8_quantize
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
 )
-from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -302,165 +295,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             k_nope, k_pe, v, enable_pdl=is_arch_support_pdl()
         )
 
-    def _get_dcp_local_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
-        parallel = get_parallel()
-        if not parallel.dcp_enabled:
-            return seq_lens
-        return get_dcp_lens(seq_lens, parallel.dcp_size, parallel.dcp_rank).to(
-            torch.int32
-        )
-
-    def _get_dcp_local_max_seq_len(self, max_seq_len: int) -> int:
-        parallel = get_parallel()
-        if not parallel.dcp_enabled:
-            return max_seq_len
-        local_max = max_seq_len // parallel.dcp_size + int(
-            parallel.dcp_rank < max_seq_len % parallel.dcp_size
-        )
-        # TokenSpeed requires a positive scheduling bound even when every
-        # sequence in a padded graph row is empty on this rank.
-        return max(local_max, 1)
-
-    def _fill_dcp_block_kv_indices(
-        self,
-        block_kv_indices: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        local_seq_lens: torch.Tensor,
-    ) -> None:
-        parallel = get_parallel()
-        pages_per_block = get_num_page_per_block_flashmla(self.page_size)
-        create_mla_kv_page_table_for_dcp[
-            (
-                block_kv_indices.shape[0],
-                get_num_kv_index_blocks_flashmla(
-                    block_kv_indices.shape[1], self.page_size
-                ),
-            )
-        ](
-            self.req_to_token,
-            req_pool_indices,
-            local_seq_lens,
-            block_kv_indices,
-            self.req_to_token.stride(0),
-            block_kv_indices.stride(0),
-            PHYSICAL_PAGE_SIZE=self.page_size,
-            DCP_SIZE=parallel.dcp_size,
-            DCP_RANK=parallel.dcp_rank,
-            PAGES_PER_BLOCK=pages_per_block,
-        )
-
-    def _create_block_kv_indices(
-        self,
-        batch_size: int,
-        max_blocks: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if not get_parallel().dcp_enabled:
-            return super()._create_block_kv_indices(
-                batch_size,
-                max_blocks,
-                req_pool_indices,
-                seq_lens,
-                device,
-            )
-
-        block_kv_indices = torch.full(
-            (batch_size, max_blocks), -1, dtype=torch.int32, device=device
-        )
-        self._fill_dcp_block_kv_indices(
-            block_kv_indices,
-            req_pool_indices,
-            self._get_dcp_local_seq_lens(seq_lens),
-        )
-        return block_kv_indices
-
-    def _init_cuda_graph_metadata(
-        self,
-        bs: int,
-        num_tokens: int,
-        forward_mode,
-        seq_lens: torch.Tensor,
-        device: torch.device,
-    ):
-        super()._init_cuda_graph_metadata(
-            bs, num_tokens, forward_mode, seq_lens, device
-        )
-        if get_parallel().dcp_enabled:
-            self.forward_decode_metadata.max_seq_len_k = (
-                self._get_dcp_local_max_seq_len(
-                    self.max_context_len
-                    + (self.num_draft_tokens if forward_mode.is_target_verify() else 0)
-                )
-            )
-
-    def _apply_cuda_graph_metadata(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_mode,
-    ):
-        if not get_parallel().dcp_enabled:
-            return super()._apply_cuda_graph_metadata(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                forward_mode,
-            )
-
-        metadata = self.decode_cuda_graph_metadata[bs]
-        if forward_mode.is_target_verify():
-            torch.add(
-                seq_lens[:bs],
-                self.num_draft_tokens,
-                out=metadata.global_seq_lens_k,
-            )
-            metadata.seq_lens_k.copy_(
-                self._get_dcp_local_seq_lens(metadata.global_seq_lens_k)
-            )
-            local_seq_lens = metadata.seq_lens_k
-        elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_req = self.num_draft_tokens
-            metadata.max_seq_len_q = num_tokens_per_req
-            metadata.sum_seq_lens_q = num_tokens_per_req * bs
-            seq_lens = seq_lens[:bs]
-            metadata.seq_lens_k.copy_(seq_lens)
-            local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
-        else:
-            seq_lens = seq_lens[:bs]
-            local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
-
-        self._fill_dcp_block_kv_indices(
-            metadata.block_kv_indices,
-            req_pool_indices[:bs],
-            local_seq_lens,
-        )
-
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        super().init_forward_metadata(forward_batch)
-        if (
-            get_parallel().dcp_enabled
-            and self.forward_decode_metadata is not None
-            and (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            )
-        ):
-            if forward_batch.forward_mode.is_target_verify():
-                metadata = self.forward_decode_metadata
-                metadata.global_seq_lens_k = metadata.seq_lens_k
-                metadata.seq_lens_k = self._get_dcp_local_seq_lens(
-                    metadata.global_seq_lens_k
-                )
-            self.forward_decode_metadata.max_seq_len_k = (
-                self._get_dcp_local_max_seq_len(
-                    self.forward_decode_metadata.max_seq_len_k
-                )
-            )
-
     def _run_decode_kernel(
         self,
         query: torch.Tensor,
@@ -517,24 +351,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         parallel = get_parallel()
-        # FlashInfer autotunes MoE kernels with a synthetic full-model decode
-        # and discards the attention/logits result.  On multi-node GB300, the
-        # synthetic full-head DCP metadata can make both the TokenSpeed and
-        # TRTLLM decode kernels surface cudaErrorNvlinkUncorrectable.  Skip
-        # attention only inside that explicitly scoped dummy pass.  Real
-        # requests and CUDA graph capture continue through TokenSpeed below.
         if parallel.dcp_enabled and get_in_autotune_dummy_run():
-            output = torch.zeros(
-                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
-                dtype=self.q_data_type,
-                device=q.device,
-            )
-            lse = torch.zeros(
-                (q.shape[0], layer.tp_q_head_num),
-                dtype=torch.float32,
-                device=q.device,
-            )
-            return output, lse
+            return self._dummy_dcp_decode_for_autotune(q, layer)
 
         if not parallel.dcp_enabled:
             return super().forward_decode(
