@@ -448,7 +448,6 @@ def test_validate_server_args_accepts_transformer_backend_override():
             "transformer",
         ),
     )
-
     with patch(
         "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
     ) as get_attn_backend:
@@ -457,6 +456,29 @@ def test_validate_server_args_accepts_transformer_backend_override():
         128,
         torch.bfloat16,
         selected_attention_backend=AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+        attention_requirements=AttentionRequirements(packed_varlen=True),
+    )
+
+
+def test_validate_server_args_accepts_sla_attn():
+    config = MiniMaxH3PipelineConfig()
+    server_args = SimpleNamespace(
+        component_attention_backends={"transformer": "sla_attn"},
+        attention_backend="fa",
+        ring_degree=1,
+        resolve_component_attention_backend=lambda *_names: (
+            AttentionBackendEnum.SLA_ATTN,
+            "transformer",
+        ),
+    )
+    with patch(
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
+    ) as get_attn_backend:
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+    get_attn_backend.assert_called_once_with(
+        128,
+        torch.bfloat16,
+        selected_attention_backend=AttentionBackendEnum.SLA_ATTN,
         attention_requirements=AttentionRequirements(packed_varlen=True),
     )
 
