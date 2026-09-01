@@ -146,7 +146,7 @@ pub struct ModelConfig {
     pub tokenizer_path: String,
     pub policy: PolicyKind,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
-    /// Tuning for the cache-aware ZMQ policy. Ignored unless
+    /// Tuning for cache-aware routing. Ignored unless
     /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at
     /// policy construction time.
     pub cache_aware: Option<CacheAwareConfig>,
@@ -157,8 +157,16 @@ pub struct ModelConfig {
     pub sticky: Option<StickyConfig>,
 }
 
-/// Per-model cache-aware-ZMQ tuning.
-#[derive(Debug, Clone, Copy)]
+/// External KV Indexer client settings.
+#[derive(Debug, Clone)]
+pub struct KvIndexerEndpointConfig {
+    pub url: String,
+    pub query_timeout_ms: u64,
+    pub query_max_inflight: usize,
+}
+
+/// Per-model cache-aware tuning.
+#[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     /// Lower bound on `matched_blocks / total_blocks` for the tree match
     /// to win the selection. Below this, the policy falls back to
@@ -174,6 +182,9 @@ pub struct CacheAwareConfig {
     /// that the absolute check is gated on. Default 1.1 — 10 % relative
     /// difference triggers re-balancing.
     pub balance_rel_threshold: f32,
+    /// Optional external KV Indexer client configuration. When configured, it
+    /// replaces the local ZMQ radix tree as the cache signal.
+    pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
 }
 
 impl Default for CacheAwareConfig {
@@ -182,6 +193,7 @@ impl Default for CacheAwareConfig {
             cache_threshold: default_cache_threshold(),
             balance_abs_threshold: default_balance_abs(),
             balance_rel_threshold: default_balance_rel(),
+            kv_indexer_endpoint: None,
         }
     }
 }

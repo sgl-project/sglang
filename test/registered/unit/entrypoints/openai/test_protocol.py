@@ -16,9 +16,11 @@
 import unittest
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionMessageContentAudioPart,
+    ChatCompletionMessageContentAudioURLPart,
     ChatCompletionMessageContentImageURL,
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -114,6 +116,42 @@ class TestCompletionRequest(unittest.TestCase):
 class TestChatCompletionRequest(unittest.TestCase):
     """Test ChatCompletionRequest protocol model"""
 
+    def test_json_schema_strict_requires_json_boolean(self):
+        base_request = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object"},
+                },
+            },
+        }
+
+        for strict in (True, False, None):
+            with self.subTest(strict=strict):
+                response_format = dict(base_request["response_format"])
+                response_format["json_schema"] = {
+                    **response_format["json_schema"],
+                    "strict": strict,
+                }
+                request = ChatCompletionRequest.model_validate(
+                    {**base_request, "response_format": response_format}
+                )
+                self.assertIs(request.response_format.json_schema.strict, strict)
+
+        for strict in ("yes", "false", 0, 1):
+            with self.subTest(strict=strict), self.assertRaises(ValidationError):
+                response_format = dict(base_request["response_format"])
+                response_format["json_schema"] = {
+                    **response_format["json_schema"],
+                    "strict": strict,
+                }
+                ChatCompletionRequest.model_validate(
+                    {**base_request, "response_format": response_format}
+                )
+
     def test_basic_chat_completion_request(self):
         """Test basic chat completion request"""
         messages = [{"role": "user", "content": "Hello"}]
@@ -124,6 +162,7 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(request.messages[0].content, "Hello")
         self.assertEqual(request.temperature, None)  # default
         self.assertFalse(request.stream)  # default
+        self.assertFalse(request.return_sampling_mask)
         self.assertEqual(request.tool_choice, "none")  # default when no tools
 
     def test_image_content_hash_validation(self):
@@ -513,6 +552,75 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertNotIn("json_schema", sampling_params)
 
 
+class TestAudioContentParts(unittest.TestCase):
+    """Test audio content parts and the input_audio conversion"""
+
+    def _audio_part(self, part):
+        """Validate a content part the way a request body would deliver it."""
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": [part]}],
+        )
+        return request.messages[0].content[0]
+
+    def test_input_audio_converted_to_data_uri(self):
+        part = self._audio_part(
+            {"type": "input_audio", "input_audio": {"data": "QUJD", "format": "wav"}}
+        )
+        # Converted during validation, so the inline type does not survive.
+        self.assertIsInstance(part, ChatCompletionMessageContentAudioURLPart)
+        self.assertEqual(part.type, "audio_url")
+        self.assertEqual(part.audio_url.url, "data:audio/wav;base64,QUJD")
+
+    def test_input_audio_mp3_uses_registered_mime_type(self):
+        part = self._audio_part(
+            {"type": "input_audio", "input_audio": {"data": "QUJD", "format": "mp3"}}
+        )
+        self.assertEqual(part.audio_url.url, "data:audio/mpeg;base64,QUJD")
+
+    def test_audio_url_passes_through_unchanged(self):
+        for url in ("http://example.com/audio.wav", "data:audio/wav;base64,QUJD"):
+            with self.subTest(url=url):
+                part = self._audio_part(
+                    {"type": "audio_url", "audio_url": {"url": url}}
+                )
+                self.assertEqual(part.type, "audio_url")
+                self.assertEqual(part.audio_url.url, url)
+
+    def test_input_audio_rejects_unsupported_format(self):
+        with self.assertRaises(ValidationError):
+            self._audio_part(
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "QUJD", "format": "ogg"},
+                }
+            )
+
+    def test_input_audio_requires_a_payload(self):
+        with self.assertRaises(ValidationError):
+            self._audio_part({"type": "input_audio"})
+
+    def test_audio_url_requires_a_payload(self):
+        with self.assertRaises(ValidationError):
+            self._audio_part({"type": "audio_url"})
+
+    def test_schema_advertises_both_spellings(self):
+        """Accepting input_audio without publishing it would hide the feature.
+
+        Each variant requires its own payload, so the schema states that exactly
+        one of the two forms is expected rather than leaving both optional.
+        """
+        schema = TypeAdapter(ChatCompletionMessageContentAudioPart).json_schema()
+        variants = {
+            frozenset(schema["$defs"][ref["$ref"].rsplit("/", 1)[-1]]["required"])
+            for ref in schema["anyOf"]
+        }
+        self.assertEqual(
+            variants,
+            {frozenset({"type", "audio_url"}), frozenset({"type", "input_audio"})},
+        )
+
+
 class TestModelSerialization(unittest.TestCase):
     """Test model serialization with hidden states"""
 
@@ -566,7 +674,7 @@ class TestModelSerialization(unittest.TestCase):
         )
         default_data = default_choice.model_dump()
         self.assertNotIn("prompt_token_ids", default_data)
-        self.assertNotIn("token_ids", default_data)
+        self.assertNotIn("response_token_ids", default_data)
         self.assertNotIn("meta_info", default_data)
 
         choice = ChatCompletionResponseChoice(
@@ -574,12 +682,13 @@ class TestModelSerialization(unittest.TestCase):
             message=ChatMessage(role="assistant", content="Hello"),
             finish_reason="stop",
             prompt_token_ids=[1, 2, 3],
-            token_ids=[4, 5],
+            response_token_ids=[4, 5],
             meta_info={"prompt_tokens": 3},
         )
         data = choice.model_dump()
         self.assertEqual(data["prompt_token_ids"], [1, 2, 3])
-        self.assertEqual(data["token_ids"], [4, 5])
+        self.assertNotIn("token_ids", data)
+        self.assertEqual(data["response_token_ids"], [4, 5])
         self.assertEqual(data["meta_info"], {"prompt_tokens": 3})
 
 

@@ -136,6 +136,12 @@ in the GitHub search bar.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use <code>--chat-template glm-4v</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>PaddleOCR-VL</strong> (0.9B, 1.5, 1.6)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>PaddlePaddle/PaddleOCR-VL-1.6</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Baidu's 0.9B document-parsing VLM: a NaViT-style dynamic-resolution SigLIP encoder on an ERNIE-4.5-0.3B backbone, covering text, tables, formulas, charts and seals in 109 languages. See the <a href="/cookbook/autoregressive/Baidu/PaddleOCR-VL">cookbook page</a>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Task is selected by the prompt (<code>OCR:</code>, <code>Table Recognition:</code>, ...). Leave <code>--trust-remote-code</code> off — <code>transformers</code> supports this architecture natively and its image processor is the faster one.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>GLM-OCR</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>zai-org/GLM-OCR</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-OCR: A fast and accurate general OCR model</td>

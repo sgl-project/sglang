@@ -1,10 +1,12 @@
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
     _target_checkpoint_bundles_dspark_draft,
 )
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -38,7 +40,7 @@ def _make_dspark_server_args(
     server_args.speculative_algorithm = "DSPARK"
     server_args.speculative_draft_model_path = None
     server_args.speculative_dspark_block_size = 5
-    server_args.model_config = SimpleNamespace(hf_config=hf_config)
+    server_args._model_config = SimpleNamespace(hf_config=hf_config)
     return server_args
 
 
@@ -62,8 +64,13 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
         )
         _handle_dspark(server_args)
-        self.assertEqual(server_args.speculative_draft_model_path, _BUNDLED_MODEL_PATH)
-        self.assertEqual(server_args.speculative_num_draft_tokens, 6)
+        self.assertEqual(
+            resolution_result(server_args, "speculative_draft_model_path"),
+            _BUNDLED_MODEL_PATH,
+        )
+        self.assertEqual(
+            resolution_result(server_args, "speculative_num_draft_tokens"), 6
+        )
 
     def test_plain_target_without_draft_path_raises(self):
         server_args = _make_dspark_server_args(
@@ -79,9 +86,38 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
         server_args.speculative_draft_model_path = "deepseek-ai/some-other-dspark-draft"
         _handle_dspark(server_args)
         self.assertEqual(
-            server_args.speculative_draft_model_path,
+            resolution_result(server_args, "speculative_draft_model_path"),
             "deepseek-ai/some-other-dspark-draft",
         )
+
+
+class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
+    """Gate contract for DSpark + dp attention + MoE a2a backends."""
+
+    def _dp_server_args(self, *, moe_a2a_backend: str) -> ServerArgs:
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.enable_dp_attention = True
+        server_args.enable_dp_lm_head = True
+        server_args.dp_size = 2
+        server_args.tp_size = 2
+        server_args.moe_a2a_backend = moe_a2a_backend
+        return server_args
+
+    def test_only_megamoe_is_admitted(self):
+        """Both sides of the allowlist: megamoe passes, others raise by name."""
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(self._dp_server_args(moe_a2a_backend="megamoe"))
+            for backend in ("deepep", "pplx"):
+                with self.assertRaisesRegex(ValueError, backend):
+                    _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
+
+    def test_a2a_backend_with_compact_verify_mode_raises(self):
+        server_args = self._dp_server_args(moe_a2a_backend="megamoe")
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+            with self.assertRaisesRegex(ValueError, "static"):
+                _handle_dspark(server_args)
 
 
 if __name__ == "__main__":

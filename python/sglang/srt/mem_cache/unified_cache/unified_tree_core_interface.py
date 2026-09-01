@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 
-from sglang.srt.mem_cache.events import KVCacheEventMixin
-
 # Tree node id -- the node handle used outside the TreeCore. The concrete tree
 # node is a TreeCore-internal type.
 NodeId = int
@@ -43,7 +41,15 @@ class BaseEvictionResult(msgspec.Struct):
 
 
 class EvictDeviceNextNodeResult(BaseEvictionResult):
+    """One device-walk step.
+
+    ``node_id`` selects a leaf for the Controller to evict. ``made_progress``
+    also covers an internal tombstone that returned no leaf, distinguishing it
+    from true walk exhaustion.
+    """
+
     node_id: Optional[NodeId] = None
+    made_progress: bool = False
 
 
 class EvictDeviceLeafResult(BaseEvictionResult):
@@ -74,6 +80,22 @@ class RadixCacheWalkResult(msgspec.Struct, frozen=True, kw_only=True):
     prev_slot_indices: torch.Tensor
 
 
+class BufferBackupSnapshot(msgspec.Struct, frozen=True):
+    node_id: NodeId
+    parent_node_id: NodeId
+    parent_is_root: bool
+    parent_last_hash: Optional[str]
+    hash_values: list[str]
+    key: RadixKey
+    prefix_keys: Optional[list[str]]
+
+
+class BufferBackupState(msgspec.Struct, frozen=True):
+    parent_node_id: NodeId
+    parent_is_root: bool
+    parent_last_hash: Optional[str]
+
+
 class InsertStepResult(msgspec.Struct, frozen=True):
     """One step of a resumable insert: the Controller executes ``actions``, then
     resumes while ``result`` is None; ``result`` is set on the final step."""
@@ -95,6 +117,7 @@ if TYPE_CHECKING:
         MatchPrefixParams,
         MatchResult,
     )
+    from sglang.srt.mem_cache.events import KVCacheEventRecorder
     from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -112,11 +135,10 @@ if TYPE_CHECKING:
     )
 
 
-class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
+class UnifiedTreeCoreInterface(ABC):
     """Methods the Controller invokes on the Tree Core. The Controller treats the
     Tree Core as opaque behind this surface, which grows as tree operations
-    migrate onto the TreeCore. Inherits KVCacheEventMixin for the KV-event API
-    (take_events, _record_* recorders)."""
+    migrate onto the TreeCore."""
 
     # ==== Tree-owned state the Controller reads (or, via its facade setters, writes) ====
     page_size: int
@@ -127,8 +149,13 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     write_through_threshold: int
     is_write_back: bool
     has_swa_host_pool: bool
+    kv_events: KVCacheEventRecorder
 
     # ==== Tree API ====
+
+    def take_events(self) -> list:
+        """Hand the queued KV placement events to the Controller."""
+        return self.kv_events.take()
 
     @abstractmethod
     def reset(self) -> None:
@@ -171,8 +198,37 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
+    def snapshot_buffer_backup(
+        self, node_id: NodeId, pass_prefix_keys: bool
+    ) -> Optional[BufferBackupSnapshot]:
+        """Snapshot an eligible buffer-only backup node."""
+        ...
+
+    @abstractmethod
+    def validate_buffer_backup(
+        self, node_id: NodeId, expected_key_length: int
+    ) -> Optional[BufferBackupState]:
+        """Validate a queued backup and return its current parent state."""
+        ...
+
+    @abstractmethod
+    def backfill_missing_hash_values(self) -> int:
+        """Hash every node built while storage was disabled; return how many.
+
+        Called when a storage backend is attached at runtime: nodes already in
+        the tree carry no hash, and hashing their descendants against them would
+        restart the page hash chain mid-sequence.
+        """
+        ...
+
+    @abstractmethod
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The NodeId anchoring matches for the namespace."""
+        ...
+
+    @abstractmethod
+    def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
+        """Return input indices in depth-first, subtree-weight order."""
         ...
 
     @abstractmethod
@@ -217,8 +273,11 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     def evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> EvictDeviceNextNodeResult:
-        """The next evictable node (None node_id when the walk is exhausted);
-        tracker is the caller's running totals, read for the doneness check."""
+        """Advance one eviction step.
+
+        A missing ``node_id`` is exhausted only when ``made_progress`` is also
+        false. ``tracker`` is the caller's running totals, read for doneness.
+        """
         ...
 
     @abstractmethod
