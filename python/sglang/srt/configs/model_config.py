@@ -293,7 +293,7 @@ def get_dsa_mtp_topk_width(config: PretrainedConfig) -> int:
     """MTP seeds include index_topk pooled tokens plus up to index_kpool - 1 tail tokens."""
     index_kpool = get_dsa_index_kpool(config)
     assert index_kpool >= 1, f"index_kpool must be positive, got {index_kpool}"
-    return get_dsa_index_topk(config) + index_kpool - 1
+    return config.index_topk + index_kpool - 1
 
 
 def get_dsa_index_kpool_compress(config: PretrainedConfig) -> bool:
@@ -2038,7 +2038,6 @@ piecewise_cuda_graph_disabled_model_archs = [
 # all multimodal models; archs here opt back in because their LM prefill captures
 # cleanly (vision encoder runs eagerly outside the graph via general_mm_embed_routine).
 multimodal_piecewise_cuda_graph_supported_model_archs = [
-    "Cohere2VisionForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
@@ -2051,6 +2050,7 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
 # generic multimodal rule disabled prefill CG for them despite the LM prefill
 # capturing cleanly.
 multimodal_breakable_cuda_graph_supported_model_archs = [
+    "Cohere2VisionForConditionalGeneration",
     "InternS2MobiusForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",

@@ -132,6 +132,19 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
+    def supports_mixed_chunk(self) -> bool:
+        """Whether mixed chunk prefill may stay enabled with this algorithm.
+
+        ngram cannot join as is: its overlap relay skips output_tokens_buf,
+        which the mixed input resolve reads.
+        """
+        return self in (
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DFLASH,
+            SpeculativeAlgorithm.DSPARK,
+        )
+
     def supports_ragged_verify(self) -> bool:
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify

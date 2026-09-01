@@ -1,6 +1,5 @@
-import sys
 import unittest
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -224,7 +223,7 @@ class TestKPoolMqaBackend(CustomTestCase):
         self.assertEqual(result.shape, (4, 11))
         self.assertEqual(result.dtype, torch.int32)
         self.assertTrue(torch.all(result == -1))
-        indexer._get_index_k_read_buffer.assert_called_once_with(pool, 7)
+        indexer._get_index_k_read_buffer.assert_not_called()
 
     def test_draft_extend_v2_keeps_split_deepgemm_layout(self):
         (
@@ -452,71 +451,21 @@ class TestKPoolMqaBackend(CustomTestCase):
 
         pool.kpool_decode_update_index_cache.assert_not_called()
 
-    def test_cuda_tilelang_selector_reads_heads_from_unexpanded_query(self):
+    def test_cuda_tilelang_selector_reads_heads_from_expanded_query(self):
         with (
             patch.object(dsa_indexer_kpool, "is_cuda", return_value=True),
             patch("torch.cuda.get_device_capability", return_value=(9, 0)),
         ):
             self.assertFalse(
                 dsa_indexer_kpool.IndexerKPool._should_use_tilelang_paged_mqa_logits(
-                    torch.empty(1, 32, 128)
+                    torch.empty(1, 1, 32, 128)
                 )
             )
             self.assertTrue(
                 dsa_indexer_kpool.IndexerKPool._should_use_tilelang_paged_mqa_logits(
-                    torch.empty(1, 16, 128)
+                    torch.empty(1, 1, 16, 128)
                 )
             )
-    def test_rocm_uses_aiter_mqa_logits(self):
-        marker = object()
-        aiter_impl = MagicMock(return_value=marker)
-        module = ModuleType("aiter.ops.triton.fp8_mqa_logits")
-        module.fp8_mqa_logits = aiter_impl
-
-        args = tuple(object() for _ in range(6))
-        with (
-            patch.object(dsa_indexer_kpool, "is_hip", return_value=True),
-            patch.dict(
-                sys.modules,
-                {"aiter.ops.triton.fp8_mqa_logits": module},
-            ),
-        ):
-            result = dsa_indexer_kpool.IndexerKPool._fp8_mqa_logits(
-                *args, clean_logits=False
-            )
-
-        self.assertIs(result, marker)
-        aiter_impl.assert_called_once_with(*args, clean_logits=False)
-
-    def test_cuda_keeps_deep_gemm_mqa_logits(self):
-        marker = object()
-        deep_gemm = MagicMock()
-        deep_gemm.fp8_mqa_logits.return_value = marker
-        q_fp8, k_fp8, k_scale, weights, starts, ends = (object() for _ in range(6))
-
-        with (
-            patch.object(dsa_indexer_kpool, "is_hip", return_value=False),
-            patch.object(dsa_indexer_kpool, "deep_gemm", deep_gemm, create=True),
-        ):
-            result = dsa_indexer_kpool.IndexerKPool._fp8_mqa_logits(
-                q_fp8,
-                k_fp8,
-                k_scale,
-                weights,
-                starts,
-                ends,
-                clean_logits=True,
-            )
-
-        self.assertIs(result, marker)
-        deep_gemm.fp8_mqa_logits.assert_called_once_with(
-            q_fp8,
-            (k_fp8, k_scale),
-            weights,
-            starts,
-            ends,
-            clean_logits=True,
-        )
 
     def test_portable_topk_masks_invalid_groups_and_expands(self):
         logits = torch.tensor([[0.1, 0.9, 0.8, 50.0]], dtype=torch.float32)

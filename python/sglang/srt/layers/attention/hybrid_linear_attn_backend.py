@@ -1041,6 +1041,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
+        self.kv_index_translator = full_attn_backend.kv_index_translator
         self.max_context_len = getattr(full_attn_backend, "max_context_len", None)
         self.needs_cpu_seq_lens = (
             full_attn_backend.needs_cpu_seq_lens
@@ -1050,7 +1051,11 @@ class HybridLinearAttnBackend(AttentionBackend):
             full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
         self.supports_overlap_plan_stream_graph_load = bool(
-            linear_attn_backend.supports_overlap_plan_stream_graph_load
+            getattr(
+                linear_attn_backend,
+                "supports_overlap_plan_stream_graph_load",
+                False,
+            )
         )
 
     @property

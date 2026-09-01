@@ -139,7 +139,7 @@ class TestPrepareServerArgs(CustomTestCase):
         # daemon to build the same static EPLB layout as the engine.
         handle_load_format(args)
 
-    def test_enable_w4a4_mxfp4_megamoe_sets_deepgemm_env(self):
+    def test_enable_w4a4_mxfp4_megamoe_preserves_legacy_deepgemm_env(self):
         deepgemm_env = {
             "DG_USE_FP4_ACTS": "0",
             "DG_USE_MXF4_KIND": "0",
@@ -158,8 +158,8 @@ class TestPrepareServerArgs(CustomTestCase):
             args.resolve_once()
 
             self.assertTrue(resolution_result(args, "enable_w4a4_mxfp4_megamoe"))
-            self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "1")
-            self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "1")
+            self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
+            self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "0")
 
     def test_w4a4_mxfp4_megamoe_disabled_preserves_deepgemm_env(self):
         deepgemm_env = {
@@ -814,6 +814,19 @@ class TestLoadBalanceMethod(unittest.TestCase):
             resolution_result(server_args, "disaggregation_transfer_backend"),
             "mooncake",
         )
+
+    def test_pd_decode_hicache_allows_rust_tree_core(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            enable_hierarchical_cache=True,
+        )
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
+            handle_pd_disaggregation(server_args)
+
+        self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
 
 
 class TestSkipTokenizerInit(unittest.TestCase):
@@ -1500,6 +1513,16 @@ class TestHiCacheArgs(unittest.TestCase):
                 resolution_result(args, "decode_attention_backend"),
                 expected_decode_backend,
             )
+
+    def test_buffer_only_accepts_both_tree_cores(self):
+        for backend in ("python", "rust"):
+            args = self._make_args(
+                enable_hierarchical_cache=True,
+                hicache_host_memory_mode="buffer_only",
+                hicache_storage_backend="file",
+            )
+            with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
+                handle_hicache(args)
 
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [

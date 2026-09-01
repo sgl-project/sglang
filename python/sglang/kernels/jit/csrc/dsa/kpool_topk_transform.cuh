@@ -11,11 +11,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
-#if defined(__HIP_PLATFORM_AMD__)
-#include <hip/hip_fp16.h>
-#else
 #include <cuda_fp16.h>
-#endif
 
 namespace sglang {
 namespace {
@@ -294,11 +290,7 @@ void setup_kernel_smem_once(host::DebugInfo where = {}) {
   [[maybe_unused]]
   static const auto result = [] {
     const auto fptr = std::bit_cast<const void*>(f);
-#if defined(__HIP_PLATFORM_AMD__)
-    return ::hipFuncSetAttribute(fptr, ::hipFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
-#else
     return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
-#endif
   }();
   host::RuntimeDeviceCheck(result, where);
 }

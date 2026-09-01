@@ -195,40 +195,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.tree_mask_mode = default_tree_mask_mode()
 
-        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
-        # Keep handoff events outside captured graphs; per-kind rings avoid
-        # re-recording an event with a pending wait.
-        handoff_ring_size = 8
-        if self.plan_stream is not None:
-            event_cls = torch.get_device_module(self.device).Event
-            self._verify_handoff_events = [
-                event_cls() for _ in range(handoff_ring_size)
-            ]
-            self._draft_extend_handoff_events = [
-                event_cls() for _ in range(handoff_ring_size)
-            ]
-        else:
-            self._verify_handoff_events = []
-            self._draft_extend_handoff_events = []
-        self._verify_handoff_index = 0
-        self._draft_extend_handoff_index = 0
-        self._pending_verify_handoff_event = None
-
-    def _record_handoff_event(self, kind: str, stream):
-        if self.plan_stream is None:
-            return None
-        if kind == "verify":
-            events = self._verify_handoff_events
-            index = self._verify_handoff_index
-            self._verify_handoff_index += 1
-        else:
-            assert kind == "draft_extend"
-            events = self._draft_extend_handoff_events
-            index = self._draft_extend_handoff_index
-            self._draft_extend_handoff_index += 1
-        event = events[index % len(events)]
-        event.record(stream)
-        return event
+        self._init_handoff_events()
 
     def alloc_memory_pool(
         self,
@@ -301,7 +268,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
         self.dsa_seed_topk_width = (
             get_dsa_mtp_topk_width(hf_config)
-            if self.dsa_index_topk is not None
+            if self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
             else None
         )
         self.seed_dsa_topk_from_draft_extend = (

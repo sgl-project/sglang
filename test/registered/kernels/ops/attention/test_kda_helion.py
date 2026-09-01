@@ -859,12 +859,23 @@ def test_raw_beta_prefill_contract() -> None:
     torch.manual_seed(811)
     batch, tokens, heads, key_dim, value_dim = 2, 17, 2, 32, 32
     q = torch.randn(batch, tokens, heads, key_dim, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn_like(q)
+    # Keep the unnormalized recurrence numerically contractive while still
+    # exercising the no-QK-L2-normalization path. Unit-scale random keys make
+    # (I - beta * k k^T) expansive and obscure the raw-beta contract with
+    # exponentially amplified BF16 round-off.
+    k = torch.randn_like(q) * 0.05
     v = torch.randn(
         batch, tokens, heads, value_dim, device="cuda", dtype=torch.bfloat16
     )
-    gate = torch.randn_like(q) * 0.2
-    raw_beta = torch.randn(batch, tokens, heads, device="cuda")
+    # Keep the recurrent decay contractive so the raw-beta check measures the
+    # sigmoid conversion instead of amplifying BF16 round-off exponentially.
+    gate = -torch.rand_like(q) * 0.2
+    raw_beta = torch.linspace(
+        -2,
+        2,
+        steps=batch * tokens * heads,
+        device="cuda",
+    ).reshape(batch, tokens, heads)
     indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
     state = torch.randn(5, heads, value_dim, key_dim, device="cuda") * 0.01
 
