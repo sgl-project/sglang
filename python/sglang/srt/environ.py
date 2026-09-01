@@ -860,6 +860,18 @@ class Envs:
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
+    # Above 8192 tokens of context, aiter's non-static workspace is large enough
+    # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
+    # honor an explicitly passed --mem-fraction-static instead. Off by default:
+    # the reserve is load-bearing, and skipping it OOMs long-context aiter serving
+    # that fits comfortably with it (67.32 GiB request against 47.40 GiB free on a
+    # 288 GB MI355 in nightly-4-gpu-mi35x-minimax-m3). Worth setting only when the
+    # scaled fraction is itself too small to hold the model weights.
+    SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION = EnvBool(False)
+    # Route Kimi-K3-style h12 + fp8 MLA decode through aiter Triton Gluon when
+    # import and Triton cga_layout prerequisites hold. Set to 0 to force the
+    # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
+    SGLANG_AITER_MLA_GLUON = EnvBool(True)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
