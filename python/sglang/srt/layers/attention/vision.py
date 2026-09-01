@@ -17,12 +17,17 @@ from sglang.kernels.ops.layernorm.norm import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_context, get_exec, get_mm, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_mm,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_capability,
-    is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_hip,
@@ -494,8 +499,7 @@ class VisionTritonAttention(nn.Module):
             seq_lens = kwargs.get("sequence_lengths")
             if seq_lens is None:
                 seq_lens = cu_seqlens_gpu[1:] - cu_seqlens_gpu[:-1]
-            else:
-                seq_lens = seq_lens.to(device=q.device, dtype=torch.int32)
+            seq_lens = seq_lens.to(device=q.device, dtype=torch.int32)
             max_seqlen = resolve_precomputed_max_seqlen(
                 cu_seqlens_gpu, kwargs.get("max_seqlen")
             )
@@ -1268,7 +1272,7 @@ class VisionAttention(nn.Module):
             backend = "xpu_attn"
         else:
             backend = "sdpa"
-        if backend == "fa3" and is_blackwell_supported():
+        if backend == "fa3" and get_platform().is_blackwell:
             raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
 
         return backend

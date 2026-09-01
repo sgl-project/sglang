@@ -1403,13 +1403,12 @@ class TestPrefillNumTokenNonPaddedPostFill(unittest.TestCase):
         # pads. local = clamp(1018 - 512, 0, 512).
         self.assertEqual(self._fill(attn_tp_rank=1, attn_tp_size=2), 506)
 
-    def test_non_gathered_keeps_plain_fb_copy(self):
-        # Without a gathered buffer there is no attn-TP scatter; the plain FB
-        # copy must be preserved (post_fill no-op), mirroring the decode
-        # registry's contract.
+    def test_non_gathered_uses_raw_token_count(self):
+        # Full prefill graphs need the live raw boundary even without a
+        # gathered buffer so model layers can discard the padded bucket tail.
         self.assertEqual(
             self._fill(attn_tp_rank=0, attn_tp_size=2, require_gathered_buffer=False),
-            509,
+            1018,
         )
 
 

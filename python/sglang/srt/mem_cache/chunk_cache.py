@@ -82,13 +82,13 @@ class ChunkCache(BasePrefixCache):
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         # The protected prefix is not this req's to free.
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
+            req.kv.req_pool_idx, req.kv.cache_protected_len : kv_len_to_handle
         ]
         self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.extend_range.end
+            req.kv.req_pool_idx, : req.extend_range.end
         ]
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
@@ -147,7 +147,7 @@ class PureSWAChunkCache(SWAChunkCache):
     explicitly skip the range already freed by ``free_swa_out_of_window_slots``
     (a.k.a. _evict_swa) during decode.
 
-    ``req.swa_evict_floor`` shields the prompt/image KV from window eviction
+    ``req.kv.swa_evict_floor`` shields the prompt/image KV from window eviction
     only while the request is active, so that range IS released here on
     finish. Distinct from the ``cache_protected_len`` prefix, which is owned
     elsewhere and never freed by this path.
@@ -158,11 +158,11 @@ class PureSWAChunkCache(SWAChunkCache):
     ):
         kv_committed_len = kv_len_to_handle
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.kv.req_pool_idx, :kv_committed_len
         ]
         # The cache_protected_len prefix is not this req's to free.
-        protected_len = req.cache_protected_len
-        evict_floor = req.swa_evict_floor
+        protected_len = req.kv.cache_protected_len
+        evict_floor = req.kv.swa_evict_floor
         evicted_seqlen = req.kv.swa_evicted_seqlen
         if evicted_seqlen > evict_floor:
             parts = []
