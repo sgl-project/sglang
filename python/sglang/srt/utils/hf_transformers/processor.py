@@ -17,15 +17,14 @@ import json
 from pathlib import Path
 from typing import Optional
 
+from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
+from sglang.srt.utils import logger
 from transformers import (
     AutoImageProcessor,
     AutoProcessor,
     AutoTokenizer,
     PreTrainedTokenizerBase,
 )
-
-from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
-from sglang.srt.utils import logger
 
 from .common import (
     AutoConfig,
@@ -208,6 +207,83 @@ def _build_processor_manually(
     return proc_cls(**init_kwargs)
 
 
+def _build_glm5_next_processor(model_path, tokenizer, revision):
+    """Build the GLM-5 Next processor until Transformers ships one.
+
+    Current GLM-5 Next checkpoints use a nested ``processor_config.json``.
+    Transformers versions without the corresponding processor class silently
+    return the tokenizer from ``AutoProcessor`` instead, dropping all visual
+    inputs. Reuse the compatible GLM-4V components, but fail loudly if the
+    checkpoint does not provide the component configuration needed to do so.
+    """
+    from transformers import (
+        Glm4vImageProcessor,
+        Glm4vProcessor,
+        Glm4vVideoProcessor,
+    )
+
+    try:
+        config_file = _resolve_local_or_cached_file(
+            model_path, "processor_config.json", revision
+        )
+        with open(config_file) as file:
+            processor_config = json.load(file)
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        raise RuntimeError(
+            "Cannot construct the GLM-5 Next multimodal processor: "
+            f"failed to load processor_config.json for {model_path}: {e}"
+        ) from e
+    if not isinstance(processor_config, dict):
+        raise TypeError(
+            "Cannot construct the GLM-5 Next multimodal processor: "
+            "processor_config.json must contain an object"
+        )
+
+    def build_component(component_class, name):
+        raw_config = processor_config.get(name)
+        if not isinstance(raw_config, dict):
+            raise TypeError(
+                "Cannot construct the GLM-5 Next multimodal processor: "
+                f"processor_config.json must contain a {name!r} object"
+            )
+        component_config = dict(raw_config)
+        component_config.pop(f"{name}_type", None)
+        min_tokens = int(component_config.pop("min_image_tokens", 16))
+        max_tokens = int(component_config.pop("max_image_tokens", 8000))
+        patch_expand_factor = int(component_config.pop("patch_expand_factor", 1))
+        patch_size = int(component_config.get("patch_size", 14))
+        merge_size = int(component_config.get("merge_size", 2))
+        temporal_patch_size = int(component_config.get("temporal_patch_size", 2))
+        if not (0 < min_tokens <= max_tokens):
+            raise RuntimeError(
+                f"Invalid {name} token budget in processor_config.json: "
+                f"min_image_tokens={min_tokens}, max_image_tokens={max_tokens}"
+            )
+        if min(patch_size, merge_size, temporal_patch_size, patch_expand_factor) <= 0:
+            raise RuntimeError(
+                f"Invalid {name} patch geometry in processor_config.json"
+            )
+        pixels_per_token = temporal_patch_size * (patch_size * merge_size) ** 2
+        component_config["size"] = {
+            "shortest_edge": min_tokens * pixels_per_token,
+            "longest_edge": max_tokens * pixels_per_token,
+        }
+        component = component_class(**component_config)
+        component.min_image_tokens = min_tokens
+        component.max_image_tokens = max_tokens
+        component.patch_expand_factor = patch_expand_factor
+        return component
+
+    image_processor = build_component(Glm4vImageProcessor, "image_processor")
+    video_processor = build_component(Glm4vVideoProcessor, "video_processor")
+    return Glm4vProcessor(
+        image_processor=image_processor,
+        tokenizer=tokenizer,
+        video_processor=video_processor,
+        chat_template=getattr(tokenizer, "chat_template", None),
+    )
+
+
 def get_processor(
     tokenizer_name: str,
     *args,
@@ -301,6 +377,12 @@ def get_processor(
                     revision=revision,
                     **kwargs,
                 )
+                if config.model_type == "glm5_next" and isinstance(
+                    processor, PreTrainedTokenizerBase
+                ):
+                    processor = _build_glm5_next_processor(
+                        tokenizer_name, processor, revision
+                    )
 
     except ValueError as e:
         error_message = str(e)
