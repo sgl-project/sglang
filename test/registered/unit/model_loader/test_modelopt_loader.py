@@ -962,6 +962,20 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             )
         )
 
+    def test_lm_head_guard_accepts_modelopt_fp4_cutedsl_w4a16_runtime_state(self):
+        lm_head = nn.Module()
+        lm_head.weight = nn.Parameter(
+            torch.empty(128, 1024, dtype=torch.uint8), requires_grad=False
+        )
+        lm_head.weight_scale_interleaved = nn.Parameter(torch.empty(1))
+        lm_head.alpha = nn.Parameter(torch.empty(1))
+        lm_head.input_size_per_partition = 2048
+        lm_head.output_size_per_partition = 128
+        quant_method = ModelOptFp4LinearMethod(ModelOptFp4Config())
+        quant_method.quant_mode = "w4a16"
+
+        self.assertTrue(should_apply_lm_head_quant_method(lm_head, quant_method))
+
     def test_lm_head_guard_rejects_stale_modelopt_fp4_method_on_dense_head(self):
         lm_head = nn.Module()
         lm_head.weight = nn.Parameter(torch.empty(128000, 2048))
