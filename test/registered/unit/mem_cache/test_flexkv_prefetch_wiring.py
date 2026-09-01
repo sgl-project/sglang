@@ -13,7 +13,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def _load_flexkv_module(module_filename: str, module_name: str):
-    connector_name = "flexkv.integration.sglang.connector"
+    connector_name = "sglang.srt.mem_cache.storage.flexkv.flexkv_connector"
     connector_stub = ModuleType(connector_name)
     connector_stub.FlexKVConnector = object
     connector_stub.FlexKVHostReleaseShim = object
