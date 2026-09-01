@@ -370,12 +370,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
-        """Give back the half-open row-position ranges of the kv row that
-        ``kv`` -- a request's or session slot's ``ReqKvInfo`` record --
-        accounts for. The record carries everything the release needs: the
-        row (``req_pool_idx``) and the SWA eviction floor. Ranges must be
-        ascending and disjoint; passing them in one call keeps a page two of
-        them share from going back to the pool twice.
+        """Give back ascending, disjoint, half-open row-position ranges
+        of the ``kv`` record's row; one call keeps a shared page freed once.
         """
         from sglang.srt.mem_cache.common import free_kv_row_segments
 
