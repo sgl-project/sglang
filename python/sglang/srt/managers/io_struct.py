@@ -292,7 +292,9 @@ class GenerateReqInput:
     # {"protocol_version", "message_id", "actions": [{"action_id", "action_type",
     #  "action_version", "payload"}]}. Typed in SGLang RFC #36224; the KVCR
     # backend implements kv.source_locations@1.0 for peer-to-peer prefix reuse.
-    kv_hints: Optional[dict] = None
+    # A hint describes one request's prefix, so a batch carries one envelope
+    # per request.
+    kv_hints: Optional[Union[List[Optional[dict]], dict]] = None
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
     # Conversation id used for tracking requests
@@ -538,6 +540,10 @@ class GenerateReqInput:
                 )
             if value == "":
                 setattr(self, field_name, None)
+        if self.kv_hints is not None and not isinstance(self.kv_hints, dict):
+            raise ValueError("kv_hints should be a dict for a single request.")
+        if not self.kv_hints:
+            self.kv_hints = None
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -562,6 +568,7 @@ class GenerateReqInput:
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
+        self._normalize_kv_hints(num)
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -823,6 +830,29 @@ class GenerateReqInput:
         else:
             raise ValueError("cache_salt should be a list or a string.")
 
+    def _normalize_kv_hints(self, num):
+        """Normalize kv_hints for batch processing."""
+        if self.kv_hints is None:
+            return
+        if isinstance(self.kv_hints, dict):
+            # A single envelope applies to every request in the batch; a router
+            # that selected per-request sources sends a list instead.
+            self.kv_hints = [self.kv_hints or None] * num
+        elif isinstance(self.kv_hints, list):
+            if len(self.kv_hints) != self.batch_size:
+                raise ValueError(
+                    "The length of kv_hints should be equal to the batch size."
+                )
+            if any(
+                value is not None and not isinstance(value, dict)
+                for value in self.kv_hints
+            ):
+                raise ValueError("Every kv_hints entry should be a dict or None.")
+            self.kv_hints = [value or None for value in self.kv_hints]
+            self.kv_hints = self.kv_hints * self.parallel_sample_num
+        else:
+            raise ValueError("kv_hints should be a list or a dict.")
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -947,7 +977,7 @@ class GenerateReqInput:
             ),
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
-            kv_hints=self.kv_hints,
+            kv_hints=(self.kv_hints[i] if self.kv_hints is not None else None),
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
             require_reasoning=self.require_reasoning,

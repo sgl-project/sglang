@@ -15,6 +15,8 @@ import msgspec
 # as a source endpoint would connect to itself.
 _UNROUTABLE_HOSTS = frozenset({"0.0.0.0", "::"})
 
+MAX_TCP_PORT = 65535
+
 
 class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
     """Draft config surface for KVCR-as-HiCacheStorage.
@@ -86,6 +88,7 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
         """
         self._validate_timeout_ordering()
         self._validate_control_endpoint()
+        self._validate_control_port_range()
 
     def _validate_timeout_ordering(self) -> None:
         """``get_timeout_s`` must outlast the core's own operation deadline.
@@ -98,14 +101,23 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
         ``check_prefetch_progress`` on the scheduler thread -- and hands them to
         the next prefetch.
 
-        What keeps that safe is only that the core gives up first: both ends
-        anchor their deadline to ``operation_timeout_ms``, so once it has
-        elapsed no peer is still writing into those pages. Order the two the
-        other way and an abandoned fetch keeps writing into pages another
-        request now owns, which surfaces as wrong KV rather than as an error --
-        block keys are token hashes with no content check, so nothing downstream
-        can notice. Both knobs are operator-settable, so the ordering is
-        enforced here rather than left as a comment on the defaults.
+        Ordering the two this way is necessary, not sufficient. Both ends anchor
+        their deadline to ``operation_timeout_ms``, so waiting past it means no
+        peer *starts* a new write into those pages -- but the deadline is a
+        timer, not a DMA fence. The source's expiry drives ``poll_transfer
+        (cancellation_requested=True)`` into NIXL, whose contract is that the
+        transfer is cancelled *or errors*; a descriptor the NIC has already
+        begun can still land after the handle is released. Closing that hole
+        needs a per-op quiescence signal from KVCR (``abort()`` is a no-op stub
+        today, ``core.py``), which is filed upstream; this check only removes the
+        configuration that makes the race certain rather than unlikely.
+
+        Order the two the other way and an abandoned fetch is still being
+        actively driven while HiCache hands its pages to the next request, which
+        surfaces as wrong KV rather than as an error -- block keys are token
+        hashes with no content check, so nothing downstream can notice. Both
+        knobs are operator-settable, so the ordering is enforced here rather than
+        left as a comment on the defaults.
         """
         if self.get_timeout_s * 1000.0 <= self.operation_timeout_ms:
             raise ValueError(
@@ -115,6 +127,19 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
                 "writing into host pages HiCache has already reused, which "
                 "corrupts KV silently. Raise get_timeout_s or lower "
                 "operation_timeout_ms in --hicache-storage-backend-extra-config."
+            )
+
+    def _validate_control_port_range(self) -> None:
+        """A configured base port must be a port, and leave room for the offset.
+
+        This only bounds the base; the per-rank offset is added in
+        ``KVCRStore._control_port``, which re-checks the sum because only the
+        store knows how many ranks the engine has.
+        """
+        if self.control_port < 0 or self.control_port > MAX_TCP_PORT:
+            raise ValueError(
+                f"KVCR control_port ({self.control_port}) is out of range: use "
+                f"0 (OS-assigned, local-only) or 1..{MAX_TCP_PORT}."
             )
 
     def _validate_control_endpoint(self) -> None:

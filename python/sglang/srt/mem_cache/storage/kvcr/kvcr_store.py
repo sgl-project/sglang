@@ -58,8 +58,8 @@ import socket
 import threading
 import time
 import uuid
-from collections import defaultdict
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from collections import defaultdict, deque
+from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
 
 import msgspec
 import torch
@@ -90,7 +90,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache
-from sglang.srt.mem_cache.storage.kvcr.kvcr_config import KVCRBackendConfig
+from sglang.srt.mem_cache.storage.kvcr.kvcr_config import (
+    MAX_TCP_PORT,
+    KVCRBackendConfig,
+)
 from sglang.srt.mem_cache.storage.kvcr.pin_adapter import NoFrameworkPinning
 from sglang.srt.mem_cache.storage.kvcr.router_hint import (
     RouterHint,
@@ -132,6 +135,18 @@ _PUMP_JOIN_TIMEOUT_S = 1.0
 # way for an operator to tell "the router stopped hinting" from "the transfers
 # are failing", which need fixes in different repositories.
 _STATS_LOG_INTERVAL_S = 30.0
+
+# How many abandoned op handles to remember. Arbitrary; large enough to cover
+# the ops in flight when a stall starts, small enough to stay negligible.
+_ABANDONED_OP_HISTORY = 256
+
+# The only transport KVCR's ZMQ control channel can dial a peer over, and the
+# bind wildcards that are legal to bind but cannot be dialed. Loopback is *not*
+# here: colocated workers are the normal single-host topology. A hint arrives
+# from outside this process, so both are checked before the endpoint reaches
+# ``submit_hint`` -- see _split_control_endpoint.
+_CONTROL_SCHEME = "tcp://"
+_UNDIALABLE_HINT_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*"})
 
 
 # KVCR core methods this backend calls. Checked once at startup because
@@ -258,18 +273,38 @@ def _no_prefix(self, *_args, **_kwargs) -> PoolTransferResult:
     return PoolTransferResult.empty()
 
 
-def _offset_endpoint_port(endpoint: str, offset: int) -> Optional[str]:
-    """``tcp://host:port`` with ``offset`` added to the port, or None.
+def _split_control_endpoint(endpoint: str) -> Optional[Tuple[str, str, int]]:
+    """``(scheme_and_host, host, port)`` for a well-formed control endpoint.
 
     Splits on the *last* colon so a bracketed IPv6 literal
     (``tcp://[fd00::1]:25000``), whose address contains colons of its own,
-    survives intact. Returns None for anything that does not end in a port, so
-    the caller can drop the hint rather than dial an address it guessed at.
+    survives intact. Returns None for anything the control channel should not
+    be handed: only ``tcp://`` is a ZMQ transport a peer can be dialed over,
+    and only a real port number names a peer rather than a guess.
     """
-    host, sep, port = endpoint.rpartition(":")
+    prefix, sep, port = endpoint.rpartition(":")
     if not sep or not port.isdigit():
         return None
-    return f"{host}:{int(port) + offset}"
+    port_num = int(port)
+    if not 1 <= port_num <= MAX_TCP_PORT:
+        return None
+    if not prefix.startswith(_CONTROL_SCHEME):
+        return None
+    host = prefix[len(_CONTROL_SCHEME) :]
+    if not host or host in _UNDIALABLE_HINT_HOSTS:
+        return None
+    return prefix, host.strip("[]"), port_num
+
+
+def _offset_endpoint_port(endpoint: str, offset: int) -> Optional[str]:
+    """A validated ``tcp://host:port`` with ``offset`` added, or None."""
+    split = _split_control_endpoint(endpoint)
+    if split is None:
+        return None
+    prefix, _host, port = split
+    if port + offset > MAX_TCP_PORT:
+        return None
+    return f"{prefix}:{port + offset}"
 
 
 def _reject_unaddressable_parallelism(storage_config: HiCacheStorageConfig) -> None:
@@ -362,6 +397,17 @@ def _rank_port_offset(storage_config: HiCacheStorageConfig) -> int:
     )
 
 
+def _highest_rank_port_offset(storage_config: HiCacheStorageConfig) -> int:
+    """The largest offset ``_rank_port_offset`` can return for this engine.
+
+    Mirrors ``_rank_port_offset`` with every rank coordinate at its maximum, so
+    the two must be edited together.
+    """
+    if storage_config.dp_size <= 1:
+        return storage_config.tp_size - 1
+    return storage_config.dp_size * _dp_stride(storage_config) - 1
+
+
 def _ephemeral_port() -> int:
     """Reserve an OS-assigned free TCP port and return it.
 
@@ -427,6 +473,14 @@ class KVCRStore(HiCacheStorage):
         # the life of the scheduler; keyed on live waiters, the set is bounded by
         # concurrency and a never-reporting op costs nothing here.
         self._waiting_ops: Set[int] = set()
+        # Handles a _drain_until gave up on. Kept only so a completion that
+        # arrives afterwards can be reported as the hazard it is rather than
+        # dropped as an ordinary late tick (see _poll_once). Bounded by the
+        # deque, because the ops that never report would otherwise accumulate
+        # for the life of the scheduler -- the same reason _waiting_ops keys on
+        # live waiters. Old entries fall out and degrade to the previous
+        # behaviour, which is the right way to lose this signal.
+        self._abandoned_ops: Deque[int] = deque(maxlen=_ABANDONED_OP_HISTORY)
         # Serializes poll_completed() between the prefetch thread (_drain_until)
         # and the source pump. poll_completed() both drains a queue and advances
         # core state machines, so two callers must not interleave.
@@ -513,11 +567,26 @@ class KVCRStore(HiCacheStorage):
         reachable only local-only: ``KVCRBackendConfig`` refuses port 0 together
         with ``enable_remote_hint``, because an OS-assigned port is known only
         inside this process and so cannot be registered for peers to dial.
+
+        A base port near the top of the range would push high ranks past 65535,
+        where ``bind`` fails on a rank the operator never named. The whole block
+        is checked here rather than just this rank's port, so every rank of the
+        engine fails at startup with the same message instead of the low ranks
+        coming up and the high ones dying.
         """
         configured = int(self._config.control_port)
         if configured <= 0:
             return _ephemeral_port()
-        return configured + _rank_port_offset(self._storage_config)
+        offset = _rank_port_offset(self._storage_config)
+        highest = configured + _highest_rank_port_offset(self._storage_config)
+        if highest > MAX_TCP_PORT:
+            raise ValueError(
+                f"KVCR control_port {configured} leaves no room for this "
+                f"engine's {highest - configured + 1} schedulers: the highest "
+                f"rank would bind {highest}, above {MAX_TCP_PORT}. Lower "
+                "control_port in --hicache-storage-backend-extra-config."
+            )
+        return configured + offset
 
     def _build_kvcr(self, mem_pool_host: HostKVCache) -> None:
         _require_kvcr_api()
@@ -681,7 +750,20 @@ class KVCRStore(HiCacheStorage):
         with self._poll_lock:
             for done_handle, entries in kvcr.poll_completed():
                 if done_handle not in self._waiting_ops:
-                    self._note("late_completions_dropped")
+                    if done_handle in self._abandoned_ops:
+                        # The op we gave up on was still live afterwards, so its
+                        # transfers were in flight while HiCache owned the pages
+                        # again. Nothing here can undo that; naming it is the
+                        # only way an operator learns the hazard fired at all.
+                        self._note("abandoned_op_reported_late")
+                        logger.warning(
+                            "KVCRStore: abandoned op %s reported after its "
+                            "deadline; its transfers outlived the host pages "
+                            "HiCache reclaimed. Raise get_timeout_s.",
+                            done_handle,
+                        )
+                    else:
+                        self._note("late_completions_dropped")
                     continue
                 self._completed_ops[done_handle] = entries
 
@@ -1132,6 +1214,14 @@ class KVCRStore(HiCacheStorage):
         shard it will happily accept and decode from. Correctness therefore rests
         entirely on this offset, which is why an endpoint we cannot realign drops
         the hint (costing a recompute) rather than passing it through.
+
+        The endpoint is an address this process will connect out to, taken from
+        request-scoped data, so ``_offset_endpoint_port`` also decides whether it
+        is dialable at all: transport, port range, and bind wildcards. What that
+        cannot decide is whether the *named peer* is one we should trust, since
+        nothing in the hint is authenticated. ``kv_hints`` is documented as
+        router-set and never client-set; enforcing that is the ingress's job
+        (SGLang RFC #36224), not reconstructible here.
         """
         if not self._config.enable_remote_hint:
             return None
@@ -1380,18 +1470,29 @@ class KVCRStore(HiCacheStorage):
         dropped.
 
         Leaving deregisters this handle, whether the result arrived or the
-        deadline did. After that the op is on its own: ``kvcr.abort()`` is a
-        no-op stub, so we cannot cancel it, only agree to ignore whatever it
-        reports -- or never reports.
+        deadline did. Those two exits are not equally safe and the difference is
+        not visible to the caller, so they are counted separately here.
 
-        Abandoning is safe only because ``get_timeout_s > operation_timeout_ms``
-        (enforced in ``KVCRBackendConfig``): HiCache frees this op's host pages
-        once we return, and nothing here fences a transfer still writing into
-        them. Do not shorten this wait below the core's deadline.
+        A *reported* op is finished: the core has retired its transfers, and the
+        host pages HiCache frees on our return are nobody's target. An
+        *abandoned* op is not. ``kvcr.abort()`` is a no-op stub, so we cannot
+        cancel it, only agree to ignore whatever it reports -- or never reports.
+        ``get_timeout_s > operation_timeout_ms`` (enforced in
+        ``KVCRBackendConfig``) means both ends have passed their own deadline by
+        the time we give up, so no *new* descriptor is submitted after this
+        point; it does not fence a descriptor the NIC has already begun. Closing
+        that needs a per-op quiescence signal from KVCR, which is filed upstream.
+
+        Until it exists, an abandoned handle is remembered (bounded) so a result
+        that shows up afterwards is reported as such rather than dropped as an
+        ordinary late tick. That late report is the only observable the hazard
+        has: it says a transfer was still live after HiCache took its pages
+        back. Do not shorten this wait below the core's deadline.
         """
         timeout = self._config.get_timeout_s if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout
         sleep_s = _DRAIN_POLL_MIN_S
+        abandoned = False
         try:
             self._register_waiter(op_handle)
             while True:
@@ -1405,11 +1506,15 @@ class KVCRStore(HiCacheStorage):
                     self._note_entry_statuses(stashed)
                     return {k: v.success for k, v in stashed.items()}
                 if time.monotonic() >= deadline:
+                    self._note("op_abandoned_on_timeout")
                     logger.warning(
-                        "KVCRStore: op %s did not complete within %.1fs",
+                        "KVCRStore: op %s did not complete within %.1fs; "
+                        "abandoning it. Its host pages return to HiCache while "
+                        "the core still owns the op.",
                         op_handle,
                         timeout,
                     )
+                    abandoned = True
                     return {}
                 time.sleep(sleep_s)
                 sleep_s = min(sleep_s * 2, _DRAIN_POLL_MAX_S)
@@ -1419,6 +1524,8 @@ class KVCRStore(HiCacheStorage):
                 # A completion can land between the last poll and here; drop it
                 # now rather than leave it for a pop that will never come.
                 self._completed_ops.pop(op_handle, None)
+                if abandoned:
+                    self._abandoned_ops.append(op_handle)
 
     # ------------------------------------------------------------------
     # v1 zero-copy interface (HiRadixCache path)
@@ -1461,6 +1568,29 @@ class KVCRStore(HiCacheStorage):
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
         return self.batch_exists_v2(keys, None, extra_info).kv_hit_pages
+
+    def clear(self) -> None:
+        """Not supported: KVCR exposes no bulk invalidation.
+
+        ``HiCacheStorage.clear`` is a bare ``pass``, so inheriting it makes
+        ``/flush_cache`` report success while every block this worker deposited
+        stays resident and peer-visible. That is worse than an error: the
+        operator's reason for flushing -- a poisoned tier, a model swap -- is
+        exactly the case where a stale block being served to a peer is a
+        correctness bug, and the caller (``clear_storage_backend``) has a False
+        return that says "this backend cannot".
+
+        The core has ``release()`` for handles this store holds and eviction
+        driven by capacity pressure, but nothing that drops a block by key, and
+        the tier's contents are not enumerable from here. Implementing this
+        needs a KVCR-side invalidate; until then it refuses honestly.
+        """
+        self._note("clear_unsupported")
+        raise NotImplementedError(
+            "KVCRStore does not support clear(): the KVCR core has no bulk "
+            "invalidation, so blocks already deposited would stay resident and "
+            "peer-visible after a flush that reported success."
+        )
 
     # ------------------------------------------------------------------
     # byte-copy legacy ABC methods -- draft stubs
