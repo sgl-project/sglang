@@ -110,7 +110,7 @@ class TestShuffledFp8Comparable(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.utils.weight_checker_comparator.unshuffle_aiter_fp8_weight",
+                "sglang.srt.utils.weight_checker_comparator.unshuffle_fp8_weight",
                 side_effect=lambda weight: weight,
             ) as unshuffle,
             patch(
@@ -129,7 +129,7 @@ class TestShuffledFp8Comparable(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.utils.weight_checker_comparator.unshuffle_aiter_fp8_weight",
+                "sglang.srt.utils.weight_checker_comparator.unshuffle_fp8_weight",
                 side_effect=lambda weight: weight,
             ) as unshuffle,
             patch(

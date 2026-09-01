@@ -65,6 +65,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_mxfp8_dense_gemm_backend,
+    unshuffle_aiter_fp8_weight,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -138,6 +139,11 @@ def _require_fp4_dtype():
             "DeepSeek-V4 FP4 experts require torch.float4_e2m1fn_x2 support."
         )
     return fp4_dtype
+
+
+def unshuffle_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Restore the logical layout of a backend-shuffled FP8 weight."""
+    return unshuffle_aiter_fp8_weight(weight)
 
 
 if _use_aiter or _use_hip_int4:

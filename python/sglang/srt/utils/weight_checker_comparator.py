@@ -2,11 +2,14 @@ from typing import Iterable, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
+from sglang.srt.layers.quantization.fp8 import (
+    Fp8LinearMethod,
+    Fp8MoEMethod,
+    unshuffle_fp8_weight,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
-    unshuffle_aiter_fp8_weight,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
@@ -101,7 +104,7 @@ class Fp8BlockComparable(ComparableWeight):
         for q, s_chunk in self._iter_quant_chunks(self.w_q, s, block_size[0]):
             q, s_chunk = q.cuda(), s_chunk.cuda()
             if self.is_shuffled:
-                q = unshuffle_aiter_fp8_weight(q)
+                q = unshuffle_fp8_weight(q)
             yield (
                 block_quant_dequant(q, s_chunk, block_size, dtype=torch.bfloat16),
                 block_quant_dequant(
@@ -113,7 +116,7 @@ class Fp8BlockComparable(ComparableWeight):
         s, block_size = self._scale_and_block_size()
         w_q = self.w_q
         if self.is_shuffled:
-            w_q = unshuffle_aiter_fp8_weight(w_q)
+            w_q = unshuffle_fp8_weight(w_q)
         return block_quant_dequant(w_q, s, block_size, dtype=dtype)
 
 
