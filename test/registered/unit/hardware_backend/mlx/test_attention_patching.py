@@ -1521,6 +1521,7 @@ if _HAS_MLX:
         def __init__(self):
             self.kv = ReqKvInfo()
             self.inflight_middle_chunks = 0
+            self.mamba_branching_seqlen = None
 
     class FakeTpWorker:
         def __init__(self, next_token_ids):
