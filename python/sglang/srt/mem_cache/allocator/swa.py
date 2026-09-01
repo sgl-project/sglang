@@ -319,17 +319,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         # NOTE: the API is not idempotent.
-        # Resolve the SWA side before deferring the full side: a cache action
-        # later in this group can re-point free_index at a different SWA slot.
+        # SWA first: it reads the mapping, and a cache action later in this
+        # group can re-point free_index at a different SWA slot.
         self.free_swa(free_index)
-        if self.free_group is None:
-            self.full_attn_allocator.free(free_index)
-        else:
-            self.free_group.append(self._copy_for_free_group(free_index))
-        assert (
-            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
-        )
-        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+        self.free_full(free_index)
 
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
@@ -388,6 +381,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """One filter per group: its data-dependent shape costs a sync, and
         filtering the batch selects the same slots as filtering per call."""
         self.swa_attn_allocator.free(swa_indices[swa_indices > 0])
+        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def free_full(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -407,11 +401,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().free_group_begin()
         self.swa_free_group = []
         self.full_free_group = []
-
-    def _release_free_group(self, free_index: torch.Tensor):
-        # The SWA side was resolved at enqueue time; free() would re-read a
-        # mapping that no longer describes these full indices.
-        self.full_attn_allocator.free(free_index)
 
     def free_group_end(self):
         super().free_group_end()

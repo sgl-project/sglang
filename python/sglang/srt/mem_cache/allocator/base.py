@@ -100,10 +100,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free_group_end(self):
         pending, self.free_group = self.free_group, None
         if pending:
-            self._release_free_group(torch.cat(pending))
-
-    def _release_free_group(self, free_index: torch.Tensor):
-        self.free(free_index)
+            self.free(torch.cat(pending))
 
     @staticmethod
     def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
