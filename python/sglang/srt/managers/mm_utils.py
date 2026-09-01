@@ -10,7 +10,7 @@ import sys
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -38,6 +38,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.multimodal.transport import (
+    TensorTransportMode,
+    determine_tensor_transport_mode,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_server_args,
@@ -51,11 +55,6 @@ from sglang.utils import logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
 # propagation that can cause some log messages (like 'server is fired up') to not appear
 # in the console when multimodal support is enabled.
-
-# TODO(mick): nccl
-# cuda_ipc: for intranode tensor sharing
-TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
-
 
 _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
@@ -365,6 +364,27 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         return ret_input_ids
 
 
+# masked_scatter_ materializes the expanded [num_tokens, hidden] bool mask plus
+# an int64 prefix-sum over it (~9 B per num_tokens x hidden element); the
+# cumsum-derived row indices keep the transients O(num_tokens) and sync-free.
+def _scatter_mm_embedding(
+    dest: torch.Tensor, mask: torch.Tensor, src: torch.Tensor
+) -> None:
+    # mask: [num_tokens, 1] bool; src: [num_mm_tokens, width] in sequence order.
+    src = src.to(dest.device, dest.dtype)
+    num_src_rows = src.size(0)
+    flat_mask = mask.view(-1)
+    ranks = torch.cumsum(flat_mask, dim=0) - 1
+    # False rows collapse into the discard slot num_src_rows; a mask/src
+    # row-count mismatch device-asserts in scatter_/index_copy_ (poison init).
+    ranks = ranks.masked_fill(~flat_mask, num_src_rows)
+    rows = torch.full(
+        (num_src_rows + 1,), dest.size(0), dtype=torch.long, device=dest.device
+    )
+    rows.scatter_(0, ranks, torch.arange(flat_mask.numel(), device=dest.device))
+    dest.index_copy_(0, rows[:num_src_rows], src)
+
+
 def embed_mm_inputs(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
@@ -486,18 +506,16 @@ def embed_mm_inputs(
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
     # 4. scatter embeddings into input embedding
-    # masked_scatter_ avoids the cudaStreamSynchronize that torch.where triggers.
-    def _scatter(dest, mask, src):
-        dest.masked_scatter_(mask.expand_as(dest), src.to(dest.device, dest.dtype))
-
     for i, modality, embedding, mask in zip(
         range(len(embeddings)), modalities, embeddings, masks
     ):
         if embedding is None or mask is None:
             continue
-        _scatter(input_embeds, mask, embedding)
+        _scatter_mm_embedding(dest=input_embeds, mask=mask, src=embedding)
         if use_deepstack.get(modality, None):
-            _scatter(input_deepstack_embeds, mask, deepstack_embeddings[i])
+            _scatter_mm_embedding(
+                dest=input_deepstack_embeds, mask=mask, src=deepstack_embeddings[i]
+            )
 
     return input_embeds, other_info
 
@@ -1336,13 +1354,7 @@ class ShmPointerMMData:
 def _get_is_default_transport():
     global _is_default_tensor_transport
     if _is_default_tensor_transport is None:
-        from sglang.srt.managers.tokenizer_manager import (
-            determine_tensor_transport_mode,
-        )
-
-        _is_default_tensor_transport = (
-            determine_tensor_transport_mode(get_server_args()) == "default"
-        )
+        _is_default_tensor_transport = determine_tensor_transport_mode() == "default"
     return _is_default_tensor_transport
 
 

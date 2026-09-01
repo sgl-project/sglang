@@ -104,7 +104,7 @@ def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device)
         return {}
     return dict(
         req_pool_indices=torch.tensor(
-            [req.req_pool_idx], dtype=torch.int64, device=device
+            [req.kv.req_pool_idx], dtype=torch.int64, device=device
         ),
         req_to_token_pool=req_to_token_pool,
     )
@@ -130,7 +130,7 @@ def write_dsv4_prealloc_tables(
     prealloc path (no ScheduleBatch); no-op without bundle / DSV4 tables."""
     if bundle is None or not hasattr(req_to_token_pool, "write_c128"):
         return
-    rp = torch.tensor([req.req_pool_idx])
+    rp = torch.tensor([req.kv.req_pool_idx])
     pl = torch.tensor([prefix_len])
     sl = torch.tensor([fill_len])
 

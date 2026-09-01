@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -37,7 +38,7 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-_A2A_STAGING_BUFFERS: dict[tuple, torch.Tensor] = {}
+_A2A_STAGING_BUFFERS: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
 
 
 def _a2a_staging_buffer(
@@ -46,8 +47,10 @@ def _a2a_staging_buffer(
     """Reusable staging buffer for a Ulysses collective.
 
     A buffer of a given role is fully consumed (in stream order) before the
-    next collective with the same role overwrites it, so caching by
-    (role, shape, dtype) is exact and removes per-block allocator churn.
+    next collective with the same role overwrites it. Keep one grow-only
+    backing allocation per (role, dtype, device), then return an exact-shape
+    view into that allocation. This removes per-block allocator churn without
+    retaining one CUDA tensor for every request shape seen by the worker.
     Bypassed under autograd and CUDA graph capture: a buffer first allocated
     while capturing would live in the graph's private memory pool and must
     not be shared with eager replays.
@@ -59,12 +62,22 @@ def _a2a_staging_buffer(
         or torch.cuda.is_current_stream_capturing()
     ):
         return torch.empty(shape, dtype=dtype, device=device)
-    key = (role, tuple(shape), dtype, device.index)
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    key = (role, dtype, device_index)
+    required_numel = math.prod(shape)
     buffer = _A2A_STAGING_BUFFERS.get(key)
-    if buffer is None:
-        buffer = torch.empty(shape, dtype=dtype, device=device)
+    if buffer is None or buffer.numel() < required_numel:
+        # The previous same-role collective is fully consumed by contract, so
+        # drop its cache reference before allocating a larger backing buffer.
+        # Any outstanding tensor view still keeps the old storage alive.
+        _A2A_STAGING_BUFFERS.pop(key, None)
+        del buffer
+        buffer = torch.empty(required_numel, dtype=dtype, device=device)
         _A2A_STAGING_BUFFERS[key] = buffer
-    return buffer
+    return buffer[:required_numel].view(shape)
 
 
 def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:

@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -19,7 +20,7 @@ def _make_spec_args(device: str, algorithm: str = "EAGLE", **overrides) -> Serve
     args.speculative_num_steps = 3
     args.speculative_eagle_topk = 1
     args.speculative_num_draft_tokens = 4
-    args.get_model_config = lambda: SimpleNamespace(
+    args._model_config = SimpleNamespace(
         hf_config=SimpleNamespace(
             architectures=["LlamaForCausalLM"],
             get_text_config=lambda: SimpleNamespace(),
@@ -33,18 +34,18 @@ def _make_spec_args(device: str, algorithm: str = "EAGLE", **overrides) -> Serve
 class TestSpecCPUOverlapConstraint(CustomTestCase):
     def test_cpu_eagle_forces_disable_overlap_schedule(self):
         args = _make_spec_args(device="cpu")
-        self.assertFalse(args.disable_overlap_schedule)
+        self.assertFalse(resolution_result(args, "disable_overlap_schedule"))
 
         handle_speculative_decoding(args)
 
-        self.assertTrue(args.disable_overlap_schedule)
+        self.assertTrue(resolution_result(args, "disable_overlap_schedule"))
 
     def test_cpu_eagle3_forces_disable_overlap_schedule(self):
         args = _make_spec_args(device="cpu", algorithm="EAGLE3")
 
         handle_speculative_decoding(args)
 
-        self.assertTrue(args.disable_overlap_schedule)
+        self.assertTrue(resolution_result(args, "disable_overlap_schedule"))
 
     def test_cpu_explicit_disable_overlap_is_preserved(self):
         args = _make_spec_args(device="cpu", disable_overlap_schedule=True)
@@ -56,7 +57,7 @@ class TestSpecCPUOverlapConstraint(CustomTestCase):
         ) as logs:
             handle_speculative_decoding(args)
 
-        self.assertTrue(args.disable_overlap_schedule)
+        self.assertTrue(resolution_result(args, "disable_overlap_schedule"))
         self.assertFalse(
             any("Overlap schedule" in message for message in logs.output),
             f"hook warned about overriding an already-disabled overlap: {logs.output}",
@@ -68,7 +69,7 @@ class TestSpecCPUOverlapConstraint(CustomTestCase):
 
         handle_speculative_decoding(args)
 
-        self.assertFalse(args.disable_overlap_schedule)
+        self.assertFalse(resolution_result(args, "disable_overlap_schedule"))
 
 
 if __name__ == "__main__":
