@@ -11,13 +11,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""UnifiedKVPool — one physical `uint8` byte buffer shared by 2 sub-pools.
+"""UnifiedKVPool -- one physical `uint8` byte buffer shared by N sub-pools.
 
-Two `MultiEndedAllocator`s grow from opposite ends; eager-compacting `free`
-keeps each pool's byte range hole-free. Layout is envelope-major (a slot's data
-for all its layers in one contiguous byte envelope) so a freed slot vacates a
-region the peer can grow into. Everything above the allocator stores virtual
-slot IDs; the allocator owns the per-sub-pool virtual<->physical tables and
+Two END `MultiEndedAllocator`s grow inward from opposite ends; optional
+"float" MIDDLE pools live between their frontiers (chain order
+`[up end, floats..., down end]`). Eager- or lazy-compacting `free` keeps each
+pool's byte range reclaimable. Layout is envelope-major (a slot's data for all
+its layers in one contiguous byte envelope) so a freed slot vacates a region a
+neighbor can grow into. Everything above the allocator stores virtual slot
+IDs; the allocator owns the per-sub-pool virtual<->physical tables and
 compaction only mutates those (no reference rewriting).
 """
 
@@ -26,7 +28,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import ClassVar, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 from torch.profiler import record_function
@@ -70,17 +72,28 @@ def _store_dtype_for(kv_cache_dtype: torch.dtype) -> torch.dtype:
 
 @dataclass(frozen=True, kw_only=True)
 class SubPoolSpec(ABC):
-    """Abstract per-slot layout of one sub-pool in a `UnifiedKVPool`."""
+    """Abstract per-slot layout of one sub-pool in a `UnifiedKVPool`.
+
+    ``grow_direction`` places the sub-pool in the buffer's chain: the two
+    ``"up"``/``"down"`` END pools own the buffer's two ends and grow inward;
+    ``"float"`` middles live between the ends' frontiers (a float's position is
+    carried entirely by its allocator's two watermarks — every view spans the
+    whole buffer, so relocation never rebuilds views).
+    """
+
+    # Grow directions this subclass accepts. Scratch-class specs (e.g. the
+    # spec-decode band) narrow this to ("float",).
+    _allowed_grow_directions: ClassVar[Tuple[str, ...]] = ("up", "down", "float")
 
     name: str
     layer_num: int
-    grow_direction: str  # "up" | "down"
+    grow_direction: str  # "up" | "down" | "float"
 
     def __post_init__(self):
-        assert self.grow_direction in (
-            "up",
-            "down",
-        ), f"grow_direction must be 'up' or 'down'; got {self.grow_direction!r}"
+        assert self.grow_direction in self._allowed_grow_directions, (
+            f"{type(self).__name__}.grow_direction must be one of "
+            f"{self._allowed_grow_directions}; got {self.grow_direction!r}"
+        )
         assert self.layer_num > 0, f"layer_num must be positive; got {self.layer_num}"
 
     @abstractmethod
@@ -253,10 +266,36 @@ def _assert_kernel_id_bound(*, sub_pool_name: str, n_rows: int) -> None:
     )
 
 
+def _reserved_floor_bytes(sub_pool_specs: List[SubPoolSpec], page_size: int) -> int:
+    """Bytes at the bottom of the buffer reserved as the slot-0 padding sink.
+
+    Slot-0 dummy writes for every sub-pool land here; each sub-pool's first
+    allocatable slot is chosen so real data starts past it. For a PAGE-AWARE
+    sub-pool the slot-0 write touches layer blocks spread across the whole
+    page-0 envelope (page_size * entry_bytes), not just one slot envelope --
+    but a mamba sub-pool is page_size=1, so its entry is charged ONCE. Charging
+    a mamba entry per page would reserve page_size * ~100 MB of buffer that the
+    sink never touches.
+
+    Single source of truth: `UnifiedKVPool` reserves exactly this, and the
+    factories' bs=1 feasibility floors charge exactly this.
+    """
+    return max(
+        [max(s.entry_bytes() for s in sub_pool_specs)]
+        + [
+            page_size * s.entry_bytes()
+            for s in sub_pool_specs
+            if not isinstance(s, MambaSubPoolSpec)  # mamba is page_size=1
+        ]
+    )
+
+
 class UnifiedKVPool:
-    """One physical `uint8` byte buffer shared by 2 sub-pools, each exposing
+    """One physical `uint8` byte buffer shared by N sub-pools, each exposing
     per-layer views over its own byte range (contiguous per layer for KV,
-    strided for the Mamba state). Allocators keep byte ranges disjoint; no usage tracking here.
+    strided for the Mamba state). Two END pools (one grow-up, one grow-down)
+    own the buffer's ends; optional "float" MIDDLE pools live between their
+    frontiers. Allocators keep byte ranges disjoint; no usage tracking here.
     """
 
     def __init__(
@@ -269,21 +308,33 @@ class UnifiedKVPool:
         page_size: int = 1,
     ):
         assert page_size >= 1, f"page_size must be >= 1; got {page_size}"
-        assert len(sub_pool_specs) == 2, (
-            f"UnifiedKVPool currently supports exactly 2 sub-pools; got "
-            f"{len(sub_pool_specs)} (N>2 is not yet implemented)"
-        )
+        assert (
+            len(sub_pool_specs) >= 2
+        ), f"UnifiedKVPool needs >= 2 sub-pools; got {len(sub_pool_specs)}"
         names = [s.name for s in sub_pool_specs]
-        assert len(set(names)) == 2, f"sub-pool names must be unique; got {names}"
-        directions = sorted(s.grow_direction for s in sub_pool_specs)
-        assert directions == ["down", "up"], (
-            f"UnifiedKVPool needs one grow-up and one grow-down sub-pool; "
-            f"got {directions}"
+        assert len(set(names)) == len(
+            names
+        ), f"sub-pool names must be unique; got {names}"
+        # Per-spec direction validity already ran in each spec's __post_init__.
+        up_specs = [s for s in sub_pool_specs if s.grow_direction == "up"]
+        down_specs = [s for s in sub_pool_specs if s.grow_direction == "down"]
+        float_specs = [s for s in sub_pool_specs if s.grow_direction == "float"]
+        assert len(up_specs) == 1 and len(down_specs) == 1, (
+            f"UnifiedKVPool needs exactly one grow-up and one grow-down END "
+            f"sub-pool; got directions "
+            f"{[s.grow_direction for s in sub_pool_specs]}"
         )
 
         self.device = device
         self.total_bytes = total_bytes
-        self.sub_pool_specs = sub_pool_specs
+        # Canonical chain order, low byte end -> high: grow-up end, float
+        # middles (input order preserved), grow-down end. The allocators'
+        # neighbour wiring follows it; all other access is by-name.
+        self.sub_pool_specs: List[SubPoolSpec] = [
+            up_specs[0],
+            *float_specs,
+            down_specs[0],
+        ]
         self._page_size = page_size
         self._specs_by_name: Dict[str, SubPoolSpec] = {
             s.name: s for s in sub_pool_specs
@@ -324,17 +375,9 @@ class UnifiedKVPool:
         # For a page-aware sub-pool the slot-0 write touches layer blocks spread
         # across the WHOLE page-0 envelope (up to page_size * entry_bytes), not
         # just one slot envelope — reserve the max of both.
-        entry_max = max(s.entry_bytes() for s in sub_pool_specs)
-        reserved_floor = max(
-            [entry_max]
-            + [
-                page_size * s.entry_bytes()
-                for s in sub_pool_specs
-                if not isinstance(s, MambaSubPoolSpec)  # mamba is page_size=1
-            ]
-        )
+        reserved_floor = _reserved_floor_bytes(self.sub_pool_specs, page_size)
 
-        for spec in sub_pool_specs:
+        for spec in self.sub_pool_specs:
             entry_bytes = spec.entry_bytes()
             max_slots = total_bytes // entry_bytes
             min_slot_index = (reserved_floor + entry_bytes - 1) // entry_bytes  # ceil
@@ -374,9 +417,9 @@ class UnifiedKVPool:
             "%d sub-pool(s)",
             total_bytes / GB,
             total_bytes,
-            len(sub_pool_specs),
+            len(self.sub_pool_specs),
         )
-        for s in sub_pool_specs:
+        for s in self.sub_pool_specs:
             logger.info(
                 "[unified-memory-pool]   sub-pool %r: kind=%s, layer_num=%d, grow=%s, "
                 "entry_bytes=%d, max_slots=%d, min_slot_index=%d (slots [0,%d) reserved)",
@@ -827,9 +870,11 @@ class UnifiedMambaPool(MambaPool):
     # Inherited MambaPool state ops (copy_from/clear_slots/get_cpu_copy/load_cpu_copy)
     # take PHYSICAL slot ids; callers translate via the slot allocator first.
 
-    def _copy_from_physical(self, src_index: torch.Tensor, dst_index: torch.Tensor):
-        # Physical-slot copy used by the allocator's `_compact_pending`.
-        MambaPool.copy_from(self, src_index, dst_index)
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Cross-pool physical-move contract, implemented by every pool the
+        # MultiEndedAllocator wraps. Ids are PHYSICAL slots; `MambaPool.copy_from`
+        # takes (src, dst), hence the swap.
+        MambaPool.copy_from(self, src_loc, tgt_loc)
 
     # -- PD state transfer (StateType.MAMBA) --
     # The transfer item is the whole per-slot envelope, addressed as
@@ -1086,6 +1131,31 @@ class UnifiedPoolBundle(NamedTuple):
     req_to_token_pool: object  # UnifiedHybridReqToTokenPool
 
 
+def _check_bs1_feasibility_floor(
+    *,
+    total_bytes: int,
+    floor_terms: List[Tuple[str, int]],
+    factory: str,
+) -> None:
+    """bs=1 feasibility FLOOR — the retract loop's terminal guarantee.
+
+    The scheduler retracts requests until the LAST one fits; if one worst-case
+    request running ALONE does not fit in the buffer, under-sizing is a retract
+    LIVELOCK at runtime, not a perf bug. Fail loud at boot, before any pool
+    construction, with the itemized requirement.
+    """
+    floor = sum(b for _, b in floor_terms)
+    if total_bytes >= floor:
+        return
+    detail = " + ".join(f"{name}={b}" for name, b in floor_terms)
+    raise RuntimeError(
+        f"[unified-memory-pool] {factory}: byte budget {total_bytes} cannot fit "
+        f"ONE worst-case request (bs=1 floor {floor} = {detail}). A pool this "
+        f"size retract-livelocks at runtime. Raise --mem-fraction-static, lower "
+        f"the model context length, or reduce reserved memory."
+    )
+
+
 def init_unified_mamba_pools(
     *,
     device: str,
@@ -1116,6 +1186,7 @@ def init_unified_mamba_pools(
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
     decode_pre_alloc_size: int = 0,
+    unified_total_bytes: Optional[int] = None,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.multi_ended_allocator import (
@@ -1164,9 +1235,29 @@ def init_unified_mamba_pools(
         conv_slice_axis=getattr(cp.shape, "conv_slice_axis", 0),
         grow_direction="up",
     )
-    total_bytes = (
-        max_total_num_tokens * full_spec.entry_bytes()
-        + max_mamba_cache_size * mamba_spec.entry_bytes()
+    if unified_total_bytes is not None:
+        # PROFILED byte budget for the token side (captured pre-ratio-floor);
+        # the state pool's bytes ride on top. The token counts stay boot
+        # labels / conserve caps -- the runtime split floats.
+        total_bytes = (
+            unified_total_bytes + max_mamba_cache_size * mamba_spec.entry_bytes()
+        )
+    else:
+        total_bytes = (
+            max_total_num_tokens * full_spec.entry_bytes()
+            + max_mamba_cache_size * mamba_spec.entry_bytes()
+        )
+    # bs=1 floor: the state slots one running request locks (1 active + 2 radix
+    # checkpoints, a FLOOR not headroom) + the slot-0 sink. The token side is
+    # not charged -- `TpModelWorker.get_worker_info` already clamps max_req_len
+    # to the pool, so a too-long request is refused at admission, not livelocked.
+    _check_bs1_feasibility_floor(
+        total_bytes=total_bytes,
+        floor_terms=[
+            ("bs1_state_slots", 3 * mamba_spec.entry_bytes()),
+            ("sink", _reserved_floor_bytes([full_spec, mamba_spec], page_size)),
+        ],
+        factory="init_unified_mamba_pools",
     )
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
@@ -1576,6 +1667,9 @@ def init_unified_swa_pools(
     need_sort: bool,
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
+    unified_total_bytes: Optional[int] = None,
+    model_context_len: Optional[int] = None,
+    sliding_window_size: Optional[int] = None,
 ) -> UnifiedSWAPoolBundle:
     """Build the SWA-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.multi_ended_allocator import (
@@ -1612,10 +1706,33 @@ def init_unified_swa_pools(
         store_dtype=store_dtype,
         grow_direction="up",
     )
-    total_bytes = (
-        full_max_total_num_tokens * full_spec.entry_bytes()
-        + swa_max_total_num_tokens * swa_spec.entry_bytes()
-    )
+    if unified_total_bytes is not None:
+        # PROFILED byte budget, sized from directly: the re-sum's floor losses
+        # stay out of the buffer, and the token counts remain boot labels.
+        total_bytes = unified_total_bytes
+    else:
+        total_bytes = (
+            full_max_total_num_tokens * full_spec.entry_bytes()
+            + swa_max_total_num_tokens * swa_spec.entry_bytes()
+        )
+    if model_context_len is not None:
+        # bs=1 floor: ONE sliding window of swa KV (+ a page of slack for the
+        # page-granular walk) + the slot-0 sink. The full side is not charged
+        # (max_req_len clamps it); the swa sub-pool is sized independently of
+        # that clamp, which is why the window term stays.
+        swa_bs1_tokens = (
+            min(model_context_len, sliding_window_size + page_size)
+            if sliding_window_size is not None
+            else model_context_len
+        )
+        _check_bs1_feasibility_floor(
+            total_bytes=total_bytes,
+            floor_terms=[
+                ("swa_window_kv", swa_bs1_tokens * swa_spec.entry_bytes()),
+                ("sink", _reserved_floor_bytes([full_spec, swa_spec], page_size)),
+            ],
+            factory="init_unified_swa_pools",
+        )
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, swa_spec],
@@ -1687,4 +1804,223 @@ def init_unified_swa_pools(
         unified_memory_pool=shared_pool,
         token_to_kv_pool=token_to_kv_pool,
         token_to_kv_pool_allocator=allocator,
+    )
+
+
+def init_unified_mamba_swa_pools(
+    *,
+    device: str,
+    kv_cache_dtype: torch.dtype,
+    head_num: int,
+    head_dim: int,
+    v_head_dim: int,
+    swa_head_num: int,
+    swa_head_dim: int,
+    swa_v_head_dim: int,
+    page_size: int,
+    start_layer: int,
+    end_layer: int,
+    swa_attention_layer_ids: List[int],
+    full_attention_layer_ids: List[int],
+    mamba_layer_ids: List[int],
+    mamba2_cache_params,
+    full_max_total_num_tokens: int,
+    swa_max_total_num_tokens: int,
+    max_mamba_cache_size: int,
+    model_context_len: int,
+    extra_max_context_len: int,
+    max_num_reqs: int,
+    enable_memory_saver: bool,
+    enable_mamba_extra_buffer: bool,
+    disable_overlap_schedule: bool,
+    need_sort: bool,
+    speculative_num_draft_tokens: Optional[int] = None,
+    forward_stream: Optional[torch.cuda.Stream] = None,
+    lazy_compaction: bool = False,
+    unified_total_bytes: Optional[int] = None,
+    sliding_window_size: Optional[int] = None,
+) -> UnifiedPoolBundle:
+    """Build the TRI-pool unified-memory-pool stack for models with full KV +
+    SWA KV + mamba/conv state (Inkling-class: `mambaish_config` AND
+    `is_hybrid_swa` simultaneously — Inkling's SConv state is conv-only but
+    rides the mamba machinery, so "mamba" here == the conv state pool).
+
+    Chain: ``[mamba (up END) | swa (FLOAT) | full (down END)]``. The KV side
+    is a `UnifiedSWAKVPool` (per-layer full/swa routing, asymmetric head
+    geometry supported); the state side is a `UnifiedHybridReqToTokenPool`
+    whose `mamba_pool` the model reads directly (sconv:
+    `req_to_token_pool.mamba2_layer_cache(layer).conv[...]` with
+    `translate_mamba_indices` for v->p).
+
+    Sizing inputs are the same token counts the 2-pool factories take (ratio-
+    fed until the byte configurator lands); the buffer budget is their byte
+    sum and the runtime split floats.
+    """
+    from sglang.srt.mem_cache.multi_ended_allocator import (
+        UnifiedMambaSWATokenToKVPoolAllocator,
+    )
+
+    assert page_size >= 1, f"page_size must be >= 1, got {page_size}"
+    assert (
+        len(full_attention_layer_ids) > 0
+    ), "tri-pool with zero full-attention layers is degenerate"
+    assert (
+        len(swa_attention_layer_ids) > 0
+    ), "tri-pool with zero SWA-attention layers is degenerate"
+    assert len(mamba_layer_ids) > 0, "tri-pool with zero state layers is degenerate"
+
+    store_dtype = _store_dtype_for(kv_cache_dtype)
+    # mamba/conv at the LOWEST bytes, full KV at the HIGHEST, SWA floating
+    # between: ends never relocate, and SWA's window-capped span is cheapest to move.
+    full_spec = MHASubPoolSpec(
+        name="full",
+        layer_num=len(full_attention_layer_ids),
+        head_num=head_num,
+        head_dim=head_dim,
+        v_head_dim=v_head_dim,
+        store_dtype=store_dtype,
+        grow_direction="down",
+    )
+    swa_spec = MHASubPoolSpec(
+        name="swa",
+        layer_num=len(swa_attention_layer_ids),
+        head_num=swa_head_num,
+        head_dim=swa_head_dim,
+        v_head_dim=swa_v_head_dim,
+        store_dtype=store_dtype,
+        grow_direction="float",
+    )
+    cp = mamba2_cache_params
+    mamba_spec = MambaSubPoolSpec(
+        name="mamba",
+        layer_num=len(mamba_layer_ids),
+        conv_state_shapes=tuple(tuple(int(x) for x in s) for s in cp.shape.conv),
+        conv_dtype=cp.dtype.conv,
+        temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
+        temporal_dtype=cp.dtype.temporal,
+        grow_direction="up",
+    )
+    if unified_total_bytes is not None:
+        # PROFILED byte budget for the token side (captured pre-ratio-floor);
+        # the state pool's bytes ride on top. The token counts stay boot
+        # labels / conserve caps -- the runtime split floats.
+        total_bytes = (
+            unified_total_bytes + max_mamba_cache_size * mamba_spec.entry_bytes()
+        )
+    else:
+        total_bytes = (
+            full_max_total_num_tokens * full_spec.entry_bytes()
+            + swa_max_total_num_tokens * swa_spec.entry_bytes()
+            + max_mamba_cache_size * mamba_spec.entry_bytes()
+        )
+    # bs=1 floor: ONE sliding window of swa KV (+ a page of slack, clamped to
+    # the context) + the state slots one running request locks (1 active + 2
+    # radix checkpoints, a FLOOR not headroom) + the slot-0 sink. The
+    # full-attention side is not charged: `max_req_len` already clamps to the pool.
+    swa_bs1_tokens = (
+        min(model_context_len, sliding_window_size + page_size)
+        if sliding_window_size is not None
+        else model_context_len
+    )
+    _check_bs1_feasibility_floor(
+        total_bytes=total_bytes,
+        floor_terms=[
+            ("swa_window_kv", swa_bs1_tokens * swa_spec.entry_bytes()),
+            ("bs1_state_slots", 3 * mamba_spec.entry_bytes()),
+            (
+                "sink",
+                _reserved_floor_bytes([full_spec, swa_spec, mamba_spec], page_size),
+            ),
+        ],
+        factory="init_unified_mamba_swa_pools",
+    )
+    shared_pool = UnifiedKVPool(
+        total_bytes=total_bytes,
+        sub_pool_specs=[full_spec, swa_spec, mamba_spec],
+        device=device,
+        enable_memory_saver=enable_memory_saver,
+        page_size=page_size,
+    )
+    token_to_kv_pool = UnifiedSWAKVPool(
+        unified_buffer=shared_pool,
+        swa_attention_layer_ids=swa_attention_layer_ids,
+        full_attention_layer_ids=full_attention_layer_ids,
+        page_size=page_size,
+        start_layer=start_layer,
+        end_layer=end_layer,
+        enable_memory_saver=enable_memory_saver,
+    )
+    req_to_token_pool = UnifiedHybridReqToTokenPool(
+        unified_buffer=shared_pool,
+        mamba_sub_pool_name="mamba",
+        size=max_num_reqs,
+        mamba_spec_state_size=max_num_reqs,
+        max_context_len=model_context_len + extra_max_context_len,
+        device=device,
+        enable_memory_saver=enable_memory_saver,
+        cache_params=mamba2_cache_params,
+        mamba_layer_ids=mamba_layer_ids,
+        enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+        enable_overlap_schedule=not disable_overlap_schedule,
+        start_layer=start_layer,
+    )
+    allocator = UnifiedMambaSWATokenToKVPoolAllocator(
+        unified_buffer=shared_pool,
+        kvcache=token_to_kv_pool,
+        mamba_kvcache=req_to_token_pool.mamba_pool,
+        device=device,
+        full_max_total_num_tokens=full_max_total_num_tokens,
+        swa_max_total_num_tokens=swa_max_total_num_tokens,
+        page_size=page_size,
+        need_sort=need_sort,
+        forward_stream=forward_stream,
+        lazy_compaction=lazy_compaction,
+    )
+    # Wrap the composite's mamba end in the slot allocator (PHYSICAL view) the
+    # radix MambaComponent / model-side sconv reads consume.
+    mamba_slot_allocator = UnifiedMambaSlotAllocator(
+        allocator.mamba_allocator,
+        max_size=req_to_token_pool._shared_mamba_size,
+        device=device,
+    )
+    req_to_token_pool.mamba_allocator = mamba_slot_allocator
+
+    logger.info(
+        "[unified-memory-pool] ============================================================"
+    )
+    logger.info(
+        "[unified-memory-pool] UNIFIED MEMORY POOL ENABLED -- path=SWA+Mamba tri-pool"
+    )
+    logger.info(
+        "[unified-memory-pool]   full_layers=%d, swa_layers=%d, state_layers=%d, "
+        "head_num=%d/%d, head_dim=%d/%d, page_size=%d",
+        len(full_attention_layer_ids),
+        len(swa_attention_layer_ids),
+        len(mamba_layer_ids),
+        head_num,
+        swa_head_num,
+        head_dim,
+        swa_head_dim,
+        page_size,
+    )
+    logger.info(
+        "[unified-memory-pool]   total_bytes=%d (=%.2f GB), full_max=%d, swa_max=%d, "
+        "max_mamba_cache_size=%d, max_num_reqs=%d, joint_available=%d",
+        total_bytes,
+        total_bytes / GB,
+        full_max_total_num_tokens,
+        swa_max_total_num_tokens,
+        max_mamba_cache_size,
+        max_num_reqs,
+        allocator.available_size(),
+    )
+    logger.info(
+        "[unified-memory-pool] ============================================================"
+    )
+    return UnifiedPoolBundle(
+        unified_memory_pool=shared_pool,
+        token_to_kv_pool=token_to_kv_pool,
+        token_to_kv_pool_allocator=allocator,
+        req_to_token_pool=req_to_token_pool,
     )
