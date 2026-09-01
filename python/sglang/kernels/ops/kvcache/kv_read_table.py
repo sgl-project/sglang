@@ -32,6 +32,11 @@ cuda-graph buffer be refreshed in place. Readers bound themselves by
 
 A `-1` in `req_to_token` and a freed (`-1`) v2p row both clamp to entry 0, the
 reserved padding slot, so a kernel dereferences padding, not a wild address.
+
+The grid is sized from `bs` alone and each program strides over the columns it
+owns, bounded by the device-side `seq_lens`. A cuda-graph capture bakes the
+grid, so a grid spanning `max_pages` would replay `max_context_len`/BLOCK column
+blocks every step no matter how short the sequences actually are.
 """
 
 from __future__ import annotations
@@ -40,7 +45,11 @@ import torch
 import triton
 import triton.language as tl
 
-_BLOCK_COLS = 256
+_BLOCK_COLS = 512
+_NUM_WARPS = 8
+# Enough blocks to fill the device without oversubscribing the column loop;
+# measured on H100 over bs 1..256 x seq 1k..128k, flat within ~10% either side.
+_TARGET_BLOCKS = 1024
 
 
 @triton.jit
@@ -53,28 +62,29 @@ def build_kv_read_table_kernel(
     req_stride,  # runtime: req_to_token row stride (elements)
     out_stride,  # runtime: out row stride (elements)
     mult,  # runtime: kernel_page_multiplier of the target sub-pool
+    col_stride,  # runtime: columns one program advances per loop trip
     PAGE_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     bid = tl.program_id(0)
-    blk = tl.program_id(1)
     req = tl.load(req_pool_indices_ptr + bid).to(tl.int64)
     seqlen = tl.load(seq_lens_ptr + bid)
     n_pages = (seqlen + PAGE_SIZE - 1) // PAGE_SIZE
+    row_in = req_to_token_ptr + req * req_stride
+    row_out = out_ptr + bid.to(tl.int64) * out_stride
 
-    cols = blk * BLOCK + tl.arange(0, BLOCK)
-    mask = cols < n_pages
-    tok = tl.load(
-        req_to_token_ptr + req * req_stride + cols.to(tl.int64) * PAGE_SIZE,
-        mask=mask,
-        other=0,
-    ).to(tl.int64)
-    # Triton's `//` truncates toward zero, so `-1 // ps` is 0 for ps > 1 but
-    # -1 at ps == 1, which would read one element BEFORE `v2p`.
-    page = tl.where(tok < 0, 0, tok // PAGE_SIZE)
-    phys = tl.load(v2p_ptr + page, mask=mask, other=0)
-    entry = tl.maximum(phys * mult, 0).to(tl.int32)
-    tl.store(out_ptr + bid.to(tl.int64) * out_stride + cols, entry, mask=mask)
+    for start in range(tl.program_id(1) * BLOCK, n_pages, col_stride):
+        cols = start + tl.arange(0, BLOCK)
+        mask = cols < n_pages
+        tok = tl.load(row_in + cols.to(tl.int64) * PAGE_SIZE, mask=mask, other=0).to(
+            tl.int64
+        )
+        # Triton's `//` truncates toward zero, so `-1 // ps` is 0 for ps > 1 but
+        # -1 at ps == 1, which would read one element BEFORE `v2p`.
+        page = tl.where(tok < 0, 0, tok // PAGE_SIZE)
+        phys = tl.load(v2p_ptr + page, mask=mask, other=0)
+        entry = tl.maximum(phys * mult, 0).to(tl.int32)
+        tl.store(row_out + cols, entry, mask=mask)
 
 
 def build_kv_read_table(
@@ -124,8 +134,10 @@ def build_kv_read_table(
         dst.copy_(torch.where(live, entry, dst))
         return out
 
-    grid = (bs, triton.cdiv(max_pages, _BLOCK_COLS))
-    build_kv_read_table_kernel[grid](
+    col_programs = min(
+        triton.cdiv(_TARGET_BLOCKS, bs), triton.cdiv(max_pages, _BLOCK_COLS)
+    )
+    build_kv_read_table_kernel[(bs, col_programs)](
         req_to_token,
         req_pool_indices,
         seq_lens,
@@ -134,7 +146,9 @@ def build_kv_read_table(
         req_to_token.stride(0),
         out.stride(0),
         multiplier,
+        col_programs * _BLOCK_COLS,
         PAGE_SIZE=page_size,
         BLOCK=_BLOCK_COLS,
+        num_warps=_NUM_WARPS,
     )
     return out
