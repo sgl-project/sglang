@@ -23,7 +23,7 @@ use sgl_router::policies::kv_events::bootstrap::{
     fetch_cursors, fetch_snapshot, PeerSnapshot, VetError, VettedSnapshot, CURSORS_ONLY_PARAM,
     SNAPSHOT_PATH,
 };
-use sgl_router::policies::kv_events::{HashTree, KvWorkerId, SnapshotNode, WireWorker};
+use sgl_router::policies::kv_events::{HashTree, KvWorkerId, SnapshotNode, Tiers, WireWorker};
 use tokio::net::TcpListener;
 use tower_http::compression::{CompressionLayer, CompressionLevel};
 
@@ -118,12 +118,16 @@ async fn serve_by_shape(
 }
 
 /// A tree shaped like a real one: shared prefixes across workers, divergent
-/// tails, single-block chains, a hash occupying two positions, and chains
-/// spread across many shards.
+/// tails, single-block chains, a hash occupying two positions, chains spread
+/// across many shards, and carriers on mixed storage tiers — a host-only
+/// holder and a device+host holder — so a snapshot that dropped or
+/// mis-paired the tier table changes `device_workers` and is caught.
 fn warm_tree(workers: &[KvWorkerId]) -> HashTree {
     let tree = HashTree::new();
     let (a, b, c) = (&workers[0], &workers[1], &workers[2]);
     tree.insert(a, None, &[1, 2, 3, 4]);
+    tree.insert_tiered(a, None, &[1, 2], Tiers::HOST);
+    tree.insert_tiered(b, None, &[1, 2, 3, 4], Tiers::HOST);
     tree.insert(b, None, &[1, 2, 5, 6]);
     tree.insert(c, None, &[7]);
     tree.insert(a, None, &[2, 3, 9]);
@@ -168,9 +172,11 @@ fn assert_same_view(want: &HashTree, got: &HashTree, ctx: &str) {
     for q in probe_queries() {
         let w = want.match_prefix(None, &q);
         let g = got.match_prefix(None, &q);
+        // Accessor before the field move: `device_workers()` borrows the
+        // result, `workers` consumes it.
         assert_eq!(
-            (g.matched_blocks, g.workers),
-            (w.matched_blocks, w.workers),
+            (g.matched_blocks, g.device_workers(), g.workers),
+            (w.matched_blocks, w.device_workers(), w.workers),
             "{ctx}: match_prefix diverged for {q:?}",
         );
     }
@@ -543,6 +549,7 @@ async fn fetch_cursors_reads_a_cursor_without_any_nodes() {
             parent: None,
             block_hash: 111,
             workers: vec![0],
+            tiers: vec![],
         }],
         ..thin.clone()
     };
@@ -579,6 +586,7 @@ async fn fetch_cursors_still_works_against_a_peer_that_ignores_the_parameter() {
             parent: None,
             block_hash: 111,
             workers: vec![0],
+            tiers: vec![],
         }],
     };
     // `None` = this peer has no cursors-only behaviour at all.

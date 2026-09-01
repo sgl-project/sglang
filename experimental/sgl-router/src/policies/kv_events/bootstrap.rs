@@ -355,6 +355,16 @@ pub enum VetError {
         index: usize,
         parent: u32,
     },
+    /// A node's `tiers` was neither empty nor the same length as its
+    /// `workers`, so carriers cannot be paired with their tiers.
+    ///
+    /// Checked here for the same reason as `InvalidParentReference`:
+    /// `retain_carriers` rebuilds both lists from the wire data before the
+    /// tree's own `TierTableMismatch` check runs, and would otherwise repair
+    /// the mismatch silently — padding missing entries as device owners.
+    TierTableMismatch {
+        index: usize,
+    },
     BlockSizeMismatch {
         peer: u32,
         local: u32,
@@ -382,6 +392,10 @@ impl std::fmt::Display for VetError {
             Self::InvalidParentReference { index, parent } => write!(
                 f,
                 "snapshot node {index} has parent {parent}, not a backward reference",
+            ),
+            Self::TierTableMismatch { index } => write!(
+                f,
+                "snapshot node {index} has a tiers list that does not pair with its workers",
             ),
             Self::BlockSizeMismatch { peer, local } => write!(
                 f,
@@ -539,7 +553,7 @@ impl VettedSnapshot {
             return;
         }
         for node in &mut self.nodes {
-            node.workers.retain(|w| allowed.contains(w));
+            node.retain_carriers(|w| allowed.contains(&w).then_some(w));
         }
         self.cursors.retain(|(w, _)| keep.contains(w));
         // Filtering carriers strands structure; leaving it would suppress real
@@ -609,6 +623,7 @@ impl VettedSnapshot {
                 parent,
                 block_hash: self.nodes[i].block_hash,
                 workers: std::mem::take(&mut self.nodes[i].workers),
+                tiers: std::mem::take(&mut self.nodes[i].tiers),
             });
         }
         self.nodes = out;
@@ -695,6 +710,9 @@ impl VettedSnapshot {
                     });
                 }
             }
+            if !rec.tiers.is_empty() && rec.tiers.len() != rec.workers.len() {
+                return Err(VetError::TierTableMismatch { index: i });
+            }
         }
 
         // Resolve wire identities to live ones. `remap[i]` is the new index of
@@ -722,11 +740,7 @@ impl VettedSnapshot {
             .nodes
             .into_iter()
             .map(|mut n| {
-                n.workers = n
-                    .workers
-                    .iter()
-                    .filter_map(|&w| remap.get(w as usize).copied().flatten())
-                    .collect();
+                n.retain_carriers(|w| remap.get(w as usize).copied().flatten());
                 n
             })
             .collect();
@@ -1346,6 +1360,7 @@ fn decode_snapshot(body: &[u8], gzipped: bool) -> Result<PeerSnapshot, anyhow::E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policies::kv_events::tree::Tiers;
 
     fn wire_worker(url: &str, dp_rank: u32) -> WireWorker {
         WireWorker {
@@ -1359,6 +1374,7 @@ mod tests {
             parent,
             block_hash,
             workers,
+            tiers: vec![],
         }
     }
 
@@ -1536,6 +1552,25 @@ mod tests {
                 parent: 1
             }
         );
+    }
+
+    /// A `tiers` list that does not pair with `workers` must be refused on the
+    /// wire. `retain_carriers` rebuilds both lists before the tree sees them
+    /// and would otherwise pad the short list with device tiers, turning a
+    /// host-only carrier on the peer into a preferred device owner here.
+    #[test]
+    fn vet_rejects_tiers_that_do_not_pair_with_workers() {
+        let mut bad = node(None, 1, vec![0, 1]);
+        bad.tiers = vec![Tiers::HOST.bits()]; // one entry for two carriers
+        let snap = snapshot(
+            vec![wire_worker("http://a", 0), wire_worker("http://b", 0)],
+            vec![node(None, 7, vec![0]), bad],
+        );
+        let err =
+            VettedSnapshot::from_wire(snap, &live(&[("http://a", 0), ("http://b", 0)]), Some(64))
+                .expect_err("mispaired tiers must be refused, not repaired");
+        assert_eq!(err, VetError::TierTableMismatch { index: 1 });
+        assert_eq!(err.outcome(), SnapshotOutcome::Rejected);
     }
 
     /// Regression: pruning can empty the node list AFTER the wire-level

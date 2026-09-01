@@ -44,7 +44,8 @@ use super::bootstrap::{
 };
 use super::discovery::{fetch_event_config, EventConfig};
 use super::subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
-use super::tree::{HashTree, KvWorkerId};
+use super::tally::{EventKind, EventTally};
+use super::tree::{HashTree, KvWorkerId, Tiers};
 use super::wire::{KvCacheEvent, KvEventBatch};
 use crate::policies::engine_load::EngineLoadTable;
 
@@ -351,6 +352,9 @@ pub struct KvEventIndex {
     /// Obligations waiting for the coordinator to fold them into the sweep that
     /// is in flight, or to start one. See [`bootstrap_coordinator`].
     bootstrap_tx: mpsc::Sender<ObligationBatch>,
+    /// Applied events by kind and storage medium, for the `/metrics` scrape.
+    /// Written only by the pump.
+    tally: Arc<EventTally>,
 }
 
 /// A built snapshot together with its already-encoded JSON body.
@@ -758,8 +762,10 @@ impl KvEventIndex {
         let pump_cancel = CancellationToken::new();
         let peers = Arc::new(PeerRegistry::new());
         let (bootstrap_tx, bootstrap_rx) = mpsc::channel(BOOTSTRAP_QUEUE_DEPTH);
+        let tally = Arc::new(EventTally::new());
         let pump = tokio::spawn(pump_loop(
             PumpDeps {
+                tally: Arc::clone(&tally),
                 tree: tree.clone(),
                 engine_load: engine_load.clone(),
                 cursors: cursors.clone(),
@@ -794,6 +800,7 @@ impl KvEventIndex {
             snapshot_cache: AsyncMutex::new(None),
             snapshot_http,
             bootstrap_tx,
+            tally,
         });
         // Gated on the SAME predicate as registration (`peer_bootstrap_enabled`),
         // not on `settled()`. If the two ever disagree, obligations get queued
@@ -951,6 +958,7 @@ impl KvEventIndex {
         apply_batch(
             &self.tree,
             &self.cursors,
+            &self.tally,
             worker,
             seq,
             &KvEventBatch {
@@ -1113,6 +1121,12 @@ impl KvEventIndex {
     /// returned handle as read-only.
     pub fn tree(&self) -> Arc<HashTree> {
         self.tree.clone()
+    }
+
+    /// Applied KV events by kind and storage medium, for the `/metrics`
+    /// scrape. See [`super::tally`].
+    pub fn event_tally(&self) -> Arc<EventTally> {
+        Arc::clone(&self.tally)
     }
 
     /// Shared accessor for the engine-load table. The `CacheAwareZmqPolicy`
@@ -1734,6 +1748,7 @@ async fn sweep_peers(
 /// Shared state the pump task reads and writes. Bundled rather than passed as
 /// eight positional arguments, which is both unreadable and easy to transpose.
 struct PumpDeps {
+    tally: Arc<EventTally>,
     tree: Arc<HashTree>,
     engine_load: Arc<EngineLoadTable>,
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
@@ -1869,6 +1884,7 @@ async fn pump_loop(
     mut ctrl_rx: mpsc::Receiver<PumpControl>,
 ) {
     let PumpDeps {
+        tally,
         tree,
         engine_load,
         cursors,
@@ -1884,6 +1900,7 @@ async fn pump_loop(
     let pump_state = PumpState {
         tree: &tree,
         cursors: &cursors,
+        tally: &tally,
         bootstrap: &bootstrap,
         bootstrap_tx: &bootstrap_tx,
         live_workers: &live_workers,
@@ -2204,7 +2221,7 @@ async fn pump_loop(
                         bootstrap.record_rank_outcome(RankOutcome::Warm);
                     }
                 }
-                apply_batch(&tree, &cursors, &worker, seq, &batch);
+                apply_batch(&tree, &cursors, &tally, &worker, seq, &batch);
             }
         }
     }
@@ -2220,6 +2237,7 @@ async fn pump_loop(
 struct PumpState<'a> {
     tree: &'a HashTree,
     cursors: &'a Mutex<HashMap<KvWorkerId, i64>>,
+    tally: &'a EventTally,
     bootstrap: &'a BootstrapTracker,
     live_workers: &'a Mutex<HashSet<KvWorkerId>>,
     /// Obligation queue, so the graft path can hand a gapped rank back for
@@ -2230,6 +2248,7 @@ struct PumpState<'a> {
 fn apply_batch(
     tree: &HashTree,
     cursors: &Mutex<HashMap<KvWorkerId, i64>>,
+    tally: &EventTally,
     worker: &KvWorkerId,
     seq: i64,
     batch: &KvEventBatch,
@@ -2247,13 +2266,37 @@ fn apply_batch(
     }
     for event in &batch.events {
         match event {
+            // The `medium` tag decides which tier a store lands on and which
+            // tier a removal clears, so a device eviction leaves a worker that
+            // still holds the block on host as an owner — see the tree's
+            // "Storage tiers" docs.
             KvCacheEvent::BlockStored(b) => {
-                tree.insert(worker, b.parent_block_hash, &b.block_hashes);
+                tally.record(
+                    EventKind::BlockStored,
+                    b.medium.as_deref(),
+                    b.block_hashes.len(),
+                );
+                tree.insert_tiered(
+                    worker,
+                    b.parent_block_hash,
+                    &b.block_hashes,
+                    Tiers::for_store(b.medium.as_deref()),
+                );
             }
             KvCacheEvent::BlockRemoved(b) => {
-                tree.remove(worker, &b.block_hashes);
+                tally.record(
+                    EventKind::BlockRemoved,
+                    b.medium.as_deref(),
+                    b.block_hashes.len(),
+                );
+                tree.remove_tiered(
+                    worker,
+                    &b.block_hashes,
+                    Tiers::for_remove(b.medium.as_deref()),
+                );
             }
             KvCacheEvent::AllBlocksCleared => {
+                tally.record(EventKind::AllBlocksCleared, None, 0);
                 tree.clear_worker(worker);
             }
         }
@@ -2296,7 +2339,7 @@ fn fail_rank(
         return;
     }
     for (seq, batch) in queue {
-        apply_batch(tree, cursors, rank, seq, &batch);
+        apply_batch(tree, cursors, st.tally, rank, seq, &batch);
     }
 }
 
@@ -2580,7 +2623,7 @@ fn apply_snapshot(
         bootstrap.set(&rank, BootstrapState::Recovered);
         // The seeded cursor filters whatever the snapshot already reflects.
         for (seq, batch) in queue {
-            apply_batch(tree, cursors, &rank, seq, &batch);
+            apply_batch(tree, cursors, st.tally, &rank, seq, &batch);
         }
         // Tallied only once the splice is proven. When it is not yet, the
         // deferred check (or its expiry) records the verdict instead, so each
@@ -2928,6 +2971,7 @@ mod tests {
         apply_batch(
             &index.tree,
             &index.cursors,
+            &index.tally,
             &w,
             42,
             &batch(vec![KvCacheEvent::BlockStored(BlockStored {
@@ -3076,6 +3120,7 @@ mod tests {
         apply_batch(
             &index.tree,
             &index.cursors,
+            &index.tally,
             &cleared,
             43,
             &batch(vec![KvCacheEvent::AllBlocksCleared]),
@@ -3376,6 +3421,8 @@ mod tests {
         engine_load: Arc<EngineLoadTable>,
         cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
         #[allow(dead_code)]
+        tally: Arc<EventTally>,
+        #[allow(dead_code)]
         live_set: Arc<Mutex<HashSet<KvWorkerId>>>,
         #[allow(dead_code)]
         cancel: CancellationToken,
@@ -3414,8 +3461,10 @@ mod tests {
         // Real queue so a gap-driven re-queue is observable rather than dropped.
         let (bootstrap_tx, bootstrap_rx) = mpsc::channel(16);
         let oracle = BlockSizeOracle::new();
+        let tally = Arc::new(EventTally::new());
         let pump = tokio::spawn(pump_loop(
             PumpDeps {
+                tally: Arc::clone(&tally),
                 tree: tree.clone(),
                 engine_load: engine_load.clone(),
                 cursors: cursors.clone(),
@@ -3439,6 +3488,7 @@ mod tests {
             tree,
             engine_load,
             cursors,
+            tally,
             live_set,
             cancel,
             tx,
@@ -3503,11 +3553,13 @@ mod tests {
                     parent: None,
                     block_hash: 100,
                     workers: carriers.clone(),
+                    tiers: vec![],
                 },
                 SnapshotNode {
                     parent: Some(0),
                     block_hash: 200,
                     workers: carriers,
+                    tiers: vec![],
                 },
             ],
             ids.iter().map(|id| ((*id).clone(), cursor)).collect(),
@@ -4960,6 +5012,114 @@ mod tests {
         let m = tree.match_prefix(None, &[10, 20, 30]);
         assert_eq!(m.matched_blocks, 3);
         assert!(m.workers.contains(&id), "tree must hold the worker");
+    }
+
+    /// The pump must carry each event's `medium` into the tree. The engine's
+    /// write-back sequence for a backed-up block is a host-tagged store
+    /// followed by a device-tagged removal; applied tier-blind, the removal
+    /// erased the worker and every repeat of that prefix routed cold for the
+    /// whole host retention horizon.
+    #[tokio::test]
+    async fn pump_keeps_host_backed_block_owned_across_device_eviction() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tree, tx, pump) = (h.tree, h.tx, h.pump);
+
+        let stored = |medium: Option<&str>| {
+            KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: vec![10, 20],
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: medium.map(str::to_owned),
+            })
+        };
+        let removed = |medium: Option<&str>| {
+            KvCacheEvent::BlockRemoved(BlockRemoved {
+                block_hashes: vec![20],
+                medium: medium.map(str::to_owned),
+            })
+        };
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 1,
+            batch: batch(vec![
+                stored(Some("GPU")),
+                stored(Some("CPU_PINNED")),
+                removed(Some("GPU")),
+            ]),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        pump.await.unwrap();
+
+        let m = tree.match_prefix(None, &[10, 20]);
+        assert_eq!(m.matched_blocks, 2, "host copy keeps the block routable");
+        assert!(m.workers.contains(&id));
+        assert!(!m.device_workers().contains(&id), "device copy is gone");
+    }
+
+    /// Every applied event is tallied by kind and medium, blocks included, so
+    /// the scrape can show the tier stream the tree is consuming. An
+    /// out-of-order batch is filtered before the tally and must not count.
+    #[tokio::test]
+    async fn pump_tallies_applied_events_by_medium() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (index_tally, tx, pump) = (h.tally, h.tx, h.pump);
+
+        let stored = |medium: Option<&str>, hashes: Vec<i64>| {
+            KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: hashes,
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: medium.map(str::to_owned),
+            })
+        };
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 2,
+            batch: batch(vec![
+                stored(Some("GPU"), vec![10, 20, 30]),
+                stored(Some("CPU_PINNED"), vec![10, 20, 30]),
+                KvCacheEvent::BlockRemoved(BlockRemoved {
+                    block_hashes: vec![30],
+                    medium: Some("GPU".into()),
+                }),
+            ]),
+        })
+        .await
+        .unwrap();
+        // Out of order: filtered, must not be tallied.
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 1,
+            batch: batch(vec![stored(None, vec![99])]),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        pump.await.unwrap();
+
+        let rows = index_tally.snapshot();
+        let cell = |event: &str, medium: &str| {
+            rows.iter()
+                .find(|r| r.event == event && r.medium == medium)
+                .cloned()
+                .expect("cell rendered")
+        };
+        assert_eq!(cell("block_stored", "GPU").blocks, 3);
+        assert_eq!(cell("block_stored", "CPU_PINNED").blocks, 3);
+        assert_eq!(cell("block_removed", "GPU").events, 1);
+        assert_eq!(
+            cell("block_stored", "untagged").events,
+            0,
+            "the out-of-order batch was filtered before the tally",
+        );
     }
 
     /// A `WorkerEvent::Load` lands in the engine-load table (gauge, no

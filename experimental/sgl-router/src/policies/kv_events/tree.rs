@@ -3,8 +3,8 @@
 //! Each non-root node represents one block hash (`i64`). A node's children
 //! are keyed by the *next* block hash in a chain, so a path from the root
 //! down to depth `n` represents a chain of `n` block hashes. Every node
-//! tracks the set of [`KvWorkerId`]s that hold the chain ending at that
-//! node.
+//! tracks the [`KvWorkerId`]s that hold the chain ending at that node, and
+//! on which storage [`Tiers`] each of them holds it.
 //!
 //! The tree is fed by `BlockStored` / `BlockRemoved` / `AllBlocksCleared`
 //! events from SGLang workers (decoded by [`super::wire`]) and is queried
@@ -79,8 +79,31 @@
 //! the reverse index. Pruning cascades upward iteratively (chains can be
 //! deep — the recursive form would risk stack-overflow for pathological
 //! inputs). Pruning is shard-local: a chain never crosses a shard boundary.
+//!
+//! # Storage tiers
+//!
+//! An engine running a hierarchical cache holds a block on device and, once
+//! it has been backed up, on host pinned memory (or a storage backend) as
+//! well. It publishes every tier transition as its own event, tagged with a
+//! `medium`: a host-tier `BlockStored` when the backup lands, a device-tier
+//! `BlockRemoved` when the device copy is evicted, a host-tier `BlockRemoved`
+//! when the host copy goes. Under write-back the device eviction of a
+//! backed-up block is therefore preceded by a host store for the same block.
+//!
+//! WHY the tree keeps the tiers apart instead of treating any `BlockRemoved`
+//! as "the worker lost the block": a device eviction that leaves a host copy
+//! behind does not end the worker's ability to serve the prefix — it loads
+//! the copy back at memory speed instead of recomputing it. Dropping the
+//! worker on that event makes every prefix unroutable after one device
+//! turnover, even though the fleet still holds it for the whole host
+//! retention horizon, and the repeat request lands on a random worker that
+//! then prefills it cold. Ownership here is "any tier"; the device subset is
+//! reported alongside so the policy can prefer it.
+//!
+//! Untagged events keep their pre-tiering meaning: an untagged store is a
+//! device store, an untagged remove clears every tier. See [`Tiers`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -165,15 +188,209 @@ impl KvWorkerId {
     }
 }
 
-/// Result of [`HashTree::match_prefix`].
-#[derive(Debug, Clone)]
+/// The storage tiers on which one worker holds one block — a bitset, because
+/// a backed-up block sits on device AND host at once (module docs, "Storage
+/// tiers").
+///
+/// A worker owns a block, and is a routing candidate for it, while ANY bit is
+/// set. Travels between replicas as raw bits ([`Self::bits`] /
+/// [`Self::from_bits`]) inside [`SnapshotNode::tiers`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct Tiers(u8);
+
+impl Tiers {
+    /// Device HBM: `medium = "GPU"`, or an untagged event from a publisher that
+    /// predates tiering.
+    pub const DEVICE: Tiers = Tiers(1);
+    /// Host pinned memory: `medium = "CPU_PINNED"`.
+    pub const HOST: Tiers = Tiers(1 << 1);
+    /// A storage backend the worker can load back from: `medium = "DISK"` or
+    /// `"EXTERNAL"`.
+    pub const STORAGE: Tiers = Tiers(1 << 2);
+    /// A tier this build cannot rank: a `medium` string [`Self::known`] does
+    /// not recognise, or a snapshot bit outside the tiers it knows. The
+    /// worker is an owner (it can serve the prefix somehow) but is never
+    /// preferred as a device owner for it.
+    pub const OTHER: Tiers = Tiers(1 << 3);
+    /// Every tier — what an untagged `BlockRemoved` clears.
+    pub const ALL: Tiers = Tiers(Self::DEVICE.0 | Self::HOST.0 | Self::STORAGE.0 | Self::OTHER.0);
+    /// Every tier with its metric label, in bit order. [`TierCounts`] is
+    /// indexed by position in this table.
+    pub const SLOTS: [(Tiers, &'static str); TIER_SLOT_COUNT] = [
+        (Self::DEVICE, "device"),
+        (Self::HOST, "host"),
+        (Self::STORAGE, "storage"),
+        (Self::OTHER, "other"),
+    ];
+
+    /// The tier a `BlockStored` tagged `medium` lands on. Untagged reads as
+    /// device, which is what the event meant before tiers existed. An unknown
+    /// tag reads as [`Self::OTHER`]: the store still makes the worker an
+    /// owner, but a tier this tree cannot rank must not be the one the policy
+    /// prefers — an engine adding a medium would otherwise turn every store
+    /// on it into a device hit.
+    pub fn for_store(medium: Option<&str>) -> Tiers {
+        match medium {
+            None => Self::DEVICE,
+            Some(m) => Self::known(m).unwrap_or(Self::OTHER),
+        }
+    }
+
+    /// The tiers a `BlockRemoved` tagged `medium` clears. Untagged clears
+    /// everything — the pre-tiering meaning. An unknown tag ALSO clears
+    /// everything, deliberately asymmetric with [`Self::for_store`]: clearing
+    /// only a bit this tree never set would leave the worker owning the block
+    /// for good, and a permanently stale owner is the one failure a routing
+    /// index must never manufacture. Over-removal costs at most one cold
+    /// prefill.
+    pub fn for_remove(medium: Option<&str>) -> Tiers {
+        medium.and_then(Self::known).unwrap_or(Self::ALL)
+    }
+
+    /// The `StorageMedium` strings SGLang puts on the wire
+    /// (`python/sglang/srt/disaggregation/kv_events.py`) and the tier each
+    /// lands on. The single source for both the tree's ranking and the event
+    /// tally's medium labels, so a medium the tree ranks can never be one the
+    /// tally reports as unknown.
+    pub const WIRE_MEDIA: [(&'static str, Tiers); 4] = [
+        ("GPU", Self::DEVICE),
+        ("CPU_PINNED", Self::HOST),
+        ("DISK", Self::STORAGE),
+        ("EXTERNAL", Self::STORAGE),
+    ];
+
+    fn known(medium: &str) -> Option<Tiers> {
+        Self::WIRE_MEDIA
+            .iter()
+            .find(|(name, _)| *name == medium)
+            .map(|(_, tier)| *tier)
+    }
+
+    /// Position in [`Self::SLOTS`] of the best tier held, `None` if none.
+    /// `SLOTS` order is preference order: a device copy is served in place, a
+    /// host copy by load-back, storage slower still, `other` unranked.
+    pub fn best_slot(self) -> Option<usize> {
+        Self::SLOTS
+            .iter()
+            .position(|(tier, _)| self.contains(*tier))
+    }
+
+    /// Metric label of the best tier held (see [`Self::best_slot`]).
+    pub fn best_label(self) -> Option<&'static str> {
+        self.best_slot().map(|slot| Self::SLOTS[slot].1)
+    }
+
+    /// Bits as they travel in a snapshot. The inverse, [`Self::from_bits`],
+    /// reads an all-zero entry as device (a producer that wrote no tier meant
+    /// device) and folds bits outside the known tiers into [`Self::OTHER`], so
+    /// a carrier is never restored as an owner of no tier, nor as a device
+    /// owner on the strength of a tier this build does not know.
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub fn from_bits(bits: u8) -> Tiers {
+        if bits == 0 {
+            return Self::DEVICE;
+        }
+        let known = bits & Self::ALL.0;
+        let unknown = bits & !Self::ALL.0;
+        Tiers(known | if unknown != 0 { Self::OTHER.0 } else { 0 })
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether every bit of `other` is set here.
+    pub fn contains(self, other: Tiers) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub fn insert(&mut self, other: Tiers) {
+        self.0 |= other.0;
+    }
+
+    pub fn remove(&mut self, other: Tiers) {
+        self.0 &= !other.0;
+    }
+
+    /// The bits set in both.
+    pub fn intersection(self, other: Tiers) -> Tiers {
+        Tiers(self.0 & other.0)
+    }
+
+    /// The bits set here and not in `other`.
+    pub fn difference(self, other: Tiers) -> Tiers {
+        Tiers(self.0 & !other.0)
+    }
+}
+
+/// Number of entries in [`Tiers::SLOTS`].
+pub const TIER_SLOT_COUNT: usize = 4;
+
+/// How many nodes one carrier holds on each tier, indexed like
+/// [`Tiers::SLOTS`]. A node held on device and host counts under both.
+pub type TierCounts = [u64; TIER_SLOT_COUNT];
+
+/// Count one node's worth of `bits` into `counts`.
+fn tally_tiers(counts: &mut TierCounts, bits: Tiers) {
+    for (slot, (tier, _)) in Tiers::SLOTS.iter().enumerate() {
+        if bits.contains(*tier) {
+            counts[slot] += 1;
+        }
+    }
+}
+
+/// Add `tiers` to `worker`'s hold in `carriers`, creating the entry on first
+/// sight, and return the bits that were newly set. One lookup on the re-store
+/// path — under a hierarchical cache the host backup of a chain the worker
+/// already holds on device, the common case — and two on first sight. Never
+/// leaves an entry with no bits, which `TreeState::remove` relies on.
+fn add_tiers(
+    carriers: &mut HashMap<KvWorkerId, Tiers>,
+    worker: &KvWorkerId,
+    tiers: Tiers,
+) -> Tiers {
+    match carriers.get_mut(worker) {
+        Some(held) => {
+            let added = tiers.difference(*held);
+            held.insert(tiers);
+            added
+        }
+        None => {
+            carriers.insert(worker.clone(), tiers);
+            tiers
+        }
+    }
+}
+
+/// Result of [`HashTree::match_prefix`]. `Default` is the no-match result:
+/// zero depth, no carriers on any tier.
+#[derive(Debug, Clone, Default)]
 pub struct MatchResult {
     /// Number of leading block hashes from the input slice that matched a
     /// path from the root.
     pub matched_blocks: usize,
-    /// Workers holding the deepest matched node. Empty when
+    /// Workers holding the deepest matched node on ANY tier. Empty when
     /// `matched_blocks == 0`.
     pub workers: HashSet<KvWorkerId>,
+    /// The tiers each of `workers` holds the deepest matched node on. A worker
+    /// without the device bit serves the prefix by loading it back from a
+    /// lower tier — cheaper than a cold prefill, dearer than serving in place
+    /// — which is the ordering the policy prefers on ([`Tiers::best_slot`]).
+    pub tiers: HashMap<KvWorkerId, Tiers>,
+}
+
+impl MatchResult {
+    /// The subset of `workers` holding the deepest matched node on device.
+    pub fn device_workers(&self) -> HashSet<KvWorkerId> {
+        self.tiers
+            .iter()
+            .filter(|(_, tiers)| tiers.contains(Tiers::DEVICE))
+            .map(|(w, _)| w.clone())
+            .collect()
+    }
 }
 
 /// One node of a tree snapshot, as produced by
@@ -198,6 +415,41 @@ pub struct SnapshotNode {
     pub parent: Option<u32>,
     pub block_hash: i64,
     pub workers: Vec<u32>,
+    /// Tier bits of each carrier, parallel to `workers` (`tiers[k]` describes
+    /// `workers[k]`), as [`Tiers::bits`]. Empty means every carrier holds the
+    /// node on device.
+    ///
+    /// That empty-means-device reading is what keeps [`super::bootstrap::SNAPSHOT_FORMAT`]
+    /// unchanged: a producer that predates tiers omits the field and its
+    /// carriers restore exactly as they did before, and a consumer that
+    /// predates tiers ignores the field and reads the old meaning. The JSON
+    /// wire tolerates both directions; `serde(default)` fills the gap.
+    #[serde(default)]
+    pub tiers: Vec<u8>,
+}
+
+impl SnapshotNode {
+    /// Keep the carriers `map` accepts, renumbering each to what it returns,
+    /// and keep their tier entries in lockstep. The only correct way to
+    /// filter a record's carriers: `workers` and `tiers` are parallel by
+    /// index, so filtering one alone silently re-pairs every later carrier
+    /// with another carrier's tiers.
+    pub fn retain_carriers(&mut self, mut map: impl FnMut(u32) -> Option<u32>) {
+        let tiered = !self.tiers.is_empty();
+        let mut workers = Vec::with_capacity(self.workers.len());
+        let mut tiers = Vec::with_capacity(if tiered { self.workers.len() } else { 0 });
+        for (k, &w) in self.workers.iter().enumerate() {
+            let Some(kept) = map(w) else {
+                continue;
+            };
+            workers.push(kept);
+            if tiered {
+                tiers.push(self.tiers.get(k).copied().unwrap_or(Tiers::DEVICE.bits()));
+            }
+        }
+        self.workers = workers;
+        self.tiers = tiers;
+    }
 }
 
 /// Why a [`HashTree::restore_snapshot`] was rejected.
@@ -211,6 +463,9 @@ pub enum RestoreError {
     ForwardParentReference { index: usize },
     /// A record referenced a worker-table slot that does not exist.
     WorkerIndexOutOfRange { index: usize, worker: u32 },
+    /// A record's `tiers` was neither empty nor the same length as its
+    /// `workers`, so carriers cannot be paired with their tiers.
+    TierTableMismatch { index: usize },
     /// A node could not be created because its parent vanished — a tree
     /// invariant violation, not a bad snapshot. Already logged by
     /// `create_child`.
@@ -227,6 +482,10 @@ impl std::fmt::Display for RestoreError {
             Self::WorkerIndexOutOfRange { index, worker } => write!(
                 f,
                 "snapshot node {index} references out-of-range worker index {worker}",
+            ),
+            Self::TierTableMismatch { index } => write!(
+                f,
+                "snapshot node {index} has a tiers list that does not pair with its workers",
             ),
             Self::TreeInvariant { index } => {
                 write!(
@@ -276,7 +535,10 @@ struct Node {
     parent_block_hash: Option<i64>,
     /// `None` only for the root sentinel.
     parent: Option<NodeId>,
-    workers: HashSet<KvWorkerId>,
+    /// Carriers of the chain ending here, each with the tiers it holds the
+    /// block on. A carrier is dropped the moment its last tier bit clears;
+    /// an entry with empty tiers never exists (see [`TreeState::insert`]).
+    workers: HashMap<KvWorkerId, Tiers>,
     /// Children keyed by next-block hash.
     children: FxHashMap<i64, NodeId>,
     last_used: AtomicU64,
@@ -288,7 +550,7 @@ impl Node {
             block_hash,
             parent_block_hash,
             parent: Some(parent),
-            workers: HashSet::new(),
+            workers: HashMap::new(),
             children: FxHashMap::default(),
             last_used: AtomicU64::new(now_millis()),
         }
@@ -312,6 +574,11 @@ struct TreeState {
     nodes: FxHashMap<NodeId, Node>,
     by_hash: FxHashMap<i64, FxHashSet<NodeId>>,
     next_id: NodeId,
+    /// Nodes in this shard each carrier holds, per tier. Booked at every
+    /// site where a carrier's tier bits on a node change (`account_add` /
+    /// `account_remove`), so a scrape reads it without walking the tree. A
+    /// carrier holding nothing in the shard has no row.
+    occupancy: HashMap<KvWorkerId, TierCounts>,
 }
 
 const ROOT_ID: NodeId = 0;
@@ -329,7 +596,7 @@ impl TreeState {
                 block_hash: ROOT_HASH_SENTINEL,
                 parent_block_hash: None,
                 parent: None,
-                workers: HashSet::new(),
+                workers: HashMap::new(),
                 children: FxHashMap::default(),
                 last_used: AtomicU64::new(now_millis()),
             },
@@ -338,6 +605,7 @@ impl TreeState {
             nodes,
             by_hash: FxHashMap::default(),
             next_id: 1,
+            occupancy: HashMap::new(),
         }
     }
 
@@ -345,6 +613,55 @@ impl TreeState {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    /// Book one node's worth of `added` tier bits newly held by `worker`.
+    fn account_add(&mut self, worker: &KvWorkerId, added: Tiers) {
+        let mut delta = TierCounts::default();
+        tally_tiers(&mut delta, added);
+        self.account_add_counts(worker, delta);
+    }
+
+    /// Book `delta` nodes-per-tier newly held by `worker` — one row lookup for
+    /// a whole chain, which is how `insert` uses it.
+    fn account_add_counts(&mut self, worker: &KvWorkerId, delta: TierCounts) {
+        if delta.iter().all(|&c| c == 0) {
+            return;
+        }
+        match self.occupancy.get_mut(worker) {
+            Some(counts) => {
+                for (acc, d) in counts.iter_mut().zip(delta) {
+                    *acc += d;
+                }
+            }
+            None => {
+                self.occupancy.insert(worker.clone(), delta);
+            }
+        }
+    }
+
+    /// Book one node's worth of `removed` tier bits `worker` no longer holds,
+    /// dropping the carrier's row once it holds nothing in this shard.
+    fn account_remove(&mut self, worker: &KvWorkerId, removed: Tiers) {
+        if removed.is_empty() {
+            return;
+        }
+        let Some(counts) = self.occupancy.get_mut(worker) else {
+            error!(
+                worker = %worker.url,
+                dp_rank = worker.dp_rank,
+                "tree invariant violation: releasing tiers for a carrier with no occupancy row",
+            );
+            return;
+        };
+        for (slot, (tier, _)) in Tiers::SLOTS.iter().enumerate() {
+            if removed.contains(*tier) {
+                counts[slot] = counts[slot].saturating_sub(1);
+            }
+        }
+        if counts.iter().all(|&c| c == 0) {
+            self.occupancy.remove(worker);
+        }
     }
 
     /// Insert a brand-new child under `parent_id` and wire up the reverse
@@ -412,7 +729,7 @@ impl TreeState {
             if self
                 .nodes
                 .get(&cand)
-                .is_some_and(|n| n.workers.contains(worker))
+                .is_some_and(|n| n.workers.contains_key(worker))
             {
                 return cand;
             }
@@ -427,13 +744,25 @@ impl TreeState {
         ROOT_ID
     }
 
-    fn insert(&mut self, worker: &KvWorkerId, parent_hash: Option<i64>, block_hashes: &[i64]) {
-        if block_hashes.is_empty() {
+    /// Mark every node along `block_hashes` as held by `worker` on `tiers`,
+    /// adding to whatever tiers it already holds there. Empty `tiers` is a
+    /// no-op: a carrier entry with no tier would be an owner of nothing, and
+    /// `remove` relies on "no bits ⇒ no entry" to know when to prune.
+    fn insert(
+        &mut self,
+        worker: &KvWorkerId,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+        tiers: Tiers,
+    ) {
+        if block_hashes.is_empty() || tiers.is_empty() {
             return;
         }
         let mut current = self.resolve_parent(worker, parent_hash);
         let mut prev_hash = parent_hash;
         let now = now_millis();
+        // Occupancy is booked once for the whole chain, not per block.
+        let mut delta = TierCounts::default();
         for &h in block_hashes {
             let child_id = match self
                 .nodes
@@ -454,16 +783,19 @@ impl TreeState {
                 );
                 return;
             };
-            child.workers.insert(worker.clone());
+            let added = add_tiers(&mut child.workers, worker, tiers);
             child.last_used.store(now, Ordering::Relaxed);
+            tally_tiers(&mut delta, added);
             current = child_id;
             prev_hash = Some(h);
         }
+        self.account_add_counts(worker, delta);
     }
 
-    /// Drop `worker` from every node in THIS shard carrying any hash in
-    /// `block_hashes`, pruning nodes that become empty + childless.
-    fn remove(&mut self, worker: &KvWorkerId, block_hashes: &[i64]) {
+    /// Clear `tiers` from `worker`'s hold on every node in THIS shard carrying
+    /// any hash in `block_hashes`. The worker leaves a node once no tier bit
+    /// remains, and a node that becomes empty + childless is pruned.
+    fn remove(&mut self, worker: &KvWorkerId, block_hashes: &[i64], tiers: Tiers) {
         // Collect all node ids to touch (fixed snapshot — avoids iterator
         // invalidation when pruning mutates `by_hash`).
         let mut targets: Vec<NodeId> = Vec::new();
@@ -475,13 +807,24 @@ impl TreeState {
         for id in targets {
             // Node may already be gone if a previous prune in this batch
             // cascaded through it — skip silently.
-            let still_present = match self.nodes.get_mut(&id) {
+            let (still_present, released) = match self.nodes.get_mut(&id) {
                 Some(node) => {
-                    node.workers.remove(worker);
-                    node.workers.is_empty() && node.children.is_empty()
+                    let mut released = Tiers::default();
+                    if let Some(held) = node.workers.get_mut(worker) {
+                        released = held.intersection(tiers);
+                        held.remove(tiers);
+                        if held.is_empty() {
+                            node.workers.remove(worker);
+                        }
+                    }
+                    (
+                        node.workers.is_empty() && node.children.is_empty(),
+                        released,
+                    )
                 }
-                None => false,
+                None => (false, Tiers::default()),
             };
+            self.account_remove(worker, released);
             if still_present {
                 self.prune_cascade(id);
             }
@@ -499,11 +842,14 @@ impl TreeState {
             .collect();
         let mut prune_candidates: Vec<NodeId> = Vec::new();
         for id in ids {
-            if let Some(node) = self.nodes.get_mut(&id) {
-                if node.workers.remove(worker)
-                    && node.workers.is_empty()
-                    && node.children.is_empty()
-                {
+            let removed = self.nodes.get_mut(&id).and_then(|node| {
+                node.workers
+                    .remove(worker)
+                    .map(|held| (held, node.workers.is_empty() && node.children.is_empty()))
+            });
+            if let Some((held, prunable)) = removed {
+                self.account_remove(worker, held);
+                if prunable {
                     prune_candidates.push(id);
                 }
             }
@@ -590,10 +936,7 @@ impl TreeState {
     /// [`HashTree::match_prefix`] documents the policy for callers.
     fn match_prefix(&self, parent_hash: Option<i64>, block_hashes: &[i64]) -> MatchResult {
         if block_hashes.is_empty() {
-            return MatchResult {
-                matched_blocks: 0,
-                workers: HashSet::new(),
-            };
+            return MatchResult::default();
         }
         // Determine starting node: root, or the unique node carrying
         // `parent_hash`. Multiple matches: bail to root (caller should
@@ -629,17 +972,14 @@ impl TreeState {
                 None => break,
             }
         }
-        let workers = match last_match_node {
-            Some(id) => self
-                .nodes
-                .get(&id)
-                .map(|n| n.workers.clone())
-                .unwrap_or_default(),
-            None => HashSet::new(),
-        };
+        let tiers: HashMap<KvWorkerId, Tiers> = last_match_node
+            .and_then(|id| self.nodes.get(&id))
+            .map(|n| n.workers.clone())
+            .unwrap_or_default();
         MatchResult {
             matched_blocks: matched,
-            workers,
+            workers: tiers.keys().cloned().collect(),
+            tiers,
         }
     }
 
@@ -684,7 +1024,7 @@ impl TreeState {
             if self
                 .nodes
                 .get(&child_id)
-                .is_some_and(|n| n.workers.iter().any(|w| w.url == url))
+                .is_some_and(|n| n.workers.keys().any(|w| w.url == url))
             {
                 owned_depth = depth;
             }
@@ -757,8 +1097,12 @@ impl TreeState {
             return 0;
         }
         let count_before = self.nodes.len();
-        if let Some(node) = self.nodes.get_mut(&victim) {
-            node.workers.clear();
+        let carriers: Vec<(KvWorkerId, Tiers)> = match self.nodes.get_mut(&victim) {
+            Some(node) => node.workers.drain().collect(),
+            None => Vec::new(),
+        };
+        for (worker, held) in &carriers {
+            self.account_remove(worker, *held);
         }
         self.prune_cascade(victim);
         count_before - self.nodes.len()
@@ -841,9 +1185,11 @@ impl HashTree {
             total_carriers += ids.len();
             single_carrier_shard = Some(idx);
             if worker_owned_shard.is_none()
-                && ids
-                    .iter()
-                    .any(|id| st.nodes.get(id).is_some_and(|n| n.workers.contains(worker)))
+                && ids.iter().any(|id| {
+                    st.nodes
+                        .get(id)
+                        .is_some_and(|n| n.workers.contains_key(worker))
+                })
             {
                 worker_owned_shard = Some(idx);
             }
@@ -897,26 +1243,50 @@ impl HashTree {
         }
     }
 
-    /// Apply a `BlockStored` event.
+    /// Apply an untagged `BlockStored` event: a device store. See
+    /// [`Self::insert_tiered`].
+    pub fn insert(&self, worker: &KvWorkerId, parent_hash: Option<i64>, block_hashes: &[i64]) {
+        self.insert_tiered(worker, parent_hash, block_hashes, Tiers::DEVICE);
+    }
+
+    /// Apply a `BlockStored` event on `tiers` (from its `medium`, via
+    /// [`Tiers::for_store`]).
     ///
     /// Walks from `parent_hash`'s node (or root) and descends along
-    /// `block_hashes`, marking every visited node as held by `worker`.
-    /// Empty `block_hashes` is a no-op.
-    pub fn insert(&self, worker: &KvWorkerId, parent_hash: Option<i64>, block_hashes: &[i64]) {
-        if block_hashes.is_empty() {
+    /// `block_hashes`, marking every visited node as held by `worker` on
+    /// `tiers` in addition to any tier it already holds there. Empty
+    /// `block_hashes` or empty `tiers` is a no-op.
+    pub fn insert_tiered(
+        &self,
+        worker: &KvWorkerId,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+        tiers: Tiers,
+    ) {
+        if block_hashes.is_empty() || tiers.is_empty() {
             return;
         }
         let (idx, effective_parent) = self.route_insert(worker, parent_hash, block_hashes);
         self.shards[idx]
             .write()
-            .insert(worker, effective_parent, block_hashes);
+            .insert(worker, effective_parent, block_hashes, tiers);
     }
 
-    /// Apply a `BlockRemoved` event.
+    /// Apply an untagged `BlockRemoved` event: the worker loses the blocks on
+    /// every tier. See [`Self::remove_tiered`].
+    pub fn remove(&self, worker: &KvWorkerId, block_hashes: &[i64]) {
+        self.remove_tiered(worker, block_hashes, Tiers::ALL);
+    }
+
+    /// Apply a `BlockRemoved` event for `tiers` (from its `medium`, via
+    /// [`Tiers::for_remove`]).
     ///
-    /// For every node carrying any hash in `block_hashes`, drop `worker`
-    /// from that node's worker set. Nodes that become empty AND childless
-    /// are pruned (cascading upward).
+    /// For every node carrying any hash in `block_hashes`, clear `tiers`
+    /// from `worker`'s hold on it. The worker stays an owner of the node
+    /// while it holds the block on any other tier — a device eviction after a
+    /// host backup leaves the worker a host-tier owner. Once no tier remains
+    /// the worker is dropped, and nodes that become empty AND childless are
+    /// pruned (cascading upward).
     ///
     /// Removing the worker from a node does NOT remove the node if other
     /// workers still hold it.
@@ -925,12 +1295,12 @@ impl HashTree {
     /// of a chain rooted elsewhere in another, so this fans out across all
     /// shards. Each shard's local `by_hash` short-circuits shards that don't
     /// carry any of the hashes.
-    pub fn remove(&self, worker: &KvWorkerId, block_hashes: &[i64]) {
-        if block_hashes.is_empty() {
+    pub fn remove_tiered(&self, worker: &KvWorkerId, block_hashes: &[i64], tiers: Tiers) {
+        if block_hashes.is_empty() || tiers.is_empty() {
             return;
         }
         for shard in &self.shards {
-            shard.write().remove(worker, block_hashes);
+            shard.write().remove(worker, block_hashes, tiers);
         }
     }
 
@@ -967,10 +1337,7 @@ impl HashTree {
     /// context, so the asymmetry is intentional.)
     pub fn match_prefix(&self, parent_hash: Option<i64>, block_hashes: &[i64]) -> MatchResult {
         if block_hashes.is_empty() {
-            return MatchResult {
-                matched_blocks: 0,
-                workers: HashSet::new(),
-            };
+            return MatchResult::default();
         }
         let (idx, effective_parent) = self.route_match(parent_hash, block_hashes);
         self.shards[idx]
@@ -1043,6 +1410,63 @@ impl HashTree {
     /// to clean up `by_hash` and the index has leaked.
     pub fn reverse_index_size(&self) -> usize {
         self.shards.iter().map(|s| s.read().by_hash.len()).sum()
+    }
+
+    /// Nodes each carrier holds on each tier, summed across shards and sorted
+    /// by carrier. Rendered as `sgl_router_kv_tree_blocks`; against the
+    /// engine's own per-tier occupancy for the same pod it is the tree's
+    /// coverage of that tier — the number that says whether a tier the engine
+    /// holds is visible to routing at all (module docs, "Storage tiers").
+    ///
+    /// Read off the per-shard accounting rather than walked, so a scrape
+    /// costs one read lock per shard plus a merge over carriers. Like
+    /// [`Self::node_count`] it is a point-in-time aggregate across shards, not
+    /// one consistent instant. A carrier holding nothing has no row.
+    pub fn tier_occupancy(&self) -> Vec<(KvWorkerId, TierCounts)> {
+        let mut total: HashMap<KvWorkerId, TierCounts> = HashMap::new();
+        for shard in &self.shards {
+            let st = shard.read();
+            for (worker, counts) in &st.occupancy {
+                let acc = total.entry(worker.clone()).or_default();
+                for (a, c) in acc.iter_mut().zip(counts) {
+                    *a += c;
+                }
+            }
+        }
+        let mut rows: Vec<(KvWorkerId, TierCounts)> = total.into_iter().collect();
+        rows.sort_by(|a, b| (&a.0.url, a.0.dp_rank).cmp(&(&b.0.url, b.0.dp_rank)));
+        rows
+    }
+
+    /// Whether ANY node carries `hash`, regardless of its position in a chain.
+    ///
+    /// Answers the question [`Self::match_prefix`] cannot. That method returns
+    /// `matched_blocks == 0` in two situations with OPPOSITE diagnoses: the
+    /// fleet never stored the block at all, or the block is present but not
+    /// reachable as a chain from the root. The first is an engine-side publish
+    /// or eviction gap; the second is a parent-linkage problem in this tree.
+    /// Nothing else separates them, and a fleet reading ~100% zero-overlap
+    /// looks identical under both.
+    ///
+    /// Scans every shard rather than only `shard_of(hash)`, for the reason
+    /// [`Self::reverse_index_size`] documents: a hash reached as an interior
+    /// node of another chain is not confined to its own root shard.
+    ///
+    /// Does NOT touch `last_used` — a diagnostic read must not perturb
+    /// eviction order, matching [`Self::match_prefix_for_url`].
+    pub fn contains_hash(&self, hash: i64) -> bool {
+        // The root shard is where a chain-leading block lives, so try it
+        // alone before sweeping the rest: a present hash usually costs one
+        // lock, and only the absent case pays the full scan.
+        let root = shard_of(hash);
+        if self.shards[root].read().by_hash.contains_key(&hash) {
+            return true;
+        }
+        self.shards
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx != root)
+            .any(|(_, shard)| shard.read().by_hash.contains_key(&hash))
     }
 
     /// Evict least-recently-used nodes until `node_count() <= max_size`
@@ -1149,20 +1573,26 @@ impl HashTree {
                 let Some(node) = st.nodes.get(&id) else {
                     continue;
                 };
-                let mut workers: Vec<u32> = node
+                let mut carriers: Vec<(u32, u8)> = node
                     .workers
                     .iter()
-                    .map(|w| match worker_index.get(w) {
-                        Some(&idx) => idx,
-                        None => {
-                            let idx = worker_table.len() as u32;
-                            worker_table.push(w.clone());
-                            worker_index.insert(w.clone(), idx);
-                            idx
-                        }
+                    .map(|(w, tiers)| {
+                        let idx = match worker_index.get(w) {
+                            Some(&idx) => idx,
+                            None => {
+                                let idx = worker_table.len() as u32;
+                                worker_table.push(w.clone());
+                                worker_index.insert(w.clone(), idx);
+                                idx
+                            }
+                        };
+                        (idx, tiers.bits())
                     })
                     .collect();
-                workers.sort_unstable();
+                // Sorted by worker index so a record's carrier list does not
+                // depend on hash-map iteration order; tiers ride along.
+                carriers.sort_unstable();
+                let (workers, tiers): (Vec<u32>, Vec<u8>) = carriers.into_iter().unzip();
                 // Pushed before its children, so children get larger indices
                 // and the backward-reference invariant holds by construction.
                 let my_idx = nodes.len() as u32;
@@ -1170,6 +1600,7 @@ impl HashTree {
                     parent: parent_idx,
                     block_hash: node.block_hash,
                     workers,
+                    tiers,
                 });
                 for &child in node.children.values() {
                     stack.push((child, Some(my_idx)));
@@ -1226,6 +1657,9 @@ impl HashTree {
             {
                 return Err(RestoreError::WorkerIndexOutOfRange { index: i, worker });
             }
+            if !rec.tiers.is_empty() && rec.tiers.len() != rec.workers.len() {
+                return Err(RestoreError::TierTableMismatch { index: i });
+            }
         }
 
         // Record index -> where it landed. Filled in order, so a parent is
@@ -1250,11 +1684,28 @@ impl HashTree {
                     .create_child(parent_id, rec.block_hash, parent_block_hash)
                     .ok_or(RestoreError::TreeInvariant { index: i })?,
             };
+            // (worker-table index, bits newly held) per carrier, booked into
+            // the shard's occupancy once the node borrow ends.
+            let mut added: Vec<(usize, Tiers)> = Vec::with_capacity(rec.workers.len());
             if let Some(node) = st.nodes.get_mut(&id) {
-                for &w in &rec.workers {
-                    node.workers.insert(worker_table[w as usize].clone());
+                for (k, &w) in rec.workers.iter().enumerate() {
+                    // Absent tiers (pre-tiering producer) read as device;
+                    // `from_bits` also folds a zero entry to device so no
+                    // carrier is restored owning no tier.
+                    let tiers = rec
+                        .tiers
+                        .get(k)
+                        .map(|&bits| Tiers::from_bits(bits))
+                        .unwrap_or(Tiers::DEVICE);
+                    let bits = add_tiers(&mut node.workers, &worker_table[w as usize], tiers);
+                    if !bits.is_empty() {
+                        added.push((w as usize, bits));
+                    }
                 }
                 node.last_used.store(now, Ordering::Relaxed);
+            }
+            for (w, bits) in added {
+                st.account_add(&worker_table[w], bits);
             }
             placed.push((shard_idx, id));
         }
@@ -1273,11 +1724,29 @@ impl HashTree {
 
 #[cfg(test)]
 impl HashTree {
-    /// Whether any shard's reverse index carries `hash`.
-    fn debug_has_hash(&self, hash: i64) -> bool {
-        self.shards
-            .iter()
-            .any(|s| s.read().by_hash.contains_key(&hash))
+    /// Recompute [`Self::tier_occupancy`] by walking every node — the oracle
+    /// the incrementally maintained counters are checked against.
+    fn debug_recount_occupancy(&self) -> Vec<(KvWorkerId, TierCounts)> {
+        let mut total: HashMap<KvWorkerId, TierCounts> = HashMap::new();
+        for shard in &self.shards {
+            let st = shard.read();
+            for (&id, node) in &st.nodes {
+                if id == ROOT_ID {
+                    continue;
+                }
+                for (worker, held) in &node.workers {
+                    let acc = total.entry(worker.clone()).or_default();
+                    for (slot, (tier, _)) in Tiers::SLOTS.iter().enumerate() {
+                        if held.contains(*tier) {
+                            acc[slot] += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let mut rows: Vec<(KvWorkerId, TierCounts)> = total.into_iter().collect();
+        rows.sort_by(|a, b| (&a.0.url, a.0.dp_rank).cmp(&(&b.0.url, b.0.dp_rank)));
+        rows
     }
 
     /// Total number of distinct nodes carrying `hash`, summed across shards.
@@ -1344,6 +1813,238 @@ mod tests {
         let m2 = tree.match_prefix(None, &[1, 2, 3]);
         assert_eq!(m2.matched_blocks, 0);
         assert!(m2.workers.is_empty());
+    }
+
+    /// The whole point of `contains_hash`: `match_prefix` returns 0 both for a
+    /// block the fleet never stored AND for one it stores at a position the
+    /// root-anchored walk cannot reach. Those have opposite diagnoses, so the
+    /// accessor must tell them apart — and must stop saying "in_tree" once the
+    /// block is actually removed, or the counter would report stale presence.
+    #[test]
+    fn contains_hash_separates_absent_from_unreachable() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        tree.insert(&a, None, &[1, 2, 3]);
+
+        // Reachable from the root: both signals agree it is there.
+        assert_eq!(tree.match_prefix(None, &[1, 2]).matched_blocks, 2);
+        assert!(tree.contains_hash(1));
+
+        // Carried by an INTERIOR node. match_prefix reports 0 because the chain
+        // does not start at the root, yet the hash is present. This is the case
+        // the counter exists to separate; without it this is indistinguishable
+        // from a block the engines never published.
+        assert_eq!(tree.match_prefix(None, &[2, 3]).matched_blocks, 0);
+        assert!(tree.contains_hash(2), "interior hash must still be visible");
+        assert!(tree.contains_hash(3), "leaf hash must still be visible");
+
+        // Never inserted: genuinely absent.
+        assert_eq!(tree.match_prefix(None, &[99]).matched_blocks, 0);
+        assert!(!tree.contains_hash(99));
+
+        // After removal the reverse index must not keep reporting presence, or
+        // an engine-side eviction would be misread as a router linkage fault.
+        tree.remove(&a, &[1, 2, 3]);
+        assert!(
+            !tree.contains_hash(1),
+            "removed chain must not read in_tree"
+        );
+        assert!(
+            !tree.contains_hash(2),
+            "removed chain must not read in_tree"
+        );
+    }
+
+    /// The write-back sequence the engine publishes for a backed-up block:
+    /// device store, host store once the D2H copy lands, then a DEVICE-tagged
+    /// removal when the device copy is evicted. The worker still holds the
+    /// block on host, so it must stay an owner — just no longer a device one.
+    /// Only the host-tagged removal ends ownership.
+    #[test]
+    fn device_eviction_after_host_backup_keeps_the_worker_as_host_owner() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        tree.insert_tiered(&a, None, &[1, 2, 3], Tiers::for_store(Some("GPU")));
+        tree.insert_tiered(&a, None, &[1, 2, 3], Tiers::for_store(Some("CPU_PINNED")));
+
+        let m = tree.match_prefix(None, &[1, 2, 3]);
+        assert_eq!(m.matched_blocks, 3);
+        assert_eq!(m.workers, workers(&[&a]));
+        assert_eq!(m.device_workers(), workers(&[&a]), "held on device too");
+
+        tree.remove_tiered(&a, &[3], Tiers::for_remove(Some("GPU")));
+        let m = tree.match_prefix(None, &[1, 2, 3]);
+        assert_eq!(m.matched_blocks, 3, "host copy keeps the chain matchable");
+        assert_eq!(
+            m.workers,
+            workers(&[&a]),
+            "host-only holder is still an owner"
+        );
+        assert!(
+            m.device_workers().is_empty(),
+            "but no longer a device owner"
+        );
+
+        tree.remove_tiered(&a, &[3], Tiers::for_remove(Some("CPU_PINNED")));
+        let m = tree.match_prefix(None, &[1, 2, 3]);
+        assert_eq!(m.matched_blocks, 2, "last tier gone: node pruned");
+        assert!(!tree.contains_hash(3));
+    }
+
+    /// Untagged events keep the pre-tiering contract: a bare `BlockStored` is
+    /// a device store, a bare `BlockRemoved` clears every tier at once. A
+    /// publisher that never tags must see exactly the behaviour it always had.
+    #[test]
+    fn untagged_events_keep_the_legacy_meaning() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        tree.insert(&a, None, &[1, 2]);
+        let m = tree.match_prefix(None, &[1, 2]);
+        assert_eq!(
+            m.device_workers(),
+            workers(&[&a]),
+            "untagged store is device"
+        );
+
+        // Add a host copy, then an UNTAGGED removal: must clear both.
+        tree.insert_tiered(&a, None, &[1, 2], Tiers::HOST);
+        tree.remove(&a, &[2]);
+        assert_eq!(tree.match_prefix(None, &[1, 2]).matched_blocks, 1);
+    }
+
+    /// An unknown medium is asymmetric on purpose: a store on it makes the
+    /// worker an owner on the unranked `OTHER` tier — never a device owner —
+    /// while a removal tagged with it clears everything. The alternative for
+    /// removal — clearing only a bit that was never set — leaves a stale
+    /// owner forever.
+    #[test]
+    fn unknown_medium_stores_as_owner_and_removes_everything() {
+        assert_eq!(Tiers::for_store(Some("NVLINK_PEER")), Tiers::OTHER);
+        assert_eq!(Tiers::for_remove(Some("NVLINK_PEER")), Tiers::ALL);
+        assert_eq!(Tiers::for_store(None), Tiers::DEVICE);
+        assert_eq!(Tiers::for_remove(None), Tiers::ALL);
+        assert_eq!(Tiers::for_store(Some("CPU_PINNED")), Tiers::HOST);
+        assert_eq!(Tiers::for_remove(Some("DISK")), Tiers::STORAGE);
+        assert_eq!(Tiers::for_remove(Some("EXTERNAL")), Tiers::STORAGE);
+
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        tree.insert_tiered(&a, None, &[1], Tiers::DEVICE);
+        tree.insert_tiered(&a, None, &[1], Tiers::HOST);
+        tree.insert_tiered(&b, None, &[1], Tiers::for_store(Some("NVLINK_PEER")));
+        let m = tree.match_prefix(None, &[1]);
+        assert_eq!(
+            m.workers,
+            workers(&[&a, &b]),
+            "unknown-tier holder is an owner"
+        );
+        assert_eq!(m.device_workers(), workers(&[&a]), "but not a device owner");
+        tree.remove_tiered(&a, &[1], Tiers::for_remove(Some("NVLINK_PEER")));
+        tree.remove_tiered(&b, &[1], Tiers::for_remove(Some("NVLINK_PEER")));
+        assert_eq!(tree.match_prefix(None, &[1]).matched_blocks, 0);
+    }
+
+    /// Snapshot bits this build does not know fold into `OTHER`: the carrier
+    /// stays an owner but is not promoted to device. A zero entry still reads
+    /// as device.
+    #[test]
+    fn from_bits_folds_unknown_bits_into_other_not_device() {
+        assert_eq!(Tiers::from_bits(0), Tiers::DEVICE);
+        assert_eq!(Tiers::from_bits(0b1000_0000), Tiers::OTHER);
+        let mut host_plus_unknown = Tiers::HOST;
+        host_plus_unknown.insert(Tiers::OTHER);
+        assert_eq!(
+            Tiers::from_bits(Tiers::HOST.bits() | 0b1000_0000),
+            host_plus_unknown
+        );
+        assert_eq!(Tiers::from_bits(Tiers::DEVICE.bits()), Tiers::DEVICE);
+    }
+
+    /// Tiers are per (node, worker): a device removal by one worker must not
+    /// touch another worker's hold on the same node, and a node whose
+    /// carriers differ by tier reports the device subset exactly.
+    #[test]
+    fn tiers_are_tracked_per_worker() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        tree.insert_tiered(&a, None, &[1, 2], Tiers::DEVICE);
+        tree.insert_tiered(&b, None, &[1, 2], Tiers::HOST);
+
+        let m = tree.match_prefix(None, &[1, 2]);
+        assert_eq!(m.workers, workers(&[&a, &b]));
+        assert_eq!(m.device_workers(), workers(&[&a]));
+
+        tree.remove_tiered(&a, &[2], Tiers::DEVICE);
+        let m = tree.match_prefix(None, &[1, 2]);
+        assert_eq!(m.workers, workers(&[&b]), "a dropped, b untouched");
+        assert!(m.device_workers().is_empty());
+    }
+
+    /// A store on no tier must not create a carrier: `remove` relies on
+    /// "no bits ⇒ no entry" to know when a node is prunable.
+    #[test]
+    fn empty_tier_insert_is_noop() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        tree.insert_tiered(&a, None, &[1], Tiers::default());
+        assert_eq!(tree.node_count(), 0);
+    }
+
+    /// The per-tier occupancy is maintained incrementally at every mutation
+    /// site, so it is checked against a full recount after a sequence that
+    /// exercises all of them: tiered stores, partial and full removals,
+    /// `clear_worker`, LRU eviction, and a snapshot restore onto live state.
+    #[test]
+    fn tier_occupancy_matches_a_full_recount_after_mixed_mutations() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 1);
+        let c = worker("http://c", 0);
+
+        tree.insert_tiered(&a, None, &[1, 2, 3, 4], Tiers::DEVICE);
+        tree.insert_tiered(&a, None, &[1, 2], Tiers::HOST);
+        tree.insert_tiered(&b, None, &[1, 2, 3], Tiers::HOST);
+        tree.insert_tiered(&b, None, &[1, 2, 5, 6], Tiers::DEVICE);
+        tree.insert_tiered(&c, None, &[7], Tiers::for_store(Some("NVLINK_PEER")));
+        for r in 0..40i64 {
+            tree.insert(&c, None, &[r * 4096 + 11, r * 4096 + 12]);
+        }
+        assert_eq!(tree.tier_occupancy(), tree.debug_recount_occupancy());
+
+        // Spot-check the shape: a holds 4 device nodes and 2 host nodes.
+        let rows = tree.tier_occupancy();
+        let (_, a_counts) = rows.iter().find(|(w, _)| *w == a).unwrap();
+        assert_eq!(a_counts[0], 4, "device");
+        assert_eq!(a_counts[1], 2, "host");
+        assert_eq!(a_counts[2], 0, "storage");
+        let (_, c_counts) = rows.iter().find(|(w, _)| *w == c).unwrap();
+        assert_eq!(c_counts[3], 1, "unknown medium lands on other");
+
+        // Partial removal (device only) on a node held on both tiers, then a
+        // removal that clears the last tier and prunes.
+        tree.remove_tiered(&a, &[2], Tiers::DEVICE);
+        tree.remove_tiered(&a, &[4], Tiers::ALL);
+        assert_eq!(tree.tier_occupancy(), tree.debug_recount_occupancy());
+
+        // Whole-worker clear, then LRU eviction down to a small cap.
+        tree.clear_worker(&b);
+        assert_eq!(tree.tier_occupancy(), tree.debug_recount_occupancy());
+        assert!(tree.evict_lru(10) > 0);
+        assert_eq!(tree.tier_occupancy(), tree.debug_recount_occupancy());
+        assert!(
+            tree.tier_occupancy().iter().all(|(w, _)| *w != b),
+            "a cleared worker must leave no occupancy row",
+        );
+
+        // Restore a peer snapshot onto the live tree (unions carriers).
+        let src = HashTree::new();
+        src.insert_tiered(&b, None, &[1, 2], Tiers::HOST);
+        src.insert_tiered(&a, None, &[1, 2, 3], Tiers::DEVICE);
+        let (table, nodes) = src.export_snapshot();
+        tree.restore_snapshot(&table, &nodes).unwrap();
+        assert_eq!(tree.tier_occupancy(), tree.debug_recount_occupancy());
     }
 
     #[test]
@@ -1503,7 +2204,7 @@ mod tests {
         assert_eq!(m.workers, workers(&[&a]));
 
         // Reverse-index sanity for hash 2: still present (node holds it).
-        assert!(tree.debug_has_hash(2));
+        assert!(tree.contains_hash(2));
     }
 
     #[test]
@@ -1546,9 +2247,9 @@ mod tests {
         // node_count() returns *non-root* count, so it should be 0.
         assert_eq!(tree.node_count(), 0);
         // Reverse index for these hashes should be empty.
-        assert!(!tree.debug_has_hash(1));
-        assert!(!tree.debug_has_hash(2));
-        assert!(!tree.debug_has_hash(3));
+        assert!(!tree.contains_hash(1));
+        assert!(!tree.contains_hash(2));
+        assert!(!tree.contains_hash(3));
     }
 
     #[test]
@@ -2049,11 +2750,13 @@ mod tests {
                 parent: Some(1), // forward
                 block_hash: 1,
                 workers: vec![0],
+                tiers: vec![],
             },
             SnapshotNode {
                 parent: None,
                 block_hash: 2,
                 workers: vec![0],
+                tiers: vec![],
             },
         ];
         assert_eq!(
@@ -2072,6 +2775,7 @@ mod tests {
             parent: Some(0),
             block_hash: 1,
             workers: vec![0],
+            tiers: vec![],
         }];
         assert_eq!(
             tree.restore_snapshot(&[a], &nodes),
@@ -2089,11 +2793,13 @@ mod tests {
                 parent: None,
                 block_hash: 1,
                 workers: vec![0],
+                tiers: vec![],
             },
             SnapshotNode {
                 parent: Some(0),
                 block_hash: 2,
                 workers: vec![7], // table has one entry
+                tiers: vec![],
             },
         ];
         assert_eq!(
@@ -2104,6 +2810,105 @@ mod tests {
             }),
         );
         assert_eq!(tree.node_count(), 0);
+    }
+
+    /// Tiers survive an export → restore round trip per carrier, so a replica
+    /// bootstrapped from a warm peer ranks device and host owners the same way
+    /// the peer did.
+    #[test]
+    fn snapshot_round_trip_preserves_tiers_per_carrier() {
+        let src = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        src.insert_tiered(&a, None, &[1, 2], Tiers::DEVICE);
+        src.insert_tiered(&a, None, &[1, 2], Tiers::HOST);
+        src.insert_tiered(&b, None, &[1, 2], Tiers::HOST);
+
+        let (table, nodes) = src.export_snapshot();
+        for n in &nodes {
+            assert_eq!(n.tiers.len(), n.workers.len(), "tiers pair with workers");
+        }
+        let dst = HashTree::new();
+        dst.restore_snapshot(&table, &nodes).unwrap();
+
+        let m = dst.match_prefix(None, &[1, 2]);
+        assert_eq!(m.workers, workers(&[&a, &b]));
+        assert_eq!(
+            m.device_workers(),
+            workers(&[&a]),
+            "b was host-only on the peer"
+        );
+    }
+
+    /// A snapshot from a producer that predates tiers carries no `tiers`; its
+    /// carriers restore as device owners, which is what its `workers` list
+    /// meant when it was written.
+    #[test]
+    fn legacy_snapshot_without_tiers_restores_as_device() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let nodes = vec![SnapshotNode {
+            parent: None,
+            block_hash: 1,
+            workers: vec![0],
+            tiers: vec![],
+        }];
+        tree.restore_snapshot(std::slice::from_ref(&a), &nodes)
+            .unwrap();
+        assert_eq!(
+            tree.match_prefix(None, &[1]).device_workers(),
+            workers(&[&a])
+        );
+    }
+
+    #[test]
+    fn restore_rejects_tiers_that_do_not_pair_with_workers() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        let nodes = vec![SnapshotNode {
+            parent: None,
+            block_hash: 1,
+            workers: vec![0, 1],
+            tiers: vec![Tiers::HOST.bits()], // one entry for two carriers
+        }];
+        assert_eq!(
+            tree.restore_snapshot(&[a, b], &nodes),
+            Err(RestoreError::TierTableMismatch { index: 0 }),
+        );
+        assert_eq!(tree.node_count(), 0);
+    }
+
+    /// `retain_carriers` is the only correct way to filter a record's
+    /// carriers: workers and tiers are parallel by index, so dropping a worker
+    /// must drop its tier entry, not shift a neighbour's onto it.
+    #[test]
+    fn retain_carriers_keeps_tiers_aligned() {
+        let mut rec = SnapshotNode {
+            parent: None,
+            block_hash: 1,
+            workers: vec![0, 1, 2],
+            tiers: vec![Tiers::DEVICE.bits(), Tiers::HOST.bits(), Tiers::ALL.bits()],
+        };
+        // Drop worker 1, renumber 2 → 1.
+        rec.retain_carriers(|w| match w {
+            0 => Some(0),
+            2 => Some(1),
+            _ => None,
+        });
+        assert_eq!(rec.workers, vec![0, 1]);
+        assert_eq!(rec.tiers, vec![Tiers::DEVICE.bits(), Tiers::ALL.bits()]);
+
+        // A legacy record stays legacy: no tiers are invented.
+        let mut legacy = SnapshotNode {
+            parent: None,
+            block_hash: 1,
+            workers: vec![0, 1],
+            tiers: vec![],
+        };
+        legacy.retain_carriers(|w| (w == 1).then_some(0));
+        assert_eq!(legacy.workers, vec![0]);
+        assert!(legacy.tiers.is_empty());
     }
 
     /// Restoring onto a tree that already holds live state must union

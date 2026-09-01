@@ -36,7 +36,7 @@
     {
       "type": "stat",
       "title": "Request rate",
-      "description": "Non-infra requests answered at the edge, per second — every route, and including requests rejected before a worker was chosen. Edge intake vs dispatched separates those two populations.",
+      "description": "Non-infra requests answered at the edge, per second \u2014 every route, and including requests rejected before a worker was chosen. Edge intake vs dispatched separates those two populations.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -244,7 +244,7 @@
     {
       "type": "stat",
       "title": "Healthy workers",
-      "description": "Distinct workers whose circuit breaker admits requests. Every router replica exports the whole worker set with its own breaker state, so this takes the per-worker maximum first — a plain sum would report the fleet once per replica. A worker counts as healthy if any replica admits it; Worker health breaks the disagreement out per replica.",
+      "description": "Distinct workers whose circuit breaker admits requests. Every router replica exports the whole worker set with its own breaker state, so this takes the per-worker maximum first \u2014 a plain sum would report the fleet once per replica. A worker counts as healthy if any replica admits it; Worker health breaks the disagreement out per replica.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -604,7 +604,7 @@
     {
       "type": "timeseries",
       "title": "Request rate by worker",
-      "description": "Per-worker dispatch rate — reveals routing imbalance. Restricted to a non-empty worker_url so requests that never reached a worker do not appear here as an unlabelled series.",
+      "description": "Per-worker dispatch rate \u2014 reveals routing imbalance. Restricted to a non-empty worker_url so requests that never reached a worker do not appear here as an unlabelled series.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -697,7 +697,7 @@
     {
       "type": "timeseries",
       "title": "Responses by HTTP status",
-      "description": "Client-visible HTTP status codes (2xx/4xx/5xx, 504=stale-cancel). Kubelet and scrape probes are excluded — the counter covers every route, and on a quiet deployment they are otherwise the only traffic shown.",
+      "description": "Client-visible HTTP status codes (2xx/4xx/5xx, 504=stale-cancel). Kubelet and scrape probes are excluded \u2014 the counter covers every route, and on a quiet deployment they are otherwise the only traffic shown.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -989,7 +989,7 @@
     {
       "type": "timeseries",
       "title": "Edge intake vs dispatched",
-      "description": "Chat-completions received at the HTTP edge against those that reached a worker. The gap is everything dropped before dispatch — backpressure rejections, early 4xx, client cancellations — which no per-worker panel can show. Dispatches are identified by a non-empty worker_url: the counter is written for every non-infra request and records an empty worker_url when nothing was dispatched. Deliberately unfiltered by model and worker, which are unknown at intake.",
+      "description": "Chat-completions received at the HTTP edge against those that reached a worker. The gap is everything dropped before dispatch \u2014 backpressure rejections, early 4xx, client cancellations \u2014 which no per-worker panel can show. Dispatches are identified by a non-empty worker_url: the counter is written for every non-infra request and records an empty worker_url when nothing was dispatched. Deliberately unfiltered by model and worker, which are unknown at intake.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1152,7 +1152,7 @@
     {
       "type": "timeseries",
       "title": "Admission wait quantiles",
-      "description": "Time spent parked in the admission queue before dispatch, among the requests that parked at all. Requests admitted straight through contribute no sample and do not pull the quantiles down, and requests that parked and were then shed contribute none either — so read this beside Queued requests, not as typical request delay. Whatever shows here is already lost to TTFT.",
+      "description": "Time spent parked in the admission queue before dispatch, among the requests that parked at all. Requests admitted straight through contribute no sample and do not pull the quantiles down, and requests that parked and were then shed contribute none either \u2014 so read this beside Queued requests, not as typical request delay. Whatever shows here is already lost to TTFT.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1788,7 +1788,7 @@
     {
       "type": "timeseries",
       "title": "Stream outcomes (end-of-stream truth)",
-      "description": "End-of-stream classification for 2xx streaming responses: ok / inband_error / upstream_error / client_disconnect. inband_error is an engine that committed 200 OK then failed in-band — invisible to every headers-time metric.",
+      "description": "End-of-stream classification for 2xx streaming responses: ok / inband_error / upstream_error / client_disconnect. inband_error is an engine that committed 200 OK then failed in-band \u2014 invisible to every headers-time metric.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1881,7 +1881,7 @@
     {
       "type": "timeseries",
       "title": "TTFT overhead share (router-attributable)",
-      "description": "Share of time-to-first-token the router itself accounts for (tokenize + admission wait + request build); the rest is engine prefill. Above 100% does not mean the router took longer than the whole request — the overhead histogram also samples 2xx streams that returned headers but no first token, which contribute no TTFT, so an excursion above 1 counts first-byteless streams rather than router slowness. Read a rising share below 1 as the router becoming the bottleneck; read a jump past 1 as streams dying before their first token.",
+      "description": "Share of time-to-first-token the router itself accounts for (tokenize + admission wait + request build); the rest is engine prefill. Above 100% does not mean the router took longer than the whole request \u2014 the overhead histogram also samples 2xx streams that returned headers but no first token, which contribute no TTFT, so an excursion above 1 counts first-byteless streams rather than router slowness. Read a rising share below 1 as the router becoming the bottleneck; read a jump past 1 as streams dying before their first token.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2361,7 +2361,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Active load — prefill tokens",
+      "title": "Active load \u2014 prefill tokens",
       "description": "Per-worker prefill-token load tracked by the active-load policy.",
       "datasource": {
         "type": "prometheus",
@@ -2454,7 +2454,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Active load — decode blocks",
+      "title": "Active load \u2014 decode blocks",
       "description": "Per-worker decode-block load tracked by the active-load policy.",
       "datasource": {
         "type": "prometheus",
@@ -2812,7 +2812,7 @@
       "id": 54,
       "type": "timeseries",
       "title": "Queue gate: prefix given up vs prefix available (p50 blocks)",
-      "description": "The queue gate is a binary test on num_waiting_reqs and ignores how much cached prefix a request would lose, so these two curves are how you tell whether that simplification is costing anything. Blue is the overlap of every cache-aware selection; orange is the overlap of just the ones the gate sent elsewhere (cache_worker_queued). Tracking together means the gate diverts a representative sample and the simple test is fine. Orange sitting materially above blue means it is trading large cached prefixes to dodge short queues — the signal to weigh forgone prefill against expected wait instead of thresholding on the queue alone, not to retune --worker-queue-limit.",
+      "description": "The queue gate is a binary test on num_waiting_reqs and ignores how much cached prefix a request would lose, so these two curves are how you tell whether that simplification is costing anything. Blue is the overlap of every cache-aware selection; orange is the overlap of just the ones the gate sent elsewhere (cache_worker_queued). Tracking together means the gate diverts a representative sample and the simple test is fine. Orange sitting materially above blue means it is trading large cached prefixes to dodge short queues \u2014 the signal to weigh forgone prefill against expected wait instead of thresholding on the queue alone, not to retune --worker-queue-limit.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2836,7 +2836,7 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.5, sum by (model_id, le) (rate(sgl_router_overlap_blocks_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
-          "legendFormat": "all selections — {{model_id}}",
+          "legendFormat": "all selections \u2014 {{model_id}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -2845,7 +2845,7 @@
         },
         {
           "expr": "histogram_quantile(0.5, sum by (model_id, le) (rate(sgl_router_diverted_overlap_blocks_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
-          "legendFormat": "diverted by gate — {{model_id}}",
+          "legendFormat": "diverted by gate \u2014 {{model_id}}",
           "refId": "B",
           "datasource": {
             "type": "prometheus",
@@ -2857,7 +2857,7 @@
     {
       "type": "timeseries",
       "title": "Locality loss by decision",
-      "description": "Blocks the best-matching worker held minus the blocks the worker actually selected held, over query blocks — the prefix locality each routing decision gave up. Zero means the decision cost nothing.",
+      "description": "Blocks the best-matching worker held minus the blocks the worker actually selected held, over query blocks \u2014 the prefix locality each routing decision gave up. Zero means the decision cost nothing.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3004,7 +3004,7 @@
     {
       "type": "timeseries",
       "title": "Cache-aware policy evaluations by replica",
-      "description": "Per-replica terminal policy-evaluation rate, not request rate: admission races can evaluate repeatedly and parked hand-offs skip evaluation. Series are unstacked so each decision reads its own rate off the axis; use \"Cache-aware routing decisions (all replicas)\" for the fleet-wide mix. below_threshold isolates tree/hash misses; load_imbalance is intentional; matched_node_unowned identifies tree lifecycle state; cache_worker_queued means every worker holding the prefix was over --worker-queue-limit and the request went elsewhere; cache_hit_all_queued means EVERY worker in the fleet was over it — the pick goes among queueing workers and under sampled min-load picks usually does NOT land on the cache home (saturation signal, not locality — alert on it); matched_workers_ineligible means the owners were not candidates at all (wrong pool, unhealthy, breaker open, or already at the router admission cap); hash_config_unknown and tokenization_unavailable identify routing-input failures. request_body_unavailable or request_json_invalid indicates a broken ingress invariant and emits an error log.",
+      "description": "Per-replica terminal policy-evaluation rate, not request rate: admission races can evaluate repeatedly and parked hand-offs skip evaluation. Series are unstacked so each decision reads its own rate off the axis; use \"Cache-aware routing decisions (all replicas)\" for the fleet-wide mix. below_threshold isolates tree/hash misses; load_imbalance is intentional; matched_node_unowned identifies tree lifecycle state; cache_worker_queued means every worker holding the prefix was over --worker-queue-limit and the request went elsewhere; cache_hit_all_queued means EVERY worker in the fleet was over it \u2014 the pick goes among queueing workers and under sampled min-load picks usually does NOT land on the cache home (saturation signal, not locality \u2014 alert on it); matched_workers_ineligible means the owners were not candidates at all (wrong pool, unhealthy, breaker open, or already at the router admission cap); hash_config_unknown and tokenization_unavailable identify routing-input failures. request_body_unavailable or request_json_invalid indicates a broken ingress invariant and emits an error log.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3332,7 +3332,7 @@
     {
       "type": "timeseries",
       "title": "KV bootstrap rank outcomes",
-      "description": "Engine ranks by final bootstrap verdict. Counts ranks, not fetches — one accepted fetch can settle several ranks.",
+      "description": "Engine ranks by final bootstrap verdict. Counts ranks, not fetches \u2014 one accepted fetch can settle several ranks.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3425,7 +3425,7 @@
     {
       "type": "timeseries",
       "title": "KV peer snapshot fetch outcomes",
-      "description": "Peer snapshot fetches by outcome. Counts fetches, not ranks — a rank can outlive many rejected fetches.",
+      "description": "Peer snapshot fetches by outcome. Counts fetches, not ranks \u2014 a rank can outlive many rejected fetches.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3517,11 +3517,311 @@
     },
     {
       "type": "row",
-      "title": "Routing Policy",
+      "title": "KV tree vs engine (storage-tier coverage)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
         "y": 106,
+        "w": 24,
+        "h": 1
+      },
+      "id": 64,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "KV event blocks by medium (per replica max)",
+      "description": "Blocks/s the router tree consumes, by event kind and the storage-medium tag the engine put on the event. On a hierarchical-cache fleet block_stored/CPU_PINNED runs at about the block_removed/GPU rate (every backed-up block is stored to host before its device copy is dropped). A CPU_PINNED line at 0 while the engines report hicache backups means the tier stream is not reaching the router. max across replicas, because every replica receives the full stream.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 107,
+        "w": 8,
+        "h": 8
+      },
+      "id": 65,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max by (event, medium) (rate(sgl_router_kv_event_blocks_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{event}} / {{medium}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "KV tree blocks by tier (fleet)",
+      "description": "Blocks the router tree attributes to the fleet, by the tier the worker holds them on (a block held on device and host counts under both). host should sit at roughly hicache-ratio times device on a fleet with a full host tier; host at 0 means routing cannot see the L2 tier at all. max per worker across replicas, then summed.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 107,
+        "w": 8,
+        "h": 8
+      },
+      "id": 66,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (tier) (max by (worker_url, dp_rank, tier) (sgl_router_kv_tree_blocks{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{tier}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Selected owner tier",
+      "description": "Cache-aware selections by the tier on which the CHOSEN worker holds the matched prefix. device = served in place; host = served by a load-back from the lower tier; none = the chosen worker is not a prefix owner. host / (device + host) is the share of affinity routes relying on the L2 tier; read it against the engine's cached_tokens_total{cache_source=\"host\"} share.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 107,
+        "w": 8,
+        "h": 8
+      },
+      "id": 67,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (tier) (rate(sgl_router_selected_owner_tier_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{tier}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Tree coverage of engine device tier",
+      "description": "Router-attributed device tokens / engine device-held tokens (used + evictable, tp_rank 0). ~1: the tree mirrors what the engines hold on device. Well below 1: the tree is missing device state (dead subscription, cold bootstrap, dropped stores). Above 1: the tree lists blocks the engines already evicted (missed removals). Falls back to max_total_num_tokens * $dcp_size - kv_available_tokens on engines that do not export kv_evictable_tokens; set $dcp_size to the engine's --dcp-size for that path.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 115,
+        "w": 12,
+        "h": 8
+      },
+      "id": 68,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "lineWidth": 1,
+            "showPoints": "never"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "(sum(max by (worker_url, dp_rank) (sgl_router_kv_tree_blocks{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",tier=\"device\"})) * scalar(max(sgl_router_kv_block_size{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}))) / ((sum(sglang_kv_used_tokens{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",tp_rank=\"0\"}) + sum(sglang_kv_evictable_tokens{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",tp_rank=\"0\"})) or (sum(sglang_max_total_num_tokens{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",tp_rank=\"0\"}) * $dcp_size - sum(sglang_kv_available_tokens{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",tp_rank=\"0\"})))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "device coverage",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Tree coverage of engine host tier",
+      "description": "Router-attributed host-tier tokens / engine hicache host tokens in use (tp_rank 0). ~1: every block the engines hold on host is routable. ~0 with a full host tier: the L2 tier is invisible to routing and repeats of anything evicted from device land on random pods. This is the ratio that separates a retention problem (engines really evicted it) from a visibility problem (engines still hold it, the router forgot).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 115,
+        "w": 12,
+        "h": 8
+      },
+      "id": 69,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "lineWidth": 1,
+            "showPoints": "never"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "(sum(max by (worker_url, dp_rank) (sgl_router_kv_tree_blocks{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",tier=\"host\"})) * scalar(max(sgl_router_kv_block_size{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}))) / (sum(sglang_hicache_host_used_tokens{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",tp_rank=\"0\"}))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "host coverage",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Routing Policy",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 123,
         "w": 24,
         "h": 1
       },
@@ -3538,7 +3838,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 107,
+        "y": 124,
         "w": 8,
         "h": 8
       },
@@ -3631,7 +3931,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 107,
+        "y": 124,
         "w": 8,
         "h": 8
       },
@@ -3724,7 +4024,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 107,
+        "y": 124,
         "w": 8,
         "h": 8
       },
@@ -3895,7 +4195,7 @@
           "uid": "${datasource}"
         },
         "definition": "label_values(sgl_router_requests_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\"}, namespace)",
-        "description": "Namespaces serving the selected endpoint in the selected clusters — one per deployment. Pick one to read a single deployment on its own.",
+        "description": "Namespaces serving the selected endpoint in the selected clusters \u2014 one per deployment. Pick one to read a single deployment on its own.",
         "hide": 0,
         "includeAll": true,
         "allValue": ".*",
@@ -3965,6 +4265,43 @@
         "regex": "",
         "sort": 1,
         "type": "query"
+      },
+      {
+        "name": "dcp_size",
+        "label": "DCP size (fallback only)",
+        "type": "custom",
+        "description": "Engine --dcp-size. Read ONLY by the device-coverage panel's fallback expression on engines that predate sglang_kv_evictable_tokens; engines that export it need no factor (their occupancy gauges are already pod-level).",
+        "query": "1,2,4,8",
+        "current": {
+          "selected": true,
+          "text": "1",
+          "value": "1"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "1",
+            "value": "1"
+          },
+          {
+            "selected": false,
+            "text": "2",
+            "value": "2"
+          },
+          {
+            "selected": false,
+            "text": "4",
+            "value": "4"
+          },
+          {
+            "selected": false,
+            "text": "8",
+            "value": "8"
+          }
+        ],
+        "hide": 0,
+        "multi": false,
+        "includeAll": false
       }
     ]
   },

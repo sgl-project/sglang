@@ -55,7 +55,9 @@
 //!    for the longest matching prefix. If `match_rate > cache_threshold`,
 //!    pick the lowest-load worker whose `url` appears in the match result and
 //!    whose engine queue is under `PerWorkerQueue`'s limit, if one is
-//!    configured. Otherwise, fall through.
+//!    configured. An owner holding the prefix on device is preferred over
+//!    one holding it only on host (the tree tracks tiers); load breaks ties
+//!    within a tier. Otherwise, fall through.
 //! 4. **Min-load fallback.** Least-loaded among `min_load_choices` uniformly
 //!    sampled workers that are not known to be queueing; if every worker is
 //!    queueing, least-loaded among a sample of the whole fleet. Sampling is
@@ -90,7 +92,7 @@ use crate::config::{CacheAwareConfig, LoadGate};
 
 use crate::policies::engine_load::{EngineLoadTable, WorkerDepth};
 use crate::policies::kv_events::{
-    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
+    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree, Tiers,
 };
 use crate::policies::mm_affinity::{self, MultimodalAffinity, PinLookup};
 use crate::policies::{request_tokens_for, Policy, SelectionContext};
@@ -276,6 +278,12 @@ struct MatchOutcome {
     /// URLs of workers owning a matched prefix, drawn only from hashing modes
     /// whose per-mode overlap cleared `cache_threshold`. Empty ⇒ no affinity.
     owner_urls: std::collections::HashSet<String>,
+    /// The storage tiers each of `owner_urls` holds the matched prefix on,
+    /// OR-ed over the URL's dp_ranks and over hashing modes. Read by
+    /// [`CacheAwareZmqPolicy::pick_owner`] to prefer the best tier and by the
+    /// tier metric to label the selection, both in [`Tiers::SLOTS`]
+    /// vocabulary so they agree with `sgl_router_kv_tree_blocks`.
+    owner_tiers: HashMap<String, Tiers>,
     /// Best (max-rate) mode's matched-block count — logging / metrics only.
     matched_blocks: usize,
     /// Best mode's query-block count — the match_rate denominator and the
@@ -509,6 +517,7 @@ impl CacheAwareZmqPolicy {
         };
 
         let mut owner_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut owner_tiers: HashMap<String, Tiers> = HashMap::new();
         let mut mode_hashes: Vec<Vec<i64>> = Vec::with_capacity(modes.len());
         let mut had_blocks = false;
         let mut any_above_threshold = false;
@@ -550,8 +559,9 @@ impl CacheAwareZmqPolicy {
             // never drags in a weak match's owners from the other.
             if rate > self.config.cache_threshold {
                 any_above_threshold = true;
-                for w in matched.workers {
-                    owner_urls.insert(w.url);
+                for (w, tiers) in matched.tiers {
+                    owner_urls.insert(w.url.clone());
+                    owner_tiers.entry(w.url).or_default().insert(tiers);
                 }
             }
             mode_hashes.push(hashes);
@@ -565,6 +575,7 @@ impl CacheAwareZmqPolicy {
         };
         MatchOutcome {
             owner_urls,
+            owner_tiers,
             matched_blocks,
             query_blocks,
             match_rate,
@@ -573,6 +584,64 @@ impl CacheAwareZmqPolicy {
             label,
             mode_hashes,
         }
+    }
+
+    /// Least-loaded of `candidates` (already filtered to prefix owners the
+    /// caller is willing to route to), preferring one that holds the prefix on
+    /// device over one that holds it only on a lower tier — unless the device
+    /// owner's engine queue is deeper than the lower-tier owner's by more than
+    /// `queue_slack` requests.
+    ///
+    /// WHY a tier preference rather than a load penalty: a host-only owner
+    /// serves the prefix by loading it back at memory speed, a device owner
+    /// serves it in place. Both are far cheaper than the cold prefill a
+    /// non-owner pays, so any owner beats any non-owner — but between owners
+    /// the load-back is a real cost with no load-derived proxy, and a penalty
+    /// would need calibrating per fleet. Tier first, load second needs none.
+    /// The slack exists for the ungated saturation pin, where the two owners'
+    /// queues can differ without bound: a load-back is not worth waiting
+    /// behind a queue that is `queue_slack` deeper, and the per-worker queue
+    /// limit is already the fleet's calibrated notion of "one queue's worth".
+    /// Candidates that passed the queue gate all sit under the limit, so the
+    /// slack never changes a gated pick. `None` slack, or an owner without a
+    /// fresh queue reading, keeps the strict preference — there is nothing to
+    /// compare.
+    fn pick_owner<'a>(
+        candidates: impl Iterator<Item = &'a Arc<Worker>> + Clone,
+        loads: &WorkerLoads,
+        owner_tiers: &HashMap<String, Tiers>,
+        queue_slack: Option<usize>,
+    ) -> Option<Arc<Worker>> {
+        // Preference rank of the best tier a candidate holds the prefix on
+        // (`Tiers::SLOTS` order); a candidate the tree does not list at all
+        // ranks last rather than being dropped, so the caller's filtering
+        // stays authoritative.
+        let rank = |w: &Arc<Worker>| {
+            owner_tiers
+                .get(w.url.as_str())
+                .and_then(|tiers| tiers.best_slot())
+                .unwrap_or(usize::MAX)
+        };
+        let best_rank = candidates.clone().map(|w| rank(w)).min()?;
+        // Least-loaded owner below the best tier: what the slack rule falls
+        // back to, and the queue the best-tier owners are measured against.
+        let lower = candidates
+            .clone()
+            .filter(|w| rank(w) != best_rank)
+            .min_by_key(|w| loads.load_of(w));
+        let lower_queue = lower.and_then(|l| loads.waiting_of(l));
+        // Every best-tier owner within slack of the lower-tier queue is a
+        // candidate, not only the least-loaded one: `load_of` and `waiting_of`
+        // diverge under saturation, so the lightest-loaded owner can be the
+        // one with the deepest queue while another sits within slack.
+        let within_slack = |w: &Arc<Worker>| match (queue_slack, lower_queue, loads.waiting_of(w)) {
+            (Some(slack), Some(lq), Some(wq)) => wq <= lq.saturating_add(slack),
+            _ => true,
+        };
+        let top = candidates
+            .filter(|w| rank(w) == best_rank && within_slack(w))
+            .min_by_key(|w| loads.load_of(w));
+        top.or(lower).map(Arc::clone)
     }
 
     /// How many blocks of this request the worker at `url` holds itself.
@@ -641,6 +710,33 @@ impl CacheAwareZmqPolicy {
             outcome.matched_blocks as u64,
             selected,
         );
+        // The best tier the chosen worker holds the matched prefix on, in the
+        // same vocabulary as `sgl_router_kv_tree_blocks`, or `none` when it
+        // owns no prefix that cleared `cache_threshold` (a below-threshold
+        // holder reads `none` here while `selected` above still credits its
+        // blocks). The `host` share is the direct read on how many selections
+        // host-tier ownership is steering; against the engine's own host-hit
+        // share it checks that those routes land on a worker whose host copy
+        // is still there.
+        let tier = outcome
+            .owner_tiers
+            .get(chosen.url.as_str())
+            .and_then(|tiers| tiers.best_label())
+            .unwrap_or("none");
+        m.record_selected_owner_tier(model_id, tier);
+        // A zero-overlap selection is the dominant outcome on an unhealthy
+        // fleet and `matched_blocks == 0` alone cannot say why. Split it by
+        // whether the PRIMARY mode's first block hash exists anywhere in the
+        // tree (`mode_hashes` holds only non-empty chains, primary first):
+        // absent means the engines never published it (or removed it), in_tree
+        // means it is carried but unreachable from the root. Those point at
+        // different subsystems. Only reached on the zero path, so the extra
+        // shard scan does not touch the matching case.
+        if outcome.matched_blocks == 0 {
+            if let Some(&first) = outcome.mode_hashes.first().and_then(|c| c.first()) {
+                m.record_zero_match_block0(model_id, self.tree.contains_hash(first));
+            }
+        }
     }
 }
 
@@ -1016,12 +1112,15 @@ impl CacheAwareZmqPolicy {
         // prefix owner can be the one with a backlog, while a slightly busier
         // owner has none.
         let matched_urls = &outcome.owner_urls;
-        let best_matched: Option<Arc<Worker>> = workers
-            .iter()
-            .filter(|w| matched_urls.contains(w.url.as_str()))
-            .filter(|w| self.config.load_gate.admits_affinity(loads.waiting_of(w)))
-            .min_by_key(|w| loads.load_of(w))
-            .map(Arc::clone);
+        let best_matched: Option<Arc<Worker>> = Self::pick_owner(
+            workers
+                .iter()
+                .filter(|w| matched_urls.contains(w.url.as_str()))
+                .filter(|w| self.config.load_gate.admits_affinity(loads.waiting_of(w))),
+            loads,
+            &outcome.owner_tiers,
+            queue_limit,
+        );
         let Some(chosen) = best_matched else {
             let owners_present = workers
                 .iter()
@@ -1040,11 +1139,14 @@ impl CacheAwareZmqPolicy {
             if owners_present {
                 if let Some(floor) = self.config.saturation_queue_floor {
                     if !Self::fleet_has_idle_worker(workers, loads, floor) {
-                        let pinned = workers
-                            .iter()
-                            .filter(|w| matched_urls.contains(w.url.as_str()))
-                            .min_by_key(|w| loads.load_of(w))
-                            .map(Arc::clone);
+                        let pinned = Self::pick_owner(
+                            workers
+                                .iter()
+                                .filter(|w| matched_urls.contains(w.url.as_str())),
+                            loads,
+                            &outcome.owner_tiers,
+                            queue_limit,
+                        );
                         if let Some(w) = pinned {
                             self.record_match_outcome(
                                 model_id,
@@ -1181,7 +1283,7 @@ mod tests {
     use crate::config::CacheAwareConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::engine_load::LoadStat;
-    use crate::policies::kv_events::tree::KvWorkerId;
+    use crate::policies::kv_events::tree::{KvWorkerId, Tiers};
     use crate::policies::kv_events::HashTree;
     use crate::tokenizer::adapter;
     use std::num::NonZeroUsize;
@@ -2787,6 +2889,117 @@ mod tests {
         assert_eq!(chosen.url, "http://w1:30000");
     }
 
+    /// Two owners of the same prefix, one on device and one only on host: the
+    /// device owner wins even when the host owner is the less loaded one.
+    /// Tier is a strict preference; load only breaks ties within a tier.
+    #[test]
+    fn device_owner_preferred_over_host_only_owner() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        assert!(!hashes.is_empty());
+        tree.insert_tiered(
+            &KvWorkerId::new("http://w0:30000".into(), 0),
+            None,
+            &hashes,
+            Tiers::DEVICE,
+        );
+        tree.insert_tiered(
+            &KvWorkerId::new("http://w1:30000".into(), 0),
+            None,
+            &hashes,
+            Tiers::HOST,
+        );
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                ..Default::default()
+            },
+            tree,
+            registry,
+            oracle_for_tests(4),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        // Make the device owner the BUSIER one; it must still win.
+        let _g = w0.load_guard();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(chosen.url, "http://w0:30000");
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                r#"sgl_router_selected_owner_tier_total{model_id="tiny",tier="device"} 1"#
+            ),
+            "selection must be booked as a device-tier hit; got:\n{rendered}"
+        );
+    }
+
+    /// A worker holding the prefix only on host is still an owner: it beats an
+    /// idle non-owner, because a load-back is far cheaper than the cold
+    /// prefill the non-owner would pay. Before the tree tracked tiers this
+    /// request read as `below_threshold` after the device eviction and went
+    /// min-load — to the idle non-owner.
+    #[test]
+    fn host_only_owner_beats_an_idle_non_owner() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        assert!(!hashes.is_empty());
+        let w0_id = KvWorkerId::new("http://w0:30000".into(), 0);
+        // The engine's write-back sequence: device store, host store, then
+        // the device copy is evicted.
+        tree.insert_tiered(&w0_id, None, &hashes, Tiers::for_store(Some("GPU")));
+        tree.insert_tiered(&w0_id, None, &hashes, Tiers::for_store(Some("CPU_PINNED")));
+        tree.remove_tiered(&w0_id, &hashes, Tiers::for_remove(Some("GPU")));
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                ..Default::default()
+            },
+            tree,
+            registry,
+            oracle_for_tests(4),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        // The host-only owner is the busier worker; it must still win.
+        let _g = w0.load_guard();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(chosen.url, "http://w0:30000");
+        let rendered = metrics.render();
+        assert!(
+            rendered
+                .contains(r#"sgl_router_selected_owner_tier_total{model_id="tiny",tier="host"} 1"#),
+            "selection must be booked as a host-tier hit; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                r#"sgl_router_cache_aware_decisions_total{model_id="tiny",decision="cache_hit"} 1"#
+            ),
+            "a host-tier owner is a cache hit, not below_threshold; got:\n{rendered}"
+        );
+    }
+
     /// w0 holds the prefix but is heavily overloaded → imbalance branch
     /// skips cache-aware and picks w1.
     #[test]
@@ -4386,6 +4599,175 @@ mod tests {
             policy.select(&workers, &ctx).expect("must pick").url,
             "http://w1:30000",
             "the pin picks the least-loaded OWNER, not the fleet minimum (w2 holds nothing)",
+        );
+    }
+
+    /// Seed [`QUEUE_TEXT`] with a device owner and a host-only owner, both over
+    /// the queue limit, with no idle worker in the fleet, and return who the
+    /// saturation pin picks.
+    fn pin_between_tiers(device_waiting: u64, host_waiting: u64) -> String {
+        let registry = tokenizer_registry_with_tiny();
+        let tree = Arc::new(HashTree::new());
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, QUEUE_TEXT).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        tree.insert_tiered(
+            &KvWorkerId::new("http://w0:30000".into(), 0),
+            None,
+            &hashes,
+            Tiers::DEVICE,
+        );
+        tree.insert_tiered(
+            &KvWorkerId::new("http://w1:30000".into(), 0),
+            None,
+            &hashes,
+            Tiers::HOST,
+        );
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": QUEUE_TEXT})).unwrap();
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(4, device_waiting), now);
+        engine_load.set("http://w1:30000", 0, load_stat(4, host_waiting), now);
+        engine_load.set("http://w2:30000", 0, load_stat(1, 4), now); // non-owner, over floor
+        let policy = new_policy_with_load(
+            queue_cfg_with_floor(4, 2),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        );
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+            worker("http://w2:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+        policy
+            .select(&workers, &ctx)
+            .expect("must pick")
+            .url
+            .clone()
+    }
+
+    /// Under saturation the pin keeps the device owner while its queue is
+    /// within one queue limit of the host owner's: a load-back is dearer than
+    /// a few extra requests' wait.
+    #[test]
+    fn saturation_pin_prefers_device_owner_within_queue_slack() {
+        // Both over the limit (4), so the gate admits neither and the pin
+        // decides; gap 3 <= limit: device wins although it is the busier owner.
+        assert_eq!(pin_between_tiers(8, 5), "http://w0:30000");
+    }
+
+    /// But the pin never trades a memory-speed load-back for an unbounded
+    /// queue: once the device owner's queue exceeds the host owner's by more
+    /// than the limit, the host owner takes the request — the premise of the
+    /// pin is "same wait, prefill from cache", and a queue ten times deeper
+    /// is not the same wait.
+    #[test]
+    fn saturation_pin_falls_back_to_host_owner_past_queue_slack() {
+        assert_eq!(pin_between_tiers(40, 5), "http://w1:30000");
+    }
+
+    /// The slack rule must consider EVERY device owner, not only the
+    /// least-loaded one: `load_of` (running + waiting) and `waiting_of`
+    /// diverge under saturation, so the lightest device owner can be the one
+    /// with the deepest queue while another device owner sits within slack of
+    /// the host owner. Falling back to the host owner there pays a load-back
+    /// for nothing.
+    #[test]
+    fn saturation_pin_considers_every_device_owner_within_slack() {
+        let registry = tokenizer_registry_with_tiny();
+        let tree = Arc::new(HashTree::new());
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, QUEUE_TEXT).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        for (url, tier) in [
+            ("http://w0:30000", Tiers::DEVICE),
+            ("http://w1:30000", Tiers::DEVICE),
+            ("http://w2:30000", Tiers::HOST),
+        ] {
+            tree.insert_tiered(&KvWorkerId::new(url.into(), 0), None, &hashes, tier);
+        }
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": QUEUE_TEXT})).unwrap();
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        // Limit (= slack) is 4. w0: lightest device owner, deepest queue
+        // (12 > 5 + 4). w1: heavier device owner, queue within slack (6 <=
+        // 9). w2: host owner, queue 5. w3: non-owner over the floor.
+        engine_load.set("http://w0:30000", 0, load_stat(0, 12), now);
+        engine_load.set("http://w1:30000", 0, load_stat(20, 6), now);
+        engine_load.set("http://w2:30000", 0, load_stat(0, 5), now);
+        engine_load.set("http://w3:30000", 0, load_stat(1, 4), now);
+        let policy = new_policy_with_load(
+            queue_cfg_with_floor(4, 2),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        );
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+            worker("http://w2:30000", "tiny"),
+            worker("http://w3:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w1:30000",
+            "the device owner within slack must win over both the deep-queued device owner and the host owner",
+        );
+    }
+
+    /// A worker holding the prefix only on a storage backend is an owner and
+    /// is booked under its own tier label, the same vocabulary
+    /// `sgl_router_kv_tree_blocks` uses — not folded into `host`.
+    #[test]
+    fn storage_only_owner_is_booked_as_storage_tier() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        tree.insert_tiered(
+            &KvWorkerId::new("http://w0:30000".into(), 0),
+            None,
+            &hashes,
+            Tiers::for_store(Some("DISK")),
+        );
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                ..Default::default()
+            },
+            tree,
+            registry,
+            oracle_for_tests(4),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://w0:30000",
+            "a storage-only holder is still an owner"
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                r#"sgl_router_selected_owner_tier_total{model_id="tiny",tier="storage"} 1"#
+            ),
+            "got:\n{rendered}"
         );
     }
 

@@ -82,6 +82,7 @@ fn render_kv_bootstrap(index: &Arc<crate::policies::kv_events::KvEventIndex>) ->
         "sgl_router_kv_tree_nodes {}\n",
         index.tree().node_count()
     ));
+    out.push_str(&render_kv_tiers(index));
 
     let tracker = index.bootstrap();
     out.push_str(
@@ -161,6 +162,78 @@ fn render_kv_bootstrap(index: &Arc<crate::policies::kv_events::KvEventIndex>) ->
     out
 }
 
+/// Render the storage-tier series: what the tree holds per worker and tier,
+/// the block size to convert it to tokens, and the tagged event stream it
+/// consumed. Same pull-on-scrape model as the bootstrap gauges.
+///
+/// These exist to make a router-vs-engine tier mismatch a number instead of
+/// an inference. `sgl_router_kv_tree_blocks * sgl_router_kv_block_size`
+/// for a worker and tier, divided by that pod's own occupancy of the tier
+/// (device: `sglang_kv_used_tokens + sglang_kv_evictable_tokens`; host:
+/// `sglang_hicache_host_used_tokens`; `tp_rank="0"`), is the tree's coverage
+/// of the tier. About 1 means the tree mirrors the engine; about 0 means the
+/// engine holds a tier that routing cannot see; a missing series means the
+/// worker publishes nothing. The event counters show whether the tagged
+/// stream that should feed the tree is arriving at all.
+fn render_kv_tiers(index: &Arc<crate::policies::kv_events::KvEventIndex>) -> String {
+    use crate::policies::kv_events::Tiers;
+    use crate::server::metrics::escape_label;
+
+    let mut out = String::new();
+
+    // 0 until the first worker reports, and the dashboard multiplies by it, so
+    // a coverage panel reads 0 rather than NaN on a fleet that has not
+    // registered yet.
+    let block_size = index.block_size_oracle().get().unwrap_or(0);
+    out.push_str(
+        "# HELP sgl_router_kv_block_size Tokens per KV block hash, as established from the fleet (0 until a worker reports). Multiply sgl_router_kv_tree_blocks by this to compare with the engine's token gauges.\n",
+    );
+    out.push_str("# TYPE sgl_router_kv_block_size gauge\n");
+    out.push_str(&format!("sgl_router_kv_block_size {block_size}\n"));
+
+    // Every tier is emitted per carrier, zeros included: a host row at 0 next
+    // to a device row in the millions is the mismatch signature, and an
+    // absent series cannot be told from a tier the tree never tracked.
+    out.push_str(
+        "# HELP sgl_router_kv_tree_blocks Blocks the cache-aware tree attributes to a worker rank, by the storage tier the worker holds them on (a block held on device and host counts under both). Times sgl_router_kv_block_size, and divided by the engine's own occupancy of that tier for the same pod (device: sglang_kv_used_tokens + sglang_kv_evictable_tokens; host: sglang_hicache_host_used_tokens; tp_rank=\"0\"), this is the tree's coverage of the tier: ~1 mirrors the engine, ~0 means the engine holds a tier routing cannot see.\n",
+    );
+    out.push_str("# TYPE sgl_router_kv_tree_blocks gauge\n");
+    for (id, counts) in index.tree().tier_occupancy() {
+        for (slot, (_, tier)) in Tiers::SLOTS.iter().enumerate() {
+            out.push_str(&format!(
+                "sgl_router_kv_tree_blocks{{worker_url=\"{}\",dp_rank=\"{}\",tier=\"{}\"}} {}\n",
+                escape_label(&id.url),
+                id.dp_rank,
+                tier,
+                counts[slot],
+            ));
+        }
+    }
+
+    let rows = index.event_tally().snapshot();
+    out.push_str(
+        "# HELP sgl_router_kv_events_total KV-cache events applied to the tree, by kind and the storage medium tag they carried (untagged = no medium field; unknown = a medium this build does not recognise). On a hierarchical-cache fleet block_stored/CPU_PINNED runs at about the block_removed/GPU rate; a CPU_PINNED row pinned at 0 with hicache enabled means the tier stream is not reaching the router.\n",
+    );
+    out.push_str("# TYPE sgl_router_kv_events_total counter\n");
+    for r in &rows {
+        out.push_str(&format!(
+            "sgl_router_kv_events_total{{event=\"{}\",medium=\"{}\"}} {}\n",
+            r.event, r.medium, r.events,
+        ));
+    }
+    out.push_str(
+        "# HELP sgl_router_kv_event_blocks_total Block hashes carried by the KV-cache events applied to the tree, by kind and storage medium tag. Times sgl_router_kv_block_size this is comparable to the engine's sglang_hicache_backup_tokens_total (block_stored/CPU_PINNED) and its device eviction volume (block_removed/GPU).\n",
+    );
+    out.push_str("# TYPE sgl_router_kv_event_blocks_total counter\n");
+    for r in &rows {
+        out.push_str(&format!(
+            "sgl_router_kv_event_blocks_total{{event=\"{}\",medium=\"{}\"}} {}\n",
+            r.event, r.medium, r.blocks,
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +242,39 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// The tier series are what the coverage dashboard joins on, so their
+    /// names and label keys are contract: per-worker blocks by tier with
+    /// zeros emitted, the block size to convert them, and every
+    /// (event, medium) cell of the tally.
+    #[tokio::test]
+    async fn kv_tier_series_render_per_worker_and_per_medium() {
+        use crate::policies::kv_events::{EventKind, KvEventIndex, KvWorkerId, Tiers};
+
+        let index = KvEventIndex::new();
+        index.block_size_oracle().try_set(64).unwrap();
+        let w = KvWorkerId::new("http://w0:30000".into(), 0);
+        index
+            .tree()
+            .insert_tiered(&w, None, &[1, 2, 3], Tiers::DEVICE);
+        index.tree().insert_tiered(&w, None, &[1, 2], Tiers::HOST);
+        index
+            .event_tally()
+            .record(EventKind::BlockStored, Some("CPU_PINNED"), 2);
+
+        let out = render_kv_tiers(&index);
+        for want in [
+            "sgl_router_kv_block_size 64\n",
+            r#"sgl_router_kv_tree_blocks{worker_url="http://w0:30000",dp_rank="0",tier="device"} 3"#,
+            r#"sgl_router_kv_tree_blocks{worker_url="http://w0:30000",dp_rank="0",tier="host"} 2"#,
+            r#"sgl_router_kv_tree_blocks{worker_url="http://w0:30000",dp_rank="0",tier="storage"} 0"#,
+            r#"sgl_router_kv_events_total{event="block_stored",medium="CPU_PINNED"} 1"#,
+            r#"sgl_router_kv_event_blocks_total{event="block_stored",medium="CPU_PINNED"} 2"#,
+            r#"sgl_router_kv_events_total{event="block_removed",medium="GPU"} 0"#,
+        ] {
+            assert!(out.contains(want), "missing {want:?}; got:\n{out}");
+        }
+    }
 
     #[tokio::test]
     async fn metrics_endpoint_returns_prometheus_text() {

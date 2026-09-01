@@ -23,6 +23,7 @@ pub mod discovery;
 pub mod hash;
 pub mod index;
 pub mod subscriber;
+pub mod tally;
 pub mod tree;
 pub mod wire;
 
@@ -36,7 +37,8 @@ pub use discovery::{fetch_event_config, EventConfig};
 pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64};
 pub use index::KvEventIndex;
 pub use subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
-pub use tree::{HashTree, KvWorkerId, MatchResult, RestoreError, SnapshotNode};
+pub use tally::{EventKind, EventTally, TallyRow};
+pub use tree::{HashTree, KvWorkerId, MatchResult, RestoreError, SnapshotNode, TierCounts, Tiers};
 pub use wire::{
     decode_event_batch, BlockRemoved, BlockStored, DecodeError, KvCacheEvent, KvEventBatch,
 };
