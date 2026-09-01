@@ -2690,8 +2690,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             not self.quant_config.use_per_token_activation
             and not use_cutedsl_w4a16
             and (
-                use_nvfp4_dispatch
-                or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                use_nvfp4_dispatch or should_use_flashinfer_cutlass_moe_fp4_allgather()
             )
         )
 
