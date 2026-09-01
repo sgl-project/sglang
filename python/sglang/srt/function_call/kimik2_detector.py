@@ -15,6 +15,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import get_schema_properties
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,7 @@ class KimiK2Detector(BaseFormatDetector):
         best_score = -1
         for tool in tools:
             params = tool.function.parameters or {}
-            props = set(params.get("properties", {}).keys())
+            props = set(get_schema_properties(params).keys())
             if not props:
                 continue
             overlap = len(arg_keys & props)

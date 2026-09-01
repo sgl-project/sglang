@@ -22,7 +22,17 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Type
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+)
 
 import einops
 import torch
@@ -35,7 +45,13 @@ from sglang.srt.observability.metrics_collector import (
     ExpertDispatchCollector,
     resolve_collector_class,
 )
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import get_device as get_device_namespace
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_schedule,
+    logs_expert_balancedness_to_server_log,
+    reports_expert_balancedness,
+)
 from sglang.srt.utils import Withable, get_device, get_int_env_var
 
 if TYPE_CHECKING:
@@ -46,16 +62,22 @@ logger = logging.getLogger(__name__)
 # --------------------------------------- Entrypoint -----------------------------------------
 
 _OutputMode = Literal["file", "object"]
+EPLB_BALANCEDNESS_WINDOW_SIZES = (10, 100, 1000)
 
 
 @dataclass
 class ExpertDistributionMetrics:
+    forward_pass_id: int
     eplb_balancedness: torch.Tensor
+    gpu_physical_count_sum: Optional[torch.Tensor]
+    reset_server_log_history: bool
 
     def map_device_tensors(self, fn):
         # Device-tensor fields only; caller injects the copy+safety primitive
         # (see GenerationBatchResult.copy_to_cpu).
         self.eplb_balancedness = fn(self.eplb_balancedness)
+        if self.gpu_physical_count_sum is not None:
+            self.gpu_physical_count_sum = fn(self.gpu_physical_count_sum)
 
 
 class ExpertDistributionRecorder(ABC):
@@ -63,19 +85,16 @@ class ExpertDistributionRecorder(ABC):
 
     @staticmethod
     def init_new(
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
-        if server_args.expert_distribution_recorder_mode is not None:
+        if get_exec().moe.expert_distribution_recorder_mode is not None:
             assert (
                 expert_location_metadata is not None
             ), "ExpertLocationMetadata is required for expert distribution recording. One possible"
             "reason is that you are using a model that does not support expert distribution"
             "recording. Try setting `get_model_config_for_expert_location` in your model."
-            return _ExpertDistributionRecorderReal(
-                server_args, expert_location_metadata, rank
-            )
+            return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
         else:
             return _ExpertDistributionRecorderNoop()
 
@@ -138,11 +157,9 @@ class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
 class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def __init__(
         self,
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
-        self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
 
         self._recording = False
@@ -150,17 +167,16 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
-        self._accumulator = _Accumulator.init_new(
-            server_args, expert_location_metadata, rank
-        )
+        self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
         self._single_pass_gatherers = {
-            k: _SinglePassGatherer.init_new(server_args, expert_location_metadata, rank)
+            k: _SinglePassGatherer.init_new(expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
-        if server_args.enable_expert_distribution_metrics:
+        if reports_expert_balancedness():
             logger.info(
-                "ExpertDistributionRecorder auto start record since enable_expert_distribution_metrics"
+                "ExpertDistributionRecorder auto start record since "
+                f"expert_balancedness_report_mode={get_exec().moe.expert_balancedness_report_mode}"
             )
             self.start_record()
 
@@ -306,34 +322,31 @@ def set_global_expert_distribution_recorder(value):
 class _SinglePassGatherer(ABC):
     @staticmethod
     def init_new(
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> _SinglePassGatherer:
-        if server_args.expert_distribution_recorder_mode == "per_token":
-            return _DetailSinglePassGatherer(
-                server_args, expert_location_metadata, rank
-            )
+        if get_exec().moe.expert_distribution_recorder_mode == "per_token":
+            return _DetailSinglePassGatherer(expert_location_metadata, rank)
 
-        if server_args.moe_a2a_backend == "mori":
+        if get_exec().moe.moe_a2a_backend == "mori":
             return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
 
-        if server_args.expert_distribution_recorder_mode == "stat_approx":
-            if server_args.moe_a2a_backend != "none" and (
-                server_args.deepep_mode == "normal"
+        if get_exec().moe.expert_distribution_recorder_mode == "stat_approx":
+            if get_exec().moe.moe_a2a_backend != "none" and (
+                get_exec().moe.deepep_mode == "normal"
             ):
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
-        if server_args.moe_a2a_backend == "deepep":
-            if server_args.deepep_mode == "normal":
+        if get_exec().moe.moe_a2a_backend == "deepep":
+            if get_exec().moe.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
-            elif server_args.deepep_mode == "low_latency":
+            elif get_exec().moe.deepep_mode == "low_latency":
                 return _DeepepLowLatencySinglePassGatherer(
                     expert_location_metadata,
                     rank,
-                    elastic_ep_enabled=server_args.elastic_ep_backend is not None,
+                    elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
                 )
             else:
                 raise NotImplementedError
@@ -380,7 +393,6 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
 
     def __init__(
         self,
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
@@ -390,15 +402,15 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
             (
                 expert_location_metadata.num_layers,
                 # TODO determine the max number
-                server_args.chunked_prefill_size * 8,
+                get_schedule().chunked_prefill_size * 8,
                 self._TOP_K_NUM,
             ),
             dtype=torch.int32,
-            device=server_args.device,
+            device=get_device_namespace().device,
         )
         self._misc_objects: List[Dict[str, Any]] = []
         assert (
-            not server_args.enable_two_batch_overlap
+            not get_exec().overlap.enable_two_batch_overlap
         ), "DetailSinglePassGatherer does not support TBO yet"
         # TODO assert shared experts fusion is disabled, o/w data is wrong
 
@@ -645,30 +657,25 @@ _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
 class _Accumulator(ABC):
     @staticmethod
     def init_new(
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> _Accumulator:
-        return _Accumulator.get_class(server_args)(
-            server_args, expert_location_metadata, rank
-        )
+        return _Accumulator.get_class()(expert_location_metadata, rank)
 
     @staticmethod
-    def get_class(server_args: ServerArgs) -> Type[_Accumulator]:
+    def get_class() -> Type[_Accumulator]:
         return {
             "stat": _StatAccumulator,
             "stat_approx": _StatAccumulator,
             "per_pass": _DetailAccumulator,
             "per_token": _DetailAccumulator,
-        }[server_args.expert_distribution_recorder_mode]
+        }[get_exec().moe.expert_distribution_recorder_mode]
 
     def __init__(
         self,
-        server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
-        self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
 
@@ -698,14 +705,14 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self._enable = self._server_args.enable_expert_distribution_metrics
+        self._enable = reports_expert_balancedness()
 
         if self._enable:
-            self.window_sizes = [10, 100, 1000]
+            self.window_sizes = EPLB_BALANCEDNESS_WINDOW_SIZES
             self._history = _DequeCollection(maxlens=self.window_sizes)
+            self._reset_server_log_history = True
             self._rank = torch.distributed.get_rank()
             expert_dispatch_cls = resolve_collector_class(
-                self._server_args,
                 STAT_LOGGER_ROLE_EXPERT_DISPATCH,
                 ExpertDispatchCollector,
             )
@@ -731,6 +738,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         super().reset()
         if self._enable:
             self._history.clear()
+            self._reset_server_log_history = True
 
     def _append_utilization_rate(
         self,
@@ -742,7 +750,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             single_pass_global_physical_count,
             num_gpu=self._expert_location_metadata.ep_size,
         )
-        gpu_physical_count = gpu_physical_count.to(self._server_args.device)
+        gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
         torch.distributed.reduce(
             gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
         )
@@ -754,29 +762,22 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 compute_utilization_rate(gpu_physical_count)
             )
             should_track_history = not math.isclose(
-                self._server_args.eplb_min_rebalancing_utilization_threshold, 1.0
+                get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
             )
-            if envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
-                outputs["metrics"] = ExpertDistributionMetrics(
-                    eplb_balancedness=utilization_rate_gpu,
-                )
-                if should_track_history:
-                    self._history.append(utilization_rate_gpu.item())
-            else:
-                # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
-                utilization_rate_cpu = utilization_rate_gpu.item()
-                self._history.append(utilization_rate_cpu)
 
-                gpu_physical_count_sum = gpu_physical_count.sum().item()
+            should_log = logs_expert_balancedness_to_server_log()
+            outputs["metrics"] = ExpertDistributionMetrics(
+                forward_pass_id=forward_pass_id,
+                eplb_balancedness=utilization_rate_gpu,
+                gpu_physical_count_sum=(
+                    gpu_physical_count.sum() if should_log else None
+                ),
+                reset_server_log_history=self._reset_server_log_history,
+            )
+            self._reset_server_log_history = False
 
-                logger.info(
-                    f"[Expert Balancedness] "
-                    f"forward_pass_id={forward_pass_id} "
-                    f"current_pass_balancedness={utilization_rate_cpu:.03f} "
-                    f"{''.join(f'last_{size}_average_balancedness={value:.03f} ' for size, value in self._history.mean().items())} "
-                    f"gpu_physical_count_sum={gpu_physical_count_sum}"
-                    # f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
-                )
+            if should_track_history:
+                self._history.append(utilization_rate_gpu.item())
 
     # TODO refactor
     def _handle_metric_eplb_heatmap(self, gpu_physical_count: torch.Tensor):
@@ -803,7 +804,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
 
 
 class _DequeCollection:
-    def __init__(self, maxlens: List[int]):
+    def __init__(self, maxlens: Sequence[int]):
         self._dequeues = [deque(maxlen=maxlen) for maxlen in maxlens]
 
     def append(self, value):
@@ -881,9 +882,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                 # Cannot use local_physical_count to support select_experts
                 self._expert_location_metadata.num_physical_experts,
             ),
-            buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
+            buffer_size=get_exec().moe.expert_distribution_recorder_buffer_size,
             dtype=torch.int32,
-            device=self._server_args.device,
+            device=get_device_namespace().device,
         )
         self._first_dump = True
 
@@ -936,7 +937,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
     def _get_global_average_utilization_rate(self):
         if not self._enable or math.isclose(
-            self._server_args.eplb_min_rebalancing_utilization_threshold, 1.0
+            get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
         ):
             return None
 

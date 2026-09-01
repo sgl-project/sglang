@@ -154,6 +154,38 @@ def test_streaming_recovers_missing_think_separator() -> None:
     assert content == "reply"
 
 
+_TOOLS_CHANNEL = (
+    f'{TOOLS_OPEN}<|open|>call tool="python" index="1"<|sep|>'
+    "<|close|>call<|sep|>"
+    f"{TOOLS_CLOSE}"
+)
+
+
+def test_non_stream_tools_channel_before_think_close_is_not_reasoning() -> None:
+    """A tools channel emitted inside the think block, with think closing after
+    it, must still reach the tool-call parser.
+
+    The reasoning grammar is deferred until think closes, so nothing stops the
+    model from opening the tools channel first. Splitting on think_end put the
+    whole call in reasoning_text, dropping it with no log line.
+    """
+    detector = KimiK3Detector(force_reasoning=True)
+    result = detector.detect_and_parse(
+        f"thought{_TOOLS_CHANNEL}{THINK_CLOSE}{MESSAGE_CLOSE}"
+    )
+    assert result.reasoning_text == "thought"
+    assert TOOLS_OPEN in result.normal_text
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 7, 1000])
+def test_streaming_tools_channel_before_think_close(chunk_size: int) -> None:
+    detector = KimiK3Detector(force_reasoning=True)
+    text = f"thought{_TOOLS_CHANNEL}{THINK_CLOSE}{MESSAGE_CLOSE}"
+    reasoning, content = _stream(detector, _chunks(text, chunk_size))
+    assert reasoning == "thought"
+    assert TOOLS_OPEN in content
+
+
 def test_reasoning_parser_registration() -> None:
     assert isinstance(ReasoningParser("kimi_k3").detector, KimiK3Detector)
 

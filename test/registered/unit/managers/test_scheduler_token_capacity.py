@@ -1,9 +1,5 @@
 import unittest
-from types import SimpleNamespace
 
-import msgspec
-
-from sglang.srt.managers.rust_server import RustServer
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.memory_usage import build_memory_usage
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -23,26 +19,6 @@ class TestSchedulerTokenCapacity(unittest.TestCase):
 
         self.assertEqual(info["max_total_num_tokens"], 4096)
         self.assertEqual(info["max_total_num_tokens_per_dcp_rank"], 1024)
-
-    def test_rust_server_args_expose_both_capacity_units(self):
-        class ModelConfig:
-            def __init__(self):
-                self.hf_config = None
-
-            def get_default_sampling_params(self):
-                return {}
-
-        scheduler = SimpleNamespace(
-            server_args=SimpleNamespace(speculative_algorithm=None),
-            model_config=ModelConfig(),
-            logical_max_total_num_tokens=4096,
-            max_total_num_tokens_per_dcp_rank=1024,
-        )
-
-        server_args = msgspec.json.decode(RustServer._build_server_args(scheduler))
-
-        self.assertEqual(server_args["max_total_num_tokens"], 4096)
-        self.assertEqual(server_args["max_total_num_tokens_per_dcp_rank"], 1024)
 
     def test_memory_usage_exposes_logical_and_per_dcp_rank_capacity(self):
         memory_usage = build_memory_usage(

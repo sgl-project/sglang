@@ -52,6 +52,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
+    is_deepep_class_backend,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -266,9 +267,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
         )
 
-        # Router gate: description-driven quant, mirroring vllm-ascend. Only the
-        # offline ModelSlim path (which carries a per-layer quant_model_description)
-        # may quantise the gate — if the checkpoint stored it as MXFP8 it is loaded
+        # Router gate: description-driven quant. Only the offline ModelSlim path
+        # (which carries a per-layer quant_model_description) may quantise the
+        # gate — if the checkpoint stored it as MXFP8 it is loaded
         # and dequantised correctly instead of cast to bf16 without its block scale.
         # The online Fp8/mxfp8 path keeps the gate in bf16 (unchanged, verified).
         gate_quant_config = (
@@ -284,7 +285,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
 
-        if get_moe_a2a_backend().is_deepep():
+        if is_deepep_class_backend():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
@@ -299,7 +300,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
 
         if (
-            not get_moe_a2a_backend().is_deepep()
+            not is_deepep_class_backend()
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
             return self.forward_normal(hidden_states)
@@ -964,6 +965,14 @@ class Qwen3MoeForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+        # IPC loading bypasses load_weights(), so initialize the EPLB descriptor here.
+        self.routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.start_layer, self.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
+            }
+        )
 
         self.attn_cp_size = get_parallel().attn_cp_size
         self.attn_cp_rank = get_parallel().attn_cp_rank

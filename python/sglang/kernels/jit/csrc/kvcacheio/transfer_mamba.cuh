@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 constexpr int kBlockSize = 1024;
 constexpr int kBlockQuotaBackup = 2;
@@ -185,4 +185,4 @@ struct TransferMambaKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

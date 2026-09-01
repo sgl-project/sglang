@@ -25,8 +25,10 @@ def set_default_torch_dtype(dtype: torch.dtype):
     """Sets the default torch dtype to the given dtype."""
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
-    yield
-    torch.set_default_dtype(old_dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(old_dtype)
 
 
 def _is_moe_model(model_config: ModelConfig, architectures: list[str]) -> bool:
@@ -233,6 +235,11 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
         _model_impl_from_architecture(resolved_arch),
     )
     return model_cls, resolved_arch
+
+
+def supports_cuda_vmm_feature_transport(model_config: ModelConfig) -> bool:
+    model_cls, _ = get_model_architecture(model_config)
+    return bool(getattr(model_cls, "supports_cuda_vmm_feature_transport", False))
 
 
 def get_resolved_model_impl(model_config: ModelConfig) -> ModelImpl:

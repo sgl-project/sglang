@@ -15,10 +15,16 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
+    get_resources,
     get_schedule,
-    get_server_args,
 )
 from sglang.srt.state_capturer.base import BaseTopkCapturer
+
+
+def _is_scattered_a2a_backend() -> bool:
+    """Return whether routed tokens are scattered across attention-TP ranks."""
+    backend = get_moe_a2a_backend()
+    return backend.is_deepep() or backend.is_deepep_v2()
 
 
 class RoutedExpertsCapturer(BaseTopkCapturer):
@@ -40,15 +46,11 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         max_running_requests: int,
         device: str,
     ) -> Optional["RoutedExpertsCapturer"]:
-        server_args = get_server_args()
         if not get_exec().features.enable_return_routed_experts:
             return None
-        if not get_exec().moe.disable_shared_experts_fusion and hasattr(
-            model, "num_fused_shared_experts"
-        ):
-            num_fused_shared_experts = model.num_fused_shared_experts
-        else:
-            num_fused_shared_experts = 0
+        # The model's own attribute is the baked decision (0 when its gate
+        # disabled fusion); the ACTIVE flag can be holding another runner's.
+        num_fused_shared_experts = getattr(model, "num_fused_shared_experts", 0)
         return RoutedExpertsCapturer(
             model_config,
             num_tokens=num_tokens,
@@ -89,11 +91,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device_topk_size=topk_size + num_fused_shared_experts,
         )
 
-        # DeepEP a2a path: each attn-TP rank only sees its scattered slice of
-        # topk_ids. All-gather across attn-TP at capture time so device_cache
-        # holds the full batch and the existing _get_local_slice / D2H sync
-        # paths work unchanged. Pre-allocate the gather target.
-        if get_moe_a2a_backend().is_deepep():
+        # Rebuild the full token batch before routed-expert readback.
+        if _is_scattered_a2a_backend():
             attn_tp_size = (
                 get_parallel().attn_tp_size if is_dp_attention_enabled() else 1
             )
@@ -107,7 +106,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             )
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
-        if get_moe_a2a_backend().is_deepep():
+        if _is_scattered_a2a_backend():
             local_topk = topk_indices
             topk_indices = self.gather_buffer[
                 : local_topk.size(0) * get_parallel().attn_tp_size
@@ -121,10 +120,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         can_run_graph: bool,
         cuda_graph_batch: Optional[int],
     ) -> torch.Tensor:
-        # Under DeepEP, capture() already attn_tp_all_gathered into the head of
-        # the per-rank buffer, so the local DP rank's data lives at [0:N_local]
-        # rather than at the global [start_pos:end_pos] offset.
-        if is_dp_attention_enabled() and not get_moe_a2a_backend().is_deepep():
+        # Gathered rows start at buffer offset zero on every DP rank.
+        if is_dp_attention_enabled() and not _is_scattered_a2a_backend():
             # GPU->CPU sync would break overlap; operate on CPU directly.
             local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
                 forward_batch, can_run_graph, cuda_graph_batch
@@ -138,13 +135,11 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
 
 
 def get_global_experts_capturer() -> Optional[RoutedExpertsCapturer]:
-    from sglang.srt.runtime_context import get_resources
 
     return get_resources().experts_capturer
 
 
 def set_global_experts_capturer(capturer: Optional[RoutedExpertsCapturer]):
-    from sglang.srt.runtime_context import get_resources
 
     get_resources().experts_capturer = capturer
 

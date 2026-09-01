@@ -154,7 +154,6 @@ class TestSkipTokenizerInit(CustomTestCase):
 
         response_stream_json = []
         for line in response_stream.iter_lines():
-            print(line)
             if line.startswith(b"data: ") and line[6:] != b"[DONE]":
                 response_stream_json.append(json.loads(line[6:]))
         out_stream_ids = []

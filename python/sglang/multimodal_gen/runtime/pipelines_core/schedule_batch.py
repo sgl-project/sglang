@@ -108,6 +108,10 @@ class Req:
     pooled_embeds: list[torch.Tensor] = field(default_factory=list)
     neg_pooled_embeds: list[torch.Tensor] = field(default_factory=list)
 
+    # GLM-Image autoregressive prior tokens
+    prior_token_id: torch.Tensor | None = None
+    prior_token_image_ids: torch.Tensor | list[torch.Tensor] | None = None
+
     # Additional text-related parameters
     max_sequence_length: int | None = None
     prompt_template: dict[str, Any] | None = None
@@ -206,6 +210,7 @@ class Req:
 
     # stage logging
     metrics: Optional[RequestMetrics] = None
+    usage: dict[str, Any] | None = None
 
     # tracing context (TraceReqContext or TraceNullContext)
     trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
@@ -466,6 +471,7 @@ class OutputBatch:
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None
     peak_memory_mb: float = 0.0
+    usage: dict[str, Any] | None = None
 
     def drop_payload_for_warmup(self) -> None:
         self.output = None

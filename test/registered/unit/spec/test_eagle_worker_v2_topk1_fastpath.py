@@ -6,6 +6,7 @@ tests check that the pre-allocated `parent_list` / `top_scores_index` match the
 slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
 """
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -17,14 +18,9 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cpu_ci,
-    register_cuda_ci,
-)
+from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -138,6 +134,31 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
+
+    def test_idle_draft_runs_each_eager_forward_without_tree_layout(self):
+        worker = object.__new__(EagleDraftWorker)
+        worker.speculative_num_steps = 3
+        worker.draft_attn_backend = SimpleNamespace(attn_backends=[object(), object()])
+        worker.draft_runner = SimpleNamespace(
+            canary_manager=None,
+            forward=MagicMock(),
+        )
+        spec_info = SimpleNamespace(hidden_states=torch.empty((0, 8), device=DEVICE))
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            input_ids=torch.empty((0,), dtype=torch.long, device=DEVICE),
+            out_cache_loc=torch.empty((0,), dtype=torch.long, device=DEVICE),
+            spec_info=spec_info,
+        )
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.forward_context",
+            side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
+        ):
+            result = worker.draft_forward(forward_batch)
+
+        self.assertEqual(result, (None, None, None, None))
+        self.assertEqual(worker.draft_runner.forward.call_count, 2)
 
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):

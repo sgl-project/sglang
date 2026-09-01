@@ -1,9 +1,15 @@
+import glob
+import inspect
+import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import sys
 import threading
 import time
+from datetime import datetime
 from functools import wraps
 from urllib.parse import urlparse
 
@@ -20,6 +26,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     NAMESPACE,
     SERVICE_PORT,
     check_role,
+    kill_process_group,
     launch_pd_mix_node,
     launch_pd_separation_node,
     launch_router,
@@ -158,6 +165,7 @@ GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/yzgjhdxf/GLM-5-top64-pruned-gsm8k"
 )
 GLM_5_1_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.1-w4a8"
+GLM_5_2_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w4a8"
 MINIMAX_M2_5_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
 )
@@ -198,6 +206,9 @@ MAX_SERVER_KEEP_ALIVE_TIME = 3600
 
 # Timeouts and delays
 SERVER_INITIALIZATION_DELAY = 120
+BENCHMARK_STDOUT_DRAIN_GRACE = 10  # Grace seconds to wait for the direct child to exit after it drains stdout / exits
+BENCHMARK_STDOUT_IDLE_TIMEOUT = 300  # Idle timeout: no output for this long means the benchmark is stuck, then force-kill
+BENCHMARK_WATCHDOG_POLL_INTERVAL = 30  # Watchdog polling interval (seconds)
 
 # Test parameters
 PROMPTS_MULTIPLIER = 4
@@ -467,6 +478,9 @@ def run_bench_serving(
     # Run benchmark command and capture output
     metrics = {"mean_ttft": None, "mean_tpot": None, "total_tps": None}
 
+    # Launch the benchmark in its own session/process group so a dead server
+    # cannot wedge the run: on timeout we nuke the whole group (including any
+    # re-parented descendants) instead of waiting forever on its stdout.
     process = subprocess.Popen(
         cmd_args,
         stdout=subprocess.PIPE,
@@ -474,11 +488,59 @@ def run_bench_serving(
         text=True,
         bufsize=1,
         env=env,
+        start_new_session=True,
     )
+
+    reader_done = threading.Event()
+    # Timestamp of the last output line; the watchdog reads it to detect a
+    # silent/stuck benchmark.
+    last_activity = time.time()
+
+    def _kill_on_timeout():
+        while True:
+            # Direct child has exited, but stdout may still be held open by a
+            # grandchild; wait for the reader to drain within the grace period,
+            # otherwise force-kill the whole process group.
+            if process.poll() is not None:
+                if not reader_done.wait(timeout=BENCHMARK_STDOUT_DRAIN_GRACE):
+                    logger.error(
+                        f"Benchmark stdout still open after process exit, "
+                        f"killing process group {process.pid}"
+                    )
+                    kill_process_group(process)
+                return
+            # stdout has drained, but the direct child may still be alive:
+            # give it a bounded time to exit, otherwise nuke the group.
+            if reader_done.is_set():
+                try:
+                    process.wait(timeout=BENCHMARK_STDOUT_DRAIN_GRACE)
+                except subprocess.TimeoutExpired:
+                    logger.error(
+                        f"Benchmark {process.pid} still alive after stdout EOF, "
+                        f"killing process group {process.pid}"
+                    )
+                    kill_process_group(process)
+                return
+            # No output for too long while still alive -> likely hung.
+            idle = time.time() - last_activity
+            if idle > BENCHMARK_STDOUT_IDLE_TIMEOUT:
+                logger.error(
+                    f"Benchmark produced no output for {idle:.0f}s "
+                    f"(> {BENCHMARK_STDOUT_IDLE_TIMEOUT}s), "
+                    f"killing process group {process.pid}"
+                )
+                kill_process_group(process)
+                return
+            time.sleep(BENCHMARK_WATCHDOG_POLL_INTERVAL)
+
+    watchdog = threading.Thread(target=_kill_on_timeout, daemon=True)
+    watchdog.start()
+
     try:
         # Read output line by line
         with open(result_file, "a", encoding="utf-8") as f:
             for line in process.stdout:
+                last_activity = time.time()
                 if line.strip():
                     print(line, end="")
                 f.write(line)
@@ -501,6 +563,7 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 5:
                         metrics["mean_e2e_latency"] = parts[4]
+        reader_done.set()
         process.wait()
         if process.returncode != 0:
             logger.error(
@@ -509,6 +572,7 @@ def run_bench_serving(
     except Exception as e:
         logger.error(f"Error running benchmark: {e}")
     finally:
+        reader_done.set()
         if process.stdout is not None and not process.stdout.closed:
             process.stdout.close()
 
@@ -910,7 +974,132 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     pop_sglang_is_in_ci_for_gsp = False
 
     @classmethod
+    def _get_tc_name(cls):
+        """Derive the test case name from the test file (filename without
+        extension). Mirrors the workflow's ``tc_name=${test_case##*/}`` logic
+        so each case in a suite writes to its own output path."""
+        try:
+            tc_file = inspect.getfile(cls)
+        except (TypeError, OSError):
+            tc_file = getattr(sys.modules.get(cls.__module__), "__file__", "")
+        return os.path.splitext(os.path.basename(tc_file))[0]
+
+    @classmethod
+    def _setup_per_case_output(cls):
+        """Set up per-case output directories and env vars.
+
+        When the workflow sets METRICS_DATA_FILE to a suite-level directory
+        (e.g. .../output/{branch_label}-{create_date}-{run_id}-{run_attempt}/
+        {workflow_name}/{test_type}/{suite}), each case in the suite
+        writes to its own subdirectory under it, so results stay in the
+        structured layout and are keyed by the case id. Falls back to the
+        legacy per-case layout when the env var is not set.
+        """
+        cls.tc_name = cls._get_tc_name()
+        suite_output = os.environ.get("METRICS_DATA_FILE")
+        if suite_output:
+            # Append the case id under the suite output prefix.
+            cls.metrics_data_file = os.path.join(suite_output, cls.tc_name)
+            # Mirror the output prefix to the plog location (drop the test_type/suite tail).
+            suite_plog = suite_output.replace("/output/", "/logs/plog/", 1)
+            cls.plog_base = os.path.dirname(os.path.dirname(suite_plog))
+        else:
+            current_date = datetime.now().strftime("%Y%m%d")
+            test_type = getattr(cls, "test_type", "perf")
+            base_output = f"/root/.cache/tests/output/{test_type}/{current_date}"
+            cls.metrics_data_file = os.path.join(base_output, cls.tc_name)
+            cls.plog_base = f"/root/.cache/tests/logs/plog"
+        os.makedirs(cls.metrics_data_file, exist_ok=True)
+        # Override env vars so evalscope/dump_metric write to per-case paths.
+        os.environ["METRICS_DATA_FILE"] = cls.metrics_data_file
+        os.environ["SGLANG_TEST_METRICS_OUTPUT"] = os.path.join(
+            cls.metrics_data_file, "metrics"
+        )
+        logger.info(
+            "Per-case output: tc_name=%s metrics_data_file=%s",
+            cls.tc_name,
+            cls.metrics_data_file,
+        )
+
+    @classmethod
+    def _save_metrics_json(cls):
+        """Write per-case ``metrics.json`` from ``dump_metric`` JSONL files.
+
+        Replaces the workflow's stdout-parsing + ``dump_metrics.py`` logic so
+        each case in a suite persists its own metrics snapshot.
+        """
+        if not getattr(cls, "metrics_data_file", None):
+            return
+        metrics = {}
+        baselines = {}
+        pattern = os.path.join(cls.metrics_data_file, "metrics.*.jsonl")
+        for jsonl_path in glob.glob(pattern):
+            try:
+                with open(jsonl_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        record = json.loads(line)
+                        name = record.get("metric_name")
+                        value = record.get("value")
+                        if name is None:
+                            continue
+                        if name.endswith("_baseline"):
+                            baselines[name[: -len("_baseline")]] = value
+                        else:
+                            metrics[name] = value
+            except Exception as e:
+                logger.warning("Failed to read %s: %s", jsonl_path, e)
+        out_path = os.path.join(cls.metrics_data_file, "metrics.json")
+        payload = {
+            "test_case": cls.tc_name,
+            "test_type": getattr(cls, "test_type", "perf"),
+            "metrics": metrics,
+            "baselines": baselines,
+        }
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            logger.info("Saved per-case metrics to %s", out_path)
+        except Exception as e:
+            logger.warning("Failed to write metrics.json: %s", e)
+        # Remove the intermediate JSONL records, keeping only the final metrics.json.
+        for jsonl_path in glob.glob(pattern):
+            try:
+                os.remove(jsonl_path)
+            except Exception as e:
+                logger.warning("Failed to remove %s: %s", jsonl_path, e)
+
+    @classmethod
+    def _backup_plog(cls):
+        """Backup Ascend plog files to a per-case path.
+
+        Replaces the workflow's ``Backup plog`` step so each case in a suite
+        gets its own plog snapshot instead of all cases sharing the suite name.
+        """
+        plog_path = "/root/ascend/log/debug/plog"
+        if not os.path.isdir(plog_path):
+            return
+        tc_name = getattr(cls, "tc_name", None)
+        if not tc_name:
+            return
+        hostname = os.getenv("HOSTNAME", "unknown")
+        plog_base = getattr(cls, "plog_base", "/root/.cache/tests/logs/plog")
+        target = os.path.join(plog_base, tc_name, hostname)
+        os.makedirs(target, exist_ok=True)
+        for name in os.listdir(plog_path):
+            src = os.path.join(plog_path, name)
+            if os.path.isfile(src):
+                try:
+                    shutil.copy2(src, os.path.join(target, name))
+                except Exception as e:
+                    logger.warning("Failed to copy plog %s: %s", name, e)
+        logger.info("Backed up plog to %s", target)
+
+    @classmethod
     def setUpClass(cls):
+        cls._setup_per_case_output()
         cls.base_url = DEFAULT_URL_FOR_TEST
         env = os.environ.copy()
         for key, value in env.items():
@@ -937,6 +1126,8 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+        cls._save_metrics_json()
+        cls._backup_plog()
 
     @retry()
     def run_throughput(self):

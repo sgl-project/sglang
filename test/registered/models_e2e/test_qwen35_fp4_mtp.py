@@ -38,6 +38,8 @@ MTP_BASE_ARGS = [
     "trtllm_mha",
     "--quantization",
     "modelopt_fp4",
+    "--speculative-draft-model-quantization",
+    "modelopt_fp4",
     "--speculative-algorithm",
     "NEXTN",
     "--speculative-num-steps",
