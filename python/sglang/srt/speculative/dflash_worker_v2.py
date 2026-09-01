@@ -82,6 +82,19 @@ _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
+# Set SGLANG_DFLASH_DP_DEBUG=1 to trace the DFlash x DP-attention pipeline
+# (prefill bonus/KV injection, draft block, verify accept) per iteration.
+_DP_DBG = os.environ.get("SGLANG_DFLASH_DP_DEBUG", "0") == "1"
+
+
+def _dp_dbg_tag() -> str:
+    try:
+        p = get_parallel()
+        return f"DP{p.attn_dp_rank} TP{p.tp_rank}"
+    except Exception:
+        return "?"
+
+
 _FusedKVMaterializeHelper = None
 
 
@@ -1896,6 +1909,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
+            if _DP_DBG:
+                _hs = logits_output.hidden_states
+                _sum_ext = int(sum(batch.extend_lens))
+                logger.warning(
+                    "[DFLASH-DPDBG] %s PREFILL bs=%d extend=%s prefix=%s bonus=%s "
+                    "ocl[:5]=%s ocl_len=%d sum_ext=%d ocl_tail=%s pos[:5]=%s "
+                    "hs_rows=%d hs_sum=%.4f",
+                    _dp_dbg_tag(),
+                    len(batch.seq_lens),
+                    list(batch.extend_lens[:4]),
+                    list(batch.prefix_lens[:4]),
+                    next_token_ids[:4].tolist(),
+                    batch.out_cache_loc[:5].tolist(),
+                    batch.out_cache_loc.numel(),
+                    _sum_ext,
+                    batch.out_cache_loc[-3:].tolist(),
+                    positions[:5].tolist(),
+                    _hs.shape[0],
+                    float(_hs.float().sum()),
+                )
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
                 cache_loc=batch.out_cache_loc,
@@ -2067,6 +2100,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             noise_embedding = noise_embedding * self._noise_embed_scale
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
+        if _DP_DBG:
+            logger.warning(
+                "[DFLASH-DPDBG] %s BLOCK bs=%d seq_lens=%s bonus=%s pos0=%s ocl0=%s ocl0_1=%s",
+                _dp_dbg_tag(),
+                bs,
+                prefix_lens[:4].tolist(),
+                draft_input.bonus_tokens[:4].tolist(),
+                positions_2d[:, 0].tolist(),
+                verify_out_cache_loc_2d[:, 0].tolist(),
+                verify_out_cache_loc_2d[:, 1].tolist(),
+            )
+
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
@@ -2180,6 +2225,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
+
+        if _DP_DBG:
+            logger.warning(
+                "[DFLASH-DPDBG] %s DRAFT bs=%d draft0=%s draft1=%s",
+                _dp_dbg_tag(),
+                bs,
+                draft_tokens[0, :6].tolist(),
+                draft_tokens[1, :6].tolist() if bs > 1 else [],
+            )
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -2376,6 +2430,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH verify requires target hidden states, but got None."
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
+
+        if _DP_DBG:
+            _ntl = logits_output.next_token_logits
+            logger.warning(
+                "[DFLASH-DPDBG] %s VERIFY bs=%d commit=%s bonus=%s tgt_top1_0=%s "
+                "hs_rows=%d hs_sum=%.4f ntl_rows=%d ntl_argmax0=%s",
+                _dp_dbg_tag(),
+                bs,
+                commit_lens[:4].tolist(),
+                bonus[:4].tolist(),
+                (target_predict[0, :6].tolist() if target_predict is not None else None),
+                hidden.shape[0] * hidden.shape[1],
+                float(hidden.reshape(-1, hidden.shape[-1]).float().sum()),
+                _ntl.shape[0],
+                torch.argmax(_ntl[: min(8, _ntl.shape[0])], dim=-1).tolist(),
+            )
 
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
