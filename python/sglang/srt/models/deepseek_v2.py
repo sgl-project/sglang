@@ -212,6 +212,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     is_non_idle_and_non_empty,
+    is_sm90_supported,
     make_layers,
     use_intel_amx_backend,
 )
@@ -3069,15 +3070,13 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         if get_exec().moe.enforce_shared_experts_fusion:
             return None
         if (
-            cls.fused_shared_experts_architecture == "GlmMoeDsaForCausalLM"
-            and quant_config is not None
+            quant_config is not None
             and quant_config.get_name() == "modelopt_fp4"
+            and is_sm90_supported()
             and get_moe_runner_backend().is_marlin()
-            and _is_cuda
-            and (9, 0) <= torch.cuda.get_device_capability("cuda") < (10, 0)
         ):
             return (
-                "Hopper GLM modelopt_fp4 with moe_runner_backend=marlin: "
+                "Hopper modelopt_fp4 with moe_runner_backend=marlin: "
                 "fusion off by default until the shared-expert fused load path "
                 "is validated."
             )
