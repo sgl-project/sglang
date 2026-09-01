@@ -707,9 +707,10 @@ class MambaPool:
                         dtype=torch.float32,
                         device=device,
                     )
-                elif enable_linear_replayssm_spec and ssm_dtype != torch.float32:
-                    # Low parts of compact D and normalized K. A BF16 checkpoint
-                    # materializes these once per accepted verify window.
+                elif enable_linear_replayssm_spec and ring_dtype != torch.float32:
+                    # Low parts of compact D and normalized K. The rings follow
+                    # the activation dtype regardless of checkpoint dtype, so
+                    # materialization always needs both parts.
                     replayssm_rawv = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
                         dtype=conv_dtype,

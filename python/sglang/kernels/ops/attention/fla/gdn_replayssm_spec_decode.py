@@ -16,30 +16,13 @@ via the chunked delta-rule ``(I + A)^{-1}`` UT-transform, and the full state is
 flushed back only every ``L`` committed tokens. Rejected drafts roll back by a
 pointer move on the cursors -- no state write-back.
 
-Closed-loop exact fold (the state / output error split):
-  The scheme has two error paths with opposite structure. The OUTPUT is one-shot
-  (computed per step, consumed by the sampler, discarded) -- its error never
-  compounds. The STATE accumulates: folding the stored ``d`` records open-loop
-  (as the vLLM reference does) feeds the chunked transform's cancellation error
-  -- amplified up to ``2^(BS-1)`` by ``(I + A)^{-1}`` -- plus their storage
-  quantization into every future window, undamped, so the error grows with
-  generation length. Therefore the flush here does NOT fold ``d``: instead
-  :func:`gdn_replayssm_exact_fold_kernel` sequentially replays the committed
-  window from rings of the RAW inputs (``v`` and pre-norm ``k``, both born in
-  the activation dtype and hence stored losslessly, plus fp32 ``g`` / ``beta``),
-  mirroring ``fused_sigmoid_gating_delta_rule_update_kernel``'s fp32 op order
-  exactly. The delta-rule recurrence is contractive (per step the perturbation
-  gain is ``exp(g) * |1 - beta| < 1`` along ``k`` and ``exp(g) < 1`` elsewhere),
-  so given identical inputs the replayed checkpoint is bit-identical to the
-  recurrent baseline's committed state and carries NO length-dependent error.
-  The chunked transform is kept only for the non-accumulating output. Its
-  dots therefore need only stay below the bf16 OUTPUT-cast floor (eps ~ 2^-8
-  ~ 4e-3 relative), not match fp32 exactly: ``DOT_PRECISION`` defaults to
-  ``"tf32"`` (~5e-4, tensor-core path; worst case through the (I+A)^{-1}
-  amplification 2^(BS-1) still lands at the floor). ``"ieee"`` / ``"tf32x3"``
-  remain selectable for ablations. The committed state is untouched by any of
-  these dots (fp32 SSM checkpoint is the server_args default; a 16-bit
-  checkpoint is allowed with a warning, unvalidated for GDN).
+Compact materialization keeps the update vector and normalized key as high/low
+activation-dtype parts. The commit kernel reconstructs both parts before the
+update reaches the recurrent checkpoint, while the scalar decay stays fp32.
+For output reconstruction, a fp32 checkpoint keeps the pre-existing fp32/TF32
+dot operands; a 16-bit checkpoint uses the activation tensor-core path plus the
+normalized-key residual terms. ``DOT_PRECISION`` remains selectable for
+ablations.
 
 Differences from the vLLM reference:
   * SGLang passes **split** ``q`` / ``k`` / ``v`` tensors (already split + post
@@ -222,7 +205,13 @@ def gdn_replayssm_spec_circular_kernel(
         b_d_all = tl.load(
             p_d_main, mask=mask_v[:, None] & cache_valid[None, :], other=0.0
         ).to(tl.float32)
-        b_d_scaled = (b_d_all * b_replay_decay[None, :]).to(d_cache.dtype.element_ty)
+        b_d_scaled_fp32 = b_d_all * b_replay_decay[None, :]
+        if STATE_FP32:
+            # Preserve the pre-existing fp32-checkpoint path: these dots use
+            # fp32 operands with DOT_PRECISION (TF32 by default).
+            b_d_scaled = b_d_scaled_fp32
+        else:
+            b_d_scaled = b_d_scaled_fp32.to(d_cache.dtype.element_ty)
 
     if USE_QK_L2NORM_IN_KERNEL:
         qnorm_acc = tl.zeros([BS], dtype=tl.float32)
@@ -285,10 +274,19 @@ def gdn_replayssm_spec_circular_kernel(
             other=0.0,
         ).to(tl.float32)
         k_raw_tile = k_tile
-        q_tile = (q_tile * (q_rnorm * scale)[:, None]).to(q.dtype.element_ty)
+        q_precise = q_tile * (q_rnorm * scale)[:, None]
         k_precise = k_tile * k_rnorm[:, None]
-        k_tile = k_precise.to(k.dtype.element_ty)
-        k_residual_tile = (k_precise - k_tile.to(tl.float32)).to(k.dtype.element_ty)
+        k_store_tile = k_precise.to(k_cache.dtype.element_ty)
+        k_residual_tile = (k_precise - k_store_tile.to(tl.float32)).to(
+            k.dtype.element_ty
+        )
+        if STATE_FP32:
+            # Do not lower the fp32-checkpoint output path to activation dtype.
+            q_tile = q_precise
+            k_tile = k_precise
+        else:
+            q_tile = q_precise.to(q.dtype.element_ty)
+            k_tile = k_store_tile
 
         p_h0 = (
             h0
@@ -303,7 +301,7 @@ def gdn_replayssm_spec_circular_kernel(
         kT = tl.trans(k_tile)
         kk_mat += tl.dot(k_tile, kT, input_precision=DOT_PRECISION)
         kq_mat += tl.dot(k_tile, qT, input_precision=DOT_PRECISION)
-        if STORE_K_RESIDUAL:
+        if STORE_K_RESIDUAL and not STATE_FP32:
             k_residual_T = tl.trans(k_residual_tile)
             kk_mat += tl.dot(k_tile, k_residual_T, input_precision=DOT_PRECISION)
             kk_mat += tl.dot(k_residual_tile, kT, input_precision=DOT_PRECISION)
@@ -317,12 +315,8 @@ def gdn_replayssm_spec_circular_kernel(
         # the whole non-window contribution and no d-fold happens here anymore.
         if STATE_FP32:
             sc_tile = sc_tile.to(tl.float32)
-            sc_hi = sc_tile.to(k_tile.dtype)
-            sc_lo = (sc_tile - sc_hi.to(tl.float32)).to(k_tile.dtype)
-            hw_q += tl.dot(sc_hi, qT) + tl.dot(sc_lo, qT)
-            hw_k += tl.dot(sc_hi, kT) + tl.dot(sc_lo, kT)
-            if STORE_K_RESIDUAL:
-                hw_k += tl.dot(sc_hi, k_residual_T) + tl.dot(sc_lo, k_residual_T)
+            hw_q += tl.dot(sc_tile, qT, input_precision=DOT_PRECISION)
+            hw_k += tl.dot(sc_tile, kT, input_precision=DOT_PRECISION)
         else:
             sc_tile = sc_tile.to(k_tile.dtype)
             hw_q += tl.dot(sc_tile, qT)
@@ -339,7 +333,11 @@ def gdn_replayssm_spec_circular_kernel(
             )
             khist_tile = tl.load(
                 p_k, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
-            ).to(k_cache.dtype.element_ty)
+            )
+            if STATE_FP32:
+                khist_tile = khist_tile.to(tl.float32)
+            else:
+                khist_tile = khist_tile.to(k_cache.dtype.element_ty)
             scores_q += tl.dot(khist_tile, qT, input_precision=DOT_PRECISION)
             scores_k += tl.dot(khist_tile, kT, input_precision=DOT_PRECISION)
 
@@ -371,7 +369,7 @@ def gdn_replayssm_spec_circular_kernel(
             )
             tl.store(
                 p_cur_k,
-                k_tile,
+                k_store_tile,
                 mask=spec_kt_mask,
             )
 
