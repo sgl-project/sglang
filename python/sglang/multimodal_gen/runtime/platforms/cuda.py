@@ -257,9 +257,6 @@ class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
 
     # The vendored Triton tile-64 kernel is written against Hopper and
     # Blackwell block-sparse geometry; older architectures fail closed.
-    # SM103 (B300 / GB300) is validated: the Triton route compiles and the
-    # sparsity->0 == dense gate holds there. SM120 stays out (no Triton
-    # tile-64 validation, and FA is unavailable for the token refiner).
     supported_capabilities = {(9, 0), (10, 0), (10, 3)}
 
     @classmethod

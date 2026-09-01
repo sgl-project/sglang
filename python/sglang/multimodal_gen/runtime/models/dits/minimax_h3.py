@@ -85,8 +85,6 @@ logger = init_logger(__name__)
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 
-# Full-rank deltas and gate replacements shipped by the FastH3 LoRA bundles;
-# no LoRA mapping rule applies them, so they must not be dropped silently.
 _NON_LORA_DELTA_SUFFIXES = (".diff", ".diff_b", ".set_weight")
 
 

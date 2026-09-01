@@ -167,15 +167,12 @@ def test_topk_tile_list_semantics() -> None:
     exempt = _topk_tile_lists(scores, num_prefix, num_video, 0.5, True)
     assert exempt.shape == (2, num_video, num_prefix + keep)
     assert exempt.dtype == torch.int32
-    # Ascending, so the kernel visits tiles in a deterministic order.
     assert torch.equal(exempt, exempt.sort(dim=-1).values)
     mask = _lists_to_mask(exempt, n_tiles)
-    # Non-video keys are always selected; exactly keep video keys per row.
     assert mask[..., :num_prefix].all()
     assert (mask[..., num_prefix:].sum(dim=-1) == keep).all()
 
     compete = _topk_tile_lists(scores, num_prefix, num_video, 0.5, False)
-    # Under compete, prefix keys fight for the FLOP-matched budget.
     assert compete.shape == (2, num_video, min(keep + num_prefix, n_tiles))
     assert (_lists_to_mask(compete, n_tiles).sum(dim=-1) == keep + num_prefix).all()
 

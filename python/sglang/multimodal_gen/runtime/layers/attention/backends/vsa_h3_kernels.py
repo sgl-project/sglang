@@ -237,21 +237,15 @@ def vsa_h3_pack_tiles(
     tiled: torch.Tensor,
     pooled: torch.Tensor,
 ) -> None:
-    """Gather packed [T, H, D] rows into ``tiled`` ([3|4, H, S_pad, D]) and
-    write per-tile fp32 means of q/k/v into ``pooled`` ([3, H, n_tiles, D]).
-
-    ``src_index`` maps every padded tile position to its packed row, or -1 for
-    a pad position, which is written as zero.
+    """Gather packed [T, H, D] rows into ``tiled`` [3|4, H, S_pad, D] and write
+    fp32 per-tile means of q/k/v into ``pooled`` [3, H, n_tiles, D].
+    ``src_index`` maps each padded position to its packed row, or -1 (pad -> 0).
     """
-    n_tensors, heads, seq_pad, head_dim = tiled.shape
+    _, heads, seq_pad, head_dim = tiled.shape
     n_tiles = seq_pad // VSA_H3_KERNEL_BLOCK
     has_gate = gate is not None
-    if n_tensors != 3 + int(has_gate):
-        raise ValueError(f"tiled holds {n_tensors} tensors, gate={has_gate}")
-    for name, t in (("q", q), ("k", k), ("v", v), ("gate", gate)):
-        if t is not None and t.stride(-1) != 1:
-            raise ValueError(f"VSA-H3 pack needs a unit last-dim stride for {name}")
     g = gate if has_gate else q
+    assert all(t.stride(-1) == 1 for t in (q, k, v, g))
     _pack_tiles_kernel[(n_tiles, heads)](
         q,
         k,
@@ -324,15 +318,12 @@ def vsa_h3_untile(
     used: int,
     result: torch.Tensor,
 ) -> None:
-    """Scatter ``out_tiled`` ([H, S_pad, D]) back to packed rows of ``result``
-    ([T, H, D]); rows past ``used`` come out zero. With a gate, adds the
-    pooled compression output ``out_compress`` ([H, n_tiles, D] fp32) scaled
-    by the tiled gate before rounding once to the result dtype."""
+    """Scatter ``out_tiled`` [H, S_pad, D] to packed rows of ``result`` [T, H, D]
+    (rows past ``used`` are zero), adding ``out_compress`` [H, n_tiles, D] fp32
+    scaled by ``gate_tiled`` when given."""
     heads, seq_pad, head_dim = out_tiled.shape
     total = result.shape[0]
     has_gate = gate_tiled is not None
-    if has_gate != (out_compress is not None):
-        raise ValueError("gate_tiled and out_compress must be given together")
     _untile_kernel[(triton.cdiv(total, VSA_H3_KERNEL_BLOCK), heads)](
         out_tiled,
         gate_tiled if has_gate else out_tiled,

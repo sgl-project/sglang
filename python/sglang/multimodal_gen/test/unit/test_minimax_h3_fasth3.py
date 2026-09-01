@@ -143,9 +143,6 @@ def test_fasth3_distilled_schedule_is_uniform_five_points() -> None:
 
 
 def test_fasth3_lora_bundle_is_rejected_loudly() -> None:
-    """The sibling FastH3 LoRA bundle carries .diff/.diff_b deltas and
-    to_gate_compress.set_weight tensors; --lora-path must fail with a readable
-    error instead of silently dropping them."""
     from types import SimpleNamespace
 
     from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (

@@ -61,12 +61,11 @@ def _h3_tile_geometry(
     dit_seq_shape: tuple[int, int, int],
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-    """Tile the packed sequence: segment-pure prefix chunks, then video tiles.
+    """Segment-pure prefix chunks, then video tiles.
 
-    Returns (variable_block_sizes int32 [n_tiles], pack_index int32 [S_pad]
-    mapping each padded tile position to its packed row or -1, unpack_index
-    int32 [used] mapping each packed row to its padded position,
-    num_prefix_tiles, num_video_tiles).
+    Returns (variable_block_sizes int32 [n_tiles], pack_index int32 [S_pad]:
+    padded position -> packed row or -1, unpack_index int32 [used]: packed row
+    -> padded position, num_prefix_tiles, num_video_tiles).
     """
     prefix_len = sum(prefix_segments)
 
@@ -162,8 +161,6 @@ class VideoSparseAttentionH3Metadata(AttentionMetadata):
     pack_index: torch.Tensor
     unpack_index: torch.Tensor
     dense_layers: tuple[int, ...] = ()
-    # Request-scoped scratch shared by every layer and step; the builder owns
-    # the dict so the buffers survive across the per-step metadata objects.
     workspace_cache: dict = field(default_factory=dict)
 
     @property
@@ -235,13 +232,9 @@ def _topk_tile_lists(
     sparsity: float,
     exempt: bool,
 ) -> torch.Tensor:
-    """Ascending kv-tile lists for the video query tiles.
-
-    scores: [H, n_tiles, n_tiles] pooled tile scores. Returns
-    [H, num_video_tiles, width] int32 with width = num_prefix_tiles + keep
-    under exempt (prefix columns first, always selected) or
-    min(keep + num_prefix_tiles, n_tiles) under compete.
-    """
+    """scores [H, n_tiles, n_tiles] -> ascending int32 kv-tile lists
+    [H, num_video_tiles, width]; width = num_prefix_tiles + keep (exempt) or
+    min(keep + num_prefix_tiles, n_tiles) (compete)."""
     prefix = num_prefix_tiles
     keep = _compute_topk(sparsity, num_video_tiles)
     video_rows = scores[:, prefix:, :]
@@ -281,12 +274,9 @@ def _workspace_key(
 
 
 class _Workspace:
-    """Per-geometry scratch shared by every layer and step of a request.
-
-    ``tiled`` holds q/k/v(/gate) in the head-major padded tile layout, ``pooled``
-    the fp32 tile means. ``q2k_index`` / ``q2k_num`` are the kernel's index
-    lists: the dense prefix query rows and the always-selected prefix columns
-    are static, so only the top-k video columns are rewritten per layer.
+    """Per-geometry scratch: tiled q/k/v(/gate) [3|4, H, S_pad, D], pooled fp32
+    tile means [3, H, n_tiles, D], and the kernel index lists (prefix rows and
+    prefix columns are static; only the top-k video columns change per layer).
     """
 
     def __init__(
@@ -310,7 +300,6 @@ class _Workspace:
         self.out_tiled = torch.empty(
             (heads, seq_pad, head_dim), dtype=dtype, device=device
         )
-        # The kernel indexes these as contiguous [H, Gq, Gk] storage.
         all_tiles = torch.arange(n_tiles, dtype=torch.int32, device=device)
         self.dense_index = all_tiles.repeat(heads, n_tiles, 1)
         self.dense_num = torch.full(
@@ -485,9 +474,6 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
 
         out_compress = None
         if has_gate:
-            # Compression branch: dense attention over pooled tiles, broadcast
-            # to each tile's rows, scaled by the learned gate. Zero gates
-            # contribute nothing, which is the base-H3 contract.
             out_compress = torch.matmul(torch.softmax(scores, dim=-1), v_pooled)
 
         result = torch.empty(query.shape, dtype=query.dtype, device=query.device)

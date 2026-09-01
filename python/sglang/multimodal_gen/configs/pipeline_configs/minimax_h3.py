@@ -312,7 +312,6 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
         self.dit_config.arch_config.has_gate_compress = True
 
     def adaln_cache_model_variant(self, server_args) -> str:
-        # The distilled weights are laid out as the FL2VA partition.
         return "fl2va"
 
     def validate_quality_deployment(self, server_args) -> None:

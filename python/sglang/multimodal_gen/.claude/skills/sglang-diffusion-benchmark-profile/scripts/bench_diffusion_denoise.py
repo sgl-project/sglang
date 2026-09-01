@@ -425,9 +425,8 @@ MODELS = {
             "num-inference-steps",
         },
     },
-    # FastH3: 4-step VSA-distilled MiniMax-H3 on its trained sparse backend.
-    # Same request contract as minimax-h3-t2va, five sigma points = four
-    # DiT forwards, ulysses-4 (faster than tp2 x ulysses2 on B300).
+    # FastH3 (4-step distilled H3) on its trained VSA-H3 backend; H3 rejects a
+    # 1-step warmup request, hence --warmup-steps=2.
     "fasth3-t2va-vsa": {
         "path": "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
         "prompt": (
@@ -451,7 +450,6 @@ MODELS = {
             "--component-attention-backends=text_encoder=fa",
             '--attention-backend-config={"VSA_sparsity": 0.9}',
             "--enable-torch-compile=false",
-            # A 1-step warmup is rejected by H3 (its sigma grid needs >= 2 points).
             "--warmup-steps=2",
         ],
         "force_eager": True,

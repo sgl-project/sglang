@@ -150,12 +150,7 @@ def _load_tensor(
 
 
 def _load_native_weight_map(transformer_path: Path) -> dict[str, tuple[str, str]]:
-    """Native H3 parameter name -> (shard filename, name inside the shard).
-
-    Accepts both the base-H3 layout (``model.safetensors.index.json``) and a
-    Diffusers-layout transformer such as FastH3
-    (``diffusion_pytorch_model.safetensors.index.json``, ``transformer_blocks.*``).
-    """
+    """Native H3 parameter name -> (shard filename, name inside the shard)."""
     candidates = [
         transformer_path / "model.safetensors.index.json",
         transformer_path / "diffusion_pytorch_model.safetensors.index.json",
@@ -210,8 +205,6 @@ def main() -> None:
             )
             for filename in {filename for filename, _ in weight_map.values()}
         }
-        # The runtime keeps the time embedder in fp32 regardless of the
-        # checkpoint dtype (base H3 ships fp32, FastH3 ships bf16).
         time_kwargs = {
             f"{module}_{name}": _load_tensor(
                 f"time_embedder.{module}.{name}",

@@ -933,11 +933,7 @@ def _assemble_condition_rows(ctx: _FullLoopContext) -> None:
 def _cache_dit_noop_reason(
     num_inference_steps: int | tuple[int, int], batch: Req
 ) -> str | None:
-    """Why generic Cache-DiT cannot hit on this request, or None if it can.
-
-    Distilled schedules such as FastH3's four forwards never exceed the default
-    warmup, so mounting would only add overhead and mislead the user.
-    """
+    """Why generic Cache-DiT cannot hit on this request, or None if it can."""
     forwards = (
         min(num_inference_steps)
         if isinstance(num_inference_steps, tuple)
