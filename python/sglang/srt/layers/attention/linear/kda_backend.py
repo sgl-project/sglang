@@ -784,7 +784,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if (
             track_ssm
             and track_chunk_idx is not None
-            # Same rows as track_chunk_idx >= 0, but known without a GPU sync.
+            # Same rows as track_ssm_h_batch_src, but known without a GPU sync.
             and self.forward_metadata.track_ssm_h_src.numel() > 0
         ):
             # fp32 scratch the kernel snapshots the tracked chunk-boundary
