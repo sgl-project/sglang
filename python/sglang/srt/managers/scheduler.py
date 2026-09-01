@@ -103,6 +103,7 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.layers.dcp.capacity import aggregate_dcp_kv_capacity
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -2221,10 +2222,18 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens
-            * get_parallel().attn_dcp_size,
+            max_total_num_tokens=self._reported_max_total_num_tokens(),
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+        )
+
+    def _reported_max_total_num_tokens(self) -> int:
+        """Allocator-visible KV capacity, including virtual DCP expansion."""
+        server_args = getattr(self, "server_args", None)
+        return aggregate_dcp_kv_capacity(
+            self.max_total_num_tokens,
+            dcp_size=getattr(server_args, "dcp_size", 1),
+            attention_backend=getattr(server_args, "attention_backend", None),
         )
 
     def init_invariant_checker(self) -> None:
@@ -2396,7 +2405,7 @@ class Scheduler(
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * get_parallel().attn_dcp_size
+                self._reported_max_total_num_tokens()
                 - paged_input_len
                 - self.page_size
                 - 1,
