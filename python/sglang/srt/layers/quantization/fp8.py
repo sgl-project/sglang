@@ -143,6 +143,8 @@ def _require_fp4_dtype():
 
 def unshuffle_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
     """Restore the logical layout of a backend-shuffled FP8 weight."""
+    if not _use_aiter:
+        raise RuntimeError("FP8 weight unshuffle requires AITER")
     return unshuffle_aiter_fp8_weight(weight)
 
 
