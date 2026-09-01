@@ -930,8 +930,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def mark_write_through_pending(
         self, node_ids: list[NodeId], ack_id: NodeId
-    ) -> None:
-        self._binding.mark_write_through_pending(list(node_ids), ack_id)
+    ) -> list[NodeId]:
+        return self._binding.mark_write_through_pending(list(node_ids), ack_id)
 
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         self._binding.finish_write_through(list(node_ids), ack_id)

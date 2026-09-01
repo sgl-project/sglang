@@ -1373,6 +1373,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def _backup_publish_node_ids(
         node_id: NodeId, comp_xfers: dict[ComponentType, list[PoolTransfer]]
     ) -> list[NodeId]:
+        """The nodes one backup ack publishes: the acked node plus every node a
+        component transfer covers. Unordered here; mark_write_through_pending
+        returns the set ordered ancestors before descendants."""
         publish_node_ids: list[NodeId] = []
         for transfers in comp_xfers.values():
             for transfer in transfers:
@@ -1408,7 +1411,9 @@ class UnifiedRadixCache(BasePrefixCache):
         lock_params: Optional[DecLockRefParams],
         publish_node_ids: list[NodeId],
     ) -> None:
-        self.tree_core.mark_write_through_pending(publish_node_ids, ack_id=node_id)
+        publish_node_ids = self.tree_core.mark_write_through_pending(
+            publish_node_ids, ack_id=node_id
+        )
         self.ongoing_write_through[node_id] = _OngoingWriteThrough(
             node_id, lock_params, publish_node_ids
         )

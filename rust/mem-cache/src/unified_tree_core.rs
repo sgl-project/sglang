@@ -3649,24 +3649,43 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
     }
 
-    /// Mark every node covered by one in-flight write-through backup.
-    pub fn mark_write_through_pending(&mut self, node_ids: Vec<NodeId>, ack_id: NodeId) {
-        let node_indices = node_ids
-            .into_iter()
-            .map(|node_id| self.arena.resolve(node_id))
-            .collect::<Vec<_>>();
-        for &node_idx in &node_indices {
-            let node = self.arena.node(node_idx);
+    /// Mark every node covered by one in-flight write-through backup, and return
+    /// the marked nodes ordered ancestors before descendants. The publish side
+    /// records one host store event per node and links each to its parent, so a
+    /// parent must be published before its children. Ties break on node id, which
+    /// keeps the order independent of the caller's component iteration order.
+    pub fn mark_write_through_pending(
+        &mut self,
+        node_ids: Vec<NodeId>,
+        ack_id: NodeId,
+    ) -> Vec<NodeId> {
+        let mut marked: Vec<(usize, NodeId)> = Vec::with_capacity(node_ids.len());
+        for node_id in node_ids {
+            let node_idx = self.arena.resolve(node_id);
+            let depth = self.depth_from_root_(node_idx);
+            let node = self.arena.node_mut(node_idx);
             assert!(
                 node.write_through_pending_id.is_none()
                     || node.write_through_pending_id == Some(ack_id),
                 "node {} is already pending under a different write-through ack",
                 node.id
             );
+            node.write_through_pending_id = Some(ack_id);
+            marked.push((depth, node_id));
         }
-        for node_idx in node_indices {
-            self.arena.node_mut(node_idx).write_through_pending_id = Some(ack_id);
+        marked.sort_unstable();
+        marked.into_iter().map(|(_, node_id)| node_id).collect()
+    }
+
+    /// The number of edges between a node and the tree root.
+    fn depth_from_root_(&self, node_idx: NodeIdx_) -> usize {
+        let mut depth = 0;
+        let mut node = self.arena.node(node_idx);
+        while !node.is_root() {
+            depth += 1;
+            node = self.arena.node(node.parent());
         }
+        depth
     }
 
     /// Clear the write-through-pending mark (when it matches ack_id) and record the

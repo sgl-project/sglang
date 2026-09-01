@@ -2155,8 +2155,9 @@ fn mark_write_through_pending_stamps_one_ack_on_every_published_node() {
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
 
-    tc.mark_write_through_pending(vec![parent, leaf], /* ack_id = */ leaf);
+    let published = tc.mark_write_through_pending(vec![parent, leaf], /* ack_id = */ leaf);
 
+    assert_eq!(published, vec![parent, leaf]);
     for node_id in [parent, leaf] {
         assert_eq!(
             tc.arena
@@ -2174,6 +2175,22 @@ fn mark_write_through_pending_stamps_one_ack_on_every_published_node() {
             None
         );
     }
+}
+
+#[test]
+fn mark_write_through_pending_returns_the_published_nodes_ancestors_first() {
+    let mut tc = core();
+    tc.insert(&insert_params(&vec![1], &[10]));
+    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+    let parent = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+    let leaf = tc
+        .match_prefix(&match_params(&vec![1, 2]))
+        .best_match_node_id;
+
+    // The caller merges per-component transfers, whose order is not tree order.
+    let published = tc.mark_write_through_pending(vec![leaf, parent], /* ack_id = */ leaf);
+
+    assert_eq!(published, vec![parent, leaf]);
 }
 
 #[test]

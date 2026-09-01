@@ -1818,9 +1818,15 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         })
     }
 
-    /// Mark every node covered by one in-flight write-through backup.
-    fn mark_write_through_pending(&self, py: Python<'_>, node_ids: Vec<NodeId>, ack_id: NodeId) {
-        py.allow_threads(|| self.core().mark_write_through_pending(node_ids, ack_id));
+    /// Mark every node covered by one in-flight write-through backup, returning
+    /// them ordered ancestors before descendants.
+    fn mark_write_through_pending(
+        &self,
+        py: Python<'_>,
+        node_ids: Vec<NodeId>,
+        ack_id: NodeId,
+    ) -> Vec<NodeId> {
+        py.allow_threads(|| self.core().mark_write_through_pending(node_ids, ack_id))
     }
 
     /// Clear the write-through-pending mark on the acked nodes.
@@ -2797,15 +2803,15 @@ macro_rules! tree_core_binding {
                 self.inner.drop_subtree_no_host(py, node_id)
             }
 
-            /// Mark every node covered by one in-flight write-through backup.
+            /// Mark every node covered by one in-flight write-through backup,
+            /// returning them ordered ancestors before descendants.
             fn mark_write_through_pending(
                 &self,
                 py: Python<'_>,
                 node_ids: Vec<NodeId>,
                 ack_id: NodeId,
-            ) {
-                self.inner
-                    .mark_write_through_pending(py, node_ids, ack_id)
+            ) -> Vec<NodeId> {
+                self.inner.mark_write_through_pending(py, node_ids, ack_id)
             }
 
             /// Clear the write-through-pending mark on the acked nodes.

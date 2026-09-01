@@ -533,8 +533,10 @@ class UnifiedTreeCoreInterface(ABC):
     @abstractmethod
     def mark_write_through_pending(
         self, node_ids: list[NodeId], ack_id: NodeId
-    ) -> None:
-        """Mark every node covered by one in-flight write-through backup."""
+    ) -> list[NodeId]:
+        """Mark every node covered by one in-flight write-through backup, and return
+        the marked nodes ordered ancestors before descendants, the order the publish
+        side (host store events, L3 writes) expects."""
         ...
 
     @abstractmethod

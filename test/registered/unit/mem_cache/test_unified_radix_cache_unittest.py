@@ -7978,6 +7978,27 @@ class TestResumableInsertWalk(_InsertWalkSuite):
                 cache.evict(EvictParams(num_tokens=8))
         self.assertEqual(allocator.available_size(), available + 4)
 
+    def test_write_through_publish_list_is_ordered_ancestors_first(self):
+        """One ack spanning several nodes publishes a parent before its children,
+        whatever order the component transfers listed them in."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+        (parent,) = _node_children(cache, cache.root_node_handle())
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4, 5, 6])
+        (child,) = _node_children(cache, parent)
+
+        cache._track_write_through_node(
+            child, lock_params=None, publish_node_ids=[child, parent]
+        )
+
+        self.assertEqual(
+            cache.ongoing_write_through[child].publish_node_ids, [parent, child]
+        )
+        cache._finish_write_through_ack(child)
+        self.assertIsNone(cache.tree_core.get_write_through_pending_id(parent))
+        self.assertIsNone(cache.tree_core.get_write_through_pending_id(child))
+        cache.sanity_check()
+
     def test_match_split_relocation_survives_finalizer_failure(self):
         """A match-walk split's pending write-through relocation applies before
         the finalizers, so a finalizer failure cannot strand the stale record."""

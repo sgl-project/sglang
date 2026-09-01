@@ -627,11 +627,13 @@ def test_cache_tracks_one_write_through_ack_across_rust_nodes():
     leaf = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
     cache = SimpleNamespace(tree_core=core, ongoing_write_through={})
 
+    # Child-first in, ancestors-first out: the publish side links every store
+    # event to its parent, and component transfer order is not tree order.
     UnifiedRadixCache._track_write_through_node(
         cache,
         leaf,
         lock_params=None,
-        publish_node_ids=[parent, leaf],
+        publish_node_ids=[leaf, parent],
     )
 
     assert cache.ongoing_write_through[leaf].publish_node_ids == [parent, leaf]

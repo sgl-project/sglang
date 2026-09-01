@@ -2160,13 +2160,33 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def mark_write_through_pending(
         self, node_ids: list[NodeId], ack_id: NodeId
-    ) -> None:
-        """Mark every node covered by one in-flight write-through backup."""
-        nodes = [self.node_by_id(node_id) for node_id in node_ids]
-        for node in nodes:
-            assert node.write_through_pending_id in (None, ack_id)
-        for node in nodes:
+    ) -> list[NodeId]:
+        """Mark every node covered by one in-flight write-through backup, and return
+        the marked nodes ordered ancestors before descendants. The publish side
+        records one host store event per node and links each to its parent, so a
+        parent must be published before its children. Ties break on node id, which
+        keeps the order independent of the caller's component iteration order.
+        """
+        marked: list[tuple[int, NodeId]] = []
+        for node_id in node_ids:
+            node = self.node_by_id(node_id)
+            assert node.write_through_pending_id in (
+                None,
+                ack_id,
+            ), f"node {node.id} is already pending under a different write-through ack"
             node.write_through_pending_id = ack_id
+            marked.append((self._depth_from_root(node), node_id))
+        marked.sort()
+        return [node_id for _, node_id in marked]
+
+    @staticmethod
+    def _depth_from_root(node: UnifiedTreeNode) -> int:
+        """The number of edges between a node and the tree root."""
+        depth = 0
+        while node.parent is not None:
+            depth += 1
+            node = node.parent
+        return depth
 
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the
