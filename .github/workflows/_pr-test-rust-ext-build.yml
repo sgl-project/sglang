@@ -82,6 +82,8 @@ jobs:
           sparse-checkout: |
             rust
             python/setup.py
+            python/pyproject.toml
+            python/sglang/srt/rust_extensions/torch_build.py
             .github
             scripts/ci/utils
           sparse-checkout-cone-mode: false
@@ -93,14 +95,16 @@ jobs:
       - name: Ensure zstd so the saved entry is readable
         run: bash scripts/ci/utils/ensure_zstd.sh
 
-      # setup.py counts because it selects which crates get built. pyproject.toml
-      # is left out - it churns on bumps that cannot affect these modules.
+      # The setup hook and torch helper select and configure what gets built;
+      # pyproject.toml pins the libtorch ABI used by sglang-radix-tree.
       - name: Restore built modules
         id: cache
         uses: actions/cache/restore@v4
         with:
-          path: python/sglang/srt/rust_extensions/_*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
+          path: |
+            python/sglang/srt/rust_extensions/_*.so
+            python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
 
       # On a miss: different hash = rust/setup.py moved; no entries = evicted.
       - name: Report cache lookup
@@ -112,7 +116,8 @@ jobs:
         run: |
           if [ -n "${MATCHED_KEY}" ]; then
               echo "hit: ${MATCHED_KEY}"
-              ls -l python/sglang/srt/rust_extensions/_*.so
+              ls -l python/sglang/srt/rust_extensions/_*.so \
+                python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
           else
               echo "miss: ${PRIMARY_KEY}"
               echo "entries under ${KEY_PREFIX}- (created / ref / size / key):"
@@ -134,7 +139,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact_name }}
-          # Archive holds rust_extensions/_*.so, so it unpacks into python/sglang/srt/.
+          # Archive holds package-relative paths, so it unpacks into python/sglang/srt/.
           path: rust-ext-staging/
           if-no-files-found: error
           retention-days: 1
@@ -182,23 +187,21 @@ jobs:
           export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
           # Per-interpreter subdirs (set in the loop): PyO3's fingerprint tracks
           # the interpreter, so a shared dir rebuilds on every ABI switch.
-          cargo_target_root="${HOME}/.cache/sglang-cargo-target"
+          # ci_install_dependency.sh drops ${HOME}/.cache/sglang-cargo-target at 85%
+          # disk and unlocks before its own build, so a CUDA job sharing this host
+          # can delete the tree mid compile. Build in a per run dir nothing else
+          # touches. The .so cache above still carries results across runs.
+          cargo_target_root="${RUNNER_TEMP:-/tmp}/sglang-cargo-target-${GITHUB_RUN_ID:-norun}-$$"
           mkdir -p "${cargo_target_root}"
-          used="$(df --output=pcent "${cargo_target_root}" 2>/dev/null | tr -dc '0-9')"
-          if [ "${used:-0}" -ge 85 ]; then
-              echo "cargo target dir filesystem at ${used}%; dropping ${cargo_target_root}"
-              rm -rf "${cargo_target_root}"
-              mkdir -p "${cargo_target_root}"
-          fi
           python3 -m pip install --upgrade pip
           command -v uv >/dev/null 2>&1 || pip install uv
-          # build_rust needs only the build backend, not sglang's ~294 runtime deps.
+          # build_rust needs the build backend and torch, not sglang's ~294 other runtime deps.
           # Per-job path: these runners are persistent and shared, so a fixed one
           # both inherits the previous job's venv and races a concurrent build.
           venv_root="${RUNNER_TEMP:-/tmp}/sglang-ci-rust-ext-${GITHUB_RUN_ID:-norun}-$$"
           # Best-effort, like ci_cleanup_venv.sh: under set -e a failing EXIT trap
           # would fail the step, and nothing here is worth keeping for a postmortem.
-          trap 'rm -rf "${venv_root}" || true' EXIT
+          trap 'rm -rf "${venv_root}" "${cargo_target_root}" || true' EXIT
           for python_bin in "${{ steps.py310.outputs.python-path }}" "${{ steps.py312.outputs.python-path }}"; do
               minor="$("${python_bin}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
               export CARGO_TARGET_DIR="${cargo_target_root}/py${minor}"
@@ -206,8 +209,87 @@ jobs:
               uv venv "${venv}" --python "${python_bin}" --seed
               # shellcheck disable=SC1091
               source "${venv}/bin/activate"
-              uv pip install "setuptools>=61.0" "setuptools-rust>=1.10" "setuptools-scm>=8.0" wheel
+              uv pip install "setuptools>=61.0" "setuptools-rust>=1.11" "setuptools-scm>=8.0" "torch==2.13.0" wheel
+              # torch-sys resolves libtorch from the active interpreter and bakes that
+              # path into the persistent cargo cache. venv_root is per-run and deleted on
+              # exit, so a later run reuses a "Fresh torch-sys" whose -L points at a gone
+              # directory and fails with "unable to find library -ltorch". Pin LIBTORCH and
+              # drop the torch-shim units so they rebuild against this run's venv.
+              LIBTORCH="$(python -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent)')"
+              export LIBTORCH
+              export LD_LIBRARY_PATH="${LIBTORCH}/lib:${LD_LIBRARY_PATH:-}"
+              cargo clean --release --manifest-path rust/sglang-radix-tree/Cargo.toml \
+                  -p torch-sys -p sglang-radix-tree 2>/dev/null || true
               (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
+              python - <<'PY'
+          import importlib.util
+          import os
+          import pathlib
+          import runpy
+          import shutil
+          import subprocess
+          import sysconfig
+
+          import torch  # noqa: F401 - preload libtorch before the extension
+
+          root = pathlib.Path.cwd()
+          suffix = sysconfig.get_config_var("EXT_SUFFIX")
+          production_path = pathlib.Path(
+              "python/sglang/srt/mem_cache/rust_tree_core/mem_cache" + suffix
+          ).resolve()
+          inspection_path = production_path.with_name(
+              "mem_cache_inspection" + suffix
+          )
+
+          helper = runpy.run_path(
+              root / "python/sglang/srt/rust_extensions/torch_build.py"
+          )
+          build = helper["torch_build_configuration"](
+              compat_header=root / "rust/sglang-radix-tree/torch_2_13_compat.h",
+              python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
+              torch_module=torch,
+              include_absolute_rpath=False,
+          )
+          subprocess.run(
+              [
+                  "cargo",
+                  "build",
+                  "--release",
+                  "--locked",
+                  "--manifest-path",
+                  "rust/sglang-radix-tree/Cargo.toml",
+                  "--features",
+                  "python-extension,inspection",
+              ],
+              env=build.environment,
+              check=True,
+          )
+          release_dir = pathlib.Path(os.environ["CARGO_TARGET_DIR"]) / "release"
+          if target := os.environ.get("CARGO_BUILD_TARGET"):
+              release_dir = pathlib.Path(os.environ["CARGO_TARGET_DIR"]) / target / "release"
+          shutil.copy2(release_dir / "libmem_cache.so", inspection_path)
+
+          def load(name, path):
+              spec = importlib.util.spec_from_file_location(name, path)
+              assert spec is not None and spec.loader is not None
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              return module
+
+          production = load(
+              "sglang.srt.mem_cache.rust_tree_core.mem_cache", production_path
+          )
+          inspection = load(
+              "sglang.srt.mem_cache.rust_tree_core.mem_cache_inspection",
+              inspection_path,
+          )
+          assert not hasattr(
+              production.RustUnifiedTreeCoreBinding, "inspect_contains_node"
+          )
+          assert hasattr(
+              inspection.RustUnifiedTreeCoreBinding, "inspect_contains_node"
+          )
+          PY
               deactivate
           done
 
@@ -226,8 +308,10 @@ jobs:
       - name: Save built modules
         uses: actions/cache/save@v4
         with:
-          path: python/sglang/srt/rust_extensions/_*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
+          path: |
+            python/sglang/srt/rust_extensions/_*.so
+            python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
 
       - name: Upload extension modules
         uses: actions/upload-artifact@v4
