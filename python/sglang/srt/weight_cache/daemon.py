@@ -160,11 +160,6 @@ class WeightCacheDaemonArgs:
             default=31999,
             help="Manifest registry bind/connect port.",
         )
-        parser.add_argument(
-            "--weight-heterogeneous-transfer-registry-url",
-            default=None,
-            help=argparse.SUPPRESS,
-        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "WeightCacheDaemonArgs":
@@ -183,9 +178,6 @@ class WeightCacheDaemonArgs:
             ),
             weight_heterogeneous_transfer_port=(
                 args.weight_heterogeneous_transfer_port
-            ),
-            weight_heterogeneous_transfer_registry_url=(
-                args.weight_heterogeneous_transfer_registry_url
             ),
         )
 
@@ -246,9 +238,9 @@ class WeightCacheDaemon:
                 "heterogeneous weight transfer requires a manifest registry URL"
             )
 
-        device_uuid = current_platform.get_device_uuid(gpu_id)
-        self.socket_path = get_socket_path(device_uuid)
-        self.ready_path = get_ready_path(device_uuid)
+        self.device_uuid = current_platform.get_device_uuid(gpu_id)
+        self.socket_path = get_socket_path(self.device_uuid)
+        self.ready_path = get_ready_path(self.device_uuid)
 
         self.model = None
         self.config: Optional[CacheConfig] = None
@@ -545,11 +537,7 @@ class WeightCacheDaemon:
                 global_rank=compute_global_rank(
                     self.tp_size, self.pp_rank, self.tp_rank
                 ),
-                gpu_id=self.gpu_id,
-                tp_size=self.tp_size,
-                dp_size=(self.dp_size if self.enable_dp_attention else 1),
-                pp_size=self.pp_size,
-                ep_size=self.ep_size,
+                device_uuid=self.device_uuid,
                 session=self.weight_transfer_session,
             )
             logger.info(
@@ -567,7 +555,7 @@ class WeightCacheDaemon:
                 transfer_weights_from_source_daemons(
                     target_session=self.weight_transfer_session,
                     model=self.model,
-                    gpu_id=self.gpu_id,
+                    device_uuid=self.device_uuid,
                     registry_url=self.weight_heterogeneous_transfer_registry_url,
                 )
             )

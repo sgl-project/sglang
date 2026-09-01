@@ -9,6 +9,7 @@ import argparse
 import socket
 
 import torch
+from sglang.srt.platforms import current_platform
 
 from sglang.srt.weight_cache.protocol import (
     get_socket_path,
@@ -22,7 +23,7 @@ from sglang.srt.weight_cache.transport import (
 
 
 def fetch_state(gpu_id: int):
-    socket_path = get_socket_path(gpu_id)
+    socket_path = get_socket_path(current_platform.get_device_uuid(gpu_id))
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(60)
         client.connect(socket_path)

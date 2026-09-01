@@ -144,7 +144,7 @@ class WeightManifestServer:
             str(runtime_manifest["revision"]),
         )
         rank_manifest = {
-            "gpu_id": int(data["gpu_id"]),
+            "device_uuid": str(data["device_uuid"]),
             "runtime_manifest": runtime_manifest,
         }
 
@@ -184,14 +184,15 @@ class WeightManifestServer:
             )
             parallel_layout = dict(self._parallel_layout)
 
-        gpu_ids = tuple(item["gpu_id"] for item in rank_manifests)
-        if len(gpu_ids) != len(set(gpu_ids)):
-            raise RuntimeError(f"source GPU ranks are not unique: {gpu_ids}")
+        device_uuids = tuple(item["device_uuid"] for item in rank_manifests)
+        if len(device_uuids) != len(set(device_uuids)):
+            raise RuntimeError(
+                f"source device UUIDs are not unique: {device_uuids}"
+            )
 
         return {
-            "node_id": self._node_id,
             "parallel_layout": parallel_layout,
-            "gpu_ids": gpu_ids,
+            "device_uuids": device_uuids,
             "runtime_manifests": tuple(
                 item["runtime_manifest"] for item in rank_manifests
             ),

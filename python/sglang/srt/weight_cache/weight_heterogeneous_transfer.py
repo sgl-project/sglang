@@ -74,12 +74,6 @@ class WeightParallelLayout:
         # daemon process axis.
         return self.tp_size * self.pp_size
 
-    def iter_ranks(self):
-        for pp_rank in range(self.pp_size):
-            for tp_rank in range(self.tp_size):
-                yield pp_rank, tp_rank
-
-
 def rebuild_transferred_weight_state(model: Any) -> None:
     """Recompute non-persistent tensors derived from immutable parameters.
 
@@ -507,13 +501,11 @@ class SourceDaemonGroup:
     """The whole source daemon group as advertised through the registry.
 
     Holds one ``WeightRuntimeManifest`` per source rank in ``runtime_manifests``,
-    plus the placement facts a target needs before planning: which node the
-    group runs on, its parallel layout, and the GPUs it occupies.
+    plus its parallel layout and physical device identities needed before planning.
     """
 
-    node_id: str
     parallel_layout: WeightParallelLayout
-    gpu_ids: tuple[int, ...]
+    device_uuids: tuple[str, ...]
     runtime_manifests: tuple[Any, ...]
 
 
@@ -527,7 +519,6 @@ def parse_source_daemon_group(
     target plans or writes any weight bytes.
     """
     try:
-        node_id = str(wire_manifest["node_id"])
         parallel_layout_data = wire_manifest["parallel_layout"]
         parallel_layout = WeightParallelLayout(
             tp_size=int(parallel_layout_data["tp_size"]),
@@ -535,7 +526,7 @@ def parse_source_daemon_group(
             pp_size=int(parallel_layout_data["pp_size"]),
             ep_size=int(parallel_layout_data["ep_size"]),
         )
-        gpu_ids = tuple(int(value) for value in wire_manifest["gpu_ids"])
+        device_uuids = tuple(str(value) for value in wire_manifest["device_uuids"])
         runtime_manifests = tuple(wire_manifest["runtime_manifests"])
     except (KeyError, TypeError, ValueError) as error:
         raise WeightHeterogeneousTransferError(
@@ -543,7 +534,7 @@ def parse_source_daemon_group(
         ) from error
 
     rank_counts = (
-        len(gpu_ids),
+        len(device_uuids),
         len(runtime_manifests),
     )
     if rank_counts != (parallel_layout.world_size,) * 2:
@@ -551,12 +542,13 @@ def parse_source_daemon_group(
             "source manifest rank count mismatch: "
             f"expected={parallel_layout.world_size}, actual={rank_counts}"
         )
-    if len(gpu_ids) != len(set(gpu_ids)):
-        raise WeightHeterogeneousTransferError("source manifest GPU ranks are invalid")
+    if len(device_uuids) != len(set(device_uuids)):
+        raise WeightHeterogeneousTransferError(
+            "source manifest device UUIDs are invalid"
+        )
     return SourceDaemonGroup(
-        node_id=node_id,
         parallel_layout=parallel_layout,
-        gpu_ids=gpu_ids,
+        device_uuids=device_uuids,
         runtime_manifests=runtime_manifests,
     )
 
@@ -594,24 +586,21 @@ def register_weight_manifest(
     registry_url: str,
     *,
     global_rank: int,
-    gpu_id: int,
-    tp_size: int,
-    dp_size: int,
-    pp_size: int,
-    ep_size: int,
+    device_uuid: str,
     session: WeightTransferSession,
     timeout: float = 30.0,
 ) -> None:
     """Register one immutable source rank with the manifest server."""
+    layout = session.parallel_layout
     payload = {
         "node_id": get_local_ip_auto(fallback=socket.gethostname()),
         "global_rank": global_rank,
-        "gpu_id": gpu_id,
+        "device_uuid": device_uuid,
         "parallel_layout": {
-            "tp_size": tp_size,
-            "dp_size": dp_size,
-            "pp_size": pp_size,
-            "ep_size": ep_size,
+            "tp_size": layout.tp_size,
+            "dp_size": layout.dp_size,
+            "pp_size": layout.pp_size,
+            "ep_size": layout.ep_size,
         },
         "runtime_manifest": session.runtime_manifest_for_wire(),
     }
@@ -830,7 +819,7 @@ def transfer_weights_from_source_daemons(
     *,
     target_session: WeightTransferSession,
     model: Any,
-    gpu_id: int,
+    device_uuid: str,
     registry_url: str,
 ) -> dict[str, int]:
     """Complete a target copy using only the source and target daemons."""
@@ -859,23 +848,25 @@ def transfer_weights_from_source_daemons(
         raise WeightHeterogeneousTransferError(result["error"])
     source_daemon_group = result["manifest"]
 
-    # Enforce the deliberately narrow no-overlap contract on a shared node
-    # before planning or writing any target weight bytes.
-    target_gpu_ids: list[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(target_gpu_ids, gpu_id)
-    target_gpu_ids = [int(value) for value in target_gpu_ids]
-    if len(target_gpu_ids) != len(set(target_gpu_ids)):
+    # Socket templates can define independent discovery namespaces, so UUID
+    # socket paths alone do not prevent two daemons from sharing one physical
+    # device. Keep the transfer-level no-overlap contract in physical identity.
+    target_device_uuids: list[Any] = [None] * dist.get_world_size()
+    dist.all_gather_object(target_device_uuids, device_uuid)
+    target_device_uuids = [str(value) for value in target_device_uuids]
+    if len(target_device_uuids) != len(set(target_device_uuids)):
         raise WeightHeterogeneousTransferError(
-            f"target GPU ranks are not unique: {tuple(target_gpu_ids)}"
+            "target device UUIDs are not unique: "
+            f"{tuple(target_device_uuids)}"
         )
-    target_node_id = get_local_ip_auto(fallback=socket.gethostname())
-    if source_daemon_group.node_id == target_node_id:
-        overlap = sorted(set(source_daemon_group.gpu_ids) & set(target_gpu_ids))
-        if overlap:
-            raise WeightHeterogeneousTransferError(
-                "source and target GPU ranks must not overlap on the same node; "
-                f"overlapping ranks: {overlap}"
-            )
+    overlap = sorted(
+        set(source_daemon_group.device_uuids) & set(target_device_uuids)
+    )
+    if overlap:
+        raise WeightHeterogeneousTransferError(
+            "source and target daemons must not share physical devices; "
+            f"overlapping device UUIDs: {overlap}"
+        )
 
     def prepare_target() -> Any:
         target_session.prepare_target(

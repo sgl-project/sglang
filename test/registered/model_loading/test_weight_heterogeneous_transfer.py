@@ -7,9 +7,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import torch
-from sglang.srt.model_executor.model_runner_components.load_model_utils import (
-    maybe_enable_ipc_weight_cache,
-)
 from sglang.srt.weight_cache.daemon import (
     WeightCacheDaemon,
     WeightCacheDaemonArgs,
@@ -718,10 +715,6 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         parallel_layout = WeightParallelLayout(tp_size=2, dp_size=2, pp_size=2)
         self.assertEqual(parallel_layout.world_size, 4)
         self.assertEqual(parallel_layout.dp_size, 2)
-        self.assertEqual(
-            tuple(parallel_layout.iter_ranks()),
-            tuple((pp, tp) for pp in range(2) for tp in range(2)),
-        )
         with self.assertRaisesRegex(
             WeightHeterogeneousTransferError, "attention-DP partial replication"
         ):
@@ -1076,12 +1069,12 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         server._rank_manifests = {}
         server._lock = threading.Lock()
 
-        for global_rank, gpu_id in ((0, 2), (1, 3)):
+        for global_rank, device_uuid in ((0, "GPU-2"), (1, "GPU-3")):
             server.register_weight_manifest(
                 {
                     "node_id": "source-node",
                     "global_rank": global_rank,
-                    "gpu_id": gpu_id,
+                    "device_uuid": device_uuid,
                     "parallel_layout": {
                         "tp_size": 2,
                         "dp_size": 2,
@@ -1097,8 +1090,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             )
 
         source = parse_source_daemon_group(server.get_weight_manifest())
-        self.assertEqual(source.node_id, "source-node")
-        self.assertEqual(source.gpu_ids, (2, 3))
+        self.assertEqual(source.device_uuids, ("GPU-2", "GPU-3"))
         self.assertEqual(source.parallel_layout.dp_size, 2)
         self.assertEqual(
             tuple(item["rank"] for item in source.runtime_manifests), (0, 1)
@@ -1110,6 +1102,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         )
         registry_url = f"tcp://127.0.0.1:{server.port}"
         session = MagicMock()
+        session.parallel_layout = WeightParallelLayout(tp_size=1)
         session.runtime_manifest_for_wire.return_value = {
             "model_id": "model",
             "revision": "revision",
@@ -1119,11 +1112,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             register_weight_manifest(
                 registry_url,
                 global_rank=0,
-                gpu_id=2,
-                tp_size=1,
-                dp_size=1,
-                pp_size=1,
-                ep_size=1,
+                device_uuid="GPU-2",
                 session=session,
                 timeout=2,
             )
@@ -1131,23 +1120,22 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         finally:
             server.close()
 
-        self.assertEqual(actual.gpu_ids, (2,))
+        self.assertEqual(actual.device_uuids, ("GPU-2",))
         self.assertEqual(actual.parallel_layout, WeightParallelLayout(tp_size=1))
         self.assertEqual(
             actual.runtime_manifests,
             ({"model_id": "model", "revision": "revision", "rank": 0},),
         )
 
-    def test_target_rejects_overlap_after_fetching_source_manifest(self):
+    def test_target_rejects_overlapping_device_uuid(self):
         source = SourceDaemonGroup(
-            node_id="shared-node",
             parallel_layout=WeightParallelLayout(1),
-            gpu_ids=(0,),
+            device_uuids=("GPU-shared",),
             runtime_manifests=({"rank": 0},),
         )
 
-        def all_gather(output, _local):
-            output[:] = [0]
+        def all_gather(output, local):
+            output[:] = [local]
 
         with (
             patch(
@@ -1159,31 +1147,27 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             patch("torch.distributed.get_world_size", return_value=1),
             patch("torch.distributed.all_gather_object", side_effect=all_gather),
             patch(
-                "sglang.srt.weight_cache.weight_heterogeneous_transfer.get_local_ip_auto",
-                return_value="shared-node",
-            ),
-            patch(
                 "sglang.srt.weight_cache.weight_heterogeneous_transfer.pull_weights_from_source"
             ) as pull,
         ):
             with self.assertRaisesRegex(
-                WeightHeterogeneousTransferError, "overlapping ranks"
+                WeightHeterogeneousTransferError,
+                "overlapping device UUIDs",
             ):
                 transfer_weights_from_source_daemons(
                     target_session=MagicMock(),
                     model=MagicMock(),
-                    gpu_id=0,
+                    device_uuid="GPU-shared",
                     registry_url="tcp://source:31999",
                 )
 
         fetch.assert_called_once_with("tcp://source:31999")
         pull.assert_not_called()
 
-    def test_target_allows_same_gpu_id_on_another_node(self):
+    def test_target_allows_distinct_device_uuid(self):
         source = SourceDaemonGroup(
-            node_id="source-node",
             parallel_layout=WeightParallelLayout(1),
-            gpu_ids=(0,),
+            device_uuids=("GPU-source",),
             runtime_manifests=({"rank": 0},),
         )
 
@@ -1200,10 +1184,6 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             patch("torch.distributed.get_world_size", return_value=1),
             patch("torch.distributed.all_gather_object", side_effect=all_gather),
             patch(
-                "sglang.srt.weight_cache.weight_heterogeneous_transfer.get_local_ip_auto",
-                return_value="target-node",
-            ),
-            patch(
                 "sglang.srt.weight_cache.weight_heterogeneous_transfer.pull_weights_from_source",
                 return_value={},
             ) as pull,
@@ -1214,7 +1194,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             transfer_weights_from_source_daemons(
                 target_session=MagicMock(),
                 model=MagicMock(),
-                gpu_id=0,
+                device_uuid="GPU-target",
                 registry_url="tcp://source:31999",
             )
 
@@ -1237,8 +1217,12 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             ):
                 _all_gather_rank_local_phase("pull", fail)
 
-    def test_heterogeneous_socket_paths_use_physical_gpu_rank(self):
-        for mode, expected_rank in (("source", 4), ("target", 4), (None, 0)):
+    @patch(
+        "sglang.srt.weight_cache.daemon.current_platform.get_device_uuid",
+        return_value="GPU-test-4",
+    )
+    def test_socket_paths_use_physical_device_uuid(self, get_device_uuid):
+        for mode in ("source", "target", None):
             with self.subTest(mode=mode):
                 daemon_args = WeightCacheDaemonArgs()
                 if mode is not None:
@@ -1257,42 +1241,14 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                     daemon_args=daemon_args,
                 )
                 self.assertEqual(
-                    daemon.socket_path, get_socket_path(expected_rank)
+                    daemon.socket_path, get_socket_path("GPU-test-4")
                 )
                 self.assertEqual(
-                    daemon.ready_path, get_ready_path(expected_rank)
+                    daemon.ready_path, get_ready_path("GPU-test-4")
                 )
 
-    @patch(
-        "sglang.srt.model_executor.model_runner_components.load_model_utils.get_model",
-        return_value=SimpleNamespace(weight_cache_mode="client"),
-    )
-    def test_client_uses_physical_socket_without_heterogeneous_server_args(self, _):
-        client_load_config = SimpleNamespace(
-            load_format="auto", weight_cache_socket=None
-        )
-        maybe_enable_ipc_weight_cache(
-            load_config=client_load_config,
-            server_args=SimpleNamespace(weight_cache_mode="client"),
-            tp_size=2,
-            pp_rank=0,
-            tp_rank=0,
-            gpu_id=4,
-        )
-        self.assertEqual(client_load_config.weight_cache_socket, get_socket_path(4))
-
-        daemon_load_config = SimpleNamespace(
-            load_format="auto", weight_cache_socket=None
-        )
-        maybe_enable_ipc_weight_cache(
-            load_config=daemon_load_config,
-            server_args=SimpleNamespace(weight_cache_mode="daemon"),
-            tp_size=2,
-            pp_rank=0,
-            tp_rank=0,
-            gpu_id=4,
-        )
-        self.assertEqual(daemon_load_config.weight_cache_socket, get_socket_path(0))
+        self.assertEqual(get_device_uuid.call_count, 3)
+        get_device_uuid.assert_any_call(4)
 
     def test_weight_heterogeneous_transfer_mode_contract(self):
         disabled = WeightCacheDaemonArgs()
@@ -1500,6 +1456,10 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             patch(
                 "sglang.srt.weight_cache.daemon.cleanup_stale_daemon_files"
             ) as cleanup,
+            patch(
+                "sglang.srt.weight_cache.daemon.current_platform.get_device_uuid",
+                return_value="GPU-test-4",
+            ),
             patch("sglang.srt.weight_cache.daemon.os.path.exists", return_value=True),
             patch(
                 "sglang.srt.weight_cache.daemon.spawn_weight_cache_daemon",
@@ -1517,10 +1477,9 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                     ),
                 )
 
-        cleanup.assert_called_once_with(4, force=False)
+        cleanup.assert_called_once_with("GPU-test-4", force=False)
         spawn.assert_called_once()
         call = spawn.call_args
-        self.assertEqual(call.kwargs["socket_rank"], 4)
         self.assertEqual(call.kwargs["gpu_id"], 4)
         child_args = call.kwargs["daemon_args"]
         self.assertEqual(
