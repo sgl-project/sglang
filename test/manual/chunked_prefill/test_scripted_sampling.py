@@ -1,7 +1,9 @@
 import unittest
 
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, FINISH_MATCHED_TOKEN
+from sglang.srt.utils import is_xpu
 from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.http_server import DEFAULT_RUN_TIMEOUT_S
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
@@ -53,7 +55,10 @@ class TestSamplingBasic(ScriptedTestCase):
         )
 
     def test_max_new_tokens_1000_long_chunked(self):
-        self.server.execute_script(self._script_max_new_tokens_1000_long_chunked)
+        timeout_s = 1400.0 if is_xpu() else DEFAULT_RUN_TIMEOUT_S
+        self.server.execute_script(
+            self._script_max_new_tokens_1000_long_chunked, timeout_s=timeout_s
+        )
 
     @staticmethod
     def _script_max_new_tokens_1000_long_chunked(t: ScriptedContext):

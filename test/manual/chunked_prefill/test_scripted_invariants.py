@@ -1,6 +1,8 @@
 import unittest
 
+from sglang.srt.utils import is_xpu
 from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.http_server import DEFAULT_RUN_TIMEOUT_S
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
@@ -186,7 +188,10 @@ class TestInvariantsBasic(ScriptedTestCase):
         assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
     def test_sustained_long_chunked_load(self):
-        self.server.execute_script(self._script_sustained_long_chunked_load)
+        timeout_s = 360.0 if is_xpu() else DEFAULT_RUN_TIMEOUT_S
+        self.server.execute_script(
+            self._script_sustained_long_chunked_load, timeout_s=timeout_s
+        )
 
     @staticmethod
     def _script_sustained_long_chunked_load(t: ScriptedContext):
@@ -241,7 +246,10 @@ class TestInvariantsBasic(ScriptedTestCase):
         assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
     def test_long_decode_then_many_short(self):
-        self.server.execute_script(self._script_long_decode_then_many_short)
+        timeout_s = 360.0 if is_xpu() else DEFAULT_RUN_TIMEOUT_S
+        self.server.execute_script(
+            self._script_long_decode_then_many_short, timeout_s=timeout_s
+        )
 
     @staticmethod
     def _script_long_decode_then_many_short(t: ScriptedContext):
