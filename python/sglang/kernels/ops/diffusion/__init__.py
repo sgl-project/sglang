@@ -37,6 +37,7 @@ from sglang.kernels.spec import (
 )
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
+_CUDA_SM100_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))})
 _HIP = frozenset({CapabilityRequirement.HIP})
 
 # ---------------------------------------------------------------------------
@@ -192,6 +193,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "rope.qknorm_rope_jit:fused_inplace_qknorm_rope",
         _CUDA,
         "Fused in-place QK RMS-norm + RoPE.",
+    ),
+    (
+        "diffusion.qwen_qkv_epilogue",
+        KernelBackend.JIT,
+        "rope.qwen_qkv_epilogue_jit:try_fused_qwen_qkv_epilogue",
+        _CUDA_SM100_PLUS,
+        "Qwen-Image QK RMS-norm, RoPE, and joint QKV writes.",
     ),
     (
         "diffusion.ltx2_qknorm_split_rope",
@@ -426,6 +434,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
     "fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
     "fused_qknorm_rope_pack_kv": "rope.qknorm_rope_jit",
+    "try_fused_qwen_qkv_epilogue": "rope.qwen_qkv_epilogue_jit",
     "can_use_fused_rope_rotate_half": "rope.rope_rotate_half_bitexact",
     "fused_rope_rotate_half_bitexact": "rope.rope_rotate_half_bitexact",
     "can_use_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
