@@ -25,6 +25,30 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+def _spec_result(index):
+    return {
+        "text": f"choice-{index}",
+        "meta_info": {
+            "id": "cmpl-spec-test",
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "cached_tokens": 0,
+            "finish_reason": {"type": "stop"},
+            "weight_version": "default",
+            "spec_accept_rate": 0.5,
+            "spec_accept_length": 2.0,
+            "spec_cap_length": index + 1.0,
+            "spec_block_accept_length": index + 0.5,
+            "spec_num_correct_drafts": 1,
+            "spec_num_proposed_drafts": 2,
+            "spec_verify_ct": 1,
+            "spec_correct_drafts_histogram": [0, 1],
+            "spec_cap_lens_histogram": [index, 1],
+        },
+        "index": index,
+    }
+
+
 class _MockTemplateManager:
     """Minimal mock for TemplateManager."""
 
@@ -399,6 +423,103 @@ class ServingCompletionTestCase(unittest.TestCase):
                 "storage_backend": "file",
             },
         )
+
+    def test_parallel_sampling_returns_spec_details_per_choice(self):
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            n=2,
+            return_spec_tokens_details=True,
+        )
+        ret = [_spec_result(index) for index in range(2)]
+
+        response = self.sc._build_completion_response(req, ret, 1234567890)
+
+        details = response.sglext.spec_tokens_details
+        self.assertEqual(len(details), 2)
+        self.assertEqual(details[0].spec_cap_length, 1.0)
+        self.assertEqual(details[0].spec_block_accept_length, 0.5)
+        self.assertEqual(details[0].spec_cap_lens_histogram, [0, 1])
+        self.assertEqual(details[1].spec_cap_length, 2.0)
+        self.assertEqual(details[1].spec_block_accept_length, 1.5)
+        self.assertEqual(details[1].spec_cap_lens_histogram, [1, 1])
+
+        single_req = req.model_copy(update={"n": 1})
+        single_response = self.sc._build_completion_response(
+            single_req, ret[:1], 1234567890
+        )
+        self.assertEqual(
+            single_response.sglext.spec_tokens_details.spec_cap_length,
+            1.0,
+        )
+
+        disabled_req = single_req.model_copy(
+            update={"return_spec_tokens_details": False}
+        )
+        disabled_response = self.sc._build_completion_response(
+            disabled_req, ret[:1], 1234567890
+        )
+        self.assertIsNone(disabled_response.sglext)
+
+    def test_streaming_parallel_sampling_orders_spec_details_by_choice(self):
+        async def mock_generate(*args, **kwargs):
+            for index in (1, 0):
+                yield _spec_result(index)
+
+        self.sc.tokenizer_manager.generate_request = mock_generate
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            n=2,
+            stream=True,
+            return_spec_tokens_details=True,
+        )
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+        async def run_stream(request):
+            return [
+                chunk
+                async for chunk in self.sc._generate_completion_stream(
+                    adapted_request, request, self.fastapi_request
+                )
+            ]
+
+        chunks = get_or_create_event_loop().run_until_complete(run_stream(req))
+        parsed = [
+            json.loads(chunk[len("data: ") :])
+            for chunk in chunks
+            if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"
+        ]
+        details = next(chunk["sglext"] for chunk in parsed if "sglext" in chunk)[
+            "spec_tokens_details"
+        ]
+        self.assertEqual([item["spec_cap_length"] for item in details], [1.0, 2.0])
+        self.assertEqual(
+            [item["spec_cap_lens_histogram"] for item in details],
+            [[0, 1], [1, 1]],
+        )
+
+        async def mock_single_generate(*args, **kwargs):
+            async for content in mock_generate():
+                if content["index"] == 0:
+                    yield content
+
+        self.sc.tokenizer_manager.generate_request = mock_single_generate
+        single_req = req.model_copy(update={"n": 1})
+        single_chunks = get_or_create_event_loop().run_until_complete(
+            run_stream(single_req)
+        )
+        single_parsed = [
+            json.loads(chunk[len("data: ") :])
+            for chunk in single_chunks
+            if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"
+        ]
+        single_details = next(
+            chunk["sglext"] for chunk in single_parsed if "sglext" in chunk
+        )["spec_tokens_details"]
+        self.assertIsInstance(single_details, dict)
 
     def test_streaming_cached_tokens_details_emits_sglext(self):
         """Test that streaming completion responses emit cached token details in sglext."""

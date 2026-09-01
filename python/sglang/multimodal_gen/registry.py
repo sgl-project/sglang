@@ -74,6 +74,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
     LingBotVideoMoEPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
+    LongCatImageEditPipelineConfig,
     LongCatImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
@@ -81,6 +82,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
     MOVA720PConfig,
@@ -149,6 +151,8 @@ from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.longcat_image import (
+    LongCatImageEditSamplingParams,
+    LongCatImageEditTurboSamplingParams,
     LongCatImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
@@ -157,6 +161,7 @@ from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX23HQSamplingParams,
     LTX23SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
@@ -194,6 +199,9 @@ from sglang.multimodal_gen.configs.sample.zimage import (
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
+from sglang.multimodal_gen.runtime.utils.external_model_package import (
+    load_external_model_package,
+)
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model_index,
 )
@@ -204,6 +212,7 @@ logger = init_logger(__name__)
 # --- Part 1: Pipeline Discovery ---
 
 _PIPELINE_REGISTRY: Dict[str, Type[ComposedPipelineBase]] = {}
+_BUILTIN_PIPELINES_DISCOVERED = False
 
 # Registry for pipeline configuration classes (for safetensors files without model_index.json)
 # Maps pipeline_class_name -> (PipelineConfig class, SamplingParams class)
@@ -217,11 +226,13 @@ def _discover_and_register_pipelines():
     finds modules with an 'EntryClass' attribute, and maps the class's 'pipeline_name'
     to the class itself in a global registry.
     """
-    if _PIPELINE_REGISTRY:  # run only once
+    global _BUILTIN_PIPELINES_DISCOVERED
+    if _BUILTIN_PIPELINES_DISCOVERED:
         return
 
     package_name = "sglang.multimodal_gen.runtime.pipelines"
     package = importlib.import_module(package_name)
+    _BUILTIN_PIPELINES_DISCOVERED = True
 
     for _, module_name, ispkg in pkgutil.walk_packages(
         package.__path__, package.__name__ + "."
@@ -264,14 +275,14 @@ def _discover_and_register_pipelines():
                             cls.pipeline_config_cls,
                             cls.sampling_params_cls,
                         )
-                        logger.debug(
-                            f"Auto-registered config classes for pipeline '{cls.pipeline_name}': "
-                            f"PipelineConfig={cls.pipeline_config_cls.__name__}, "
-                            f"SamplingParams={cls.sampling_params_cls.__name__}"
-                        )
     logger.debug(
         f"Registering pipelines complete, {len(_PIPELINE_REGISTRY)} pipelines registered"
     )
+
+
+def _ensure_registry_initialized() -> None:
+    _discover_and_register_pipelines()
+    load_external_model_package()
 
 
 def get_pipeline_config_classes(
@@ -281,8 +292,21 @@ def get_pipeline_config_classes(
     Get the configuration classes for a pipeline.
     """
     # Ensure pipelines are discovered first
-    _discover_and_register_pipelines()
+    _ensure_registry_initialized()
     return _PIPELINE_CONFIG_REGISTRY.get(pipeline_class_name)
+
+
+def get_pipeline_class(
+    pipeline_class_name: str,
+) -> Type[ComposedPipelineBase] | None:
+    """Get a registered pipeline class by name."""
+    _ensure_registry_initialized()
+    return _PIPELINE_REGISTRY.get(pipeline_class_name)
+
+
+def get_registered_pipeline_names() -> List[str]:
+    _ensure_registry_initialized()
+    return list(_PIPELINE_REGISTRY)
 
 
 # --- Part 2: Config Registration ---
@@ -326,7 +350,7 @@ def register_configs(
     pipeline_config_cls: Type[PipelineConfig],
     hf_model_paths: Optional[List[str]] = None,
     model_detectors: Optional[List[Callable[[str], bool]]] = None,
-):
+) -> str:
     """
     Registers configuration classes for a new model family.
     """
@@ -347,6 +371,67 @@ def register_configs(
     if model_detectors:
         for detector in model_detectors:
             _MODEL_NAME_DETECTORS.append((model_id, detector))
+    return model_id
+
+
+def register_pipeline(
+    pipeline_cls: Type[ComposedPipelineBase],
+    *,
+    sampling_param_cls: Any,
+    pipeline_config_cls: Type[PipelineConfig],
+    hf_model_paths: Optional[List[str]] = None,
+    model_detectors: Optional[List[Callable[[str], bool]]] = None,
+    overwrite: bool = False,
+) -> None:
+    """Register an out-of-tree native diffusion pipeline and its configs."""
+    _discover_and_register_pipelines()
+    if not issubclass(pipeline_cls, ComposedPipelineBase):
+        raise TypeError("pipeline_cls must inherit from ComposedPipelineBase")
+    if not issubclass(pipeline_config_cls, PipelineConfig):
+        raise TypeError("pipeline_config_cls must inherit from PipelineConfig")
+
+    pipeline_name = pipeline_cls.pipeline_name
+    existing_pipeline = _PIPELINE_REGISTRY.get(pipeline_name)
+    if existing_pipeline is not None and not overwrite:
+        raise ValueError(
+            f"Pipeline '{pipeline_name}' is already registered; pass overwrite=True to replace it"
+        )
+    for model_path in hf_model_paths or []:
+        if model_path in _MODEL_HF_PATH_TO_NAME and not overwrite:
+            raise ValueError(f"Model path '{model_path}' is already registered")
+        registered_pipeline = KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS.get(
+            model_path.lower()
+        )
+        if registered_pipeline is not None and not overwrite:
+            raise ValueError(
+                f"Model path '{model_path}' is already registered for pipeline "
+                f"'{registered_pipeline}'"
+            )
+
+    _PIPELINE_REGISTRY[pipeline_name] = pipeline_cls
+    _PIPELINE_CONFIG_REGISTRY[pipeline_name] = (
+        pipeline_config_cls,
+        sampling_param_cls,
+    )
+    config_id = register_configs(
+        sampling_param_cls=sampling_param_cls,
+        pipeline_config_cls=pipeline_config_cls,
+        hf_model_paths=hf_model_paths,
+        model_detectors=None if overwrite else model_detectors,
+    )
+    if overwrite and model_detectors:
+        _MODEL_NAME_DETECTORS[:0] = [
+            (config_id, detector) for detector in model_detectors
+        ]
+    for model_path in hf_model_paths or []:
+        KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS[model_path.lower()] = pipeline_name
+    _get_config_info.cache_clear()
+    get_model_info.cache_clear()
+    logger.info(
+        "Registered external diffusion pipeline '%s' from %s",
+        pipeline_name,
+        pipeline_cls.__module__,
+    )
 
 
 def get_model_short_name(model_id: str) -> str:
@@ -365,6 +450,7 @@ def _normalize_hf_cache_path(path: str) -> str:
 
 
 def has_registered_diffusion_model_path(model_path: str) -> bool:
+    _ensure_registry_initialized()
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
     if model_path in _MODEL_HF_PATH_TO_NAME:
@@ -394,6 +480,7 @@ def _get_config_info(
     """
     Gets the ConfigInfo for a given model path using mappings and detectors.
     """
+    _ensure_registry_initialized()
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
     # 0. Explicit model_id override: match by short name
@@ -578,7 +665,7 @@ def get_model_info(
 
     # For AUTO or SGLANG backend, try native implementation first
     # 1. Discover all available pipeline classes and cache them
-    _discover_and_register_pipelines()
+    _ensure_registry_initialized()
 
     # Detect quantized models and fallback to diffusers
     is_quantized = any(q in model_path.lower() for q in ["-4bit", "-awq", "-gptq"])
@@ -692,7 +779,9 @@ def _register_configs():
         hf_model_paths=["Lightricks/LTX-2"],
         model_detectors=[
             lambda path: "ltx" in path.lower() and "video" in path.lower(),
-            lambda path: "ltx-2" in path.lower() and "ltx-2.3" not in path.lower(),
+            lambda path: "ltx-2" in path.lower()
+            and "ltx-2.3" not in path.lower()
+            and "ltx-2.5" not in path.lower(),
         ],
     )
     register_configs(
@@ -701,6 +790,18 @@ def _register_configs():
         hf_model_paths=["Lightricks/LTX-2.3"],
         model_detectors=[
             lambda path: "ltx-2.3" in path.lower(),
+        ],
+    )
+    # Keeps the LTX-2 pipeline class; only component geometry and the pinned
+    # distilled schedule differ. Only the `-Diffusers` repo is listed --
+    # `Lightricks/LTX-2.5` is a split pack of bare `.safetensors` and would need
+    # a model overlay first.
+    register_configs(
+        sampling_param_cls=LTX25SamplingParams,
+        pipeline_config_cls=LTX25PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2.5-Diffusers"],
+        model_detectors=[
+            lambda path: "ltx-2.5" in path.lower(),
         ],
     )
     # register dedicated sampling params for LTX2TwoStageHQPipeline
@@ -1226,6 +1327,34 @@ def _register_configs():
         ],
         model_detectors=[
             lambda hf_id: "longcat" in hf_id.lower() and "edit" not in hf_id.lower(),
+        ],
+    )
+
+    # LongCat-Image-Edit-Turbo (registered before Edit so its detector wins)
+    register_configs(
+        sampling_param_cls=LongCatImageEditTurboSamplingParams,
+        pipeline_config_cls=LongCatImageEditPipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image-Edit-Turbo",
+        ],
+        model_detectors=[
+            lambda hf_id: "longcat" in hf_id.lower()
+            and "edit" in hf_id.lower()
+            and "turbo" in hf_id.lower(),
+        ],
+    )
+
+    # LongCat-Image-Edit
+    register_configs(
+        sampling_param_cls=LongCatImageEditSamplingParams,
+        pipeline_config_cls=LongCatImageEditPipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image-Edit",
+        ],
+        model_detectors=[
+            lambda hf_id: "longcat" in hf_id.lower()
+            and "edit" in hf_id.lower()
+            and "turbo" not in hf_id.lower(),
         ],
     )
 
