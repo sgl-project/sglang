@@ -23,11 +23,15 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
+    can_defer_flux2_gated_residual,
+    can_use_flux2_gated_resnorm,
     can_use_fused_layernorm_modulate,
+    flux2_gated_resnorm_raw,
     fused_layernorm_modulate_raw,
     fused_packed_silu_mul_bitexact,
     is_plain_layer_norm,
     residual_gate_add,
+    try_flux2_token_cat_nvfp4,
 )
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
@@ -58,6 +62,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
+    apply_nvfp4_gemm_prequantized,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -83,6 +89,38 @@ assert _FLUX2_LN_MOD_SIGS is not None
 _FLUX2_SWIGLU = BitExactFusionGate("FLUX.2 fused SwiGLU", per_signature=True)
 _FLUX2_SWIGLU_SIGS = _FLUX2_SWIGLU.verified_sigs
 assert _FLUX2_SWIGLU_SIGS is not None
+
+PendingGatedResidual = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+def _materialize_gated_residual(pending: PendingGatedResidual) -> torch.Tensor:
+    residual, update, gate = pending
+    return residual_gate_add(residual, update, gate)
+
+
+def _defer_gated_residual(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor | PendingGatedResidual:
+    if can_defer_flux2_gated_residual(residual, update, gate):
+        return residual, update, gate
+    return residual_gate_add(residual, update, gate)
+
+
+def _flux2_gated_resnorm(
+    norm: nn.Module,
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if is_plain_layer_norm(norm, residual.shape[-1]) and can_use_flux2_gated_resnorm(
+        residual, update, gate, scale, shift
+    ):
+        return flux2_gated_resnorm_raw(residual, update, gate, scale, shift, norm.eps)
+
+    residual = residual_gate_add(residual, update, gate)
+    return _flux2_norm_modulate(norm, residual, scale, shift), residual
 
 
 def _flux2_norm_modulate(
@@ -575,6 +613,15 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             quant_config=quant_config,
             prefix=f"{prefix}.to_out" if prefix else "to_out",
         )
+        self._enable_nvfp4_token_cat = False
+        capability = current_platform.get_device_capability()
+        if (
+            self.tp_size == 1
+            and capability is not None
+            and (capability.major, capability.minor) == (10, 3)
+            and isinstance(self.to_out.quant_method, ModelOptFp4LinearMethod)
+        ):
+            self._enable_nvfp4_token_cat = True
         if self.tp_size > 1:
             self._patch_to_out_weight_loader()
 
@@ -676,9 +723,25 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         # Handle the feedforward (FF) logic
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
 
-        # Concatenate and parallel output projection
-        hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
-        hidden_states, _ = self.to_out(hidden_states)
+        # Concatenate and parallel output projection. On SM103 NVFP4 the
+        # producer writes the concatenated packed values and swizzled scales
+        # directly, avoiding a full-width BF16 cat materialization.
+        output_shape = (*hidden_states.shape[:-1], self.out_dim)
+        packed = None
+        if self._enable_nvfp4_token_cat:
+            packed = try_flux2_token_cat_nvfp4(
+                hidden_states, mlp_hidden_states, self.to_out.input_scale_inv
+            )
+        if packed is None:
+            hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+            hidden_states, _ = self.to_out(hidden_states)
+        else:
+            hidden_states = apply_nvfp4_gemm_prequantized(
+                self.to_out,
+                *packed,
+                output_dtype=hidden_states.dtype,
+                bias=self.to_out.bias,
+            ).view(*output_shape)
 
         return hidden_states
 
@@ -720,7 +783,7 @@ class Flux2SingleTransformerBlock(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | PendingGatedResidual,
         encoder_hidden_states: Optional[torch.Tensor],
         temb_mod_params: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -728,18 +791,25 @@ class Flux2SingleTransformerBlock(nn.Module):
         split_hidden_states: bool = False,
         text_seq_len: Optional[int] = None,
         num_replicated_prefix: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | PendingGatedResidual:
         # If encoder_hidden_states is None, hidden_states is assumed to have encoder_hidden_states already
         # concatenated
         if encoder_hidden_states is not None:
+            assert isinstance(hidden_states, torch.Tensor)
             text_seq_len = encoder_hidden_states.shape[1]
             hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         mod_shift, mod_scale, mod_gate = temb_mod_params
 
-        norm_hidden_states = _flux2_norm_modulate(
-            self.norm, hidden_states, mod_scale, mod_shift
-        )
+        if isinstance(hidden_states, tuple):
+            residual, update, gate = hidden_states
+            norm_hidden_states, hidden_states = _flux2_gated_resnorm(
+                self.norm, residual, update, gate, mod_scale, mod_shift
+            )
+        else:
+            norm_hidden_states = _flux2_norm_modulate(
+                self.norm, hidden_states, mod_scale, mod_shift
+            )
 
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
@@ -749,11 +819,16 @@ class Flux2SingleTransformerBlock(nn.Module):
             **joint_attention_kwargs,
         )
 
-        hidden_states = residual_gate_add(hidden_states, attn_output, mod_gate)
-        if hidden_states.dtype == torch.float16:
+        hidden_states = _defer_gated_residual(hidden_states, attn_output, mod_gate)
+        if (
+            isinstance(hidden_states, torch.Tensor)
+            and hidden_states.dtype == torch.float16
+        ):
             hidden_states = hidden_states.clip(-65504, 65504)
 
         if split_hidden_states:
+            if isinstance(hidden_states, tuple):
+                hidden_states = _materialize_gated_residual(hidden_states)
             encoder_hidden_states, hidden_states = (
                 hidden_states[:, :text_seq_len],
                 hidden_states[:, text_seq_len:],
@@ -819,8 +894,8 @@ class Flux2TransformerBlock(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | PendingGatedResidual,
+        encoder_hidden_states: torch.Tensor | PendingGatedResidual,
         temb_mod_params_img: Tuple[
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...
         ],
@@ -830,7 +905,9 @@ class Flux2TransformerBlock(nn.Module):
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         num_replicated_prefix: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor | PendingGatedResidual, torch.Tensor | PendingGatedResidual
+    ]:
         joint_attention_kwargs = joint_attention_kwargs or {}
 
         # Modulation parameters shape: [1, 1, self.dim]
@@ -852,17 +929,34 @@ class Flux2TransformerBlock(nn.Module):
         ) = temb_mod_params_txt
 
         # Img stream
-        norm_hidden_states = _flux2_norm_modulate(
-            self.norm1, hidden_states, scale_msa, shift_msa
-        )
+        if isinstance(hidden_states, tuple):
+            residual, update, gate = hidden_states
+            norm_hidden_states, hidden_states = _flux2_gated_resnorm(
+                self.norm1, residual, update, gate, scale_msa, shift_msa
+            )
+        else:
+            norm_hidden_states = _flux2_norm_modulate(
+                self.norm1, hidden_states, scale_msa, shift_msa
+            )
 
         # Conditioning txt stream
-        norm_encoder_hidden_states = _flux2_norm_modulate(
-            self.norm1_context,
-            encoder_hidden_states,
-            c_scale_msa,
-            c_shift_msa,
-        )
+        if isinstance(encoder_hidden_states, tuple):
+            residual, update, gate = encoder_hidden_states
+            norm_encoder_hidden_states, encoder_hidden_states = _flux2_gated_resnorm(
+                self.norm1_context,
+                residual,
+                update,
+                gate,
+                c_scale_msa,
+                c_shift_msa,
+            )
+        else:
+            norm_encoder_hidden_states = _flux2_norm_modulate(
+                self.norm1_context,
+                encoder_hidden_states,
+                c_scale_msa,
+                c_shift_msa,
+            )
 
         # Attention on concatenated img + txt stream
         attention_outputs = self.attn(
@@ -876,32 +970,36 @@ class Flux2TransformerBlock(nn.Module):
         attn_output, context_attn_output = attention_outputs
 
         # Process attention outputs for the image stream (`hidden_states`).
-        hidden_states = residual_gate_add(hidden_states, attn_output, gate_msa)
-
-        norm_hidden_states = _flux2_norm_modulate(
-            self.norm2, hidden_states, scale_mlp, shift_mlp
+        norm_hidden_states, hidden_states = _flux2_gated_resnorm(
+            self.norm2,
+            hidden_states,
+            attn_output,
+            gate_msa,
+            scale_mlp,
+            shift_mlp,
         )
 
         ff_output = self.ff(norm_hidden_states)
-        hidden_states = residual_gate_add(hidden_states, ff_output, gate_mlp)
+        hidden_states = _defer_gated_residual(hidden_states, ff_output, gate_mlp)
 
         # Process attention outputs for the text stream (`encoder_hidden_states`).
-        encoder_hidden_states = residual_gate_add(
-            encoder_hidden_states, context_attn_output, c_gate_msa
-        )
-
-        norm_encoder_hidden_states = _flux2_norm_modulate(
+        norm_encoder_hidden_states, encoder_hidden_states = _flux2_gated_resnorm(
             self.norm2_context,
             encoder_hidden_states,
+            context_attn_output,
+            c_gate_msa,
             c_scale_mlp,
             c_shift_mlp,
         )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
-        encoder_hidden_states = residual_gate_add(
+        encoder_hidden_states = _defer_gated_residual(
             encoder_hidden_states, context_ff_output, c_gate_mlp
         )
-        if encoder_hidden_states.dtype == torch.float16:
+        if (
+            isinstance(encoder_hidden_states, torch.Tensor)
+            and encoder_hidden_states.dtype == torch.float16
+        ):
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
 
         return encoder_hidden_states, hidden_states
@@ -1256,6 +1354,10 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 joint_attention_kwargs=joint_attention_kwargs,
                 num_replicated_prefix=num_replicated_prefix,
             )
+        if isinstance(encoder_hidden_states, tuple):
+            encoder_hidden_states = _materialize_gated_residual(encoder_hidden_states)
+        if isinstance(hidden_states, tuple):
+            hidden_states = _materialize_gated_residual(hidden_states)
         # Concatenate text and image streams for single-block inference;
         # join_seqs relocates any SP text tail-pad behind the image once for
         # the whole trunk (see sp_shard.join_seqs for why).
@@ -1273,6 +1375,8 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 text_seq_len=txt_real,
                 num_replicated_prefix=num_replicated_prefix,
             )
+        if isinstance(hidden_states, tuple):
+            hidden_states = _materialize_gated_residual(hidden_states)
         # Remove text (and any tail pad) from the concatenated stream
         img_end = hidden_states.shape[1] - sp_txt_pad
         hidden_states = hidden_states[:, txt_real:img_end, ...]

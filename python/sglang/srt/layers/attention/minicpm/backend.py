@@ -17,15 +17,19 @@ from sglang.srt.layers.attention.minicpm.attention_adapter import (
 )
 from sglang.srt.layers.attention.minicpm.cache import attach_compressed_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_blackwell_supported, next_power_of_2
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_platform,
+    get_schedule,
+)
+from sglang.srt.utils import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-from sglang.kernels.jit.minicpm_sala import get_block_table
+from sglang.kernels.ops.minicpm_sala import get_block_table
 from sglang.srt.layers.attention.minicpm.sparse_utils import (
     CompressionLevelMetadata,
     MiniCPMSparseMetadata,
@@ -127,7 +131,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         use_flashinfer: bool,
     ):
         super().__init__()
-        use_blackwell = is_blackwell_supported()
+        use_blackwell = get_platform().is_blackwell
         if use_blackwell:
             fa_impl_ver = 4
         self.flash_attn_backend = FlashAttentionBackend(
@@ -273,7 +277,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             "local_blocks": self.local_blocks,
             "dtype_str": dtype_str,
         }
-        chunked_prefill_size = model_runner.server_args.chunked_prefill_size
+        chunked_prefill_size = get_schedule().chunked_prefill_size
         if self.minicpm_fuse_topk and chunked_prefill_size <= 0:
             raise ValueError(
                 "MiniCPM fused top-k requires a positive --chunked-prefill-size."
