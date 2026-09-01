@@ -357,20 +357,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.page_size == 1:
             mapping_indices = free_index
         else:
-            # The paged full side frees whole pages, so cover every listed
-            # slot's whole page. Duplicates collapse in the paged free's own
-            # dedup; deduplicating here would cost a torch.unique sync.
-            base = (free_index // self.page_size) * self.page_size
-            offsets = torch.arange(
-                self.page_size, dtype=free_index.dtype, device=free_index.device
-            )
-            mapping_indices = (base[:, None] + offsets[None, :]).reshape(-1)
-            if self.swa_attn_allocator.debug_mode:
-                # Reference unique on CPU: the expansion must cover exactly
-                # the touched pages, on every caller's real input.
-                got = torch.unique(mapping_indices.cpu() // self.page_size)
-                ref = torch.unique(free_index.cpu() // self.page_size)
-                assert torch.equal(got, ref), "expansion page set mismatch"
+            mapping_indices = self._expand_to_full_pages(free_index)
 
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
         self.clear_full_to_swa_mapping(mapping_indices)
@@ -384,8 +371,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._release_swa(swa_indices)
 
     def _release_swa(self, swa_indices: torch.Tensor):
-        """One filter per group: its data-dependent shape costs a sync, and
-        filtering the batch selects the same slots as filtering per call."""
+        # One filter per group: its data-dependent shape costs a sync, and
+        # filtering the batch selects the same slots as filtering per call.
         self.swa_attn_allocator.free(swa_indices[swa_indices > 0])
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
@@ -422,6 +409,23 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+
+    def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
+        # Duplicates are kept: deduplicating would be a torch.unique whose
+        # data-dependent output shape synchronizes the scheduler stream, and
+        # every consumer ends in the paged free's own page dedup anyway.
+        base = (indices // self.page_size) * self.page_size
+        page_offsets = torch.arange(
+            self.page_size, dtype=indices.dtype, device=indices.device
+        )
+        expanded = (base[:, None] + page_offsets[None, :]).reshape(-1)
+        if self.swa_attn_allocator.debug_mode:
+            # Reference unique on CPU: the expansion must cover exactly the
+            # touched pages, on every caller's real input.
+            got = torch.unique(expanded.cpu() // self.page_size)
+            ref = torch.unique(indices.cpu() // self.page_size)
+            assert torch.equal(got, ref), "expansion page set mismatch"
+        return expanded
 
     def resize(self, config) -> None:
         size_full = int(config.full_max_total_num_tokens)

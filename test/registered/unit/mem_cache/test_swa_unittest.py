@@ -411,11 +411,10 @@ class TestSWA(unittest.TestCase):
                     self._swa_slot_is_free(allocator, new_swa),
                     "the replacement SWA slot was freed while still mapped",
                 )
-                # And the count moved by exactly one slot: everything the pool
-                # still counts as in use stays reachable through the mapping.
                 self.assertEqual(
                     allocator.swa_available_size(), available_before + page_size
                 )
+                # Everything still in use stays reachable through the mapping.
                 mapped = allocator.full_to_swa_index_mapping[:-1]
                 num_mapped = int((mapped > 0).sum().item())
                 num_in_use = (
