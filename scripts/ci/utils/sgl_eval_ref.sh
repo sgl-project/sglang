@@ -9,5 +9,5 @@
 # MODEL_SCORE_THRESHOLDS in
 # test/registered/eval/test_text_models_gsm8k_eval.py, and the mmlu thresholds
 # of run_eval's other callers, before changing this.
-SGL_EVAL_REF="20479bc1dea69ba6af0645c9058d26ca640b63f1"
+SGL_EVAL_REF="db1547d6098c791ecb3576353f8a5e9d06344e7c"
 SGL_EVAL_SPEC="sgl-eval@git+https://github.com/sgl-project/sgl-eval.git@${SGL_EVAL_REF}"

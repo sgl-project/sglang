@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Prepare a verified, shared MMLU cache for AMD CI runners."""
 
 from __future__ import annotations
