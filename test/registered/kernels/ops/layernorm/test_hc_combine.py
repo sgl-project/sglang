@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -54,6 +56,4 @@ def test_hc_combine_strided_pre():
 
 
 if __name__ == "__main__":
-    import sys
-
     sys.exit(pytest.main([__file__]))
