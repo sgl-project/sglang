@@ -1708,6 +1708,20 @@ class DeepseekV2MoE(nn.Module):
         # on vision models). The per-ubatch forward_batch.input_ids is already
         # sliced+padded to match hidden_states rows (and equals the global ids
         # under EP dp-attention). No-op for non-hash models.
+        # Prefer the pre-clamp snapshot: embed_mm_inputs clamps
+        # forward_batch.input_ids in place, which would erase the mm pad
+        # sentinels the bias_vl routing keys on (EP+TBO+image path).
+        routing_ids = getattr(state.forward_batch, "dsv4_routing_input_ids", None)
+        if routing_ids is not None:
+            if routing_ids.shape[0] < hidden_states.shape[0]:
+                # The child batch may pad input_ids after the slice; pad with
+                # a plain token id so the image mask stays empty there.
+                routing_ids = torch.nn.functional.pad(
+                    routing_ids,
+                    (0, hidden_states.shape[0] - routing_ids.shape[0]),
+                )
+            elif routing_ids.shape[0] > hidden_states.shape[0]:
+                routing_ids = None
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
@@ -1715,7 +1729,11 @@ class DeepseekV2MoE(nn.Module):
                 state.topk_output = self._forward_topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    input_ids=state.forward_batch.input_ids,
+                    input_ids=(
+                        routing_ids
+                        if routing_ids is not None
+                        else state.forward_batch.input_ids
+                    ),
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
                     expert_location_dispatch_info=(
                         ExpertLocationDispatchInfo.init_new(

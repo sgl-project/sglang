@@ -194,6 +194,18 @@ class DeepseekV4ForCausalLM(nn.Module):
         # DSPARK aux-hidden capture is configured on the text model.
         self.language_model.set_dspark_layers_to_capture(layer_ids)
 
+    # Class-level probes (hasattr(model_class, ...)) bypass instance
+    # __getattr__, so these must exist on the wrapper class itself.
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        return _DeepseekV4TextLM.shared_experts_fusion_disable_reason(
+            hf_config, quant_config
+        )
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return _DeepseekV4TextLM.get_model_config_for_expert_location(config)
+
     def __getattr__(self, name: str):
         # The wrapper replaces the text model in the registry for every
         # DeepseekV4 checkpoint, so it must expose the text model's full
