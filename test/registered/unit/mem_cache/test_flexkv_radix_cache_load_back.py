@@ -66,7 +66,6 @@ def _make_cache(page_size=4):
     cache._inflight_store_nodes = {}
     cache._pending_store_launches = {}
     cache._pending_store_copies = {}
-    cache._defer_store_launch = False
     cache._async_store_slot_mapping = False
     cache._profile_store_stages = False
     cache.flexkv_connector.is_store_sync_leader = True
@@ -283,58 +282,8 @@ def test_finished_store_uses_radix_owned_slots_after_request_row_is_cleared():
     cache.store_stream.wait_stream.assert_called_once_with(producer_stream)
 
 
-def test_deferred_store_retains_node_and_launches_on_hicache_tick():
-    cache, allocator = _make_cache(page_size=4)
-    cache._defer_store_launch = True
-    request_row = torch.tensor([[4, 5, 6, 7]], dtype=torch.int64)
-    cache.req_to_token_pool = SimpleNamespace(req_to_token=request_row)
-    allocator.free_segments.side_effect = lambda *_args, **_kwargs: request_row.zero_()
-    cache.flexkv_connector.store_kv.return_value = 17
-    req = SimpleNamespace(
-        rid="deferred-store",
-        origin_input_ids=[1, 2, 3, 4],
-        output_ids=[],
-        kv=SimpleNamespace(
-            kv_committed_len=4,
-            req_pool_idx=0,
-            cache_protected_len=0,
-        ),
-        extra_key=None,
-        cache_salt=None,
-        last_node=cache.root_node,
-        _flexkv_uncached_restore=False,
-    )
-
-    producer_stream = MagicMock()
-    with (
-        patch.dict(
-            FlexKVRadixCache.cache_finished_req.__globals__,
-            {"get_spec": lambda: SimpleNamespace(speculative_eagle_topk=None)},
-        ),
-        patch("torch.cuda.current_stream", return_value=producer_stream),
-        patch(
-            "torch.cuda.stream", side_effect=lambda _stream: contextlib.nullcontext()
-        ),
-    ):
-        cache.cache_finished_req(req, kv_len_to_handle=4)
-
-        cache.flexkv_connector.store_kv.assert_not_called()
-        cache.store_stream.wait_stream.assert_not_called()
-        assert list(cache._pending_store_launches) == ["deferred-store"]
-
-        cache.check_hicache_events()
-
-    stored = cache.flexkv_connector.store_kv.call_args.kwargs
-    assert stored["token_ids"] == [1, 2, 3, 4]
-    assert stored["kv_indices"].tolist() == [4, 5, 6, 7]
-    assert cache._pending_store_launches == {}
-    assert "deferred-store" in cache._inflight_store_nodes
-    cache.store_stream.wait_stream.assert_called_once_with(producer_stream)
-
-
 def test_async_store_waits_for_event_then_uses_pinned_cpu_mapping():
     cache, allocator = _make_cache(page_size=4)
-    cache._defer_store_launch = True
     cache._async_store_slot_mapping = True
     request_row = torch.tensor([[4, 5, 6, 7]], dtype=torch.int64)
     cache.req_to_token_pool = SimpleNamespace(req_to_token=request_row)
