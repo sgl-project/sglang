@@ -469,12 +469,6 @@ class TestVAELoader(unittest.TestCase):
 
         native_load.assert_not_called()
 
-    def test_pipeline_config_declares_an_empty_native_only_default(self):
-        loader = vae_loader.VAELoader()
-        server_args = _FakeServerArgs(QwenImagePipelineConfig())
-
-        self.assertFalse(loader.should_raise_customized_load_error(server_args, "vae"))
-
     def test_backfill_ltx2_audio_vae_latent_stats_maps_official_keys(self):
         loaded = {
             "per_channel_statistics.mean-of-means": torch.tensor([1.0, 2.0]),

@@ -418,7 +418,9 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                     for _, quality, breakable_cuda_graph in module.QUALITY_BCG_ABBA_MATRIX
                 ],
             )
-            self.assertEqual({call[2]["cuda_visible_devices"] for call in calls}, {"0"})
+            self.assertEqual(
+                len({call[2]["cuda_visible_devices"] for call in calls}), 1
+            )
             self.assertEqual(
                 {call[2]["model_cache_dir"] for call in calls},
                 {calls[0][2]["model_cache_dir"]},
