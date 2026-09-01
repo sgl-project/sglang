@@ -393,13 +393,8 @@ class NgramEmbeddingInfo:
 def _mrope_delta_on_device(
     mm_input: MultimodalInputs, device, refresh: bool = False
 ) -> torch.Tensor:
-    """Device copy of a request's MRoPE delta, uploaded at most once per extend.
-
-    The delta is per-request metadata fixed at prefill, so the decode loop can
-    read the device copy instead of re-uploading. `refresh` re-reads the CPU
-    source; every writer of `mrope_position_delta` either runs before the extend
-    that refreshes it or clears the copy (see `MultimodalInputs.merge`).
-    """
+    """Every writer of `mrope_position_delta` either runs before the extend that
+    refreshes this copy, or clears it (see `MultimodalInputs.merge`)."""
     cached = mm_input.mrope_position_delta_device
     if cached is None or refresh:
         cached = mm_input.mrope_position_delta.to(device=device, non_blocking=True)
@@ -1126,8 +1121,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 (batch_size, 1), dtype=torch.int64, device=device
             )
         else:
-            # Stacking device copies keeps the whole batch on-device; the CPU
-            # sources would need a fresh H2D on every decode step.
             mrope_deltas = [
                 (
                     torch.zeros(1, dtype=torch.int64, device=device)
@@ -1184,10 +1177,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 f"_compute_mrope_positions called with unsupported forward_mode: {forward_mode}"
             )
 
-        # Refill the device copies on the extend, while the stream is still
-        # free: the speculative decode loop that reads them back runs behind
-        # queued draft work. Decode must not land here -- it would re-upload
-        # every step, which is exactly what the device copy avoids.
+        # Extend-only: decode reaching here would re-upload every step, which
+        # is exactly what the device copy exists to avoid.
         for mm_input in batch.multimodal_inputs:
             if mm_input is not None and mm_input.mrope_position_delta is not None:
                 _mrope_delta_on_device(mm_input, model_runner.device, refresh=True)

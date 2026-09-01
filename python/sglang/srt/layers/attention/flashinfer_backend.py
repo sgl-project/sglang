@@ -832,9 +832,8 @@ class FlashInferAttnBackend(AttentionBackend):
             and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
             and getattr(spec_info, "custom_mask", None) is None
             and self.prefill_backend == "fa2"
-            # Full attention rebuilds straight from seq_lens_cpu; SWA rebuilds
-            # from the window-clamped host lengths assembled below. Cross-attn
-            # has no host-rebuildable layout, so it keeps the plain plan().
+            # SWA rebuilds from the window-clamped host lengths assembled
+            # below; cross-attn has no host-rebuildable layout at all.
             and self.dispatch_reason in (None, WrapperDispatch.SLIDING_WINDOW)
         ):
             # DFLASH target-verify replays are shape-static per
@@ -2006,8 +2005,7 @@ class FlashInferIndicesUpdaterPrefill:
                     )
                     if prefix_is_full_seq and seq_lens_cpu is not None:
                         # prefix_lens is seq_lens, so the trim is min(seq_lens, window);
-                        # summing the host mirror avoids draining the stream. The
-                        # clamped lengths also feed the sync-free plan below.
+                        # summing the host mirror avoids draining the stream.
                         paged_kernel_lens_cpu = torch.clamp(
                             seq_lens_cpu, max=sliding_window_size
                         )

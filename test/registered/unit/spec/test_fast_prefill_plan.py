@@ -204,11 +204,8 @@ class TestFastPrefillPlan(CustomTestCase):
         torch.testing.assert_close(out_fast, out_upstream, rtol=0, atol=0)
 
     def test_dflash_swa_conservative_bound_matches_upstream(self):
-        # The SWA draft path clamps the host prefix to the window before adding
-        # the verify block, so its bound overshoots by up to one block. window_left
-        # also sends FlashInfer's scheduler down a different kv-chunk split
-        # (effective_kv_len is capped by the window), so cover it separately from
-        # the full-attention bound above. WINDOW straddles SEQ_LENS on both sides.
+        # Separate from the full-attention bound above because window_left caps
+        # effective_kv_len, sending the scheduler down a different kv-chunk split.
         kv_lens_host = torch.clamp(self.kv_lens_host, max=WINDOW) + NUM_TOKENS_PER_REQ
         kv_indptr_host = torch.zeros(self.bs + 1, dtype=torch.int32, device="cpu")
         kv_indptr_host[1:] = torch.cumsum(kv_lens_host, dim=0)
