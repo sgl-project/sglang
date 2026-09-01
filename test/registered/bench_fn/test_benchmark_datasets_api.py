@@ -3,6 +3,7 @@ import asyncio
 import base64
 import csv
 import functools
+import importlib.util
 import io
 import json
 import pickle
@@ -50,19 +51,6 @@ from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.datasets.openai_dataset import sample_openai_requests
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
-from sglang.benchmark.prefix_cache_benchmark import (
-    build_point_command,
-    cache_hit_tolerance_for_row,
-    load_completed_results,
-    make_tag,
-)
-from sglang.benchmark.prefix_cache_benchmark import (
-    parse_args as parse_prefix_cache_benchmark_args,
-)
-from sglang.benchmark.prefix_cache_benchmark import (
-    result_validation_error,
-    write_summary,
-)
 from sglang.benchmark.serving import (
     _BACKEND_API_PATHS,
     _EMBEDDING_BACKENDS,
@@ -77,6 +65,27 @@ from sglang.benchmark.serving import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+_PREFIX_CACHE_SCRIPT = (
+    Path(__file__).resolve().parents[3]
+    / "benchmark"
+    / "prefix_cache"
+    / "bench_prefix_cache.py"
+)
+_PREFIX_CACHE_SPEC = importlib.util.spec_from_file_location(
+    "sglang_prefix_cache_benchmark", _PREFIX_CACHE_SCRIPT
+)
+assert _PREFIX_CACHE_SPEC is not None and _PREFIX_CACHE_SPEC.loader is not None
+_PREFIX_CACHE_MODULE = importlib.util.module_from_spec(_PREFIX_CACHE_SPEC)
+_PREFIX_CACHE_SPEC.loader.exec_module(_PREFIX_CACHE_MODULE)
+
+build_point_command = _PREFIX_CACHE_MODULE.build_point_command
+cache_hit_tolerance_for_row = _PREFIX_CACHE_MODULE.cache_hit_tolerance_for_row
+load_completed_results = _PREFIX_CACHE_MODULE.load_completed_results
+make_tag = _PREFIX_CACHE_MODULE.make_tag
+parse_prefix_cache_args = _PREFIX_CACHE_MODULE.parse_args
+result_validation_error = _PREFIX_CACHE_MODULE.result_validation_error
+write_summary = _PREFIX_CACHE_MODULE.write_summary
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 register_cpu_ci(est_time=46, suite="base-c-test-cpu")
@@ -1696,7 +1705,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
 
 class TestPrefixCacheBenchmark(unittest.TestCase):
     def _parse(self, *extra):
-        return parse_prefix_cache_benchmark_args(
+        return parse_prefix_cache_args(
             [
                 "--base-url",
                 "http://127.0.0.1:30000",

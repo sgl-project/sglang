@@ -394,8 +394,11 @@ it cannot be combined with `--gsp-fast-prepare` or `--gsp-num-turns` greater tha
 For a repeatable matrix across models, use the matrix runner instead of maintaining a
 model-specific shell loop:
 
+For a compact quick start with workflow and data-structure diagrams, see the
+[prefix-cache benchmark README](https://github.com/sgl-project/sglang/tree/main/benchmark/prefix_cache).
+
 ```bash Command
-python3 -m sglang.benchmark.prefix_cache_benchmark \
+python3 benchmark/prefix_cache/bench_prefix_cache.py \
   --base-url http://127.0.0.1:30000 \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --tokenizer meta-llama/Llama-3.1-8B-Instruct \

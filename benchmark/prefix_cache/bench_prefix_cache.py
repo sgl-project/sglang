@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-SGLANG_REPO_ROOT = Path(__file__).resolve().parents[3]
+SGLANG_REPO_ROOT = Path(__file__).resolve().parents[2]
 SGLANG_PYTHON_ROOT = SGLANG_REPO_ROOT / "python"
 
 
@@ -377,7 +377,8 @@ def run_point(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a resumable prefix-cache benchmark matrix using bench_serving."
+        prog="python3 benchmark/prefix_cache/bench_prefix_cache.py",
+        description="Run a resumable prefix-cache benchmark matrix using bench_serving.",
     )
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--model", required=True)
