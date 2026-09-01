@@ -11,8 +11,7 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 4, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 4, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 4, ep: 0, bf16: true, fp8: true },
-      xeon:   { tp: 6, ep: 0, bf16: true, fp8: true },
-      arc_b:  { tp: 6, ep: 0, bf16: true, fp8: true }
+      xeon:   { tp: 6, ep: 0, bf16: true, fp8: true }
     },
     '30b': {
       baseName: '30B-A3B',
@@ -51,7 +50,6 @@ export const Qwen3Deployment = () => {
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
       xeon:   { tp: 3, ep: 0, bf16: true, fp8: true },
-      arc_b:  { tp: 1, ep: 0, bf16: true, fp8: true },
     },
     '8b': {
       baseName: '8B',
@@ -64,7 +62,6 @@ export const Qwen3Deployment = () => {
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
       xeon:   { tp: 3, ep: 0, bf16: true, fp8: true },
-      arc_b:  { tp: 1, ep: 0, bf16: true, fp8: true },
     },
     '4b': {
       baseName: '4B',
@@ -77,7 +74,6 @@ export const Qwen3Deployment = () => {
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
       xeon:   { tp: 3, ep: 0, bf16: true, fp8: true },
-      arc_b:  { tp: 2, ep: 0, bf16: true, fp8: true },
     },
     '1.7b': {
       baseName: '1.7B',
@@ -90,7 +86,6 @@ export const Qwen3Deployment = () => {
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
       xeon:   { tp: 3, ep: 0, bf16: true, fp8: true },
-      arc_b: { tp: 2, ep: 0, bf16: true, fp8: true },
     },
     '0.6b': {
       baseName: '0.6B',
@@ -103,7 +98,6 @@ export const Qwen3Deployment = () => {
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
       xeon:   { tp: 3, ep: 0, bf16: true, fp8: true },
-      arc_b:  { tp: 3, ep: 0, bf16: true, fp8: true },
     }
   };
 
