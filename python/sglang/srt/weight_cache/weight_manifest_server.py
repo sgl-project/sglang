@@ -146,7 +146,6 @@ class WeightManifestServer:
         rank_manifest = {
             "gpu_id": int(data["gpu_id"]),
             "runtime_inventory": runtime_inventory,
-            "content_checksums": data["content_checksums"],
         }
 
         with self._lock:
@@ -195,9 +194,6 @@ class WeightManifestServer:
             "gpu_ids": gpu_ids,
             "runtime_inventories": tuple(
                 item["runtime_inventory"] for item in rank_manifests
-            ),
-            "content_checksum_groups": tuple(
-                item["content_checksums"] for item in rank_manifests
             ),
         }
 

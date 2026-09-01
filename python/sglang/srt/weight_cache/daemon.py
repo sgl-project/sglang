@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Weight Cache Daemon — a persistent process that holds post-quantized,
-TP-sharded model weights in GPU memory and serves them via pluggable transport backends.
+TP-sharded model weights in GPU memory and serves them via pluggable transports.
 
 Each GPU runs one daemon process for its TP rank. The daemon:
 1. Loads model weights from disk (full pipeline: disk → TP shard → quantize)
-2. Exports every parameter/buffer as a CUDA IPC handle
+2. Exports parameters, buffers, and immutable derived weight state
 3. Serves transport entries over a Unix socket to requesting engine processes
 4. Validates CacheConfig compatibility before serving
 
@@ -77,6 +77,15 @@ if TYPE_CHECKING:
 # healthy client, yet guarantees one hung/dead peer can't stall the other
 # engine ranks indefinitely.
 CLIENT_CONNECTION_TIMEOUT = 30.0
+
+# Plain tensor attributes produced by model-specific post-load hooks. They are
+# immutable weight-derived state, but are not registered parameters/buffers and
+# therefore need an explicit IPC entry. Export their exact tensors; never
+# reconstruct them with a cross-model formula on the client.
+_WEIGHT_CACHE_PLAIN_TENSOR_ATTRS = frozenset(
+    {"w_kc", "w_vc", "w_scale", "w_scale_k", "w_scale_v"}
+)
+_WEIGHT_CACHE_PLAIN_VALUE_ATTRS = frozenset({"use_deep_gemm_bmm"})
 
 
 @dataclasses.dataclass
@@ -427,6 +436,8 @@ class WeightCacheDaemon:
                 ep_size=self.ep_size,
                 pp_size=self.pp_size,
                 enable_dp_attention=self.enable_dp_attention,
+                moe_dp_size=self.moe_dp_size,
+                attn_cp_size=self.attn_cp_size,
                 nnodes=self.server_args.nnodes,
                 quantization=self.quantization or model_config.quantization,
             )
@@ -539,8 +550,6 @@ class WeightCacheDaemon:
                 pp_rank=self.pp_rank,
                 ep_size=self.ep_size,
                 dp_size=(self.dp_size if self.enable_dp_attention else 1),
-                dp_attention_enabled=self.enable_dp_attention,
-                dp_lm_head_enabled=self.enable_dp_lm_head,
                 gpu_id=self.gpu_id,
                 revision=(
                     self.revision
@@ -662,8 +671,60 @@ class WeightCacheDaemon:
                 state_tensors[name] = (buf.data, False)
                 non_persistent_count += 1
 
+        # Export exact model-specific derived tensors (for example MLA w_kc /
+        # w_vc layouts). These are plain attrs, so mark their entries for direct
+        # setattr on the client instead of registering them as model buffers.
+        plain_tensor_names = set()
+        plain_values = {}
+        for module_name, module in self.model.named_modules():
+            registered_names = set(module._parameters) | set(module._buffers)
+            for attr_name in sorted(
+                (
+                    _WEIGHT_CACHE_PLAIN_TENSOR_ATTRS
+                    | _WEIGHT_CACHE_PLAIN_VALUE_ATTRS
+                )
+                - registered_names
+            ):
+                if attr_name not in vars(module):
+                    continue
+                name = f"{module_name}.{attr_name}" if module_name else attr_name
+                value = vars(module)[attr_name]
+                if not isinstance(value, torch.Tensor):
+                    if value is None:
+                        continue
+                    if isinstance(value, (bool, int, float)):
+                        plain_values[name] = value
+                        continue
+                    raise RuntimeError(
+                        "weight-cache derived attribute has unsupported type: "
+                        f"{name}: {type(value).__name__}"
+                    )
+                if attr_name in _WEIGHT_CACHE_PLAIN_VALUE_ATTRS:
+                    raise RuntimeError(
+                        "weight-cache scalar derived attribute became a Tensor: "
+                        f"{name}"
+                    )
+                tensor = value
+                if name in state_tensors:
+                    raise RuntimeError(
+                        f"weight-cache derived tensor name collides with state: {name}"
+                    )
+                state_tensors[name] = (tensor.data, False)
+                plain_tensor_names.add(name)
+
         self.transport_backend = choose_daemon_transport_backend(state_tensors)
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
+        for name in plain_tensor_names:
+            self.state_entries[name]["is_plain_tensor"] = True
+        for name, value in plain_values.items():
+            if name in self.state_entries:
+                raise RuntimeError(
+                    f"weight-cache plain value name collides with state: {name}"
+                )
+            self.state_entries[name] = {
+                "is_plain_value": True,
+                "value": value,
+            }
 
         # Log approximate serialized metadata size (not payload-backed bytes).
         # Only the handle blob carries real weight, so measure it directly:
@@ -675,8 +736,10 @@ class WeightCacheDaemon:
         )
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] "
-            f"Exported {len(self.state_entries)} tensors "
+            f"Exported {len(self.state_entries)} state entries "
             f"({non_persistent_count} non-persistent buffers), "
+            f"({len(plain_tensor_names)} plain derived tensors), "
+            f"({len(plain_values)} plain derived values), "
             f"transport={self.transport_backend.name}, "
             f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
         )
@@ -913,6 +976,8 @@ def _prepare_weight_heterogeneous_transfer(
         ep_size=server_args.ep_size,
         pp_size=server_args.pp_size,
         enable_dp_attention=server_args.enable_dp_attention,
+        moe_dp_size=server_args.moe_dp_size,
+        attn_cp_size=server_args.attn_cp_size,
         nnodes=server_args.nnodes,
         quantization=server_args.quantization,
     )
@@ -929,10 +994,23 @@ def _prepare_weight_heterogeneous_transfer(
             port=daemon_args.weight_heterogeneous_transfer_server_port,
             expected_rank_count=expected_rank_count,
         )
+        from sglang.srt.utils.network import NetworkAddress
+
+        try:
+            connect_host = {
+                "": "127.0.0.1",
+                "0.0.0.0": "127.0.0.1",
+                "::": "::1",
+            }.get(daemon_args.weight_heterogeneous_transfer_server_host)
+            if connect_host is None:
+                connect_host = daemon_args.weight_heterogeneous_transfer_server_host
+            registry_address = NetworkAddress(connect_host, manifest_server.port)
+        except BaseException:
+            manifest_server.close()
+            raise
         return (
             manifest_server,
-            f"tcp://127.0.0.1:"
-            f"{daemon_args.weight_heterogeneous_transfer_server_port}",
+            f"tcp://{registry_address.to_host_port_str()}",
         )
     if (
         not daemon_args.weight_heterogeneous_transfer_source_ip
@@ -941,11 +1019,29 @@ def _prepare_weight_heterogeneous_transfer(
         raise ValueError(
             "target heterogeneous transfer requires source IP and source port"
         )
-    return (
-        None,
-        f"tcp://{daemon_args.weight_heterogeneous_transfer_source_ip}:"
-        f"{daemon_args.weight_heterogeneous_transfer_source_port}",
+    from sglang.srt.utils.network import NetworkAddress
+
+    source_address = NetworkAddress(
+        daemon_args.weight_heterogeneous_transfer_source_ip,
+        daemon_args.weight_heterogeneous_transfer_source_port,
     )
+    return None, f"tcp://{source_address.to_host_port_str()}"
+
+
+def _cleanup_weight_cache_daemon_launch(procs, weight_manifest_server) -> None:
+    """Stop every launched daemon and release the optional registry."""
+    try:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+        for proc in procs:
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
+    finally:
+        if weight_manifest_server is not None:
+            weight_manifest_server.close()
 
 
 def launch_weight_cache_daemons(
@@ -992,6 +1088,7 @@ def launch_weight_cache_daemons(
             expected_rank_count=server_args.tp_size * server_args.pp_size,
         )
     )
+    procs = []
 
     # Replicate _calculate_rank_ranges logic from engine.py
     pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
@@ -1008,6 +1105,7 @@ def launch_weight_cache_daemons(
     )
 
     if server_args.nnodes > 1 and dist_init_method is None:
+        _cleanup_weight_cache_daemon_launch(procs, weight_manifest_server)
         raise ValueError(
             "dist_init_method is required for multi-node weight cache daemons. "
             "Use --dist-init-method tcp://<node0-ip>:<port> to specify the "
@@ -1016,102 +1114,108 @@ def launch_weight_cache_daemons(
 
     # Auto-allocate a free port for the distributed init method
     if dist_init_method is None:
-        with sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            free_port = s.getsockname()[1]
+        try:
+            with sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                free_port = s.getsockname()[1]
+        except BaseException:
+            _cleanup_weight_cache_daemon_launch(procs, weight_manifest_server)
+            raise
         dist_init_method = f"tcp://127.0.0.1:{free_port}"
 
     # Validate and clean up stale .ready/.sock files from prior runs.
-    for pp_rank in pp_rank_range:
-        for tp_rank in tp_rank_range:
-            socket_rank = compute_local_gpu_id(
-                pp_rank,
-                tp_rank,
-                pp_size_per_node,
-                tp_size_per_node,
-                base_gpu_id=server_args.base_gpu_id,
-                gpu_id_step=server_args.gpu_id_step,
-            )
-            cleanup_stale_daemon_files(socket_rank, force=force)
+    try:
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                socket_rank = compute_local_gpu_id(
+                    pp_rank,
+                    tp_rank,
+                    pp_size_per_node,
+                    tp_size_per_node,
+                    base_gpu_id=server_args.base_gpu_id,
+                    gpu_id_step=server_args.gpu_id_step,
+                )
+                cleanup_stale_daemon_files(socket_rank, force=force)
 
-    procs = []
-    for pp_rank in pp_rank_range:
-        for tp_rank in tp_rank_range:
-            gpu_id = compute_local_gpu_id(
-                pp_rank,
-                tp_rank,
-                pp_size_per_node,
-                tp_size_per_node,
-                base_gpu_id=server_args.base_gpu_id,
-                gpu_id_step=server_args.gpu_id_step,
-            )
-            child_daemon_args = dataclasses.replace(
-                daemon_args,
-                weight_heterogeneous_transfer_registry_url=(
-                    weight_manifest_registry_url
-                ),
-                weight_cache_socket_rank=gpu_id,
-            )
-            proc = spawn_weight_cache_daemon(
-                server_args,
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                pp_rank=pp_rank,
-                dist_init_method=dist_init_method,
-                daemon_args=child_daemon_args,
-                socket_rank=gpu_id,
-            )
-            procs.append(proc)
-            logger.info(
-                f"Launched weight cache daemon gpu={gpu_id} "
-                f"pp_rank={pp_rank} tp_rank={tp_rank} pid={proc.pid}"
-            )
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                gpu_id = compute_local_gpu_id(
+                    pp_rank,
+                    tp_rank,
+                    pp_size_per_node,
+                    tp_size_per_node,
+                    base_gpu_id=server_args.base_gpu_id,
+                    gpu_id_step=server_args.gpu_id_step,
+                )
+                child_daemon_args = dataclasses.replace(
+                    daemon_args,
+                    weight_heterogeneous_transfer_registry_url=(
+                        weight_manifest_registry_url
+                    ),
+                    weight_cache_socket_rank=gpu_id,
+                )
+                proc = spawn_weight_cache_daemon(
+                    server_args,
+                    gpu_id=gpu_id,
+                    tp_rank=tp_rank,
+                    pp_rank=pp_rank,
+                    dist_init_method=dist_init_method,
+                    daemon_args=child_daemon_args,
+                    socket_rank=gpu_id,
+                )
+                procs.append(proc)
+                logger.info(
+                    f"Launched weight cache daemon gpu={gpu_id} "
+                    f"pp_rank={pp_rank} tp_rank={tp_rank} pid={proc.pid}"
+                )
+    except BaseException:
+        _cleanup_weight_cache_daemon_launch(procs, weight_manifest_server)
+        raise
 
     # Wait for all daemons on this node to become ready
     num_daemons = len(procs)
     check_interval = 2
     start_time = time.time()
-    for pp_rank in pp_rank_range:
-        for tp_rank in tp_rank_range:
-            socket_rank = compute_local_gpu_id(
-                pp_rank,
-                tp_rank,
-                pp_size_per_node,
-                tp_size_per_node,
-                base_gpu_id=server_args.base_gpu_id,
-                gpu_id_step=server_args.gpu_id_step,
-            )
-            ready_path = get_ready_path(socket_rank)
-            while not os.path.exists(ready_path):
-                time.sleep(check_interval)
-                if time.time() - start_time > timeout:
-                    logger.error(
-                        f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
-                        f"did not become ready within {timeout}s"
-                    )
-                    for p in procs:
-                        p.terminate()
-                    raise TimeoutError(
-                        f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
-                        f"did not become ready within {timeout}s"
-                    )
-                # Check if any daemon exited prematurely
-                for p in procs:
-                    if not p.is_alive():
+    try:
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                socket_rank = compute_local_gpu_id(
+                    pp_rank,
+                    tp_rank,
+                    pp_size_per_node,
+                    tp_size_per_node,
+                    base_gpu_id=server_args.base_gpu_id,
+                    gpu_id_step=server_args.gpu_id_step,
+                )
+                ready_path = get_ready_path(socket_rank)
+                while not os.path.exists(ready_path):
+                    time.sleep(check_interval)
+                    if time.time() - start_time > timeout:
                         logger.error(
-                            f"Weight cache daemon exited prematurely "
-                            f"with code {p.exitcode}"
+                            f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
+                            f"did not become ready within {timeout}s"
                         )
-                        for other in procs:
-                            if other.is_alive():
-                                other.terminate()
-                        raise RuntimeError(
-                            f"Weight cache daemon exited prematurely "
-                            f"with code {p.exitcode}"
+                        raise TimeoutError(
+                            f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
+                            f"did not become ready within {timeout}s"
                         )
-            logger.info(
-                f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} is ready"
-            )
+                    # Check if any daemon exited prematurely
+                    for proc in procs:
+                        if not proc.is_alive():
+                            logger.error(
+                                "Weight cache daemon exited prematurely "
+                                f"with code {proc.exitcode}"
+                            )
+                            raise RuntimeError(
+                                "Weight cache daemon exited prematurely "
+                                f"with code {proc.exitcode}"
+                            )
+                logger.info(
+                    f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} is ready"
+                )
+    except BaseException:
+        _cleanup_weight_cache_daemon_launch(procs, weight_manifest_server)
+        raise
 
     logger.info(
         f"All {num_daemons} weight cache daemons on node {server_args.node_rank} are ready "
@@ -1137,16 +1241,7 @@ def launch_weight_cache_daemons(
     except KeyboardInterrupt:
         logger.info("Received KeyboardInterrupt, shutting down daemons")
     finally:
-        for proc in procs:
-            if proc.is_alive():
-                proc.terminate()
-        for proc in procs:
-            proc.join(timeout=5)
-            if proc.is_alive():
-                proc.kill()
-                proc.join()
-        if weight_manifest_server is not None:
-            weight_manifest_server.close()
+        _cleanup_weight_cache_daemon_launch(procs, weight_manifest_server)
         logger.info("All weight cache daemons have been terminated")
 
     if exited is not None:
@@ -1173,35 +1268,35 @@ if __name__ == "__main__":
                 expected_rank_count=1,
             )
         )
-        gpu_id = (
-            daemon_args.gpu_id
-            if daemon_args.gpu_id is not None
-            else daemon_args.tp_rank
-        )
-        tp_rank = (
-            daemon_args.tp_rank
-            if daemon_args.tp_rank is not None
-            else daemon_args.gpu_id
-        )
-        socket_rank = daemon_args.weight_cache_socket_rank
-        if socket_rank is None:
-            socket_rank = (
-                gpu_id
-                if daemon_args.weight_heterogeneous_transfer_enabled
-                else compute_global_rank(
-                    server_args.tp_size, daemon_args.pp_rank, tp_rank
-                )
-            )
-        cleanup_stale_daemon_files(
-            socket_rank,
-            force=daemon_args.force,
-        )
-        child_daemon_args = dataclasses.replace(
-            daemon_args,
-            weight_heterogeneous_transfer_registry_url=registry_url,
-            weight_cache_socket_rank=socket_rank,
-        )
         try:
+            gpu_id = (
+                daemon_args.gpu_id
+                if daemon_args.gpu_id is not None
+                else daemon_args.tp_rank
+            )
+            tp_rank = (
+                daemon_args.tp_rank
+                if daemon_args.tp_rank is not None
+                else daemon_args.gpu_id
+            )
+            socket_rank = daemon_args.weight_cache_socket_rank
+            if socket_rank is None:
+                socket_rank = (
+                    gpu_id
+                    if daemon_args.weight_heterogeneous_transfer_enabled
+                    else compute_global_rank(
+                        server_args.tp_size, daemon_args.pp_rank, tp_rank
+                    )
+                )
+            cleanup_stale_daemon_files(
+                socket_rank,
+                force=daemon_args.force,
+            )
+            child_daemon_args = dataclasses.replace(
+                daemon_args,
+                weight_heterogeneous_transfer_registry_url=registry_url,
+                weight_cache_socket_rank=socket_rank,
+            )
             run_weight_cache_daemon(
                 server_args,
                 gpu_id=gpu_id,

@@ -33,10 +33,6 @@ class WeightParallelTopology(msgspec.Struct, frozen=True, kw_only=True):
     pp_size: int = 1
     ep_rank: int = 0
     ep_size: int = 1
-    moe_tp_rank: int = 0
-    moe_tp_size: int = 1
-    attention_tp_rank: int = 0
-    attention_tp_size: int = 1
 
     def __post_init__(self) -> None:
         ranks = (
@@ -44,16 +40,12 @@ class WeightParallelTopology(msgspec.Struct, frozen=True, kw_only=True):
             self.tp_rank,
             self.pp_rank,
             self.ep_rank,
-            self.moe_tp_rank,
-            self.attention_tp_rank,
         )
         sizes = (
             self.dp_size,
             self.tp_size,
             self.pp_size,
             self.ep_size,
-            self.moe_tp_size,
-            self.attention_tp_size,
         )
         if any(rank < 0 for rank in ranks) or any(size <= 0 for size in sizes):
             raise ValueError("parallel ranks and sizes must be positive")
@@ -124,12 +116,10 @@ class WeightRuntimeManifest(msgspec.Struct, frozen=True, kw_only=True):
 
 class _PhysicalParameter(msgspec.Struct, frozen=True, kw_only=True):
     names: tuple[str, ...]
-    parameter: Any
     parameters: tuple[Any, ...]
+    is_parameter: bool
     address: int
     nbytes: int
-    shape: tuple[int, ...]
-    stride: tuple[int, ...]
     storage_offset: int
     dtype: str
     itemsize: int
@@ -197,42 +187,41 @@ def _inspect_parameter(
     names: tuple[str, ...],
     parameter: Any,
     parameters: tuple[Any, ...],
+    is_parameter: bool,
     allowed_devices: frozenset[str],
 ) -> _PhysicalParameter:
     runtime_name = names[0]
+    kind = "parameter" if is_parameter else "buffer"
     if getattr(parameter, "is_sparse", False):
-        raise WeightManifestError(f"sparse parameter is unsupported: {runtime_name}")
+        raise WeightManifestError(f"sparse {kind} is unsupported: {runtime_name}")
     layout = getattr(parameter, "layout", None)
     if layout is not None and str(layout) not in ("strided", "torch.strided"):
         raise WeightManifestError(
-            f"non-strided parameter is unsupported: {runtime_name}"
+            f"non-strided {kind} is unsupported: {runtime_name}"
         )
     if not parameter.is_contiguous():
         raise WeightManifestError(
-            f"non-contiguous parameter is unsupported: {runtime_name}"
+            f"non-contiguous {kind} is unsupported: {runtime_name}"
         )
 
     device = str(parameter.device.type)
     if device not in allowed_devices:
         raise WeightManifestError(
-            f"parameter device is unsupported: {runtime_name}: {device}"
+            f"{kind} device is unsupported: {runtime_name}: {device}"
         )
-    shape = tuple(int(value) for value in parameter.shape)
     itemsize = int(parameter.element_size())
     nbytes = int(parameter.numel()) * itemsize
     address = int(parameter.data_ptr())
     if address <= 0 or itemsize <= 0 or nbytes <= 0:
         raise WeightManifestError(
-            f"parameter has no transferable storage: {runtime_name}"
+            f"{kind} has no transferable storage: {runtime_name}"
         )
     return _PhysicalParameter(
         names=names,
-        parameter=parameter,
         parameters=parameters,
+        is_parameter=is_parameter,
         address=address,
         nbytes=nbytes,
-        shape=shape,
-        stride=tuple(int(value) for value in parameter.stride()),
         storage_offset=int(parameter.storage_offset()),
         dtype=_dtype_name(parameter.dtype),
         itemsize=itemsize,
@@ -294,7 +283,9 @@ def _validate_view(view: LogicalTensorView, physical: _PhysicalParameter) -> int
         or view.byte_offset % physical.itemsize != 0
         or view.byte_offset + nbytes > physical.nbytes
     ):
-        raise WeightManifestError(f"view exceeds parameter storage: {view.tensor_id}")
+        raise WeightManifestError(
+            f"view exceeds registered tensor storage: {view.tensor_id}"
+        )
     return nbytes
 
 
@@ -372,24 +363,86 @@ class ImmutableWeightRuntimeManifestBuilder:
         )
 
     def _collect_physical_parameters(self) -> tuple[_PhysicalParameter, ...]:
-        grouped: dict[tuple, tuple[Any, list[Any], list[str]]] = {}
+        grouped: dict[tuple, tuple[Any, list[Any], list[str], list[str]]] = {}
+        recorded_views_by_id: dict[int, list[Any]] = {}
+        recorded_views_by_name: dict[str, list[Any]] = {}
+        for view in self._load_plan.views:
+            recorded_views_by_id.setdefault(id(view.parameter), []).append(view)
+            for name in view.parameter_names:
+                recorded_views_by_name.setdefault(name, []).append(view)
         for name, parameter in self._model.named_parameters(remove_duplicate=False):
             key = _storage_key(parameter)
             if key not in grouped:
-                grouped[key] = (parameter, [], [])
+                grouped[key] = (parameter, [], [], [])
             grouped[key][1].append(parameter)
             grouped[key][2].append(name)
-
-        physical = [
-            _inspect_parameter(
-                names=tuple(sorted(names)),
-                parameter=parameter,
-                parameters=tuple(parameters),
-                allowed_devices=self._allowed_devices,
+        for name, buffer in self._model.named_buffers(remove_duplicate=False):
+            candidate_views = {
+                id(view): view
+                for view in (
+                    *recorded_views_by_id.get(id(buffer), ()),
+                    *recorded_views_by_name.get(name, ()),
+                )
+            }
+            if not candidate_views:
+                continue
+            key = _storage_key(buffer)
+            for view in candidate_views.values():
+                if _storage_key(view.parameter) != key:
+                    raise WeightManifestError(
+                        "recorded tensor storage changed before manifest build: "
+                        f"{name}"
+                    )
+            if key not in grouped:
+                grouped[key] = (buffer, [], [], [])
+            grouped[key][1].append(buffer)
+            grouped[key][1].extend(
+                view.parameter for view in candidate_views.values()
             )
-            for parameter, parameters, names in grouped.values()
+            grouped[key][3].append(name)
+
+        physical = []
+        for (
+            parameter,
+            parameters,
+            parameter_names,
+            buffer_names,
+        ) in grouped.values():
+            unique_parameters = tuple(
+                {id(item): item for item in parameters}.values()
+            )
+            is_parameter = bool(parameter_names)
+            names = tuple(
+                dict.fromkeys(
+                    (*sorted(set(parameter_names)), *sorted(set(buffer_names)))
+                )
+            )
+            physical.append(
+                _inspect_parameter(
+                    names=names,
+                    parameter=parameter,
+                    parameters=unique_parameters,
+                    is_parameter=is_parameter,
+                    allowed_devices=self._allowed_devices,
+                )
+            )
+        physical = tuple(sorted(physical, key=lambda item: item.names))
+        bound_view_ids = {
+            id(view)
+            for item in physical
+            for view in self._load_plan.views_for_parameters(item.parameters)
+        }
+        missing_views = [
+            view
+            for view in self._load_plan.views
+            if id(view) not in bound_view_ids
         ]
-        return tuple(sorted(physical, key=lambda item: item.names))
+        if missing_views:
+            raise WeightManifestError(
+                "recorded tensor is no longer bound to model storage: "
+                f"{missing_views[0].tensor_id}"
+            )
+        return physical
 
     def _build_runtime_tensors(
         self,
@@ -426,6 +479,7 @@ class ImmutableWeightRuntimeManifestBuilder:
                     "native weight-load recorder did not cover parameter: "
                     f"{item.names[0]}"
                 )
+            kind = "parameter" if item.is_parameter else "buffer"
             intervals = sorted(
                 (
                     view.byte_offset,
@@ -439,13 +493,13 @@ class ImmutableWeightRuntimeManifestBuilder:
                 if begin != cursor:
                     relation = "overlaps" if begin < cursor else "leaves a gap in"
                     raise WeightManifestError(
-                        f"recorded tensor {tensor_id} {relation} parameter "
+                        f"recorded tensor {tensor_id} {relation} {kind} "
                         f"{item.names[0]} at byte {begin}; expected {cursor}"
                     )
                 cursor = end
             if cursor != item.nbytes:
                 raise WeightManifestError(
-                    "native weight-load recorder did not cover complete parameter: "
+                    f"native weight-load recorder did not cover complete {kind}: "
                     f"{item.names[0]}: covered={cursor}, nbytes={item.nbytes}"
                 )
             for view in views:

@@ -8,13 +8,10 @@ then use Mooncake's manifest planner and Transfer Engine reader to pull exactly
 the ranges needed by each target rank. No Engine control-plane participation is
 required and both daemon-owned models remain immutable.
 
-SGLang attention DP reuses the global TP workers: attention weights are
-replicated across attention-DP ranks while FFN weights remain sharded across
-the full TP world.  The runtime manifest therefore folds attention DP into one
-Mooncake model-replica coordinate and records its effects through attention-TP
-tensor geometry.  Registry rank counts remain TP x PP.  The planner consumes
-layout-independent logical tensor boxes, so TP, PP, static EP and attention-DP
-support belongs here, above Mooncake, rather than in the transport.
+EP and MoE-TP are represented as hierarchical Mooncake split/ownership axes.
+SGLang attention DP also reuses the global TP workers, but a partially sharded
+and replicated attention layout remains ambiguous and is rejected explicitly,
+as are MoE-DP and attention context parallelism.
 """
 
 from __future__ import annotations
@@ -25,7 +22,7 @@ import socket
 import time
 from bisect import bisect_right
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import msgspec
 
@@ -100,176 +97,6 @@ def rebuild_transferred_weight_state(model: Any) -> None:
     from sglang.srt.model_loader.loader import PreshardedModelLoader
 
     PreshardedModelLoader._rebind_parameter_aliases(model)
-
-
-def rebuild_client_derived_weight_state(model: Any) -> None:
-    """Rebuild client-local views without writing daemon-owned IPC tensors."""
-    import torch
-
-    for _, module in model.named_modules():
-        kv_b_proj = getattr(module, "kv_b_proj", None)
-        weight = getattr(kv_b_proj, "weight", None)
-        if (
-            isinstance(weight, torch.Tensor)
-            and weight.dtype in (torch.bfloat16, torch.float16, torch.float32)
-            and hasattr(module, "qk_nope_head_dim")
-            and hasattr(module, "v_head_dim")
-            and hasattr(module, "w_kc")
-            and hasattr(module, "w_vc")
-        ):
-            w_kc, w_vc = weight.unflatten(
-                0, (-1, module.qk_nope_head_dim + module.v_head_dim)
-            ).split([module.qk_nope_head_dim, module.v_head_dim], dim=1)
-            module.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-            module.w_vc = w_vc.contiguous().transpose(1, 2)
-            if hasattr(kv_b_proj, "weight_scale"):
-                module.w_scale = kv_b_proj.weight_scale
-
-
-def _compute_weight_content_checksums(
-    model: Any,
-    runtime_inventory: Any,
-) -> tuple[dict[str, Any], ...]:
-    """Compute layout-independent checksums over logical parameter bytes."""
-    import numpy as np
-    import torch
-
-    parameters = dict(model.named_parameters(remove_duplicate=False))
-    mask = (1 << 64) - 1
-    multiplier = np.uint64(0x9E3779B185EBCA87)
-    increment = np.uint64(0xC2B2AE3D27D4EB4F)
-    max_chunk_bytes = 4 * 1024 * 1024
-    checksums = []
-
-    for tensor_record in runtime_inventory.tensors:
-        parameter = parameters.get(tensor_record.runtime_name)
-        if parameter is None:
-            raise WeightHeterogeneousTransferError(
-                "manifest parameter is missing at checksum time: "
-                f"{tensor_record.runtime_name}"
-            )
-        itemsize = int(tensor_record.itemsize)
-        if tensor_record.byte_offset % itemsize or tensor_record.nbytes % itemsize:
-            raise WeightHeterogeneousTransferError(
-                f"unaligned manifest bytes for {tensor_record.runtime_name}: "
-                f"offset={tensor_record.byte_offset}, "
-                f"nbytes={tensor_record.nbytes}, itemsize={itemsize}"
-            )
-        element_offset = int(tensor_record.byte_offset // itemsize)
-        element_count = int(tensor_record.nbytes // itemsize)
-        flat = parameter.detach().reshape(-1)
-        if element_offset + element_count > flat.numel():
-            raise WeightHeterogeneousTransferError(
-                f"manifest checksum range exceeds {tensor_record.runtime_name} storage"
-            )
-
-        global_shape = tuple(int(value) for value in tensor_record.global_shape)
-        global_offset = tuple(int(value) for value in tensor_record.global_offset)
-        local_shape = tuple(int(value) for value in tensor_record.local_shape)
-        local_strides = []
-        global_strides = []
-        for shape, output in (
-            (local_shape, local_strides),
-            (global_shape, global_strides),
-        ):
-            stride = 1
-            reverse = []
-            for size in reversed(shape):
-                reverse.append(stride)
-                stride *= size
-            output.extend(reversed(reverse))
-
-        byte_sum = 0
-        weighted_sum = 0
-        elements_per_chunk = max(1, max_chunk_bytes // itemsize)
-        for local_start in range(0, element_count, elements_per_chunk):
-            count = min(elements_per_chunk, element_count - local_start)
-            raw = (
-                flat[
-                    element_offset + local_start : element_offset + local_start + count
-                ]
-                .view(torch.uint8)
-                .cpu()
-                .numpy()
-                .reshape(-1)
-            )
-            local_indices = np.arange(
-                local_start,
-                local_start + count,
-                dtype=np.uint64,
-            )
-            global_indices = np.zeros(count, dtype=np.uint64)
-            for local_stride, local_size, offset, global_stride in zip(
-                local_strides,
-                local_shape,
-                global_offset,
-                global_strides,
-            ):
-                coordinate = (
-                    (local_indices // np.uint64(local_stride)) % np.uint64(local_size)
-                ) + np.uint64(offset)
-                global_indices += coordinate * np.uint64(global_stride)
-
-            byte_sum = (byte_sum + int(raw.sum(dtype=np.uint64))) & mask
-            global_byte_base = global_indices * np.uint64(itemsize)
-            for lane in range(itemsize):
-                values = raw[lane::itemsize].astype(np.uint64)
-                byte_indices = global_byte_base + np.uint64(lane)
-                weights = byte_indices * multiplier + increment
-                weighted_sum = (
-                    weighted_sum + int((values * weights).sum(dtype=np.uint64))
-                ) & mask
-
-        checksums.append(
-            {
-                "tensor_id": tensor_record.tensor_id,
-                "global_shape": global_shape,
-                "global_offset": global_offset,
-                "local_shape": local_shape,
-                "nbytes": int(tensor_record.nbytes),
-                "byte_sum": byte_sum,
-                "weighted_sum": weighted_sum,
-            }
-        )
-    return tuple(checksums)
-
-
-def _aggregate_weight_content_checksums(
-    groups: Sequence[Sequence[dict[str, Any]]],
-) -> dict[str, tuple[tuple[int, ...], int, int, int]]:
-    """Deduplicate replicas and fold arbitrary TP boxes by logical tensor ID."""
-    mask = (1 << 64) - 1
-    boxes: dict[tuple[Any, ...], dict[str, Any]] = {}
-    for group in groups:
-        for record in group:
-            key = (
-                record["tensor_id"],
-                tuple(record["global_offset"]),
-                tuple(record["local_shape"]),
-            )
-            existing = boxes.get(key)
-            if existing is not None and existing != record:
-                raise WeightHeterogeneousTransferError(
-                    f"replicated logical box has inconsistent content: {key}"
-                )
-            boxes[key] = record
-
-    totals: dict[str, tuple[tuple[int, ...], int, int, int]] = {}
-    for record in boxes.values():
-        tensor_id = record["tensor_id"]
-        global_shape = tuple(record["global_shape"])
-        previous = totals.get(tensor_id, (global_shape, 0, 0, 0))
-        if previous[0] != global_shape:
-            raise WeightHeterogeneousTransferError(
-                f"logical tensor global shape differs across fragments: {tensor_id}"
-            )
-        totals[tensor_id] = (
-            global_shape,
-            previous[1] + int(record["nbytes"]),
-            (previous[2] + int(record["byte_sum"])) & mask,
-            (previous[3] + int(record["weighted_sum"])) & mask,
-        )
-    return totals
 
 
 def _register_weight_fragment_allocations(
@@ -373,22 +200,11 @@ def validate_weight_heterogeneous_transfer_configuration(
     ep_size: int,
     pp_size: int,
     enable_dp_attention: bool,
+    moe_dp_size: int = 1,
+    attn_cp_size: int = 1,
     nnodes: int = 1,
     quantization: Optional[str] = None,
 ) -> None:
-    unsupported = []
-    if nnodes != 1:
-        unsupported.append(f"nnodes={nnodes}")
-    if dp_size != 1 and not enable_dp_attention:
-        unsupported.append(f"dp_size={dp_size} without enable_dp_attention")
-    if quantization is not None:
-        unsupported.append(f"quantization={quantization!r}")
-    if unsupported:
-        raise WeightHeterogeneousTransferError(
-            "weight-cache heterogeneous transfer supports only single-node, "
-            "attention DP and unquantized weights; unsupported: "
-            + ", ".join(unsupported)
-        )
     try:
         WeightParallelLayout(
             tp_size=tp_size, dp_size=dp_size, pp_size=pp_size, ep_size=ep_size
@@ -396,19 +212,42 @@ def validate_weight_heterogeneous_transfer_configuration(
     except ValueError as error:
         raise WeightHeterogeneousTransferError(str(error)) from error
 
+    unsupported = []
+    if nnodes != 1:
+        unsupported.append(f"nnodes={nnodes}")
+    if dp_size != 1 and not enable_dp_attention:
+        unsupported.append(f"dp_size={dp_size} without enable_dp_attention")
+    if enable_dp_attention and dp_size > 1 and tp_size // dp_size > 1:
+        unsupported.append(
+            "attention-DP partial replication "
+            f"(tp_size={tp_size}, dp_size={dp_size}, "
+            f"attention_tp_size={tp_size // dp_size})"
+        )
+    if moe_dp_size != 1:
+        unsupported.append(f"moe_dp_size={moe_dp_size}")
+    if attn_cp_size != 1:
+        unsupported.append(f"attn_cp_size={attn_cp_size}")
+    if quantization is not None:
+        unsupported.append(f"quantization={quantization!r}")
+    if unsupported:
+        raise WeightHeterogeneousTransferError(
+            "weight-cache heterogeneous transfer supports only single-node, "
+            "TP/PP/EP, moe_dp_size=1, fully replicated attention DP, "
+            "attn_cp_size=1, and unquantized weights; "
+            "unsupported: "
+            + ", ".join(unsupported)
+        )
+
 
 def _build_weight_runtime_inventory(
     *,
     model: Any,
-    model_config: Any,
     tp_size: int,
     tp_rank: int,
     pp_size: int,
     pp_rank: int,
     ep_size: int,
     dp_size: int,
-    dp_attention_enabled: bool,
-    dp_lm_head_enabled: bool,
     gpu_id: int,
     transfer_endpoint: str,
     model_id: str,
@@ -416,8 +255,6 @@ def _build_weight_runtime_inventory(
     load_plan: Any,
 ):
     from sglang.srt.distributed.parallel_state import (
-        get_attn_tensor_model_parallel_rank,
-        get_attn_tensor_model_parallel_world_size,
         get_moe_expert_parallel_rank,
         get_moe_expert_parallel_world_size,
         get_moe_tensor_parallel_rank,
@@ -430,32 +267,38 @@ def _build_weight_runtime_inventory(
     from sglang.srt.runtime_context import get_parallel
 
     parallel = get_parallel()
-    # Mooncake DP means a complete model replica. Attention DP is only a
-    # replica for attention weights, while FFN weights still span global TP.
-    # Fold it into one logical DP replica and describe its real placement via
-    # attention_tp_rank/size, matching SGLang's proven runtime-manifest model.
+    # Mooncake's TP/EP coordinates describe the MoE factorization. Dense
+    # global-TP shards are represented by hierarchical EP+TP split axes in the
+    # placement descriptor; attention DP remains folded into tensor geometry.
     parallel_topology = WeightParallelTopology(
         dp_rank=0,
         dp_size=1,
-        tp_rank=get_tensor_model_parallel_rank(),
-        tp_size=get_tensor_model_parallel_world_size(),
+        tp_rank=get_moe_tensor_parallel_rank(),
+        tp_size=get_moe_tensor_parallel_world_size(),
         pp_rank=get_pipeline_model_parallel_rank(),
         pp_size=get_pipeline_model_parallel_world_size(),
         ep_rank=get_moe_expert_parallel_rank(),
         ep_size=get_moe_expert_parallel_world_size(),
-        moe_tp_rank=get_moe_tensor_parallel_rank(),
-        moe_tp_size=get_moe_tensor_parallel_world_size(),
-        attention_tp_rank=get_attn_tensor_model_parallel_rank(),
-        attention_tp_size=get_attn_tensor_model_parallel_world_size(),
     )
-    expected_topology = (tp_size, tp_rank, pp_size, pp_rank, ep_size, dp_size)
+    expected_topology = (
+        tp_size,
+        tp_rank,
+        pp_size,
+        pp_rank,
+        ep_size,
+        tp_size // ep_size,
+        dp_size,
+        1,
+    )
     actual_topology = (
-        parallel_topology.tp_size,
-        parallel_topology.tp_rank,
+        get_tensor_model_parallel_world_size(),
+        get_tensor_model_parallel_rank(),
         parallel_topology.pp_size,
         parallel_topology.pp_rank,
         parallel_topology.ep_size,
+        parallel_topology.tp_size,
         parallel.attn_dp_size,
+        parallel.moe_dp_size,
     )
     if actual_topology != expected_topology:
         raise WeightHeterogeneousTransferError(
@@ -470,7 +313,7 @@ def _build_weight_runtime_inventory(
     worker_id = (
         f"weight-cache:{os.getpid()}:gpu{gpu_id}:pp{pp_rank}:tp{tp_rank}:"
         f"adp{parallel.attn_dp_rank}:ep{parallel_topology.ep_rank}:"
-        f"mtp{parallel_topology.moe_tp_rank}"
+        f"mtp{parallel_topology.tp_rank}"
     )
     runtime_inventory = manifest_builder.build(
         model_id=model_id,
@@ -517,11 +360,9 @@ def _initialize_weight_transfer_engine():
 @dataclass
 class WeightsManifestState:
     transfer_engine: Any
-    transfer_endpoint: str
     runtime_inventory: Any | None
     parallel_layout: WeightParallelLayout
     registered_memory_ranges: tuple[tuple[int, int], ...]
-    source_content_checksums: tuple[dict[str, Any], ...]
     inventory_context: dict[str, Any]
 
     @classmethod
@@ -536,8 +377,6 @@ class WeightsManifestState:
         pp_rank: int,
         ep_size: int,
         dp_size: int,
-        dp_attention_enabled: bool,
-        dp_lm_head_enabled: bool,
         gpu_id: int,
         revision: str,
         is_source_daemon: bool,
@@ -547,22 +386,18 @@ class WeightsManifestState:
         registered_memory_ranges: list[tuple[int, int]] = []
         try:
             inventory_context = dict(
-                model_config=model_config,
                 tp_size=tp_size,
                 tp_rank=tp_rank,
                 pp_size=pp_size,
                 pp_rank=pp_rank,
                 ep_size=ep_size,
                 dp_size=dp_size,
-                dp_attention_enabled=dp_attention_enabled,
-                dp_lm_head_enabled=dp_lm_head_enabled,
                 gpu_id=gpu_id,
                 transfer_endpoint=transfer_endpoint,
                 model_id=model_identity_from_config(model_config.hf_config),
                 revision=revision,
             )
             runtime_inventory = None
-            source_content_checksums: tuple[dict[str, Any], ...] = ()
             if is_source_daemon:
                 if load_plan is None:
                     raise WeightHeterogeneousTransferError(
@@ -579,12 +414,8 @@ class WeightsManifestState:
                         runtime_inventory.tensors,
                     )
                 )
-                source_content_checksums = _compute_weight_content_checksums(
-                    model, runtime_inventory
-                )
             return cls(
                 transfer_engine=transfer_engine,
-                transfer_endpoint=transfer_endpoint,
                 runtime_inventory=runtime_inventory,
                 parallel_layout=WeightParallelLayout(
                     tp_size=tp_size,
@@ -593,7 +424,6 @@ class WeightsManifestState:
                     ep_size=ep_size,
                 ),
                 registered_memory_ranges=tuple(registered_memory_ranges),
-                source_content_checksums=source_content_checksums,
                 inventory_context=inventory_context,
             )
         except BaseException:
@@ -670,7 +500,6 @@ class SourceWeightsManifest:
     parallel_layout: WeightParallelLayout
     gpu_ids: tuple[int, ...]
     runtime_inventories: tuple[Any, ...]
-    content_checksum_groups: tuple[tuple[dict[str, Any], ...], ...]
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -683,7 +512,6 @@ class SourceWeightsManifest:
             },
             "gpu_ids": self.gpu_ids,
             "runtime_inventories": self.runtime_inventories,
-            "content_checksum_groups": self.content_checksum_groups,
         }
 
     @classmethod
@@ -699,9 +527,6 @@ class SourceWeightsManifest:
             )
             gpu_ids = tuple(int(value) for value in wire_manifest["gpu_ids"])
             runtime_inventories = tuple(wire_manifest["runtime_inventories"])
-            content_checksum_groups = tuple(
-                tuple(group) for group in wire_manifest["content_checksum_groups"]
-            )
         except (KeyError, TypeError, ValueError) as error:
             raise WeightHeterogeneousTransferError(
                 "registry returned an invalid source weight manifest"
@@ -710,25 +535,21 @@ class SourceWeightsManifest:
         rank_counts = (
             len(gpu_ids),
             len(runtime_inventories),
-            len(content_checksum_groups),
         )
-        if rank_counts != (parallel_layout.world_size,) * 3:
+        if rank_counts != (parallel_layout.world_size,) * 2:
             raise WeightHeterogeneousTransferError(
                 "source manifest rank count mismatch: "
                 f"expected={parallel_layout.world_size}, actual={rank_counts}"
             )
-        if len(gpu_ids) != len(set(gpu_ids)) or any(
-            not group for group in content_checksum_groups
-        ):
+        if len(gpu_ids) != len(set(gpu_ids)):
             raise WeightHeterogeneousTransferError(
-                "source manifest GPU ranks or checksums are invalid"
+                "source manifest GPU ranks are invalid"
             )
         return cls(
             node_id=node_id,
             parallel_layout=parallel_layout,
             gpu_ids=gpu_ids,
             runtime_inventories=runtime_inventories,
-            content_checksum_groups=content_checksum_groups,
         )
 
 
@@ -785,7 +606,6 @@ def register_source_weights_manifest(
             "ep_size": ep_size,
         },
         "runtime_inventory": manifest_state.runtime_inventory_for_wire(),
-        "content_checksums": manifest_state.source_content_checksums,
     }
     deadline = time.monotonic() + timeout
     last_error: Optional[Exception] = None
@@ -844,44 +664,6 @@ def fetch_source_weights_manifest(
     raise WeightHeterogeneousTransferError(
         f"failed to fetch source manifest from {registry_url}: {last_error}"
     )
-
-
-def validate_transferred_weights(
-    *,
-    target_manifest_state: WeightsManifestState,
-    model: Any,
-    source_content_checksum_groups: Sequence[Sequence[dict[str, Any]]],
-) -> dict[str, int]:
-    """Validate logical weight bytes across source and target layouts."""
-    import torch.distributed as dist
-
-    target_content_checksums = _compute_weight_content_checksums(
-        model, target_manifest_state.runtime_inventory
-    )
-    target_rank_checksums: list[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(target_rank_checksums, target_content_checksums)
-    expected_weights = _aggregate_weight_content_checksums(
-        source_content_checksum_groups
-    )
-    transferred_weights = _aggregate_weight_content_checksums(target_rank_checksums)
-    if expected_weights != transferred_weights:
-        source_ids = set(expected_weights)
-        target_ids = set(transferred_weights)
-        differing = sorted(
-            tensor_id
-            for tensor_id in source_ids & target_ids
-            if expected_weights[tensor_id] != transferred_weights[tensor_id]
-        )
-        raise WeightHeterogeneousTransferError(
-            "heterogeneous weight transfer checksum mismatch: "
-            f"source_only={sorted(source_ids - target_ids)[:5]}, "
-            f"target_only={sorted(target_ids - source_ids)[:5]}, "
-            f"differing={differing[:5]}"
-        )
-    return {
-        "validated_tensors": len(expected_weights),
-        "validated_bytes": sum(item[1] for item in expected_weights.values()),
-    }
 
 
 def pull_weights_from_source(
@@ -1001,6 +783,41 @@ def pull_weights_from_source(
     }
 
 
+def _all_gather_rank_local_phase(
+    phase: str,
+    operation: Callable[[], Any],
+) -> list[Any]:
+    """Run a rank-local phase and make every rank observe any local failure."""
+    import torch.distributed as dist
+
+    local_error: Optional[Exception] = None
+    try:
+        local_result = operation()
+        local_status = {"error": None, "result": local_result}
+    except Exception as error:
+        local_error = error
+        local_status = {
+            "error": f"{type(error).__name__}: {error}",
+            "result": None,
+        }
+
+    rank_statuses: list[Any] = [None] * dist.get_world_size()
+    dist.all_gather_object(rank_statuses, local_status)
+    failures = [
+        f"rank {rank}: {status['error']}"
+        for rank, status in enumerate(rank_statuses)
+        if status["error"] is not None
+    ]
+    if failures:
+        aggregated_error = WeightHeterogeneousTransferError(
+            f"{phase} failed on target rank(s): " + "; ".join(failures)
+        )
+        if local_error is not None:
+            raise aggregated_error from local_error
+        raise aggregated_error
+    return [status["result"] for status in rank_statuses]
+
+
 def transfer_weights_from_source_daemons(
     *,
     target_manifest_state: WeightsManifestState,
@@ -1052,30 +869,30 @@ def transfer_weights_from_source_daemons(
                 f"overlapping ranks: {overlap}"
             )
 
-    target_manifest_state.prepare_target(
-        model=model,
-        source_runtime_inventories=source_weights_manifest.runtime_inventories,
+    def prepare_target() -> Any:
+        target_manifest_state.prepare_target(
+            model=model,
+            source_runtime_inventories=source_weights_manifest.runtime_inventories,
+        )
+        return target_manifest_state.runtime_inventory_for_wire()
+
+    target_runtime_inventories = _all_gather_rank_local_phase(
+        "prepare_target",
+        prepare_target,
     )
 
-    target_runtime_inventories: list[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(
-        target_runtime_inventories,
-        target_manifest_state.runtime_inventory_for_wire(),
-    )
-    transfer_stats = pull_weights_from_source(
-        target_manifest_state=target_manifest_state,
-        source_runtime_inventories=source_weights_manifest.runtime_inventories,
-        source_parallel_layout=source_weights_manifest.parallel_layout,
-        target_runtime_inventories=target_runtime_inventories,
-    )
-    rebuild_transferred_weight_state(model)
-    transfer_stats.update(
-        validate_transferred_weights(
+    transfer_stats_by_rank = _all_gather_rank_local_phase(
+        "pull",
+        lambda: pull_weights_from_source(
             target_manifest_state=target_manifest_state,
-            model=model,
-            source_content_checksum_groups=(
-                source_weights_manifest.content_checksum_groups
-            ),
-        )
+            source_runtime_inventories=source_weights_manifest.runtime_inventories,
+            source_parallel_layout=source_weights_manifest.parallel_layout,
+            target_runtime_inventories=target_runtime_inventories,
+        ),
+    )
+    transfer_stats = transfer_stats_by_rank[dist.get_rank()]
+    _all_gather_rank_local_phase(
+        "rebuild",
+        lambda: rebuild_transferred_weight_state(model),
     )
     return transfer_stats

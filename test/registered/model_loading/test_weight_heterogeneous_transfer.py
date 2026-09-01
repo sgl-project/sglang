@@ -3,7 +3,7 @@
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
@@ -12,8 +12,10 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.weight_cache.daemon import (
     WeightCacheDaemon,
     WeightCacheDaemonArgs,
+    _prepare_weight_heterogeneous_transfer,
     launch_weight_cache_daemons,
 )
+from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
 from sglang.srt.weight_cache.mooncake_weight_adapter import (
     _parallel_axes,
     build_mooncake_weight_manifests,
@@ -23,6 +25,7 @@ from sglang.srt.weight_cache.weight_heterogeneous_transfer import (
     SourceWeightsManifest,
     WeightHeterogeneousTransferError,
     WeightParallelLayout,
+    _all_gather_rank_local_phase,
     _initialize_weight_transfer_engine,
     fetch_source_weights_manifest,
     register_source_weights_manifest,
@@ -78,6 +81,75 @@ def _daemon_server_args(**overrides):
 
 
 class TestWeightHeterogeneousTransfer(unittest.TestCase):
+    def test_daemon_exports_exact_plain_derived_tensor_for_ipc_client(self):
+        class DerivedLayer(torch.nn.Module):
+            def __init__(self, derived):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(2))
+                self.w_kc = derived
+                self.w_scale = 1.0
+                self.use_deep_gemm_bmm = derived is not None
+
+        class Model(torch.nn.Module):
+            def __init__(self, derived):
+                super().__init__()
+                self.layer = DerivedLayer(derived)
+
+        derived = torch.arange(24).reshape(2, 3, 4).transpose(1, 2)
+        daemon = object.__new__(WeightCacheDaemon)
+        daemon.model = Model(derived)
+        daemon.gpu_id = 0
+        daemon.state_entries = {}
+
+        captured = {}
+        backend = MagicMock()
+        backend.name = "test"
+
+        def prepare_export(state_tensors):
+            captured.update(state_tensors)
+            return {
+                name: {"handle": b"", "is_param": is_param}
+                for name, (_, is_param) in state_tensors.items()
+            }
+
+        backend.prepare_export.side_effect = prepare_export
+        with patch(
+            "sglang.srt.weight_cache.daemon.choose_daemon_transport_backend",
+            return_value=backend,
+        ):
+            daemon._export_state()
+
+        exported, is_param = captured["layer.w_kc"]
+        self.assertFalse(is_param)
+        self.assertEqual(exported.data_ptr(), derived.data_ptr())
+        self.assertEqual(exported.stride(), derived.stride())
+        self.assertTrue(daemon.state_entries["layer.w_kc"]["is_plain_tensor"])
+        self.assertNotIn("layer.w_scale", captured)
+        self.assertEqual(
+            daemon.state_entries["layer.w_scale"]["value"], 1.0
+        )
+        self.assertTrue(
+            daemon.state_entries["layer.use_deep_gemm_bmm"]["value"]
+        )
+
+        client = Model(None)
+        imported = torch.full(derived.shape, 7, dtype=derived.dtype)
+        IpcModelLoader._set_plain_module_tensor(
+            client, "layer.w_kc", imported
+        )
+        self.assertIs(client.layer.w_kc, imported)
+        self.assertNotIn("w_kc", client.layer._parameters)
+        self.assertNotIn("w_kc", client.layer._buffers)
+        imported_scale = torch.tensor(3.0)
+        IpcModelLoader._set_plain_module_tensor(
+            client, "layer.w_scale", imported_scale
+        )
+        self.assertIs(client.layer.w_scale, imported_scale)
+        IpcModelLoader._set_plain_module_value(
+            client, "layer.use_deep_gemm_bmm", True
+        )
+        self.assertTrue(client.layer.use_deep_gemm_bmm)
+
     def test_source_capture_isolated_to_daemon_loader_instance(self):
         class Model(torch.nn.Module):
             def __init__(self):
@@ -511,6 +583,92 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 execute_writes=False,
             )
 
+    def test_recorder_rejects_index_after_shape_changing_view(self):
+        class ReshapeSelectModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.empty(3, 2))
+
+            def load_weights(self, weights):
+                for _, loaded_weight in weights:
+                    selected = loaded_weight.reshape(3, 2, 4).select(2, 0)
+                    self.weight.data.copy_(selected)
+
+        with self.assertRaisesRegex(
+            WeightLoadRecordingError, "select after shape-changing view"
+        ):
+            WeightLoadRecorder().record_model_load(
+                ReshapeSelectModel(),
+                (("weight", torch.empty(2, 3, 4)),),
+                execute_writes=False,
+            )
+
+    def test_runtime_manifest_includes_checkpoint_loaded_buffer(self):
+        class BufferModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(2))
+                self.register_buffer("weight_scale", torch.zeros(2))
+
+            def load_weights(self, weights):
+                destinations = {
+                    "weight": self.weight.data,
+                    "weight_scale": self.weight_scale,
+                }
+                for name, loaded_weight in weights:
+                    destinations[name].copy_(loaded_weight)
+
+        source = BufferModel()
+        recorder = WeightLoadRecorder()
+        recorder.record_model_load(
+            source,
+            (
+                ("weight", torch.ones(2)),
+                ("weight_scale", torch.full((2,), 2.0)),
+            ),
+            execute_writes=True,
+        )
+        source_plan = recorder.build_plan()
+
+        target = BufferModel()
+        target_plan = record_target_weight_load_plan(
+            target, source_plan.logical_weights
+        )
+        self.assertTrue(torch.equal(target.weight_scale, torch.zeros(2)))
+
+        def build_manifest(model, plan, worker):
+            return ImmutableWeightRuntimeManifestBuilder(
+                model=model,
+                load_plan=plan,
+                topology=WeightParallelTopology(),
+                allowed_devices=("cpu",),
+            ).build(
+                model_id="model",
+                revision="revision",
+                instance_id=worker,
+                worker_id=worker,
+                endpoint="127.0.0.1:1",
+            )
+
+        for manifest in (
+            build_manifest(source, source_plan, "source"),
+            build_manifest(target, target_plan, "target"),
+        ):
+            self.assertEqual(
+                {tensor.runtime_name for tensor in manifest.tensors},
+                {"weight", "weight_scale"},
+            )
+
+        source.weight_scale = source.weight_scale.clone()
+        with self.assertRaisesRegex(
+            WeightManifestError, "recorded tensor storage changed"
+        ):
+            build_manifest(
+                source,
+                source_plan,
+                "replaced-buffer",
+            )
+
     def test_manifest_rejects_parameter_not_covered_by_native_loader(self):
         class IncompleteModel(torch.nn.Module):
             def __init__(self):
@@ -546,24 +704,65 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 endpoint="127.0.0.1:1",
             )
 
-    def test_weight_parallel_layout_supports_attention_dp_pp_and_ep(self):
+    def test_weight_parallel_layout_supports_ep_and_rejects_unsupported_dp(self):
         validate_weight_heterogeneous_transfer_configuration(
-            tp_size=8,
+            tp_size=2,
             dp_size=2,
-            ep_size=4,
+            ep_size=1,
             pp_size=2,
             enable_dp_attention=True,
             quantization=None,
         )
-        parallel_layout = WeightParallelLayout(
-            tp_size=4, dp_size=2, pp_size=2, ep_size=2
-        )
-        self.assertEqual(parallel_layout.world_size, 8)
+        parallel_layout = WeightParallelLayout(tp_size=2, dp_size=2, pp_size=2)
+        self.assertEqual(parallel_layout.world_size, 4)
         self.assertEqual(parallel_layout.dp_size, 2)
         self.assertEqual(
             tuple(parallel_layout.iter_ranks()),
-            tuple((pp, tp) for pp in range(2) for tp in range(4)),
+            tuple((pp, tp) for pp in range(2) for tp in range(2)),
         )
+        with self.assertRaisesRegex(
+            WeightHeterogeneousTransferError, "attention-DP partial replication"
+        ):
+            validate_weight_heterogeneous_transfer_configuration(
+                tp_size=8,
+                dp_size=2,
+                ep_size=1,
+                pp_size=1,
+                enable_dp_attention=True,
+                quantization=None,
+            )
+        validate_weight_heterogeneous_transfer_configuration(
+            tp_size=4,
+            dp_size=1,
+            ep_size=2,
+            pp_size=1,
+            enable_dp_attention=False,
+            quantization=None,
+        )
+        with self.assertRaisesRegex(
+            WeightHeterogeneousTransferError, "moe_dp_size=2"
+        ):
+            validate_weight_heterogeneous_transfer_configuration(
+                tp_size=4,
+                dp_size=1,
+                ep_size=2,
+                pp_size=1,
+                enable_dp_attention=False,
+                moe_dp_size=2,
+                quantization=None,
+            )
+        with self.assertRaisesRegex(
+            WeightHeterogeneousTransferError, "attn_cp_size=2"
+        ):
+            validate_weight_heterogeneous_transfer_configuration(
+                tp_size=4,
+                dp_size=1,
+                ep_size=2,
+                pp_size=1,
+                enable_dp_attention=False,
+                attn_cp_size=2,
+                quantization=None,
+            )
         with self.assertRaisesRegex(
             WeightHeterogeneousTransferError, "without enable_dp_attention"
         ):
@@ -596,32 +795,27 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 quantization="fp8",
             )
 
-    def test_local_expert_axis_is_not_misclassified_as_tp(self):
+    def test_parallel_axes_use_inferred_process_semantics(self):
         from mooncake.reshard.weight import ReplicatedAxis, SplitAxis
 
-        tensor = {"shard_dims": (0, 2), "expert_id": None}
-        self.assertEqual(
-            _parallel_axes(tensor, tp_size=2, pp_size=1, ep_size=1),
-            (SplitAxis("tp", dim=2),),
-        )
-        self.assertEqual(
-            _parallel_axes(tensor, tp_size=4, pp_size=1, ep_size=2),
-            (
-                SplitAxis("ep", dim=0),
-                SplitAxis("tp", dim=2),
-            ),
-        )
+        tensor = {"tensor_id": "tensor", "expert_id": None}
         self.assertEqual(
             _parallel_axes(
-                {
-                    "shard_dims": (0,),
-                    "global_shape": (32, 8),
-                    "local_shape": (32, 8),
-                    "expert_id": None,
-                },
+                tensor,
                 tp_size=2,
                 pp_size=1,
                 ep_size=1,
+                tp_split_dims=(2,),
+            ),
+            (SplitAxis("tp", dim=2),),
+        )
+        self.assertEqual(
+            _parallel_axes(
+                tensor,
+                tp_size=2,
+                pp_size=1,
+                ep_size=1,
+                tp_replicated=True,
             ),
             (ReplicatedAxis("tp"),),
         )
@@ -688,6 +882,189 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         self.assertEqual(descriptor.parallel_axes, (ReplicatedAxis("tp"),))
         self.assertEqual(descriptor.shard_dims, ())
 
+    def test_ep_moe_tp_manifest_reshards_to_different_ep_layout(self):
+        from math import prod
+
+        from mooncake.reshard.weight import (
+            OwnershipAxis,
+            ReplicatedAxis,
+            SplitAxis,
+            plan_placement_transfer,
+        )
+
+        def contiguous_stride(shape):
+            stride = 1
+            result = []
+            for extent in reversed(shape):
+                result.append(stride)
+                stride *= extent
+            return tuple(reversed(result))
+
+        def make_inventories(*, ep_size, moe_tp_size, prefix, address_base):
+            inventories = []
+            num_experts = 4
+            experts_per_rank = num_experts // ep_size
+            for ep_rank in range(ep_size):
+                for tp_rank in range(moe_tp_size):
+                    tensors = []
+
+                    def add_tensor(
+                        tensor_id,
+                        global_shape,
+                        global_offset,
+                        local_shape,
+                        shard_dims,
+                        *,
+                        expert_id=None,
+                    ):
+                        tensor_index = len(tensors)
+                        address = (
+                            address_base
+                            + (ep_rank * moe_tp_size + tp_rank) * 0x100000
+                            + tensor_index * 0x10000
+                        )
+                        tensors.append(
+                            {
+                                "fragment_id": (
+                                    f"{prefix}:e{ep_rank}:t{tp_rank}:"
+                                    f"{tensor_index}:{tensor_id}"
+                                ),
+                                "tensor_id": tensor_id,
+                                "runtime_name": tensor_id,
+                                "global_shape": global_shape,
+                                "global_offset": global_offset,
+                                "local_shape": local_shape,
+                                "dtype": "bfloat16",
+                                "itemsize": 2,
+                                "shard_dims": shard_dims,
+                                "layer_id": 0,
+                                "expert_id": expert_id,
+                                "layout_fingerprint": "ep-moe-tp-test",
+                                "address": address,
+                                "nbytes": prod(local_shape) * 2,
+                                "byte_offset": 0,
+                                "stride": contiguous_stride(local_shape),
+                                "storage_offset": 0,
+                                "device": f"cuda:{ep_rank * moe_tp_size + tp_rank}",
+                                "worker_id": f"{prefix}-e{ep_rank}-t{tp_rank}",
+                                "endpoint": f"127.0.0.1:{2000 + ep_rank * moe_tp_size + tp_rank}",
+                                "rank": {
+                                    "dp": 0,
+                                    "tp": tp_rank,
+                                    "pp": 0,
+                                    "ep": ep_rank,
+                                },
+                            }
+                        )
+
+                    global_tp_rank = ep_rank * moe_tp_size + tp_rank
+                    global_tp_size = ep_size * moe_tp_size
+                    for internal_part in range(2):
+                        add_tensor(
+                            "model.layers.0.dense.weight",
+                            (4, 8),
+                            (
+                                internal_part * 2,
+                                global_tp_rank * (8 // global_tp_size),
+                            ),
+                            (2, 8 // global_tp_size),
+                            (0, 1),
+                        )
+                    add_tensor(
+                        "model.layers.0.experts.weight",
+                        (num_experts, 8),
+                        (ep_rank * experts_per_rank, tp_rank * (8 // moe_tp_size)),
+                        (experts_per_rank, 8 // moe_tp_size),
+                        tuple(dim for dim, size in enumerate((ep_size, moe_tp_size)) if size > 1),
+                    )
+                    first_expert = ep_rank * experts_per_rank
+                    for expert_id in range(
+                        first_expert, first_expert + experts_per_rank
+                    ):
+                        add_tensor(
+                            f"model.layers.0.experts.{expert_id}.weight",
+                            (2, 8),
+                            (0, tp_rank * (8 // moe_tp_size)),
+                            (2, 8 // moe_tp_size),
+                            (1,) if moe_tp_size > 1 else (),
+                            expert_id=expert_id,
+                        )
+                        for internal_part in range(2):
+                            add_tensor(
+                                f"model.layers.0.experts.{expert_id}.replicated",
+                                (4, 4),
+                                (internal_part * 2, 0),
+                                (2, 4),
+                                (0,),
+                                expert_id=expert_id,
+                            )
+
+                    inventories.append(
+                        {
+                            "model_id": "model",
+                            "revision": "revision",
+                            "instance_id": f"{prefix}-e{ep_rank}-t{tp_rank}",
+                            "generation": IMMUTABLE_WEIGHT_GENERATION,
+                            "tensors": tensors,
+                        }
+                    )
+            return tuple(inventories)
+
+        source_inventories = make_inventories(
+            ep_size=2,
+            moe_tp_size=2,
+            prefix="source",
+            address_base=0x1000000,
+        )
+        target_inventories = make_inventories(
+            ep_size=4,
+            moe_tp_size=1,
+            prefix="target",
+            address_base=0x2000000,
+        )
+        source, _ = build_mooncake_weight_manifests(
+            source_inventories,
+            placement_set_id="source",
+            tp_size=4,
+            pp_size=1,
+            ep_size=2,
+        )
+        target, _ = build_mooncake_weight_manifests(
+            target_inventories,
+            placement_set_id="target",
+            tp_size=4,
+            pp_size=1,
+            ep_size=4,
+        )
+
+        descriptors = {
+            tensor.tensor_id: tensor
+            for part in source.parts
+            for tensor in part.tensors
+        }
+        self.assertEqual(
+            descriptors["model.layers.0.dense.weight"].parallel_axes,
+            (SplitAxis("ep", dim=1), SplitAxis("tp", dim=1)),
+        )
+        self.assertEqual(
+            descriptors["model.layers.0.experts.weight"].parallel_axes,
+            (SplitAxis("ep", dim=0), SplitAxis("tp", dim=1)),
+        )
+        self.assertEqual(
+            descriptors["model.layers.0.experts.0.weight"].parallel_axes,
+            (OwnershipAxis("ep"), SplitAxis("tp", dim=1)),
+        )
+        self.assertEqual(
+            descriptors[
+                "model.layers.0.experts.0.replicated"
+            ].parallel_axes,
+            (OwnershipAxis("ep"), ReplicatedAxis("tp")),
+        )
+        logical_plan = plan_placement_transfer(source, target)
+        self.assertTrue(logical_plan.operations)
+        reverse_plan = plan_placement_transfer(target, source)
+        self.assertTrue(reverse_plan.operations)
+
     def test_manifest_server_aggregates_source_ranks(self):
         server = object.__new__(WeightManifestServer)
         server.expected_rank_count = 2
@@ -714,7 +1091,6 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                         "revision": "revision",
                         "rank": global_rank,
                     },
-                    "content_checksums": [{"rank": global_rank}],
                 }
             )
 
@@ -737,7 +1113,6 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             "revision": "revision",
             "rank": 0,
         }
-        manifest_state.source_content_checksums = ({"rank": 0},)
         try:
             register_source_weights_manifest(
                 registry_url,
@@ -760,7 +1135,6 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             actual.runtime_inventories,
             ({"model_id": "model", "revision": "revision", "rank": 0},),
         )
-        self.assertEqual(actual.content_checksum_groups, (({"rank": 0},),))
 
     def test_target_rejects_overlap_after_fetching_source_manifest(self):
         source = SourceWeightsManifest(
@@ -768,7 +1142,6 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             parallel_layout=WeightParallelLayout(1),
             gpu_ids=(0,),
             runtime_inventories=({"rank": 0},),
-            content_checksum_groups=(({"rank": 0},),),
         )
 
         def all_gather(output, _local):
@@ -810,11 +1183,10 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             parallel_layout=WeightParallelLayout(1),
             gpu_ids=(0,),
             runtime_inventories=({"rank": 0},),
-            content_checksum_groups=(({"rank": 0},),),
         )
 
-        def all_gather(output, _local):
-            output[:] = [0]
+        def all_gather(output, local):
+            output[:] = [local]
 
         with (
             patch(
@@ -836,10 +1208,6 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             patch(
                 "sglang.srt.weight_cache.weight_heterogeneous_transfer.rebuild_transferred_weight_state"
             ),
-            patch(
-                "sglang.srt.weight_cache.weight_heterogeneous_transfer.validate_transferred_weights",
-                return_value={},
-            ),
         ):
             transfer_weights_from_source_daemons(
                 target_manifest_state=MagicMock(),
@@ -849,6 +1217,23 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             )
 
         pull.assert_called_once()
+
+    def test_rank_local_phase_propagates_failure_to_every_rank(self):
+        def all_gather(output, local):
+            output[:] = [local]
+
+        def fail():
+            raise RuntimeError("rank-local boom")
+
+        with (
+            patch("torch.distributed.get_world_size", return_value=1),
+            patch("torch.distributed.all_gather_object", side_effect=all_gather),
+        ):
+            with self.assertRaisesRegex(
+                WeightHeterogeneousTransferError,
+                "pull failed on target rank.*rank 0.*rank-local boom",
+            ):
+                _all_gather_rank_local_phase("pull", fail)
 
     def test_heterogeneous_socket_paths_use_physical_gpu_rank(self):
         daemon = WeightCacheDaemon(
@@ -942,6 +1327,68 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 }
             ],
         )
+
+    def test_source_registry_url_uses_actual_bind_host_and_port(self):
+        cases = (
+            ("0.0.0.0", "tcp://127.0.0.1:43210"),
+            ("::", "tcp://[::1]:43210"),
+            ("10.0.0.8", "tcp://10.0.0.8:43210"),
+            ("::1", "tcp://[::1]:43210"),
+        )
+        for bind_host, expected_url in cases:
+            with self.subTest(bind_host=bind_host):
+                manifest_server = MagicMock()
+                manifest_server.port = 43210
+                with patch(
+                    "sglang.srt.weight_cache.weight_manifest_server.WeightManifestServer",
+                    return_value=manifest_server,
+                ):
+                    actual_server, registry_url = (
+                        _prepare_weight_heterogeneous_transfer(
+                            _daemon_server_args(),
+                            WeightCacheDaemonArgs(
+                                enable_weight_heterogeneous_copy=True,
+                                weight_heterogeneous_transfer_server_host=bind_host,
+                                weight_heterogeneous_transfer_server_port=31999,
+                            ),
+                            expected_rank_count=1,
+                        )
+                    )
+                self.assertIs(actual_server, manifest_server)
+                self.assertEqual(registry_url, expected_url)
+
+    def test_launcher_cleans_up_after_partial_spawn_failure(self):
+        manifest_server = MagicMock()
+        process = MagicMock(pid=123)
+        process.is_alive.side_effect = (True, True)
+
+        with (
+            patch(
+                "sglang.srt.weight_cache.daemon._prepare_weight_heterogeneous_transfer",
+                return_value=(manifest_server, "tcp://source:31999"),
+            ),
+            patch("sglang.srt.weight_cache.daemon.cleanup_stale_daemon_files"),
+            patch(
+                "sglang.srt.weight_cache.daemon.spawn_weight_cache_daemon",
+                side_effect=(process, RuntimeError("second spawn failed")),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "second spawn failed"):
+                launch_weight_cache_daemons(
+                    _daemon_server_args(tp_size=2),
+                    dist_init_method="tcp://127.0.0.1:12345",
+                    daemon_args=WeightCacheDaemonArgs(
+                        enable_weight_heterogeneous_copy=True
+                    ),
+                )
+
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        self.assertEqual(
+            process.join.call_args_list,
+            [call(timeout=5), call()],
+        )
+        manifest_server.close.assert_called_once_with()
 
     def test_target_launcher_passes_manifest_registry_url(self):
         process = MagicMock(pid=123, exitcode=0)

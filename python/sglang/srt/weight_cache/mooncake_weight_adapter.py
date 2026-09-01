@@ -75,47 +75,185 @@ def immutable_weight_allocation_guards(
     }
 
 
-def _infer_tp_replicated_tensor_ids(
-    inventories: Sequence[dict[str, Any]], *, tp_size: int
-) -> frozenset[str]:
-    """Find logical tensors with identical fragment geometry on every TP rank.
-
-    A native loader may split one checkpoint tensor into several writes even
-    when every rank owns a complete replica.  Per-fragment ``shard_dims``
-    cannot distinguish those internal writes from an actual TP partition, so
-    make that decision only after all rank inventories are available.
-    """
-
-    if tp_size <= 1:
-        return frozenset()
-
-    geometry_by_tensor: dict[
-        str, dict[int, set[tuple[tuple[int, ...], tuple[int, ...]]]]
-    ] = {}
-    for inventory in inventories:
-        for tensor in inventory["tensors"]:
-            tensor_id = tensor["tensor_id"]
-            tp_rank = int(tensor["rank"]["tp"])
-            geometry_by_tensor.setdefault(tensor_id, {}).setdefault(
-                tp_rank, set()
-            ).add(
+def _geometry_signature(tensors: Sequence[dict[str, Any]]) -> tuple[Any, ...]:
+    return tuple(
+        sorted(
+            {
                 (
                     tuple(tensor["global_offset"]),
                     tuple(tensor["local_shape"]),
                 )
-            )
+                for tensor in tensors
+            }
+        )
+    )
 
-    expected_ranks = set(range(tp_size))
+
+def _index_tensor_geometry(
+    inventories: Sequence[dict[str, Any]],
+) -> dict[str, dict[tuple[int, int, int], list[dict[str, Any]]]]:
+    """Index fragments by logical tensor and (PP, EP, MoE-TP) rank."""
+    result: dict[
+        str, dict[tuple[int, int, int], list[dict[str, Any]]]
+    ] = {}
+    for inventory in inventories:
+        for tensor in inventory["tensors"]:
+            rank = tensor["rank"]
+            coordinate = (
+                int(rank["pp"]),
+                int(rank["ep"]),
+                int(rank["tp"]),
+            )
+            result.setdefault(tensor["tensor_id"], {}).setdefault(
+                coordinate, []
+            ).append(tensor)
+    return result
+
+
+def _infer_replicated_tensor_ids(
+    geometry_index: dict[
+        str, dict[tuple[int, int, int], list[dict[str, Any]]]
+    ],
+    *,
+    axis: str,
+    axis_size: int,
+) -> frozenset[str]:
+    """Find tensors whose complete fragment geometry repeats over one axis."""
+    if axis_size <= 1:
+        return frozenset()
+    if axis not in ("ep", "tp"):
+        raise ValueError(f"unsupported replication axis: {axis}")
+
+    axis_index = 1 if axis == "ep" else 2
+    fixed_indices = (0, 2) if axis == "ep" else (0, 1)
+    expected = set(range(axis_size))
     replicated = set()
-    for tensor_id, geometry_by_rank in geometry_by_tensor.items():
-        if set(geometry_by_rank) != expected_ranks:
+    for tensor_id, geometry_by_rank in geometry_index.items():
+        if axis == "ep" and any(
+            tensor.get("expert_id") is not None
+            for tensors in geometry_by_rank.values()
+            for tensor in tensors
+        ):
             continue
-        signatures = {
-            tuple(sorted(geometry)) for geometry in geometry_by_rank.values()
-        }
-        if len(signatures) == 1:
+        groups: dict[tuple[int, int], dict[int, list[dict[str, Any]]]] = {}
+        for coordinate, tensors in geometry_by_rank.items():
+            fixed = tuple(coordinate[index] for index in fixed_indices)
+            groups.setdefault(fixed, {})[coordinate[axis_index]] = tensors
+        if all(
+            set(geometry_by_axis) == expected
+            and len(
+                {
+                    _geometry_signature(tensors)
+                    for tensors in geometry_by_axis.values()
+                }
+            )
+            == 1
+            for geometry_by_axis in groups.values()
+        ):
             replicated.add(tensor_id)
     return frozenset(replicated)
+
+
+def _merge_intervals(
+    intervals: Sequence[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    merged: list[list[int]] = []
+    for begin, end in sorted(set(intervals)):
+        if not merged or begin > merged[-1][1]:
+            merged.append([begin, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return tuple((begin, end) for begin, end in merged)
+
+
+def _infer_split_dims(
+    geometry_index: dict[
+        str, dict[tuple[int, int, int], list[dict[str, Any]]]
+    ],
+    *,
+    axis: str,
+    axis_size: int,
+) -> dict[str, tuple[int, ...]]:
+    """Infer process split dims from complete cross-rank logical geometry."""
+    if axis_size <= 1:
+        return {}
+    if axis not in ("ep", "tp"):
+        raise ValueError(f"unsupported split axis: {axis}")
+
+    axis_index = 1 if axis == "ep" else 2
+    expected = set(range(axis_size))
+    result = {}
+    for tensor_id, geometry_by_rank in geometry_index.items():
+        if axis == "ep" and any(
+            tensor.get("expert_id") is not None
+            for tensors in geometry_by_rank.values()
+            for tensor in tensors
+        ):
+            continue
+
+        geometry_by_pp: dict[
+            int, dict[tuple[int, int, int], list[dict[str, Any]]]
+        ] = {}
+        for coordinate, tensors in geometry_by_rank.items():
+            geometry_by_pp.setdefault(coordinate[0], {})[coordinate] = tensors
+
+        inferred_by_pp = []
+        for pp_geometry in geometry_by_pp.values():
+            all_tensors = [
+                tensor
+                for tensors in pp_geometry.values()
+                for tensor in tensors
+            ]
+            candidates = sorted(
+                {
+                    dim
+                    for tensor in all_tensors
+                    for dim in tuple(tensor.get("shard_dims") or ())
+                    if int(tensor["local_shape"][dim])
+                    != int(tensor["global_shape"][dim])
+                }
+            )
+            split_dims = []
+            for dim in candidates:
+                extents = {
+                    int(tensor["global_shape"][dim])
+                    for tensor in all_tensors
+                }
+                if len(extents) != 1:
+                    raise WeightManifestError(
+                        f"global shape differs across fragments: {tensor_id}"
+                    )
+                intervals_by_rank: dict[int, list[tuple[int, int]]] = {}
+                for coordinate, tensors in pp_geometry.items():
+                    rank = coordinate[axis_index]
+                    for tensor in tensors:
+                        begin = int(tensor["global_offset"][dim])
+                        end = begin + int(tensor["local_shape"][dim])
+                        intervals_by_rank.setdefault(rank, []).append(
+                            (begin, end)
+                        )
+                if set(intervals_by_rank) != expected:
+                    continue
+                owned = sorted(
+                    (begin, end, rank)
+                    for rank, intervals in intervals_by_rank.items()
+                    for begin, end in _merge_intervals(intervals)
+                )
+                cursor = 0
+                for begin, end, _ in owned:
+                    if begin != cursor:
+                        break
+                    cursor = end
+                else:
+                    if cursor == next(iter(extents)):
+                        split_dims.append(dim)
+            inferred_by_pp.append(tuple(split_dims))
+
+        if len(set(inferred_by_pp)) == 1:
+            dims = inferred_by_pp[0]
+            if dims:
+                result[tensor_id] = dims
+    return result
 
 
 def _parallel_axes(
@@ -124,6 +262,9 @@ def _parallel_axes(
     tp_size: int,
     pp_size: int,
     ep_size: int,
+    ep_split_dims: tuple[int, ...] = (),
+    tp_split_dims: tuple[int, ...] = (),
+    ep_replicated: bool = False,
     tp_replicated: bool = False,
 ) -> tuple[Any, ...]:
     from mooncake.reshard.weight import (
@@ -132,42 +273,32 @@ def _parallel_axes(
         SplitAxis,
     )
 
+    if len(ep_split_dims) > 1 or len(tp_split_dims) > 1:
+        raise WeightManifestError(
+            "runtime tensor has unsupported multi-dimensional parallel shards: "
+            f"{tensor['tensor_id']}"
+        )
+
     axes = []
     if pp_size > 1:
         axes.append(OwnershipAxis("pp"))
 
-    declared_shard_dims = tuple(tensor.get("shard_dims") or ())
-    global_shape = tuple(tensor.get("global_shape") or ())
-    local_shape = tuple(tensor.get("local_shape") or ())
-    shard_dims = tuple(
-        dim
-        for dim in declared_shard_dims
-        if not global_shape or not local_shape or local_shape[dim] != global_shape[dim]
-    )
-    ep_dim = None
     if tensor.get("expert_id") is not None:
-        axes.append(OwnershipAxis("ep"))
-    elif 0 in shard_dims and (ep_size > 1 or len(declared_shard_dims) > 1):
-        # Aggregated MoE tensors are emitted as one logical fragment per
-        # expert. Even with EP=1, dim 0 is the locally enumerated expert axis,
-        # not a second TP split axis.
-        ep_dim = 0
         if ep_size > 1:
-            axes.append(SplitAxis("ep", dim=ep_dim))
+            axes.append(OwnershipAxis("ep"))
+    elif ep_split_dims:
+        axes.append(SplitAxis("ep", dim=ep_split_dims[0]))
+    elif ep_size > 1:
+        axes.append(
+            ReplicatedAxis("ep") if ep_replicated else OwnershipAxis("ep")
+        )
 
-    tp_dims = (
-        ()
-        if tp_replicated
-        else tuple(dim for dim in shard_dims if dim != ep_dim)
-    )
-    if tp_dims:
-        if len(tp_dims) != 1:
-            raise WeightManifestError(
-                "runtime tensor has unsupported TP shard semantics"
-            )
-        axes.append(SplitAxis("tp", dim=tp_dims[0]))
-    elif tp_size > 1 and ep_dim is None and tensor.get("expert_id") is None:
-        axes.append(ReplicatedAxis("tp"))
+    if tp_split_dims:
+        axes.append(SplitAxis("tp", dim=tp_split_dims[0]))
+    elif tp_size > 1:
+        axes.append(
+            ReplicatedAxis("tp") if tp_replicated else OwnershipAxis("tp")
+        )
     return tuple(axes)
 
 
@@ -179,7 +310,7 @@ def build_mooncake_weight_manifests(
     pp_size: int,
     ep_size: int,
 ):
-    """Build one Mooncake placement and its per-participant runtime bindings."""
+    """Build a placement using SGLang global TP factored as EP × MoE-TP."""
     from mooncake.reshard.weight import (
         ParallelRank,
         ParallelTopology,
@@ -196,8 +327,31 @@ def build_mooncake_weight_manifests(
     inventories = tuple(msgspec.to_builtins(item) for item in runtime_inventories)
     if not inventories:
         raise WeightManifestError("runtime inventory set must not be empty")
-    tp_replicated_tensor_ids = _infer_tp_replicated_tensor_ids(
-        inventories, tp_size=tp_size
+    if tp_size % ep_size != 0:
+        raise WeightManifestError(
+            f"tp_size={tp_size} must be divisible by ep_size={ep_size}"
+        )
+    moe_tp_size = tp_size // ep_size
+    geometry_index = _index_tensor_geometry(inventories)
+    ep_replicated_tensor_ids = _infer_replicated_tensor_ids(
+        geometry_index,
+        axis="ep",
+        axis_size=ep_size,
+    )
+    tp_replicated_tensor_ids = _infer_replicated_tensor_ids(
+        geometry_index,
+        axis="tp",
+        axis_size=moe_tp_size,
+    )
+    ep_split_dims = _infer_split_dims(
+        geometry_index,
+        axis="ep",
+        axis_size=ep_size,
+    )
+    tp_split_dims = _infer_split_dims(
+        geometry_index,
+        axis="tp",
+        axis_size=moe_tp_size,
     )
 
     local_parts = []
@@ -264,9 +418,14 @@ def build_mooncake_weight_manifests(
 
             parallel_axes = _parallel_axes(
                 tensor,
-                tp_size=tp_size,
+                tp_size=moe_tp_size,
                 pp_size=pp_size,
                 ep_size=ep_size,
+                ep_split_dims=ep_split_dims.get(tensor["tensor_id"], ()),
+                tp_split_dims=tp_split_dims.get(tensor["tensor_id"], ()),
+                ep_replicated=(
+                    tensor["tensor_id"] in ep_replicated_tensor_ids
+                ),
                 tp_replicated=tensor["tensor_id"] in tp_replicated_tensor_ids,
             )
             descriptor = TensorDescriptor(
@@ -275,7 +434,13 @@ def build_mooncake_weight_manifests(
                 dtype=tensor["dtype"],
                 itemsize=itemsize,
                 shard_dims=tuple(
-                    axis.dim for axis in parallel_axes if isinstance(axis, SplitAxis)
+                    sorted(
+                        {
+                            axis.dim
+                            for axis in parallel_axes
+                            if isinstance(axis, SplitAxis)
+                        }
+                    )
                 ),
                 layout_fingerprint=tensor["layout_fingerprint"],
                 parallel_axes=parallel_axes,
@@ -348,8 +513,25 @@ def build_mooncake_weight_manifests(
             )
         )
 
+    expected_ranks = {
+        (0, tp_rank, pp_rank, ep_rank)
+        for pp_rank in range(pp_size)
+        for ep_rank in range(ep_size)
+        for tp_rank in range(moe_tp_size)
+    }
+    actual_ranks = {
+        (rank.dp, rank.tp, rank.pp, rank.ep)
+        for _, _, rank, _, _, _ in local_parts
+    }
+    if actual_ranks != expected_ranks:
+        raise WeightManifestError(
+            "runtime inventories do not form a complete PP×EP×MoE-TP topology: "
+            f"missing={sorted(expected_ranks - actual_ranks)[:5]}, "
+            f"unexpected={sorted(actual_ranks - expected_ranks)[:5]}"
+        )
+
     topology = ParallelTopology(
-        tp_size=tp_size,
+        tp_size=moe_tp_size,
         pp_size=pp_size,
         ep_size=ep_size,
         dp_size=1,

@@ -3,9 +3,9 @@
 
 The recorder treats ``model.load_weights`` as the source of truth.  Source
 daemons record the real load while allowing writes to execute.  Target daemons
-replay the same checkpoint metadata with meta tensors and suppress parameter
-writes.  In both modes the result is a model-independent set of logical tensor
-boxes backed by final parameter storage.
+replay the same checkpoint metadata with meta tensors and suppress registered
+tensor writes.  In both modes the result is a model-independent set of logical
+tensor boxes backed by final registered parameter or buffer storage.
 
 Only byte-preserving layout operations are supported.  Anything that cannot be
 lowered to a contiguous destination range fails explicitly instead of falling
@@ -196,6 +196,38 @@ def _iter_tensors(value: Any) -> Iterator[torch.Tensor]:
     elif isinstance(value, dict):
         for item in value.values():
             yield from _iter_tensors(item)
+
+
+def _iter_registered_tensors(
+    model: Any,
+) -> Iterator[tuple[str, torch.Tensor, bool]]:
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        yield name, parameter, True
+    for name, buffer in model.named_buffers(remove_duplicate=False):
+        yield name, buffer, False
+
+
+def _runtime_tensor_state(
+    tensor: torch.Tensor, *, require_storage: bool
+) -> tuple[Any, ...]:
+    common = (
+        id(tensor),
+        str(tensor.layout),
+        str(tensor.device),
+        tuple(int(value) for value in tensor.shape),
+        tensor.dtype,
+    )
+    try:
+        storage = (
+            _storage_id(tensor),
+            _tensor_address(tensor),
+            tuple(int(value) for value in tensor.stride()),
+        )
+    except (NotImplementedError, RuntimeError):
+        if require_storage:
+            raise
+        storage = None
+    return common + (storage,)
 
 
 def _replace_provenance_shape(
@@ -527,8 +559,12 @@ class _WeightLoadDispatchMode(TorchDispatchMode):
             ndim = len(provenance.local_shape)
             if dim < 0:
                 dim += ndim
-            if input_tensor.dim() != ndim:
-                return (provenance.unsupported("slice after rank-changing view"),)
+            if tuple(int(value) for value in input_tensor.shape) != tuple(
+                provenance.local_shape
+            ):
+                return (
+                    provenance.unsupported("slice after shape-changing view"),
+                )
             start = 0 if len(args) < 3 or args[2] is None else int(args[2])
             end = (
                 provenance.local_shape[dim]
@@ -558,8 +594,12 @@ class _WeightLoadDispatchMode(TorchDispatchMode):
             ndim = len(provenance.local_shape)
             if dim < 0:
                 dim += ndim
-            if input_tensor.dim() != ndim:
-                return (provenance.unsupported("select after rank-changing view"),)
+            if tuple(int(value) for value in input_tensor.shape) != tuple(
+                provenance.local_shape
+            ):
+                return (
+                    provenance.unsupported("select after shape-changing view"),
+                )
             index = int(args[2])
             if index < 0:
                 index += provenance.local_shape[dim]
@@ -607,8 +647,12 @@ class _WeightLoadDispatchMode(TorchDispatchMode):
 
         if name in ("aten::split", "aten::split_with_sizes"):
             ndim = len(provenance.local_shape)
-            if input_tensor.dim() != ndim:
-                return (provenance.unsupported("split after rank-changing view"),)
+            if tuple(int(value) for value in input_tensor.shape) != tuple(
+                provenance.local_shape
+            ):
+                return (
+                    provenance.unsupported("split after shape-changing view"),
+                )
             dim = int(args[2] if len(args) > 2 else kwargs.get("dim", 0))
             if dim < 0:
                 dim += ndim
@@ -636,6 +680,12 @@ class _WeightLoadDispatchMode(TorchDispatchMode):
             # this explicit path for backends that expose aten::narrow directly.
             dim, start, length = (int(args[1]), int(args[2]), int(args[3]))
             ndim = len(provenance.local_shape)
+            if tuple(int(value) for value in input_tensor.shape) != tuple(
+                provenance.local_shape
+            ):
+                return (
+                    provenance.unsupported("narrow after shape-changing view"),
+                )
             if dim < 0:
                 dim += ndim
             offset = list(provenance.global_offset)
@@ -661,6 +711,8 @@ class WeightLoadRecorder:
             int, tuple[weakref.ReferenceType[torch.Tensor], _TensorProvenance]
         ] = {}
         self._destinations: dict[int, tuple[_Destination, ...]] = {}
+        self._unsupported_destinations: dict[int, tuple[str, ...]] = {}
+        self._unsupported_destination_ids: dict[int, str] = {}
         self._model: Any | None = None
 
     def record_model_load(
@@ -757,33 +809,68 @@ class WeightLoadRecorder:
 
     def _index_destinations(self, model: Any) -> None:
         grouped: dict[tuple[Any, ...], tuple[Any, list[str]]] = {}
-        for name, parameter in model.named_parameters(remove_duplicate=False):
-            if parameter.device.type == "meta":
+        unsupported_by_storage: dict[int, list[str]] = {}
+        unsupported_by_id: dict[int, str] = {}
+
+        def mark_unsupported(name: str, tensor: torch.Tensor) -> None:
+            unsupported_by_id[id(tensor)] = name
+            try:
+                storage_id = _storage_id(tensor)
+            except (NotImplementedError, RuntimeError):
+                return
+            unsupported_by_storage.setdefault(storage_id, []).append(name)
+
+        for name, tensor, is_parameter in _iter_registered_tensors(model):
+            if tensor.device.type == "meta":
+                if not is_parameter:
+                    mark_unsupported(name, tensor)
+                    continue
                 raise WeightLoadRecordingError(
                     f"runtime parameter remains on meta device: {name}"
                 )
-            key = (
-                _storage_id(parameter),
-                int(parameter.storage_offset()),
-                tuple(int(value) for value in parameter.shape),
-                tuple(int(value) for value in parameter.stride()),
-                parameter.dtype,
-            )
+            try:
+                is_contiguous = tensor.is_contiguous()
+            except (NotImplementedError, RuntimeError) as error:
+                if not is_parameter:
+                    mark_unsupported(name, tensor)
+                    continue
+                raise WeightLoadRecordingError(
+                    f"cannot inspect runtime parameter layout: {name}: {error}"
+                ) from error
+            if not is_contiguous:
+                if not is_parameter:
+                    mark_unsupported(name, tensor)
+                    continue
+                raise WeightLoadRecordingError(
+                    f"non-contiguous runtime parameter is unsupported: {name}"
+                )
+            try:
+                key = (
+                    _storage_id(tensor),
+                    int(tensor.storage_offset()),
+                    tuple(int(value) for value in tensor.shape),
+                    tuple(int(value) for value in tensor.stride()),
+                    tensor.dtype,
+                )
+                _tensor_address(tensor)
+            except (NotImplementedError, RuntimeError) as error:
+                if not is_parameter:
+                    mark_unsupported(name, tensor)
+                    continue
+                raise WeightLoadRecordingError(
+                    f"cannot inspect runtime parameter storage: {name}: {error}"
+                ) from error
             if key not in grouped:
-                grouped[key] = (parameter, [])
+                grouped[key] = (tensor, [])
             grouped[key][1].append(name)
 
         by_storage: dict[int, list[_Destination]] = {}
         for parameter, names in grouped.values():
-            if not parameter.is_contiguous():
-                raise WeightLoadRecordingError(
-                    f"non-contiguous runtime parameter is unsupported: {names[0]}"
-                )
             begin = _tensor_address(parameter)
             end = begin + int(parameter.numel()) * int(parameter.element_size())
             destination = _Destination(
                 parameter=parameter,
-                names=tuple(sorted(names)),
+                names=tuple(sorted(set(names))),
                 storage_id=_storage_id(parameter),
                 begin=begin,
                 end=end,
@@ -794,6 +881,27 @@ class WeightLoadRecorder:
             key: tuple(sorted(value, key=lambda item: (item.end - item.begin, item.names)))
             for key, value in by_storage.items()
         }
+        self._unsupported_destinations = {
+            key: tuple(sorted(set(value)))
+            for key, value in unsupported_by_storage.items()
+        }
+        self._unsupported_destination_ids = unsupported_by_id
+
+    def _reject_unsupported_destination(
+        self, destination: torch.Tensor, storage_id: int | None = None
+    ) -> None:
+        names = (
+            self._unsupported_destinations.get(storage_id)
+            if storage_id is not None
+            else None
+        )
+        name = self._unsupported_destination_ids.get(id(destination))
+        if names or name is not None:
+            runtime_name = names[0] if names else name
+            raise WeightLoadRecordingError(
+                "checkpoint tensor writes an unsupported registered buffer: "
+                f"{runtime_name}"
+            )
 
     @contextlib.contextmanager
     def _wrap_parameter_loaders(self, model: Any, *, execute_writes: bool):
@@ -912,7 +1020,9 @@ class WeightLoadRecorder:
                 ),
             )
 
-        candidates = self._destinations.get(_storage_id(destination), ())
+        self._reject_unsupported_destination(destination)
+        storage_id = _storage_id(destination)
+        candidates = self._destinations.get(storage_id, ())
         begin = _tensor_address(destination)
         end = begin + logical_elements * int(destination.element_size())
         owner = next(
@@ -926,8 +1036,9 @@ class WeightLoadRecorder:
             None,
         )
         if owner is None:
-            # Temporary tensors are allowed; only final writes into model
-            # parameters contribute placement records.
+            self._reject_unsupported_destination(destination, storage_id)
+            # Temporary tensors are allowed; only final writes into registered
+            # model tensors contribute placement records.
             return
 
         self._append_event(
@@ -969,7 +1080,9 @@ class WeightLoadRecorder:
                 "concatenated checkpoint weights change tensor element count"
             )
 
-        candidates = self._destinations.get(_storage_id(destination), ())
+        self._reject_unsupported_destination(destination)
+        storage_id = _storage_id(destination)
+        candidates = self._destinations.get(storage_id, ())
         begin = _tensor_address(destination)
         end = begin + int(destination.numel()) * int(destination.element_size())
         owner = next(
@@ -983,6 +1096,7 @@ class WeightLoadRecorder:
             None,
         )
         if owner is None:
+            self._reject_unsupported_destination(destination, storage_id)
             return
 
         for piece in provenance.pieces:
@@ -1066,7 +1180,8 @@ class WeightLoadRecorder:
     def build_plan(self) -> WeightLoadPlan:
         if self._model is None or not self._events:
             raise WeightLoadRecordingError(
-                "native model.load_weights produced no recordable parameter writes"
+                "native model.load_weights produced no recordable "
+                "registered-tensor writes"
             )
         deduplicated: dict[tuple[Any, ...], RecordedWeightView] = {}
         for event in self._events:
@@ -1206,30 +1321,35 @@ def record_target_weight_load_plan(
             tensor = torch.empty(metadata.shape, dtype=dtype, device="meta")
             yield metadata.tensor_id, tensor
 
-    parameter_state = {
-        id(parameter): (
-            _storage_id(parameter),
-            _tensor_address(parameter),
-            tuple(int(value) for value in parameter.shape),
-            tuple(int(value) for value in parameter.stride()),
-            parameter.dtype,
+    runtime_tensor_state = {
+        (is_parameter, name): _runtime_tensor_state(
+            tensor, require_storage=is_parameter
         )
-        for parameter in model.parameters()
+        for name, tensor, is_parameter in _iter_registered_tensors(model)
     }
     recorder.record_model_load(model, meta_weights(), execute_writes=False)
-    for name, parameter in model.named_parameters(remove_duplicate=False):
-        before = parameter_state.get(id(parameter))
-        after = (
-            _storage_id(parameter),
-            _tensor_address(parameter),
-            tuple(int(value) for value in parameter.shape),
-            tuple(int(value) for value in parameter.stride()),
-            parameter.dtype,
+    replayed_tensor_state = {
+        (is_parameter, name): _runtime_tensor_state(
+            tensor, require_storage=is_parameter
         )
-        if before is None or before != after:
-            raise WeightLoadRecordingError(
-                f"target layout replay mutated parameter storage: {name}"
+        for name, tensor, is_parameter in _iter_registered_tensors(model)
+    }
+    changed = next(
+        (
+            key
+            for key in sorted(
+                runtime_tensor_state.keys() | replayed_tensor_state.keys()
             )
+            if runtime_tensor_state.get(key) != replayed_tensor_state.get(key)
+        ),
+        None,
+    )
+    if changed is not None:
+        is_parameter, name = changed
+        kind = "parameter" if is_parameter else "buffer"
+        raise WeightLoadRecordingError(
+            f"target layout replay mutated {kind} storage: {name}"
+        )
     return recorder.build_plan()
 
 
