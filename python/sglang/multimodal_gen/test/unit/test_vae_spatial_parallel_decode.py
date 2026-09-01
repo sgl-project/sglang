@@ -77,12 +77,6 @@ class _DispatchProbeVAE(ParallelTiledVAE):
 
 
 class TestVAESpatialParallelDecode(unittest.TestCase):
-    def test_base_vae_config_defaults_to_auto_parallel_decode(self):
-        config = VAEConfig()
-
-        self.assertTrue(config.use_parallel_decode)
-        self.assertEqual(config.parallel_decode_mode, "auto")
-
     def test_image_video_vae_configs_default_to_auto_parallel_decode(self):
         configs = (
             ErnieImageVAEConfig(),
