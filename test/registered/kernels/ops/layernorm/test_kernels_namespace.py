@@ -30,6 +30,9 @@ EXPECTED = {
     "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
     "kvcache.reshape_and_cache_flash": {"triton"},
     "diffusion.apply_group_norm_silu": {"triton"},
+    "diffusion.flux2_layernorm_modulate_fp8_quant": {"KDA"},
+    "diffusion.flux2_qkv_epilogue": {"KDA"},
+    "diffusion.flux2_token_cat_fp8": {"KDA"},
 }
 
 _CPU = PlatformInfo(device_type="cpu")
