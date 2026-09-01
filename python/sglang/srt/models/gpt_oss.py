@@ -77,6 +77,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_device,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
