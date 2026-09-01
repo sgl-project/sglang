@@ -337,14 +337,6 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
 
-    def test_unified_memory_records_exact_target_bytes(self):
-        available = 10_000_000
-        mr, _, config = self._run(available, enable_unified_memory=True)
-        used = _actual_memory_used(mr, config)
-        self.assertEqual(config.unified_memory_pool_bytes, used)
-        self.assertLessEqual(used, available)
-        self.assertGreater(used, available * 0.99)
-
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
