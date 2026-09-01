@@ -4,6 +4,7 @@ import copy
 import json
 import logging
 import math
+import re
 import time
 import uuid
 from enum import Enum
@@ -246,6 +247,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
     _default_sampling_params_logged = False
     _KIMI_K3_GENERATION_STUB_TOKENS = 3
+    _MM_ORDER_SENTINEL_RE = re.compile("\\x1e\\x1eSGLMM([IVA])(\\d+)\\x1e\\x1e")
+    _MM_ORDER_TAGS = {"image": "I", "video": "V", "audio": "A"}
 
     def __init__(
         self,
@@ -716,6 +719,85 @@ class OpenAIServingChat(OpenAIServingBase):
             # reference API excludes it from billed/reported prompt tokens.
             prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
         return prompt_tokens
+
+    def _recover_media_order_from_chat_template(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict]],
+        extra_template_kwargs: Dict[str, Any],
+        image_data: List[Any],
+        video_data: List[Any],
+        audio_data: List[Any],
+    ) -> tuple[List[Any], List[Any], List[Any]]:
+        """Tool-result templates can reorder positional media independently of request extraction."""
+        counters = {media_type: 0 for media_type in self._MM_ORDER_TAGS}
+        sentinel_messages = []
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                sentinel_messages.append(message)
+                continue
+
+            sentinel_content = []
+            for part in content:
+                media_type = part.get("type") if isinstance(part, dict) else None
+                if media_type not in counters:
+                    sentinel_content.append(part)
+                    continue
+
+                index = counters[media_type]
+                counters[media_type] += 1
+                sentinel_content.append(
+                    {
+                        "type": "text",
+                        "text": (
+                            f"\x1e\x1eSGLMM{self._MM_ORDER_TAGS[media_type]}"
+                            f"{index}\x1e\x1e"
+                        ),
+                    }
+                )
+
+            sentinel_message = dict(message)
+            sentinel_message["content"] = sentinel_content
+            sentinel_messages.append(sentinel_message)
+
+        try:
+            rendered = self.tokenizer_manager.tokenizer.apply_chat_template(
+                sentinel_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                tools=tools,
+                return_dict=False,
+                **extra_template_kwargs,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to recover media order from the chat template (%s); "
+                "using request message order.",
+                exc,
+            )
+            return image_data, video_data, audio_data
+
+        permutations = {"I": [], "V": [], "A": []}
+        for tag, index in self._MM_ORDER_SENTINEL_RE.findall(rendered):
+            permutations[tag].append(int(index))
+
+        def apply_permutation(data: List[Any], permutation: List[int]) -> List[Any]:
+            if not data or permutation == list(range(len(data))):
+                return data
+            if sorted(permutation) != list(range(len(data))):
+                logger.warning(
+                    "Chat template did not preserve every media sentinel; "
+                    "using request message order."
+                )
+                return data
+            return [data[index] for index in permutation]
+
+        return (
+            apply_permutation(image_data, permutations["I"]),
+            apply_permutation(video_data, permutations["V"]),
+            apply_permutation(audio_data, permutations["A"]),
+        )
 
     async def _generate_stream_content(
         self,
@@ -1421,6 +1503,39 @@ class OpenAIServingChat(OpenAIServingBase):
                     # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)
                     # should be treated as client errors (400 BadRequest)
                     raise ValueError(str(template_error)) from template_error
+
+            if getattr(
+                self.template_manager,
+                "jinja_template_may_reorder_tool_results",
+                False,
+            ):
+                tool_media_counts = {
+                    media_type: 0 for media_type in self._MM_ORDER_TAGS
+                }
+                for message in openai_compatible_messages:
+                    if message.get("role") not in ("tool", "function"):
+                        continue
+                    content = message.get("content")
+                    if not isinstance(content, list):
+                        continue
+                    for part in content:
+                        media_type = (
+                            part.get("type") if isinstance(part, dict) else None
+                        )
+                        if media_type in tool_media_counts:
+                            tool_media_counts[media_type] += 1
+
+                if any(count >= 2 for count in tool_media_counts.values()):
+                    image_data, video_data, audio_data = (
+                        self._recover_media_order_from_chat_template(
+                            openai_compatible_messages,
+                            tools,
+                            extra_template_kwargs,
+                            image_data,
+                            video_data,
+                            audio_data,
+                        )
+                    )
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:

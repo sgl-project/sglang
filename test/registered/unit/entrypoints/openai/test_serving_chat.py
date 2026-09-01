@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional
 from unittest.mock import Mock, patch
 
+import jinja2
 from fastapi import Request
 
 from sglang.srt.entrypoints.openai import chat_encoding
@@ -39,6 +40,9 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.parser.jinja_template_utils import (
+    jinja_template_may_reorder_tool_results,
+)
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -79,6 +83,24 @@ _DSV4_OFFICIAL_ENCODER = (
     '{"low": "", "high": "h", "max": "m"}\n'
     'DEFAULT_REASONING_EFFORT = "low"\n'
 )
+
+_TOOL_RESULT_REORDER_TEMPLATE = """
+{%- for assistant in messages
+    if assistant.role == 'assistant' and assistant.tool_calls -%}
+    {%- for tool_call in assistant.tool_calls -%}
+        {%- for result in messages
+            if result.role == 'tool' and result.tool_call_id == tool_call.id -%}
+            {%- for part in result.content -%}
+                {%- if part.type == 'text' -%}
+                    {{- part.text -}}
+                {%- else -%}
+                    {{- '<' + part.type + '>' -}}
+                {%- endif -%}
+            {%- endfor -%}
+        {%- endfor -%}
+    {%- endfor -%}
+{%- endfor -%}
+"""
 
 
 def _create_dsv4_checkpoint(test_case: unittest.TestCase, source: str) -> str:
@@ -191,6 +213,117 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    @staticmethod
+    def _render_tool_results_in_call_order(messages, **kwargs):
+        del kwargs
+        return jinja2.Template(_TOOL_RESULT_REORDER_TEMPLATE).render(messages=messages)
+
+    def test_media_order_recovery_follows_tool_call_order_for_all_modalities(self):
+        self.tm.tokenizer.apply_chat_template.side_effect = (
+            self._render_tool_results_in_call_order
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call-a", "function": {"name": "a", "arguments": {}}},
+                    {"id": "call-b", "function": {"name": "b", "arguments": {}}},
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-b",
+                "content": [
+                    {"type": "image"},
+                    {"type": "video"},
+                    {"type": "audio"},
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-a",
+                "content": [
+                    {"type": "image"},
+                    {"type": "video"},
+                    {"type": "audio"},
+                ],
+            },
+        ]
+
+        image_data, video_data, audio_data = (
+            self.chat._recover_media_order_from_chat_template(
+                messages,
+                tools=None,
+                extra_template_kwargs={},
+                image_data=["image-b", "image-a"],
+                video_data=["video-b", "video-a"],
+                audio_data=["audio-b", "audio-a"],
+            )
+        )
+
+        self.assertEqual(image_data, ["image-a", "image-b"])
+        self.assertEqual(video_data, ["video-a", "video-b"])
+        self.assertEqual(audio_data, ["audio-a", "audio-b"])
+
+    def test_jinja_path_recovers_tool_result_images_only_when_template_needs_it(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "openai"
+        self.template_manager.jinja_template_may_reorder_tool_results = (
+            jinja_template_may_reorder_tool_results(_TOOL_RESULT_REORDER_TEMPLATE)
+        )
+        self.assertTrue(self.template_manager.jinja_template_may_reorder_tool_results)
+        self.tm.tokenizer.apply_chat_template.side_effect = (
+            self._render_tool_results_in_call_order
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "inspect"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-a",
+                            "type": "function",
+                            "function": {"name": "a", "arguments": {}},
+                        },
+                        {
+                            "id": "call-b",
+                            "type": "function",
+                            "function": {"name": "b", "arguments": {}},
+                        },
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-b",
+                    "content": [{"type": "image_url", "image_url": {"url": "image-b"}}],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-a",
+                    "content": [{"type": "image_url", "image_url": {"url": "image-a"}}],
+                },
+            ],
+        )
+
+        result = self.chat._apply_jinja_template(request, None, is_multimodal=True)
+
+        self.assertEqual(
+            [item.url for item in result.image_data], ["image-a", "image-b"]
+        )
+        self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 2)
+
+        self.template_manager.jinja_template_may_reorder_tool_results = False
+        self.tm.tokenizer.apply_chat_template.reset_mock()
+        result = self.chat._apply_jinja_template(request, None, is_multimodal=True)
+        self.assertEqual(
+            [item.url for item in result.image_data], ["image-b", "image-a"]
+        )
+        self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
 
     def test_parsers_follow_the_control_plane_overlay(self):
         """Template detection records the parsers through `override`, so they

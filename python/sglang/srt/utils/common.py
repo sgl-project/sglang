@@ -87,7 +87,7 @@ import torch
 import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
@@ -1803,6 +1803,14 @@ class ImageData:
     content_hash: Optional[str] = None
 
 
+GLM_MEDIA_CONFIG_KEYS = (
+    "fps",
+    "max_frames",
+    "max_tokens_per_frame",
+    "max_image_tokens",
+)
+
+
 @dataclass
 class VideoData:
     url: str
@@ -1811,6 +1819,45 @@ class VideoData:
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
+
+
+def smart_to_rgb(
+    image: Union[torch.Tensor, Image.Image],
+) -> Union[torch.Tensor, Image.Image]:
+    if not isinstance(image, Image.Image):
+        return image
+
+    image = ImageOps.exif_transpose(image)
+    if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+        image = image.convert("RGBA")
+        width, height = image.size
+        edge_pixels = []
+
+        for x in range(0, width, max(1, width // 20)):
+            for y in (0, height - 1):
+                pixel = image.getpixel((x, y))
+                if pixel[3] > 128:
+                    edge_pixels.append(pixel[:3])
+
+        for y in range(0, height, max(1, height // 20)):
+            for x in (0, width - 1):
+                pixel = image.getpixel((x, y))
+                if pixel[3] > 128:
+                    edge_pixels.append(pixel[:3])
+
+        if edge_pixels:
+            avg_brightness = sum(sum(pixel) for pixel in edge_pixels) / (
+                len(edge_pixels) * 3
+            )
+            background_color = (32, 32, 32) if avg_brightness > 128 else (240, 240, 240)
+        else:
+            background_color = (255, 255, 255)
+
+        background = Image.new("RGB", image.size, background_color)
+        background.paste(image, mask=image.getchannel("A"))
+        return background
+
+    return image.convert("RGB")
 
 
 def is_jpeg_with_cuda(
@@ -1922,6 +1969,8 @@ def load_image(
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
+    if image_size is not None and isinstance(image, Image.Image):
+        image_size = (image.width, image.height)
     return image, image_size
 
 

@@ -9,7 +9,7 @@ import logging
 import jinja2
 import transformers.utils.chat_template_utils as hf_chat_utils
 
-from sglang.srt.utils import ImageData
+from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS, ImageData
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +120,52 @@ def detect_jinja_template_content_format(chat_template: str) -> str:
         return "string"
 
 
+def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
+    """Detect call-ID use so rendered media can be realigned without model-specific allowlists."""
+    if not isinstance(chat_template, str):
+        return False
+
+    jinja_ast = _try_extract_ast(chat_template)
+    if jinja_ast is None:
+        return False
+
+    def is_tool_call_id(node: jinja2.nodes.Node) -> bool:
+        return isinstance(node, jinja2.nodes.Const) and node.value == "tool_call_id"
+
+    if any(
+        node.attr == "tool_call_id" for node in jinja_ast.find_all(jinja2.nodes.Getattr)
+    ):
+        return True
+
+    if any(
+        is_tool_call_id(node.arg) for node in jinja_ast.find_all(jinja2.nodes.Getitem)
+    ):
+        return True
+
+    for call in jinja_ast.find_all(jinja2.nodes.Call):
+        if (
+            isinstance(call.node, jinja2.nodes.Getattr)
+            and call.node.attr == "get"
+            and call.args
+            and is_tool_call_id(call.args[0])
+        ):
+            return True
+
+    attribute_filters = {"groupby", "map", "rejectattr", "selectattr", "sort"}
+    for filter_node in jinja_ast.find_all(jinja2.nodes.Filter):
+        if filter_node.name not in attribute_filters:
+            continue
+        if filter_node.args and is_tool_call_id(filter_node.args[0]):
+            return True
+        if any(
+            keyword.key == "attribute" and is_tool_call_id(keyword.value)
+            for keyword in filter_node.kwargs
+        ):
+            return True
+
+    return False
+
+
 def process_content_for_template_format(
     msg_dict: dict,
     content_format: str,
@@ -179,16 +225,21 @@ def process_content_for_template_format(
                 elif chunk_type == "video_url":
                     video_obj = chunk.get("video_url") or {}
                     mdp = video_obj.get("max_dynamic_patch", None)
-                    if mdp is None:
+                    preprocess_kwargs = {
+                        key: video_obj[key]
+                        for key in GLM_MEDIA_CONFIG_KEYS
+                        if video_obj.get(key) is not None
+                    }
+                    if not preprocess_kwargs and mdp is None:
                         video_data.append(chunk["video_url"]["url"])
                     else:
                         # Keep structured info for backend, but template only sees {"type":"video"}
-                        video_data.append(
-                            {
-                                "url": video_obj["url"],
-                                "max_dynamic_patch": mdp,
-                            }
-                        )
+                        item = {"url": video_obj["url"]}
+                        if mdp is not None:
+                            item["max_dynamic_patch"] = mdp
+                        if preprocess_kwargs:
+                            item["preprocess_kwargs"] = preprocess_kwargs
+                        video_data.append(item)
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'video' type for template compatibility
@@ -207,9 +258,7 @@ def process_content_for_template_format(
                             {"type": "text", "text": chunk["text"]}
                         )
                 elif chunk_type == "tool_reference":
-                    # GLM-specific extension: pass through so the chat template
-                    # can match tool_reference.name against tools[*].function.name
-                    # and render the referenced tool schemas inline.
+                    # Preserve this extension because GLM templates resolve referenced tool schemas by function name.
                     processed_content_parts.append(chunk)
 
         new_msg = {
