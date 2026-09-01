@@ -30,6 +30,14 @@ class NPUACLFormat(IntEnum):
     ACL_FORMAT_FRACTAL_NZ = 29
 
 
+# Ships in the sgl-kernel-npu; absent on A5
+# Cached because torch does not negatively cache a missing
+# torch.ops lookup. Should be called during forward pass.
+@functools.lru_cache(maxsize=1)
+def has_batch_matmul_transpose() -> bool:
+    return hasattr(torch.ops.npu, "batch_matmul_transpose")
+
+
 def _call_once(fn: Callable):
 
     @functools.wraps(fn)
