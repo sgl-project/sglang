@@ -1042,7 +1042,6 @@ class DeepseekV4AscendAttnBackend(
 
         if ragged_layout is not None:
             metadata.actual_seq_lengths_q_pa = ragged_layout.qo_indptr_device
-            metadata.actual_seq_lengths_q_pa_cpu = None
             n_tok = int(ragged_layout.graph_num_tokens)
         else:
             metadata.actual_seq_lengths_q_pa = torch.arange(
@@ -1167,6 +1166,7 @@ class DeepseekV4AscendAttnBackend(
         ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
         verify_lens = None
         verify_lens_cpu = None
+        effective_verify_lens_cpu = None
         if ragged_layout is not None:
             verify_lens = ragged_layout.verify_lens.to(device=device, dtype=torch.int32)
             # Correctness-first host mirror for compressor position planning.
@@ -1178,24 +1178,20 @@ class DeepseekV4AscendAttnBackend(
         raw_seq_lens_cpu = seq_lens_cpu[:bs]
         is_idle_replay = runtime_mode.is_idle()
         if graph_mode.is_target_verify():
-            explicit_live_cpu = getattr(
-                getattr(forward_batch, "spec_info", None),
-                "live_seq_lens_cpu",
-                None,
-            )
             if is_idle_replay:
                 live_seq_lens_cpu = torch.zeros_like(raw_seq_lens_cpu)
                 final_seq_lens_cpu = live_seq_lens_cpu
             elif self._is_dspark_algorithm:
+                live_seq_lens_cpu = torch.as_tensor(
+                    forward_batch.spec_info.live_seq_lens_cpu,
+                    dtype=raw_seq_lens_cpu.dtype,
+                    device=raw_seq_lens_cpu.device,
+                ).flatten()[:raw_bs]
+                live_seq_lens_cpu = F.pad(
+                    live_seq_lens_cpu,
+                    (0, bs - live_seq_lens_cpu.numel()),
+                )
                 if ragged_layout is not None:
-                    live_seq_lens_cpu = forward_batch.spec_info.live_seq_lens_cpu.to(
-                        dtype=raw_seq_lens_cpu.dtype,
-                        device=raw_seq_lens_cpu.device,
-                    ).flatten()[:raw_bs]
-                    live_seq_lens_cpu = F.pad(
-                        live_seq_lens_cpu,
-                        (0, bs - live_seq_lens_cpu.numel()),
-                    )
                     # Query rows beyond raw_bs are graph-tier ghosts. Keep their
                     # Q indptr geometry intact, but do not allocate/write target
                     # compressor state for them.
@@ -1206,22 +1202,6 @@ class DeepseekV4AscendAttnBackend(
                     # Static DSpark temporarily expands seq_lens_cpu to the final
                     # target-verify length and carries the live prefix separately.
                     final_seq_lens_cpu = raw_seq_lens_cpu
-                    if explicit_live_cpu is None:
-                        live_seq_lens_cpu = torch.clamp(
-                            final_seq_lens_cpu - int(tokens_per_bs), min=0
-                        )
-                    else:
-                        explicit_live_cpu = torch.as_tensor(
-                            explicit_live_cpu,
-                            dtype=final_seq_lens_cpu.dtype,
-                            device=final_seq_lens_cpu.device,
-                        ).flatten()
-                        live_seq_lens_cpu = torch.zeros_like(final_seq_lens_cpu)
-                        num_live_rows = min(bs, explicit_live_cpu.numel())
-                        if num_live_rows > 0:
-                            live_seq_lens_cpu[:num_live_rows].copy_(
-                                explicit_live_cpu[:num_live_rows]
-                            )
             else:
                 # EAGLE and the other uniform verify callers keep
                 # seq_lens_cpu at the committed/live prefix length.
@@ -1252,7 +1232,6 @@ class DeepseekV4AscendAttnBackend(
             forward_batch=forward_batch,
             fm=self.forward_metadata,
             graph_mode=graph_mode,
-            runtime_mode=runtime_mode,
             is_idle_replay=is_idle_replay,
             has_compress=has_compress,
             active_target_verify=active_target_verify,
@@ -1261,9 +1240,8 @@ class DeepseekV4AscendAttnBackend(
             tokens_per_bs=tokens_per_bs,
             ragged_layout=ragged_layout,
             verify_lens=verify_lens,
-            verify_lens_cpu=verify_lens_cpu,
+            effective_verify_lens_cpu=effective_verify_lens_cpu,
             device=device,
-            seq_lens_cpu=seq_lens_cpu,
             final_seq_lens_cpu=final_seq_lens_cpu,
             live_seq_lens_cpu=live_seq_lens_cpu,
             live_seq_lens=live_seq_lens,
@@ -1279,7 +1257,6 @@ class DeepseekV4AscendAttnBackend(
                     device=ctx.device, dtype=torch.int32
                 )
             )
-            fm.actual_seq_lengths_q = fm.actual_seq_lengths_q_pa[1:]
         attn_seq_lens = ctx.live_seq_lens
         if ctx.graph_mode.is_target_verify():
             valid_verify_rows = ctx.live_seq_lens > 0
@@ -1349,21 +1326,19 @@ class DeepseekV4AscendAttnBackend(
             ctx.live_seq_lens_cpu,
         )
         if ctx.ragged_layout is not None:
-            effective_verify_lens_cpu = ctx.verify_lens_cpu.clone()
-            effective_verify_lens_cpu[ctx.raw_bs :].zero_()
             self._fill_ragged_verify_positions_cmp_padding_one(
                 positions=ctx.forward_batch.positions,
                 dst=fm.positions_cmp_padding_c4,
                 ratio=4,
                 final_seq_lens_cpu=verify_seq_lens_cpu,
-                verify_lens_cpu=effective_verify_lens_cpu,
+                verify_lens_cpu=ctx.effective_verify_lens_cpu,
             )
             self._fill_ragged_verify_positions_cmp_padding_one(
                 positions=ctx.forward_batch.positions,
                 dst=fm.positions_cmp_padding_c128,
                 ratio=128,
                 final_seq_lens_cpu=verify_seq_lens_cpu,
-                verify_lens_cpu=effective_verify_lens_cpu,
+                verify_lens_cpu=ctx.effective_verify_lens_cpu,
             )
         else:
             self._fill_verify_positions_cmp_padding_one(
@@ -1554,14 +1529,12 @@ class DeepseekV4AscendAttnBackend(
             )
             metadata.block_tables_swa[:bs, :max_seq_pages].copy_(swa_page_table)
             metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
-            metadata.block_tables_swa[bs:, :].fill_(0)
 
         metadata.block_tables[:bs, :max_seq_pages].copy_(
             self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
             // self.page_size
         )
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
-        metadata.block_tables[bs:, :].fill_(0)
 
         self.forward_metadata = metadata
         self.graph_mode = True
@@ -1641,8 +1614,6 @@ class DeepseekV4AscendAttnBackend(
                 device=device, dtype=torch.int32
             )
             fm.actual_seq_lengths_q = fm.actual_seq_lengths_q_pa[1:]
-            # Ragged target verify uses the device-side metadata operator.
-            fm.actual_seq_lengths_q_pa_cpu = None
         elif (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
@@ -2033,12 +2004,11 @@ class DeepseekV4AscendAttnBackend(
                 )
             setattr(fm, f"positions_cmp_padding_c{ratio}", padding)
         fm.start_pos = forward_batch.seq_lens[:bs].to(torch.int32)
-        valid = forward_batch.seq_lens[:bs] > 0
-        fm.seqused = (
-            ragged_layout.verify_lens.to(device=device, dtype=torch.int32)
-            if ragged_layout is not None
-            else valid.to(torch.int32) * int(n_draft)
-        )
+        if ragged_layout is not None:
+            fm.seqused = ragged_layout.verify_lens.to(device=device, dtype=torch.int32)
+        else:
+            valid = forward_batch.seq_lens[:bs] > 0
+            fm.seqused = valid.to(torch.int32) * int(n_draft)
         fm.dsv4_max_input_capacity = max(1, n_draft)
         _bundle = getattr(forward_batch, "out_cache_loc_dsv4", None)
         if _bundle is not None:
