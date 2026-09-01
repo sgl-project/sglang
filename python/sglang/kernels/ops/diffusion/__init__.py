@@ -463,6 +463,8 @@ _EXPORTS: dict[str, str] = {
     # adaLN modulation, gating and timestep conditioning
     "indexed_gate_bf16": "modulate.indexed_modulation_triton",
     "indexed_gate_bf16_": "modulate.indexed_modulation_triton",
+    "can_use_indexed_gate_bf16_cpu": "modulate.indexed_modulation_triton",
+    "indexed_gate_bf16_cpu_": "modulate.indexed_modulation_triton",
     "indexed_scale_shift_bf16_": "modulate.indexed_modulation_triton",
     "ltx2_ada_values9": "modulate.ltx2_ada_values_triton",
     "can_use_modulate_scale_shift_cuda": "modulate.modulate_scale_shift_jit",
