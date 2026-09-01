@@ -419,10 +419,7 @@ class TestResolutionDeclarations(CustomTestCase):
         the last hop: whether the leaf is reachable through the path the
         metadata declares, and whether it carries the resolved value once it
         is. Both sides here come from that metadata, so this cannot tell that
-        a field is assigned to the *wrong* group -- the readers are the
-        independent source for that, and
-        `test_server_args_namespaces.py::test_the_readers_agree_with_the_namespace_metadata`
-        is where the two are compared.
+        a field is assigned to the *wrong* group.
         """
         import sglang.srt.runtime_context as runtime_context
         from sglang.srt.arg_groups.arg_utils import namespace_of

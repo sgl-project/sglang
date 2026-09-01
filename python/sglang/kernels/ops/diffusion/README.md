@@ -17,7 +17,7 @@ from sglang.kernels.ops.diffusion import fused_rmsnorm_scale_shift_bitexact
 ```
 
 **Import from the package, never from a submodule.** The internal layout is
-free to move; the facade is not. `test_import_surface.py` enforces this, with
+free to move; the facade is not. Callers should use the facade, with
 a small allowlist for tests that deliberately exercise one backend.
 
 Resolution is lazy (PEP 562): the backends have disjoint heavy dependencies
@@ -164,7 +164,7 @@ inspecting model modules is its whole job.
 
 1. Put it in the operator domain it belongs to, with a backend suffix.
 2. Export it from `__init__.py` (`_EXPORTS`) and register a `KernelSpec`
-   (`_SPECS`) — `test_import_surface.py` checks both resolve.
+   (`_SPECS`).
 3. Give it a `can_use_*` predicate; raise, don't return `None`.
 4. State the numerical contract in the module docstring, including which
    shapes it was verified on.
