@@ -317,6 +317,7 @@ FROM torch_deps AS flashinfer_cache
 
 ARG CUDA_VERSION
 ARG INSTALL_FLASHINFER_JIT_CACHE
+ARG INSTALL_FLASHINFER_CUBIN=1
 ARG FLASHINFER_VERSION
 
 # Stage jit-cache/cubin artifacts into /flashinfer_jit_output for clean COPY later
@@ -329,9 +330,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     esac \
     && mkdir -p /flashinfer_jit_output \
     # flashinfer-cubin is CUDA-version-agnostic, unlike jit-cache, so its index-url has no cu${CUINDEX} suffix
-    && python3 -m pip install flashinfer-cubin==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl \
-    && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_cubin /flashinfer_jit_output/ \
-    && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_cubin-*.dist-info /flashinfer_jit_output/ \
+    && if [ "$INSTALL_FLASHINFER_CUBIN" = "1" ]; then \
+        python3 -m pip install flashinfer-cubin==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl \
+        && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_cubin /flashinfer_jit_output/ \
+        && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_cubin-*.dist-info /flashinfer_jit_output/; \
+    fi \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
         && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
@@ -820,8 +823,11 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
 # Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
 COPY --from=framework_final /opt/sglang/lib/python3.12/site-packages /opt/sglang/lib/python3.12/site-packages
 
-# Copy SGLang workspace
-COPY --from=framework_final /sgl-workspace /sgl-workspace
+# Copy only the runtime source tree. Cargo build output is about 1.8 GB and is
+# not consumed after the gateway binary/wheel have been copied above.
+COPY --from=framework_final /sgl-workspace/sglang/python /sgl-workspace/sglang/python
+COPY --from=framework_final /sgl-workspace/sglang/LICENSE /sgl-workspace/sglang/LICENSE
+COPY --from=framework_final /sgl-workspace/sglang/README.md /sgl-workspace/sglang/README.md
 
 # Copy sgl-model-gateway binary
 COPY --from=framework_final /opt/sglang/bin/sgl-model-gateway /opt/sglang/bin/sgl-model-gateway
