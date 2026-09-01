@@ -31,14 +31,13 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 # match the granularity q2k_index and variable_block_sizes were built at.
 VSA_H3_KERNEL_BLOCK = 64
 
-_configs = [
-    triton.Config({}, num_stages=s, num_warps=w)
-    for s in (2, 3, 4, 5, 6, 7)
-    for w in (4, 8)
-]
+# Pinned instead of autotuned: on B300 num_warps=4 wins at every sequence
+# length and num_stages=5 is within 0.5% of the best (7 spills); FastVideo
+# reports the same optimum for Blackwell.
+_ATTN_NUM_WARPS = 4
+_ATTN_NUM_STAGES = 5
 
 
-@triton.autotune(_configs, key=["N_CTX_Q", "HEAD_DIM"])
 @triton.jit
 def _attn_fwd_sparse(
     desc_q,
@@ -145,6 +144,8 @@ def vsa_h3_block_sparse_attn_forward(
         HEAD_DIM=head_dim,
         BLOCK_M=VSA_H3_KERNEL_BLOCK,
         BLOCK_N=VSA_H3_KERNEL_BLOCK,
+        num_warps=_ATTN_NUM_WARPS,
+        num_stages=_ATTN_NUM_STAGES,
     )
     return out
 
