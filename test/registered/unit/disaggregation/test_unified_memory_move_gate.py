@@ -148,9 +148,20 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
             self.entry_bytes_per_page = 512
             self.disagg_move_gate = gate
 
+        def _is_frontier_transparent(self):
+            return False
+
     class _Owner:
+        """Stands in for a grow-up END pool: the credit walks the chain from
+        `_growth_side_neighbor()`, so the stub must expose what that walk reads,
+        not the pre-chain `_peer` slot it used to."""
+
         def __init__(self, peer):
-            self._peer = peer
+            self.grow_direction = "up"
+            self.high_peer = peer
+            self.low_peer = None
+
+        _growth_side_neighbor = MultiEndedAllocator._growth_side_neighbor
 
     def _credit(self, gate):
         peer = self._Peer(gate)

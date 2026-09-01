@@ -431,8 +431,43 @@ def install_platform_stubs() -> None:
 
             pass
 
+        class _KernelInterface(_StubBase):
+            pass
+
         jit_mod.JITFunction = _JITFunction
+        jit_mod.KernelInterface = _KernelInterface
         runtime.jit = jit_mod
+
+        # Torch 2.13 imports these as classes while initializing Inductor, even on
+        # MPS where no Triton kernel is compiled. Define them explicitly so the
+        # catch-all meta-path finder does not materialize class names as modules.
+        autotuner = _make_mock("triton.runtime.autotuner")
+
+        class _OutOfResources(Exception):
+            pass
+
+        class _PTXASError(Exception):
+            pass
+
+        autotuner.OutOfResources = _OutOfResources
+        autotuner.PTXASError = _PTXASError
+        runtime.autotuner = autotuner
+
+        compiler_root = _make_mock("triton.compiler")
+
+        class _CompiledKernel(_StubBase):
+            pass
+
+        compiler_root.CompiledKernel = _CompiledKernel
+        compiler_impl = _make_mock("triton.compiler.compiler")
+
+        class _ASTSource(_StubBase):
+            pass
+
+        compiler_impl.ASTSource = _ASTSource
+        compiler_impl.triton_key = lambda: "triton-stub"
+        compiler_root.compiler = compiler_impl
+        triton.compiler = compiler_root
 
         # triton.runtime.driver
         driver = _make_mock("triton.runtime.driver")
@@ -452,6 +487,11 @@ def install_platform_stubs() -> None:
         backends = _make_mock("triton.backends")
         triton.backends = backends
         compiler = _make_mock("triton.backends.compiler")
+
+        class _GPUTarget(_StubBase):
+            pass
+
+        compiler.GPUTarget = _GPUTarget
         backends.compiler = compiler
 
     mps = torch.mps
