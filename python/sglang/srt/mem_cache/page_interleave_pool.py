@@ -37,8 +37,8 @@ scratch slot laid out ``[prefix region | chunk region | trash page]``:
 - The trash page absorbs padded/dummy locations (the reserved logical pages
   covering loc < N*ps, and any location outside the current batch's plan).
 
-Scratch addressing goes through a per-batch ``logical page -> plan
-position`` lookup (``_page_pos``, one int32 per logical page, rebuilt in
+Scratch addressing goes through a per-batch ``logical page -> scratch
+page`` lookup (``_page_pos``, one int32 per logical page, rebuilt in
 ``begin_shard_extend``): purely local, mirrored by construction, and valid
 for any consumer index vector (attention page tables, MLA prefix
 ``kv_indices``), not just whole-prefix position arithmetic.
@@ -152,13 +152,13 @@ class PageInterleaveKVPoolMixin:
                     )
                     for _ in range(2)
                 ]
-                # Per-batch plan position of every logical page; -1 = not in
-                # the current batch (translated to the trash page). Logical
-                # page ids run [0, N * (size/ps + 1)) — N per physical page
-                # of one rank's pool incl. the reserved padded page.
+                # Per-batch absolute scratch-page index of every logical page.
+                # Unplanned pages initially target the trash page. Logical page
+                # ids run [0, N * (size/ps + 1)) — N per physical page of one
+                # rank's pool incl. the reserved padded page.
                 self._page_pos = torch.full(
                     (spec.shard_size * (self.size // spec.page_size + 2),),
-                    -1,
+                    self._trash_base // spec.page_size,
                     dtype=torch.int32,
                     device=self.device,
                 )
@@ -167,8 +167,6 @@ class PageInterleaveKVPoolMixin:
 
         self._epoch = 0
         self._shard_extend_active = False
-        self._prefix_active = False
-        self._n_prefix_slots = 0
         self._block_pages = 0
         # Strictly larger than any local physical page id: the owner-major
         # sort key of logical page l is (l % N) * stride + l // N.
@@ -178,7 +176,6 @@ class PageInterleaveKVPoolMixin:
         self._write_plan_key = None
         self._write_plan: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._translate_cache: Dict[Tuple[int, int], torch.Tensor] = {}
-        self._translate_cache_epoch = -1
 
         logger.info(
             "Page-interleave KV sharding enabled: shard_rank=%d shard_size=%d "
@@ -287,7 +284,7 @@ class PageInterleaveKVPoolMixin:
             f"capacity ({spec.chunk_tokens})"
         )
 
-        self._page_pos.fill_(-1)
+        self._page_pos.fill_(self._trash_base // ps)
         if n_prefix:
             # Owner-major slot assignment: sort the batch's unique pages by
             # (owner, local page) so rank r's pages are contiguous at
@@ -309,20 +306,17 @@ class PageInterleaveKVPoolMixin:
             )
         if n_chunk:
             self._page_pos[chunk_pages] = torch.arange(
-                n_prefix_slots,
-                n_prefix_slots + n_chunk,
+                self._chunk_base // ps,
+                self._chunk_base // ps + n_chunk,
                 dtype=torch.int32,
                 device=self.device,
             )
 
         self._epoch += 1
-        self._n_prefix_slots = n_prefix_slots
         self._block_pages = block_pages
-        self._prefix_active = n_prefix > 0
         self._shard_extend_active = True
-        self._write_plan_key = None
-        self._write_plan = None
-        if self._prefix_active:
+        self._translate_cache.clear()
+        if block_pages:
             # This rank's owned pages in slot order (already local-sorted) —
             # logical page l is its local physical page l // N — padded to
             # the regular allgather block with the reserved trash page
@@ -354,21 +348,16 @@ class PageInterleaveKVPoolMixin:
     def translate_loc_to_scratch(self, loc: torch.Tensor) -> torch.Tensor:
         """Logical token slots -> rows of the current batch's scratch slots.
 
-        ``_page_pos`` holds each planned page's ABSOLUTE scratch page slot:
+        ``_page_pos`` holds every logical page's absolute scratch page slot:
         prefix pages owner-major in ``[0, N * block_pages)`` (rank ``l % N``'s
         pages contiguous at ``rank * block_pages``, local-page order), chunk
-        pages in batch-sequence order after the prefix span. Anything outside
-        the plan (padded locations, the reserved pages of loc < N*ps) lands
-        in the trash page.
+        pages in batch-sequence order at ``_chunk_base``, and anything outside
+        the plan at the trash page.
         """
         ps = self.shard_spec.page_size
         loc64 = loc.long()
-        k = self._page_pos[loc64 // ps].long()
-        n_prefix_slots = self._n_prefix_slots
-        prefix_row = k * ps + loc64 % ps
-        chunk_row = self._chunk_base + (k - n_prefix_slots) * ps + loc64 % ps
-        row = torch.where(k >= n_prefix_slots, chunk_row, prefix_row)
-        return torch.where(k < 0, self._trash_base + loc64 % ps, row)
+        scratch_page = self._page_pos[loc64 // ps].long()
+        return scratch_page * ps + loc64 % ps
 
     # ---- the layer-ahead gather -------------------------------------------------
 
@@ -414,7 +403,7 @@ class PageInterleaveKVPoolMixin:
             "(begin_shard_extend not called?)"
         )
         slot = self._slots[layer_id % 2]
-        if self._prefix_active:
+        if self._block_pages:
             assert slot.resident_key == (layer_id, self._epoch), (
                 f"prefix scratch miss for layer {layer_id} "
                 f"(resident={slot.resident_key}, epoch={self._epoch})"
@@ -429,13 +418,9 @@ class PageInterleaveKVPoolMixin:
         callers: the same loc tensors (``out_cache_loc`` at every layer's
         ``set_kv_buffer``; the prefix ``kv_indices`` at every layer's
         ``get_mla_kv_buffer``) arrive at all layers of a forward, and the
-        plan is frozen per epoch — so each distinct loc tensor is translated
-        once per batch instead of once per layer. The dict holds
-        one entry per distinct loc tensor of the batch and is dropped on
-        epoch change."""
-        if self._translate_cache_epoch != self._epoch:
-            self._translate_cache_epoch = self._epoch
-            self._translate_cache = {}
+        plan is frozen per batch — so each distinct loc tensor is translated
+        once per batch instead of once per layer. ``begin_shard_extend`` clears
+        the cache when it installs a new plan."""
         key = (loc.data_ptr(), loc.numel())
         rows = self._translate_cache.get(key)
         if rows is None:

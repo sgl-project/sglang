@@ -23,7 +23,7 @@ Pins the pure arithmetic that rotated owner-classed allocation hangs on:
    immediately reusable).
 3. The host rotation base on radix ``TreeNode`` — stamped at insert, copied
    on split, read through ``last_node``.
-4. ``translate_loc_to_scratch`` — the per-batch page->position lookup mapping
+4. ``translate_loc_to_scratch`` — the per-batch page->scratch-page lookup mapping
    any consumer index vector onto the owner-major ``[prefix | chunk | trash]``
    scratch, checked against a brute-force reference.
 5. ``begin_shard_extend`` plan capture (page positions, padded send rows,
@@ -656,11 +656,17 @@ def _make_pool_stub(spec, shard_rank=0, debug=True, table_pages=4096):
     stub.start_layer = 0
     stub._chunk_base = spec.max_prefix_tokens
     stub._trash_base = spec.max_prefix_tokens + spec.chunk_tokens
-    stub._page_pos = torch.full((table_pages,), -1, dtype=torch.int32)
+    stub._page_pos = torch.full(
+        (table_pages,), stub._trash_base // PS, dtype=torch.int32
+    )
     stub._local_page_stride = table_pages
     stub._epoch = 0
     stub._write_plan_key = stub._write_plan = None
+    stub._translate_cache = {}
     stub._debug_plan_checks = debug
+    stub.translate_loc_to_scratch = lambda loc: (
+        PageInterleaveKVPoolMixin.translate_loc_to_scratch(stub, loc)
+    )
     stub.prefetched = []
     stub._prefetch_layer = lambda layer_id: stub.prefetched.append(layer_id)
     return stub
@@ -710,15 +716,13 @@ class TestBeginShardExtendPlan(CustomTestCase):
                 _make_pool_stub(_make_spec(), rank), [prefix_len], [seq_len], [row]
             )
             self.assertEqual(stub._block_pages, block)
-            self.assertEqual(stub._n_prefix_slots, N * block)
-            self.assertTrue(stub._prefix_active)
             self.assertTrue(stub._shard_extend_active)
             self.assertEqual(stub._epoch, 1)
             self.assertEqual(stub.prefetched, [0])  # first layer kicked
             for page, slot in slots.items():
                 self.assertEqual(int(stub._page_pos[page]), slot)
             for j, page in enumerate(pages[7:]):
-                self.assertEqual(int(stub._page_pos[page]), N * block + j)
+                self.assertEqual(int(stub._page_pos[page]), stub._chunk_base // PS + j)
             own = sorted((p for p in pages[:7] if p % N == rank), key=lambda p: p // N)
             expect = torch.cat(
                 [torch.arange((p // N) * PS, (p // N + 1) * PS) for p in own]
@@ -756,9 +760,9 @@ class TestBeginShardExtendPlan(CustomTestCase):
         self.assertEqual(stub._block_pages, block)
         for page, slot in slots.items():
             self.assertEqual(int(stub._page_pos[page]), slot)
-        # Chunk slots in batch order after the prefix span.
+        # Chunk slots are absolute scratch pages in batch order.
         for j, page in enumerate(chunk0 + chunk1 + chunk2):
-            self.assertEqual(int(stub._page_pos[page]), N * block + j)
+            self.assertEqual(int(stub._page_pos[page]), stub._chunk_base // PS + j)
         # Shared pages: both requests' locs hit the SAME scratch rows.
         shared_loc_r0 = rows[0][:PS].long()
         shared_loc_r1 = rows[1][:PS].long()
@@ -813,13 +817,12 @@ class TestBeginShardExtendPlan(CustomTestCase):
         stub = _run_begin(
             _make_pool_stub(_make_spec()), [0], [PS + 5], [_chain_row(pages, PS + 5)]
         )
-        self.assertEqual(stub._n_prefix_slots, 0)
-        self.assertFalse(stub._prefix_active)
+        self.assertEqual(stub._block_pages, 0)
         self.assertTrue(stub._shard_extend_active)
         self.assertEqual(stub.prefetched, [])  # nothing to gather
         self.assertIsNone(stub._send_rows)
-        self.assertEqual(int(stub._page_pos[pages[0]]), 0)
-        self.assertEqual(int(stub._page_pos[pages[1]]), 1)
+        self.assertEqual(int(stub._page_pos[pages[0]]), stub._chunk_base // PS)
+        self.assertEqual(int(stub._page_pos[pages[1]]), stub._chunk_base // PS + 1)
 
     def test_unaligned_prefix_rejected(self):
         # The tree quantum is the PHYSICAL page: a prefix that is not a
@@ -922,6 +925,24 @@ class TestScratchTranslation(CustomTestCase):
         # stride-divide contract).
         self.assertTrue(bool((rows[:3] % PS == 0).all()))
         self.assertEqual(int(rows[3]), stub._trash_base)
+
+    def test_translation_cache_cleared_with_new_plan(self):
+        pages = _chain_pages(base=0, n_pages=2)
+        stub = _make_pool_stub(_make_spec())
+
+        # The first batch treats page 0 as part of the current chunk.
+        _run_begin(stub, [0], [PS], [_chain_row(pages[:1], PS)])
+        loc = _chain_row(pages[:1], PS).long()
+        first = PageInterleaveKVPoolMixin._translate_loc_cached(stub, loc)
+        again = PageInterleaveKVPoolMixin._translate_loc_cached(stub, loc)
+        self.assertIs(again, first)
+
+        # The next batch reuses the same loc tensor after page 0 becomes a
+        # cached prefix. Installing the new plan must discard the old mapping.
+        _run_begin(stub, [PS], [2 * PS], [_chain_row(pages, 2 * PS)])
+        fresh = PageInterleaveKVPoolMixin._translate_loc_cached(stub, loc)
+        self.assertIsNot(fresh, first)
+        self.assertFalse(torch.equal(fresh, first))
 
 
 class TestWritePlan(CustomTestCase):
