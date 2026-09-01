@@ -949,7 +949,6 @@ class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
         tree.sanity_check()
 
 
-
 class TestSWARadixCacheCompact(CustomTestCase):
     def _build_chain(self, n_tokens: int, window: int = 4):
         tree, allocator, _ = _build_swa_tree(
