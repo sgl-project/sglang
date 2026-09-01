@@ -14,6 +14,7 @@ from sglang.srt.models.deepseek_common.utils import _is_hip
 from sglang.srt.runtime_context import (
     get_exec,
     get_platform,
+    get_parallel,
 )
 from sglang.srt.utils import use_intel_amx_backend
 
@@ -193,6 +194,8 @@ def handle_attention_aiter(attn, forward_batch):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
+        if get_parallel().dcp_enabled:
+            return AttnForwardMethod.MHA_ONE_SHOT
         return AttnForwardMethod.MHA
     else:
         return AttnForwardMethod.MLA
