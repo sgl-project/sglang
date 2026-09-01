@@ -337,7 +337,7 @@ automatically.
 
 Two options are available for running DeepSeek-V4 on Hopper:
 
-- **Original FP4 checkpoints** — apply the W4A16 MoE kernels (Marlin) as the command generator picks for Hopper cells. This path works on both H100 and H200 and is the only option for H100 (no FP8 path). It is TP-only; on H200 the Pro variant fits on a single 8-GPU node, while H100 Pro needs 2 nodes (TP=16).
+- **Original FP4 checkpoints** — run the MoE experts with W4A16 kernels (Marlin or the FlashInfer SM90 CUTLASS runner) as the command generator picks for Hopper cells. With FlashInfer >= 0.6.18 you can instead select the **W4A8** path — MXFP4 weights with FP8 activations via FlashInfer's Humming kernels — by adding `--flashinfer-mxfp4-moe-precision fp8` to `--moe-runner-backend flashinfer_mxfp4`; the low-latency Hopper cells now generate this form. Both work on H100 and H200; FP4 is the only option for H100 (no FP8 path). It is TP-only; on H200 the Pro variant fits on a single 8-GPU node, while H100 Pro needs 2 nodes (TP=16).
 - **Converted FP8 checkpoints** (H100 and H200 only) — pre-repackaged FP8 weights at [`sgl-project/DeepSeek-V4-Flash-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8) and [`sgl-project/DeepSeek-V4-Pro-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Pro-FP8) unlock DP-attention + DeepEP and richer parallelism (e.g. Pro TP=16 across 2 nodes).
 
 On these FP8 checkpoints you can additionally enable the all-FP8 **MegaMoE** path on SM90 for higher long-context / large-decode throughput — see the **SM90 (Hopper) FP8 MegaMoE** note in Configuration Tips below.

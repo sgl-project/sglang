@@ -1904,13 +1904,17 @@ sgl-eval run mmmu_pro \\
 
     {
       match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: true,
+      // W4A8 (MXFP4 weights x FP8 activations, FlashInfer Humming kernels);
+      // requires FlashInfer >= 0.6.18. Falls back: drop the precision flag
+      // for the W4A16 path, or use --moe-runner-backend marlin.
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--moe-runner-backend marlin",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--flashinfer-mxfp4-moe-precision fp8",
         "--speculative-algorithm DSPARK",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -1918,13 +1922,15 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: true,
+      // W4A8 Humming path -- see the flash-official cell above.
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--moe-runner-backend marlin",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--flashinfer-mxfp4-moe-precision fp8",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1993,13 +1999,15 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: true,
+      // W4A8 Humming path -- see the flash-official cell above.
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--moe-runner-backend flashinfer_mxfp4",
+        "--flashinfer-mxfp4-moe-precision fp8",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
