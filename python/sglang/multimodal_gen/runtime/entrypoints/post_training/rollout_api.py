@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
+import msgspec
 import torch
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import ORJSONResponse
+from fastapi import APIRouter, HTTPException, Response
 
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
@@ -130,6 +130,7 @@ def _slice_rollout_trajectory_for_sample(
         dit_trajectory = RolloutDitTrajectory(
             latents=_extract_single_sample_tensor(dit.latents, sample_idx, batch_size),
             timesteps=dit.timesteps,
+            sigmas=dit.sigmas,
         )
     return RolloutTrajectoryData(
         rollout_log_probs=log_probs,
@@ -143,6 +144,7 @@ def _serialize_rollout_trajectory(
     rtd: RolloutTrajectoryData | None,
     *,
     serialized_dit_timesteps: dict | None = None,
+    serialized_dit_sigmas: dict | None = None,
 ) -> tuple[dict | None, dict | None, dict | None, dict | None]:
     """Return order: rollout_log_probs, rollout_debug_tensors, denoising_env, dit_trajectory."""
     if rtd is None:
@@ -182,6 +184,7 @@ def _serialize_rollout_trajectory(
                 _maybe_serialize(dit.latents) if dit.latents is not None else None
             ),
             "timesteps": serialized_dit_timesteps,
+            "sigmas": serialized_dit_sigmas,
         }
     return (
         serialized_log_probs,
@@ -211,9 +214,13 @@ def _build_response(
         ), "rollout_trajectory_data must be present when rollout=True"
 
     serialized_dit_timesteps = None
+    serialized_dit_sigmas = None
     if rollout and rollout_trajectory_data and rollout_trajectory_data.dit_trajectory:
         serialized_dit_timesteps = _maybe_serialize(
             rollout_trajectory_data.dit_trajectory.timesteps
+        )
+        serialized_dit_sigmas = _maybe_serialize(
+            rollout_trajectory_data.dit_trajectory.sigmas
         )
 
     responses: list[RolloutResponse] = []
@@ -245,6 +252,7 @@ def _build_response(
         ) = _serialize_rollout_trajectory(
             per_sample_trajectory,
             serialized_dit_timesteps=serialized_dit_timesteps,
+            serialized_dit_sigmas=serialized_dit_sigmas,
         )
         responses.append(
             RolloutResponse(
@@ -298,7 +306,16 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
     return {k: v for k, v in sampling_kwargs.items() if v is not None}
 
 
-@router.post("/generate", response_model=list[RolloutResponse])
+@router.post(
+    "/generate",
+    response_class=Response,
+    responses={
+        200: {
+            "model": list[RolloutResponse],
+            "content": {"application/msgpack": {}},
+        }
+    },
+)
 async def rollout_generate(request: RolloutRequest):
     request_id = generate_request_id()
     server_args = get_global_server_args()
@@ -326,4 +343,8 @@ async def rollout_generate(request: RolloutRequest):
     rollout_responses = _build_response(
         request_id, request.prompt, request.seed, request.rollout, output_batch
     )
-    return ORJSONResponse(content=[r.model_dump() for r in rollout_responses])
+    payload = [r.model_dump() for r in rollout_responses]
+    return Response(
+        content=msgspec.msgpack.encode(payload),
+        media_type="application/msgpack",
+    )

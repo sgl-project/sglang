@@ -19,12 +19,12 @@ from typing import Any
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
+    quant_to_nope_fp8_rope_bf16_pack_triton,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-from sglang.srt.layers.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
-)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -287,6 +287,9 @@ class TinyDSV4ModelConfig:
         self.hf_text_config = self.hf_config
         self.linear_attn_registry_result = None
 
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
 
 class MockDSV4ModelRunner:
     """Minimal runner exposing what `DeepseekV4AttnBackend.__init__` reads.
@@ -328,6 +331,12 @@ class MockDSV4ModelRunner:
         self.device = device
         self.dtype = dtype
         self.kv_cache_dtype = dtype
+        self.kv_cache_dtype_str = "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
         self.gpu_id = 0
         self.canary_manager = None
         self.page_size = case.page_size
@@ -362,7 +371,7 @@ class MockDSV4ModelRunner:
             max_running_requests=None,
             pp_size=1,
             revision=None,
-            speculative_algorithm=None,
+            speculative_algorithm=("EAGLE" if speculative_num_draft_tokens else None),
             speculative_eagle_topk=speculative_eagle_topk,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
@@ -391,7 +400,7 @@ class MockDSV4ModelRunner:
             c4_state_pool_size=pool_batch_size,
             c128_state_pool_size=pool_batch_size,
             page_size=case.page_size,
-            swa_page_size=DSV4_SWA_WINDOW,
+            swa_page_size=case.page_size,
             dtype=torch.float8_e4m3fn,
             c4_state_dtype=dtype,
             c128_state_dtype=dtype,
@@ -1490,6 +1499,7 @@ def run_dsv4_target_verify_attention_case(
     fixture = build_dsv4_attention_fixture(testcase, case, dtype=dtype, device=device)
     runner = fixture.runner
     max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+    testcase.assertEqual(fixture.backend.max_context_len, max_context_len)
 
     _populate_swa_kv_cache(fixture, max_context_len=max_context_len, device=device)
     if case.compress_ratio in (4, 128):
@@ -1530,6 +1540,7 @@ def run_dsv4_draft_extend_attention_case(
     *,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    force_gpu_only_seq_lens: bool = False,
 ) -> None:
     """Math-faithful EAGLE `DRAFT_EXTEND` test for DSV4.
 
@@ -1567,6 +1578,10 @@ def run_dsv4_draft_extend_attention_case(
         fixture.forward_batch,
         device=device,
     )
+    if force_gpu_only_seq_lens:
+        fixture.forward_batch.seq_lens_cpu = None
+        fixture.forward_batch.seq_lens_sum = None
+        fixture.forward_batch.spec_info.seq_lens_cpu = None
 
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):

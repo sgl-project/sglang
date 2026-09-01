@@ -13,6 +13,7 @@ import torch
 
 from sglang.benchmark.serving import run_benchmark
 from sglang.srt.managers.prefill_delayer import PrefillDelayer
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -66,6 +67,7 @@ class NegotiateTestCase:
     # to exercise the legacy slot-only code paths.
     queue_min_ratio: Optional[float] = None
     max_delay_ms: Optional[float] = None
+    prefill_max_requests: Optional[int] = None
     # Expected accumulated wait surfaced on the final (release) outcome. When
     # set, asserts the wait histograms would observe this value instead of 0.
     expected_wait_forward_passes: Optional[int] = None
@@ -76,17 +78,18 @@ def _run_negotiate_test(rank, test_cases):
     cpu_group = torch.distributed.new_group(backend="gloo")
 
     for case in test_cases:
+        # The DP-attention gate is a published config leaf.
+        override = get_context().override_server_args(
+            enable_dp_attention=True,
+            prefill_delayer_queue_min_ratio=case.queue_min_ratio,
+            prefill_delayer_max_delay_ms=case.max_delay_ms,
+            prefill_max_requests=case.prefill_max_requests,
+        )
+        override.install()
         delayer = PrefillDelayer(
             dp_size=world_size,
             attn_tp_size=1,
             cpu_group=cpu_group,
-            server_args=SimpleNamespace(
-                enable_dp_attention=True,
-                disaggregation_mode="null",
-                disable_overlap_schedule=False,
-                prefill_delayer_queue_min_ratio=case.queue_min_ratio,
-                prefill_delayer_max_delay_ms=case.max_delay_ms,
-            ),
             max_delay_passes=case.max_delay_passes,
             token_usage_low_watermark=case.token_usage_low_watermark,
         )
@@ -126,6 +129,8 @@ def _run_negotiate_test(rank, test_cases):
                 assert (
                     result.wait_seconds > 0.0
                 ), f"Case {case.name} rank {rank}: wait_seconds not surfaced"
+
+        override.restore()
 
 
 _NEGOTIATE_TEST_CASES = [
@@ -285,6 +290,34 @@ _NEGOTIATE_TEST_CASES = [
         expected_allow=False,
         expected_reason="delay",
     ),
+    NegotiateTestCase(
+        name="queue_trigger_uses_admission_capacity",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        queue_min_ratio=0.02,
+        max_delay_ms=5000,
+        prefill_max_requests=128,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[500, 500, 500, 500],
+                max_prefill_bs=[1, 1, 1, 1],
+                waiting_queue_len=[1, 1, 1, 1],
+                max_running_requests=1024,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[500, 500, 500, 500],
+                max_prefill_bs=[1, 1, 1, 1],
+                waiting_queue_len=[1, 1, 1, 1],
+                max_running_requests=1024,
+            ),
+        ],
+        expected_allow=False,
+        expected_reason="delay",
+    ),
     # Waiting queue at or above queue_min: queue trigger must not fire.
     NegotiateTestCase(
         name="queue_trigger_above_threshold",
@@ -370,6 +403,53 @@ _NEGOTIATE_TEST_CASES = [
         expected_reason="wait_success",
         # One queue-trigger delay was recorded before the wall-clock release.
         expected_wait_forward_passes=1,
+    ),
+    # slot_condition (all-branch) must not delay forever: with 128-100=28
+    # free slots < max_prefill_bs=80 the delay holds, but it must release
+    # with wait_timeout after max_delay_passes, like the mixed branch.
+    NegotiateTestCase(
+        name="slot_condition_pass_cap_timeout",
+        max_delay_passes=3,
+        token_usage_low_watermark=0.8,
+        calls=[
+            # skip_first_delayer consumes the first would-be delay.
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=128,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=128,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=128,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=128,
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="wait_timeout",
+        # Two slot-condition delays accumulated after the skip-first pass.
+        expected_wait_forward_passes=2,
     ),
 ]
 

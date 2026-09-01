@@ -18,7 +18,7 @@ FOLDER_NAMES = [
     "docs",
     "examples",
     "python/sglang/lang",
-    "python/sglang/jit_kernel",
+    "python/sglang/kernels/jit",
     "python/sglang/srt",
     "python/sglang/test",
     "python/sglang/utils.py",

@@ -9,6 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
+
 
 class PackTopkIds:
 
@@ -51,12 +53,16 @@ class PackTopkIds:
 
         BLOCK_SIZE = 1024
         grid = (triton.cdiv(numel, BLOCK_SIZE),)
+        pdl_kwargs = (
+            {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+        )
         _pack_topk_ids_triton_kernel[grid](
             topk_ids,
             topk_weights,
             out,
             numel,
             BLOCK_SIZE=BLOCK_SIZE,
+            **pdl_kwargs,
         )
         return out
 
@@ -68,13 +74,20 @@ def _pack_topk_ids_triton_kernel(
     out_ptr,
     numel,
     BLOCK_SIZE: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < numel
 
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     ids = tl.load(topk_ids_ptr + offsets, mask=mask, other=0)
     w = tl.load(topk_weights_ptr + offsets, mask=mask, other=0.0)
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
     w_bf16 = w.to(tl.bfloat16)
     w_i16 = w_bf16.to(tl.int16, bitcast=True)
