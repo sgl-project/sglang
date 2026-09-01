@@ -232,8 +232,11 @@ class StreamingSession(BasePrefixCache):
             f"{slot.kv.cache_protected_len=}"
         )
 
-        # Floor-align prefix_len to page boundary (NPU workaround).
-        if is_npu() and self.page_size > 1:
+        # NPU requires page-aligned KV reuse; and a rewind below the SWA
+        # eviction cursor must land on a page boundary -- free_kv_row_segments
+        # splits dead/alive at the cursor, and a mid-page cut frees the shared
+        # page twice.
+        if self.page_size > 1 and (is_npu() or req.kv.swa_evicted_seqlen > prefix_len):
             prefix_len = (prefix_len // self.page_size) * self.page_size
             req.kv.kv_committed_len = min(req.kv.kv_committed_len, prefix_len)
 
@@ -510,6 +513,10 @@ class StreamingSession(BasePrefixCache):
         be released to avoid token/KV mismatch.
         """
         target = len(req.origin_input_ids) + finished_len
+        if self.page_size > 1 and req.kv.swa_evicted_seqlen > target:
+            # Same hazard as the match-path rewind: the cursor must stay
+            # page-aligned; the partial page is re-prefilled next turn.
+            target = (target // self.page_size) * self.page_size
         self._free_kv_aligned(req.kv, target, req.kv.kv_allocated_len)
         req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
         req.kv.kv_committed_len = min(req.kv.kv_committed_len, target)

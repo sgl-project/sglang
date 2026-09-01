@@ -122,6 +122,12 @@ def free_kv_row_segments(
         # Below the floor the SWA peers are already gone -- window eviction, or
         # the deliberately unmapped prefix of a PD decode SWA-tail prealloc.
         num_dead = min(max(swa_evicted_seqlen - start_pos, 0), num_indices)
+        if 0 < num_dead < num_indices:
+            # A mid-page cut would send the shared page back from both sides.
+            assert swa_evicted_seqlen % allocator.page_size == 0, (
+                f"SWA eviction floor {swa_evicted_seqlen} splits a page "
+                f"(page_size {allocator.page_size})"
+            )
         if num_dead > 0:
             dead.append(kv_indices[:num_dead])
         if num_dead < num_indices:

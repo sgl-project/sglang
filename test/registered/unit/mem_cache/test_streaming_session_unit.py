@@ -306,6 +306,38 @@ def test_trim_overshoot_postcondition():
     assert [t.tolist() for t in allocator.freed] == [[38, 39, 40, 41], [42, 43]]
 
 
+def test_trim_overshoot_keeps_cursor_page_aligned_on_paged():
+    """A mid-page trim target must not become the SWA eviction cursor (the
+    dead/alive split there frees the shared page twice); rewind to the boundary."""
+    page_size = 16
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator(page_size=page_size)
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    )
+
+    # origin=26, finished=12 -> raw target 38 (mid-page); cursor 48 > target.
+    req = _FakeReq("session-a", req_pool_idx=0, committed=52, allocated=64)
+    req.origin_input_ids = list(range(26))
+    req.output_ids = list(range(14))
+    req.kv.swa_evicted_seqlen = 48
+
+    tree_cache._trim_overshoot(req, finished_len=12)
+
+    # Rewound to floor_align(38) = 32; every cursor lands page-aligned.
+    assert req.kv.kv_allocated_len == 32
+    assert req.kv.kv_committed_len == 32
+    assert req.kv.swa_evicted_seqlen == 32
+    assert len(req.output_ids) == 12
+    # Freed [32, 64): [32, 48) below the old cursor goes back full-only,
+    # [48, 64) both halves.
+    assert [t.tolist() for t in allocator.freed] == [
+        list(range(32, 48)),
+        list(range(48, 64)),
+    ]
+
+
 if __name__ == "__main__":
     import sys
 
