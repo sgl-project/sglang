@@ -101,10 +101,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.mem_cache.allocation import (
-    alloc_for_decode,
-    alloc_for_extend,
-)
+from sglang.srt.mem_cache.allocation import alloc_for_decode, alloc_for_extend
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -3054,11 +3051,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 else [self.reqs[i] for i in selected_indices]
             )
             active_slots = len(
-                {
-                    int(r.kv.req_pool_idx)
-                    for r in reqs
-                    if r.kv.req_pool_idx is not None
-                }
+                {int(r.kv.req_pool_idx) for r in reqs if r.kv.req_pool_idx is not None}
             )
             unified = getattr(allocator.get_kvcache(), "unified_kv_pool", None)
             if unified is not None:

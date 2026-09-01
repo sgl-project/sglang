@@ -382,9 +382,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             indexer_ratio = parse_hisparse_config().host_to_device_ratio
 
-        from sglang.srt.mem_cache.kv_cache_configurator import (
-            _should_elide_dsa_index_k,
-        )
+        from sglang.srt.mem_cache.kv_cache_configurator import _should_elide_dsa_index_k
 
         if allocate_all_layers or not _should_elide_dsa_index_k(
             is_draft_worker=kvc.is_draft_worker

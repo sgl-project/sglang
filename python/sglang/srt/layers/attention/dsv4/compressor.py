@@ -26,9 +26,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_finish,
     cp_all_gather_rerange_launch,
 )
-from sglang.srt.mem_cache.deepseek_v4_compress_state import (
-    CompressStatePool,
-)
+from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip

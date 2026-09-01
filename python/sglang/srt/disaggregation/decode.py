@@ -95,11 +95,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.runtime_context import (
-    get_disagg,
-    get_memory,
-    get_parallel,
-)
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
