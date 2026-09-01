@@ -103,6 +103,7 @@ class _MockTokenizerManager:
             reasoning_parser=None,
             stream_response_default_include_usage=False,
             default_chat_template_kwargs=None,
+            incremental_streaming_output=False,
         )
         self.model_path = self.server_args.model_path
         # The manager tracks the served name itself; a weight update rewrites it.
@@ -365,16 +366,172 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(request.model_dump(), body)
         self.assertFalse(hasattr(request, "conversation_id"))
 
-    def test_convert_to_internal_request_rejects_stream_token_ids(self):
-        for field in ("return_prompt_token_ids", "return_token_ids"):
-            req = ChatCompletionRequest(
-                model="x",
-                messages=[{"role": "user", "content": "Hi?"}],
-                stream=True,
-                **{field: True},
+    def test_convert_to_internal_request_allows_stream_token_ids(self):
+        processed_messages = MessageProcessingResult(
+            "Test prompt", [1, 2, 3], None, None, [], [], None
+        )
+
+        with patch.object(
+            self.chat, "_process_messages", return_value=processed_messages
+        ):
+            for field in ("return_prompt_token_ids", "return_token_ids"):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    stream=True,
+                    **{field: True},
+                )
+                with self.subTest(field=field):
+                    adapted, processed = self.chat._convert_to_internal_request(
+                        req, self.fastapi_request
+                    )
+                    self.assertTrue(adapted.stream)
+                    self.assertEqual(getattr(processed, field), True)
+                    self.assertTrue(adapted.return_prompt_token_ids)
+                    self.assertEqual(processed, req)
+
+    def test_convert_to_internal_request_allows_stream_token_ids_with_tools(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is the weather?"}],
+            stream=True,
+            return_token_ids=True,
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        )
+        processed_messages = MessageProcessingResult(
+            "Test prompt", [1, 2, 3], None, None, [], [], None
+        )
+
+        with patch.object(
+            self.chat, "_process_messages", return_value=processed_messages
+        ):
+            adapted, processed = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
             )
-            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
-                self.chat._convert_to_internal_request(req, self.fastapi_request)
+
+        self.assertTrue(adapted.stream)
+        self.assertTrue(processed.return_token_ids)
+        self.assertTrue(adapted.return_prompt_token_ids)
+
+    def test_streaming_token_ids_deltas_cover_output_exactly(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=10,
+            stream=True,
+            return_token_ids=True,
+        )
+        processed_messages = MessageProcessingResult(
+            "Test prompt", [1, 2, 3], None, None, [], [], None
+        )
+        with patch.object(
+            self.chat, "_process_messages", return_value=processed_messages
+        ):
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+        self.chat.tokenizer_manager.server_args.stream_response_default_include_usage = (
+            False
+        )
+
+        for incremental in (False, True):
+            with self.subTest(incremental_streaming_output=incremental):
+                self.chat.tokenizer_manager.server_args.incremental_streaming_output = (
+                    incremental
+                )
+                texts = ("a", "b", "c") if incremental else ("a", "ab", "abc")
+                output_ids = (
+                    ([5], [6], [7]) if incremental else ([5], [5, 6], [5, 6, 7])
+                )
+                chunks = [
+                    {
+                        "text": text,
+                        "output_ids": ids,
+                        "prompt_token_ids": [1, 2],
+                        "meta_info": {
+                            "id": "chatcmpl-test",
+                            "prompt_tokens": 2,
+                            "completion_tokens": i + 1,
+                            "finish_reason": {"type": "stop"} if i == 2 else None,
+                            "weight_version": "default",
+                        },
+                        "index": 0,
+                    }
+                    for i, (text, ids) in enumerate(zip(texts, output_ids))
+                ]
+
+                async def _mock_generate(*args, _chunks=chunks, **kwargs):
+                    for chunk in _chunks:
+                        yield chunk
+
+                self.chat.tokenizer_manager.generate_request = _mock_generate
+
+                async def run_stream():
+                    return [
+                        chunk
+                        async for chunk in self.chat._generate_chat_stream(
+                            adapted_request, req, self.fastapi_request
+                        )
+                    ]
+
+                raw_chunks = get_or_create_event_loop().run_until_complete(run_stream())
+
+                choices = []
+                for raw in raw_chunks:
+                    if not raw.startswith("data: ") or raw.strip() == "data: [DONE]":
+                        continue
+                    data = json.loads(raw[len("data: ") :])
+                    choices.extend(data.get("choices", []))
+
+                token_ids = [tid for c in choices for tid in c.get("token_ids", [])]
+                text = "".join(
+                    c["delta"].get("content", "") or ""
+                    for c in choices
+                    if "delta" in c
+                )
+                self.assertEqual(text, "abc")
+                self.assertEqual(token_ids, [5, 6, 7])
+                self.assertEqual(choices[0]["prompt_token_ids"], [1, 2])
+                for choice in choices[1:]:
+                    self.assertNotIn("prompt_token_ids", choice)
+
+    def test_streaming_token_ids_emit_when_text_is_deferred(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            return_token_ids=True,
+        )
+
+        async def collect():
+            return [
+                chunk
+                async for chunk in self.chat._generate_stream_content(
+                    content={
+                        "text": None,
+                        "output_ids": [11],
+                        "meta_info": {"id": "chatcmpl-test"},
+                    },
+                    index=0,
+                    request=req,
+                    stream_offsets={},
+                    token_id_offsets={},
+                    reasoning_parser_dict={},
+                    parser_dict={},
+                    has_tool_calls={},
+                    choice_logprobs=None,
+                    finish_reason_type=None,
+                    continuous_usage_stats=False,
+                    prompt_tokens={},
+                    reasoning_tokens={},
+                    completion_tokens={},
+                )
+            ]
+
+        chunks = get_or_create_event_loop().run_until_complete(collect())
+        payload = json.loads(chunks[0].removeprefix("data: ").strip())
+        self.assertEqual(payload["choices"][0]["delta"]["content"], "")
+        self.assertEqual(payload["choices"][0]["token_ids"], [11])
 
     def test_validate_request_rejects_sampling_mask_without_meta_info(self):
         req = ChatCompletionRequest(
@@ -2338,6 +2495,7 @@ class ServingChatTestCase(unittest.TestCase):
             index=0,
             request=req,
             stream_offsets={},
+            token_id_offsets={},
             reasoning_parser_dict={},
             parser_dict={},
             has_tool_calls={},
@@ -2451,6 +2609,51 @@ class ServingChatTestCase(unittest.TestCase):
             logprob_chunks,
             "logprobs dropped: no flush chunk carried logprobs when tool parser buffered the delta",
         )
+
+    def test_streaming_token_ids_flushed_when_tool_parser_buffers_delta(self):
+        """Raw token ids must keep streaming even when the tool parser buffers text."""
+        self.chat.tool_call_parser = "hermes"
+
+        content = {
+            "text": "(<",
+            "output_ids": [42],
+            "meta_info": {
+                "id": "chatcmpl-tool",
+                "prompt_tokens": 5,
+                "completion_tokens": 1,
+                "cached_tokens": 0,
+                "finish_reason": {"type": "stop", "matched": None},
+            },
+            "index": 0,
+        }
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            stream=True,
+            return_token_ids=True,
+        )
+
+        async def _empty_tool_stream(*args, **kwargs):
+            return
+            yield  # make it an async generator
+
+        with patch.object(self.chat, "_process_tool_call_stream", _empty_tool_stream):
+            chunks = get_or_create_event_loop().run_until_complete(
+                self._collect_stream_content(content, None, req)
+            )
+
+        parsed = self._parse_chunks(chunks)
+        token_id_chunks = [
+            c for c in parsed if c["choices"][0].get("token_ids") is not None
+        ]
+        self.assertEqual(
+            [c["choices"][0]["token_ids"] for c in token_id_chunks],
+            [[42]],
+        )
+        self.assertNotIn("content", token_id_chunks[0]["choices"][0]["delta"])
+        self.assertNotIn("tool_calls", token_id_chunks[0]["choices"][0]["delta"])
 
     def test_streaming_logprobs_not_flushed_on_empty_delta_step_without_parser(self):
         """With no parser active, an empty-delta step must not emit a standalone
@@ -2848,6 +3051,7 @@ class ServingChatTestCase(unittest.TestCase):
                 index=0,
                 request=req,
                 stream_offsets={},
+                token_id_offsets={},
                 reasoning_parser_dict={},
                 parser_dict={},
                 has_tool_calls={},
