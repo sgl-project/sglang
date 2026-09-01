@@ -1041,6 +1041,7 @@ class TestSWAPeerMappedContract(CustomTestCase):
         self.assertTrue(self._condition_checked_by(allocator, live))
         self.assertFalse(self._condition_checked_by(allocator, stale))
 
+    @unittest.skipUnless(torch.cuda.is_available(), "sync detection needs CUDA")
     def test_free_swa_does_not_synchronize(self):
         """The filter's output shape was data-dependent, so it read a count back
         to the host; the gather that replaced it has a fixed shape."""
