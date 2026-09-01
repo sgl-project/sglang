@@ -169,7 +169,8 @@ sgl-eval run aime25 \\
 
     // ----- Card 4: "Speculative Decoding" -----
     // GLM-5.3 ships a single MTP (nextn) layer; index_share_for_mtp_iteration reuses the
-    // DSA indexer topk across draft steps (topk==1 only).
+    // DSA indexer topk across draft steps (topk==1 only). DFlash2 is the one
+    // algorithm no Deploy cell ships: its draft is a separate checkpoint.
     speculative: {
       options: [
         { id: "current", label: "Inherited from base" },
@@ -184,6 +185,25 @@ sgl-eval run aime25 \\
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
           disable: { hw: ["mi355x", "mi325x", "mi300x"] },
           disableReason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
+        { id: "dflash", label: "DFlash2 (block diffusion)",
+          // Block-wise draft from a separate checkpoint, not the in-checkpoint
+          // MTP layer. The block size (8) comes from the draft's own
+          // dflash_config, so no --speculative-num-draft-tokens here. The draft
+          // is a small dense model and does not run on the target's DSA
+          // backends, hence the explicit draft attention backend.
+          flags: ["--speculative-algorithm DFLASH",
+                  "--speculative-draft-model-path incoai/GLM-5.3-DFlash2",
+                  "--speculative-draft-attention-backend fa4"],
+          // The DFlash2 drafter (PR #35371) merged after v0.5.18, so neither the
+          // release wheel nor the lmsysorg/sglang:latest image this page pins
+          // carries it. Drop this note once a release ships it.
+          note: "⚠️ Needs a nightly image: the DFlash2 drafter (PR #35371) is not in the release wheel nor the lmsysorg/sglang:latest image this page pins — install SGLang from main or use a lmsysorg/sglang:dev image. The draft is a separate checkpoint, so fetch incoai/GLM-5.3-DFlash2 alongside the target; it is public but licensed CC BY-NC-ND 4.0 for research and evaluation.",
+          disable: [
+            { when: { dpAttnOn: [true] },
+              reason: "DFLASH speculative decoding does not support DP-Attention — the server rejects the combination at startup. Turn DP-Attention off in the Attention card above (the high-throughput recipes enable it)." },
+            { when: { hw: ["mi355x", "mi325x", "mi300x"] },
+              reason: "DFLASH speculative decoding only supports CUDA and NPU devices; the server rejects it on ROCm at startup." },
+          ] },
       ],
     },
 
