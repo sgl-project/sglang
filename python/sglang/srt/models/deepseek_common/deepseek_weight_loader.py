@@ -72,6 +72,32 @@ logger = logging.getLogger(__name__)
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
 
+def _normalize_mxfp4_packed_expert_weight_name(
+    name: str, quant_config: Optional[QuantizationConfig]
+) -> str:
+    """Map compressed-tensors MXFP4 checkpoint names to generic MoE params.
+
+    ``Mxfp4MoEMethod`` registers ``w13_weight``/``w2_weight`` while serialized
+    compressed-tensors checkpoints expose each expert tensor as
+    ``weight_packed``.  The packed bytes are already in the layout expected by
+    the generic method; only the parameter name differs.
+    """
+    if "weight_packed" not in name:
+        return name
+
+    if _is_npu:
+        return name.replace("weight_packed", "weight")
+
+    if (
+        quant_config is not None
+        and quant_config.get_name() == "compressed_tensors"
+        and "mxfp4" in (getattr(quant_config, "quant_format", "") or "")
+    ):
+        return name.replace("weight_packed", "weight")
+
+    return name
+
+
 def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
         return tensor.clone().detach()
@@ -306,8 +332,9 @@ class DeepseekV2WeightLoaderMixin:
                     # Skip non-stacked layers and experts (experts handled below).
                     if weight_name not in name:
                         continue
-                    if _is_npu:
-                        name = name.replace("weight_packed", "weight")
+                    name = _normalize_mxfp4_packed_expert_weight_name(
+                        name, self.quant_config
+                    )
                     # We have mlp.experts[0].gate_proj in the checkpoint.
                     # Since we handle the experts below in expert_params_mapping,
                     # we need to skip here BEFORE we update the name, otherwise
@@ -335,8 +362,9 @@ class DeepseekV2WeightLoaderMixin:
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
-                        if _is_npu:
-                            name = name.replace("weight_packed", "weight")
+                        name = _normalize_mxfp4_packed_expert_weight_name(
+                            name, self.quant_config
+                        )
                         name = name.replace(weight_name, param_name)
                         if name not in params_dict:
                             continue
