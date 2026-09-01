@@ -134,20 +134,37 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self._restore_generation = 0
         self._inflight_store_nodes: dict[str, tuple[Any, DecLockRefParams]] = {}
         self._store_generation = 0
+        self._defer_store_launch = os.getenv(
+            "FLEXKV_DEFER_STORE_LAUNCH", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self._profile_store_stages = os.getenv(
             "FLEXKV_PROFILE_STORE_STAGES", "0"
         ).strip().lower() in {"1", "true", "yes", "on"}
+        async_store_requested = os.getenv(
+            "FLEXKV_ASYNC_STORE_SLOT_MAPPING", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self._async_store_slot_mapping = bool(
-            getattr(
+            async_store_requested
+            and self._defer_store_launch
+            and getattr(
                 self.flexkv_connector,
                 "supports_async_store_slot_mapping",
                 False,
             )
         )
-        logger.info(
-            "[FlexKV] hybrid store slot-mapping mode: %s",
-            "async" if self._async_store_slot_mapping else "sync",
-        )
+        if async_store_requested and not self._async_store_slot_mapping:
+            logger.warning(
+                "[FlexKV] FLEXKV_ASYNC_STORE_SLOT_MAPPING requested but disabled: "
+                "deferred=%s connector_supported=%s",
+                self._defer_store_launch,
+                bool(
+                    getattr(
+                        self.flexkv_connector,
+                        "supports_async_store_slot_mapping",
+                        False,
+                    )
+                ),
+            )
         self._pending_store_launches: dict[str, _PendingStoreLaunch] = {}
         self._pending_store_copies: dict[str, _PendingStoreCopy] = {}
         self._node_lock = threading.Lock()
@@ -490,7 +507,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             token_ids=token_ids,
             kv_indices=indices,
         )
-        if self.__dict__.get("_async_store_slot_mapping", False):
+        if self.__dict__.get("_defer_store_launch", False):
             with self._node_lock:
                 self._pending_store_launches[store_key] = pending
             return
@@ -626,12 +643,28 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                     break
                 store_key = next(iter(self._pending_store_launches))
                 pending = self._pending_store_launches.pop(store_key)
+            if self.__dict__.get("_async_store_slot_mapping", False):
+                try:
+                    self._stage_store_copy(pending)
+                except Exception:
+                    self._inner_cache.dec_lock_ref(pending.node, pending.dec_params)
+                    raise
+                continue
             try:
-                self._stage_store_copy(pending)
+                task_id = self._launch_store(pending)
             except Exception:
                 self._inner_cache.dec_lock_ref(pending.node, pending.dec_params)
                 raise
-        self._launch_ready_store_copies()
+            if task_id < 0:
+                self._inner_cache.dec_lock_ref(pending.node, pending.dec_params)
+                continue
+            with self._node_lock:
+                self._inflight_store_nodes[store_key] = (
+                    pending.node,
+                    pending.dec_params,
+                )
+        if self.__dict__.get("_async_store_slot_mapping", False):
+            self._launch_ready_store_copies()
 
     @staticmethod
     def _apply_restore_swa_boundary(req: Req) -> None:

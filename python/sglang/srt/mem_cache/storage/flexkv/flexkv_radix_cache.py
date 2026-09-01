@@ -159,25 +159,37 @@ class FlexKVRadixCache(RadixCache):
         # FlexKV signals completion at the scheduler's synchronized
         # ``check_hicache_events`` point.
         self._inflight_store_nodes: dict[str, TreeNode] = {}
+        # Overlap scheduling can enqueue the next forward before the previous
+        # request reaches cache_finished_req().  The synchronous GPU->CPU slot
+        # mapping below then waits behind that whole forward and delays the
+        # already-computed response.  Keep this experimental and opt-in while
+        # we validate the scheduler-lifecycle boundary in production traces.
+        self._defer_store_launch = os.getenv(
+            "FLEXKV_DEFER_STORE_LAUNCH", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self._profile_store_stages = os.getenv(
             "FLEXKV_PROFILE_STORE_STAGES", "0"
         ).strip().lower() in {"1", "true", "yes", "on"}
-        # Overlap scheduling can enqueue the next forward before the previous
-        # request reaches cache_finished_req(). A synchronous GPU->CPU slot
-        # mapping then waits behind that forward and delays the completed
-        # response. Use the optimized path whenever the connector can preserve
-        # the topology's slot-mapping semantics.
-        self._async_store_slot_mapping = bool(
+        async_store_requested = os.getenv(
+            "FLEXKV_ASYNC_STORE_SLOT_MAPPING", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        async_store_supported = bool(
             getattr(
                 self.flexkv_connector,
                 "supports_async_store_slot_mapping",
                 False,
             )
         )
-        logger.info(
-            "[FlexKV] store slot-mapping mode: %s",
-            "async" if self._async_store_slot_mapping else "sync",
+        self._async_store_slot_mapping = (
+            async_store_requested and self._defer_store_launch and async_store_supported
         )
+        if async_store_requested and not self._async_store_slot_mapping:
+            logger.warning(
+                "[FlexKV] FLEXKV_ASYNC_STORE_SLOT_MAPPING requested but disabled: "
+                "deferred=%s connector_supported=%s",
+                self._defer_store_launch,
+                async_store_supported,
+            )
         self._pending_store_launches: dict[str, _PendingStoreLaunch] = {}
         self._pending_store_copies: dict[str, _PendingStoreCopy] = {}
         self._node_lock = threading.Lock()
@@ -575,7 +587,7 @@ class FlexKVRadixCache(RadixCache):
             return
 
         self.inc_lock_ref(new_last_node)
-        if self._async_store_slot_mapping:
+        if self._defer_store_launch:
             with self._node_lock:
                 if (
                     req.rid in self._pending_store_launches
@@ -736,12 +748,28 @@ class FlexKVRadixCache(RadixCache):
                         break
                     rid = next(iter(self._pending_store_launches))
                     pending = self._pending_store_launches.pop(rid)
+                if self._async_store_slot_mapping:
+                    try:
+                        self._stage_store_copy(rid, pending)
+                    except Exception:  # noqa: BLE001
+                        self.dec_lock_ref(pending.node)
+                        raise
+                    continue
                 try:
-                    self._stage_store_copy(rid, pending)
+                    with self._store_profile_scope("flexkv.store.launch_one_pending"):
+                        fkv_task_id = self._launch_store(
+                            rid, pending.token_ids, pending.kv_indices
+                        )
                 except Exception:  # noqa: BLE001
                     self.dec_lock_ref(pending.node)
                     raise
-            self._launch_ready_store_copies()
+                if fkv_task_id < 0:
+                    self.dec_lock_ref(pending.node)
+                    continue
+                with self._node_lock:
+                    self._inflight_store_nodes[rid] = pending.node
+            if self._async_store_slot_mapping:
+                self._launch_ready_store_copies()
 
     def cache_unfinished_req(  # type: ignore[override]
         self, req: Req, chunked=False
