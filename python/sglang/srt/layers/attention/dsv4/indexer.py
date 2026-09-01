@@ -19,8 +19,8 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
-    topk_transform_512,
-    topk_transform_512_v2,
+    topk_transform_paged,
+    topk_transform_paged_v2,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -261,7 +261,7 @@ def fp8_paged_mqa_logits_torch_sm120(
     return logits
 
 
-def _topk_transform_512_vectorized(
+def _topk_transform_vectorized(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
     page_tables: torch.Tensor,
@@ -349,7 +349,7 @@ def _topk_transform_512_vectorized(
         out_raw_indices.copy_(raw_indices)
 
 
-def topk_transform_512_pytorch_vectorized(
+def topk_transform_pytorch_vectorized(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
     page_tables: torch.Tensor,
@@ -357,11 +357,11 @@ def topk_transform_512_pytorch_vectorized(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    """Vectorized PyTorch fallback for topk_transform_512.
+    """Vectorized PyTorch fallback for topk_transform_paged.
     All helper tensors (arange, zeros) are cached to avoid device-tensor
     creation during HIP/CUDA graph capture."""
 
-    _topk_transform_512_vectorized(
+    _topk_transform_vectorized(
         scores,
         seq_lens,
         page_tables,
@@ -373,7 +373,7 @@ def topk_transform_512_pytorch_vectorized(
     )
 
 
-def topk_transform_512_flashinfer_unfused(
+def topk_transform_flashinfer_unfused(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
     page_tables: torch.Tensor,
@@ -387,7 +387,7 @@ def topk_transform_512_flashinfer_unfused(
         _flashinfer_tie_break_value,
     )
 
-    _topk_transform_512_vectorized(
+    _topk_transform_vectorized(
         scores,
         seq_lens,
         page_tables,
@@ -405,7 +405,7 @@ def topk_transform_512_flashinfer_unfused(
     )
 
 
-def topk_transform_512_flashinfer_fused(
+def topk_transform_flashinfer_fused(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
     page_tables: torch.Tensor,
@@ -439,9 +439,9 @@ class C4IndexerBackendMixin:
         self.debug_use_external_c4_sparse_indices: bool = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
         self.flashinfer_topk_transform: Callable[..., None] = (
-            topk_transform_512_flashinfer_fused
+            topk_transform_flashinfer_fused
             if envs.SGLANG_DSA_FUSE_TOPK.get()
-            else topk_transform_512_flashinfer_unfused
+            else topk_transform_flashinfer_unfused
         )
 
     def _forward_prepare_multi_stream(
@@ -829,7 +829,7 @@ class C4IndexerBackendMixin:
         def run_topk_transform(rows: slice, logits: torch.Tensor) -> None:
             row_raw_indices = raw_indices[rows] if raw_indices is not None else None
             if self.dsa_topk_backend.is_torch():
-                topk_transform_512_pytorch_vectorized(
+                topk_transform_pytorch_vectorized(
                     logits,
                     c4_seq_lens[rows],
                     page_table[rows],
@@ -838,7 +838,7 @@ class C4IndexerBackendMixin:
                     row_raw_indices,
                 )
             elif self.dsa_topk_backend.is_flashinfer():
-                topk_transform_512_flashinfer_unfused(
+                self.flashinfer_topk_transform(
                     logits,
                     c4_seq_lens[rows],
                     page_table[rows],
@@ -847,7 +847,7 @@ class C4IndexerBackendMixin:
                     row_raw_indices,
                 )
             elif self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None:
-                topk_transform_512_v2(
+                topk_transform_paged_v2(
                     logits,
                     c4_seq_lens[rows],
                     page_table[rows],
@@ -856,7 +856,7 @@ class C4IndexerBackendMixin:
                     indexer_metadata.topk_metadata,
                 )
             else:
-                topk_transform_512(
+                topk_transform_paged(
                     logits,
                     c4_seq_lens[rows],
                     page_table[rows],
@@ -911,6 +911,7 @@ class C4IndexerBackendMixin:
                     run_paged_indexer(rows, deep_gemm_metadata[chunk_idx])
             else:
                 run_paged_indexer(all_rows, deep_gemm_metadata)
+
         if hisparse_coordinator is not None:
             if hisparse_decode:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
