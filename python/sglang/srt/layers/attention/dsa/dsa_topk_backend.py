@@ -306,7 +306,7 @@ def _topk_transform_v2_paged(
     padded rows to 0 (see ``fused_dsa_draft_extend_metadata`` /
     ``seqlens_expand_kernel``); 0 takes the trivial all-(-1) output path.
     """
-    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_512_v2
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_v2
 
     num_rows = logits.shape[0]
 
@@ -335,7 +335,7 @@ def _topk_transform_v2_paged(
 
     page_size = attn_metadata.page_size
     out = logits.new_empty((num_rows, topk), dtype=torch.int32)
-    topk_transform_512_v2(logits, lengths, page_table, out, page_size, plan)
+    topk_transform_paged_v2(logits, lengths, page_table, out, page_size, plan)
     return out
 
 

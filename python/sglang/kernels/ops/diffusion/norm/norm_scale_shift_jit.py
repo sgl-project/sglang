@@ -222,6 +222,33 @@ def try_fused_scale_residual_norm_scale_shift(
     return y, residual_out
 
 
+def kda_norm_scale_shift(x, weight, bias, scale, shift, norm_type, eps):
+    """Run the KDA B200 native CUDA path introduced by PR #27392.
+
+    Unlike ``try_fused_norm_scale_shift``, this explicit backend entry point
+    fails on unsupported inputs instead of silently returning ``None`` for a
+    caller-owned fallback.
+    """
+    out = try_fused_norm_scale_shift(x, weight, bias, scale, shift, norm_type, eps)
+    if out is None:
+        raise RuntimeError("unsupported input for KDA norm-scale-shift CUDA")
+    return out
+
+
+def kda_scale_residual_norm_scale_shift(
+    residual, x, gate, weight, bias, scale, shift, norm_type, eps
+):
+    """Run the KDA B200 residual + norm + scale/shift path from PR #27392."""
+    out = try_fused_scale_residual_norm_scale_shift(
+        residual, x, gate, weight, bias, scale, shift, norm_type, eps
+    )
+    if out is None:
+        raise RuntimeError(
+            "unsupported input for KDA scale-residual-norm-scale-shift CUDA"
+        )
+    return out
+
+
 def try_fused_norm_scale_shift_fp8(
     x, weight, bias, scale, shift, input_scale, norm_type, eps
 ):
