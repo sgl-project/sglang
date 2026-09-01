@@ -676,8 +676,6 @@ class KVCacheConfigurator:
             unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
             # Widens the allocator's virtual id space only; the pool below it
             # still holds this rank's shard.
-            dcp_size=get_parallel().attn_dcp_size,
-            dcp_rank=get_parallel().attn_dcp_rank,
         )
         return bundle
 

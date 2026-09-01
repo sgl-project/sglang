@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
     UnifiedMLATokenToKVPool,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 
 logger = logging.getLogger(__name__)
@@ -263,8 +264,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         is_id_owner: bool,
         page_size: int = 1,
-        dcp_size: int = 1,
-        dcp_rank: int = 0,
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
@@ -272,10 +271,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     ):
         spec = unified_buffer.spec(sub_pool_name)
         max_slots = unified_buffer.max_slots(sub_pool_name)
-        assert dcp_size >= 1, f"dcp_size must be >= 1; got {dcp_size}"
-        assert (
-            0 <= dcp_rank < dcp_size
-        ), f"dcp_rank must be in [0, {dcp_size}); got {dcp_rank}"
+        dcp_size = get_parallel().attn_dcp_size
         super().__init__(
             size=max_slots * dcp_size,
             page_size=page_size * dcp_size,
@@ -318,8 +314,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # table -- byte budget, compaction moves, translate -- stays on
         # `pool_page_size`.
         # Page ids are invariant under the widening, so v2p/p2v are unchanged.
-        self.dcp_size = dcp_size
-        self.dcp_rank = dcp_rank
         self.pool_page_size = page_size
         self.page_size = page_size * dcp_size
         self.num_pages = max_slots // self.pool_page_size
@@ -1117,11 +1111,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         does not own go to kernel id 0, the padding sink every write kernel
         skips. Identity with `translate_kv_loc_for_kernel` at dcp_size == 1.
         """
-        if self.dcp_size == 1:
+        parallel = get_parallel()
+        if parallel.attn_dcp_size == 1:
             return self.translate_kv_loc_for_kernel(widened_loc, out=out)
         with record_function("MultiEndedAlloc.translate_write_loc_for_kernel"):
-            owned = (widened_loc % self.dcp_size) == self.dcp_rank
-            dense = self.translate_kv_loc_for_kernel(widened_loc // self.dcp_size)
+            owned = (widened_loc % parallel.attn_dcp_size) == parallel.attn_dcp_rank
+            dense = self.translate_kv_loc_for_kernel(
+                widened_loc // parallel.attn_dcp_size
+            )
             dense = torch.where(owned, dense, torch.zeros_like(dense))
             if out is not None:
                 out.copy_(dense)
@@ -1626,8 +1623,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # `oclv` is a WIDENED virtual id under DCP; collapse to the id space
             # translate speaks. The write set is a page set, and a widened page
             # covers exactly the same page, so the non-owned ids fold in harmlessly.
-            if self.dcp_size > 1:
-                oclv = oclv // self.dcp_size
+            dcp_size = get_parallel().attn_dcp_size
+            if dcp_size > 1:
+                oclv = oclv // dcp_size
             phys_tokens = self.translate_kv_loc(oclv)
             if self.pool_page_size > 1:
                 phys_pages = (phys_tokens // self.pool_page_size).unique()
@@ -2761,13 +2759,12 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache,  # HybridLinearKVPool
         device: str,
         page_size: int = 1,
-        dcp_size: int = 1,
-        dcp_rank: int = 0,
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
     ):
         full_max = unified_buffer.max_slots("full")
+        dcp_size = get_parallel().attn_dcp_size
         super().__init__(
             size=(full_max - 1) * dcp_size,
             page_size=page_size * dcp_size,
@@ -2779,7 +2776,6 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.unified_buffer = unified_buffer
         self._kvcache = kvcache
         # Widened under DCP, matching the full sub-allocator; see its __init__.
-        self.dcp_size = dcp_size
         self.page_size = page_size * dcp_size
         self.lazy_compaction = lazy_compaction
 
@@ -2793,8 +2789,6 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             device=device,
             is_id_owner=True,
             page_size=page_size,
-            dcp_size=dcp_size,
-            dcp_rank=dcp_rank,
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
@@ -2883,14 +2877,14 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """
         return -(
             -self.mamba_allocator.entry_bytes_per_page
-            * self.dcp_size
+            * get_parallel().attn_dcp_size
             // self.full_attn_allocator.entry_bytes
         )
 
     @property
     def size_full(self) -> int:
         # Widened like `size`: a logical token capacity, not a row count.
-        return (self.full_attn_allocator.max_slots - 1) * self.dcp_size
+        return (self.full_attn_allocator.max_slots - 1) * get_parallel().attn_dcp_size
 
     @property
     def size_mamba(self) -> int:
@@ -3003,7 +2997,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """
         # Defensive: `_validate_unified_memory_dcp` rejects this pairing at
         # argument validation, so reaching it means a config path got past that.
-        assert self.dcp_size == 1, (
+        assert get_parallel().attn_dcp_size == 1, (
             "PD-disaggregation transfer with the unified memory pool does not "
             "support decode context parallelism: the transfer ships whole page "
             "envelopes, which hold only this rank's shard of each widened page."
@@ -3225,9 +3219,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             swa_allocator=self.swa_attn_allocator,
         )
 
-        # Always set: readers (the KV index translator) key on it unconditionally.
-        # DCP is rejected for this composite at argument validation, so 1.
-        self.dcp_size = 1
         self.free_group = None
         self.free_page_reps_group: Optional[List[torch.Tensor]] = None
         # Empty (not None) for the leak checker.

@@ -1240,8 +1240,6 @@ def init_unified_mamba_pools(
     lazy_compaction: bool = False,
     decode_pre_alloc_size: int = 0,
     unified_total_bytes: Optional[int] = None,
-    dcp_size: int = 1,
-    dcp_rank: int = 0,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.multi_ended_allocator import (
@@ -1376,8 +1374,6 @@ def init_unified_mamba_pools(
         kvcache=token_to_kv_pool,
         device=device,
         page_size=page_size,
-        dcp_size=dcp_size,
-        dcp_rank=dcp_rank,
         need_sort=need_sort,
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,

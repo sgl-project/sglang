@@ -130,7 +130,7 @@ class KVIndexTranslator:
             self._translate_write_full = alloc.translate_write_loc_for_kernel
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
             # share changes the length, so only the production site can do it.
-            self.defer_read_translate = alloc.dcp_size > 1
+            self.defer_read_translate = get_parallel().attn_dcp_size > 1
             if isinstance(alloc, UnifiedSWATokenToKVPoolAllocator):
                 self._swa_v2p_table = alloc.swa_v2p_page_table
                 self._swa_page_multiplier = alloc.swa_kernel_page_multiplier
@@ -379,16 +379,10 @@ class KVIndexTranslator:
     # -- token-level translate surface (the mixin / local-attn consumers) ------
 
     @property
-    def dcp_size(self) -> int:
-        """Read at use, not at construction: the parallel bag is published
-        after some callers build a translator."""
-        return get_parallel().dcp_size
-
-    @property
     def needs_read_translate(self) -> bool:
         """Whether `translate_dcp_read_ids` is anything but the identity, so a
         hot path can skip the call rather than round-trip a no-op copy."""
-        return self.is_translating or self.dcp_size > 1
+        return self.is_translating or get_parallel().attn_dcp_size > 1
 
     def translate_dcp_read_ids(self, widened_ids: torch.Tensor) -> torch.Tensor:
         """Widened logical READ ids -> kernel-facing ids, for either pool.
@@ -396,8 +390,9 @@ class KVIndexTranslator:
         The one hook every DCP read-index production site calls; on a static
         pool `widened // dcp_size` IS the whole virtual->physical translation.
         """
-        if self.dcp_size > 1:
-            widened_ids = widened_ids // self.dcp_size
+        dcp_size = get_parallel().attn_dcp_size
+        if dcp_size > 1:
+            widened_ids = widened_ids // dcp_size
         return self.translate_full_attn_ids(widened_ids)
 
     def translate_full_attn_ids(
