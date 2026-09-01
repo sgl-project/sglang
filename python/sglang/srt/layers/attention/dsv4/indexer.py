@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -369,6 +370,137 @@ def topk_transform_512_pytorch_vectorized(
         out_raw_indices,
         topk_op=torch.topk,
         topk_op_kwargs={"dim": 1, "largest": True, "sorted": False},
+    )
+
+
+def _dcp_indexer_topk_enabled() -> bool:
+    """Opt-in distributed (DCP) sharding of the C4 indexer top-k selection.
+
+    The HIP ``deepseek_v4_topk_transform_kernel`` launches a single block per
+    batch row, so at small decode batch the O(c4_seq_len) radix-select runs on a
+    single CU and dominates context-length scaling (profiled: ~7.7ms/step of the
+    +8ms/step at 1M). When enabled (and dcp_size>1, decode, long context), the
+    candidate axis is sharded across the DCP group and merged, giving ~dcp-fold
+    parallelism. Default off -> baseline byte-for-byte unchanged."""
+    return os.environ.get("SGLANG_DSV4_DCP_INDEXER_TOPK", "0") not in (
+        "0",
+        "",
+        "false",
+        "False",
+    )
+
+
+# Minimum indexer (c4) sequence length before the distributed top-k path is
+# worth the per-layer all-gather latency; below this we keep the local kernel.
+_DCP_TOPK_MIN_C4_LEN = int(os.environ.get("SGLANG_DSV4_DCP_INDEXER_TOPK_MIN", "16384"))
+
+
+def topk_transform_512_dcp(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    dcp_group,
+    dcp_size: int,
+    dcp_rank: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Distributed (DCP) equivalent of ``topk_transform_512``.
+
+    Shards the candidate (score) axis across the DCP group: rank ``r`` selects
+    the local top-k over its contiguous ``1/dcp`` slice of each score row, the
+    group all-gathers ``(score, global_token_index)`` pairs, and every rank
+    re-selects the global top-k from the ``dcp*k`` union. Each globally-top-k
+    token is also top-k within its own slice, so the union always contains the
+    exact global top-k -> the selected page set is identical to the non-sharded
+    kernel (output order may differ; downstream sparse attention is invariant to
+    page order). All shapes are static and helper tensors cached, so the path is
+    CUDA-graph capturable (mirrors the existing DCP attention all-gather)."""
+
+    TOPK = out_page_indices.shape[1]
+    B = scores.shape[0]
+    N = scores.shape[1]
+    device = scores.device
+    neg_inf = float("-inf")
+
+    page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
+    page_mask = page_size - 1
+
+    chunk = (N + dcp_size - 1) // dcp_size
+    padded = chunk * dcp_size
+    base = dcp_rank * chunk
+
+    cache = _arange_cache
+    key_chunk = f"arange_{chunk}_{device}"
+    if key_chunk not in cache:
+        cache[key_chunk] = torch.arange(chunk, device=device)
+    # Global token index of each position in this rank's slice: [1, chunk].
+    local_pos = (cache[key_chunk] + base).unsqueeze(0)
+
+    if padded != N:
+        scores_p = F.pad(scores, (0, padded - N), value=neg_inf)
+    else:
+        scores_p = scores.contiguous()
+    local = scores_p.view(B, dcp_size, chunk)[:, dcp_rank, :]  # [B, chunk]
+
+    if seq_lens.dim() > 1:
+        _sl = seq_lens.view(B, -1)[:, 0:1]
+    else:
+        _sl = seq_lens.view(B, 1)
+    valid = local_pos < _sl  # [B, chunk]
+    local = torch.where(valid, local, torch.full_like(local, neg_inf))
+
+    k = min(TOPK, chunk)
+    local_scores, local_idx = torch.topk(local, k, dim=1, largest=True, sorted=False)
+    global_raw = local_idx.to(torch.int32) + base  # [B, k] global token idx
+    if k < TOPK:
+        pad = TOPK - k
+        local_scores = F.pad(local_scores, (0, pad), value=neg_inf)
+        global_raw = F.pad(global_raw, (0, pad), value=0)
+
+    # Gather every rank's local top-k -> [B, dcp*TOPK], rank-ordered.
+    g_scores = dcp_group.all_gather(local_scores.contiguous(), dim=1)
+    g_raw = dcp_group.all_gather(global_raw.contiguous(), dim=1)
+
+    m_scores, m_pos = torch.topk(g_scores, TOPK, dim=1, largest=True, sorted=False)
+    final_raw = torch.gather(g_raw, 1, m_pos)  # [B, TOPK] global token idx (int32)
+    final_valid = m_scores != neg_inf
+
+    raw_i = final_raw.clamp(min=0)
+    page_idx = raw_i >> page_bits
+    offset = raw_i & page_mask
+    physical = torch.gather(page_tables, 1, page_idx.to(torch.int64))
+    page_indices = ((physical << page_bits) | offset).to(torch.int32)
+    page_indices = torch.where(
+        final_valid, page_indices, torch.full_like(page_indices, -1)
+    )
+    out_page_indices.copy_(page_indices)
+
+    if out_raw_indices is not None:
+        rr = torch.where(final_valid, final_raw, torch.full_like(final_raw, -1))
+        out_raw_indices.copy_(rr.to(out_raw_indices.dtype))
+
+
+# DCP candidate-axis sharding lives in a torch-only module so it can be loaded
+# and tested without pulling in the full sglang attention stack (the dsv4
+# kernels package __init__ imports compiled extensions).
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.dcp_indexer import (  # noqa: E402
+    dcp_candidate_shard,
+    topk_transform_512_dcp_sharded,
+)
+
+
+def _dcp_indexer_scoring_enabled() -> bool:
+    """Opt-in DCP sharding of the C4 indexer SCORING (candidate axis).
+
+    Implies the sharded selection (the local top-k is computed over the local
+    scores). Default off -> baseline byte-for-byte unchanged."""
+    return os.environ.get("SGLANG_DSV4_DCP_INDEXER_SCORING", "0") not in (
+        "0",
+        "",
+        "false",
+        "False",
     )
 
 
@@ -801,6 +933,25 @@ class C4IndexerBackendMixin:
             c4_seq_lens=c4_seq_lens,
             query_rows=query_rows,
         )
+        # DCP: shard the candidate axis (scoring) across the group. Only on the
+        # paged decode path -- the nonpaged plan has its own gathered layout, and
+        # prefill still scores the full context (it also consumes raw indices).
+        dcp_shard = None
+        if (
+            nonpaged_plan is None
+            and _dcp_indexer_scoring_enabled()
+            and getattr(self, "dcp_size", 1) > 1
+            and forward_batch.forward_mode.is_decode()
+            and indexer_metadata.max_c4_seq_len > _DCP_TOPK_MIN_C4_LEN
+        ):
+            dcp_shard = dcp_candidate_shard(
+                page_table,
+                _c4sl,
+                indexer_metadata.c4_page_size,
+                int(self.dcp_size),
+                int(self.dcp_rank),
+            )
+
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             logits = self._forward_nonpaged_indexer(
@@ -819,16 +970,29 @@ class C4IndexerBackendMixin:
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
-            logits = fn(
-                q,
-                c4_indexer_kv_cache,
-                weights,
-                _c4sl,
-                page_table,
-                indexer_metadata.deep_gemm_metadata,
-                indexer_metadata.max_c4_seq_len,
-                False,
-            )
+            if dcp_shard is not None:
+                _local_pt, _local_sl, _local_max = dcp_shard
+                logits = fn(
+                    q,
+                    c4_indexer_kv_cache,
+                    weights,
+                    _local_sl,
+                    _local_pt,
+                    indexer_metadata.deep_gemm_metadata,
+                    _local_max,
+                    False,
+                )
+            else:
+                logits = fn(
+                    q,
+                    c4_indexer_kv_cache,
+                    weights,
+                    _c4sl,
+                    page_table,
+                    indexer_metadata.deep_gemm_metadata,
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                )
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
@@ -852,7 +1016,41 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
-        if self.dsa_topk_backend.is_torch():
+        if dcp_shard is not None:
+            _local_pt, _local_sl, _ = dcp_shard
+            topk_transform_512_dcp_sharded(
+                logits,
+                _local_sl,
+                _local_pt,
+                c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+                self._get_dcp_group(),
+                int(self.dcp_size),
+                int(self.dcp_rank),
+                raw_indices,
+            )
+
+        use_dcp_topk = dcp_shard is None and (
+            _dcp_indexer_topk_enabled()
+            and getattr(self, "dcp_size", 1) > 1
+            and forward_batch.forward_mode.is_decode()
+            and indexer_metadata.max_c4_seq_len > _DCP_TOPK_MIN_C4_LEN
+        )
+        if dcp_shard is not None:
+            pass  # already merged above
+        elif use_dcp_topk:
+            topk_transform_512_dcp(
+                logits,
+                c4_seq_lens,
+                page_table,
+                c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+                self._get_dcp_group(),
+                int(self.dcp_size),
+                int(self.dcp_rank),
+                raw_indices,
+            )
+        elif self.dsa_topk_backend.is_torch():
             topk_transform_512_pytorch_vectorized(
                 logits,
                 c4_seq_lens,
