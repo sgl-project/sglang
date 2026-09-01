@@ -1,0 +1,98 @@
+---
+title: "Expert Parallelism"
+description: "Shard LingBot-Video MoE experts across an SP-aligned GPU group."
+---
+
+Expert parallelism (EP) reduces per-GPU memory by sharding a Mixture-of-Experts
+DiT's routed expert weights. Each GPU runs its local experts, while the router
+and shared expert remain replicated.
+
+## Enable EP
+
+Set `ep_size` to the sequence-parallel degree. For example:
+
+```bash
+sglang generate \
+  --model-path robbyant/lingbot-video-moe-30b-a3b \
+  --num-gpus 2 \
+  --ep-size 2 \
+  --ulysses-degree 2 \
+  --prompt "A robotic arm moves a red cube on a white table" \
+  --save-output
+```
+
+## Requirements and compatibility
+
+| Setting | Current support |
+| --- | --- |
+| Model | Native LingBot-Video MoE pipeline |
+| Platform | NVIDIA CUDA or AMD ROCm |
+| EP degree | `1` disables EP; values greater than `1` enable it |
+| Serving mode | Monolithic |
+| Sequence parallelism | `ep_size = sp_degree`; Ulysses, Ring, and K/V-gather follow their existing constraints |
+| Attention heads | With Ulysses, the TP-local head count must be divisible by `ulysses_degree` |
+| Routed experts | The expert count must be divisible by `ep_size` |
+| FSDP inference | Not supported with EP |
+| `torch.compile` | Not supported with EP |
+| Offload | DiT layerwise offload is supported with EP |
+
+## Parallel layout
+
+EP reuses the full SP group for expert ownership and token exchange. It does
+not add another factor to the physical GPU count:
+
+```text
+num_gpus = dp_size × cfg_parallel_degree × tp_size × sp_degree
+ep_size = sp_degree
+```
+
+Each SP rank sends its local token rows to every EP rank. A destination rank
+computes only the routes assigned to its local experts, then returns one partial
+result per source row. Attention independently uses the configured Ulysses,
+Ring, or K/V-gather exchange.
+
+Hidden-state traffic grows with `ep_size`. Benchmark larger degrees and
+multi-node layouts on the target topology before deployment.
+
+For the other parallel axes, see
+[Parallelism in SGLang Diffusion](/sglang-diffusion/parallelism).
+
+## Measured tradeoff
+
+The following results used two H100 80 GB GPUs, TP1/DP1/CFG1/SP2,
+`--performance-mode speed`, and an 81-frame, 480×480 LingBot-Video MoE request
+with 40 denoising steps and BF16. Each configuration used one warmup followed
+by three measured runs; the table reports the median. Only `ep_size` changed.
+
+| Configuration | Median end-to-end latency | Peak allocated memory per GPU |
+| --- | ---: | ---: |
+| SP2 + EP disabled (`--ep-size 1`) | 41.52 s | 67.28 GiB |
+| SP2 + EP2 | 46.97 s | 40.66 GiB |
+
+In this workload, EP2 reduced peak allocated memory by 39.6% (26.62 GiB per
+GPU) and increased end-to-end latency by 13.1%. Treat these values as one
+measured point and benchmark your own input shape and hardware.
+
+EP2 also completed with DiT layerwise offload at 9.16 GiB peak allocated memory
+per GPU and produced the same output as the resident EP2 run. That smoke run
+took 72.91 s, so offload adds another memory-latency tradeoff.
+
+## Numerical behavior
+
+EP is deterministic for a fixed topology and input, but it is not bit-exact
+with the dense path. EP applies routing weights and groups FP32 reductions at
+different points around BF16 rounding. Long denoising trajectories can amplify
+those small per-block differences into a different video sample.
+
+Use an EP-specific reference output for consistency testing instead of comparing
+EP output against a dense reference.
+
+## Weight loading and updates
+
+Checkpoint loading retains only the contiguous routed-expert shard owned by each
+rank. With `--direct-gpu-weight-loading`, each full expert tensor reaches the GPU
+before it is sliced, so EP reduces resident memory but not the transient
+load-time peak.
+
+Live full-weight updates to the EP-sharded DiT are rejected. Restart the server
+to load new DiT weights. LoRA updates remain supported.

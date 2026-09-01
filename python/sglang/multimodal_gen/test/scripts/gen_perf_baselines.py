@@ -59,6 +59,8 @@ def _build_server_extra_args(case: DiffusionTestCase) -> str:
     a += f" --num-gpus {server_args.num_gpus}"
     if server_args.tp_size is not None:
         a += f" --tp-size {server_args.tp_size}"
+    if server_args.ep_size is not None:
+        a += f" --ep-size {server_args.ep_size}"
     if server_args.ulysses_degree is not None:
         a += f" --ulysses-degree {server_args.ulysses_degree}"
     if server_args.dit_layerwise_offload:

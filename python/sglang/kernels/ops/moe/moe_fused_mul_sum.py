@@ -164,10 +164,12 @@ def moe_fused_mul_sum(
             Shape: (num_tokens, top_k).
         outputs: Optional pre-allocated output tensor.
             Shape: (num_tokens, hidden_size).
-        topk_ids: Optional indices of the top-k experts. Used when
-            `expert_map` is provided. Shape: (num_tokens, top_k).
+        topk_ids: Optional indices of the top-k experts. Required when
+            `is_ep=True` and used when `expert_map` is provided.
+            Shape: (num_tokens, top_k).
         expert_map: Optional mapping for Expert Parallelism. A value < 0
             indicates an invalid token/expert pair that will be skipped.
+        is_ep: Whether negative top-k IDs mark skipped expert slots.
 
     Returns:
         The fused weighted sum of expert outputs.
@@ -179,6 +181,7 @@ def moe_fused_mul_sum(
     assert topk_weights.is_contiguous()
     assert inputs.dtype in (torch.float32, torch.float16, torch.bfloat16)
     assert topk_weights.dtype in (torch.float32, torch.float16, torch.bfloat16)
+    assert not is_ep or topk_ids is not None, "topk_ids is required when is_ep=True"
 
     num_tokens, top_k, size = inputs.shape
     output_shape = (num_tokens, size)

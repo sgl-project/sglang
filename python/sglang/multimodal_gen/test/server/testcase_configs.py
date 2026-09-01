@@ -201,6 +201,7 @@ class DiffusionServerArgs:
     # resources
     num_gpus: int = 1
     tp_size: int | None = None
+    ep_size: int | None = None
     ulysses_degree: int | None = None
     ring_degree: int | None = None
     cfg_parallel: bool | None = None

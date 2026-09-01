@@ -29,6 +29,8 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.moe import (
     LingBotVideoMLP,
     LingBotVideoSparseMoeBlock,
+    MoeExpertParallelInfo,
+    resolve_moe_expert_parallel,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -64,8 +66,47 @@ LINGBOT_VIDEO_FP32_MODULES = (
 )
 
 
+EXPERT_PARAM_SUFFIXES = (".ffn.experts.w13_weight", ".ffn.experts.w2")
+
+
 def is_lingbot_block(name: str, _module: object) -> bool:
     return "blocks" in name and name.split(".")[-1].isdigit()
+
+
+def is_expert_parallel_param(name: str) -> bool:
+    return name.endswith(EXPERT_PARAM_SUFFIXES)
+
+
+def pack_expert_weights(
+    weight_iterator: Iterable[tuple[str, torch.Tensor]],
+    *,
+    ep_info: MoeExpertParallelInfo,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Pack gate/up weights and retain this rank's expert shard."""
+
+    def shard(name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if not ep_info.enabled or not is_expert_parallel_param(name):
+            return tensor
+        start = ep_info.local_expert_start
+        return tensor[start : start + ep_info.num_local_experts].clone()
+
+    seen: dict[str, list[torch.Tensor | None]] = {}
+    for name, tensor in weight_iterator:
+        suffix = next(
+            (s for s in (".ffn.experts.w1", ".ffn.experts.w3") if name.endswith(s)),
+            None,
+        )
+        if suffix is None:
+            yield name, shard(name, tensor)
+            continue
+        prefix = name[: -len(suffix)]
+        packed_name = f"{prefix}.ffn.experts.w13_weight"
+        tensor = shard(packed_name, tensor)
+        pair = seen.setdefault(prefix, [None, None])
+        pair[0 if suffix.endswith(".w1") else 1] = tensor
+        if pair[0] is not None and pair[1] is not None:
+            yield packed_name, torch.cat(pair, dim=1)
+            del seen[prefix]
 
 
 def should_keep_in_fp32(name: str) -> bool:
@@ -275,6 +316,7 @@ class LingBotVideoBlock(nn.Module):
         topk_group,
         routed_scaling_factor,
         layer_idx: int,
+        ep_info: MoeExpertParallelInfo,
         prefix: str = "",
         supported_attention_backends: Optional[set[AttentionBackendEnum]] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -310,6 +352,7 @@ class LingBotVideoBlock(nn.Module):
                 topk_group=topk_group,
                 routed_scaling_factor=routed_scaling_factor,
                 n_shared_experts=n_shared_experts,
+                ep_info=ep_info,
             )
         else:
             self.ffn = LingBotVideoMLP(h, intermediate_size)
@@ -399,22 +442,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
     def preprocess_loaded_state_dict(
         self, weight_iterator: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        # Pack experts.w1+w3 into experts.w13_weight, gate then up on dim 1; w2 passes through.
-        seen: dict[str, list[torch.Tensor | None]] = {}
-        for name, tensor in weight_iterator:
-            suffix = next(
-                (s for s in (".ffn.experts.w1", ".ffn.experts.w3") if name.endswith(s)),
-                None,
-            )
-            if suffix is None:
-                yield name, tensor
-                continue
-            prefix = name[: -len(suffix)]
-            pair = seen.setdefault(prefix, [None, None])
-            pair[0 if suffix.endswith(".w1") else 1] = tensor
-            if pair[0] is not None and pair[1] is not None:
-                yield f"{prefix}.ffn.experts.w13_weight", torch.cat(pair, dim=1)
-                del seen[prefix]
+        return pack_expert_weights(weight_iterator, ep_info=self.ep_info)
 
     def __init__(
         self,
@@ -434,6 +462,10 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
+        self.ep_info = resolve_moe_expert_parallel(
+            config.num_experts,
+            ep_size=config.ep_size,
+        )
         self.in_channels = config.in_channels
         self.out_channels = config.out_channels
         self.num_channels_latents = config.out_channels
@@ -487,6 +519,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                     topk_group=config.topk_group,
                     routed_scaling_factor=config.routed_scaling_factor,
                     layer_idx=i,
+                    ep_info=self.ep_info,
                     prefix=f"blocks.{i}",
                     supported_attention_backends=self._supported_attention_backends,
                     quant_config=quant_config,

@@ -278,6 +278,7 @@ class ServerArgs(DisaggServerArgsMixin):
     node_rank: int = 0
     dist_init_addr: str | None = None
     tp_size: Optional[int] = None
+    ep_size: int = 1
     sp_degree: Optional[int] = None
     # sequence parallelism
     ulysses_degree: Optional[int] = None
@@ -613,6 +614,7 @@ class ServerArgs(DisaggServerArgsMixin):
         if not current_platform.is_cpu():
             self._validate_parallelism()
         self._validate_cfg_parallel()
+        self._validate_expert_parallel()
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self.pipeline_config.validate_server_args(self)
@@ -1321,6 +1323,9 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.tp_size is None:
             self.tp_size = 1
 
+        if self.ep_size < 1:
+            raise ValueError(f"ep_size ({self.ep_size}) must be >= 1")
+
         if current_platform.is_cpu() and self.tp_size > 1:
             # CPU platform reuse num_gpus to represent num cpu numa nodes as devices
             self.num_gpus = self.tp_size
@@ -1357,6 +1362,7 @@ class ServerArgs(DisaggServerArgsMixin):
                     and sp_unspecified
                     and ulysses_unspecified
                     and ring_unspecified
+                    and self.ep_size == 1
                     and self._model_default_uses_cfg()
                 ):
                     self.cfg_parallel_degree = auto_cfg_parallel_degree
@@ -1398,7 +1404,13 @@ class ServerArgs(DisaggServerArgsMixin):
             and self.kv_gather_degree is None
             and self.sp_degree != 1
         ):
-            if self.sp_degree == 2:
+            if self.ep_size > 1:
+                self.ulysses_degree = self.sp_degree
+                logger.info(
+                    "Automatically set ulysses_degree=sp_degree=%d for MoE token dispatch",
+                    self.ulysses_degree,
+                )
+            elif self.sp_degree == 2:
                 # measured-win zone for the K/V-gather exchange; layers whose
                 # calls the gather path cannot take fall back to Ulysses
                 self.kv_gather_degree = 2
@@ -2106,6 +2118,15 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=None,
             help="The tensor parallelism size. Defaults to 1 if not specified.",
+        )
+        parser.add_argument(
+            "--ep-size",
+            type=int,
+            default=ServerArgs.ep_size,
+            help="Expert parallelism degree for supported MoE DiTs. Values greater "
+            "than 1 shard routed experts across an equally sized SP group and "
+            "require monolithic serving. The routed-expert count must be divisible "
+            "by this degree. Defaults to 1 (disabled).",
         )
         parser.add_argument(
             "--sp-degree",
@@ -3639,6 +3660,38 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(
                 "CFG Parallelism is enabled via `--enable-cfg-parallel`, but num_gpus == 1"
             )
+
+    def _validate_expert_parallel(self):
+        if self.ep_size <= 1:
+            return
+        if not (current_platform.is_cuda() or current_platform.is_rocm()):
+            raise ValueError("expert parallelism requires CUDA or ROCm")
+        if self.disagg_mode or self.disagg_role != RoleType.MONOLITHIC:
+            raise ValueError("expert parallelism requires monolithic diffusion serving")
+        deployment_config = self.pipeline_config.get_model_deployment_config()
+        if not deployment_config.supports_expert_parallel:
+            raise ValueError(
+                f"{type(self.pipeline_config).__name__} does not support expert parallelism"
+            )
+        if self.sp_degree != self.ep_size:
+            raise ValueError(
+                "expert parallelism requires sp_degree == ep_size, got "
+                f"{self.sp_degree} and {self.ep_size}"
+            )
+        expected_num_gpus = self.dp_size * self.tp_size * self.sp_degree
+        if self.enable_cfg_parallel:
+            expected_num_gpus *= self.cfg_parallel_degree
+        if self.num_gpus != expected_num_gpus:
+            raise ValueError(
+                "expert parallelism requires num_gpus to equal the physical "
+                "parallel-axis product dp_size * tp_size * cfg_parallel_degree * "
+                f"sp_degree; got num_gpus={self.num_gpus} and "
+                f"product={expected_num_gpus}"
+            )
+        if self.enable_torch_compile:
+            raise ValueError("expert parallelism does not support torch.compile")
+        if self.use_fsdp_inference:
+            raise ValueError("expert parallelism does not support FSDP inference")
 
     def _validate_batching(self):
         if self.batching_mode != "dynamic":

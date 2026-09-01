@@ -58,7 +58,18 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
         self.vae_config.load_decoder = True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig(dit_layerwise_offload_modes=("memory",))
+        return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("memory",),
+            supports_expert_parallel=True,
+        )
+
+    def validate_server_args(self, server_args) -> None:
+        num_experts = self.dit_config.arch_config.num_experts
+        if server_args.ep_size > 1 and num_experts % server_args.ep_size != 0:
+            raise ValueError(
+                f"num_experts ({num_experts}) must be divisible by "
+                f"ep_size ({server_args.ep_size})"
+            )
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[0]
