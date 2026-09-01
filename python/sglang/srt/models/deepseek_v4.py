@@ -730,6 +730,16 @@ class MqaAttentionBase(nn.Module):
             self.wo_a.weight_scale_inv.format_ue8m0 = (
                 deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             )
+            # wo_a is quantized but never *applied* through its quant method:
+            # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
+            # runs its own batched kernel (DeepGEMM fp8_einsum on CUDA, aiter
+            # mxscale BMM on gfx950), both of which want the plain row-major
+            # [G, R, D] weight. Opt out of any backend-private weight layout the
+            # linear method would otherwise install for its own GEMM -- on ROCm
+            # that is aiter's B-preshuffle, which silently permutes the weight
+            # in place (same shape, dtype and strides) and makes this GEMM
+            # return noise.
+            self.wo_a.skip_aiter_bpreshuffle = True
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -3419,7 +3429,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             if _wo_a_weight_scale_to_e8m0 is not None:
                 # ROCm: aiter's mxscale GEMM reads uint8 e8m0 block scales, and
                 # requantizes the weight when the checkpoint's scales are not
-                # already powers of two.
+                # already powers of two. It also needs the weight row-major, so
+                # check the linear method honoured skip_aiter_bpreshuffle: a
+                # preshuffled weight has the same shape, dtype and strides and
+                # would only show up as garbage output.
+                assert not getattr(attn.wo_a, "aiter_bpreshuffled", False), (
+                    "DSV4 wo_a was B-preshuffled by the fp8 linear method; the "
+                    "aiter mxscale absorb GEMM needs the row-major weight"
+                )
                 weight, scale = _wo_a_weight_scale_to_e8m0(
                     attn.wo_a.weight.data,
                     attn.wo_a.weight_scale_inv.data,
