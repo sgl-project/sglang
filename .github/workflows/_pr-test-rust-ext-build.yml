@@ -126,7 +126,7 @@ jobs:
                   || echo "(gh cache list unavailable: token lacks actions:read)"
           fi
 
-      # No MAX_GLIBC: these are the bytes the compile job already checked before
+      # No MAX_GLIBC: these are the bytes the publish job already checked before
       # saving them under this key. The module count is still worth re-checking,
       # so a truncated entry fails here rather than as a test import error.
       - name: Stage modules for upload
@@ -152,13 +152,16 @@ jobs:
     needs: restore
     if: needs.restore.outputs.hit != 'true'
     runs-on: ${{ inputs.runs_on }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     name: Build Rust Ext
     # No crate sets abi3, so the pools' interpreters (h100 ships 3.10, h20 ships
     # 3.12) each need their own module set, and each its own target dir, since
     # PyO3's fingerprint tracks the interpreter. The two passes therefore share
     # nothing, which is why they run as parallel jobs rather than back to back.
     strategy:
+      # Both legs run to completion, so a failure in one still leaves the other's
+      # log to compare against.
+      fail-fast: false
       matrix:
         python-version: ['3.10', '3.12']
     steps:
@@ -315,6 +318,8 @@ jobs:
             .github
             scripts/ci/utils
           sparse-checkout-cone-mode: false
+
+      - uses: ./.github/actions/check-maintenance
 
       - name: Collect the per-interpreter modules
         uses: actions/download-artifact@v4

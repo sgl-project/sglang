@@ -34,5 +34,4 @@ jobs:
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
       runs_on: ubuntu-22.04
-      max_glibc: '2.35'
     secrets: inherit
