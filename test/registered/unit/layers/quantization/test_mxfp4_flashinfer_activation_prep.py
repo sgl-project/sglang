@@ -46,7 +46,37 @@ class TestMxfp4FlashinferActivationPrep(CustomTestCase):
         self.assertIs(actual_quant, x_quant)
         self.assertTrue(torch.equal(actual_scale.view(torch.uint8), x_scale))
 
-    def test_other_sm10x_handoff_miss_keeps_triton_quantizer(self):
+    def test_sm107_fp32_handoff_miss_uses_sglang_quantizer(self):
+        x = torch.randn(3, 64, dtype=torch.float32)
+        x_quant = torch.empty(3, 64, dtype=torch.float8_e4m3fn)
+        x_scale = torch.arange(6, dtype=torch.uint8).reshape(3, 2)
+
+        with patch(
+            "sglang.srt.layers.moe.route_quant_handoff.take", return_value=None
+        ) as take, patch(
+            "sglang.srt.layers.quantization.mxfp4._is_sm107_supported",
+            return_value=True,
+        ), patch.object(
+            per_token_group_quant_module,
+            "per_token_group_quant",
+            return_value=(x_quant, x_scale),
+        ) as quantize, patch(
+            "sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_quantize",
+            create=True,
+        ) as flashinfer_quantize:
+            actual_x, packed_topk, actual_quant, actual_scale = (
+                _prepare_flashinfer_mxfp8_activations(x, 64)
+            )
+
+        take.assert_called_once_with(x)
+        quantize.assert_called_once_with(x, group_size=32, scale_ue8m0=True)
+        flashinfer_quantize.assert_not_called()
+        self.assertIs(actual_x, x)
+        self.assertIsNone(packed_topk)
+        self.assertIs(actual_quant, x_quant)
+        self.assertTrue(torch.equal(actual_scale.view(torch.uint8), x_scale))
+
+    def test_other_sm10x_handoff_miss_keeps_sglang_quantizer(self):
         x = torch.randn(3, 64, dtype=torch.bfloat16)
         x_quant = torch.empty(3, 64, dtype=torch.float8_e4m3fn)
         x_scale = torch.arange(6, dtype=torch.uint8).reshape(3, 2)

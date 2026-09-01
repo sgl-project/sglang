@@ -98,7 +98,9 @@ def _prepare_flashinfer_mxfp8_activations(
     if prepared is not None:
         prepared_packed_topk, x_quant, x_scale = prepared
         x_scale = x_scale.view(torch.float8_e4m3fn)
-    elif x.shape[-1] != hidden_size or _is_sm107_supported():
+    elif x.shape[-1] != hidden_size or (
+        _is_sm107_supported() and x.dtype != torch.float32
+    ):
         from sglang.srt.layers.quantization.fp8_utils import (
             flashinfer_mxfp8_quantize,
         )
