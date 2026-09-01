@@ -268,7 +268,7 @@ class ZayaConfig(PretrainedConfig):
         try:
 
             tp_size = get_parallel().tp_size
-        except (AssertionError, RuntimeError):
+        except (AssertionError, RuntimeError, ValueError):
             tp_size = 1
 
         in_out_ch_full = (
