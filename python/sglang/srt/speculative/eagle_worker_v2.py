@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -87,6 +88,7 @@ from sglang.srt.speculative.eagle_worker_common import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    draft_pp_context,
     draft_tp_context,
     fast_sample,
     get_plan_stream,
@@ -160,7 +162,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Load draft model weights only.
         if (
-            get_parallel().config.enable_dp_attention
+            get_parallel().enable_dp_attention
             and self.speculative_algorithm.is_eagle3()
         ):
             ctx = draft_tp_context(get_parallel().attn_tp_group)
@@ -168,16 +170,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ctx = empty_context()
         with (
             ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
+        ), draft_pp_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
                 # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
                 context_length=target_worker.model_runner.model_config.context_len,
+                random_seed=target_worker.random_seed,
             )
 
         # Alias for better readability
@@ -186,9 +189,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
         self.draft_tp_context = (
-            draft_tp_context
-            if get_parallel().config.enable_dp_attention
-            else empty_context
+            draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
         self.tree_mask_mode = default_tree_mask_mode()
 
@@ -316,7 +317,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
 
         else:
-            if self.hot_token_id is not None:
+            if self.hot_token_id is not None and head is not None:
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
                 head.data = head.data[self.hot_token_id]
@@ -1080,17 +1081,24 @@ class EAGLEWorkerV2(BaseSpecWorker):
             get_spec().speculative_algorithm
         )
 
-        self._draft_worker = EagleDraftWorker(
-            server_args,
-            gpu_id,
-            ps,
-            nccl_port,
-            target_worker,
+        # Only the last PP stage runs the draft; other EAGLEWorkerV2 instances
+        # return proxies so scheduler dispatch remains rank-uniform.
+        self._hosts_draft = get_pp_group().is_last_rank
+        self._draft_worker = (
+            EagleDraftWorker(
+                server_args,
+                gpu_id,
+                ps,
+                nccl_port,
+                target_worker,
+            )
+            if self._hosts_draft
+            else None
         )
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
-        if get_spec().speculative_adaptive:
+        if get_spec().speculative_adaptive and self._hosts_draft:
             self.adaptive_controller = AdaptiveController(
                 self,
                 config_path=get_spec().speculative_adaptive_config,
@@ -1153,7 +1161,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors=None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
@@ -1163,7 +1175,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 else CaptureHiddenMode.FULL
             )
             batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=target_capture_mode
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=target_capture_mode,
             )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
@@ -1172,6 +1186,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Publish before draft_extend so the fence is at target-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
+
+            # A rank that does not host the draft (prefill-side PP builds it only on
+            # the last stage) forwards the target's proxy tensors and stops here.
+            if self._draft_worker is None:
+                return batch_output
 
             # Draft prefill
             with (

@@ -307,7 +307,7 @@ class DeepseekMLAForwardMixin:
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
         q_replicate_active = (
-            get_parallel().config.dcp_replicate_q_proj
+            get_parallel().dcp_replicate_q_proj
             and is_dcp_mla_decode_phase(forward_batch)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
@@ -702,6 +702,7 @@ class DeepseekMLAForwardMixin:
         topk_indices,
         llama_4_scaling,
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
+        gate: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = True
 
@@ -799,7 +800,7 @@ class DeepseekMLAForwardMixin:
                     attn_output, self.num_local_heads
                 )
             else:
-                dcp_comm_backend = get_parallel().config.dcp_comm_backend
+                dcp_comm_backend = get_parallel().dcp_comm_backend
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
                     self.current_attention_backend
                 )
@@ -931,6 +932,8 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
             )
+        if gate is not None:
+            attn_bmm_output = self._apply_gated(attn_bmm_output, gate)
         if fp8_proj_gemm_active(self.o_proj):
             attn_bmm_output = flatten_fp8_per_token_quant(
                 attn_bmm_output.contiguous(),

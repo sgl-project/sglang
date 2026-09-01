@@ -78,6 +78,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
 )
+from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
@@ -96,6 +97,9 @@ from sglang.srt.model_executor.runner_utils.capture_mode import (
 )
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
+)
+from sglang.srt.model_executor.runner_utils.pool import (
+    get_or_create_global_graph_capture_stream,
 )
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
@@ -238,7 +242,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.require_mlp_tp_gather or self.require_attn_tp_gather
         )
         self.require_mlp_sync = (
-            get_parallel().config.enable_dp_attention or self.require_gathered_buffer
+            get_parallel().enable_dp_attention or self.require_gathered_buffer
         )
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
@@ -455,6 +459,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             require_mlp_tp_gather=self.require_mlp_tp_gather,
             dp_size=self.dp_size,
             source=self.buffers,
+        )
+
+        # Captures the per-replay attention-metadata prep into a small CUDA
+        # graph; see metadata_glue_graph.py for the correctness contract.
+        # Force-off for DFlash-family spec: verify installs host-fed fast
+        # plans (sync-free begin_forward that recomputes plan inputs on the
+        # host every replay), and capturing one freezes the capture-time
+        # plan — drafts go stale and accept length collapses to ~1.
+        enable_metadata_glue = envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
+        if enable_metadata_glue and model_runner.spec_algorithm.is_dflash_family():
+            logger.warning(
+                "SGLANG_ENABLE_METADATA_GLUE_GRAPH is incompatible with "
+                "DFlash-family speculative decoding (host-fed fast verify "
+                "plans must re-run on the host every replay); disabling the "
+                "metadata glue graph."
+            )
+            enable_metadata_glue = False
+        self._metadata_glue = (
+            MetadataGlueGraph(self.device) if enable_metadata_glue else None
         )
 
         # --- backend ---------------------------------------------------
@@ -1041,7 +1064,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # can reuse the memory pool allocated for the large shapes.
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             if not self.enable_pdmux:
-                with graph_capture() as graph_capture_context, profile_context as prof:
+                with (
+                    graph_capture(
+                        stream=get_or_create_global_graph_capture_stream()
+                    ) as graph_capture_context,
+                    profile_context as prof,
+                ):
                     self.stream = graph_capture_context.stream
                     with self.backend.capture_session(self.stream):
                         self._capture_one_stream()
@@ -1219,8 +1247,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     variant_label,
                     dsa_variant,
                 )
+                # Adaptive runners may own a different backend than model_runner.
                 post_warmup_hook = getattr(
-                    self.model_runner.attn_backend,
+                    attn_backend,
                     "on_after_cuda_graph_warmup",
                     None,
                 )
@@ -1367,7 +1396,34 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
-        attn_backend.init_forward_metadata_out_graph(fb_view)
+        # Glue-graph fast path: pointer-stable prep (static buffers + pool
+        # tensors only) is captured per key; guards keep every python-visible
+        # branch inside the backends constant for that key.
+        if (
+            self._metadata_glue is not None
+            and not self._metadata_glue.disabled
+            and raw_bs == bs
+            and not self.enable_two_batch_overlap
+            and not self.enable_pdmux
+            and self.model_runner.lora_manager is None
+        ):
+            # actual_forward_mode belongs in the key even though the captured
+            # graph always targets capture_forward_mode: DSV4's replay prep
+            # substitutes seq_lens / seq_lens_cpu / seq_lens_sum /
+            # req_pool_indices / out_cache_loc when the runtime mode is IDLE,
+            # so IDLE and active DECODE are different python branches and must
+            # not share a captured graph.
+            self._metadata_glue.run(
+                attn_backend,
+                fb_view,
+                (
+                    bs,
+                    str(self.capture_forward_mode),
+                    str(fb_view.actual_forward_mode),
+                ),
+            )
+        else:
+            attn_backend.init_forward_metadata_out_graph(fb_view)
 
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token

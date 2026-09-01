@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -74,6 +75,39 @@ def test_vit_graph_runner_caches_resolved_backend_name():
     runner = ViTCudaGraphRunner(vit)
 
     assert runner._attn_backend == "fa3"
+
+
+def test_vit_graph_key_includes_full_and_window_attention_boundaries():
+    runner = _runner(use_data_parallel=True)
+    x = torch.empty(8, 1, 4)
+
+    first = runner._get_graph_key(
+        x,
+        torch.tensor([0, 4, 8]),
+        torch.tensor([0, 2, 4, 8]),
+    )
+    second = runner._get_graph_key(
+        x,
+        torch.tensor([0, 2, 8]),
+        torch.tensor([0, 4, 6, 8]),
+    )
+
+    assert first != second
+
+
+def test_vit_graph_keeps_rotary_workspace_address_after_growth():
+    runner = _runner(use_data_parallel=True)
+    runner.vit.device = torch.device("cpu")
+    runner.vit.dtype = torch.float32
+
+    small = runner._get_sin_cos_ws("small", seq_len=4, head_dim=2)
+    small_address = small[0].data_ptr()
+    runner._get_sin_cos_ws("large", seq_len=16, head_dim=2)
+
+    assert runner._get_sin_cos_ws("small", seq_len=4, head_dim=2)[0].data_ptr() == (
+        small_address
+    )
+    assert len(runner._retired_sin_cos_ws) == 1
 
 
 def test_internvl_graph_runner_caches_resolved_backend_name():

@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=50, stage="weekly", runner_config="1-gpu-large")
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
 register_cpu_ci(est_time=55, suite="base-c-test-cpu")
 

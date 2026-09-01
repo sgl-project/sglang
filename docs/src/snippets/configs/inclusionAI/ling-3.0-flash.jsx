@@ -1,7 +1,7 @@
 export const config = {
   modelName: "Ling-3.0-flash",
 
-  supportedHardware: ["h20-3e", "h200", "h800", "h100", "b200", "gb300"],
+  supportedHardware: ["h20-3e", "h200", "h800", "h100", "b200", "gb300", "dgx-spark"],
   groupHardware: false,
 
   variants: [{ id: "default", label: "Ling-3.0-flash" }],
@@ -46,6 +46,7 @@ export const config = {
     "h100": "lmsysorg/sglang:dev-Ling-3.0-flash",
     "b200": "lmsysorg/sglang:dev-Ling-3.0-flash",
     "gb300": "lmsysorg/sglang:dev-Ling-3.0-flash",
+    "dgx-spark": "lmsysorg/sglang:dev-Ling-3.0-flash",
   },
 
   dockerHostNetworkWhen: (_sel, { flags }) =>
@@ -375,6 +376,19 @@ sgl-eval run gsm8k \\
       ],
     },
     {
+      match: { hw: "dgx-spark", variant: "default", quant: "mxfp4", strategy: "low-latency", spec: "dspark", nodes: "single" },
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--moe-runner-backend flashinfer_mxfp4",
+        ...DSPARK_FLAGS,
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "h20-3e", variant: "default", quant: "bf16", strategy: "high-throughput", spec: "off", nodes: "single" },
       verified: false,
       flags: [
@@ -560,6 +574,20 @@ sgl-eval run gsm8k \\
         "--tp 2",
         "--moe-runner-backend flashinfer_mxfp4",
         "--fp8-gemm-backend triton",
+        "--mem-fraction-static 0.85",
+        "--tool-call-parser ling3",
+        "--reasoning-parser ling3",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "mxfp4", strategy: "high-throughput", spec: "off", nodes: "single" },
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--moe-runner-backend flashinfer_mxfp4",
         "--mem-fraction-static 0.85",
         "--tool-call-parser ling3",
         "--reasoning-parser ling3",

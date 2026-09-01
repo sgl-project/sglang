@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 
@@ -300,9 +300,12 @@ class DeepseekMHAForwardMixin:
         k: torch.Tensor,
         v: torch.Tensor,
         forward_batch: ForwardBatch,
+        gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        if gate is not None:
+            attn_output = self._apply_gated(attn_output, gate)
         attn_output = _maybe_quant_o_proj_input(self, attn_output)
         output, _ = self.o_proj(attn_output)
         return output
@@ -331,6 +334,7 @@ class DeepseekMHAForwardMixin:
         k: torch.Tensor,
         v: torch.Tensor,
         forward_batch: ForwardBatch,
+        gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
             forward_batch.extend_prefix_lens_cpu
@@ -358,6 +362,8 @@ class DeepseekMHAForwardMixin:
             )
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        if gate is not None:
+            attn_output = self._apply_gated(attn_output, gate)
         attn_output = _maybe_quant_o_proj_input(self, attn_output)
         output, _ = self.o_proj(attn_output)
         return output
@@ -380,6 +386,7 @@ class DeepseekMHAForwardMixin:
         k: torch.Tensor,
         v: torch.Tensor,
         forward_batch: ForwardBatch,
+        gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
         # Only initialize the info once
@@ -390,7 +397,7 @@ class DeepseekMHAForwardMixin:
         forward_batch.mha_return_lse = False
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
-        return self.forward_normal_core(q, k, v, forward_batch)
+        return self.forward_normal_core(q, k, v, forward_batch, gate)
 
     def _chunked_prefix_attn_mha(
         self: DeepseekV2AttentionMLA,
@@ -535,6 +542,10 @@ class DeepseekMHAForwardMixin:
             # Without this, a chunked-prefill split (extend_prefix_lens != 0) that
             # reads cached prefix KV crashes with "576 != 656".
             kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
+            # Read door: the pool never translates, so the production site does.
+            kv_indices = get_attn_backend().kv_index_translator.translate_dcp_read_ids(
+                kv_indices
+            )
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, torch.bfloat16
             )

@@ -281,9 +281,9 @@ def register_fake_ops(tp_size: int):
 
     @register_cpu_compile_fake("rotary_embedding_cpu")
     def _(positions, query, key, head_size, cos_sin_cache, is_neox):
-        # TODO: the kernel aliases query/key for 2D and 4D but allocates for 3D,
-        # which no schema expresses; an accurate fake needs it to pick one
-        return torch.empty_like(query), torch.empty_like(key)
+        if query.ndim == 3:
+            return torch.empty_like(query), torch.empty_like(key)
+        return query, key
 
     @register_cpu_compile_fake("apply_rotary_pos_emb_cpu")
     def _(query, key, cos, sin):
@@ -609,9 +609,9 @@ class CPUGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
-        self.tp_size = get_parallel().config.tp_size
-        self.dp_size = get_parallel().config.dp_size
-        self.pp_size = get_parallel().config.pp_size
+        self.tp_size = get_parallel().tp_size
+        self.dp_size = get_parallel().dp_size
+        self.pp_size = get_parallel().pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = self.return_hidden_states_mode

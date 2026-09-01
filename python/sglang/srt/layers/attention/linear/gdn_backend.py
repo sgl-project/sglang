@@ -8,6 +8,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -32,10 +33,21 @@ if not is_cpu():
 
 if is_cuda() or is_hip() or is_xpu():
     from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+        can_use_fused_qkvzba_causal_conv1d_update_contiguous,
         fused_qkv_split_gdn_prefill,
+        fused_qkvzba_causal_conv1d_update_contiguous,
+        fused_qkvzba_split_reshape_cat_contiguous,
     )
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
+_fused_decode_proj_conv_logged = False
+_fused_decode_proj_conv_fallback_logged = False
+_fused_decode_proj_conv_layers_logged: set[int] = set()
+_fused_decode_real_tensor_verified_layers: set[int] = set()
+_fused_decode_log_layer_hits = envs.SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS.get()
+_fused_decode_verify_real_tensors = (
+    envs.SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS.get()
+)
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -433,6 +445,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        global _fused_decode_proj_conv_fallback_logged
+        global _fused_decode_proj_conv_logged
+        global _fused_decode_proj_conv_layers_logged
+        global _fused_decode_real_tensor_verified_layers
+
         if _is_hip and isinstance(mixed_qkv, torch.Tensor) and mixed_qkv.shape[0] == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
@@ -453,15 +470,163 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
 
-        assert isinstance(mixed_qkv, torch.Tensor)
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv,
-            conv_states,
-            layer.conv_weights,
-            layer.bias,
-            layer.activation,
-            conv_state_indices=cache_indices,
-        )
+        return_z = False
+        conv_already_applied = False
+        if isinstance(mixed_qkv, tuple):
+            if len(mixed_qkv) != 2:
+                raise ValueError(
+                    "Fused GDN decode projection input must be "
+                    "(projected_qkvz, projected_ba)"
+                )
+            projected_qkvz, projected_ba = mixed_qkv
+            eligible, eligibility_reason = (
+                can_use_fused_qkvzba_causal_conv1d_update_contiguous(
+                    projected_qkvz,
+                    projected_ba,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    cache_indices,
+                    qkv_dim=layer.q_dim + layer.k_dim + layer.v_dim,
+                    v_dim=layer.v_dim,
+                    num_v_heads=layer.num_v_heads,
+                    activation=layer.activation,
+                )
+            )
+            if eligible:
+                qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+                fused_backend = "triton_direct_oracle_exact"
+                if not _fused_decode_proj_conv_logged:
+                    rank0_log("Using fused GDN decode QKVZ/BA unpack + indexed Conv1D.")
+                    _fused_decode_proj_conv_logged = True
+                if (
+                    _fused_decode_log_layer_hits or _fused_decode_verify_real_tensors
+                ) and layer.layer_id not in _fused_decode_proj_conv_layers_logged:
+                    rank0_log(
+                        "GDN_FUSED_DECODE_BACKEND "
+                        f"layer_id={layer.layer_id} backend={fused_backend} "
+                        f"batch={projected_qkvz.shape[0]} "
+                        f"qkv_dim={qkv_dim} state_shape={tuple(conv_states.shape)} "
+                        f"state_indices_dtype={cache_indices.dtype}"
+                    )
+                    _fused_decode_proj_conv_layers_logged.add(layer.layer_id)
+
+                # Compare real activations against the direct-Triton update on a
+                # compact state copy, leaving the live cache to the candidate.
+                verify_real_tensors = (
+                    _fused_decode_verify_real_tensors
+                    and layer.layer_id not in _fused_decode_real_tensor_verified_layers
+                )
+                if verify_real_tensors:
+                    if bool(torch.any(cache_indices < 0).item()):
+                        raise AssertionError(
+                            "Real-tensor GDN fusion verification requires "
+                            "non-padding cache indices"
+                        )
+                    ref_indices = torch.arange(
+                        cache_indices.numel(),
+                        device=cache_indices.device,
+                        dtype=torch.int32,
+                    )
+                    ref_state = torch.index_select(
+                        conv_states, 0, cache_indices.to(torch.int64)
+                    )
+                    ref_mixed_qkv, ref_z, ref_b, ref_a = (
+                        fused_qkvzba_split_reshape_cat_contiguous(
+                            projected_qkvz,
+                            projected_ba,
+                            layer.num_q_heads,
+                            layer.num_v_heads,
+                            layer.head_q_dim,
+                            layer.head_v_dim,
+                        )
+                    )
+                    ref_mixed_qkv = causal_conv1d_update(
+                        ref_mixed_qkv,
+                        ref_state,
+                        layer.conv_weights,
+                        layer.bias,
+                        layer.activation,
+                        conv_state_indices=ref_indices,
+                    )
+
+                mixed_qkv, z, b, a = fused_qkvzba_causal_conv1d_update_contiguous(
+                    projected_qkvz,
+                    projected_ba,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    cache_indices,
+                    qkv_dim=qkv_dim,
+                    v_dim=layer.v_dim,
+                    num_v_heads=layer.num_v_heads,
+                    head_v_dim=layer.head_v_dim,
+                    activation=layer.activation,
+                )
+                if verify_real_tensors:
+                    candidate_state = torch.index_select(
+                        conv_states, 0, cache_indices.to(torch.int64)
+                    )
+                    named_pairs = (
+                        ("qkv", mixed_qkv, ref_mixed_qkv),
+                        ("z", z, ref_z),
+                        ("b", b, ref_b),
+                        ("a", a, ref_a),
+                        ("state", candidate_state, ref_state),
+                    )
+                    report = []
+                    mismatch = False
+                    for tensor_name, candidate, reference in named_pairs:
+                        diff = (candidate.float() - reference.float()).abs()
+                        nonzero = int(torch.count_nonzero(diff).item())
+                        mismatch |= nonzero != 0
+                        report.append(
+                            f"{tensor_name}_nonzero={nonzero}/"
+                            f"{diff.numel()} {tensor_name}_max="
+                            f"{diff.max().item()}"
+                        )
+                    rank0_log(
+                        "GDN_FUSED_REAL_TENSOR_PARITY "
+                        f"layer_id={layer.layer_id} backend={fused_backend} "
+                        + " ".join(report)
+                    )
+                    _fused_decode_real_tensor_verified_layers.add(layer.layer_id)
+                    if mismatch:
+                        raise AssertionError(
+                            "GDN fused real-tensor parity failed at "
+                            f"layer_id={layer.layer_id}; " + " ".join(report)
+                        )
+                conv_already_applied = True
+            else:
+                # Explicit correctness fallback for an unexpected runtime
+                # tensor/state contract. This still returns Z to the model.
+                if not _fused_decode_proj_conv_fallback_logged:
+                    rank0_log(
+                        "Falling back from fused GDN decode projection/Conv1D: "
+                        f"{eligibility_reason}"
+                    )
+                    _fused_decode_proj_conv_fallback_logged = True
+                mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+                    projected_qkvz,
+                    projected_ba,
+                    layer.num_q_heads,
+                    layer.num_v_heads,
+                    layer.head_q_dim,
+                    layer.head_v_dim,
+                )
+            return_z = True
+        else:
+            assert isinstance(mixed_qkv, torch.Tensor)
+
+        if not conv_already_applied:
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_states,
+                layer.conv_weights,
+                layer.bias,
+                layer.activation,
+                conv_state_indices=cache_indices,
+            )
 
         # Skip split + reshape + separate gating kernel by consuming
         # the packed mixed_qkv directly in a single fused Triton kernel.
@@ -486,7 +651,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self._track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
             )
-            return core_attn_out
+            return (core_attn_out, z) if return_z else core_attn_out
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -516,7 +681,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
         )
 
-        return core_attn_out
+        return (core_attn_out, z) if return_z else core_attn_out
 
     def forward_extend(
         self,
@@ -735,6 +900,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_checkpoint_every_n_tokens=(
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
+                output=kwargs.get("linear_attn_output"),
             )
 
             if is_npu() and last_recurrent_state is not None:

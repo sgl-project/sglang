@@ -11,11 +11,11 @@ One container owns process-static runtime state: `sglang.srt.runtime_context.Run
 | Tier | Accessor | Holds | Lifecycle |
 |------|----------|-------|-----------|
 | raw config seed | `get_server_args()` | the published `ServerArgs` — the startup record, for debugging, dumps and provenance. **Business code does not read fields off it**: the read ratchet pins that at zero, and "Reading config: the seed is off limits" below says what to read instead, which forms the ratchet sees, and what is outside it by construction (a runtime-computed name; a whole-object hand-off) | published at process entry; re-publish is **last-publish-wins** (the tokenizer publish in the launcher process; sequential engine rebuild in one process, e.g. unit tests) and re-projects the bags; read-only |
-| resolved config | `get_exec()` `get_memory()` `get_schedule()` `get_model()` `get_spec()` `get_serving()` `get_observability()` `get_disagg()` `get_lora()` `get_mm()` `get_device()` | namespace **config bags** — the single source of truth for resolved config; leaves are real attributes (dynamo-traceable). Each is a **module function of no arguments**, and a module binds the name once: `manager.get_disagg()`, `self.get_disagg = get_disagg`, or a same-named import next to the bag one (`from model_loader import get_model`) all import fine and fail only when that path runs. `ruff --select F811` catches the import collision; `RuntimeContext` has no bag-named member and no `__getattr__`, so the member-call shapes are an `AttributeError` at call time — give it a delegating `__getattr__` and they go silent instead | projected from `server_args` at `publish`; mutated only via `get_context().override` |
+| resolved config | `get_exec()` `get_memory()` `get_schedule()` `get_model()` `get_spec()` `get_serving()` `get_observability()` `get_disagg()` `get_lora()` `get_mm()` `get_device()` | namespace **config bags** — the single source of truth for resolved config; leaves are real attributes (dynamo-traceable). Each is a **module function of no arguments**, and a module binds the name once: `manager.get_disagg()`, `self.get_disagg = get_disagg`, or a same-named import next to the bag one (`from model_loader import get_model`) all import fine and fail only when that path runs. `ruff --select F811` catches the import collision; `RuntimeContext` has no bag-named member and no `__getattr__`, so the member-call shapes are an `AttributeError` at call time — give it a delegating `__getattr__` and they go silent instead | projected at `publish` from the declarations over `server_args`' raw fields; mutated only via `get_context().override` |
 | runtime flags | `get_flags()` | state that is *not* a pure function of config: `capture` (cuda-graph lifecycle), `moe` (ACTIVE backends, swappable), `dp` (DP-attention runtime flags) | materialized at subsystem init; groups offer `override()` for tests |
 | resources | `get_resources()`, `get_stream(name)`, `get_buffer(name, factory)` | process-level handles: graph pools, EPLB state, EP dispatcher state, named side streams, workspace buffers | lazy; cleared by `reset_context()` |
 | per-forward | `get_forward()` | forward-scoped flags (multi-stream switch, MoE output buffer, attn-TP inputs, extend-in-batch) | contextvar-backed; `scoped(**kw)` restores on exit; new threads see defaults |
-| parallel | `get_parallel()` | **dual, spelled**: bare names are the live topology (tp/pp/moe/attn sizes, ranks, groups — `@property`, read-through); `get_parallel().config.<leaf>` is the parallel config bag | live: after dist init; `config`: after publish |
+| parallel | `get_parallel()` | one spelling per name: ranks and group handles are the live topology (`@property`, read-through); every other name, sizes included, is a leaf of the parallel config bag | ranks/groups: after dist init; leaves: after publish |
 
 `reset_context()` (unit-test teardown) drops the published config and installs fresh
 flags/resources/forward tiers.
@@ -24,9 +24,8 @@ flags/resources/forward tiers.
 
 **`ServerArgs` holds the raw input and nothing else. Resolution writes no field:
 it declares, and the declarations are what the namespace bags are projected from.
-Business code never reads the record for a decision — and after this cut, a field
-read there answers with what the operator typed, not with what resolution
-decided.**
+Business code never reads the record for a decision: a field read there answers
+with what the operator typed, not with what resolution decided.**
 
 - Every publishing process entry calls `publish(server_args, role=...)`
   (`run_scheduler_process`, the Ray `SchedulerActor`, the DP controller, tokenizer,
@@ -39,8 +38,8 @@ decided.**
   `run_multi_detokenizer_router_process`: it *is* handed a `ServerArgs`, and uses
   it only for `configure_logger(server_args)` today, so it has nothing to publish
   for — a bag read added under that entry needs a `publish` at the entry first.
-  `publish` snapshots the resolved field
-  values into the config bags; the accessors (`get_exec()` etc.) fail closed before it
+  `publish` projects the config bags from the declarations over the record's raw
+  fields; the accessors (`get_exec()` etc.) fail closed before it
   runs. `role` records which process type published, and keys per-role namespace
   enforcement: `SGLANG_ROLE_NAMESPACES=record` audits which namespaces each role's
   process actually reads (per-pair persisted via `SGLANG_ROLE_NAMESPACES_OUT`;
@@ -161,10 +160,10 @@ bag to override at all.
   and the callee runs in a process that has published.** That second case is a
   decision, not a style question: the record carries the user's raw input, so a
   resolution-filled field read off it inside a runner-owned constructor answers
-  with the pre-resolution value instead of the effective one. Debt means a decision, not automatically a bag read: pick where the
-  value should come from — usually the `get_*()` bag, sometimes a runner stamp
-  or a constructor argument (the per-mode attention pair and the encode-server
-  `gpu_id` above are dispositions of exactly this debt). The per-instance
+  with the pre-resolution value instead of the effective one. The answer is not
+  automatically a bag read: pick where the value should come from — usually the
+  `get_*()` bag, sometimes a runner stamp or a constructor argument (the per-mode
+  attention pair and the encode-server `gpu_id` above are both this). The per-instance
   boundaries above are **not** exempt from this unless-clause (the multi-Engine
   exemption is retracted); each one gets its own disposition.
   `test_supplied_instance_exposure_ratchet.py`
@@ -222,26 +221,33 @@ row for a method the Ray actor does not have, and an effective-field set
 without `load_format` -- and both were invisible because the assertion had
 slack (`>= len(...) - 1`) or compared key names instead of value sources.
 
-### `get_parallel()`: live topology bare, configuration under `config`
+### `get_parallel()`: one spelling per name
 
-**Bare is the live group, `config` is what was configured.** `get_parallel().tp_size`
-and its size / rank / group siblings are `@property` read-through over the canonical
-getters; `get_parallel().config.<leaf>` reads the published `parallel` bag
-(`nccl_port`, `enable_dp_attention`, `dp_size`, `ep_size`, `dwdp_size`, ... and the
-five sizes that also have a live property). A bare read of a config-only leaf raises
-an `AttributeError` naming the `.config` spelling — the tier is never guessed from
-whether a property happens to exist.
+**There is no `.config` hop.** Ranks and group handles are `@property`
+read-through over the canonical getters, so they answer with the live process
+groups. Everything else — `tp_size`, `pp_size`, `attn_cp_size`, `dcp_size`,
+`moe_dp_size` included, alongside config-only leaves like `nccl_port`,
+`enable_dp_attention`, `dp_size`, `ep_size`, `dwdp_size` — is answered from the
+published `parallel` bag. Reading a leaf before publish raises a `ValueError`
+naming the namespace; an unknown name is an `AttributeError`.
 
-The two tiers are **not** two spellings of one number. Live diverges from configured
-wherever elastic EP scales the world away from the launch shape, and wherever
-`initialize_model_parallel` aliases `_MOE_DP` to `_ATTN_CP` (`attn_cp_size >
-moe_dp_size`), which makes a live comparison of that pair degenerate. The five
-live-shadowed sizes (`tp/pp/dcp/attn_cp/moe_dp_size`) are where the choice matters,
-and every business read of `get_parallel().config.<one of them>` is registered with
-its reason in `_CONFIGURED_SIZE_CALL_SITES` (`test_global_config_read_ratchet.py`).
-DCP has a third shape: the live `get_parallel().attn_dcp_size` / `.dcp_enabled`
-answer the *effective* topology (`1` / `False` with no group installed), never the
-requested size — `.config.dcp_size` is the requested one.
+A size reads from the configuration because the groups are built at exactly the
+configured widths — checked at every assignment to `_TP` / `_PP` / `_ATTN_CP` /
+`_DCP` / `_MOE_DP` in `parallel_state.py`. Three things do not follow that rule:
+
+- `initialize_model_parallel` aliases `_MOE_DP` to `_ATTN_CP` when `attn_cp_size >
+  moe_dp_size`, so a reader that means **the MoE communicator's width** calls
+  `get_moe_cp_size()`, not `get_parallel().moe_dp_size`.
+- `patch_tensor_parallel_group` runs a scope under a different TP group (draft
+  workers), and declares it by overriding `tp_size`, `tp_rank` and `tp_group`
+  for the scope's duration. Readers inside need no special spelling.
+- Elastic EP scales `ep_size` / `dp_size` on the published bag while the group
+  coordinators keep their construction width. Those are different names, not two
+  answers to one name.
+
+DCP keeps its own pair: `get_parallel().attn_dcp_size` / `.dcp_enabled` answer the
+*effective* topology (`1` / `False` with no group installed), while `dcp_size` is
+what the launch requested.
 
 A process-global seed field-read of one of these sizes
 (`get_server_args().tp_size`, or an alias of it) is a read-ratchet failure. A
@@ -269,8 +275,7 @@ where an object was handed one; it is not a global accessor.
 
 - **a resolved leaf** → its namespace bag (`get_exec().moe.moe_runner_backend`,
   `get_schedule().chunked_prefill_size`, …). Bag-backed reads — a leaf directly, or
-  a bag-derived accessor below, including the `get_parallel().config` hop — are
-  what see post-publish overrides. Only the
+  a bag-derived accessor below — are what see post-publish overrides. Only the
   instance-derived accessors (the ones with no leaf to read) answer from the
   startup record and therefore do not.
 - **a leaf the caller names at runtime** (a readback reporting a list of fields)
@@ -290,23 +295,20 @@ where an object was handed one; it is not a global accessor.
   theirs from `spec` / `schedule` / `exec.graph`.
 - **a value only the instance can compute** → the named accessor in
   `runtime_context`, which is the one module allowed to read the slot:
-  `mamba_cache_chunk_size()`, `uses_mla_backend()`, `process_model_config()`.
+  `mamba_cache_chunk_size()`, `mamba_state_chunk_size()`, `uses_mla_backend()`,
+  `process_model_config()`.
   These have no leaf to read — they combine several fields, the HF config, or a
   property with no bag of its own. A new derived member gets an accessor here
   rather than call sites reaching for the record, and only when the bag-derived
   shape above cannot express it.
-- **what was *configured*, where the bare name is the live value**
-  → `get_parallel().config.{tp,pp,moe_dp,attn_cp,dcp}_size`. It reads the parallel
-  bag's own leaf, so it answers with the resolved configuration and follows a
-  post-publish override. The DCP live pair (`get_parallel().attn_dcp_size` /
-  `.dcp_enabled`) is a different question again: it answers the effective topology
-  (`1` / `False` when no group is installed), never the requested size, and it does
-  not *need* dist init to answer. Every (file, size) pair is registered
-  with its reason in `test_global_config_read_ratchet.py`
-  (`_CONFIGURED_SIZE_CALL_SITES`), and that test fails if the code and the list
-  disagree — a new file, or a new size in a listed file, has to be added — so a new
-  site needs both an answer the live property cannot give and an entry saying what
-  it is.
+- **a parallel size** → `get_parallel().{tp,pp,moe_dp,attn_cp,dcp}_size`, which is
+  the parallel bag's own leaf: it answers with the resolved configuration and
+  follows a post-publish override. Two questions are *not* that, and have their
+  own spelling: the width of the MoE communicator you are about to collectively
+  operate on is `get_moe_cp_size()` (the `_MOE_DP = _ATTN_CP` alias makes it
+  differ), and the effective DCP topology is `get_parallel().attn_dcp_size` /
+  `.dcp_enabled` (`1` / `False` when no group is installed), which does not need
+  dist init to answer.
 - **this runner's resolved value** → the runner
   (`prefill_attention_backend_str`, `kv_cache_dtype_str`,
   `draft_attention_backend`, `num_fused_shared_experts` on the model).
@@ -534,18 +536,14 @@ ONE thread — do not design for TBO threads that don't exist.
    instance attribute, plus the `getattr(..., "field")` spelling of each; a name
    computed at runtime or indirection deeper than a local name copy is census-tool
    territory, per the test's docstring). The scanner matches `get_server_args` by its
-   literal name, and the same file *bans* `import ... as` renames of it so that
-   matching stays sound. Exempt by owner
-   module only (`runtime_context.py`, `server_args.py`, `arg_groups/`). The same file
-   carries `_CONFIGURED_SIZE_CALL_SITES`, the (file, size) map of every
-   `get_parallel().config.<live-shadowed size>` reader with the reason the live property
-   cannot serve it — a new file or a new size in a listed file must be added there. Its
-   subject set is *derived* (property names ∩ `parallel` NS leaves), and it resolves
-   every spelling of the call itself — an aliased import, a module-qualified receiver
-   (including the whole dotted path an unaliased `import` binds), a local bound to either
-   hop — so neither a rename nor a new shadowed size escapes it.
-   `TestParallelConfigReadSpellings` in that file runs each spelling, because a spelling
-   the scanner cannot resolve drops the read instead of failing anything.
+   literal name — bare or module-qualified (`ctx.get_server_args()`) — and
+   `TestNoRenamedAccessorImports` in the same file *bans* `import ... as` renames of it,
+   which is what makes literal-name matching sound. Exempt by owner
+   module only (`runtime_context.py`, `server_args.py`, `arg_groups/`). Two classes,
+   no more: `TestGlobalConfigReadRatchet` holds the two baselines and
+   `TestNoRenamedAccessorImports` holds the ban. There is no configured-size registry
+   here any longer — `get_parallel()` has one spelling per name, so a size read is not a
+   choice between two answers and nothing needs registering.
 6. **Module-state ratchet** (`test_module_state_ratchet.py`): `global` statements in the
    flag-owning layers are pinned by name. A new module-level runtime global belongs on a
    flags group / resources slot instead; migrating a pinned survivor must shrink the pin.
@@ -579,9 +577,10 @@ Never module-skip a test "until the migration settles" — seed the context inst
   form** (attribute-source ints get automatic-dynamic after the first size
   change). Bools (≤2 values) are tolerable in any form — see
   `ForwardFlags._GRAPH_VISIBLE`. Config-bag leaves are real instance attributes for
-  exactly this reason, and the parallel config tier is read through the plain
-  `ParallelContext.config` property for the same reason (`__getattr__` is
-  error-only, and `object.__getattribute__` graph-breaks). Before moving such state,
+  exactly this reason. Parallel leaves are the exception that was measured rather
+  than assumed: they come through `ParallelContext.__getattr__`, which traces
+  under `torch.compile(fullgraph=True)` (`object.__getattribute__` is the form
+  that graph-breaks, and it is not on this path). Before moving such state,
   prove its readers sit outside compile coverage; a piecewise-prefill boot of a small
   model is the fast check (recompile storms show as `torch._dynamo hit
   config.recompile_limit` during the compile pass).
