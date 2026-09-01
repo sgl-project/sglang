@@ -74,6 +74,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -609,12 +610,11 @@ class KimiK3MoE(nn.Module):
         # (TP8/EP8 MegaMoE + SP-MoE): +4~5% output tok/s and −5% ITL over
         # bs 1–32, GSM8K unchanged — so it is on whenever the shape allows,
         # no flag.
-        # EP a2a only: with plain-TP experts the fused front already lands both
-        # partial sums in one collective (_forward_fused), a strictly better
-        # overlap than two streams.
+        # In NPU attention-TP compatibility mode, the all-gather and
+        # reduce-scatter remain on the current stream while only the shared
+        # MLP runs on the side stream.
         self._sbo_shared_overlap = (
             self._ep_a2a
-            and not self._shared_experts_attn_tp_comm
             and self.shared_experts is not None
             and self.alt_stream is not None
         )
@@ -1008,6 +1008,7 @@ class KimiK3MoE(nn.Module):
         # the DP local buffer is the full reassembled per-replica batch.
         gathered_hidden_states = get_local_dp_buffer(group)
         attn_tp_all_gather_into_tensor(gathered_hidden_states, hidden_states)
+
         gathered_shared_output = self.shared_experts(gathered_hidden_states)
         shared_output = torch.empty_like(hidden_states)
         attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
@@ -1024,12 +1025,11 @@ class KimiK3MoE(nn.Module):
         # Shared experts on original hidden_states. Under SBO they go to the
         # side stream and are joined at the tail (see _sbo_shared_overlap).
         #
-        # Issued *after* the front, deliberately: alt_stream.wait_stream() makes
-        # the side stream wait for whatever the main stream has enqueued so far,
-        # so issuing here means the shared experts overlap the routed a2a rather
-        # than the front GEMMs. The shared branch is the shorter of the two and
-        # does not need a head start; running it against the front only takes
-        # bandwidth away from the critical path.
+        # CUDA issues this after the front so the shared experts overlap the
+        # routed a2a rather than the front GEMMs. NPU issues it before the front:
+        # this starts the attention-TP all-gather as soon as the post-attention
+        # RMSNorm output is available and lets the shared branch finish its
+        # lightweight DynamicQuant before the routed GroupedMatmul starts.
         shared_output = None
         shared_event = None
 
@@ -1038,12 +1038,38 @@ class KimiK3MoE(nn.Module):
             if self.shared_experts is None or hidden_states.shape[0] == 0:
                 return
             if self._sbo_shared_overlap:
-                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                current_stream = torch.cuda.current_stream()
+                # Keep HCCL collectives on the current stream. The alternate
+                # stream only executes the shared-expert MLP.
+                shared_input = hidden_states
+                if self._shared_experts_attn_tp_comm:
+                    group = get_parallel().attn_tp_group
+                    shared_input = get_local_dp_buffer(group)
+                    attn_tp_all_gather_into_tensor(shared_input, hidden_states)
+                shared_input.record_stream(self.alt_stream)
+                self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
-                    shared_output = self._forward_shared_experts(hidden_states)
+                    shared_output = self.shared_experts(shared_input)
                     shared_event = self.alt_stream.record_event()
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
+
+        def wait_and_finalize_shared_experts():
+            nonlocal shared_output
+            if shared_event is None:
+                return
+            # Join as late as possible, then keep the attention-TP collective
+            # on the current stream before the shared output is consumed.
+            torch.cuda.current_stream().wait_event(shared_event)
+            if self._shared_experts_attn_tp_comm:
+                gathered_shared_output = shared_output
+                shared_output = torch.empty_like(hidden_states)
+                attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
+
+        # Give the NPU shared-expert branch a head start. At this point
+        # hidden_states is the decoder layer's post-attention RMSNorm output.
+        if _is_npu and self._sbo_shared_overlap:
+            issue_shared()
 
         # Front: gate + TopK (+ latent down-proj when the merged front covers it).
         # The gate and the latent down-proj read the same hidden_states, so the
@@ -1061,12 +1087,12 @@ class KimiK3MoE(nn.Module):
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
-        issue_shared()
+        if not (_is_npu and self._sbo_shared_overlap):
+            issue_shared()
 
         if not self.use_latent_moe:
             expert_output = self.experts(hidden_states, topk_output)
-            if shared_event is not None:
-                torch.cuda.current_stream().wait_event(shared_event)
+            wait_and_finalize_shared_experts()
             if shared_output is not None:
                 expert_output = expert_output + shared_output
             if self.tp_size > 1:
@@ -1105,10 +1131,7 @@ class KimiK3MoE(nn.Module):
             latent = self._reduce_latent(expert_output)
             # up_proj is replicated, so the routed output is now fully reduced.
             out, _ = self.routed_expert_up_proj(latent)
-        if shared_event is not None:
-            # SBO join: as late as possible, so the side-stream shared experts
-            # get the whole routed a2a + latent tail to hide under.
-            torch.cuda.current_stream().wait_event(shared_event)
+        wait_and_finalize_shared_experts()
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
             # ones need the partial-sum reduction.
@@ -1439,13 +1462,17 @@ class KimiK3DeltaAttention(nn.Module):
             quant_config, f"{prefix}.b_proj"
         )
 
-        # The fused path hardcodes tp_size sharding, so require attn_tp == tp.
-        # Full-rank K3 also fuses mixed block-FP8 attention projections.
-        self.do_fuse_qkvbfg = self.attn_tp_size == self.tp_size and (
-            quant_config is None or self.use_full_rank_gate
+        # The full-rank [q, k, v, g] merged projection is explicitly sharded
+        # with attn_tp_rank/attn_tp_size, so it also supports DP attention.
+        # The low-rank fused path still uses full-TP-only projection helpers.
+        # For the full-rank gate (K3) the checkpoint quantizes only the MoE
+        # experts; attention linears resolve to UnquantizedLinearMethod, so a
+        # non-None quant_config is fine for the merged projection.
+        self.do_fuse_qkvbfg = (
+            quant_config is None and self.attn_tp_size == self.tp_size
         )
 
-        if self.do_fuse_qkvbfg and self.use_full_rank_gate:
+        if self.use_full_rank_gate:
             # Fuse only the alignment-friendly wide projections [q, k, v, g]
             # (6144/rank at TP8). Folding b (12/rank) and f_a (128, replicated)
             # in as well skews the output dim to 6284 and measurably degrades
@@ -1465,8 +1492,8 @@ class KimiK3DeltaAttention(nn.Module):
                 prefix=f"{prefix}.fused_qkvg_proj",
             )
             self.split_sizes = [
-                3 * projection_size // self.tp_size,
-                projection_size // self.tp_size,
+                3 * projection_size // self.attn_tp_size,
+                projection_size // self.attn_tp_size,
             ]
             self.b_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -1847,7 +1874,7 @@ class KimiK3DeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        if self.do_fuse_qkvbfg:
+        if self.do_fuse_qkvbfg or self.use_full_rank_gate:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 hidden_states
             )
@@ -2867,6 +2894,13 @@ class KimiK3LinearModel(nn.Module):
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
 
+    # ModelSlim describes quantization with the original checkpoint module
+    # names. Register the runtime fused QKVG module so it can resolve the
+    # q_proj scheme while the weight loader packs q/k/v/g into its shards.
+    packed_modules_mapping = {
+        "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
+    }
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -2876,6 +2910,15 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        if quant_config is not None:
+            if isinstance(quant_config, ModelSlimConfig):
+                model_mapping = {
+                    **quant_config.packed_modules_mapping.get("model", {}),
+                    **self.packed_modules_mapping,
+                }
+                quant_config.update_packed_modules_mapping({"model": model_mapping})
+            else:
+                quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -3087,7 +3130,10 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if not self.config.is_kda_layer(layer_id):
                         continue
                     layer = self.model.layers[layer_id].self_attn
-                    if not getattr(layer, "do_fuse_qkvbfg", False):
+                    if param_name == ".fused_qkvg_proj":
+                        if not getattr(layer, "use_full_rank_gate", False):
+                            continue
+                    elif not getattr(layer, "do_fuse_qkvbfg", False):
                         continue
                 if weight_name in {".q_proj", ".k_proj", ".v_proj"}:
                     layer_id = int(name.split(".")[2])
