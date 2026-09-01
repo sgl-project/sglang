@@ -1550,6 +1550,19 @@ class Engine(EngineScoreMixin, EngineBase):
                 for _ in range(self.server_args.tp_size)
             ]
 
+    def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
+        """Load a new LoRA adapter without re-launching the engine."""
+
+        obj = LoadLoRAAdapterReqInput(
+            lora_name=lora_name,
+            lora_path=lora_path,
+            pinned=pinned,
+        )
+
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_lora_adapter(obj, None)
+        )
+
     def unload_lora_adapter(self, lora_name: str):
         """Unload a LoRA adapter without re-launching the engine."""
 
