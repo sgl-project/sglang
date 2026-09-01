@@ -242,6 +242,14 @@ jobs:
             install_pkg "${pkg}"
           done
 
+          # Install sgl-eval (CLI used by run_eval.py's `sgl-eval run ...`; skip if present).
+          if command -v sgl-eval >/dev/null 2>&1; then
+            echo "sgl-eval: available, skip"
+          else
+            source scripts/ci/utils/sgl_eval_ref.sh
+            install_pkg "${SGL_EVAL_SPEC}"
+          fi
+
           cd test
           # Append `--nightly` and `--continue-on-error` when the job belongs to the nightly pipeline.
           # --nightly: Collect test cases registered for nightly runs.
