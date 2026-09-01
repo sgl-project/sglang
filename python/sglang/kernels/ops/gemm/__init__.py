@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import functools
-import importlib.util
 from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
@@ -22,30 +20,7 @@ if TYPE_CHECKING:
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 _SM90 = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))})
 _SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
-_QWEN3X_NVFP4_SHAPES = frozenset(
-    (m, k, n)
-    for m in (1, 2, 4, 8)
-    for k, n in (
-        (2560, 18432),
-        (9216, 2560),
-        (4096, 24576),
-        (12288, 4096),
-    )
-).union({(9, 17408, 5120)})
-
-
-@functools.cache
-def _has_qwen3x_nvfp4_runtime(device: torch.device) -> bool:
-    import torch
-
-    try:
-        return (
-            importlib.util.find_spec("cutlass") is not None
-            and importlib.util.find_spec("cuda.bindings.driver") is not None
-            and torch.cuda.get_device_capability(device) == (12, 0)
-        )
-    except ModuleNotFoundError:
-        return False
+_KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
 
 def _prefer_torch_rowwise_fp8(
@@ -243,7 +218,7 @@ register_kernel(
     KernelSpec(
         op="gemm.qwen3x_nvfp4",
         backend=KernelBackend.KDA,
-        target="sglang.kernels.ops.gemm:_dispatch_qwen3x_nvfp4_gemm",
+        target=f"{_KDA_PACKAGE}.qwen3x_nvfp4_gemm:try_qwen3x_nvfp4_gemm",
         capabilities=_SM120,
         format_signature=FormatSignature(
             supported_dtypes=("uint8", "float8_e4m3fn", "bfloat16"),
@@ -305,91 +280,6 @@ def tiny_gemm_bf16(
     """Tiny bf16 GEMM ``x[m, k] @ w[n, k].T``, support bf16/fp32 out"""
     impl = get_kernel("gemm.tiny_gemm", KernelBackend.JIT)
     return impl(x, w, out, out_dtype=out_dtype, max_m=max_m)
-
-
-def _supports_qwen3x_nvfp4_gemm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    input_sf: Optional[torch.Tensor],
-    weight_sf: torch.Tensor,
-    alpha: torch.Tensor,
-    out_dtype: torch.dtype,
-    out_features: int,
-) -> bool:
-    import torch
-
-    if (
-        input.device.type != "cuda"
-        or input.ndim != 2
-        or input.dtype != torch.uint8
-        or input_sf is None
-        or out_dtype != torch.bfloat16
-    ):
-        return False
-    m, packed_k = input.shape
-    k = packed_k * 2
-    n = int(out_features)
-    if (m, k, n) not in _QWEN3X_NVFP4_SHAPES:
-        return False
-    if input.stride() != (packed_k, 1):
-        return False
-    if (
-        weight.dtype != torch.uint8
-        or weight.shape != (packed_k, n)
-        or weight.stride() != (1, packed_k)
-    ):
-        return False
-
-    scale_k = k // 16
-    padded_m = ((m + 127) // 128) * 128
-    if (
-        input_sf.dtype not in (torch.uint8, torch.float8_e4m3fn)
-        or input_sf.shape != (padded_m, scale_k)
-        or input_sf.stride() != (scale_k, 1)
-    ):
-        return False
-    if (
-        weight_sf.dtype != torch.float8_e4m3fn
-        or weight_sf.shape != (scale_k, n)
-        or weight_sf.stride() != (1, scale_k)
-    ):
-        return False
-    if alpha.dtype != torch.float32 or alpha.numel() != 1 or not alpha.is_contiguous():
-        return False
-    if any(t.device != input.device for t in (weight, input_sf, weight_sf, alpha)):
-        return False
-    return _has_qwen3x_nvfp4_runtime(input.device)
-
-
-def _run_qwen3x_nvfp4_gemm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    input_sf: torch.Tensor,
-    weight_sf: torch.Tensor,
-    alpha: torch.Tensor,
-) -> torch.Tensor:
-    from sglang.kernels.ops.gemm.qwen3x_nvfp4_gemm_sm120 import (
-        _run_qwen3x_nvfp4_gemm as run,
-    )
-
-    return run(input, weight, input_sf, weight_sf, alpha)
-
-
-def _dispatch_qwen3x_nvfp4_gemm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    input_sf: Optional[torch.Tensor],
-    weight_sf: torch.Tensor,
-    alpha: torch.Tensor,
-    out_dtype: torch.dtype,
-    out_features: int,
-) -> torch.Tensor | None:
-    if not _supports_qwen3x_nvfp4_gemm(
-        input, weight, input_sf, weight_sf, alpha, out_dtype, out_features
-    ):
-        return None
-    assert input_sf is not None
-    return _run_qwen3x_nvfp4_gemm(input, weight, input_sf, weight_sf, alpha)
 
 
 def try_qwen3x_nvfp4_gemm(
