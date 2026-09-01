@@ -369,6 +369,9 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 _EXPORTS: dict[str, str] = {
     "load_extension_with_recovery": "ext.loader",
     # Normalization: RMSNorm / LayerNorm / GroupNorm and their fused epilogues
+    "can_defer_flux2_gated_residual": "norm.flux2_gated_resnorm_jit",
+    "can_use_flux2_gated_resnorm": "norm.flux2_gated_resnorm_jit",
+    "flux2_gated_resnorm_raw": "norm.flux2_gated_resnorm_jit",
     "FLYDSL_NORM_MIN_ALIGNED_DIM": "norm.fused_residual_norm_flydsl",
     "flydsl_fused_residual_norm_scale_shift": "norm.fused_residual_norm_flydsl",
     "flydsl_norm_scale_shift": "norm.fused_residual_norm_flydsl",
