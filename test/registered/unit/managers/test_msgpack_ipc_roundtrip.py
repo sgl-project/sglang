@@ -15,6 +15,7 @@ import msgspec
 
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BackupDramReq,
     ChecksumInfo,
     CheckWeightsReqOutput,
@@ -37,10 +38,11 @@ from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.weight_checker import ChecksumInfo as PydanticChecksumInfo
 from sglang.srt.utils.weight_checker import ParallelismInfo as PydanticParallelismInfo
+from sglang.srt.utils.weight_versions import WeightVersionSpan
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-c-test-cpu")
+register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 
 def _round_trip(obj):
@@ -235,6 +237,35 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
 
         output = GetInternalStateReqOutput(internal_state=sanitized)
         self.assertEqual(_round_trip(output), output)
+
+
+class TestWeightVersionSpansRoundTrip(CustomTestCase):
+    """The per-request weight-version spans ride the same msgpack IPC path."""
+
+    def test_abort_req_carries_spans(self):
+        """A scheduler-side abort keeps its spans across the wire."""
+        obj = AbortReq(
+            rid="r0",
+            weight_versions=[
+                WeightVersionSpan(version="v1", start=0, end=3),
+                WeightVersionSpan(version="v2", start=3, end=7),
+            ],
+        )
+
+        decoded = _double_hop(obj)
+
+        self.assertEqual(
+            decoded.weight_versions,
+            [
+                WeightVersionSpan(version="v1", start=0, end=3),
+                WeightVersionSpan(version="v2", start=3, end=7),
+            ],
+        )
+        self.assertIsInstance(decoded.weight_versions[0], WeightVersionSpan)
+
+    def test_abort_req_defaults_to_no_spans(self):
+        """The field is optional on the wire, so an abort without spans decodes to None."""
+        self.assertIsNone(_round_trip(AbortReq(rid="r0")).weight_versions)
 
 
 if __name__ == "__main__":

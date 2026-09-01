@@ -18,12 +18,10 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import (
-    component_attn_backend_context_manager,
-)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
+from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_order import (
     ComponentLoadSpec,
     order_component_load_specs,
@@ -56,6 +54,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
+    prepare_diffusers_component_path_for_loading,
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -75,6 +74,7 @@ class ComposedPipelineBase(ABC):
     is_video_pipeline: bool = False  # To be overridden by video pipelines
     # should contains only the modules to be loaded
     _required_config_modules: list[str] = []
+    _unfiltered_required_config_modules: tuple[str, ...] = ()
     _extra_config_module_map: dict[str, str] = {}
     server_args: ServerArgs | None = None
     modules: dict[str, Any] = {}
@@ -120,7 +120,8 @@ class ComposedPipelineBase(ABC):
         )
         if base_required_config_modules is None:
             raise NotImplementedError("Subclass must set _required_config_modules")
-        self._required_config_modules = list(base_required_config_modules)
+        self._unfiltered_required_config_modules = tuple(base_required_config_modules)
+        self._required_config_modules = list(self._unfiltered_required_config_modules)
         self._extra_config_module_map = dict(self._extra_config_module_map)
 
         # Filter modules based on disaggregation role
@@ -133,6 +134,7 @@ class ComposedPipelineBase(ABC):
                 extra_allowed_modules=self._get_extra_allowed_modules_for_role(
                     self._disagg_role, task_name
                 ),
+                structural_component_names=self._extra_config_module_map,
             )
             skipped = set(original_modules) - set(self._required_config_modules)
             if skipped:
@@ -181,7 +183,9 @@ class ComposedPipelineBase(ABC):
 
         if model_subfolder is None:
             model_path = maybe_download_model(
-                self.model_path, force_diffusers_model=True
+                self.model_path,
+                force_diffusers_model=True,
+                revision=self.server_args.revision,
             )
         else:
             model_subfolder = os.path.normpath(model_subfolder)
@@ -196,6 +200,7 @@ class ComposedPipelineBase(ABC):
             model_root = maybe_download_model(
                 self.model_path,
                 allow_patterns=[f"{model_subfolder}/**"],
+                revision=self.server_args.revision,
             )
             model_path = os.path.join(model_root, model_subfolder)
 
@@ -256,6 +261,7 @@ class ComposedPipelineBase(ABC):
                 "QwenImageEditPipeline": {"vae"},
                 "QwenImageEditPlusPipeline": {"vae"},
                 "QwenImageLayeredPipeline": {"vae", "transformer"},
+                "LongCatImageEditPipeline": {"vae"},
                 "GlmImagePipeline": {"vae", "transformer"},
                 "WanImageToVideoPipeline": {"vae"},
                 "WanImageToVideoDmdPipeline": {"vae"},
@@ -268,6 +274,12 @@ class ComposedPipelineBase(ABC):
         extra_allowed_modules = set(
             role_to_pipeline_modules.get(role, {}).get(self.pipeline_name, set())
         )
+        if (
+            role == RoleType.DENOISER
+            and self.pipeline_name == "GlmImagePipeline"
+            and getattr(self.server_args, "srt_encoder_url", None) is not None
+        ):
+            extra_allowed_modules.update({"text_encoder", "tokenizer", "vae"})
 
         if role == RoleType.DENOISER and task_name == "ti2v":
             if self.pipeline_name in {
@@ -300,11 +312,36 @@ class ComposedPipelineBase(ABC):
             get_diffusers_component_config,
         )
 
-        required = set(self.required_config_modules)
-        for module_name in full_model_index:
-            if module_name in required:
-                continue  # will be loaded normally
-            cfg_attr = self._CONFIG_ATTR_MAP.get(module_name)
+        loaded_components = set(self.required_config_modules)
+        loaded_structural_components = {
+            self._extra_config_module_map.get(name, name)
+            for name in self.required_config_modules
+        }
+        skipped_components: list[tuple[str, str]] = []
+        seen_component_keys = loaded_components | loaded_structural_components
+        for component_name in self._unfiltered_required_config_modules:
+            structural_name = self._extra_config_module_map.get(
+                component_name, component_name
+            )
+            if (
+                component_name in seen_component_keys
+                or structural_name in seen_component_keys
+                or (
+                    component_name not in full_model_index
+                    and structural_name not in full_model_index
+                )
+            ):
+                continue
+            skipped_components.append((component_name, structural_name))
+            seen_component_keys.update((component_name, structural_name))
+        for structural_name in full_model_index:
+            if structural_name not in seen_component_keys:
+                skipped_components.append((structural_name, structural_name))
+
+        for component_name, structural_name in skipped_components:
+            cfg_attr = self._CONFIG_ATTR_MAP.get(
+                _normalize_component_type(structural_name)
+            )
             if cfg_attr is None:
                 continue  # not a config we need to patch
 
@@ -314,7 +351,7 @@ class ComposedPipelineBase(ABC):
 
             try:
                 component_path = self._resolve_component_path(
-                    server_args, module_name, module_name
+                    server_args, component_name, structural_name
                 )
                 hf_config = get_diffusers_component_config(
                     component_path=component_path
@@ -328,7 +365,7 @@ class ComposedPipelineBase(ABC):
                     "Disagg role=%s: initialized %s config from HF JSON "
                     "(spatial_compression_ratio=%s)",
                     self._disagg_role.value,
-                    module_name,
+                    component_name,
                     getattr(
                         getattr(pipeline_cfg, "arch_config", None),
                         "spatial_compression_ratio",
@@ -340,7 +377,7 @@ class ComposedPipelineBase(ABC):
                     "Disagg role=%s: failed to read HF config for skipped "
                     "component %s: %s",
                     self._disagg_role.value,
-                    module_name,
+                    component_name,
                     e,
                 )
 
@@ -349,13 +386,30 @@ class ComposedPipelineBase(ABC):
     ) -> str:
         override_path = server_args.component_paths.get(module_name)
         if override_path is not None:
-            # overridden with args like --vae-path
-            component_model_path = maybe_download_model(override_path)
+            component_model_path = prepare_diffusers_component_path_for_loading(
+                override_path
+            )
         else:
             component_model_path = os.path.join(self.model_path, load_module_name)
 
         logger.debug("Resolved component path: %s", component_model_path)
         return component_model_path
+
+    @staticmethod
+    def _validate_direct_gpu_component_selection(
+        model_index: dict[str, Any], server_args: ServerArgs
+    ) -> None:
+        unavailable = sorted(
+            component_name
+            for component_name in server_args.component_direct_gpu_weight_loading
+            if component_name not in model_index or model_index[component_name] is None
+        )
+        if unavailable:
+            raise ValueError(
+                "--component-direct-gpu-weight-loading selects component(s) "
+                "that are not available in this pipeline: "
+                f"{', '.join(unavailable)}"
+            )
 
     def load_modules(
         self,
@@ -423,6 +477,7 @@ class ComposedPipelineBase(ABC):
         model_index.pop("boundary_ratio", None)
         # used by Wan2.2 ti2v
         model_index.pop("expand_timesteps", None)
+        self._validate_direct_gpu_component_selection(model_index, server_args)
 
         # some sanity checks
         assert (
@@ -434,9 +489,11 @@ class ComposedPipelineBase(ABC):
         if self._disagg_role != RoleType.MONOLITHIC:
             self._init_skipped_component_configs(model_index, server_args)
 
+        declared_modules = model_index
         model_index = {
             required_module: model_index[required_module]
             for required_module in self.required_config_modules
+            if required_module in model_index
         }
 
         for module_name in self.required_config_modules:
@@ -451,15 +508,17 @@ class ComposedPipelineBase(ABC):
                     module_name,
                     extra_module_value,
                 )
-                if extra_module_value in model_index:
+                if extra_module_value in declared_modules:
                     logger.info(
                         "Using module %s for %s", extra_module_value, module_name
                     )
-                    model_index[module_name] = model_index[extra_module_value]
+                    model_index[module_name] = declared_modules[extra_module_value]
                     continue
                 else:
                     raise ValueError(
-                        f"Required module key: {module_name} value: {model_index.get(module_name)} was not found in loaded modules {model_index.keys()}"
+                        f"Required module key: {module_name} value: "
+                        f"{declared_modules.get(module_name)} was not found in "
+                        f"declared modules {declared_modules.keys()}"
                     )
 
         # all the component models used by the pipeline
@@ -554,18 +613,18 @@ class ComposedPipelineBase(ABC):
                     attn_backend.name.lower(),
                     matched_backend_key,
                 )
-            with component_attn_backend_context_manager(
-                attn_backend, component_name=matched_backend_key or module_name
-            ):
-                module, memory_usage = PipelineComponentLoader.load_component(
-                    component_name=load_module_name,
-                    component_model_path=component_model_path,
-                    transformers_or_diffusers=transformers_or_diffusers,
-                    server_args=server_args,
-                    component_architecture=architecture,
-                )
+            module, memory_usage = PipelineComponentLoader.load_component(
+                component_name=module_name,
+                component_type=load_module_name,
+                component_model_path=component_model_path,
+                transformers_or_diffusers=transformers_or_diffusers,
+                server_args=server_args,
+                component_architecture=architecture,
+                component_attn_backend=attn_backend,
+                component_attn_name=matched_backend_key or module_name,
+            )
 
-            self.memory_usages[load_module_name] = memory_usage
+            self.memory_usages[module_name] = memory_usage
 
             if module_name in loaded_components:
                 logger.warning("Overwriting module %s", module_name)
@@ -1062,6 +1121,10 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
         return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
         )
