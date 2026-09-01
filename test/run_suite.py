@@ -147,6 +147,7 @@ NIGHTLY_SUITES = {
         "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
+        "nightly-amd-accuracy-8-gpu-deepseek-v4-flash",
         "nightly-amd-8-gpu-mi35x-deepseek-v4-flash",
         # MI35x 8-GPU suite (different model configs)
         "nightly-amd-8-gpu-mi35x",
@@ -187,12 +188,20 @@ NIGHTLY_SUITES = {
 OTHER_SUITES = {
     HWBackend.CPU: [
         "default",
+        # `stage="weekly"`, dispatched by weekly-test-cpu.yml.
+        "weekly-test-cpu",
     ],
     HWBackend.CUDA: [
         "stress",
         # `stage="weekly"` -- same shape. The three dicts group names for
-        # readability only; validation reads their union.
+        # readability only; validation reads their union. One entry per row of
+        # the matrix in weekly-test-nvidia.yml.
+        "weekly-test-1-gpu-large",
+        "weekly-test-2-gpu-large",
+        "weekly-test-4-gpu-h100",
+        "weekly-test-4-gpu-b200",
         "weekly-test-8-gpu-h200",
+        "weekly-test-8-gpu-b200",
     ],
 }
 
@@ -394,6 +403,7 @@ def run_a_suite(args):
         enable_retry=args.enable_retry,
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
+        fork_worker_batch_size=args.fork_worker_batch_size,
     )
 
 
@@ -486,7 +496,19 @@ def main():
         default=None,
         help="Path to sglang-ci-stats model.json for live LPT est; missing/malformed -> in-source est_time fallback.",
     )
+    parser.add_argument(
+        "--fork-worker-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Preload common modules, then run this many files in isolated fork "
+            "children (default: 1, preserving one exec per file)."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.fork_worker_batch_size <= 0:
+        parser.error("--fork-worker-batch-size must be positive")
 
     # Validate auto-partition arguments
     if (args.auto_partition_id is not None) != (args.auto_partition_size is not None):

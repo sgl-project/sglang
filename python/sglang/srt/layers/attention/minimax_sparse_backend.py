@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -20,6 +21,10 @@ from sglang.srt.layers.attention.base_attn_backend import (
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 from sglang.srt.utils import is_npu
 
@@ -116,7 +121,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.max_context_len = int(runner.model_config.context_len)
         # Per-forward cache for the native decode block table (rebuilt each forward).
         self._native_decode_bt: dict = {}
-        self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(runner.server_args)
+        self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(
+            resolving_view(runner.server_args)
+        )
         if self.fp8_attn_gemm:
             assert self.kv_pool.main_pool.dtype == torch.float8_e4m3fn, (
                 "fp8 attn-GEMM mode requires an fp8_e4m3fn main KV pool, got "
@@ -219,7 +226,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         self._msa_dec_meta = None
         if self.use_msa:
-            from sglang.srt.runtime_context import get_parallel
 
             self.num_q_heads = (
                 runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -245,10 +251,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             check_cuda_graph_backend,
         )
 
-        _sa = getattr(runner, "server_args", None)
-        self.speculative_num_draft_tokens = getattr(
-            _sa, "speculative_num_draft_tokens", None
-        )
+        spec = get_spec()
+        self.speculative_num_draft_tokens = spec.speculative_num_draft_tokens
         _decode_cuda_graph = not check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         )
@@ -261,7 +265,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         if (
             self.use_msa
             and _decode_cuda_graph
-            and getattr(_sa, "speculative_algorithm", None) is not None
+            and spec.speculative_algorithm is not None
         ):
             raise NotImplementedError(
                 "MiniMax-M3 MSA attention does not support speculative decoding under "
