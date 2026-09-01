@@ -29,7 +29,11 @@ from sglang.srt.layers.clippable_linear import (
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.runtime_context import get_mm, get_parallel
+from sglang.srt.runtime_context import (
+    get_mm,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -200,9 +204,8 @@ class Gemma4VisionAttention(nn.Module):
         if is_cuda():
             major, _ = get_device_capability()
             if major == 9:
-                from sglang.srt.utils import is_blackwell_supported
 
-                if is_blackwell_supported():
+                if get_platform().is_blackwell:
                     return "triton_attn"
                 return "fa3"
             return "triton_attn"

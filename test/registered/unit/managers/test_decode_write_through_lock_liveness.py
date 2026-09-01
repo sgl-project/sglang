@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -36,7 +37,7 @@ def _scheduler(tree_cache, *, enable_decode_hicache):
     )
 
 
-class TestDecodeWriteThroughLockLiveness(unittest.TestCase):
+class TestDecodeWriteThroughLockLiveness(CustomTestCase):
     def test_retraction_only_host_pool_drains_on_every_rank(self):
         server_args = ServerArgs(
             model_path="dummy",

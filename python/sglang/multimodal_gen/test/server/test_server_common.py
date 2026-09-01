@@ -45,7 +45,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     PerformanceSummary,
     ScenarioConfig,
     get_model_task_type_for_server_args,
-    get_perf_baseline_path,
+    get_perf_baseline_update_path,
 )
 from sglang.multimodal_gen.test.test_utils import (
     SGL_TEST_FILES_CI_DATA_REVISION,
@@ -246,7 +246,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             logger.error(
                 f'\n{"=" * 60}\n'
                 f'Add "estimated_full_test_time_s" to scenario "{case.id}":\n\n'
-                f"File: {get_perf_baseline_path()}\n\n"
+                f"File: {get_perf_baseline_update_path()}\n\n"
                 f'    "{case.id}": {{\n'
                 f"        ...\n"
                 f'        "estimated_full_test_time_s": {_measured_full_time:.1f}\n'
@@ -445,7 +445,7 @@ class DiffusionServerBase:
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
                 if missing_scenario:
                     pytest.fail(
-                        f"Testcase '{case.id}' not found in {get_perf_baseline_path()}"
+                        f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
                     )
                 return
 
@@ -459,7 +459,7 @@ class DiffusionServerBase:
                     self._dump_baseline_for_testcase(case, summary, missing_scenario)
                     pytest.fail(
                         f"Testcase '{case.id}' is missing a load/runtime peak VRAM "
-                        f"baseline in {get_perf_baseline_path()}"
+                        f"baseline in {get_perf_baseline_update_path()}"
                     )
                 try:
                     validator.validate_peak_vram(
@@ -467,8 +467,13 @@ class DiffusionServerBase:
                         expected_load_peak_vram_mb,
                         expected_runtime_peak_vram_mb,
                     )
+                    validator.validate_peak_host_anon(
+                        summary,
+                        scenario.load_peak_host_anon_mb,
+                        scenario.runtime_peak_host_anon_mb,
+                    )
                 except AssertionError as e:
-                    logger.error(f"Peak VRAM validation failed for {case.id}:\n{e}")
+                    logger.error(f"Peak memory validation failed for {case.id}:\n{e}")
                     self._dump_baseline_for_testcase(case, summary, missing_scenario)
                     raise
 
@@ -516,7 +521,9 @@ class DiffusionServerBase:
 
         scenario = BASELINE_CONFIG.scenarios.get(case.id)
         if scenario is None:
-            pytest.fail(f"Testcase '{case.id}' not found in {get_perf_baseline_path()}")
+            pytest.fail(
+                f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
+            )
 
         validator = PerformanceValidator(
             scenario=scenario,
@@ -539,7 +546,7 @@ class DiffusionServerBase:
         if scenario.load_peak_vram_mb is None or scenario.runtime_peak_vram_mb is None:
             pytest.fail(
                 f"Testcase '{case.id}' is missing a load/runtime peak VRAM "
-                f"baseline in {get_perf_baseline_path()}; measured "
+                f"baseline in {get_perf_baseline_update_path()}; measured "
                 f"load={summary.load_peak_vram_mb:.0f}MiB, "
                 f"runtime={summary.runtime_peak_vram_mb:.0f}MiB"
             )
@@ -664,6 +671,10 @@ class DiffusionServerBase:
                 {
                     "load_peak_vram_mb": round(summary.load_peak_vram_mb, 2),
                     "runtime_peak_vram_mb": round(summary.runtime_peak_vram_mb, 2),
+                    "load_peak_host_anon_mb": round(summary.load_peak_host_anon_mb, 2),
+                    "runtime_peak_host_anon_mb": round(
+                        summary.runtime_peak_host_anon_mb, 2
+                    ),
                 }
             )
 
@@ -680,7 +691,7 @@ class DiffusionServerBase:
                 )
         action = "add" if missing_scenario else "update"
         output = f"""
-{action} this baseline in the "scenarios" section of {get_perf_baseline_path()}:
+{action} this baseline in the "scenarios" section of {get_perf_baseline_update_path()}:
 
 "{case.id}": {json.dumps(baseline, indent=4)}
 
@@ -1546,14 +1557,18 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             sampling_params=case.sampling_params,
         )
 
-        # Single generation - output is reused for both validations
+        # Generation - output of the last request is used for both validations.
+        # perf_repeat_requests > 1 asserts a warm second request meets the same
+        # baselines as the first: residency or courier state leaking between
+        # requests shows up here as degradation or an OOM.
         is_realtime_case = case.sampling_params.realtime_num_chunks is not None
-        perf_record, content = self.run_and_collect(
-            diffusion_server,
-            case.id,
-            generate_fn,
-            collect_perf=not is_gt_gen_mode and not is_realtime_case,
-        )
+        for _ in range(max(1, case.perf_repeat_requests)):
+            perf_record, content = self.run_and_collect(
+                diffusion_server,
+                case.id,
+                generate_fn,
+                collect_perf=not is_gt_gen_mode and not is_realtime_case,
+            )
 
         if is_gt_gen_mode:
             # GT generation mode: save output and skip all validations/tests

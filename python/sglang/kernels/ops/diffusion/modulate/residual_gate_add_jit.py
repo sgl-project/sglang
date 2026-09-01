@@ -14,6 +14,8 @@ if TYPE_CHECKING:
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _BIT_EXACT_DTYPES = (torch.float16, torch.bfloat16)
+_TRANSPOSE_TILE = 32
+_MAX_GRID_DIM = 65535
 _FAILED_RUNTIME_KEYS: set[tuple[int | None, torch.dtype]] = set()
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,10 @@ def _jit_residual_gate_add_module(dtype: torch.dtype) -> Module:
                 "residual_gate_add",
                 "residual_gate_add::" f"ResidualGateAddKernel<{args}>::run",
             ),
+            (
+                "residual_gate_add_transposed",
+                "residual_gate_add::" f"ResidualGateAddKernel<{args}>::run_transposed",
+            ),
         ],
     )
 
@@ -40,7 +46,12 @@ def _jit_residual_gate_add_module(dtype: torch.dtype) -> Module:
 def _fake_impl(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
-    return torch.empty_like(residual)
+    return torch.empty_strided(
+        residual.shape,
+        residual.stride(),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
 
 
 @register_custom_op(
@@ -51,8 +62,16 @@ def _fake_impl(
 def _residual_gate_add_custom_op(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
-    out = torch.empty_like(residual)
+    out = torch.empty_strided(
+        residual.shape,
+        residual.stride(),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
     module = _jit_residual_gate_add_module(residual.dtype)
+    if _is_transposed_dense_residual(residual, update, gate):
+        module.residual_gate_add_transposed(out, residual, update, gate)
+        return out
     broadcast_gate = gate.shape != residual.shape
     module.residual_gate_add(
         out.view(-1),
@@ -71,6 +90,22 @@ def _is_row_broadcast_gate(residual: torch.Tensor, gate: torch.Tensor) -> bool:
     return all(size == 1 for size in gate.shape[:-1])
 
 
+def _is_transposed_dense_residual(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+) -> bool:
+    if residual.dim() != 3 or gate.shape != (1, 1, residual.shape[-1]):
+        return False
+    batch, tokens, hidden_size = residual.shape
+    return (
+        batch <= _MAX_GRID_DIM
+        and (tokens + _TRANSPOSE_TILE - 1) // _TRANSPOSE_TILE <= _MAX_GRID_DIM
+        and (hidden_size + _TRANSPOSE_TILE - 1) // _TRANSPOSE_TILE <= _MAX_GRID_DIM
+        and residual.stride() == (tokens * hidden_size, 1, tokens)
+        and update.is_contiguous()
+        and gate.is_contiguous()
+    )
+
+
 def can_use_residual_gate_add_cuda(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> bool:
@@ -86,8 +121,10 @@ def can_use_residual_gate_add_cuda(
         and residual.numel() > 0
         and update.shape == residual.shape
         and (gate.shape == residual.shape or _is_row_broadcast_gate(residual, gate))
-        and residual.is_contiguous()
-        and update.is_contiguous()
+        and (
+            (residual.is_contiguous() and update.is_contiguous())
+            or _is_transposed_dense_residual(residual, update, gate)
+        )
         and gate.is_contiguous()
     )
 
