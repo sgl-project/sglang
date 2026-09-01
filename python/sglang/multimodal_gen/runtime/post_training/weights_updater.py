@@ -398,6 +398,16 @@ class WeightsUpdater:
             logger.error(error_msg)
             return False, error_msg
 
+        try:
+            for module_name, module in modules_to_update:
+                if isinstance(module, BaseDiT):
+                    module.validate_weight_update_source(
+                        weights_path=weights_map[module_name]
+                    )
+        except ValueError as e:
+            logger.error(str(e))
+            return False, str(e)
+
         logger.info(
             f"Updating {len(weights_map)} modules: "
             + ", ".join(f"{n} <- {p}" for n, p in weights_map.items())
@@ -552,6 +562,14 @@ class WeightsUpdater:
             logger.error(str(e))
             return False, str(e)
 
+        try:
+            for _module_name, module in modules_to_update:
+                if isinstance(module, BaseDiT):
+                    module.validate_weight_update_source(weights_path=None)
+        except ValueError as e:
+            logger.error(str(e))
+            return False, str(e)
+
         updated_modules: list[str] = []
         for module_name, module in modules_to_update:
             try:
@@ -570,8 +588,9 @@ class WeightsUpdater:
 
         for module_name, module in modules_to_update:
             if isinstance(module, BaseDiT):
-                # Same invariant as the disk path; there is no on-disk source
-                # to retarget the rebuild at, so only the caches drop.
+                # Same invariant as the disk path. Any model whose derived
+                # state needs an on-disk source rejected this update above, so
+                # what reaches here only has caches to drop.
                 module.refresh_weight_derived_caches(weights_path=None)
 
         gc.collect()
@@ -635,6 +654,19 @@ class WeightsUpdater:
         if not pairs:
             return False, "No LoRA A/B tensor pairs found in payload"
 
+        dit_module = dict(modules_to_update).get(target_module)
+        if dit_module is None:
+            return False, f"No DiT module found for LoRA IPC target {target_module!r}"
+        if isinstance(dit_module, BaseDiT):
+            # Before convert_to_lora_layers() wraps anything: a layer the model
+            # cannot host is skipped as "unknown" further down, which would
+            # publish success for a partially applied adapter.
+            try:
+                dit_module.validate_lora_layers(list(pairs))
+            except ValueError as e:
+                logger.error(str(e))
+                return False, str(e)
+
         lora_pipeline: LoRAPipeline = self.pipeline
         if not lora_pipeline.lora_initialized:
             convert_target = (
@@ -659,10 +691,6 @@ class WeightsUpdater:
         except ValueError as e:
             logger.error(str(e))
             return False, str(e)
-
-        dit_module = dict(modules_to_update).get(target_module)
-        if dit_module is None:
-            return False, f"No DiT module found for LoRA IPC target {target_module!r}"
 
         updated = 0
         skipped = 0

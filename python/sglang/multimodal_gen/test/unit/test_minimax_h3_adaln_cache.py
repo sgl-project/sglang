@@ -454,3 +454,113 @@ def test_online_cache_width_rejection_preserves_resident_plans(tmp_path):
 
     cache.lookup(plan_a)
     cache.lookup(plan_b)
+
+
+def _sidecar_cache(tmp_path: Path) -> MiniMaxH3AdalnCache:
+    # The weight-update guards only read which tier the cache was built as, so
+    # the sidecar never has to be loaded here.
+    return MiniMaxH3AdalnCache(_ARCH, path=str(tmp_path / "adaln.safetensors"))
+
+
+def _cache_mode_model(cache: MiniMaxH3AdalnCache | None):
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+        MiniMaxH3DiTModel,
+    )
+
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model._adaln_precomputed = True
+    model.adaln_cache = cache
+    return model
+
+
+def test_sidecar_mode_rejects_weight_updates(tmp_path):
+    """A sidecar is built offline; no update can keep it in step."""
+    model = _cache_mode_model(_sidecar_cache(tmp_path))
+    for weights_path in (str(tmp_path), None):
+        with pytest.raises(ValueError, match="sidecar"):
+            model.validate_weight_update_source(weights_path=weights_path)
+
+
+def test_online_cache_rejects_tensor_weight_updates(tmp_path):
+    """Tensor RPC carries no directory the rebuild could stream adaln from."""
+    model = _cache_mode_model(_online_cache(tmp_path))
+    with pytest.raises(ValueError, match="update_weights_from_disk"):
+        model.validate_weight_update_source(weights_path=None)
+
+
+def test_online_cache_rejects_update_source_without_native_adaln(tmp_path):
+    model = _cache_mode_model(_online_cache(tmp_path))
+    diffusers_layout = tmp_path / "diffusers"
+    diffusers_layout.mkdir()
+    save_file({"unrelated": torch.zeros(1)}, diffusers_layout / "model.safetensors")
+
+    for weights_path in (str(diffusers_layout), str(tmp_path / "absent")):
+        with pytest.raises(ValueError, match="no native adaln_proj"):
+            model.validate_weight_update_source(weights_path=weights_path)
+
+
+def test_disk_update_retargets_rebuild_source_and_drops_plans(tmp_path):
+    cache = _online_cache(tmp_path, max_plan_width=1)
+    model = _cache_mode_model(cache)
+    plan = torch.tensor([1.0])
+    cache.build([plan], embed=_embed)
+    updated = tmp_path / "updated"
+    updated.mkdir()
+    _write_online_weights(updated / "model.safetensors")
+
+    model.validate_weight_update_source(weights_path=str(updated))
+    model.refresh_weight_derived_caches(weights_path=str(updated))
+
+    assert cache.weight_files == [str(updated / "model.safetensors")]
+    with pytest.raises(ValueError, match="does not cover"):
+        cache.lookup(plan)
+
+
+def test_lora_ipc_layer_guard_rejects_adaln_in_cache_mode():
+    """IPC passes module prefixes, not the '.lora_A' keys the disk path sees."""
+    model = _cache_mode_model(None)
+    model.validate_lora_layers(["blocks.0.attn.qkv_proj"])
+    with pytest.raises(ValueError, match="adaln_proj"):
+        model.validate_lora_layers(["blocks.0.adaln_proj.linear"])
+
+
+def _updater_for(model, model_path: str):
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.post_training.weights_updater import (
+        WeightsUpdater,
+    )
+
+    model.register_parameter("probe", torch.nn.Parameter(torch.zeros(2)))
+    pipeline = SimpleNamespace(modules={"transformer": model}, model_path=model_path)
+    return WeightsUpdater(pipeline), pipeline
+
+
+def test_weights_updater_rejects_sidecar_update_before_writing_weights(tmp_path):
+    model = _cache_mode_model(_sidecar_cache(tmp_path))
+    updater, pipeline = _updater_for(model, str(tmp_path))
+    new_checkpoint = tmp_path / "new"
+    (new_checkpoint / "transformer").mkdir(parents=True)
+    save_file(
+        {"probe": torch.ones(2)}, new_checkpoint / "transformer" / "model.safetensors"
+    )
+
+    ok, message = updater.update_weights_from_disk(str(new_checkpoint))
+
+    assert not ok
+    assert "sidecar" in message
+    # The rejection has to land before _apply_weights touches anything.
+    assert torch.equal(model.probe, torch.zeros(2))
+    assert pipeline.model_path == str(tmp_path)
+
+
+def test_weights_updater_rejects_tensor_update_in_online_cache_mode(tmp_path):
+    model = _cache_mode_model(_online_cache(tmp_path))
+    updater, _ = _updater_for(model, str(tmp_path))
+
+    ok, message = updater.update_weights_from_tensor([("probe", torch.ones(2))])
+
+    assert not ok
+    assert "update_weights_from_disk" in message
+    assert torch.equal(model.probe, torch.zeros(2))

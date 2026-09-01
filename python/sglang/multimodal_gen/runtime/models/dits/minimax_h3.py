@@ -1449,6 +1449,24 @@ class MiniMaxH3FinalLayer(nn.Module):
         return video, audio
 
 
+def _reject_adaln_lora(names: list[str]) -> None:
+    """Reject LoRA names touching adaln_proj; callers gate on cache mode.
+
+    Cache modes prune the adaln_proj modules, so these deltas have nothing to
+    attach to: they would be dropped without a trace while the rebuild keeps
+    reading base weights from the checkpoint.
+    """
+    adaln_names = sorted(name for name in names if "adaln_proj" in name)
+    if not adaln_names:
+        return
+    raise ValueError(
+        "MiniMax H3 AdaLN cache modes (--minimax-h3-adaln-online / "
+        "--minimax-h3-adaln-cache-path) cannot apply LoRA deltas on "
+        f"adaln_proj ({len(adaln_names)} name(s), e.g. {adaln_names[0]!r}); "
+        "serve this adapter with resident AdaLN weights"
+    )
+
+
 class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     _aliases = [
         "MiniMaxH3Transformer3DModel",
@@ -1471,18 +1489,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     ) -> dict[str, torch.Tensor]:
         """Project released-checkpoint AdaLN LoRAs onto pruned coordinates."""
         if self._adaln_precomputed:
-            adaln_keys = sorted(key for key in adapter if ".adaln_proj." in key)
-            if adaln_keys:
-                # Without this the adapter's adaln deltas are dropped without
-                # a trace (no adaln_proj modules exist to attach them to) and
-                # the online rebuild reads base weights from disk regardless.
-                raise ValueError(
-                    "MiniMax H3 AdaLN cache modes (--minimax-h3-adaln-online / "
-                    "--minimax-h3-adaln-cache-path) cannot apply LoRA deltas "
-                    f"on adaln_proj ({len(adaln_keys)} keys, e.g. "
-                    f"{adaln_keys[0]!r}); serve this adapter with resident "
-                    "AdaLN weights"
-                )
+            _reject_adaln_lora(list(adapter))
         full_width = self.arch.adaln_affine_input_dim
         if full_width is None:
             return adapter
@@ -1569,6 +1576,48 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             cache.build(step_timesteps, embed=embed, keys=keys)
         return cache.resolve_slots(step_timesteps, keys=keys)
 
+    def validate_lora_layers(self, layer_names: list[str]) -> None:
+        if self._adaln_precomputed:
+            _reject_adaln_lora(layer_names)
+
+    def validate_weight_update_source(self, *, weights_path: str | None) -> None:
+        """Reject a weight update the AdaLN cache cannot follow.
+
+        Runs before any weight is written: cached AdaLN outputs are derived
+        from adaln_proj, so an update this cache cannot follow would pair new
+        transformer weights with the previous checkpoint's conditioning.
+        """
+        cache = self.adaln_cache
+        if cache is None:
+            return
+        if cache.weight_files is None:
+            raise ValueError(
+                "MiniMax H3 was started with a prebuilt AdaLN sidecar "
+                "(--minimax-h3-adaln-cache-path), which is built offline from "
+                "the startup checkpoint and cannot be regenerated online; "
+                "rebuild the sidecar against the new weights and restart, or "
+                "serve with --minimax-h3-adaln-online"
+            )
+        if weights_path is None:
+            raise ValueError(
+                "MiniMax H3 --minimax-h3-adaln-online rebuilds AdaLN outputs "
+                "by streaming adaln_proj from a checkpoint directory, and a "
+                "tensor weight update carries no such directory (its "
+                "adaln_proj tensors have no resident modules to land in); "
+                "use update_weights_from_disk instead"
+            )
+        if not (
+            os.path.isdir(weights_path) and native_adaln_weight_files(weights_path)
+        ):
+            # The rebuild streams native tensor names; a Diffusers-layout or
+            # quantized export would defer a KeyError to the next request.
+            raise ValueError(
+                "MiniMax H3 --minimax-h3-adaln-online cannot retarget its "
+                f"AdaLN rebuild at {weights_path!r} (no native adaln_proj "
+                "safetensors there), and rebuilding from the original "
+                "checkpoint would serve stale conditioning"
+            )
+
     def refresh_weight_derived_caches(self, *, weights_path: str | None) -> None:
         """Drop cached AdaLN plans after a weight swap; retarget the rebuild.
 
@@ -1578,27 +1627,11 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         cache = self.adaln_cache
         if cache is None:
             return
-        if cache.weight_files is None:
-            logger.warning(
-                "MiniMax H3 AdaLN sidecar (--minimax-h3-adaln-cache-path) was "
-                "built against the previous weights; requests keep using its "
-                "stale conditioning until the sidecar is rebuilt"
-            )
-            return
-        files: list[str] = []
-        if weights_path is not None and os.path.isdir(weights_path):
-            # The rebuild streams native tensor names; a Diffusers-layout or
-            # quantized export would defer a KeyError to the next request.
-            files = native_adaln_weight_files(weights_path)
-        if files:
-            cache.weight_files = files
-        else:
-            logger.warning(
-                "MiniMax H3 AdaLN rebuild source not retargeted (no native "
-                "adaln_proj safetensors under %s); rebuilds keep reading the "
-                "original checkpoint",
-                weights_path,
-            )
+        # validate_weight_update_source ran before the weights were written and
+        # rejected every source this cannot follow; anything else is a broken
+        # call order rather than a deployment the cache can degrade through.
+        self.validate_weight_update_source(weights_path=weights_path)
+        cache.weight_files = native_adaln_weight_files(weights_path)
         cache.invalidate()
 
     def _can_batch_block_adaln(self) -> bool:
