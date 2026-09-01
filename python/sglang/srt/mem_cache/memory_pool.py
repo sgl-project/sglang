@@ -31,7 +31,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -3619,24 +3619,6 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         return k_size_bytes, v_size_bytes
 
 
-def mamba_slot_identity(mamba_indices: torch.Tensor) -> torch.Tensor:
-    """The static pool's `mamba_translate`: its slot ids are already physical."""
-    return mamba_indices
-
-
-def mamba_slot_translate_unset(mamba_indices: torch.Tensor) -> torch.Tensor:
-    """Default `mamba_translate`: refuses rather than assuming identity.
-
-    The unified pool cannot pass its own at construction -- pool -> allocator ->
-    slot allocator -> translate -> pool is a cycle -- so it installs one after.
-    """
-    raise RuntimeError(
-        "mamba_translate was never installed on this HybridLinearKVPool: a "
-        "static pool passes mamba_slot_identity, the unified pool installs the "
-        "allocator's translate once the slot allocator exists."
-    )
-
-
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 
@@ -3665,11 +3647,6 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
-        # HiCache offload resolves mamba slots through this; the unified pool
-        # holds VIRTUAL ones. See `mamba_slot_translate_unset` for the default.
-        mamba_translate: Callable[
-            [torch.Tensor], torch.Tensor
-        ] = mamba_slot_translate_unset,
     ):
         self.size = size
         self.dtype = dtype
@@ -3681,7 +3658,11 @@ class HybridLinearKVPool(KVCache):
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
-        self._mamba_translate = mamba_translate
+        # Mamba-slot translate for `get_cpu_copy` / `load_cpu_copy`, whose only
+        # caller is the cpu_tensor retraction backup. Identity: a static pool's
+        # slot ids are already physical, and the unified composite allocator
+        # implements neither method, so its virtual ids never arrive here.
+        self._mamba_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
             # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool

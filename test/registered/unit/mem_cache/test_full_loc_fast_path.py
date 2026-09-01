@@ -439,41 +439,5 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
         self.assertFalse(MLATokenToKVPool.write_loc_is_dcp_resolved)
 
 
-class TestMambaTranslateDefault(unittest.TestCase):
-    """`mamba_translate` defaults to a REFUSAL, not to identity.
-
-    The unified pool holds VIRTUAL mamba slot ids and installs its translate
-    after construction (the pool is one hop of a cycle ending at the allocator
-    that owns it). With an identity default, a dropped install reads as "no
-    translation needed" and offloads the wrong slots silently -- the same
-    fail-silent shape that cost a released regression in the KV read path."""
-
-    def test_default_refuses_and_identity_is_opt_in(self):
-        from sglang.srt.mem_cache.memory_pool import (
-            mamba_slot_identity,
-            mamba_slot_translate_unset,
-        )
-
-        ids = torch.tensor([7, 8], dtype=torch.int64)
-        with self.assertRaises(RuntimeError):
-            mamba_slot_translate_unset(ids)
-        self.assertIs(mamba_slot_identity(ids), ids)
-
-    def test_pool_default_is_the_refusal(self):
-        import inspect
-
-        from sglang.srt.mem_cache.memory_pool import (
-            HybridLinearKVPool,
-            mamba_slot_translate_unset,
-        )
-
-        default = (
-            inspect.signature(HybridLinearKVPool.__init__)
-            .parameters["mamba_translate"]
-            .default
-        )
-        self.assertIs(default, mamba_slot_translate_unset)
-
-
 if __name__ == "__main__":
     unittest.main()

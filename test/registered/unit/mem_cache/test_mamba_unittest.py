@@ -21,7 +21,6 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MambaPool,
-    mamba_slot_identity,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -599,9 +598,6 @@ class TestMamba(unittest.TestCase):
             device=device,
             enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool,
-            # Static pool: its mamba slot ids are already physical. Stated
-            # explicitly because the default refuses rather than assuming so.
-            mamba_translate=mamba_slot_identity,
         )
         allocator = TokenToKVPoolAllocator(
             size=size,
