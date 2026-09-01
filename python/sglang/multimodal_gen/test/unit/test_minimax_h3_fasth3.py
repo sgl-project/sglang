@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FastH3 (4-step DMD2-distilled MiniMax-H3) registration and admission
-contracts: t2va-only task coverage, five-point schedule defaults, trained
-VSA gate module, and the pinned overlay registry entry."""
+"""FastH3 (4-step VSA-distilled MiniMax-H3) registration and admission contracts."""
 
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,33 +13,52 @@ from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     FastH3PipelineConfig,
     MiniMaxH3PipelineConfig,
 )
-from sglang.multimodal_gen.configs.sample.minimax_h3 import (
-    FastH3SamplingParams,
+from sglang.multimodal_gen.configs.sample.minimax_h3 import FastH3SamplingParams
+from sglang.multimodal_gen.registry import (
+    get_model_info,
+    get_non_diffusers_pipeline_name,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    maybe_init_distributed_environment_and_model_parallel,
+    model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+    KitchenInt8Config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3ReleaseMetadata,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+    minimax_h3_time_shift_sigmas,
+)
+from sglang.multimodal_gen.runtime.utils.model_overlay import resolve_model_overlay
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
+    ensure_distributed_env_defaults,
 )
 
 FASTH3_MODEL_ID = "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree"
 
 
-def test_registry_resolves_fasth3_configs() -> None:
-    from sglang.multimodal_gen.registry import (
-        get_model_info,
-        get_non_diffusers_pipeline_name,
-    )
+def _ensure_single_process_parallel_runtime() -> None:
+    if model_parallel_is_initialized():
+        return
+    ensure_distributed_env_defaults()
+    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
+
+def test_registry_resolves_fasth3_configs() -> None:
     info = get_model_info(FASTH3_MODEL_ID)
     assert info.sampling_param_cls is FastH3SamplingParams
     assert info.pipeline_config_cls is FastH3PipelineConfig
     assert get_non_diffusers_pipeline_name(FASTH3_MODEL_ID) == "FastH3Pipeline"
-    # The materialized overlay directory name must resolve identically.
     materialized = (
         "/cache/materialized_models/"
         "FastVideo__FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-0123abcd"
     )
-    info = get_model_info(materialized)
-    assert info.sampling_param_cls is FastH3SamplingParams
+    assert get_model_info(materialized).sampling_param_cls is FastH3SamplingParams
 
 
 def test_fasth3_sampling_defaults_and_task_rejection() -> None:
@@ -71,8 +89,6 @@ def test_fasth3_pipeline_config_gates_and_quality() -> None:
 
 
 def test_fasth3_rejects_model_variant() -> None:
-    from types import SimpleNamespace
-
     config = FastH3PipelineConfig()
     with pytest.raises(ValueError, match="--model-variant does not apply"):
         config.validate_server_args(SimpleNamespace(model_variant="ref2va"))
@@ -90,13 +106,6 @@ def test_fasth3_gate_param_mapping() -> None:
 
 
 def test_fasth3_overlay_registry_entry_is_pinned() -> None:
-    """The overlay repo carries FastH3's model_index/manifest/materializer;
-    the registry entry must stay revision-pinned so materialization is
-    reproducible (same contract as the other overlay entries)."""
-    from sglang.multimodal_gen.runtime.utils.model_overlay import (
-        resolve_model_overlay,
-    )
-
     spec = resolve_model_overlay(FASTH3_MODEL_ID)
     assert spec is not None
     assert spec["overlay_repo_id"] == "kevin-mi/FastH3-4step-Preview-overlay"
@@ -104,7 +113,6 @@ def test_fasth3_overlay_registry_entry_is_pinned() -> None:
 
 
 def test_fasth3_release_metadata_contract() -> None:
-    """The t2va-only release block the overlay's model_index must declare."""
     metadata = MiniMaxH3ReleaseMetadata.from_model_index(
         {
             "_minimax_h3": {
@@ -122,12 +130,6 @@ def test_fasth3_release_metadata_contract() -> None:
 
 
 def test_fasth3_distilled_schedule_is_uniform_five_points() -> None:
-    """The distilled grid is the base shift-12 schedule at 5 sigma points;
-    dmd_denoising_steps [999, 749, 500, 250] are the unshifted grid labels."""
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
-        minimax_h3_time_shift_sigmas,
-    )
-
     sigmas = minimax_h3_time_shift_sigmas(num_steps=5, shift_scale=12.0)
     assert len(sigmas) == 5
     assert sigmas[0] == 1.0 and sigmas[-1] == 0.0
@@ -137,12 +139,6 @@ def test_fasth3_distilled_schedule_is_uniform_five_points() -> None:
 
 
 def test_fasth3_lora_bundle_is_rejected_loudly() -> None:
-    from types import SimpleNamespace
-
-    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
-        MiniMaxH3DiTModel,
-    )
-
     model = SimpleNamespace(arch=SimpleNamespace(adaln_affine_input_dim=None))
     plain = {
         "blocks.0.attn.qkv_proj.lora_A": torch.zeros(3, 64, 8),
@@ -154,27 +150,12 @@ def test_fasth3_lora_bundle_is_rejected_loudly() -> None:
     bundle["blocks.0.attn.qkv_proj.diff"] = torch.zeros(3, 64, 64)
     bundle["audio_patch_proj.diff_b"] = torch.zeros(64)
     bundle["blocks.0.attn.to_gate_compress.set_weight"] = torch.zeros(64, 64)
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(ValueError, match="3 non-LoRA tensors.*set_weight"):
         MiniMaxH3DiTModel.prepare_lora_adapter(model, bundle)
-    message = str(excinfo.value)
-    assert "3 non-LoRA tensors" in message
-    assert "set_weight" in message
 
 
 @pytest.mark.parametrize("quant_name", ["fp8", "kitchen_int8"])
 def test_fasth3_gates_stay_bf16_under_runtime_quantization(quant_name: str) -> None:
-    from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
-    from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-        KitchenInt8Config,
-    )
-    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
-    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
-        MiniMaxH3DiTModel,
-    )
-    from sglang.multimodal_gen.test.unit.test_minimax_h3_dit_contract import (
-        _ensure_single_process_parallel_runtime,
-    )
-
     if quant_name == "kitchen_int8":
         pytest.importorskip("comfy_kitchen")
     _ensure_single_process_parallel_runtime()

@@ -177,7 +177,7 @@ def test_topk_tile_list_semantics() -> None:
     assert (_lists_to_mask(compete, n_tiles).sum(dim=-1) == keep + num_prefix).all()
 
 
-def _masked_dense_reference(impl, meta, used, q, k, v, gate, sparsity):
+def _masked_dense_reference(meta, used, q, k, v, gate, sparsity):
     """fp32 reference over the padded tile layout with the top-k tile mask."""
     n_tiles = meta.num_tiles
     seq_pad = n_tiles * VSA_H3_TILE_ELEMS
@@ -222,9 +222,8 @@ def test_sparse_gated_matches_masked_dense_reference() -> None:
         meta = _build_metadata(0.5, device, exempt=exempt)
         used, total, (q, k, v) = _packed_qkv(device)
         gate = (torch.randn_like(q) * 0.1).to(torch.bfloat16)
-        impl = _impl()
-        out = _run(impl, meta, used, total, q, k, v, gate=gate)
-        reference = _masked_dense_reference(impl, meta, used, q, k, v, gate, 0.5)
+        out = _run(_impl(), meta, used, total, q, k, v, gate=gate)
+        reference = _masked_dense_reference(meta, used, q, k, v, gate, 0.5)
         diff = (out[:used].float() - reference).abs().max().item()
         assert diff < 2e-2, f"exempt={exempt}: sparse+gate vs reference {diff}"
         assert torch.all(out[used:] == 0)
