@@ -1,15 +1,22 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-# (fastvideo-kernel triton_kernels/block_sparse_attn_triton.py and index.py).
-# Inference-only subset: the block-sparse forward and the mask -> index
-# conversion. Backward stays upstream; SGLang serves no-grad forwards.
+# (fastvideo-kernel triton_kernels/block_sparse_attn_triton.py).
+# Inference-only subset: the block-sparse forward. Backward stays upstream;
+# SGLang serves no-grad forwards. The tile pack/unpack kernels are SGLang's.
 
 # SPDX-License-Identifier: Apache-2.0
 """Triton 64-token block-sparse attention for MiniMax-H3 VSA.
 
-The kernel consumes an explicit per-query-block index list (``q2k_index`` /
-``q2k_num``) plus per-key-block valid token counts (``variable_block_sizes``),
-so ragged interior tiles - segment-pure prefix chunks and 3D video tiles whose
-dimensions do not divide the tile shape - mask their pad columns exactly.
+The attention kernel consumes an explicit per-query-block index list
+(``q2k_index`` / ``q2k_num``) plus per-key-block valid token counts
+(``variable_block_sizes``), so ragged interior tiles - segment-pure prefix
+chunks and 3D video tiles whose dimensions do not divide the tile shape - mask
+their pad columns exactly.
+
+``vsa_h3_pack_tiles`` gathers packed ``[T, H, D]`` rows into the head-major
+padded tile layout the attention kernel reads and pools each tile in the same
+pass; ``vsa_h3_untile`` scatters the attention output back to packed rows and
+folds in the gated compression branch. Both replace chains of index copies
+and transposes that otherwise cost more than the attention kernel itself.
 """
 
 import math
@@ -17,6 +24,7 @@ import math
 import torch
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 # BLOCK_M / BLOCK_N are structural, not tunable: the kernel indexes the top-k
 # list per BLOCK_M q-tile and addresses keys as kv_idx * BLOCK_N, so both must
@@ -24,45 +32,24 @@ import triton.language as tl
 VSA_H3_KERNEL_BLOCK = 64
 
 _configs = [
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_stages=s, num_warps=w)
-    for s in (2, 3, 4, 5, 6, 7)
-    for w in (4, 8)
+    triton.Config({}, num_stages=s, num_warps=w) for s in (2, 3, 4) for w in (4, 8)
 ]
 
 
 @triton.autotune(_configs, key=["N_CTX_Q", "HEAD_DIM"])
 @triton.jit
 def _attn_fwd_sparse(
-    Q,
-    K,
-    V,
+    desc_q,
+    desc_k,
+    desc_v,
+    desc_o,
     sm_scale,
     q2k_index,
     q2k_num,
     max_kv_blks,
     variable_block_sizes,
-    M,
-    Out,
-    stride_qz,
-    stride_qh,
-    stride_qm,
-    stride_qk,
-    stride_kz,
-    stride_kh,
-    stride_kn,
-    stride_kk,
-    stride_vz,
-    stride_vh,
-    stride_vk,
-    stride_vn,
-    stride_oz,
-    stride_oh,
-    stride_om,
-    stride_on,
-    Z,
     H,
     N_CTX_Q,
-    N_CTX_KV,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -72,64 +59,22 @@ def _attn_fwd_sparse(
     b = off_hz // H
     h = off_hz % H
     q_tiles = N_CTX_Q // BLOCK_M
-    meta_base = (b * H + h) * q_tiles + q_blk
+    meta_base = off_hz * q_tiles + q_blk
 
     kv_blocks = tl.load(q2k_num + meta_base)
-    kv_ptr = q2k_index + meta_base * max_kv_blks
+    kv_ptr = q2k_index + meta_base.to(tl.int64) * max_kv_blks
 
-    q_off = b.to(tl.int64) * stride_qz + h.to(tl.int64) * stride_qh
-    k_off = b.to(tl.int64) * stride_kz + h.to(tl.int64) * stride_kh
-    v_off = b.to(tl.int64) * stride_vz + h.to(tl.int64) * stride_vh
-    o_off = b.to(tl.int64) * stride_oz + h.to(tl.int64) * stride_oh
-
-    Q_ptr = tl.make_block_ptr(
-        base=Q + q_off,
-        shape=(N_CTX_Q, HEAD_DIM),
-        strides=(stride_qm, stride_qk),
-        offsets=(q_blk * BLOCK_M, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
-        order=(1, 0),
-    )
-    K_base = tl.make_block_ptr(
-        base=K + k_off,
-        shape=(HEAD_DIM, N_CTX_KV),
-        strides=(stride_kk, stride_kn),
-        offsets=(0, 0),
-        block_shape=(HEAD_DIM, BLOCK_N),
-        order=(0, 1),
-    )
-    V_base = tl.make_block_ptr(
-        base=V + v_off,
-        shape=(N_CTX_KV, HEAD_DIM),
-        strides=(stride_vk, stride_vn),
-        offsets=(0, 0),
-        block_shape=(BLOCK_N, HEAD_DIM),
-        order=(1, 0),
-    )
-    O_ptr = tl.make_block_ptr(
-        base=Out + o_off,
-        shape=(N_CTX_Q, HEAD_DIM),
-        strides=(stride_om, stride_on),
-        offsets=(q_blk * BLOCK_M, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
-        order=(1, 0),
-    )
-
-    offs_m = q_blk * BLOCK_M + tl.arange(0, BLOCK_M)
+    q = desc_q.load([b, h, q_blk * BLOCK_M, 0]).reshape([BLOCK_M, HEAD_DIM])
     m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     qk_scale = sm_scale * 1.44269504  # 1/ln2
-    q = tl.load(Q_ptr)
 
     for i in range(0, kv_blocks):
         kv_idx = tl.load(kv_ptr + i).to(tl.int32)
         block_size = tl.load(variable_block_sizes + kv_idx)
-        K_ptr = tl.advance(K_base, (0, kv_idx * BLOCK_N))
-        V_ptr = tl.advance(V_base, (kv_idx * BLOCK_N, 0))
-
-        k = tl.load(K_ptr)
-        qk = tl.dot(q, k)
+        k = desc_k.load([b, h, kv_idx * BLOCK_N, 0]).reshape([BLOCK_N, HEAD_DIM])
+        qk = tl.dot(q, tl.trans(k))
         mask = tl.arange(0, BLOCK_N) < block_size
         qk = tl.where(mask[None, :], qk, -float("inf"))
 
@@ -141,83 +86,15 @@ def _attn_fwd_sparse(
         l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
 
-        v = tl.load(V_ptr)
+        v = desc_v.load([b, h, kv_idx * BLOCK_N, 0]).reshape([BLOCK_N, HEAD_DIM])
         acc = tl.dot(p.to(tl.bfloat16), v, acc)
         m_i = m_ij
 
-    m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
-    tl.store(M + off_hz * N_CTX_Q + offs_m, m_i)
-    tl.store(O_ptr, acc.to(Out.type.element_ty))
-
-
-@triton.jit
-def _map_to_index_kernel(
-    map_ptr,
-    index_ptr,
-    index_num_ptr,
-    map_bs_stride,
-    map_h_stride,
-    map_q_stride,
-    map_kv_stride,
-    index_bs_stride,
-    index_h_stride,
-    index_q_stride,
-    index_kv_stride,
-    index_num_bs_stride,
-    index_num_h_stride,
-    index_num_q_stride,
-    num_kv_blocks,
-):
-    b, h, q = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    index_ptr_base = (
-        index_ptr + b * index_bs_stride + h * index_h_stride + q * index_q_stride
+    desc_o.store(
+        [b, h, q_blk * BLOCK_M, 0],
+        acc.to(desc_o.dtype).reshape([1, 1, BLOCK_M, HEAD_DIM]),
     )
-    map_ptr_base = map_ptr + b * map_bs_stride + h * map_h_stride + q * map_q_stride
-
-    num = 0
-    for i in tl.range(num_kv_blocks):
-        map_entry = tl.load(map_ptr_base + i * map_kv_stride)
-        if map_entry:
-            tl.store(index_ptr_base + num * index_kv_stride, i)
-            num += 1
-
-    tl.store(
-        index_num_ptr
-        + b * index_num_bs_stride
-        + h * index_num_h_stride
-        + q * index_num_q_stride,
-        num,
-    )
-
-
-def vsa_h3_map_to_index(block_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """[B, H, Gq, Gk] bool map -> ([B, H, Gq, Gk] int32 ascending index list
-    padded with -1, [B, H, Gq] int32 per-row counts)."""
-    batch, heads, num_q_blocks, num_kv_blocks = block_map.shape
-    index = torch.full(block_map.shape, -1, dtype=torch.int32, device=block_map.device)
-    index_num = torch.empty(
-        (batch, heads, num_q_blocks), dtype=torch.int32, device=block_map.device
-    )
-    grid = (batch, heads, num_q_blocks)
-    _map_to_index_kernel[grid](
-        block_map,
-        index,
-        index_num,
-        block_map.stride(0),
-        block_map.stride(1),
-        block_map.stride(2),
-        block_map.stride(3),
-        index.stride(0),
-        index.stride(1),
-        index.stride(2),
-        index.stride(3),
-        index_num.stride(0),
-        index_num.stride(1),
-        index_num.stride(2),
-        num_kv_blocks=num_kv_blocks,
-    )
-    return index, index_num
 
 
 def vsa_h3_block_sparse_attn_forward(
@@ -227,8 +104,11 @@ def vsa_h3_block_sparse_attn_forward(
     q2k_index: torch.Tensor,
     q2k_num: torch.Tensor,
     variable_block_sizes: torch.Tensor,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """q/k/v: [B, H, S_pad, D] bf16 with S_pad = n_tiles * 64; pad rows zero."""
+    """q/k/v: contiguous [B, H, S_pad, D] bf16 with S_pad = n_tiles * 64; pad
+    rows zero. q2k_index/q2k_num: contiguous [B, H, n_tiles, max_kv] /
+    [B, H, n_tiles] int32."""
     batch, heads, seq_q, head_dim = q.shape
     seq_kv = k.shape[2]
     if seq_q % VSA_H3_KERNEL_BLOCK or seq_kv % VSA_H3_KERNEL_BLOCK:
@@ -241,43 +121,229 @@ def vsa_h3_block_sparse_attn_forward(
             "variable_block_sizes must have one entry per 64-token key block: "
             f"{variable_block_sizes.numel()} vs {seq_kv // VSA_H3_KERNEL_BLOCK}"
         )
-    sm_scale = 1.0 / math.sqrt(head_dim)
-    max_kv_blks = q2k_index.shape[-1]
-    out = torch.empty_like(q)
-    # Row-max running stats in Triton's base-2 M format; inference discards it.
-    row_max = torch.empty((batch, heads, seq_q), dtype=torch.float32, device=q.device)
-    grid = lambda _: (triton.cdiv(seq_q, VSA_H3_KERNEL_BLOCK), batch * heads, 1)
+    if out is None:
+        out = torch.empty_like(q)
+    block = [1, 1, VSA_H3_KERNEL_BLOCK, head_dim]
+    desc_q, desc_k, desc_v, desc_o = (
+        TensorDescriptor.from_tensor(t, block_shape=block) for t in (q, k, v, out)
+    )
+    grid = (seq_q // VSA_H3_KERNEL_BLOCK, batch * heads, 1)
     _attn_fwd_sparse[grid](
+        desc_q,
+        desc_k,
+        desc_v,
+        desc_o,
+        1.0 / math.sqrt(head_dim),
+        q2k_index,
+        q2k_num,
+        q2k_index.shape[-1],
+        variable_block_sizes,
+        heads,
+        seq_q,
+        HEAD_DIM=head_dim,
+        BLOCK_M=VSA_H3_KERNEL_BLOCK,
+        BLOCK_N=VSA_H3_KERNEL_BLOCK,
+    )
+    return out
+
+
+@triton.jit
+def _pack_tiles_kernel(
+    Q,
+    K,
+    V,
+    G,
+    src_index,
+    variable_block_sizes,
+    Tiled,
+    Pooled,
+    stride_q_row,
+    stride_q_head,
+    stride_k_row,
+    stride_k_head,
+    stride_v_row,
+    stride_v_head,
+    stride_g_row,
+    stride_g_head,
+    H,
+    S_PAD,
+    N_TILES,
+    HAS_GATE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    h = tl.program_id(1)
+    rows = tile * BLOCK + tl.arange(0, BLOCK)
+    cols = tl.arange(0, HEAD_DIM)
+    src = tl.load(src_index + rows)
+    valid = src >= 0
+    src = tl.where(valid, src, 0).to(tl.int64)
+    mask = valid[:, None]
+    inv_size = 1.0 / tl.load(variable_block_sizes + tile).to(tl.float32)
+
+    tensor_stride = H.to(tl.int64) * S_PAD * HEAD_DIM
+    out_off = (
+        h.to(tl.int64) * S_PAD * HEAD_DIM + rows[:, None] * HEAD_DIM + cols[None, :]
+    )
+    pool_off = (h * N_TILES + tile).to(tl.int64) * HEAD_DIM + cols
+
+    x = tl.load(
+        Q + src[:, None] * stride_q_row + h * stride_q_head + cols[None, :],
+        mask=mask,
+        other=0.0,
+    )
+    tl.store(Tiled + out_off, x)
+    tl.store(Pooled + pool_off, tl.sum(x.to(tl.float32), 0) * inv_size)
+
+    x = tl.load(
+        K + src[:, None] * stride_k_row + h * stride_k_head + cols[None, :],
+        mask=mask,
+        other=0.0,
+    )
+    tl.store(Tiled + tensor_stride + out_off, x)
+    tl.store(
+        Pooled + H * N_TILES * HEAD_DIM + pool_off,
+        tl.sum(x.to(tl.float32), 0) * inv_size,
+    )
+
+    x = tl.load(
+        V + src[:, None] * stride_v_row + h * stride_v_head + cols[None, :],
+        mask=mask,
+        other=0.0,
+    )
+    tl.store(Tiled + 2 * tensor_stride + out_off, x)
+    tl.store(
+        Pooled + 2 * H * N_TILES * HEAD_DIM + pool_off,
+        tl.sum(x.to(tl.float32), 0) * inv_size,
+    )
+
+    if HAS_GATE:
+        x = tl.load(
+            G + src[:, None] * stride_g_row + h * stride_g_head + cols[None, :],
+            mask=mask,
+            other=0.0,
+        )
+        tl.store(Tiled + 3 * tensor_stride + out_off, x)
+
+
+def vsa_h3_pack_tiles(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor | None,
+    src_index: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+    tiled: torch.Tensor,
+    pooled: torch.Tensor,
+) -> None:
+    """Gather packed [T, H, D] rows into ``tiled`` ([3|4, H, S_pad, D]) and
+    write per-tile fp32 means of q/k/v into ``pooled`` ([3, H, n_tiles, D]).
+
+    ``src_index`` maps every padded tile position to its packed row, or -1 for
+    a pad position, which is written as zero.
+    """
+    n_tensors, heads, seq_pad, head_dim = tiled.shape
+    n_tiles = seq_pad // VSA_H3_KERNEL_BLOCK
+    has_gate = gate is not None
+    if n_tensors != 3 + int(has_gate):
+        raise ValueError(f"tiled holds {n_tensors} tensors, gate={has_gate}")
+    for name, t in (("q", q), ("k", k), ("v", v), ("gate", gate)):
+        if t is not None and t.stride(-1) != 1:
+            raise ValueError(f"VSA-H3 pack needs a unit last-dim stride for {name}")
+    g = gate if has_gate else q
+    _pack_tiles_kernel[(n_tiles, heads)](
         q,
         k,
         v,
-        sm_scale,
-        q2k_index,
-        q2k_num,
-        max_kv_blks,
+        g,
+        src_index,
         variable_block_sizes,
-        row_max,
-        out,
+        tiled,
+        pooled,
         q.stride(0),
         q.stride(1),
-        q.stride(2),
-        q.stride(3),
         k.stride(0),
         k.stride(1),
-        k.stride(2),
-        k.stride(3),
         v.stride(0),
         v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        out.stride(3),
-        batch,
+        g.stride(0),
+        g.stride(1),
         heads,
-        seq_q,
-        seq_kv,
+        seq_pad,
+        n_tiles,
+        HAS_GATE=has_gate,
         HEAD_DIM=head_dim,
+        BLOCK=VSA_H3_KERNEL_BLOCK,
     )
-    return out
+
+
+@triton.jit
+def _untile_kernel(
+    OutTiled,
+    Gate,
+    OutC,
+    dst_index,
+    Res,
+    used,
+    total,
+    S_PAD,
+    N_TILES,
+    HAS_GATE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row_block = tl.program_id(0)
+    h = tl.program_id(1)
+    H = tl.num_programs(1)
+    rows = row_block * BLOCK + tl.arange(0, BLOCK)
+    cols = tl.arange(0, HEAD_DIM)
+    in_used = rows < used
+    pos = tl.load(dst_index + rows, mask=in_used, other=0).to(tl.int64)
+    head_base = h.to(tl.int64) * S_PAD * HEAD_DIM
+    off = head_base + pos[:, None] * HEAD_DIM + cols[None, :]
+    o = tl.load(OutTiled + off, mask=in_used[:, None], other=0.0).to(tl.float32)
+    if HAS_GATE:
+        g = tl.load(Gate + off, mask=in_used[:, None], other=0.0).to(tl.float32)
+        tile = pos // BLOCK
+        c = tl.load(
+            OutC + (h * N_TILES + tile)[:, None] * HEAD_DIM + cols[None, :],
+            mask=in_used[:, None],
+            other=0.0,
+        )
+        o = o + c * g
+    res_off = (rows[:, None] * H + h).to(tl.int64) * HEAD_DIM + cols[None, :]
+    tl.store(Res + res_off, o.to(Res.type.element_ty), mask=(rows < total)[:, None])
+
+
+def vsa_h3_untile(
+    out_tiled: torch.Tensor,
+    gate_tiled: torch.Tensor | None,
+    out_compress: torch.Tensor | None,
+    dst_index: torch.Tensor,
+    used: int,
+    result: torch.Tensor,
+) -> None:
+    """Scatter ``out_tiled`` ([H, S_pad, D]) back to packed rows of ``result``
+    ([T, H, D]); rows past ``used`` come out zero. With a gate, adds the
+    pooled compression output ``out_compress`` ([H, n_tiles, D] fp32) scaled
+    by the tiled gate before rounding once to the result dtype."""
+    heads, seq_pad, head_dim = out_tiled.shape
+    total = result.shape[0]
+    has_gate = gate_tiled is not None
+    if has_gate != (out_compress is not None):
+        raise ValueError("gate_tiled and out_compress must be given together")
+    _untile_kernel[(triton.cdiv(total, VSA_H3_KERNEL_BLOCK), heads)](
+        out_tiled,
+        gate_tiled if has_gate else out_tiled,
+        out_compress if has_gate else out_tiled,
+        dst_index,
+        result,
+        used,
+        total,
+        seq_pad,
+        seq_pad // VSA_H3_KERNEL_BLOCK,
+        HAS_GATE=has_gate,
+        HEAD_DIM=head_dim,
+        BLOCK=VSA_H3_KERNEL_BLOCK,
+    )

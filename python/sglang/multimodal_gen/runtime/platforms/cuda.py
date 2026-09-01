@@ -257,7 +257,10 @@ class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
 
     # The vendored Triton tile-64 kernel is written against Hopper and
     # Blackwell block-sparse geometry; older architectures fail closed.
-    supported_capabilities = {(9, 0), (10, 0)}
+    # SM103 (B300 / GB300) is validated: the Triton route compiles and the
+    # sparsity->0 == dense gate holds there. SM120 stays out (no Triton
+    # tile-64 validation, and FA is unavailable for the token refiner).
+    supported_capabilities = {(9, 0), (10, 0), (10, 3)}
 
     @classmethod
     def resolve(cls, platform) -> str:
@@ -269,7 +272,8 @@ class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
             found = capability.as_version_str() if capability else "unknown"
             raise ValueError(
                 "VSA-H3 (video_sparse_attn_h3) needs compute capability 9.0 "
-                f"(Hopper) or 10.0 (B200 / GB200); this device reports {found}."
+                "(Hopper), 10.0 (B200 / GB200) or 10.3 (B300 / GB300); "
+                f"this device reports {found}."
             )
         try:
             from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (  # noqa: F401

@@ -82,7 +82,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`video_sparse_attn_h3`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`VIDEO_SPARSE_ATTN_H3`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Video Sparse Attention for MiniMax-H3 / FastH3 (VSA-H3). In-tree Triton block-sparse kernel (SM90/SM100); no external package. Requires <code>--component-attention-backends text_encoder=fa</code> when the DiT backend is not FA. Configure via <code>--attention-backend-config</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Video Sparse Attention for MiniMax-H3 / FastH3 (VSA-H3). In-tree Triton block-sparse kernel (SM90 / SM100 / SM103, i.e. H100/H200, B200/GB200, B300/GB300); no external package. Requires <code>--component-attention-backends text_encoder=fa</code> when the DiT backend is not FA. Configure via <code>--attention-backend-config</code>.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`vmoba_attn`</td>
@@ -293,6 +293,19 @@ VSA-H3 constraints:
 - Ulysses sequence parallelism is supported (each rank attends the full packed
   sequence with a head shard); `--ring-degree` greater than 1 is rejected.
 - `torch.compile` and breakable CUDA graph execution are rejected with VSA-H3.
+- The Triton kernel autotunes six launch configs on the first call for a new
+  sequence length (about 1 s with a warm Triton disk cache, a few seconds on a
+  cold one); request- or server-mode warmup absorbs it before serving traffic.
+- Per layer the backend runs one fused gather that tiles q/k/v/gate into the
+  kernel's head-major layout and pools them, a top-k over pooled tile scores
+  emitted directly as the kernel's index lists, the TMA-fed block-sparse
+  kernel, and one fused untile that folds in the gated compression branch. On
+  4x B300 at 1344x768 / 10 s this is about 1 ms of bookkeeping next to 9 ms of
+  attention per DiT layer.
+- Rounding-level differences (Ulysses vs TP2 x Ulysses2, fp8, kernel changes
+  at one bf16 ulp) produce a visibly different but equally coherent sample from
+  the same seed: the 4-step distilled schedule amplifies them. Judge quality by
+  coherence, not by SSIM against a single-seed reference.
 
 **V-MoBA (`vmoba_attn`)**
 
@@ -613,7 +626,7 @@ VSA-H3 constraints:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA-only (SM90/SM100). In-tree Triton kernel, no external dependency. Requires <code>--component-attention-backends text_encoder=fa</code>. Configure via <code>--attention-backend-config</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA-only (SM90 / SM100 / SM103: Hopper, B200/GB200, B300/GB300). In-tree Triton kernel, no external dependency. Requires <code>--component-attention-backends text_encoder=fa</code>. Configure via <code>--attention-backend-config</code>.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>sla_attn</code></td>
