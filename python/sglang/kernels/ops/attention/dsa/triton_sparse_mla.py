@@ -39,11 +39,11 @@ def _validate_input_dtypes(
     q_rope: torch.Tensor,
     kv: torch.Tensor,
 ) -> bool:
-    """Validate sparse-MLA dtypes and return whether the dot path is FP8.
+    """Validate sparse-MLA dtypes and return whether the KV cache is FP8.
 
     MI300X produces BF16 queries with an FP8 FNUZ KV cache. The kernels cast
-    query fragments to the KV element type while loading them, so this mixed
-    input avoids separate query-conversion kernels and still uses FP8 MFMA.
+    query fragments to the KV element type while loading them, keeping both dot
+    operands matched without a separate query-conversion kernel.
     """
     q_dtype = q_nope.dtype
     kv_dtype = kv.dtype
@@ -207,7 +207,7 @@ def _prune_configs(configs, named_args, **kwargs):
     topk = named_args["topk"]
     max_block_n = _sparse_mla_block_k(named_args["kv_ptr"])
     candidates = configs
-    if kwargs["IS_FP8"]:
+    if kwargs["USE_FP8_DOT"]:
         candidates = [
             c
             for c in candidates
@@ -239,7 +239,7 @@ _SPLIT_DIM_CONFIGS = [
 
 @triton.autotune(
     configs=_SPLIT_DIM_CONFIGS,
-    key=["topk", "H", "IS_FP8", "SEQ_BUCKET"],
+    key=["topk", "H", "USE_FP8_DOT", "SEQ_BUCKET"],
     prune_configs_by={"early_config_prune": _prune_configs},
 )
 @triton.jit
@@ -261,7 +261,7 @@ def _sparse_mla_fwd_split_dim_kernel(
     STRIDE_QN_H: tl.constexpr,
     STRIDE_QR_T: tl.constexpr,
     STRIDE_QR_H: tl.constexpr,
-    IS_FP8: tl.constexpr,
+    USE_FP8_DOT: tl.constexpr,
     SEQ_BUCKET: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -271,17 +271,18 @@ def _sparse_mla_fwd_split_dim_kernel(
     dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
+    input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
     q_row = q_nope_ptr + s_i * STRIDE_QN_T + h[:, None] * STRIDE_QN_H
-    q0 = tl.load(q_row + g[None, :]).to(q_nope_ptr.dtype.element_ty)
+    q0 = tl.load(q_row + g[None, :]).to(input_type)
     if NUM_GROUPS >= 2:
-        q1 = tl.load(q_row + (_G + g)[None, :]).to(q_nope_ptr.dtype.element_ty)
+        q1 = tl.load(q_row + (_G + g)[None, :]).to(input_type)
     if NUM_GROUPS >= 3:
-        q2 = tl.load(q_row + (2 * _G + g)[None, :]).to(q_nope_ptr.dtype.element_ty)
+        q2 = tl.load(q_row + (2 * _G + g)[None, :]).to(input_type)
     if NUM_GROUPS >= 4:
-        q3 = tl.load(q_row + (3 * _G + g)[None, :]).to(q_nope_ptr.dtype.element_ty)
+        q3 = tl.load(q_row + (3 * _G + g)[None, :]).to(input_type)
     q_tail = tl.load(
         q_rope_ptr + s_i * STRIDE_QR_T + h[:, None] * STRIDE_QR_H + dt[None, :]
-    ).to(q_nope_ptr.dtype.element_ty)
+    ).to(input_type)
 
     neg_large = -3.4028234663852886e38
     m_i = tl.full([H], neg_large, tl.float32)
@@ -294,8 +295,7 @@ def _sparse_mla_fwd_split_dim_kernel(
     if NUM_GROUPS >= 4:
         acc3 = tl.zeros([H, _G], tl.float32)
 
-    input_type = kv_ptr.dtype.element_ty
-    if IS_FP8:
+    if USE_FP8_DOT:
         p_dot_scale = 1.0 / fp8_max
     else:
         p_dot_scale = 1.0
@@ -307,24 +307,22 @@ def _sparse_mla_fwd_split_dim_kernel(
         page = tl.where(valid, idx, 0).to(tl.int64)
         kbase = kv_ptr + page[:, None] * DIM
 
-        kv0 = tl.load(kbase + g[None, :], mask=valid[:, None], other=0.0).to(
-            q_nope_ptr.dtype.element_ty
-        )
+        kv0 = tl.load(kbase + g[None, :], mask=valid[:, None], other=0.0).to(input_type)
         if NUM_GROUPS >= 2:
             kv1 = tl.load(kbase + (_G + g)[None, :], mask=valid[:, None], other=0.0).to(
-                q_nope_ptr.dtype.element_ty
+                input_type
             )
         if NUM_GROUPS >= 3:
             kv2 = tl.load(
                 kbase + (2 * _G + g)[None, :], mask=valid[:, None], other=0.0
-            ).to(q_nope_ptr.dtype.element_ty)
+            ).to(input_type)
         if NUM_GROUPS >= 4:
             kv3 = tl.load(
                 kbase + (3 * _G + g)[None, :], mask=valid[:, None], other=0.0
-            ).to(q_nope_ptr.dtype.element_ty)
+            ).to(input_type)
         kv_tail = tl.load(
             kbase + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
-        ).to(q_nope_ptr.dtype.element_ty)
+        ).to(input_type)
 
         qk = tl.dot(q0, tl.trans(kv0))
         if NUM_GROUPS >= 2:
@@ -343,7 +341,7 @@ def _sparse_mla_fwd_split_dim_kernel(
         p = tl.exp2(qk - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
 
-        if IS_FP8:
+        if USE_FP8_DOT:
             p_dot = (p * fp8_max).to(input_type)
         else:
             p_dot = p.to(input_type)
@@ -402,6 +400,7 @@ def _triton_sparse_mla_fwd_single(
 ) -> torch.Tensor:
     """Single-pass prefill: grid=(seq,), loops over all topk per CTA."""
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
+    use_fp8_dot = is_fp8
     seq, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     assert d_v % 128 == 0, f"Triton sparse MLA requires d_v divisible by 128, got {d_v}"
@@ -427,10 +426,10 @@ def _triton_sparse_mla_fwd_single(
     qk_scale = float(sm_scale) * _LOG2E
     # Keep FP8 in one cache bucket while allowing the two target BF16 prefill
     # regimes to retain different autotuned configurations.
-    seq_bucket = int(not is_fp8 and seq >= _LONG_PREFILL_SEQ_THRESHOLD)
+    seq_bucket = int(not use_fp8_dot and seq >= _LONG_PREFILL_SEQ_THRESHOLD)
     if H < 16:
-        # Pad H to 16 so fp8 tl.dot maps to native MFMA tiles on CDNA4.
-        # Without padding, M=H<16 fp8 dots fall back to a scalar path.
+        # Pad H to 16 so the FP8 dot path maps to native MFMA tiles on CDNA4.
+        # Without padding, M=H<16 FP8 dots fall back to a scalar path.
         H_pad = 16
         q_nope_pad = torch.zeros(
             seq, H_pad, d_v, device=q_nope.device, dtype=q_nope.dtype
@@ -464,7 +463,7 @@ def _triton_sparse_mla_fwd_single(
             STRIDE_QN_H=stride_qn_h,
             STRIDE_QR_T=stride_qr_t,
             STRIDE_QR_H=stride_qr_h,
-            IS_FP8=is_fp8,
+            USE_FP8_DOT=use_fp8_dot,
             SEQ_BUCKET=seq_bucket,
         )
         out = out_pad[:, :H, :].contiguous()
@@ -487,7 +486,7 @@ def _triton_sparse_mla_fwd_single(
             STRIDE_QN_H=stride_qn_h,
             STRIDE_QR_T=stride_qr_t,
             STRIDE_QR_H=stride_qr_h,
-            IS_FP8=is_fp8,
+            USE_FP8_DOT=use_fp8_dot,
             SEQ_BUCKET=seq_bucket,
         )
     return out.unsqueeze(0)
@@ -530,7 +529,7 @@ def _sparse_mla_fused_kernel(
     STRIDE_QN_H: tl.constexpr,
     STRIDE_QR_T: tl.constexpr,
     STRIDE_QR_H: tl.constexpr,
-    IS_FP8: tl.constexpr,
+    USE_FP8_DOT: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -543,8 +542,8 @@ def _sparse_mla_fused_kernel(
     dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
-    input_type = kv_ptr.dtype.element_ty
-    if IS_FP8:
+    input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
+    if USE_FP8_DOT:
         p_dot_scale = 1.0 / fp8_max
     else:
         p_dot_scale = 1.0
@@ -635,7 +634,7 @@ def _sparse_mla_fused_kernel(
         p = tl.exp2(scores - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
 
-        if IS_FP8:
+        if USE_FP8_DOT:
             p_dot = (p * fp8_max).to(input_type)
         else:
             p_dot = p.to(input_type)
@@ -710,7 +709,7 @@ def _sparse_mla_split_k_kernel(
     STRIDE_QN_H: tl.constexpr,
     STRIDE_QR_T: tl.constexpr,
     STRIDE_QR_H: tl.constexpr,
-    IS_FP8: tl.constexpr,
+    USE_FP8_DOT: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -725,8 +724,8 @@ def _sparse_mla_split_k_kernel(
     dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
-    input_type = kv_ptr.dtype.element_ty
-    if IS_FP8:
+    input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
+    if USE_FP8_DOT:
         p_dot_scale = 1.0 / fp8_max
     else:
         p_dot_scale = 1.0
@@ -822,7 +821,7 @@ def _sparse_mla_split_k_kernel(
         p = tl.exp2(scores - m_new[:, None])
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
-        if IS_FP8:
+        if USE_FP8_DOT:
             p_dot = (p * fp8_max).to(input_type)
         else:
             p_dot = p.to(input_type)
@@ -956,6 +955,7 @@ def _triton_sparse_mla_fwd_splitk(
 ) -> torch.Tensor:
     """Split-K path for short sequences."""
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
+    use_fp8_dot = is_fp8
     seq, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     d_tail = q_rope.shape[-1]
@@ -1003,7 +1003,7 @@ def _triton_sparse_mla_fwd_splitk(
             STRIDE_QN_H=stride_qn_h,
             STRIDE_QR_T=stride_qr_t,
             STRIDE_QR_H=stride_qr_h,
-            IS_FP8=is_fp8,
+            USE_FP8_DOT=use_fp8_dot,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,
             num_warps=4,
@@ -1043,7 +1043,7 @@ def _triton_sparse_mla_fwd_splitk(
         STRIDE_QN_H=stride_qn_h,
         STRIDE_QR_T=stride_qr_t,
         STRIDE_QR_H=stride_qr_h,
-        IS_FP8=is_fp8,
+        USE_FP8_DOT=use_fp8_dot,
         KV_SPLITS=kv_splits,
         BLOCK_H=BLOCK_H,
         BLOCK_K=BLOCK_K,

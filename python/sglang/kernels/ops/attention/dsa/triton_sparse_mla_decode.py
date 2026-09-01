@@ -127,7 +127,7 @@ def _sparse_mla_decode_fused_kernel(
     STRIDE_QN_H: tl.constexpr,
     STRIDE_QR_T: tl.constexpr,
     STRIDE_QR_H: tl.constexpr,
-    IS_FP8: tl.constexpr,
+    USE_FP8_DOT: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -139,8 +139,8 @@ def _sparse_mla_decode_fused_kernel(
     dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
-    input_type = kv_ptr.dtype.element_ty
-    if IS_FP8:
+    input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
+    if USE_FP8_DOT:
         p_dot_scale = 1.0 / fp8_max
     else:
         p_dot_scale = 1.0
@@ -246,7 +246,7 @@ def _sparse_mla_decode_fused_kernel(
         p = tl.exp2(scores - m_new[:, None])
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
-        if IS_FP8:
+        if USE_FP8_DOT:
             p_dot = (p * fp8_max).to(input_type)
         else:
             p_dot = p.to(input_type)
@@ -322,7 +322,7 @@ def _sparse_mla_decode_split_kernel(
     STRIDE_QN_H: tl.constexpr,
     STRIDE_QR_T: tl.constexpr,
     STRIDE_QR_H: tl.constexpr,
-    IS_FP8: tl.constexpr,
+    USE_FP8_DOT: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -336,8 +336,8 @@ def _sparse_mla_decode_split_kernel(
     dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
-    input_type = kv_ptr.dtype.element_ty
-    if IS_FP8:
+    input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
+    if USE_FP8_DOT:
         p_dot_scale = 1.0 / fp8_max
     else:
         p_dot_scale = 1.0
@@ -448,7 +448,7 @@ def _sparse_mla_decode_split_kernel(
         p = tl.exp2(scores - m_new[:, None])
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
-        if IS_FP8:
+        if USE_FP8_DOT:
             p_dot = (p * fp8_max).to(input_type)
         else:
             p_dot = p.to(input_type)
@@ -588,6 +588,7 @@ def triton_sparse_mla_decode_splitk(
     returns: [1, bs, H, d_v] bf16
     """
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
+    use_fp8_dot = is_fp8
     bs, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     d_tail = q_rope.shape[-1]
@@ -620,7 +621,7 @@ def triton_sparse_mla_decode_splitk(
         # two workgroups per CU. Once token/head parallelism is less sparse, keep the
         # one-wave target to avoid paying extra partial-output reduction cost.
         target_wg_per_cu = 1.0
-        if not is_fp8 and base_ctas <= max(1, num_cu // 16):
+        if not use_fp8_dot and base_ctas <= max(1, num_cu // 16):
             target_wg_per_cu = 2.0
         kv_splits = min(
             _kv_splits_heuristic(
@@ -659,7 +660,7 @@ def triton_sparse_mla_decode_splitk(
                 STRIDE_QN_H=stride_qn_h,
                 STRIDE_QR_T=stride_qr_t,
                 STRIDE_QR_H=stride_qr_h,
-                IS_FP8=is_fp8,
+                USE_FP8_DOT=use_fp8_dot,
                 BLOCK_H=BLOCK_H,
                 BLOCK_K=BLOCK_K,
                 num_warps=4,
@@ -699,7 +700,7 @@ def triton_sparse_mla_decode_splitk(
             STRIDE_QN_H=stride_qn_h,
             STRIDE_QR_T=stride_qr_t,
             STRIDE_QR_H=stride_qr_h,
-            IS_FP8=is_fp8,
+            USE_FP8_DOT=use_fp8_dot,
             KV_SPLITS=kv_splits,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,
