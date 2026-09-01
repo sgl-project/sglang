@@ -152,12 +152,41 @@ verified: 0.42/0.84 lands 517,529 / 540,798 tokens (within 5%). Hardware
 MIG partitions would not have this coupling; these software caps only
 emulate them coarsely.
 
+## Case 4 — co-located speculative-decoding server + 27B-class model
+
+Two mixed tenants on one H200: Qwen3-32B (plain) and Qwen3-8B with an
+EAGLE3 draft head (`AngelSlim/Qwen3-8B_eagle3`, `--speculative-algorithm
+EAGLE3 --speculative-num-steps 3 --speculative-eagle-topk 1
+--speculative-num-draft-tokens 4`). Sequential startup, fractions 0.55 / 0.85.
+
+Spec-dec effect (8B alone, spec on vs off):
+
+| | c=1 | c=8 |
+|---|---:|---:|
+| spec on (accept len ~1.3) | 220.0 tok/s | 1,436.5 tok/s |
+| spec off | 196.8 tok/s | 1,446.3 tok/s |
+| delta | **+11.8%** | -0.7% |
+
+Co-location cost (both benched at c=8, concurrently):
+
+| tenant | KV tokens | alone c=8 | co-located c=8 | cost |
+|---|---:|---:|---:|---:|
+| Qwen3-32B | 63,127 | 430.6 | 342.3 | -20.5% |
+| Qwen3-8B + EAGLE3 | 228,720 | 1,436.5 | 747.1 | -48.0% |
+
+Notes: the EAGLE3 draft's acceptance is modest on this prompt family
+(accept len ~1.3 with chain topk=1), so spec-dec only pays at c=1 and the
+8B tenant's co-location slowdown partly reflects wasted draft compute under
+SM contention. Both servers stayed healthy with byte-coherent outputs;
+KV splits land where the fraction formula predicts.
+
 ## Files
 
 - `launch_emulated_tp2.sh` — canonical TP=2 emulated launch + health wait
 - `run_case.sh` — parameterized case runner (`PP=2 ./run_case.sh ...` for PP)
 - `dp_like.sh` — Case 3 runner
 - `bench_single.sh` — single-instance baseline at the same loads (c=1/8/16/32)
+- `spec_coloc.sh` — Case 4: spec-dec (Qwen3-8B+EAGLE3) co-located with Qwen3-32B
 - `profile_dp.sh` — Case 3 torch-profiler capture (`/start_profile` on both
   instances under concurrent load; traces in `traces/`, open in Perfetto)
 - `traces/dp-instance-{A,B}.trace.json.gz` — Chrome traces of both instances
