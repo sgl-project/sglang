@@ -65,6 +65,14 @@ def _quant_config_to_dict(quant_config):
     return quant_config
 
 
+def unwrap_modelopt_quantization_config(quant_config: dict) -> dict:
+    quantization = quant_config.get("quantization")
+    if not isinstance(quantization, dict):
+        return {}
+    nested = quantization.get("quantization")
+    return nested if isinstance(nested, dict) else quantization
+
+
 def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
     layout = getattr(hf_config, "attention_projection_layout", None)
     if layout is None:
@@ -1377,9 +1385,7 @@ class ModelConfig:
 
     def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> Optional[dict]:
         """Parse ModelOpt quantization config and return the appropriate quant_method."""
-        json_quant_configs = quant_config_dict["quantization"]
-        if isinstance(json_quant_configs.get("quantization"), dict):
-            json_quant_configs = json_quant_configs["quantization"]
+        json_quant_configs = unwrap_modelopt_quantization_config(quant_config_dict)
         quant_algo = json_quant_configs.get("quant_algo", None)
 
         if quant_algo == "MIXED_PRECISION":

@@ -808,7 +808,10 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     before it by _set_default_dsa_kv_cache_dtype) and the env writes stay in
     the branch."""
     cfg = resolving_view(server_args)
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import (
+        is_deepseek_dsa,
+        unwrap_modelopt_quantization_config,
+    )
 
     model_arch = (getattr(hf_config, "architectures", None) or [None])[0]
     if model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
@@ -832,7 +835,9 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
 
     if model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
         quant_cfg = getattr(hf_config, "quantization_config", None) or {}
-        quant_algo = (quant_cfg.get("quantization") or {}).get("quant_algo", "")
+        quant_algo = unwrap_modelopt_quantization_config(quant_cfg).get(
+            "quant_algo", ""
+        )
         if str(quant_algo).upper() == "MXFP8":
             from sglang.srt.layers import deep_gemm_wrapper
 

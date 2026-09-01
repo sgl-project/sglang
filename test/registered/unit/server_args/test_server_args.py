@@ -1073,20 +1073,32 @@ class TestContextParallelServerArgs(CustomTestCase):
     def test_hyv4_mxfp8_defaults_deep_gemm_backends(self):
         from sglang.srt.arg_groups.overrides import _deepseek_family_overrides
 
-        hf_config = SimpleNamespace(
-            architectures=["HYV4ForCausalLM"],
-            quantization_config={
-                "quant_method": "modelopt",
-                "quantization": {"quant_algo": "MXFP8", "kv_cache_quant_algo": None},
+        for quantization in (
+            {"quant_algo": "MXFP8", "kv_cache_quant_algo": None},
+            {
+                "quantization": {
+                    "quant_algo": "MXFP8",
+                    "kv_cache_quant_algo": None,
+                }
             },
-        )
-        server_args = self._new_cp_args(
-            moe_runner_backend="auto", fp8_gemm_runner_backend="auto"
-        )
-        with patch("sglang.srt.layers.deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM", True):
-            result = _deepseek_family_overrides(server_args, hf_config)
-        self.assertEqual(result["moe_runner_backend"], "deep_gemm")
-        self.assertEqual(result["fp8_gemm_runner_backend"], "deep_gemm")
+        ):
+            with self.subTest(quantization=quantization):
+                hf_config = SimpleNamespace(
+                    architectures=["HYV4ForCausalLM"],
+                    quantization_config={
+                        "quant_method": "modelopt",
+                        "quantization": quantization,
+                    },
+                )
+                server_args = self._new_cp_args(
+                    moe_runner_backend="auto", fp8_gemm_runner_backend="auto"
+                )
+                with patch(
+                    "sglang.srt.layers.deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM", True
+                ):
+                    result = _deepseek_family_overrides(server_args, hf_config)
+                self.assertEqual(result["moe_runner_backend"], "deep_gemm")
+                self.assertEqual(result["fp8_gemm_runner_backend"], "deep_gemm")
 
     def test_hyv4_mxfp8_explicit_backend_choice_is_preserved(self):
         from sglang.srt.arg_groups.overrides import _deepseek_family_overrides
