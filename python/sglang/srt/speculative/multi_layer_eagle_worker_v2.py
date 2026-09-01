@@ -259,7 +259,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             return
         if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
             conv_state = self.req_to_token_pool.mamba_pool.mamba_cache.conv
-            self.draft_extend_num_warmup_tokens = conv_state[0].shape[2]
+            self.draft_extend_num_warmup_tokens = conv_state[0].shape[-1]
         self.draft_extend_num_front_tokens = (
             self.speculative_num_steps - 1 + self.draft_extend_num_warmup_tokens
         )
