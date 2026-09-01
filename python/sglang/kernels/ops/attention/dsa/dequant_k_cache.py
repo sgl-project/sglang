@@ -190,6 +190,12 @@ def dequantize_k_cache_paged(
     # Index bounds validated in dsa_backend.init_forward_metadata
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
+
+    if quant_k_cache.device.type == "cpu":
+        return torch.ops.sgl_kernel.dequantize_k_cache_paged_cpu(
+            quant_k_cache.view(torch.uint8), page_table_1_flattened, group_size
+        )
+
     dim_nope = 512
     dim_rope = 64
     num_tiles = dim_nope // group_size  # 512 // 128 = 4

@@ -3,6 +3,60 @@
 
 namespace {
 
+// Selects up to min(length, topk) local indices (0-based within [0, length)) of the
+// largest values in `score_row`, unsorted, ties broken toward the smaller index. Only
+// fills the first returned count of `out_local_indices`; -1 padded.
+inline int64_t select_topk_local_indices(
+    const float* __restrict__ score_row,
+    int64_t length,
+    int64_t topk,
+    std::vector<TopKTransformElem>& heap,
+    int32_t* __restrict__ out_local_indices) {
+  if (length <= topk) {
+    for (int64_t i = 0; i < length; ++i) {
+      out_local_indices[i] = static_cast<int32_t>(i);
+    }
+    return length;
+  }
+
+  heap.clear();
+  for (int64_t i = 0; i < topk; ++i) {
+    heap.push_back({score_row[i], static_cast<int32_t>(i)});
+  }
+  std::make_heap(heap.begin(), heap.end(), TopKTransformMinHeapCmp());
+
+  for (int64_t i = topk; i < length; ++i) {
+    const float score = score_row[i];
+    const TopKTransformElem& current_min = heap.front();
+    if (score > current_min.score || (score == current_min.score && static_cast<int32_t>(i) < current_min.index)) {
+      std::pop_heap(heap.begin(), heap.end(), TopKTransformMinHeapCmp());
+      heap.back() = {score, static_cast<int32_t>(i)};
+      std::push_heap(heap.begin(), heap.end(), TopKTransformMinHeapCmp());
+    }
+  }
+
+  for (int64_t i = 0; i < topk; ++i) {
+    out_local_indices[i] = heap[i].index;
+  }
+  return topk;
+}
+
+// Maps each of the `num_rows` (possibly query-expanded) score rows to its owning
+// prefill request index, from `cu_seqlens_q` boundaries (mirrors the CUDA prefill
+// kernel's per-block scan over cu_seqlens_q to locate the shared src page-table row).
+inline std::vector<int32_t> build_row_to_src_request(
+    const int32_t* __restrict__ cu_seqlens_q, int64_t prefill_bs, int64_t num_rows) {
+  std::vector<int32_t> row_to_src(num_rows);
+  int64_t src = 0;
+  for (int64_t b = 0; b < num_rows; ++b) {
+    while (src + 1 < prefill_bs && b >= cu_seqlens_q[src + 1]) {
+      ++src;
+    }
+    row_to_src[b] = static_cast<int32_t>(src);
+  }
+  return row_to_src;
+}
+
 template <typename scalar_t, int SIZE>
 inline void softmax(float* __restrict__ out, const scalar_t* __restrict__ input) {
   using bVec = at::vec::Vectorized<scalar_t>;
@@ -470,6 +524,195 @@ void biased_grouped_topk_kernel_impl(
       renormalize);
 
 }  // anonymous namespace
+
+// For each row, selects the top `indices.size(1)` scores within [row_starts[b], row_starts[b] + lengths[b]) 
+// and writes their LOCAL (row_start-relative) positions into `indices`, -1 padded.
+void fast_topk_cpu(
+    const at::Tensor& score,
+    at::Tensor& indices,
+    const at::Tensor& lengths,
+    const std::optional<at::Tensor>& row_starts_opt) {
+  CHECK_CPU(score);
+  TORCH_CHECK(score.dim() == 2 && score.stride(1) == 1, "score must be a 2D tensor with unit row stride");
+  TORCH_CHECK(score.scalar_type() == at::kFloat, "score must be float32");
+  CHECK_INPUT(indices);
+  TORCH_CHECK(
+      indices.dim() == 2 && indices.scalar_type() == at::kInt, "indices must be a contiguous int32 2D tensor");
+  CHECK_INPUT(lengths);
+  TORCH_CHECK(lengths.dim() == 1 && lengths.scalar_type() == at::kInt, "lengths must be a contiguous int32 1D tensor");
+
+  const int64_t B = score.size(0);
+  const int64_t topk = indices.size(1);
+  TORCH_CHECK(indices.size(0) == B, "indices batch size must match score");
+  TORCH_CHECK(lengths.size(0) == B, "lengths size must match score");
+
+  const int32_t* row_starts_ptr = nullptr;
+  if (row_starts_opt.has_value()) {
+    CHECK_INPUT(row_starts_opt.value());
+    TORCH_CHECK(row_starts_opt->scalar_type() == at::kInt, "row_starts must be int32");
+    TORCH_CHECK(row_starts_opt->size(0) == B, "row_starts size must match score");
+    row_starts_ptr = row_starts_opt->data_ptr<int32_t>();
+  }
+
+  const float* __restrict__ score_ptr = score.data_ptr<float>();
+  const int64_t score_stride0 = score.stride(0);
+  const int32_t* __restrict__ lengths_ptr = lengths.data_ptr<int32_t>();
+  int32_t* __restrict__ indices_ptr = indices.data_ptr<int32_t>();
+
+  at::parallel_for(0, B, 0, [&](int64_t begin, int64_t end) {
+    std::vector<TopKTransformElem> heap;
+    heap.reserve(topk);
+    for (int64_t b = begin; b < end; ++b) {
+      const int64_t row_start = row_starts_ptr == nullptr ? 0 : row_starts_ptr[b];
+      const int64_t length = lengths_ptr[b];
+      int32_t* __restrict__ out_row = indices_ptr + b * topk;
+      const int64_t valid =
+          select_topk_local_indices(score_ptr + b * score_stride0 + row_start, length, topk, heap, out_row);
+      for (int64_t i = valid; i < topk; ++i) {
+        out_row[i] = -1;
+      }
+    }
+  });
+}
+
+void fast_topk_transform_fused_cpu(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& dst_page_table,
+    const at::Tensor& src_page_table,
+    const at::Tensor& cu_seqlens_q,
+    const std::optional<at::Tensor>& row_starts_opt) {
+  CHECK_CPU(score);
+  TORCH_CHECK(score.dim() == 2 && score.stride(1) == 1, "score must be a 2D tensor with unit row stride");
+  TORCH_CHECK(score.scalar_type() == at::kFloat, "score must be float32");
+  CHECK_INPUT(lengths);
+  TORCH_CHECK(lengths.dim() == 1 && lengths.scalar_type() == at::kInt, "lengths must be a contiguous int32 1D tensor");
+  CHECK_INPUT(dst_page_table);
+  TORCH_CHECK(
+      dst_page_table.dim() == 2 && dst_page_table.scalar_type() == at::kInt,
+      "dst_page_table must be a contiguous int32 2D tensor");
+  CHECK_CPU(src_page_table);
+  TORCH_CHECK(
+      src_page_table.dim() == 2 && src_page_table.stride(1) == 1 && src_page_table.scalar_type() == at::kInt,
+      "src_page_table must be a 2D int32 tensor with unit row stride");
+  CHECK_INPUT(cu_seqlens_q);
+  TORCH_CHECK(
+      cu_seqlens_q.dim() == 1 && cu_seqlens_q.scalar_type() == at::kInt,
+      "cu_seqlens_q must be a contiguous int32 1D tensor");
+
+  const int64_t B = score.size(0);
+  const int64_t topk = dst_page_table.size(1);
+  TORCH_CHECK(lengths.size(0) == B);
+  TORCH_CHECK(dst_page_table.size(0) == B);
+  const int64_t prefill_bs = cu_seqlens_q.size(0) - 1;
+  TORCH_CHECK(src_page_table.size(0) == prefill_bs, "src_page_table row count must match cu_seqlens_q");
+  TORCH_CHECK(prefill_bs <= B, "prefill_bs must not exceed the expanded row count");
+
+  const int32_t* row_starts_ptr = nullptr;
+  if (row_starts_opt.has_value()) {
+    CHECK_INPUT(row_starts_opt.value());
+    TORCH_CHECK(row_starts_opt->scalar_type() == at::kInt, "row_starts must be int32");
+    TORCH_CHECK(row_starts_opt->size(0) == B);
+    row_starts_ptr = row_starts_opt->data_ptr<int32_t>();
+  }
+
+  const bool is_decode = row_starts_ptr == nullptr && prefill_bs == B;
+  std::vector<int32_t> row_to_src;
+  if (!is_decode) {
+    row_to_src = build_row_to_src_request(cu_seqlens_q.data_ptr<int32_t>(), prefill_bs, B);
+  }
+
+  const float* __restrict__ score_ptr = score.data_ptr<float>();
+  const int64_t score_stride0 = score.stride(0);
+  const int32_t* __restrict__ lengths_ptr = lengths.data_ptr<int32_t>();
+  const int32_t* __restrict__ src_page_table_ptr = src_page_table.data_ptr<int32_t>();
+  const int64_t src_stride0 = src_page_table.stride(0);
+  int32_t* __restrict__ dst_page_table_ptr = dst_page_table.data_ptr<int32_t>();
+
+  at::parallel_for(0, B, 0, [&](int64_t begin, int64_t end) {
+    std::vector<TopKTransformElem> heap;
+    heap.reserve(topk);
+    std::vector<int32_t> local_idx(topk);
+    for (int64_t b = begin; b < end; ++b) {
+      const int64_t row_start = row_starts_ptr == nullptr ? 0 : row_starts_ptr[b];
+      const int64_t length = lengths_ptr[b];
+      const int64_t valid =
+          select_topk_local_indices(score_ptr + b * score_stride0 + row_start, length, topk, heap, local_idx.data());
+
+      const int64_t src_row = is_decode ? b : row_to_src[b];
+      const int32_t* __restrict__ src_row_ptr = src_page_table_ptr + src_row * src_stride0;
+      int32_t* __restrict__ dst_row_ptr = dst_page_table_ptr + b * topk;
+      for (int64_t i = 0; i < valid; ++i) {
+        dst_row_ptr[i] = src_row_ptr[local_idx[i]];
+      }
+      for (int64_t i = valid; i < topk; ++i) {
+        dst_row_ptr[i] = -1;
+      }
+    }
+  });
+}
+
+void fast_topk_transform_ragged_fused_cpu(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& topk_indices_ragged,
+    const at::Tensor& topk_indices_offset,
+    const std::optional<at::Tensor>& row_starts_opt) {
+  CHECK_CPU(score);
+  TORCH_CHECK(score.dim() == 2 && score.stride(1) == 1, "score must be a 2D tensor with unit row stride");
+  TORCH_CHECK(score.scalar_type() == at::kFloat, "score must be float32");
+  CHECK_INPUT(lengths);
+  TORCH_CHECK(lengths.dim() == 1 && lengths.scalar_type() == at::kInt, "lengths must be a contiguous int32 1D tensor");
+  CHECK_INPUT(topk_indices_ragged);
+  TORCH_CHECK(
+      topk_indices_ragged.dim() == 2 && topk_indices_ragged.scalar_type() == at::kInt,
+      "topk_indices_ragged must be a contiguous int32 2D tensor");
+  CHECK_INPUT(topk_indices_offset);
+  TORCH_CHECK(
+      topk_indices_offset.dim() == 1 && topk_indices_offset.scalar_type() == at::kInt,
+      "topk_indices_offset must be a contiguous int32 1D tensor");
+
+  const int64_t B = score.size(0);
+  const int64_t topk = topk_indices_ragged.size(1);
+  TORCH_CHECK(lengths.size(0) == B);
+  TORCH_CHECK(topk_indices_ragged.size(0) == B);
+  TORCH_CHECK(topk_indices_offset.size(0) == B);
+
+  const int32_t* row_starts_ptr = nullptr;
+  if (row_starts_opt.has_value()) {
+    CHECK_INPUT(row_starts_opt.value());
+    TORCH_CHECK(row_starts_opt->scalar_type() == at::kInt, "row_starts must be int32");
+    TORCH_CHECK(row_starts_opt->size(0) == B);
+    row_starts_ptr = row_starts_opt->data_ptr<int32_t>();
+  }
+
+  const float* __restrict__ score_ptr = score.data_ptr<float>();
+  const int64_t score_stride0 = score.stride(0);
+  const int32_t* __restrict__ lengths_ptr = lengths.data_ptr<int32_t>();
+  const int32_t* __restrict__ offset_ptr = topk_indices_offset.data_ptr<int32_t>();
+  int32_t* __restrict__ out_ptr = topk_indices_ragged.data_ptr<int32_t>();
+
+  at::parallel_for(0, B, 0, [&](int64_t begin, int64_t end) {
+    std::vector<TopKTransformElem> heap;
+    heap.reserve(topk);
+    std::vector<int32_t> local_idx(topk);
+    for (int64_t b = begin; b < end; ++b) {
+      const int64_t row_start = row_starts_ptr == nullptr ? 0 : row_starts_ptr[b];
+      const int64_t length = lengths_ptr[b];
+      const int64_t valid =
+          select_topk_local_indices(score_ptr + b * score_stride0 + row_start, length, topk, heap, local_idx.data());
+
+      const int32_t offset = offset_ptr[b];
+      int32_t* __restrict__ out_row = out_ptr + b * topk;
+      for (int64_t i = 0; i < valid; ++i) {
+        out_row[i] = local_idx[i] + offset;
+      }
+      for (int64_t i = valid; i < topk; ++i) {
+        out_row[i] = -1;
+      }
+    }
+  });
+}
 
 std::tuple<at::Tensor, at::Tensor> topk_sigmoid_cpu(
     at::Tensor& hidden_states,

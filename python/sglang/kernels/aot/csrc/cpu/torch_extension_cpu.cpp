@@ -256,7 +256,22 @@ at::Tensor flash_attn_varlen_func(
     const at::Tensor& cu_seqlens_k,
     int64_t max_seqlen_q,
     int64_t max_seqlen_k,
-    bool causal);
+    bool causal,
+    double sm_scale);
+
+// DSA MHA_ONE_SHOT support (dense attention over prefix+extend KV already
+// materialized by the caller; no KV-cache indirection)
+at::Tensor create_flashinfer_kv_indices_cpu(
+    const at::Tensor& req_to_token,
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& page_kernel_lens,
+    const at::Tensor& kv_indptr,
+    const std::optional<at::Tensor>& kv_start_idx);
+
+at::Tensor dequantize_k_cache_paged_cpu(
+    const at::Tensor& quant_k_cache,
+    const at::Tensor& page_table_1_flattened,
+    int64_t group_size);
 
 // linear attention
 std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
@@ -365,6 +380,39 @@ at::Tensor fused_experts_cpu(
     const std::optional<std::string>& activation);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
+// DSA/NSA indexer fused top-k (CPU counterpart of the CUDA sgl_kernel::fast_topk* ops)
+void fast_topk_cpu(
+    const at::Tensor& score,
+    at::Tensor& indices,
+    const at::Tensor& lengths,
+    const std::optional<at::Tensor>& row_starts_opt);
+void fast_topk_transform_fused_cpu(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& dst_page_table,
+    const at::Tensor& src_page_table,
+    const at::Tensor& cu_seqlens_q,
+    const std::optional<at::Tensor>& row_starts_opt);
+void fast_topk_transform_ragged_fused_cpu(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& topk_indices_ragged,
+    const at::Tensor& topk_indices_offset,
+    const std::optional<at::Tensor>& row_starts_opt);
+
+at::Tensor fp8_mqa_logits_cpu(
+    at::Tensor& q_fp8,
+    at::Tensor& k_fp8,
+    at::Tensor& k_scale,
+    at::Tensor& weight,
+    at::Tensor& ks,
+    at::Tensor& ke,
+    at::Tensor& cu_seqlens_q,
+    bool clean_logits,
+    int64_t max_seqlen_k);
+
+at::Tensor fp8_index_cpu(at::Tensor& q, at::Tensor& q_s, at::Tensor& k, at::Tensor& k_s);
+
 at::Tensor shared_expert_cpu(
     at::Tensor& hidden_states,
     at::Tensor& w1,
@@ -380,7 +428,7 @@ at::Tensor shared_expert_cpu(
     bool is_vnni);
 
 // weight absorption
-std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     at::Tensor& hidden_states,
     at::Tensor& q_a_proj_weight,
     at::Tensor& q_b_proj_weight,
@@ -398,9 +446,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     std::optional<at::Tensor> kv_a_proj_scale,
     std::optional<at::Tensor> w_scale,
     bool is_vnni,
-    std::optional<std::vector<int64_t>> block_size);
+    std::optional<std::vector<int64_t>> block_size,
+    bool need_q_lora);
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
     at::Tensor& hidden_states,
     at::Tensor& qkv_a_proj_weight,
     at::Tensor& q_b_proj_weight,
@@ -419,7 +468,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
     std::optional<std::vector<int64_t>> block_size,
     int64_t q_lora_rank,
     int64_t kv_lora_rank,
-    int64_t qk_rope_head_dim);
+    int64_t qk_rope_head_dim,
+    bool need_q_lora);
 
 // mamba causal conv1d
 at::Tensor causal_conv1d_weight_pack(const at::Tensor& weight);
@@ -446,6 +496,50 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& conv_state_indices,
     int64_t pad_slot_id,
     bool is_vnni);
+
+// get_k
+at::Tensor get_k_cpu(
+    at::Tensor& buf,
+    at::Tensor& page_indices,
+    int64_t seq_len,
+    int64_t page_size,
+    int64_t index_head_dim);
+
+// get_s
+at::Tensor get_s_cpu(
+    at::Tensor& buf,
+    at::Tensor& page_indices,
+    int64_t seq_len,
+    int64_t page_size,
+    int64_t index_head_dim);
+
+// get_k_and_s (batched, multi-sequence)
+std::tuple<at::Tensor, at::Tensor> get_k_and_s_cpu(
+    at::Tensor& buf,
+    at::Tensor& page_indices,
+    at::Tensor& seq_lens,
+    int64_t seq_len_sum,
+    int64_t page_size,
+    int64_t index_head_dim);
+
+// DSA indexer fused kernels (DeepSeek-V3.2 only)
+void fused_k_indexer_norm_rope_store_cpu(
+    at::Tensor& k_input,
+    at::Tensor& cache,
+    at::Tensor& out_cache_loc,
+    at::Tensor& weight,
+    at::Tensor& bias,
+    double eps,
+    at::Tensor& cos_sin_cache,
+    at::Tensor& positions,
+    int64_t page_size);
+
+std::tuple<at::Tensor, at::Tensor> fused_q_indexer_rope_first_quant_cpu(
+    at::Tensor& q_input,
+    at::Tensor& weight_raw,
+    double weight_scale,
+    at::Tensor& cos_sin_cache,
+    at::Tensor& positions);
 #endif
 
 // conv3d fast path for patch embedding
@@ -725,8 +819,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // flash attn
   m.def(
       "flash_attn_varlen_func(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
-      "int max_seqlen_q, int max_seqlen_k, bool causal) -> Tensor");
+      "int max_seqlen_q, int max_seqlen_k, bool causal, float sm_scale=-1.0) -> Tensor");
   m.impl("flash_attn_varlen_func", torch::kCPU, &flash_attn_varlen_func);
+
+  m.def(
+      "create_flashinfer_kv_indices_cpu(Tensor req_to_token, Tensor req_pool_indices, Tensor page_kernel_lens, "
+      "Tensor kv_indptr, Tensor? kv_start_idx) -> Tensor");
+  m.impl("create_flashinfer_kv_indices_cpu", torch::kCPU, &create_flashinfer_kv_indices_cpu);
+
+  m.def(
+      "dequantize_k_cache_paged_cpu(Tensor quant_k_cache, Tensor page_table_1_flattened, int group_size) -> Tensor");
+  m.impl("dequantize_k_cache_paged_cpu", torch::kCPU, &dequantize_k_cache_paged_cpu);
 
   // linear attn
   m.def(
@@ -803,13 +906,37 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
+  // DSA/NSA indexer fused top-k: same op names/schemas as the CUDA build in
+  // common_extension.cc, so sgl_kernel.top_k.fast_topk_v2/fast_topk_transform_fused/
+  // fast_topk_transform_ragged_fused work unchanged on CPU tensors.
+  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
+  m.impl("fast_topk", torch::kCPU, &fast_topk_cpu);
+  m.def(
+      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
+      "cu_seqlens_q, Tensor? row_starts) -> ()");
+  m.impl("fast_topk_transform_fused", torch::kCPU, &fast_topk_transform_fused_cpu);
+  m.def(
+      "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor topk_indices_ragged, Tensor "
+      "topk_indices_offset, Tensor? row_starts) -> ()");
+  m.impl("fast_topk_transform_ragged_fused", torch::kCPU, &fast_topk_transform_ragged_fused_cpu);
+
+  // DSA indexer ragged (non-paged) FP8 MQA logits
+  m.def(
+      "fp8_mqa_logits_cpu(Tensor q_fp8, Tensor k_fp8, Tensor k_scale, Tensor weight, "
+      "Tensor ks, Tensor ke, Tensor cu_seqlens_q, bool clean_logits, int max_seqlen_k=0) -> Tensor");
+  m.impl("fp8_mqa_logits_cpu", torch::kCPU, &fp8_mqa_logits_cpu);
+
+  // DSA indexer FP8 index score (ragged loop path)
+  m.def("fp8_index_cpu(Tensor q, Tensor q_s, Tensor k, Tensor k_s) -> Tensor");
+  m.impl("fp8_index_cpu", torch::kCPU, &fp8_index_cpu);
+
   // weight absorption
   m.def(
       "qkv_proj_with_rope(Tensor hidden_states, Tensor q_a_proj_weight, Tensor q_b_proj_weight, Tensor "
       "kv_a_proj_weight, Tensor w_kc, Tensor q_a_layernorm_weight, Tensor kv_a_layernorm_weight, Tensor positions, "
       "Tensor cos_sin_cache, float eps, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? q_a_proj_scale, Tensor? "
       "q_b_proj_scale, Tensor? kv_a_proj_scale, Tensor? w_scale, "
-      "bool is_vnni, int[]? block_size) -> (Tensor, Tensor, Tensor)");
+      "bool is_vnni, int[]? block_size, bool need_q_lora) -> (Tensor, Tensor, Tensor, Tensor)");
   m.impl("qkv_proj_with_rope", torch::kCPU, &qkv_proj_with_rope);
   m.def(
       "qkv_proj_with_rope_fused_weight(Tensor hidden_states, Tensor qkv_a_proj_weight, Tensor q_b_proj_weight, "
@@ -817,7 +944,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor cos_sin_cache, float eps, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? qkv_a_proj_scale, Tensor? "
       "q_b_proj_scale, Tensor? w_scale,"
       "bool is_vnni, int[]? block_size, int q_lora_rank, int kv_lora_rank,"
-      "int qk_rope_head_dim) -> (Tensor, Tensor, Tensor)");
+      "int qk_rope_head_dim, bool need_q_lora) -> (Tensor, Tensor, Tensor, Tensor)");
   m.impl("qkv_proj_with_rope_fused_weight", torch::kCPU, &qkv_proj_with_rope_fused_weight);
 
   // shared expert
@@ -841,6 +968,35 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "causal_conv1d_update_cpu(Tensor x, Tensor(a!) conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
       "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
+
+  // get_k
+  m.def(
+      "get_k_cpu(Tensor buf, Tensor page_indices, int seq_len, "
+      "int page_size, int index_head_dim) -> Tensor");
+  m.impl("get_k_cpu", torch::kCPU, &get_k_cpu);
+
+  // get_s
+  m.def(
+      "get_s_cpu(Tensor buf, Tensor page_indices, int seq_len, "
+      "int page_size, int index_head_dim) -> Tensor");
+  m.impl("get_s_cpu", torch::kCPU, &get_s_cpu);
+
+  // get_k_and_s (batched, multi-sequence)
+  m.def(
+      "get_k_and_s_cpu(Tensor buf, Tensor page_indices, Tensor seq_lens, "
+      "int seq_len_sum, int page_size, int index_head_dim) -> (Tensor, Tensor)");
+  m.impl("get_k_and_s_cpu", torch::kCPU, &get_k_and_s_cpu);
+
+  // DSA indexer fused kernels (DeepSeek-V3.2 only)
+  m.def(
+      "fused_k_indexer_norm_rope_store_cpu(Tensor k_input, Tensor(a!) cache, Tensor out_cache_loc, "
+      "Tensor weight, Tensor bias, float eps, Tensor cos_sin_cache, Tensor positions, int page_size) -> ()");
+  m.impl("fused_k_indexer_norm_rope_store_cpu", torch::kCPU, &fused_k_indexer_norm_rope_store_cpu);
+
+  m.def(
+      "fused_q_indexer_rope_first_quant_cpu(Tensor q_input, Tensor weight_raw, float weight_scale, "
+      "Tensor cos_sin_cache, Tensor positions) -> (Tensor, Tensor)");
+  m.impl("fused_q_indexer_rope_first_quant_cpu", torch::kCPU, &fused_q_indexer_rope_first_quant_cpu);
 #endif
 
   // conv3d fast path for patch embedding
