@@ -518,7 +518,7 @@ class KVCacheConfigurator:
                     and self.is_hybrid_swa
                 ):
                     size_overrides["full_max_total_num_tokens"] = draft_virtual_id_space
-                    if not self.is_inkling_mtp_draft or self.draft_swa_full_capacity:
+                    if not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity:
                         size_overrides["swa_max_total_num_tokens"] = (
                             draft_virtual_id_space
                         )
@@ -1982,7 +1982,7 @@ class KVCacheConfigurator:
                     swa_allocator, UnifiedSWATokenToKVPoolAllocator
                 )
                 has_draft_swa_layers = (
-                    not self.is_inkling_mtp_draft or self.draft_swa_full_capacity
+                    not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity
                 )
                 if self.draft_swa_full_capacity or (
                     uses_unified_virtual_ids and has_draft_swa_layers
