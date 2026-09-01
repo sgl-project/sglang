@@ -41,10 +41,6 @@ export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
 ${UV_PIP_INSTALL} pybind11 pyyaml decorator scipy attrs psutil
 
 
-### Install MemFabric
-${UV_PIP_INSTALL} memfabric-hybrid==1.0.8
-
-
 ### Install PyTorch and PTA
 PYTORCH_VERSION="2.10.0"
 TORCHVISION_VERSION="0.25.0"
@@ -54,8 +50,6 @@ PTA_URL="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.1
 # GitCode does not allow UV downloads.
 ${PIP_INSTALL} ${PTA_URL}
 
-### Install zbal
-${UV_PIP_INSTALL} memfabric-zbal==1.2.0
 ### Install Triton-Ascend
 ${PIP_INSTALL} triton-ascend==3.2.1.dev20260530 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly --trusted-host triton-ascend.osinfra.cn
 
