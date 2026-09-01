@@ -1803,6 +1803,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use an explicitly passed <code>--mem-fraction-static</code> as-is on AITER with context length above 8192, instead of scaling it by 0.85 to reserve non-static attention workspace. Skipping the reserve can OOM long-context serving; set it only when the scaled fraction is too small to hold the model weights.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_AITER_MOE_GU_ITLV</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select the AITER MoE gate/up tile layout: <code>true</code> interleaves, <code>false</code> uses the separated layout.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
