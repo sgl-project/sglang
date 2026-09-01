@@ -1,8 +1,8 @@
 """
-JIT kernel for DeepSeek V3 router GEMM.
+Router GEMM with FlashInfer fixed-shape ops and an SGLang JIT fallback.
 
-Runtime-compiled CUDA C++ kernel for SM90+ (Hopper) GPUs.
-Supports num_experts in {256, 384}, hidden_dim a multiple of 1024, num_tokens 1-16.
+The JIT fallback supports num_experts in {256, 384}, hidden_dim a multiple of
+1024, and num_tokens 1-16 on SM90+ GPUs.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from flashinfer import gemm as flashinfer_gemm
 
 from sglang.kernels.jit.utils import (
     cache_once,
@@ -22,6 +23,19 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+
+_FLASHINFER_ROUTER_GEMM_OPS = {
+    (6144, 256, torch.float32): flashinfer_gemm.mm_M1_16_K6144_N256,
+    (7168, 128, torch.bfloat16): flashinfer_gemm.mm_M1_16_K7168_N128,
+    (7168, 256, torch.float32): flashinfer_gemm.mm_M1_16_K7168_N256,
+    (7168, 256, torch.bfloat16): flashinfer_gemm.mm_M1_16_K7168_N256_bf16,
+    (7168, 384, torch.float32): flashinfer_gemm.mm_M1_16_K7168_N384,
+    (7168, 384, torch.bfloat16): flashinfer_gemm.mm_M1_16_K7168_N384_bf16,
+    (7168, 896, torch.float32): flashinfer_gemm.mm_M1_16_K7168_N896,
+    (7168, 896, torch.bfloat16): flashinfer_gemm.mm_M1_16_K7168_N896_bf16,
+}
+_FLASHINFER_ROUTER_GEMM_SMS = frozenset({90, 100, 103, 107})
 
 
 @cache_once
@@ -69,7 +83,7 @@ def dsv3_router_gemm(
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    DeepSeek V3 router GEMM kernel (JIT variant).
+    Router GEMM with FlashInfer fixed-shape ops and an SGLang JIT fallback.
 
     Args:
         hidden_states: Input tensor of shape [num_tokens, hidden_dim], bfloat16.
@@ -88,5 +102,20 @@ def dsv3_router_gemm(
             device=hidden_states.device,
             dtype=out_dtype,
         )
+
+    flashinfer_op = _FLASHINFER_ROUTER_GEMM_OPS.get(
+        (hidden_states.shape[1], router_weights.shape[0], output.dtype)
+    )
+    if flashinfer_op is not None:
+        major, minor = torch.cuda.get_device_capability(hidden_states.device)
+        if major * 10 + minor in _FLASHINFER_ROUTER_GEMM_SMS:
+            flashinfer_op(
+                hidden_states,
+                router_weights.T,
+                output,
+                launch_with_pdl=is_arch_support_pdl(),
+            )
+            return output
+
     _dsv3_router_gemm_custom_op(hidden_states, router_weights, output)
     return output

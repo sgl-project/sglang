@@ -36,7 +36,7 @@ ROUTER_GEMM_CASES = get_ci_test_range(
         (256, 7168, 16, torch.float32),
         (384, 5120, 16, torch.float32),
     ],
-)
+) + [(896, 7168, 1, torch.float32)]
 ATOL = 1e-2
 RTOL = 1e-2
 

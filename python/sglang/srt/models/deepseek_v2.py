@@ -542,7 +542,14 @@ class MoEGate(nn.Module):
                 _is_cuda
                 and hidden_states.shape[0] <= 16
                 and hidden_states.shape[1] % 1024 == 0
-                and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
+                and (
+                    self.weight.shape[0] in (256, 384)
+                    or (
+                        self.weight.shape[0] == 896
+                        and hidden_states.shape[1] == 7168
+                        and _device_sm in (90, 100, 103, 107)
+                    )
+                )
                 and _device_sm >= 90
             ):
                 logits = dsv3_router_gemm(
