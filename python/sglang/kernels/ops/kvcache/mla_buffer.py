@@ -88,13 +88,15 @@ def set_mla_kv_buffer_kernel(
 _TMA_BULK_STORE_MIN_LOCS = 768
 
 
-def set_mla_kv_buffer_triton(
+def _set_mla_kv_buffer_impl(
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
     *,
-    reserved_skip_index: int = 0,
+    reserved_skip_index: int,
+    dcp_world_size: int,
+    dcp_rank: int,
 ):
     """Dispatch MLA paged-KV scatter writes to the fastest available path.
 
@@ -121,6 +123,9 @@ def set_mla_kv_buffer_triton(
 
     Writes targeting ``reserved_skip_index`` are skipped. Slot 0 is reserved
     for CUDA-graph padding by default; pass -1 to disable skipping.
+
+    Shared body of the two entry points below; the owner rule reaches it as
+    ``1, 0`` (nothing to select) or as the live topology.
     """
     from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
         can_use_set_mla_kv_buffer,
@@ -136,7 +141,7 @@ def set_mla_kv_buffer_triton(
         n_loc >= _TMA_BULK_STORE_MIN_LOCS
         and is_arch_support_pdl()
         and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
-        and not get_parallel().dcp_enabled
+        and dcp_world_size == 1
     ):
         jit_set_mla_kv_buffer(
             kv_buffer,
@@ -170,9 +175,51 @@ def set_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
-        DCP_RANK=get_parallel().attn_dcp_rank,
-        DCP_WORLD_SIZE=get_parallel().attn_dcp_size,
+        DCP_RANK=dcp_rank,
+        DCP_WORLD_SIZE=dcp_world_size,
         **pdl_kwargs,
+    )
+
+
+def set_mla_kv_buffer_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    *,
+    reserved_skip_index: int = 0,
+):
+    """Scatter at locs already addressing this rank's rows (widened ->
+    `set_mla_kv_buffer_dcp_sharded_triton`)."""
+    _set_mla_kv_buffer_impl(
+        kv_buffer,
+        loc,
+        cache_k_nope,
+        cache_k_rope,
+        reserved_skip_index=reserved_skip_index,
+        dcp_world_size=1,
+        dcp_rank=0,
+    )
+
+
+def set_mla_kv_buffer_dcp_sharded_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    *,
+    reserved_skip_index: int = 0,
+):
+    """Scatter at DCP-WIDENED locs: select this rank's ids and collapse them."""
+    parallel = get_parallel()
+    _set_mla_kv_buffer_impl(
+        kv_buffer,
+        loc,
+        cache_k_nope,
+        cache_k_rope,
+        reserved_skip_index=reserved_skip_index,
+        dcp_world_size=parallel.attn_dcp_size,
+        dcp_rank=parallel.attn_dcp_rank,
     )
 
 

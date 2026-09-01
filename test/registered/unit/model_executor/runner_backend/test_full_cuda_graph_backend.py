@@ -56,6 +56,9 @@ def _make_backend(runner):
     backend._outputs = {}
     backend._pool = None
     backend._capture_stream = None
+    backend._precarve = SimpleNamespace(
+        measure=contextlib.nullcontext, mint=mock.Mock()
+    )
     backend._memory_saver_adapter = None
     backend._cuda_graph_runner = runner
     backend._device_module = runner.device_module

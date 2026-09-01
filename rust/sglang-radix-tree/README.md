@@ -1,4 +1,4 @@
-# mem-cache
+# sglang-radix-tree
 
 Rust tree core for the Unified Radix Cache, covering Full attention, sliding window attention, and Mamba components. It implements the tree side of the `UnifiedTreeCoreInterface` split — match/insert walks, node arena, locks, eviction walks, HiCache backup/load-back specs, and KV events — behind a PyO3 binding, while the cache orchestration stays in Python.
 
@@ -20,7 +20,7 @@ and `torch_2_13_compat.h` covers two alignment APIs removed in PyTorch 2.13.
 
 ```bash
 # Build (libtorch from the installed torch package):
-cd rust/mem-cache
+cd rust/sglang-radix-tree
 LIBTORCH_USE_PYTORCH=1 \
   LIBTORCH_BYPASS_VERSION_CHECK=1 \
   CXXFLAGS="-include $PWD/torch_2_13_compat.h" \
