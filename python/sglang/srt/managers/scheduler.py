@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, 
 
 from sglang.srt.runtime_context import (
     attention_backends,
+    get_context,
     get_device,
     get_disagg,
     get_exec,
@@ -41,6 +42,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
+    publish,
 )
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
@@ -196,7 +198,6 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
-from sglang.srt.managers.rust_server import RustServer
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -292,7 +293,7 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import get_context, get_spec, publish
+from sglang.srt.rust_server.server import RustServer
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
@@ -3123,7 +3124,7 @@ class Scheduler(
         if self.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
             # it. Drop the marker once the request is actually gone.
-            if req.finished() or req.req_pool_idx is None:
+            if req.finished() or not req.kv.holds_kv:
                 self._pending_chunked_abort_req = None
             return
 
@@ -3160,7 +3161,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
         )
 
-        req_pool_indices = [r.req_pool_idx for r in reqs]
+        req_pool_indices = [r.kv.req_pool_idx for r in reqs]
         batch.req_pool_indices = torch.tensor(
             req_pool_indices, dtype=torch.int64, device=device
         )
@@ -3526,7 +3527,7 @@ class Scheduler(
             if running_batch.batch_is_full:
                 if (
                     not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                    or not adder.preempt_to_schedule(req)
                 ):
                     break
 
@@ -3586,15 +3587,13 @@ class Scheduler(
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
-                    req.mamba_cow_src_index = None
-                    req.mamba_needs_clear = False
-                    if req.mamba_pool_idx is not None and not getattr(
-                        req, "session", None
-                    ):
+                    req.kv.mamba_cow_src_index = None
+                    req.kv.mamba_needs_clear = False
+                    if req.kv.holds_mamba and not getattr(req, "session", None):
                         self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                            req.mamba_pool_idx.unsqueeze(-1)
+                            req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
-                        req.mamba_pool_idx = None
+                        req.kv.mamba_pool_idx = None
                 break
 
         if mamba_allocator is not None:
@@ -3679,9 +3678,20 @@ class Scheduler(
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
-            running_batch = ScheduleBatch(
-                reqs=[], batch_is_full=running_batch.batch_is_full
-            )
+                if not self.enable_overlap and not self.spec_algorithm.is_none():
+                    # Non-overlap spec never writes the relay; stash the
+                    # tails' pending tokens for the mixed input resolve.
+                    last_tokens = torch.tensor(
+                        [r.output_ids[-1] for r in running_batch.reqs],
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    self.future_map.stash_bonus_tokens(
+                        running_batch.req_pool_indices, last_tokens
+                    )
+                running_batch = ScheduleBatch(
+                    reqs=[], batch_is_full=running_batch.batch_is_full
+                )
         else:
             new_batch.decoding_reqs = None
 
@@ -4373,6 +4383,13 @@ class Scheduler(
             if has_leak:
                 self.invariant_checker._report_leak("pool", "\n".join(messages))
             self.invariant_checker._check_req_pool()
+            # Byte-conservation diagnostic (allocator-owned; static pools
+            # return [] — the token identity above can't see byte leaks).
+            byte_violations = self.token_to_kv_pool_allocator.verify_byte_accounting()
+            if byte_violations:
+                self.invariant_checker._report_leak(
+                    "pool-bytes", "\n".join(byte_violations)
+                )
 
         # tree cache sanity check
         self.invariant_checker._check_tree_cache()
@@ -4851,7 +4868,7 @@ class Scheduler(
 
             # For mamba radix cache
             if (
-                req.mamba_pool_idx is not None
+                req.kv.holds_mamba
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
@@ -4866,10 +4883,7 @@ class Scheduler(
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
                 )
-                if (
-                    req.req_pool_idx is not None
-                    or getattr(req, "mamba_pool_idx", None) is not None
-                ):
+                if req.kv.holds_kv or req.kv.holds_mamba:
                     release_kv_cache(req, self.tree_cache, is_insert=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 

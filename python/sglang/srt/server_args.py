@@ -68,6 +68,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     parse_cuda_graph_config_arg,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.runtime_context import (
+    get_context,
+    get_platform,
+    publish,
+)
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
@@ -1117,6 +1122,15 @@ class ServerArgs:
     enable_dense_mlp_attn_tp: A[
         bool,
         "Shard dense MLP weights across the attention TP group under DP attention.",
+        NS("parallel"),
+    ] = False
+    enable_layernorm_sp: A[
+        bool,
+        "Enable Megatron-style sequence parallelism (arXiv:2205.05198) for the "
+        "LayerNorm/residual regions under pure tensor parallelism: the row-parallel "
+        "all-reduce becomes reduce-scatter + all-gather, so LayerNorm runs on "
+        "sequence-sharded activations with no extra communication volume. "
+        "Prefill only; Qwen3 dense; requires tp_size > 1 and NVLink/NVSwitch.",
         NS("parallel"),
     ] = False
     disable_attn_tp_gather: A[
@@ -2384,8 +2398,8 @@ class ServerArgs:
     ] = "none"
     enable_w4a4_mxfp4_megamoe: A[
         bool,
-        "Enable the W4A4 MXFP4 MegaMoE path by setting DeepGEMM's "
-        "DG_USE_FP4_ACTS=1 and DG_USE_MXF4_KIND=1. Use with "
+        "Enable the W4A4 MXFP4 MegaMoE path with DeepGEMM's "
+        "mxf4xmxf4 MMA type. Use with "
         "--moe-a2a-backend megamoe.",
         NS("exec.moe"),
     ] = False
@@ -3614,7 +3628,8 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="Unix socket path for weight cache daemon (client mode)."
-            "If not set, uses /tmp/sglang_weight_cache_rank{global_rank}.sock",
+            "If not set, derives the path from SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE "
+            "using the caller's physical GPU UUID.",
         ),
         NS("model"),
     ] = None
@@ -3753,38 +3768,11 @@ class ServerArgs:
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
 
-    def pre_capture_activation_reserve_mb(self, gpu_mem: Optional[float]) -> float:
-        # Runtime activation working-set reserve for eager decode above the captured
-        # max_bs and transient prefill/logits; also covers fixed state caches.
-        cfg = resolving_view(self)
-        if cfg.disaggregation_mode == "decode":
-            running_requests = (
-                cfg.max_running_requests or cfg.cuda_graph_config.decode.max_bs or 1
-            )
-            activation_tokens = max(
-                running_requests * (cfg.speculative_num_draft_tokens or 1), 2048
-            )
-        elif cfg.chunked_prefill_size > 0:
-            activation_tokens = max(cfg.chunked_prefill_size, 2048)
-        else:
-            activation_tokens = max(cfg.max_prefill_tokens, 2048)
-        reserved_mem = (
-            512 + activation_tokens * 1.5 + cfg.tp_size * cfg.pp_size / 8 * 1024
-        )
-        if gpu_mem is not None and gpu_mem > 60 * 1024:
-            reserved_mem = max(reserved_mem, 10 * 1024)
-        return reserved_mem
-
-    def _support_mamba_cache_extra_buffer(self, model_arch: str):
-        from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
-
-        return supports_mamba_cache_extra_buffer(self, model_arch)
-
-        # ===== END TO BE REFACTORED ====
+    # ===== END TO BE REFACTORED ====
 
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
 
-    # The strided-layout Triton requirement is enforced via
+    # The attention-backend allow-list is enforced via
     # --enable-page-major-kv-layout (implied by the unified pool in
     # _handle_page_major_kv_layout); the model-family gate is enforced at pool
     # construction in model_runner_kv_cache_mixin._init_pools.
@@ -4132,41 +4120,13 @@ class ServerArgs:
 
         return cfg.startup_weight_load_mode == "overlap"
 
-    def ssl_verify(self):
-        """Return the value for the requests library's verify= parameter.
-
-        When SSL is configured:
-          - If a CA certificate file is provided, return its path so requests
-            validates the server certificate against that CA.
-          - Otherwise, return False to disable certificate verification
-            (suitable for self-signed certificates in development/testing).
-            A warning is logged once when this happens.
-        When SSL is not configured, return True to use the system's default
-        CA bundle.
-        """
-        if self.ssl_ca_certs:
-            return self.ssl_ca_certs
-        if self.ssl_certfile:
-            if not getattr(self, "_ssl_verify_warned", False):
-                logger.warning(
-                    "SSL is enabled but --ssl-ca-certs was not provided. "
-                    "Certificate verification is DISABLED for internal "
-                    "health checks. For production deployments, provide "
-                    "--ssl-ca-certs or use CA-signed certificates."
-                )
-                self._ssl_verify_warned = True
-            return False
-        return True
-
     def __setattr__(self, name, value):
         # Once resolution has finished the record is the READ-ONLY raw input
         # the config bags were projected from. Resolved config changes go to the bags via
         # get_context().override(source, ...); a value one runner or worker
         # owns travels as a constructor argument to it.
-        if (
-            getattr(self, "_resolution_finished", False)
-            and not getattr(self, "_internal_write", False)
-            and (not name.startswith("_") or name in _underscore_field_names())
+        if getattr(self, "_resolution_finished", False) and (
+            not name.startswith("_") or name in _underscore_field_names()
         ):
             raise AttributeError(
                 f"server_args.{name} assigned after resolution; server_args is "
@@ -4187,159 +4147,10 @@ class ServerArgs:
 
         check_server_args(self)
 
-    @property
-    def _parsed_modelexpress_config(self) -> dict:
-        cache = getattr(self, "_mx_config_cache", None)
-        if cache is not None:
-            return cache
-        if self.modelexpress_config is None:
-            result = {}
-        elif isinstance(self.modelexpress_config, str):
-            result = json.loads(self.modelexpress_config)
-        else:
-            result = self.modelexpress_config
-        self._mx_config_cache = result
-        return result
-
-    @property
-    def modelexpress_url(self) -> Optional[str]:
-        return self._parsed_modelexpress_config.get("url")
-
-    @property
-    def modelexpress_transport(self) -> str:
-        """Transport backend for modelexpress."""
-        return self._parsed_modelexpress_config.get("transport", "nixl")
-
     def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
         """``load_format`` overrides the seed's: a draft runner loading under
         ``--speculative-draft-load-format`` needs its own transfer engine."""
         return remote_instance_transfer_engine_of(resolving_view(self), load_format)
-
-    @property
-    def kv_event_block_size(self) -> int:
-        """Width KV events are emitted at: under DCP the radix tree pages at
-        ``page_size * dcp_size`` (``mem_cache/kv_cache_builder.py``).
-        """
-        cfg = resolving_view(self)
-        return cfg.page_size * self.dcp_size
-
-    def describe_kv_events_publisher(self) -> Optional[dict]:
-        """Return a structured description of this server's KV-event
-        publisher, or `None` if publishing is disabled / misconfigured.
-
-        This is the wire contract surfaced under the `kv_events` key on
-        `/server_info` so KV-aware routers (e.g. the SGLang model
-        gateway) can subscribe per-worker without operator-supplied port
-        coordination. The router constructs the per-DP-rank SUB endpoint
-        as tcp://<worker_host>:<endpoint_port_base + dp_rank> for
-        every rank reported in dp_size.
-
-        Returned descriptor shape:
-
-            {
-                "publisher": "zmq",
-                "endpoint_host": "*",             # may be a ZMQ wildcard
-                                                  # ("*", "0.0.0.0", "::");
-                                                  # subscribers MUST substitute
-                                                  # the worker URL's host when
-                                                  # dialing
-                "endpoint_port_base": 5557,       # base TCP port; per-rank
-                                                  # port = base + dp_rank
-                "topic": "",                      # ZMQ topic prefix on the
-                                                  # SUB filter (empty =
-                                                  # subscribe-all)
-                "block_size": <kv_event_block_size>,  # subscribers MUST
-                                                  # hash prompts at this size
-                "dp_size": <dp_size>,             # number of SUB sockets to
-                                                  # open; not DCP-scaled, as
-                                                  # DCP shards within a rank
-                                                  # rather than adding
-                                                  # publishers
-                "load_endpoint_port_base": <resolved>,
-                                                  # base TCP port of the load
-                                                  # range (load rank r = base
-                                                  # + r). Consumers MUST read
-                                                  # this key, not re-derive
-                                                  # it; present only when
-                                                  # --load-publish-endpoint
-                                                  # opted in and a range
-                                                  # resolved
-                "load_topic": "load",             # SUB filter for the load
-                                                  # socket; present iff
-                                                  # load_endpoint_port_base
-                                                  # is present
-            }
-
-        Returns None (i.e. "no publisher to describe") when any of:
-
-        * --kv-events-config is unset / empty / malformed JSON,
-        * the configured publisher is "null",
-        * page_size is missing or non-positive (a placeholder
-          block_size would cause silent KV-cache misses by hashing
-          prompts at the wrong granularity on the router side),
-        * the endpoint is not a routable TCP address (inproc:// /
-          ipc://, missing port, non-integer port, port outside
-          1..65535, or a bare unbracketed IPv6 host, which is
-          ambiguous).
-
-        NOTE for load-socket consumers: pair the load port with the worker's
-        own URL host, as with the KV SUB endpoints — endpoint_host is a
-        wildcard ("*", "0.0.0.0", "::") whenever the default packing applies,
-        so splicing it yields tcp://*:PORT and connects to nothing.
-
-        Reuses parse_advertisable_tcp and resolve_load_pub_range — the same
-        helpers the scheduler binds through — so the advertisement cannot
-        drift from the sockets.
-        """
-        # Lazy import so loading server_args doesn't pull in
-        # disaggregation / msgspec / zmq at module top level.
-        from sglang.srt.disaggregation.kv_events import (
-            LOAD_TOPIC,
-            KVEventsConfig,
-            parse_advertisable_tcp,
-            resolve_load_pub_range,
-        )
-
-        resolved = resolving_view(self)
-        raw = resolved.kv_events_config
-        page_size = resolved.page_size
-        if not raw or page_size is None or page_size <= 0:
-            return None
-        try:
-            cfg = KVEventsConfig.from_cli(raw)
-        except Exception:
-            # Malformed JSON / schema mismatch. The publisher would
-            # have failed at server startup; /server_info must
-            # keep working, so just report "no publisher" to consumers.
-            return None
-        if cfg.publisher == "null" or not cfg.endpoint:
-            return None
-        resolved_kv = parse_advertisable_tcp(cfg.endpoint)
-        if resolved_kv is None:
-            return None
-        host, port = resolved_kv
-
-        descriptor = {
-            "publisher": cfg.publisher,
-            "endpoint_host": host,
-            "endpoint_port_base": port,
-            "topic": cfg.topic,
-            "block_size": resolved.kv_event_block_size,
-            "dp_size": resolved.dp_size,
-        }
-        # Load range, from the same resolver SchedulerLoadPublisher binds
-        # with (so the two can't drift). The decline reason is logged once at
-        # startup, not here — this runs per /server_info request.
-        resolved_range, _reason = resolve_load_pub_range(
-            kv_endpoint=cfg.endpoint,
-            replay_endpoint=cfg.replay_endpoint,
-            dp_size=resolved.dp_size,
-            load_publish_endpoint=self.load_publish_endpoint,
-        )
-        if resolved_range is not None:
-            descriptor["load_endpoint_port_base"] = resolved_range[1]
-            descriptor["load_topic"] = LOAD_TOPIC
-        return descriptor
 
 
 # --------------------------------------------------------------------------
@@ -4381,12 +4192,11 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
     bf16 q) without having to move off trtllm_mha.
     """
     from sglang.srt.environ import envs
-    from sglang.srt.utils.common import is_sm100_supported
 
     return (
         args.kv_cache_dtype == "fp8_e4m3"
         and args.attention_backend == "trtllm_mha"
-        and is_sm100_supported()
+        and get_platform().is_sm100
         and not envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get()
     )
 
@@ -4417,7 +4227,6 @@ def _underscore_field_names() -> frozenset:
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
     """Legacy publish shim (role=scheduler) — prefer
     ``runtime_context.publish(server_args, role=...)`` in new code."""
-    from sglang.srt.runtime_context import publish
 
     publish(server_args, role="scheduler")
 
@@ -4425,7 +4234,6 @@ def set_global_server_args_for_scheduler(server_args: ServerArgs):
 def set_global_server_args_for_tokenizer(server_args: ServerArgs):
     """Legacy publish shim (role=tokenizer). Not aliased to the scheduler shim:
     the process role differs."""
-    from sglang.srt.runtime_context import publish
 
     publish(server_args, role="tokenizer")
 
@@ -4433,7 +4241,6 @@ def set_global_server_args_for_tokenizer(server_args: ServerArgs):
 def get_global_server_args() -> ServerArgs:
     """Legacy accessor shim — prefer ``get_server_args()`` from
     ``sglang.srt.runtime_context`` in new code."""
-    from sglang.srt.runtime_context import get_context
 
     return get_context().server_args
 

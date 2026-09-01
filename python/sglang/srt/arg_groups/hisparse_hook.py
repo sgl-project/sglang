@@ -8,6 +8,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
+from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -22,21 +23,14 @@ HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "aiter"}
 HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
 
 
-def _is_hip() -> bool:
-    """The one place this family asks about ROCm, and the seam the tests patch."""
-    from sglang.srt.utils.common import is_hip
-
-    return is_hip()
-
-
 def _hisparse_default_backend(kv_cache_dtype: str) -> str:
-    if _is_hip():
+    if get_platform().is_hip:
         return "tilelang"
     return "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
 
 
 def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
-    if _is_hip():
+    if get_platform().is_hip:
         return HISPARSE_ROCM_DSA_BACKENDS
     return HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE.get(
         kv_cache_dtype, {"flashmla_sparse", "flashmla_kv", "flashinfer_sparse_mla"}
@@ -96,7 +90,7 @@ def validate_hisparse(server_args: ServerArgs) -> None:
 
     hf_config = model_config_of(server_args).hf_config
     is_v4_hisparse = is_deepseek_v4(hf_config)
-    is_hip = _is_hip()
+    is_hip = get_platform().is_hip
     assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (
         "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
