@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -215,9 +216,12 @@ class IntelAMXAttnBackend(AttentionBackend):
         seq_lens, extend_seq_lens, extend_start_loc, tree_mask = self.extend_metadata
 
         _, max_extend_len = self.forward_metadata
-        seq_lens = forward_batch.seq_lens
         if seq_lens.dtype != torch.int64:
             seq_lens = seq_lens.to(torch.int64)
+
+        is_causal = True
+        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+            is_causal = False
 
         # Gemma4's KV-shared layers pass k=v=None - the layer they share with
         # already wrote their extend K/V to the cache
@@ -241,6 +245,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             forward_batch.encoder_lens,
             sinks,
             tree_mask,
+            is_causal,
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -262,7 +267,6 @@ class IntelAMXAttnBackend(AttentionBackend):
             seq_lens = forward_batch.seq_lens
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
-        seq_lens = forward_batch.seq_lens
         if seq_lens.dtype != torch.int64:
             seq_lens = seq_lens.to(torch.int64)
 

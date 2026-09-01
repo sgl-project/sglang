@@ -34,7 +34,15 @@ from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReq
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
-from sglang.srt.runtime_context import get_disagg, get_exec, get_serving
+from sglang.srt.multimodal.transport import determine_tensor_transport_mode
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_mm,
+    get_model,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.srt.utils.common import safe_pickle_loads
@@ -1696,16 +1704,6 @@ def _view_pool_buffer_by_modality(raw_buffer, embedding_data, dtype):
     }
 
 
-def _determine_tensor_transport_mode(server_args):
-    is_cross_node = server_args.dist_init_addr
-
-    if is_cross_node:
-        # Fallback to default CPU transport for multi-node
-        return "default"
-    else:
-        return "cuda_ipc"
-
-
 class MMReceiverBase(ABC):
     def __init__(
         self,
@@ -1730,15 +1728,15 @@ class MMReceiverBase(ABC):
         # When None (e.g. in a scheduler subprocess that has no in-process
         # bootstrap), fall back to a snapshot of the static --encoder-urls.
         self.encode_urls: List[str] = (
-            encode_urls if encode_urls is not None else list(server_args.encoder_urls)
+            encode_urls if encode_urls is not None else list(get_disagg().encoder_urls)
         )
         self.recv_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
-        self.host = get_local_ip_auto(server_args.host)
+        self.host = get_local_ip_auto(get_serving().host)
         self.pp_rank = pp_rank
         self.tp_rank = tp_rank
-        self.tp_size = server_args.tp_size
+        self.tp_size = get_parallel().tp_size
         self.tp_group = tp_group
-        self.nnodes = server_args.nnodes
+        self.nnodes = get_parallel().nnodes
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingMMRequestBase] = []
         self.waiting_by_rid: Dict[str, WaitingMMRequestBase] = {}
@@ -1835,24 +1833,24 @@ class MMReceiverBase(ABC):
         model_config=None,
     ):
         """Load processor and initialize mm_processor, shared by all backends."""
-        transport_mode = _determine_tensor_transport_mode(server_args)
+        transport_mode = determine_tensor_transport_mode()
         import_processors("sglang.srt.multimodal.processors")
 
         extra_kwargs = {}
         if getattr(server_args, "tokenizer_backend", None) is not None:
-            extra_kwargs["tokenizer_backend"] = server_args.tokenizer_backend
+            extra_kwargs["tokenizer_backend"] = get_serving().tokenizer_backend
 
         _processor = get_processor(
             get_serving().tokenizer_path,
-            tokenizer_mode=server_args.tokenizer_mode,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            image_processor_backend=resolve_image_processor_backend(server_args),
+            tokenizer_mode=get_serving().tokenizer_mode,
+            trust_remote_code=get_model().trust_remote_code,
+            revision=get_model().revision,
+            image_processor_backend=resolve_image_processor_backend(get_mm()),
             **extra_kwargs,
         )
 
         enable_adaptive_dispatch_to_encoder = (
-            server_args.enable_adaptive_dispatch_to_encoder
+            get_disagg().enable_adaptive_dispatch_to_encoder
         )
         mm_processor_kwargs = {}
         if model_config is not None:
@@ -2668,7 +2666,7 @@ def create_mm_receiver(
         transport_mode = envs.SGLANG_ENCODER_MM_RECEIVER_MODE.get()
         logger.debug(f"MMReceiver transport_mode from env: {transport_mode}")
 
-    _validate_transport_mode(transport_mode, encode_urls or server_args.encoder_urls)
+    _validate_transport_mode(transport_mode, encode_urls or get_disagg().encoder_urls)
     logger.info(f"EPD MMReceiver: using transport_mode={transport_mode}")
 
     receiver_cls = _MM_RECEIVER_BY_MODE.get(transport_mode)

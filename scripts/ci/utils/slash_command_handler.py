@@ -27,6 +27,8 @@ _ALLOWED_INSTALL_SCRIPT = re.compile(r"^scripts/ci/cuda/[\w.-]+\.sh$")
 
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
+PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regression.py"
+PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
 
 
 MAINTENANCE_ISSUE_NUMBER = 21065
@@ -349,17 +351,36 @@ def handle_tag_run_ci(
     return True
 
 
+def _latest_run_per_workflow(runs):
+    """
+    Collapse a head_sha's workflow runs to the newest run per workflow.
+
+    GitHub can have several runs of the *same* workflow at one commit — a
+    `synchronize` run superseded by a `labeled` run, or a run cancelled by
+    `cancel-in-progress` (pr-test.yml sets it) while its replacement is
+    already in flight. Only the newest one reflects current state; rerunning
+    the older ones spawns duplicates that fight the live run for runners.
+    """
+    latest = {}
+    for run in runs:
+        current = latest.get(run.workflow_id)
+        if current is None or run.id > current.id:
+            latest[run.workflow_id] = run
+    return list(latest.values())
+
+
 def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
     """
     Handles the /rerun-failed-ci command.
-    Reruns workflows with 'failure' or 'skipped' conclusions.
+    Reruns workflows that ended in 'failure', 'skipped', 'cancelled' or
+    'timed_out', restarting only the jobs that didn't succeed.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_failed_ci", False):
         print("Permission denied: can_rerun_failed_ci is false.")
         return False
 
-    print("Permission granted. Triggering rerun of failed or skipped workflows.")
+    print("Permission granted. Triggering rerun of unsuccessful workflows.")
 
     # Check if PR has sgl-kernel changes - if so, we may need full reruns
     # to ensure sgl-kernel-build-wheels runs and produces fresh artifacts.
@@ -405,7 +426,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
                 f"Failed to check kernel wheel status: {e} - falling back to full rerun"
             )
 
-    # Rerun workflows with conclusion=failure or conclusion=skipped.
+    # Rerun workflows that ended in failure, skipped, cancelled or timed_out.
     #
     # - failure: use rerun_failed_jobs() which reruns failed jobs *and their
     #   dependent jobs* (GitHub API). Fast-fail cascades call
@@ -420,17 +441,27 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   label-gated workflow, add the missing label (the `labeled` event
     #   dispatches a fresh run with the current label set); this function
     #   cannot recover those by rerun alone.
+    # - cancelled / timed_out: rerun_failed_jobs() as well. GitHub restarts
+    #   every job that didn't succeed — cancelled ones included — plus their
+    #   dependents, and carries the passing jobs over untouched. A full
+    #   rerun here would re-execute dozens of already-green GPU jobs to
+    #   recover one cancelled partition.
+    #   A run cancelled before any job failed has nothing for the endpoint to
+    #   target, so fall back to run.rerun() when it rejects the request.
     # - kernel wheel escape: if the PR touches sgl-kernel and not all wheel
     #   builds are success yet, full-rerun failure runs too — Build Wheel
     #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
     #   rerun_failed_jobs() is scoped to a single workflow run.
-    runs = gh_repo.get_workflow_runs(head_sha=head_sha)
+    runs = _latest_run_per_workflow(gh_repo.get_workflow_runs(head_sha=head_sha))
 
     rerun_count = 0
     for run in runs:
         if run.status != "completed":
+            # A newer attempt is still in flight - nothing to recover.
             continue
-        if run.conclusion not in ("failure", "skipped"):
+        if run.conclusion not in ("failure", "skipped", "cancelled", "timed_out"):
+            # action_required (fork PR awaiting approval) is deliberately left
+            # out: it needs an approval, not a rerun.
             continue
 
         print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
@@ -441,8 +472,12 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
                 print("  Full rerun")
                 run.rerun()
             else:
-                print("  rerun_failed_jobs")
-                run.rerun_failed_jobs()
+                try:
+                    print("  rerun_failed_jobs")
+                    run.rerun_failed_jobs()
+                except Exception as e:
+                    print(f"  rerun_failed_jobs rejected ({e}) - full rerun")
+                    run.rerun()
             rerun_count += 1
         except Exception as e:
             print(f"Failed to rerun workflow {run.id}: {e}")
@@ -453,7 +488,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
             comment.create_reaction("+1")
         return True
     else:
-        print("No failed or skipped workflows found to rerun.")
+        print("No failed, skipped, cancelled or timed-out workflows found to rerun.")
         return False
 
 
@@ -701,17 +736,44 @@ def _extract_runner_configs(content):
     return out
 
 
-def _extract_legacy_suites(content):
-    """Pull every legacy single-string `suite=` from `register_cuda_ci(...)`
-    calls. Used only to report why such a file is not dispatchable."""
+def _extract_suites(content, register_fn):
+    """Pull every single-string `suite=` from `<register_fn>(...)` calls."""
     out = []
     for args in re.finditer(
-        r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE
+        rf"^[^#\n]*{register_fn}\s*\(([^)]*)\)", content, re.MULTILINE
     ):
         m = re.search(r'suite\s*=\s*["\']([^"\']+)["\']', args.group(1))
         if m:
             out.append(m.group(1))
     return out
+
+
+def _extract_legacy_suites(content):
+    """Pull every legacy single-string `suite=` from `register_cuda_ci(...)`
+    calls. Used only to report why such a file is not dispatchable."""
+    return _extract_suites(content, "register_cuda_ci")
+
+
+# Backends with no job in rerun-test.yml (cuda / multimodal_gen / cpu only) and
+# no runner_config in runner_configs.yml, so no dispatch can be built for them.
+# Mirrors `REGISTER_MAPPING` in python/sglang/test/ci/ci_register.py.
+_OTHER_BACKEND_REGISTERS = {
+    "register_amd_ci": "AMD",
+    "register_npu_ci": "NPU",
+    "register_xpu_ci": "XPU",
+    "register_musa_ci": "MUSA",
+    "register_mlx_ci": "MLX",
+}
+
+
+def _extract_other_backends(content):
+    """Return (backend labels, suite names) for every non-CUDA/CPU registration."""
+    labels, suites = [], []
+    for register_fn, label in _OTHER_BACKEND_REGISTERS.items():
+        if re.search(rf"^[^#\n]*{register_fn}\s*\(", content, re.MULTILINE):
+            labels.append(label)
+            suites.extend(_extract_suites(content, register_fn))
+    return labels, sorted(set(suites))
 
 
 def _dispatch_err(suite, msg):
@@ -829,6 +891,20 @@ def detect_suite(file_path_from_test):
             )
         ]
 
+    labels, suites = _extract_other_backends(content)
+    if labels:
+        backends = ", ".join(labels)
+        where = f" (suite `{suites[0]}`)" if suites else ""
+        return [
+            _dispatch_err(
+                suites[0] if suites else None,
+                f"`{full_path}` is registered for {backends}{where}, not for "
+                f"CUDA or CPU; rerun-test.yml has no {backends} job. Rerun it "
+                f"with /rerun-failed-ci, or dispatch the {backends} workflow "
+                f"manually.",
+            )
+        ]
+
     return [
         _dispatch_err(
             None,
@@ -921,7 +997,15 @@ def _resolve_test_spec(test_spec):
     return out
 
 
-def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker=""):
+def _dispatch_batch(
+    gh_repo,
+    pr,
+    batch,
+    token,
+    reply_comment_id="",
+    reply_marker="",
+    refresh_precision_baseline=False,
+):
     """
     Dispatch a single workflow run for a batch of resolved test specs that
     share the same dispatch shape (mode + runs_on + install_script +
@@ -969,6 +1053,7 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
             "rdma_devices": rdma_devices,
             "reply_comment_id": str(reply_comment_id) if reply_comment_id else "",
             "reply_marker": reply_marker,
+            "refresh_precision_baseline": str(refresh_precision_baseline).lower(),
         }
         if is_fork:
             ref = "main"
@@ -1054,6 +1139,27 @@ def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name
     return False
 
 
+def _check_precision_baseline_refresh_permissions(gh_repo, pr, comment):
+    commenter = comment.user.login
+    is_fork = pr.head.repo is None or pr.head.repo.full_name != gh_repo.full_name
+    if is_fork:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            "⛔ Precision baseline refresh is only available on PR branches in "
+            "this repository. Fork PR code cannot receive the baseline write token."
+        )
+        return False
+
+    perm = gh_repo.get_collaborator_permission(commenter)
+    if perm not in ("admin", "maintain", "write"):
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            "⛔ Precision baseline refresh requires write permission on the repo."
+        )
+        return False
+    return True
+
+
 def handle_rerun_test(
     gh_repo,
     pr,
@@ -1063,6 +1169,7 @@ def handle_rerun_test(
     token,
     skip_permission_check=False,
     command_label=None,
+    refresh_precision_baseline=False,
 ):
     """
     Handles the /rerun-test command. Resolves all test specs, groups them by
@@ -1071,6 +1178,12 @@ def handle_rerun_test(
     """
     if not skip_permission_check and not _check_rerun_test_permissions(
         gh_repo, pr, comment, user_perms, "rerun-test"
+    ):
+        return False
+
+    if (
+        refresh_precision_baseline
+        and not _check_precision_baseline_refresh_permissions(gh_repo, pr, comment)
     ):
         return False
 
@@ -1154,6 +1267,20 @@ def handle_rerun_test(
             seen_commands.add(key)
             resolved.append(r)
 
+    if refresh_precision_baseline:
+        is_exact_precision_test = (
+            not resolve_failures
+            and len(resolved) == 1
+            and resolved[0]["test_command"] == PRECISION_BASELINE_TEST
+        )
+        if not is_exact_precision_test:
+            comment.create_reaction("confused")
+            pr.create_issue_comment(
+                "⛔ `--refresh-precision-baseline` must be used alone with "
+                f"`test/{PRECISION_BASELINE_TEST}`."
+            )
+            return False
+
     # Phase 2: Group by dispatch shape.
     groups = {}
     for r in resolved:
@@ -1186,6 +1313,7 @@ def handle_rerun_test(
                 token,
                 reply_comment_id=reply_comment.id,
                 reply_marker=marker,
+                refresh_precision_baseline=refresh_precision_baseline,
             )
         )
 
@@ -1387,7 +1515,11 @@ def main():
         )
 
     elif first_line.startswith("/rerun-test"):
-        test_specs = first_line.split()[1:]
+        rerun_args = first_line.split()[1:]
+        refresh_precision_baseline = PRECISION_BASELINE_REFRESH_FLAG in rerun_args
+        test_specs = [
+            arg for arg in rerun_args if arg != PRECISION_BASELINE_REFRESH_FLAG
+        ]
         handle_rerun_test(
             repo,
             pr,
@@ -1396,6 +1528,7 @@ def main():
             test_specs or None,
             token,
             command_label=first_line,
+            refresh_precision_baseline=refresh_precision_baseline,
         )
 
     else:

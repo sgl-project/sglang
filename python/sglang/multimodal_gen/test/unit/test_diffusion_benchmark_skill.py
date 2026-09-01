@@ -87,6 +87,11 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
 
             expected = {
                 "longcat-image",
+                "longcat-image-edit",
+                "longcat-image-edit-turbo",
+                "qwen-edit-base",
+                "qwen-image-layered",
+                "stable-diffusion-3.5-medium",
                 "sana-video",
                 "sana-wm-bidirectional",
                 "sana-wm-streaming",
@@ -122,6 +127,39 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
 
             compiled_cmd = module.build_sglang_cmd("longcat-image", torch_compile=True)
             self.assertIn("--enable-torch-compile", compiled_cmd)
+
+            longcat_edit_cmd = module.build_sglang_cmd("longcat-image-edit")
+            self.assertIn(
+                "--model-path=meituan-longcat/LongCat-Image-Edit",
+                longcat_edit_cmd,
+            )
+            self.assertTrue(
+                any(arg.startswith("--image-path=") for arg in longcat_edit_cmd)
+            )
+            self.assertIn("--enable-prompt-rewrite=false", longcat_edit_cmd)
+
+            longcat_edit_bcg_cmd = module.build_sglang_cmd(
+                "longcat-image-edit", breakable_cuda_graph=True
+            )
+            resolution_index = longcat_edit_bcg_cmd.index("--warmup-resolutions")
+            self.assertEqual(longcat_edit_bcg_cmd[resolution_index + 1], "1264x848")
+
+            longcat_edit_turbo_cmd = module.build_sglang_cmd("longcat-image-edit-turbo")
+            self.assertIn(
+                "--model-path=meituan-longcat/LongCat-Image-Edit-Turbo",
+                longcat_edit_turbo_cmd,
+            )
+
+            layered_cmd = module.build_sglang_cmd("qwen-image-layered")
+            self.assertIn("--model-path=Qwen/Qwen-Image-Layered", layered_cmd)
+            self.assertIn("--num-frames=4", layered_cmd)
+
+            sd35_cmd = module.build_sglang_cmd("stable-diffusion-3.5-medium")
+            self.assertIn(
+                "--model-path=stabilityai/stable-diffusion-3.5-medium-diffusers",
+                sd35_cmd,
+            )
+            self.assertIn("stable-diffusion-3.5-medium", module.GATED_MODELS)
 
             h3_cmd = module.build_sglang_cmd("minimax-h3-t2va", torch_compile=True)
             self.assertNotIn("--enable-torch-compile", h3_cmd)
@@ -233,6 +271,14 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                 bcg_cmd[bucket_index + 1 : bucket_index + 3], ["256", "512"]
             )
 
+            sana_video_bcg_cmd = module.build_sglang_cmd(
+                "sana-video", breakable_cuda_graph=True
+            )
+            self.assertEqual(
+                sana_video_bcg_cmd[sana_video_bcg_cmd.index("--warmup-num-frames") + 1],
+                "17",
+            )
+
             for _, quality, breakable_cuda_graph in module.QUALITY_BCG_ABBA_MATRIX:
                 module.build_sglang_cmd(
                     "longcat-image",
@@ -294,6 +340,54 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
 
             with self.assertRaises(FileExistsError):
                 module._prepare_model_cache(cache_root, "sana-video", "baseline")
+
+    def test_isolated_cache_seeds_read_only_hf_cache_with_writable_overlay(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_root = Path(tmpdir)
+            module = _load_benchmark_module(temp_root)
+            seed_root = temp_root / "shared-hf"
+            source_model = seed_root / "hub" / "models--org--model"
+            source_weight = source_model / "snapshots" / "abc" / "model.safetensors"
+            source_weight.parent.mkdir(parents=True)
+            source_weight.write_bytes(b"shared weights")
+            source_ref = source_model / "refs" / "main"
+            source_ref.parent.mkdir()
+            source_ref.write_text("abc")
+
+            cache_root = temp_root / "model-caches"
+            cache_dir = module._prepare_model_cache(
+                cache_root,
+                "sana-video",
+                "baseline",
+                seed_model_cache_roots=[seed_root],
+            )
+            seeded_model = cache_dir / "huggingface" / "hub" / "models--org--model"
+            self.assertTrue(seeded_model.is_dir())
+            self.assertFalse(seeded_model.is_symlink())
+            seeded_weight = seeded_model / "snapshots" / "abc" / "model.safetensors"
+            self.assertTrue(seeded_weight.is_symlink())
+            self.assertEqual(
+                seeded_weight.read_bytes(),
+                b"shared weights",
+            )
+
+            new_blob = seeded_model / "blobs" / "downloaded"
+            new_blob.parent.mkdir(exist_ok=True)
+            new_blob.write_bytes(b"new download")
+            (seeded_model / "refs" / "main").write_text("new-revision")
+            self.assertEqual(new_blob.read_bytes(), b"new download")
+            self.assertEqual(source_ref.read_text(), "abc")
+
+            module._cleanup_model_cache(
+                cache_root,
+                cache_dir,
+                temp_root / "cleanup.jsonl",
+                "sana-video",
+                "baseline",
+                "success",
+            )
+            self.assertFalse(cache_dir.exists())
+            self.assertEqual(source_weight.read_bytes(), b"shared weights")
 
     def test_interrupted_run_cleans_isolated_cache_in_finally(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -377,6 +471,41 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
             self.assertEqual(
                 result["missing_artifacts"], ["perf dump", "generated output"]
             )
+
+    def test_mesh_artifacts_are_accepted_and_hashed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_root = Path(tmpdir)
+            module = _load_benchmark_module(temp_root)
+            output_dir = temp_root / "outputs"
+            output_dir.mkdir()
+
+            def finish_run():
+                (output_dir / "hunyuan3d-shape_mesh-output.json").write_text(
+                    json.dumps({"total_duration_ms": 1000, "steps": []}),
+                    encoding="utf-8",
+                )
+                (output_dir / "hunyuan3d-shape-mesh-output.obj").write_bytes(
+                    b"v 0 0 0\n"
+                )
+                return 0
+
+            with patch.object(module.subprocess, "Popen") as popen:
+                popen.return_value.stdout = iter(())
+                popen.return_value.wait.side_effect = finish_run
+                result = module._run_benchmark_once_impl(
+                    "hunyuan3d-shape",
+                    "mesh-output",
+                    output_dir,
+                    warmup=False,
+                    cuda_visible_devices="0",
+                )
+
+            self.assertFalse(result["error"])
+            self.assertEqual(
+                result["output_artifacts"],
+                [str(output_dir / "hunyuan3d-shape-mesh-output.obj")],
+            )
+            self.assertEqual(len(result["output_sha256"]), 1)
 
     def test_high_bcg_rejects_quality_fusion_mounted_after_capture(self):
         with tempfile.TemporaryDirectory() as tmpdir:
