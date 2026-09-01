@@ -308,6 +308,22 @@ class KVIndexTranslator:
         self._index_table_memo = (weakref.ref(forward_batch), view)
         return view
 
+    def assert_backends_carry_translator(self, backends) -> None:
+        """Boot guard: under the unified pool every backend a forward can reach
+        must carry THIS translator."""
+        if not self.is_translating:
+            return
+        for backend in backends:
+            if backend is None:
+                continue
+            assert backend.kv_index_translator is self, (
+                f"{type(backend).__name__} does not carry the runner's "
+                "KVIndexTranslator. A backend (or wrapper) reachable under "
+                "--enable-unified-memory must forward `kv_index_translator`, or "
+                "read-index producers silently skip the virtual->kernel-facing "
+                "translation."
+            )
+
     # -- write loc (phase 1; phase 2 lives in build_index_table) ----------------
 
     def rebind_write_loc(self, forward_batch) -> None:
