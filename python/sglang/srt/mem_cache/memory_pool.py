@@ -4830,14 +4830,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def get_compress_tail_buf_infos(self):
         if not self.kpool_use_compress:
             return [], [], []
-        if self.layer_shard_enabled:
-            transfer_layer_ids = [
-                i
-                for i in range(self.layer_num)
-                if self._is_layer_owned(self.start_layer + i)
-            ]
-        else:
-            transfer_layer_ids = list(range(self.layer_num))
+        transfer_layer_ids = list(range(self.layer_num))
         # Keep zero-row indexShare entries in the pointer list so layer offsets
         # stay aligned across PD peers; item_len=0 makes transfer backends skip them.
         tail_buffers = [self._compress_tail_k[i] for i in transfer_layer_ids] + [

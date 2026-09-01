@@ -2458,11 +2458,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         dst_layer_ids=dst_lids,
                     )
             elif st == StateType.DSA_TAIL:
-                if (
-                    self.attn_cp_size > 1
-                    and self.attn_cp_rank != 0
-                    and not self.server_args.enable_dsa_cache_layer_split
-                ):
+                if self.attn_cp_size > 1 and self.attn_cp_rank != 0:
                     skipped_replicated_state = True
                     h = None
                 else:
@@ -2478,11 +2474,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         comp_notif,
                     )
             elif st == StateType.DSA:
-                if (
-                    self.attn_cp_size > 1
-                    and self.attn_cp_rank != 0
-                    and not self.server_args.enable_dsa_cache_layer_split
-                ):
+                if self.attn_cp_size > 1 and self.attn_cp_rank != 0:
                     skipped_replicated_state = True
                     h = None
                 else:

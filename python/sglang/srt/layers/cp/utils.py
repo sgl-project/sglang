@@ -65,7 +65,6 @@ def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
         not model_runner.is_draft_worker
         and get_parallel().enable_dsa_cache_layer_split
         and model_runner.use_mla_backend
-        and not getattr(model_runner, "mambaish_config", None)
         and is_deepseek_dsa(model_runner.model_config.hf_config)
     )
 

@@ -232,10 +232,6 @@ class IndexerKPool(MultiPlatformOp):
         pool = get_token_to_kv_pool()
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
-        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
-            if not return_compressed:
-                return None
-            write_cache = False
 
         buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
         return kpool_softmax_rotate_write_cache(
@@ -280,8 +276,6 @@ class IndexerKPool(MultiPlatformOp):
         pool = get_token_to_kv_pool()
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
-        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
-            return
 
         pool.kpool_decode_update_index_cache(
             layer_id=layer_id,
@@ -325,19 +319,13 @@ class IndexerKPool(MultiPlatformOp):
             pool = get_token_to_kv_pool()
             if hasattr(pool, "invalidate_index_buffer_for_layer"):
                 pool.invalidate_index_buffer_for_layer(layer_id)
-            layer_owned = not (
-                hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id)
-            )
-            if not layer_owned:
-                return None
 
             writes, tails, cp = plan.writes, plan.tails, plan.cp
             if writes.is_empty and tails.is_empty:
                 return None
 
             tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
-            layer_sharded = bool(getattr(pool, "layer_shard_enabled", False))
-            cache_cp = None if layer_sharded else cp
+            cache_cp = cp
             if os.environ.get("SGLANG_DSA_KPOOL_DEBUG_BOUNDS") == "1":
                 if not writes.is_empty:
                     active = (

@@ -126,38 +126,6 @@ def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[
     return layer_ids
 
 
-def _get_dsa_indexer_effective_num_layers(
-    kvc: KVCacheConfigurator, cache_layer_ids: list[int]
-) -> int:
-    """Indexer buffers materialized per rank, including split remote scratch."""
-    enable_hisparse = kvc.server_args.enable_hisparse
-    if enable_hisparse or kvc.is_draft_worker:
-        included_layers = [True] * len(cache_layer_ids)
-    else:
-        included_layers = [
-            not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
-            for layer_id in cache_layer_ids
-        ]
-
-    from sglang.srt.layers.cp.utils import (
-        get_glm_dsa_cp_layer_shard_info,
-        get_layer_shard_range,
-    )
-
-    layer_shard_rank, shard_size = get_glm_dsa_cp_layer_shard_info(kvc)
-    if enable_hisparse or layer_shard_rank is None:
-        return sum(included_layers)
-
-    # All ranks must derive the same token capacity. Use the maximum number of
-    # non-skipped owned layers across shards, then account for the one full-size
-    # remote indexer scratch buffer allocated by LayerSplitDSATokenToKVPool.
-    max_owned_layers = 0
-    for rank in range(shard_size):
-        start, end = get_layer_shard_range(rank, shard_size, len(cache_layer_ids))
-        max_owned_layers = max(max_owned_layers, sum(included_layers[start:end]))
-    return max(1, max_owned_layers + 1)
-
-
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
     if dtype_name in ("float32", "fp32"):
@@ -316,10 +284,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
         )
 
-        from sglang.srt.mem_cache.kv_cache_configurator import (
-            calculate_mla_kv_cache_dim,
-        )
-
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
         dcp_size = get_parallel().attn_dcp_size
@@ -448,14 +412,47 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             _should_elide_dsa_index_k,
         )
 
-        if allocate_all_layers or not _should_elide_dsa_index_k(
-            is_draft_worker=kvc.is_draft_worker
+        if (
+            allocate_all_layers
+            or kvc.server_args.enable_hisparse
+            or not _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
         ):
             num_indexer_layers = num_layers
         else:
-            num_indexer_layers = _get_dsa_indexer_effective_num_layers(
-                kvc, _get_dsa_cache_layer_ids(kvc, num_layers)
+            from sglang.srt.layers.cp.utils import (
+                get_glm_dsa_cp_layer_shard_info,
+                get_layer_shard_range,
             )
+
+            _, shard_size = get_glm_dsa_cp_layer_shard_info(kvc)
+            if shard_size > 1:
+                # Preserve the existing LayerSplit sizing semantics. GLM-5.3
+                # hybrid-layer support is intentionally limited to the normal
+                # (non-LayerSplit) pool below.
+                active_indexer_layers = [
+                    layer_id
+                    for layer_id in range(
+                        kvc.layer_info.start_layer, kvc.layer_info.end_layer
+                    )
+                    if not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+                ]
+                active_set = set(active_indexer_layers)
+                max_owned = 0
+                for rank in range(shard_size):
+                    start, end = get_layer_shard_range(rank, shard_size, num_layers)
+                    max_owned = max(
+                        max_owned,
+                        sum(
+                            kvc.layer_info.start_layer + i in active_set
+                            for i in range(start, end)
+                        ),
+                    )
+                num_indexer_layers = max_owned + 1
+            else:
+                num_indexer_layers = sum(
+                    not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+                    for layer_id in _get_dsa_cache_layer_ids(kvc, num_layers)
+                )
 
         return int(
             indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
