@@ -552,7 +552,6 @@ class TestFactoryViews(unittest.TestCase):
             token_to_kv_pool_allocator=alloc,
             token_to_kv_pool=b.token_to_kv_pool,
             page_size=1,
-            dcp_size=1,
             device="cpu",
         )
         self.assertTrue(source.is_translating)

@@ -63,6 +63,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.runtime_context import get_parallel
 
 
 class KVReadTables(msgspec.Struct, frozen=True):
@@ -103,13 +104,11 @@ class KVIndexTranslator:
         token_to_kv_pool_allocator,
         token_to_kv_pool,
         page_size: int,
-        dcp_size: int,
         device: str,
     ):
         self.req_to_token = req_to_token
         self.page_size = page_size
         self.device = device
-        self.dcp_size = dcp_size
 
         self.is_translating = (
             isinstance(
@@ -129,11 +128,8 @@ class KVIndexTranslator:
             # carries the owner rule in `loc % dcp_size`. Identity with the read
             # translate when dcp_size == 1.
             self._translate_write_full = alloc.translate_write_loc_for_kernel
-            # DCP: read ids reach their consumer WIDENED, because selecting this
-            # rank's share changes the tensor's length and only the production
-            # site can do it. The table therefore stays virtual
-            # (`is_translated=False`) and the consumer calls
-            # `translate_dcp_read_ids` once, after selecting.
+            # DCP read ids stay WIDENED to the consumer: selecting this rank's
+            # share changes the length, so only the production site can do it.
             self.defer_read_translate = alloc.dcp_size > 1
             if isinstance(alloc, UnifiedSWATokenToKVPoolAllocator):
                 self._swa_v2p_table = alloc.swa_v2p_page_table
@@ -326,12 +322,8 @@ class KVIndexTranslator:
     def bind_and_verify_backends(self, backends) -> None:
         """Boot: make every reachable backend carry THIS translator.
 
-        Model-layer read-index producers (the DCP planner, the DeepSeek MHA
-        paths) reach the translator off `get_attn_backend()`, the same way they
-        reach the pools, so an unset attribute there is not "no translation
-        needed" -- it is an unreachable hook. Bind rather than assert for that
-        case; assert only when a backend carries a DIFFERENT translator, which
-        can only be a wiring bug.
+        Model-layer producers read it off `get_attn_backend()`, so an unset
+        attribute is an unreachable hook, not "no translation needed".
         """
         for backend in backends:
             if backend is None:
@@ -387,6 +379,12 @@ class KVIndexTranslator:
     # -- token-level translate surface (the mixin / local-attn consumers) ------
 
     @property
+    def dcp_size(self) -> int:
+        """Read at use, not at construction: the parallel bag is published
+        after some callers build a translator."""
+        return get_parallel().dcp_size
+
+    @property
     def needs_read_translate(self) -> bool:
         """Whether `translate_dcp_read_ids` is anything but the identity, so a
         hot path can skip the call rather than round-trip a no-op copy."""
@@ -395,11 +393,8 @@ class KVIndexTranslator:
     def translate_dcp_read_ids(self, widened_ids: torch.Tensor) -> torch.Tensor:
         """Widened logical READ ids -> kernel-facing ids, for either pool.
 
-        The single hook every DCP read-index production site calls. Selecting
-        this rank's share stays at the production site because it changes the
-        tensor's length; the collapse does not, so there is no second transform
-        to get out of order. On a static pool `widened // dcp_size` IS the whole
-        virtual->physical translation, which is why one hook serves both.
+        The one hook every DCP read-index production site calls; on a static
+        pool `widened // dcp_size` IS the whole virtual->physical translation.
         """
         if self.dcp_size > 1:
             widened_ids = widened_ids // self.dcp_size

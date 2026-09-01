@@ -54,7 +54,6 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
             token_to_kv_pool_allocator=SimpleNamespace(),
             token_to_kv_pool=SimpleNamespace(),
             page_size=1,
-            dcp_size=1,
             device="cpu",
         )
         backend.is_prefill_aware_swa = False

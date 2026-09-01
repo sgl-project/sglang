@@ -1555,15 +1555,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         v_moved = self.physical_to_virtual[src_pages].clone()  # read pre-wipe
 
-        # Expand page ids to token ids for the token-granular move kernel.
-        if self.page_size == 1:
+        # Expand to PHYSICAL token granularity, as the lazy `_flush` path does:
+        # these are physical page ids, and `page_size` is dcp_size times larger.
+        if self.pool_page_size == 1:
             src_t, dst_t = src_pages, dst_pages
         else:
-            offsets = torch.arange(
-                self.page_size, dtype=torch.int64, device=self.device
-            )
-            src_t = (src_pages[:, None] * self.page_size + offsets).reshape(-1)
-            dst_t = (dst_pages[:, None] * self.page_size + offsets).reshape(-1)
+            ps = self.pool_page_size
+            offsets = torch.arange(ps, dtype=torch.int64, device=self.device)
+            src_t = (src_pages[:, None] * ps + offsets).reshape(-1)
+            dst_t = (dst_pages[:, None] * ps + offsets).reshape(-1)
 
         # Un-translated copy: the public copy_from translates virtual ids,
         # which we must NOT do here.

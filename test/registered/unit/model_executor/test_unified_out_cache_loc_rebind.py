@@ -66,7 +66,6 @@ def _armed_source(v2p, swa_map):
         token_to_kv_pool_allocator=SimpleNamespace(),
         token_to_kv_pool=SimpleNamespace(),
         page_size=1,
-        dcp_size=1,
         device=_DEV,
     )
     src.is_translating = True

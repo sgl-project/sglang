@@ -930,9 +930,8 @@ class FlashInferMLAIndicesUpdaterDecode:
                 ENTRY_PAGE_SIZE=kv_view.entry_page_size,
             )
 
-            # SELECT BEFORE TRANSLATE. Under DCP the table above is deliberately
-            # VIRTUAL (`is_translated=False`): the planner picks this rank's
-            # share, which changes the length, and compacts it to the front.
+            # Under DCP the table above is deliberately VIRTUAL: the planner
+            # selects this rank's share and compacts it to the front.
             n_kernel_ids = paged_kernel_lens_sum
             if get_parallel().dcp_enabled:
                 n_kernel_ids = plan_dcp_decode_metadata(

@@ -44,8 +44,7 @@ def get_dcp_lens(
 def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
     """Keep this rank's share of a read-index tensor, still WIDENED.
 
-    Selection only -- the caller collapses and translates in one step via
-    KVIndexTranslator.translate_dcp_read_ids.
+    Selection only; the caller collapses via translate_dcp_read_ids.
     """
     parallel = get_parallel()
     if parallel.dcp_enabled:
