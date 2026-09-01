@@ -682,6 +682,57 @@ void transfer_kv_all_layer_lf_ph(
       head_num);
 }
 
+// D2H mirror of transfer_kv_per_layer_pfdhg_lf: write the device pool's
+// per-layer NHD rows back into a head-group-major page block.
+//
+// Required so the host pool has ONE byte order. The unified L3 grid reads and
+// writes page blocks as (page_num, HG, L, P, hg, D); if write-back kept
+// page_first_direct's natural (L, P, H, D) order, a page's order would depend
+// on whether it came from L3 or from the device, and the H2D would have no way
+// to tell. Same functor as the H2D, used as the destination.
+void transfer_kv_all_layer_lf_pfdhg(
+    const at::Tensor src_k_layers,
+    at::Tensor dst_k,
+    const at::Tensor src_v_layers,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
+  // The launcher's PageHeadLayout precondition only checks src_layout_dim,
+  // which is 0 in this direction; the head-group offset arithmetic divides
+  // dst_layout_dim here, so check that instead.
+  TORCH_CHECK(head_num > 0, "head_num must be positive, got ", head_num);
+  TORCH_CHECK(dst_layout_dim % head_num == 0, "dst_layout_dim must be divisible by head_num");
+  at::Tensor empty;
+  transfer_kv_launcher<get_global_offset_per_head_lf_tbl<const char>, get_global_offset_pfd_hg<char>, false, true>(
+      empty,
+      dst_k,
+      empty,
+      dst_v,
+      src_indices,
+      dst_indices,
+      0,
+      num_layers,
+      item_size,
+      0,
+      dst_layout_dim,
+      src_k_layers,
+      empty,
+      src_v_layers,
+      empty,
+      block_quota,
+      num_warps_per_block,
+      page_size,
+      head_num);
+}
+
 void transfer_kv_per_layer_mla(
     const at::Tensor src,
     at::Tensor dst,

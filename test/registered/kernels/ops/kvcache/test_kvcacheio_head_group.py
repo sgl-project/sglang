@@ -36,7 +36,9 @@ def _has_op() -> bool:
         from sgl_kernel import kvcacheio  # noqa: F401
     except ImportError:
         return False
-    return hasattr(kvcacheio, "transfer_kv_per_layer_pfdhg_lf")
+    return hasattr(kvcacheio, "transfer_kv_per_layer_pfdhg_lf") and hasattr(
+        kvcacheio, "transfer_kv_all_layer_lf_pfdhg"
+    )
 
 
 # (head_num, head_groups, layers, page_size, head_dim)
@@ -257,6 +259,143 @@ class TestTransferKVHeadGroup(CustomTestCase):
 
         # An empty transfer is a valid no-op, not a grid-size division by zero.
         launch(indices=idx[:0])
+
+
+@unittest.skipUnless(
+    _has_op(),
+    "requires CUDA and transfer_kv_all_layer_lf_pfdhg",
+)
+class TestTransferKVHeadGroupWriteBack(CustomTestCase):
+    """Correctness of transfer_kv_all_layer_lf_pfdhg (head-group-major D2H).
+
+    The write-back mirror of transfer_kv_per_layer_pfdhg_lf. It exists so the
+    host pool has ONE byte order: if write-back kept page_first_direct's natural
+    (layer, token, head, dim) order while the L3 grid reads head-group-major,
+    a page's order would depend on whether it arrived from the device or from
+    L3, and the H2D would have no way to tell.
+
+    Contract, the inverse of the H2D one:
+
+        host[d // P, g, layer, d % P, j, :] == device[layer][s, g * hg + j, :]
+    """
+
+    def _write_back(self, head_num, head_groups, layers, page_size, head_dim, dtype):
+        hg = head_num // head_groups
+        self.assertEqual(head_num % head_groups, 0)
+        num_pages = 3
+        rows = num_pages * page_size
+        itemsize = torch.tensor([], dtype=dtype).element_size()
+        item_size = head_num * head_dim * itemsize
+        layout_dim = item_size * layers
+
+        def make(seed):
+            n = layers * rows * head_num * head_dim
+            vals = (torch.arange(n, dtype=torch.int32) + seed) % 2048
+            return vals.to(dtype).reshape(layers, rows, head_num, head_dim).contiguous()
+
+        dev_k, dev_v = make(0).cuda(), make(1024).cuda()
+        host_k = torch.zeros(
+            num_pages, head_groups, layers, page_size, hg, head_dim, dtype=dtype
+        ).pin_memory()
+        host_v = torch.zeros_like(host_k)
+
+        # non-identity permutation so the index tensors are actually exercised
+        src = torch.arange(rows, dtype=torch.int64)
+        dst = torch.flip(src, [0]).contiguous()
+
+        k_tbl = torch.tensor(
+            [dev_k[i].data_ptr() for i in range(layers)], dtype=torch.uint64
+        ).cuda()
+        v_tbl = torch.tensor(
+            [dev_v[i].data_ptr() for i in range(layers)], dtype=torch.uint64
+        ).cuda()
+
+        from sgl_kernel.kvcacheio import transfer_kv_all_layer_lf_pfdhg
+
+        transfer_kv_all_layer_lf_pfdhg(
+            src_k_layers=k_tbl,
+            dst_k=host_k.view(-1),
+            src_v_layers=v_tbl,
+            dst_v=host_v.view(-1),
+            src_indices=src.cuda(),
+            dst_indices=dst.cuda(),
+            item_size=item_size,
+            dst_layout_dim=layout_dim,
+            num_layers=layers,
+            page_size=page_size,
+            head_num=head_groups,
+        )
+        torch.cuda.synchronize()
+        return host_k, host_v, dev_k, dev_v, src, dst, hg
+
+    def _check(self, host, dev, src, dst, page_size, head_groups, hg, label):
+        """Oracle built from the device tensor with plain torch indexing."""
+        want = torch.zeros_like(host)
+        for i in range(len(src)):
+            s, d = int(src[i]), int(dst[i])
+            page, tok = d // page_size, d % page_size
+            for layer in range(dev.shape[0]):
+                row = dev[layer, s].cpu()  # (head_num, head_dim)
+                for g in range(head_groups):
+                    want[page, g, layer, tok] = row[g * hg : (g + 1) * hg]
+        self.assertTrue(torch.equal(host, want), f"{label} mismatch")
+
+    def test_matches_oracle(self):
+        for (h, hgs, l, p, d), dtype in itertools.product(CONFIGS, DTYPES):
+            with self.subTest(
+                head_num=h,
+                head_groups=hgs,
+                layers=l,
+                page_size=p,
+                head_dim=d,
+                dtype=dtype,
+            ):
+                hk, hv, dk, dv, src, dst, hg = self._write_back(h, hgs, l, p, d, dtype)
+                self._check(hk, dk, src, dst, p, hgs, hg, "K")
+                self._check(hv, dv, src, dst, p, hgs, hg, "V")
+
+    def test_round_trip_is_identity(self):
+        """D2H then H2D over the same slots must return the original bytes.
+
+        This is the property the host pool actually relies on: a page written
+        back by the device and later loaded again must be unchanged, whatever
+        the head-group count.
+        """
+        from sgl_kernel.kvcacheio import transfer_kv_per_layer_pfdhg_lf
+
+        for head_num, head_groups, layers, page_size, head_dim in CONFIGS:
+            with self.subTest(
+                head_num=head_num,
+                head_groups=head_groups,
+                layers=layers,
+                page_size=page_size,
+                head_dim=head_dim,
+            ):
+                dtype = torch.bfloat16
+                hk, hv, dk, dv, src, dst, _ = self._write_back(
+                    head_num, head_groups, layers, page_size, head_dim, dtype
+                )
+                itemsize = torch.tensor([], dtype=dtype).element_size()
+                item_size = head_num * head_dim * itemsize
+                out_k, out_v = torch.zeros_like(dk), torch.zeros_like(dv)
+                # read back along the inverse index mapping
+                for layer in range(layers):
+                    transfer_kv_per_layer_pfdhg_lf(
+                        src_k=hk.view(-1),
+                        dst_k=out_k[layer],
+                        src_v=hv.view(-1),
+                        dst_v=out_v[layer],
+                        src_indices=dst.cuda(),
+                        dst_indices=src.cuda(),
+                        layer_id=layer,
+                        item_size=item_size,
+                        src_layout_dim=item_size * layers,
+                        page_size=page_size,
+                        head_num=head_groups,
+                    )
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(out_k, dk), "K round trip changed bytes")
+                self.assertTrue(torch.equal(out_v, dv), "V round trip changed bytes")
 
 
 if __name__ == "__main__":

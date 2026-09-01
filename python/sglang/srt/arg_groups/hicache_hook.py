@@ -198,11 +198,46 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
     )
 
 
+def _unified_adapter_knobs(server_args: Any) -> tuple[bool, bool]:
+    """Return ``(adapter, head_cut)`` for the unified L3 partition knobs.
+
+    ``adapter`` -- any partition knob is set, so L3 objects use the unified
+    byte order and the host layout must be ``page_first_direct`` (the only
+    layout whose page block IS that order).
+
+    ``head_cut`` -- the kv-head axis is partitioned, so page blocks become
+    head-group-major and the KV transfer must run through the permuting pfdhg
+    kernels, i.e. the ``kernel`` io backend. MLA has no kv-head axis to cut,
+    so its pages stay in the natural order and only need the layout.
+
+    Read from inline JSON only; the '@file' form and the runtime attach
+    endpoint are re-checked in HiCacheController._build_unified_suffix, which
+    is where a mismatch raises.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.hicache_storage_key_scheme != "unified":
+        return False, False
+    extra = cfg.hicache_storage_backend_extra_config
+    if not extra or extra.startswith("@"):
+        return False, False
+    try:
+        parsed = json.loads(extra)
+        head_group = parsed.get("head_group")
+        layer_partition = parsed.get("layer_partition")
+    except (ValueError, AttributeError):
+        return False, False
+    head_cut = bool(head_group) and not use_mla_backend(server_args)
+    adapter = head_cut or layer_partition is not None
+    return adapter, head_cut
+
+
 def resolve_layout_io_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
+    adapter, head_cut = _unified_adapter_knobs(server_args)
     if (
         cfg.hicache_mem_layout == "page_first_direct"
         and cfg.hicache_io_backend == "kernel"
+        and not head_cut
     ):
         declare_resolution(
             server_args,
@@ -212,6 +247,40 @@ def resolve_layout_io_compatibility(server_args: Any):
         logger.warning(
             "Kernel io backend does not support page first direct layout, switching to direct io backend"
         )
+
+    if adapter:
+        # Every partition knob needs page_first_direct: it is the only host
+        # layout whose page block already IS the unified byte order, so an L3
+        # chunk is one contiguous range. On page_first no chunk is contiguous
+        # at any page size > 1, which is why it is no longer an adapter layout.
+        # Steer here rather than let attach raise -- the mooncake default
+        # steering below would otherwise land a layer_partition-only
+        # deployment on page_first and fail at startup.
+        if cfg.hicache_mem_layout != "page_first_direct":
+            declare_resolution(
+                server_args,
+                "_resolve_layout_io_compatibility",
+                hicache_mem_layout="page_first_direct",
+            )
+            logger.warning(
+                "The unified key scheme's partition knobs require the "
+                "page_first_direct host layout, switching to it"
+            )
+    if head_cut:
+        # Head-group-major page blocks are only readable by the pfdhg transfer
+        # kernels, which are the 'kernel' io backend; the copy-engine 'direct'
+        # path can only move a page block verbatim.
+        if cfg.hicache_io_backend != "kernel":
+            declare_resolution(
+                server_args,
+                "_resolve_layout_io_compatibility",
+                hicache_io_backend="kernel",
+            )
+            logger.warning(
+                "The unified key scheme with head_group stores host pages "
+                "head-group-major, which only the kernel io backend can read; "
+                "switching to the kernel io backend"
+            )
 
     if cfg.hicache_mem_layout == "page_first" and cfg.hicache_io_backend == "direct":
         declare_resolution(

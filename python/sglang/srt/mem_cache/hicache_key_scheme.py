@@ -369,7 +369,9 @@ class UnifiedKVPlan(msgspec.Struct, frozen=True, kw_only=True):
 # Host layouts the adapter can present in the unified byte order. Deliberately
 # only the page-first pair: their page blocks are the two orders worth storing,
 # and both are what the server-arg resolution already steers L3 deployments to.
-ADAPTER_LAYOUTS = ("page_first", "page_first_direct")
+# Only page_first_direct stores a page block in the unified byte order, so
+# only it can serve L3 chunks as direct copies into and out of pool memory.
+ADAPTER_LAYOUTS = ("page_first_direct",)
 
 
 def plan_unified_kv(

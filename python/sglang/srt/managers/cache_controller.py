@@ -777,6 +777,14 @@ class HiCacheController:
                 "--hicache-storage-key-scheme unified."
             )
 
+        pool = getattr(self, "storage_host_pool", None)
+        if (unified_head_ranges is None or len(unified_head_ranges) <= 1) and getattr(
+            pool, "unified_head_groups", 1
+        ) != 1:
+            # This backend declares no head-group order, so the pool must not
+            # inherit one from a previous attach. Raises if pages are live.
+            pool.set_unified_head_groups(1)
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -820,11 +828,18 @@ class HiCacheController:
             plan_unified_kv,
         )
 
-        if type(self) is not HiCacheController:
+        # A unified namespace names ONE grid, so it covers a controller that
+        # owns exactly one host pool. That is the plain controller and also the
+        # KV-only hybrid stack (a dense model on UnifiedRadixCache, whose only
+        # component is FULL). Side pools -- SWA, Mamba, C128 -- each need their
+        # own grid, which is the follow-up.
+        pool_entries = getattr(self.mem_pool_host, "entries", None)
+        if pool_entries is not None and len(pool_entries) != 1:
             raise NotImplementedError(
-                "the unified key scheme is not supported for hybrid/side-pool cache "
-                "controllers yet (per-component grids are the follow-up); use "
-                "--hicache-storage-key-scheme rank-suffix."
+                f"the unified key scheme is not supported for multi-component "
+                f"cache controllers yet (this one has {len(pool_entries)} host "
+                f"pools; per-component grids are the follow-up); use "
+                f"--hicache-storage-key-scheme rank-suffix."
             )
         if self.storage_backend_type not in ("file", "mooncake"):
             raise NotImplementedError(
@@ -847,18 +862,50 @@ class HiCacheController:
             dtype=normalize_dtype(self.mem_pool_device.dtype),
             page_size=self.page_size,
             rank_replicated=is_rank_replicated,
-            local_kv_heads=0 if is_rank_replicated else self.mem_pool_host.head_num,
+            local_kv_heads=0 if is_rank_replicated else self.storage_host_pool.head_num,
             attn_tp_rank=self.tp_rank,
             attn_tp_size=self.tp_size,
             attn_cp_size=attn_cp_size,
-            start_layer=self.mem_pool_host.start_layer,
-            end_layer=self.mem_pool_host.end_layer,
+            start_layer=self.storage_host_pool.start_layer,
+            end_layer=self.storage_host_pool.end_layer,
             is_final_stage=self.pp_rank == self.pp_size - 1,
-            pool_layout=self.mem_pool_host.layout,
+            pool_layout=self.storage_host_pool.layout,
             head_group_knob=head_group_knob,
             layer_partition=layer_partition,
         )
-        if plan.adapter and not torch.is_tensor(self.mem_pool_host.kv_buffer):
+        head_cut = plan.head_ranges is not None and len(plan.head_ranges) > 1
+        if head_cut:
+            # Page blocks are head-group-major, which ONLY the pfdhg kernels can
+            # read. transfer_kv_*_direct_* move a page block verbatim, so the
+            # copy-engine path would transfer permuted bytes as if natural.
+            # Checked here rather than only in the arg hook because the hook
+            # sees inline JSON only -- '@file' configs and the runtime attach
+            # endpoint reach this point without it.
+            if self.io_backend != "kernel":
+                raise NotImplementedError(
+                    f"unified head_group stores host pages head-group-major, "
+                    f"which only --hicache-io-backend kernel can read; got "
+                    f"{self.io_backend!r}. (The copy-engine 'direct' backend "
+                    f"moves a page block verbatim and would silently transfer "
+                    f"permuted bytes.)"
+                )
+            if self.storage_host_pool.layout != "page_first_direct":
+                raise NotImplementedError(
+                    f"unified head_group requires --hicache-mem-layout "
+                    f"page_first_direct; got {self.storage_host_pool.layout!r}."
+                )
+        if plan.adapter and getattr(
+            self.storage_host_pool, "mtp_draft_device_pools", ()
+        ):
+            # Draft layers are appended to the host pool's layer axis but are
+            # not named by the grid, so they would sit inside a head group's
+            # region unnamed and be transferred in the wrong byte order.
+            raise NotImplementedError(
+                "unified-scheme partition knobs (head_group / layer_partition) "
+                "do not support MTP draft pools: the draft layers are not part "
+                "of the L3 grid. Use --hicache-storage-key-scheme rank-suffix."
+            )
+        if plan.adapter and not torch.is_tensor(self.storage_host_pool.kv_buffer):
             # Fail at attach, not on the first backup — a raise on the
             # storage threads would silently wedge write-back.
             raise NotImplementedError(

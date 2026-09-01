@@ -51,6 +51,7 @@ if _is_cuda or _is_hip:
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_lf_pf,
+        transfer_kv_all_layer_lf_pfdhg,
         transfer_kv_all_layer_lf_ph,
         transfer_kv_all_layer_mla_lf_pf,
         transfer_kv_direct,
@@ -59,6 +60,7 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
         transfer_kv_per_layer_pf_lf,
+        transfer_kv_per_layer_pfdhg_lf,
         transfer_kv_per_layer_ph_lf,
     )
 if _is_npu:
@@ -325,6 +327,24 @@ class MHATokenToKVPoolHost(UnifiedKVLayoutHostMixin, HostKVCache):
                     page_size=self.page_size,
                     head_num=self.head_num,
                 )
+            elif self.layout == "page_first_direct":
+                # Head-group-major page blocks (the unified L3 grid cuts the kv
+                # head axis). head_num here is the head GROUP count, so the
+                # kernel's per-head-group run is one L3 chunk's worth of a
+                # token. With one group this is page_first_direct's own order.
+                transfer_kv_per_layer_pfdhg_lf(
+                    src_k=self.k_buffer,
+                    dst_k=device_pool.k_buffer[device_layer_id],
+                    src_v=self.v_buffer,
+                    dst_v=device_pool.v_buffer[device_layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=host_layer_id,
+                    item_size=self.token_stride_size,
+                    src_layout_dim=self.layout_dim,
+                    page_size=self.page_size,
+                    head_num=self.unified_head_groups,
+                )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
@@ -469,6 +489,23 @@ class MHATokenToKVPoolHost(UnifiedKVLayoutHostMixin, HostKVCache):
                     page_size=self.page_size,
                     head_num=self.head_num,
                 )
+            elif self.layout == "page_first_direct":
+                # Mirror of the H2D arm: write back in the SAME head-group-major
+                # order the L3 grid reads, so a page's byte order does not
+                # depend on whether it came from the device or from L3.
+                transfer_kv_all_layer_lf_pfdhg(
+                    src_k_layers=device_k_data_ptrs,
+                    dst_k=self.k_buffer,
+                    src_v_layers=device_v_data_ptrs,
+                    dst_v=self.v_buffer,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    item_size=self.token_stride_size,
+                    dst_layout_dim=self.layout_dim,
+                    num_layers=self.layer_num,
+                    page_size=self.page_size,
+                    head_num=self.unified_head_groups,
+                )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
@@ -612,29 +649,26 @@ class MHATokenToKVPoolHost(UnifiedKVLayoutHostMixin, HostKVCache):
         return ptr_list, element_size_list
 
     def _unified_page_view(self, index: int):
-        """One page's KV as a (2, layer, page_size, head, dim) strided view.
+        """One page's KV as a (2, layer, page_size, head, dim) view.
 
-        The unified byte order — (layer, token, head, dim) per K/V half — is
-        exactly ``page_first_direct``'s page block, so there a chunk covering
-        the rank's whole head shard is a single contiguous range and transfers
-        straight from pool memory: every layer partition, including a model's
-        short trailing chunk at a prime layer count, is zero-copy.
-        ``page_first`` stores (token, layer, head, dim) and so stages.
+        ``page_first_direct``'s page block IS the unified byte order, so each
+        component's block is contiguous and an L3 chunk is a single byte range
+        of pool memory -- that is what lets both transfer directions be direct
+        copies. Cutting the kv-head axis keeps that property by storing the
+        block head-group-major (see unified_layout); a chunk is still one
+        range, and the pfdhg kernels absorb the permutation.
 
-        Cutting the head axis costs on both: a head subgroup breaks
-        contiguity at the token axis, leaving runs of
-        ``head_group x head_dim``. A single linear order can make only one
-        axis outermost; this one buys the layer axis — the axis
-        ``page_first_direct`` already stores, and the only axis MLA has.
+        ``page_first`` stores (token, layer, head, dim), where no chunk is
+        contiguous at any page size > 1, so it cannot be served by a direct
+        copy and is rejected here rather than silently staged.
         """
-        if self.layout == "page_first":
-            page = self.kv_buffer[:, index : index + self.page_size]
-            return page.permute(0, 2, 1, 3, 4)
         if self.layout == "page_first_direct":
             return self.kv_buffer[:, index // self.page_size]
         raise ValueError(
             f"the unified key scheme does not support the {self.layout!r} host "
-            f"layout; use page_first or page_first_direct."
+            f"layout; use --hicache-mem-layout page_first_direct (its page "
+            f"block is the unified byte order, so L3 objects transfer without "
+            f"a copy)."
         )
 
     def get_page_buffer_meta(self, indices):

@@ -715,10 +715,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 KVCacheLayoutAdapter,
             )
 
+            # The adapter owns no buffers: both directions address the host
+            # pool, which is already registered above.
             self.layout_adapter = KVCacheLayoutAdapter(
-                self.mem_pool_host,
-                self.storage_config,
-                register_buffer=super().register_buffer,
+                self.mem_pool_host, self.storage_config
             )
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
@@ -1077,47 +1077,47 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ]
 
     def _batch_set_adapter(self, keys: List[str], host_indices) -> List[bool]:
-        """Layout-adapter write: unified-order (ptr, size) slabs per
-        sub-batch (zero-copy where pool-contiguous, staged otherwise),
-        then put."""
+        """Layout-adapter write: put each chunk straight out of host pool memory.
+
+        The chunk pointers address the pool directly, so there is no packing
+        step -- the page block already stores the unified byte order.
+        """
         start_time = time.perf_counter()
         adapter = self.layout_adapter
-        results: List[bool] = []
-        for page_keys, indices in adapter.sub_batches(keys, host_indices):
-            ptrs, sizes = adapter.gather(indices)
-            key_strs = adapter.chunk_keys(page_keys)
-            assert len(key_strs) == len(ptrs)
-            exist_result = self._batch_exist(key_strs)
-            put_keys, put_ptrs, put_sizes, put_slots = [], [], [], []
-            set_results = [-1] * len(key_strs)
-            for i, key_str in enumerate(key_strs):
-                if exist_result[i] != 1:
-                    put_keys.append(key_str)
-                    put_ptrs.append(ptrs[i])
-                    put_sizes.append(sizes[i])
-                    put_slots.append(i)
-                else:
-                    set_results[i] = 0
-            if put_keys:
-                group_ids = (
-                    self._expand_group_ids(page_keys, adapter.keys_per_page)
-                    if self._can_use_group_semantics()
-                    else None
-                )
-                if group_ids is not None:
-                    group_ids = [group_ids[i] for i in put_slots]
-                put_results = self._put_batch_zero_copy_impl(
-                    put_keys, put_ptrs, put_sizes, group_ids=group_ids
-                )
-                for slot, res in zip(put_slots, put_results):
-                    set_results[slot] = res
-            results.extend(
-                self._batch_postprocess(
-                    set_results,
-                    is_set_operate=True,
-                    key_multiplier=adapter.keys_per_page,
-                )
+        ptrs, sizes = adapter.chunk_metas(host_indices)
+        key_strs = adapter.chunk_keys(keys)
+        assert len(key_strs) == len(ptrs)
+
+        exist_result = self._batch_exist(key_strs)
+        put_keys, put_ptrs, put_sizes, put_slots = [], [], [], []
+        set_results = [-1] * len(key_strs)
+        for i, key_str in enumerate(key_strs):
+            if exist_result[i] != 1:
+                put_keys.append(key_str)
+                put_ptrs.append(ptrs[i])
+                put_sizes.append(sizes[i])
+                put_slots.append(i)
+            else:
+                set_results[i] = 0
+        if put_keys:
+            group_ids = (
+                self._expand_group_ids(keys, adapter.keys_per_page)
+                if self._can_use_group_semantics()
+                else None
             )
+            if group_ids is not None:
+                group_ids = [group_ids[i] for i in put_slots]
+            put_results = self._put_batch_zero_copy_impl(
+                put_keys, put_ptrs, put_sizes, group_ids=group_ids
+            )
+            for slot, res in zip(put_slots, put_results):
+                set_results[slot] = res
+
+        results = self._batch_postprocess(
+            set_results,
+            is_set_operate=True,
+            key_multiplier=adapter.keys_per_page,
+        )
         if self.enable_storage_metrics:
             self.backup_pgs.append(len(keys))
             self.backup_bandwidth.append(
@@ -1126,27 +1126,25 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return results
 
     def _batch_get_adapter(self, keys: List[str], host_indices) -> List[bool]:
-        """Layout-adapter read into the pool or component-major staging.
+        """Layout-adapter read: get each chunk straight into host pool memory.
 
-        All-direct plans fetch into the pool. If any slab is strided, every
-        slab lands in staging so the result forms an H2D-ready component arena;
-        successful pages are then scattered into the host pool.
+        A direct copy -- the transport writes the pool's own pages, so nothing
+        is staged and nothing is scattered afterwards. Chunks of a page that
+        failed leave that page partially written, which is safe because the
+        caller only inserts pages whose whole leading run succeeded.
         """
         start_time = time.perf_counter()
         adapter = self.layout_adapter
-        results: List[bool] = []
-        for page_keys, indices in adapter.sub_batches(keys, host_indices):
-            key_strs = adapter.chunk_keys(page_keys)
-            ptrs, sizes = adapter.read_metas(indices)
-            assert len(key_strs) == len(ptrs)
-            get_results = self._get_batch_zero_copy_impl(key_strs, ptrs, sizes)
-            page_ok = self._batch_postprocess(
-                get_results,
-                is_set_operate=False,
-                key_multiplier=adapter.keys_per_page,
-            )
-            adapter.scatter(indices, page_ok)
-            results.extend(page_ok)
+        ptrs, sizes = adapter.chunk_metas(host_indices)
+        key_strs = adapter.chunk_keys(keys)
+        assert len(key_strs) == len(ptrs)
+
+        get_results = self._get_batch_zero_copy_impl(key_strs, ptrs, sizes)
+        results = self._batch_postprocess(
+            get_results,
+            is_set_operate=False,
+            key_multiplier=adapter.keys_per_page,
+        )
         if self.enable_storage_metrics:
             self.prefetch_pgs.append(len(keys))
             self.prefetch_bandwidth.append(

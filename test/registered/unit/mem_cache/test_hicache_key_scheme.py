@@ -1,10 +1,12 @@
 """Unit tests for srt/mem_cache/hicache_key_scheme (unified L3 keys)."""
 
+import ctypes
 import json
 import tempfile
 import unittest
 
 import msgspec
+import torch
 
 from sglang.srt.mem_cache.hicache_key_scheme import (
     KVCacheNamespace,
@@ -21,6 +23,30 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _tobytes(tensor) -> bytes:
+    """Raw bytes of ``tensor`` in its own dim order."""
+    return tensor.contiguous().flatten().view(torch.uint8).numpy().tobytes()
+
+
+def _assert_chunk_bytes(case, got, want, label=""):
+    """Compare chunk byte lists without letting unittest render a diff.
+
+    ``assertEqual`` on lists of multi-kilobyte bytes spends its time building a
+    repr diff nobody can read; report the first differing chunk instead.
+    """
+    case.assertEqual(len(got), len(want), f"{label}: chunk count")
+    for i, (g, w) in enumerate(zip(got, want)):
+        if g == w:
+            continue
+        where = next(
+            (j for j, (a, b) in enumerate(zip(g, w)) if a != b), min(len(g), len(w))
+        )
+        case.fail(
+            f"{label}: chunk {i} differs at byte {where} "
+            f"({len(g)} vs {len(w)} bytes)"
+        )
 
 
 def _gqa_namespace(**overrides) -> KVCacheNamespace:
@@ -426,7 +452,9 @@ class TestUnifiedKVPlan(CustomTestCase):
             start_layer=0,
             end_layer=61,
             is_final_stage=True,
-            pool_layout="page_first",
+            # The only layout the adapter can serve: its page block IS the
+            # unified byte order, so every chunk is one contiguous range.
+            pool_layout="page_first_direct",
         )
         kwargs.update(overrides)
         return plan_unified_kv(**kwargs)
@@ -434,16 +462,21 @@ class TestUnifiedKVPlan(CustomTestCase):
     def test_no_knobs_keeps_raw_layout(self):
         plan = self._plan()
         self.assertFalse(plan.adapter)
-        self.assertEqual(plan.namespace.object_layout, "page_first")
+        self.assertEqual(plan.namespace.object_layout, "page_first_direct")
         self.assertEqual(len(plan.suffixes), 1)
         self.assertIsNone(plan.layer_ranges)
         self.assertIsNone(plan.head_ranges)
+        # Without a knob there is no adapter, so no layout requirement: the
+        # raw pool bytes are the object and any host layout may write them.
+        raw = self._plan(pool_layout="page_first")
+        self.assertFalse(raw.adapter)
+        self.assertEqual(raw.namespace.object_layout, "page_first")
 
     def test_any_knob_selects_adapter(self):
         # head knob alone: adapter, single layer window, head chunks.
         plan = self._plan(head_group_knob=2)
         self.assertTrue(plan.adapter)
-        self.assertEqual(plan.namespace.object_layout, "unified-v2:page_first")
+        self.assertEqual(plan.namespace.object_layout, "unified-v2:page_first_direct")
         self.assertEqual(plan.layer_ranges, [(0, 61)])
         self.assertEqual(plan.head_ranges, [(0, 2), (2, 4)])
         self.assertEqual(len(plan.suffixes), 2)
@@ -499,12 +532,7 @@ class TestUnifiedKVPlan(CustomTestCase):
     def test_host_layout_partitions_the_keyspace(self):
         """page_first and page_first_direct serialize a page differently and we
         do not reuse objects across them, so the layout stays in the identity
-        with or without a partition knob."""
-        adapter = {
-            namespace_digest(self._plan(layer_partition=30, pool_layout=lay).namespace)
-            for lay in ("page_first", "page_first_direct")
-        }
-        self.assertEqual(len(adapter), 2)
+        even where no adapter is involved."""
         raw = {
             namespace_digest(self._plan(pool_layout=lay).namespace)
             for lay in ("page_first", "page_first_direct")
@@ -518,10 +546,24 @@ class TestUnifiedKVPlan(CustomTestCase):
             namespace_digest(self._plan().namespace),
         )
 
+    def test_adapter_supports_only_page_first_direct(self):
+        """Every chunk is now ONE contiguous byte range of the host pool, in
+        both directions. Only page_first_direct's page block stores that byte
+        order, so every other host layout is rejected outright rather than
+        silently repacked through a staging buffer."""
+        from sglang.srt.mem_cache.hicache_key_scheme import ADAPTER_LAYOUTS
+
+        self.assertEqual(ADAPTER_LAYOUTS, ("page_first_direct",))
+        # page_first used to be a supported adapter layout (staged); it is not.
+        for knob in ({"layer_partition": 30}, {"head_group_knob": 2}):
+            with self.assertRaisesRegex(ValueError, "page_first_direct") as ctx:
+                self._plan(pool_layout="page_first", **knob)
+            self.assertIn("does not support", str(ctx.exception))
+
     def test_plan_validation(self):
         with self.assertRaisesRegex(ValueError, "does not support"):
             self._plan(pool_layout="page_first_kv_split", layer_partition=30)
-        for unsupported in ("layer_first", "page_head"):
+        for unsupported in ("layer_first", "page_head", "page_first"):
             with self.assertRaisesRegex(ValueError, "does not support"):
                 self._plan(pool_layout=unsupported, layer_partition=30)
         with self.assertRaisesRegex(ValueError, "divide"):
@@ -540,7 +582,7 @@ class TestControllerGuards(CustomTestCase):
     """Attach-time guards of HiCacheController._build_unified_suffix."""
 
     class _StubHostPool:
-        def __init__(self, layout: str):
+        def __init__(self, layout: str = "page_first_direct"):
             self.layout = layout
             self.head_num = 4
             self.start_layer = 0
@@ -549,17 +591,34 @@ class TestControllerGuards(CustomTestCase):
 
             self.kv_buffer = torch.zeros(1)
 
+    class _StubPoolGroup:
+        """A hybrid stack's host-pool group; ``entries`` is what the guard
+        counts. One entry (a dense model's FULL component) is supported."""
+
+        def __init__(self, *host_pools):
+            self.entries = list(host_pools)
+            self.anchor_entry = self.entries[0]
+
     class _StubDevicePool:
         def __init__(self):
             import torch
 
             self.dtype = torch.bfloat16
 
-    def _stub_controller(self, controller_cls, backend_type: str):
+    def _stub_controller(
+        self, controller_cls, backend_type: str, layout: str = "page_first_direct"
+    ):
         controller = controller_cls.__new__(controller_cls)
         controller.storage_backend_type = backend_type
-        controller.mem_pool_host = self._StubHostPool("page_first")
+        host_pool = self._StubHostPool(layout)
+        # A plain controller's host pool is the storage pool itself, and has
+        # no `entries`.
+        controller.mem_pool_host = host_pool
+        controller.storage_host_pool = host_pool
         controller.mem_pool_device = self._StubDevicePool()
+        # Head-group-major page blocks are only readable by the pfdhg transfer
+        # kernels, i.e. the 'kernel' io backend.
+        controller.io_backend = "kernel"
         controller.page_size = 64
         controller.tp_rank, controller.tp_size = 0, 2
         controller.pp_rank, controller.pp_size = 0, 1
@@ -585,15 +644,39 @@ class TestControllerGuards(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "file and mooncake"):
             self._build(nixl)
 
-    def test_subclass_controllers_rejected(self):
+    def test_multi_component_pool_groups_rejected(self):
+        """The guard is now about the POOL, not the controller class: one
+        unified namespace names one grid, so a host-pool group with several
+        components (SWA / Mamba / C128 side pools) has no single grid."""
         from sglang.srt.managers.cache_controller import HiCacheController
 
         class FakeHybridController(HiCacheController):
             pass
 
         hybrid = self._stub_controller(FakeHybridController, "mooncake")
-        with self.assertRaisesRegex(NotImplementedError, "hybrid"):
-            self._build(hybrid)
+        hybrid.mem_pool_host = self._StubPoolGroup(
+            hybrid.storage_host_pool, self._StubHostPool()
+        )
+        with self.assertRaisesRegex(NotImplementedError, "multi-component"):
+            self._build(hybrid, is_rank_replicated=False, head_group_knob=2)
+
+    def test_kv_only_hybrid_stack_is_allowed(self):
+        """A dense model on UnifiedRadixCache is a hybrid controller whose pool
+        group holds exactly one (FULL) component. That is the default path and
+        must attach: the class no longer decides, the entry count does."""
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        class FakeHybridController(HiCacheController):
+            pass
+
+        hybrid = self._stub_controller(FakeHybridController, "mooncake")
+        hybrid.mem_pool_host = self._StubPoolGroup(hybrid.storage_host_pool)
+        suffix, layer_ranges, head_ranges = self._build(
+            hybrid, is_rank_replicated=False, head_group_knob=2
+        )
+        self.assertEqual(len(suffix), 2)
+        self.assertEqual(layer_ranges, [(0, 61)])
+        self.assertEqual(head_ranges, [(0, 2), (2, 4)])
 
     def test_partition_knobs_require_mooncake(self):
         from sglang.srt.managers.cache_controller import HiCacheController
@@ -604,9 +687,9 @@ class TestControllerGuards(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "multi-key"):
             self._build(file_stub, layer_partition=30)
 
-    def test_adapter_plan_from_any_layout(self):
-        # No host-layout requirement: head_group on a page_first pool
-        # attaches through the adapter (list suffix + local chunk grid).
+    def test_adapter_plan_on_page_first_direct(self):
+        # head_group on a page_first_direct pool attaches through the adapter
+        # (list suffix + local chunk grid).
         from sglang.srt.managers.cache_controller import HiCacheController
 
         stub = self._stub_controller(HiCacheController, "mooncake")
@@ -621,23 +704,64 @@ class TestControllerGuards(CustomTestCase):
     def test_adapter_rejects_unsupported_layout_at_attach(self):
         from sglang.srt.managers.cache_controller import HiCacheController
 
+        # page_first is no longer an adapter layout: nothing stages any more,
+        # so a layout whose page block is not the unified order cannot serve
+        # an L3 chunk at all.
+        for layout in ("page_first", "page_first_kv_split", "layer_first"):
+            stub = self._stub_controller(HiCacheController, "mooncake", layout=layout)
+            with self.assertRaisesRegex(ValueError, "does not support"):
+                self._build(
+                    stub,
+                    is_rank_replicated=False,
+                    head_group_knob=2,
+                    layer_partition=30,
+                )
+
+    def test_head_cut_requires_the_kernel_io_backend(self):
+        """A head cut makes the pool's page blocks head-group-major, which only
+        the pfdhg kernels can read. The copy-engine 'direct' backend moves a
+        page block verbatim and would transfer permuted bytes as if natural."""
+        from sglang.srt.managers.cache_controller import HiCacheController
+
         stub = self._stub_controller(HiCacheController, "mooncake")
-        stub.mem_pool_host = self._StubHostPool("page_first_kv_split")
-        with self.assertRaisesRegex(ValueError, "does not support"):
-            self._build(
-                stub,
-                is_rank_replicated=False,
-                head_group_knob=2,
-                layer_partition=30,
-            )
+        stub.io_backend = "direct"
+        with self.assertRaisesRegex(NotImplementedError, "head-group-major"):
+            self._build(stub, is_rank_replicated=False, head_group_knob=2)
+        # A grid that does NOT cut heads keeps the natural order, so any io
+        # backend can read it.
+        layer_only = self._stub_controller(HiCacheController, "mooncake")
+        layer_only.io_backend = "direct"
+        suffix, layer_ranges, head_ranges = self._build(
+            layer_only, is_rank_replicated=False, layer_partition=30
+        )
+        self.assertEqual(head_ranges, [(0, 4)])
+        self.assertEqual(len(suffix), len(layer_ranges))
 
     def test_adapter_rejects_split_kv_pools(self):
         from sglang.srt.managers.cache_controller import HiCacheController
 
         stub = self._stub_controller(HiCacheController, "mooncake")
-        stub.mem_pool_host.kv_buffer = (1, 2)
+        stub.storage_host_pool.kv_buffer = (1, 2)
         with self.assertRaisesRegex(NotImplementedError, "split K/V"):
             self._build(stub, is_rank_replicated=False, head_group_knob=2)
+
+    def test_adapter_rejects_mtp_draft_pools(self):
+        """Draft layers extend the host pool's layer axis but are not named by
+        the L3 grid; under a head cut they would sit inside a head group's
+        region and be transferred in the wrong byte order."""
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        stub = self._stub_controller(HiCacheController, "mooncake")
+        stub.storage_host_pool.mtp_draft_device_pools = (object(),)
+        with self.assertRaisesRegex(NotImplementedError, "MTP draft"):
+            self._build(stub, is_rank_replicated=False, head_group_knob=2)
+        # ...and only under the adapter: knob-free plans are untouched (one
+        # suffix string, no chunk grid), so MTP still works without the grid.
+        stub2 = self._stub_controller(HiCacheController, "mooncake")
+        stub2.storage_host_pool.mtp_draft_device_pools = (object(),)
+        suffix, layer_ranges, head_ranges = self._build(stub2)
+        self.assertIsInstance(suffix, str)
+        self.assertEqual((layer_ranges, head_ranges), (None, None))
 
     def test_nonpositive_head_group_rejected(self):
         from sglang.srt.managers.cache_controller import HiCacheController
@@ -836,15 +960,15 @@ class TestLayerPartition(CustomTestCase):
 
 
 class TestMlaLayoutAdapter(CustomTestCase):
-    """MLA layout adapter: page_first_direct is already the unified order,
-    so its slabs skip the staging copy (pointer math == the pool address);
-    other layouts stage byte-identical unified chunks."""
+    """MLA unified chunks. ``page_first_direct``'s page block IS the unified
+    MLA order (layer, token, dim), so every chunk is ONE contiguous byte range
+    of host pool memory: a get lands straight in the pool and a put reads
+    straight out of it. Nothing is staged, and no other host layout can serve
+    a chunk at all."""
 
     _PS, _LAYERS, _DIM, _PAGES = 4, 6, 8, 3
 
     def _logical(self):
-        import torch
-
         torch.manual_seed(0)
         # L[layer, token, 1, dim] per page — the unified MLA order.
         return [
@@ -853,8 +977,6 @@ class TestMlaLayoutAdapter(CustomTestCase):
         ]
 
     def _pool(self, layout, logical):
-        import torch
-
         from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
         pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
@@ -864,6 +986,7 @@ class TestMlaLayoutAdapter(CustomTestCase):
         pool.layer_num = self._LAYERS
         pool.dtype = torch.bfloat16
         pool.size = self._PAGES * self._PS
+        pool.slot_used = torch.zeros(pool.size, dtype=torch.bool)
         if layout == "layer_first":
             pool.kv_buffer = torch.zeros(
                 self._LAYERS, pool.size, 1, self._DIM, dtype=pool.dtype
@@ -888,100 +1011,92 @@ class TestMlaLayoutAdapter(CustomTestCase):
 
     _RANGES = [(0, 2), (2, 6)]
 
-    def test_page_first_direct_is_zero_copy(self):
-        import torch
-
+    def test_chunk_metas_address_the_pool_directly(self):
         pool = self._pool("page_first_direct", self._logical())
-        self.assertTrue(pool.unified_zero_copy(self._RANGES))
         itemsize = pool.dtype.itemsize
         layer_stride = pool.page_size * pool.kv_cache_dim * itemsize
         page_stride = pool.layer_num * layer_stride
         base = pool.kv_buffer.data_ptr()
-        # Pages 2 and 0; no staging needed for direct slabs.
+        # Pages 2 and 0, in that order: chunk metas are page-major then slab
+        # order, and every pointer is a pool address (no staging buffer).
         indices = torch.tensor([8, 9, 10, 11, 0, 1, 2, 3])
-        for meta in (pool.gather_unified_chunks, pool.get_unified_chunk_meta):
-            ptrs, sizes = meta(indices, self._RANGES, None, None)
-            self.assertEqual(
-                ptrs,
-                [
-                    base + 2 * page_stride,
-                    base + 2 * page_stride + 2 * layer_stride,
-                    base,
-                    base + 2 * layer_stride,
-                ],
-            )
-            self.assertEqual(sizes, [2 * layer_stride, 4 * layer_stride] * 2)
-
-    def test_all_layouts_gather_identical_unified_bytes(self):
-        import ctypes
-
-        import torch
-
-        logical = self._logical()
-        indices = torch.arange(self._PAGES * self._PS)
-        expected = b"".join(
-            bytes(L[l0:l1].contiguous().view(torch.uint8).flatten().tolist())
-            for L in logical
-            for l0, l1 in self._RANGES
+        ptrs, sizes = pool.get_unified_chunk_meta(indices, self._RANGES, None)
+        self.assertEqual(
+            ptrs,
+            [
+                base + 2 * page_stride,
+                base + 2 * page_stride + 2 * layer_stride,
+                base,
+                base + 2 * layer_stride,
+            ],
         )
-        for layout in ("page_first", "page_first_direct"):
-            pool = self._pool(layout, logical)
-            staging = torch.zeros(
-                self._PAGES * pool.unified_bytes_per_page(self._RANGES),
-                dtype=torch.uint8,
-            )
-            ptrs, sizes = pool.gather_unified_chunks(
-                indices, self._RANGES, None, staging
-            )
-            got = b"".join(
-                ctypes.string_at(ptr, size) for ptr, size in zip(ptrs, sizes)
-            )
-            self.assertEqual(got, expected, layout)
+        self.assertEqual(sizes, [2 * layer_stride, 4 * layer_stride] * 2)
+        # The chunks tile each page block exactly — nothing is left unnamed.
+        self.assertEqual(sum(sizes), 2 * page_stride)
 
-    def test_scatter_inverts_fetch_for_staged_layouts(self):
-        import ctypes
-
-        import torch
-
+    def test_chunk_bytes_are_the_logical_chunk_contents(self):
+        """The strongest statement available: the bytes NAMED by chunk_metas
+        equal the logical (layer range) chunk taken from the naturally-ordered
+        reference tensor by plain indexing."""
         logical = self._logical()
+        pool = self._pool("page_first_direct", logical)
         indices = torch.arange(self._PAGES * self._PS)
+        ptrs, sizes = pool.get_unified_chunk_meta(indices, self._RANGES, None)
+        got = [ctypes.string_at(ptr, size) for ptr, size in zip(ptrs, sizes)]
+        want = [_tobytes(L[l0:l1]) for L in logical for l0, l1 in self._RANGES]
+        _assert_chunk_bytes(self, got, want)
+
+    def test_direct_get_lands_in_the_pool(self):
+        """A get is a direct copy into pool memory: no staging, no scatter.
+        Chunks of a page that failed simply leave that page untouched."""
+        logical = self._logical()
         writer = self._pool("page_first_direct", logical)
-        src_ptrs, src_sizes = writer.gather_unified_chunks(
-            indices, self._RANGES, None, None
-        )
-        reader = self._pool("page_first", [torch.zeros_like(l) for l in logical])
-        self.assertFalse(reader.unified_zero_copy(self._RANGES))
-        staging = torch.zeros(
-            self._PAGES * reader.unified_bytes_per_page(self._RANGES), dtype=torch.uint8
-        )
-        dst_ptrs, dst_sizes = reader.get_unified_chunk_meta(
-            indices, self._RANGES, None, staging
-        )
+        reader = self._pool("page_first_direct", [torch.zeros_like(L) for L in logical])
+        indices = torch.arange(self._PAGES * self._PS)
+        src_ptrs, src_sizes = writer.get_unified_chunk_meta(indices, self._RANGES, None)
+        dst_ptrs, dst_sizes = reader.get_unified_chunk_meta(indices, self._RANGES, None)
         self.assertEqual(src_sizes, dst_sizes)
-        # Emulate the store fetch, then scatter; page 1 "failed".
-        for dst, src, size in zip(dst_ptrs, src_ptrs, src_sizes):
+        # Emulate the transport writing pool memory; page 1 "failed".
+        chunks_per_page = len(self._RANGES)
+        for i, (dst, src, size) in enumerate(zip(dst_ptrs, src_ptrs, src_sizes)):
+            if i // chunks_per_page == 1:
+                continue
             ctypes.memmove(dst, src, size)
-        page_ok = [True, False, True]
-        reader.scatter_unified_chunks(indices, self._RANGES, None, staging, page_ok)
         for p, L in enumerate(logical):
             got = reader._unified_page_view(p * self._PS)[0]
-            for l0, l1 in self._RANGES:
-                if page_ok[p]:
-                    self.assertTrue(torch.equal(got[l0:l1], L[l0:l1]))
-                else:
-                    self.assertEqual(got[l0:l1].abs().sum().item(), 0)
+            if p == 1:
+                self.assertEqual(got.abs().sum().item(), 0)
+            else:
+                self.assertTrue(torch.equal(got, L))
+
+    def test_non_direct_layouts_are_rejected(self):
+        """page_first stores (token, layer, dim): no chunk of it is contiguous
+        at page_size > 1. Nothing stages any more, so it is rejected instead."""
+        for layout in ("page_first", "layer_first"):
+            pool = self._pool(layout, self._logical())
+            with self.assertRaisesRegex(ValueError, "page_first_direct") as ctx:
+                pool.get_unified_chunk_meta(torch.arange(self._PS), self._RANGES, None)
+            self.assertIn(layout, str(ctx.exception))
+
+    def test_grid_must_tile_every_layer_of_the_pool(self):
+        """A grid that names only part of the pool's layer axis (an MTP draft
+        pool appends unnamed layers) would leave bytes transferred in the other
+        order, so the plan is refused."""
+        pool = self._pool("page_first_direct", self._logical())
+        with self.assertRaisesRegex(ValueError, "layers"):
+            pool.build_unified_layout([(0, 2)])
 
 
 class TestMhaDirectChunks(CustomTestCase):
-    """MHA skip-convert for the (layer, token, head, dim) object order.
+    """MHA chunk placement inside a ``page_first_direct`` page block.
 
-    Whole-head page_first_direct slabs are direct; splitting the head axis
-    makes them strided and therefore staged.
+    With one head group the block is page_first_direct's natural
+    (layer, token, head, dim). When the L3 grid cuts the kv-head axis the block
+    is stored head-group-major, (head_group, layer, token, head_in_group, dim),
+    which keeps every chunk a single contiguous byte range.
     """
 
     def _pool(self, head_num):
-        import torch
-
         from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
         pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
@@ -993,6 +1108,7 @@ class TestMhaDirectChunks(CustomTestCase):
         pool.dtype = torch.bfloat16
         page_num = 3
         pool.size = page_num * pool.page_size
+        pool.slot_used = torch.zeros(pool.size, dtype=torch.bool)
         pool.kv_buffer = torch.zeros(
             2,
             page_num,
@@ -1004,19 +1120,19 @@ class TestMhaDirectChunks(CustomTestCase):
         )
         return pool
 
-    def test_single_head_layer_chunks_are_direct(self):
-        import torch
-
+    def test_single_head_layer_chunks_address_the_pool(self):
         pool = self._pool(head_num=1)
         ranges, heads = [(0, 2), (2, 6)], [(0, 1)]
-        self.assertTrue(pool.unified_zero_copy(ranges, heads))
+        layout = pool.build_unified_layout(ranges, heads)
+        self.assertEqual(layout.head_group_num, 1)
+        self.assertFalse(layout.permuted)
         itemsize = pool.dtype.itemsize
         layer_stride = pool.page_size * pool.head_dim * itemsize
         page_stride = pool.layer_num * layer_stride
         v_offset = pool.layer_num * pool.size * pool.head_dim * itemsize
         base = pool.kv_buffer.data_ptr()
         ptrs, sizes = pool.get_unified_chunk_meta(
-            torch.tensor([8, 9, 10, 11]), ranges, heads, None
+            torch.tensor([8, 9, 10, 11]), ranges, heads
         )
         k0 = base + 2 * page_stride
         self.assertEqual(
@@ -1033,325 +1149,282 @@ class TestMhaDirectChunks(CustomTestCase):
             [2 * layer_stride, 2 * layer_stride, 4 * layer_stride, 4 * layer_stride],
         )
 
-    def test_whole_head_shard_chunks_are_direct(self):
-        """Under the (layer, token, head, dim) order a layer-range chunk over
-        the rank's whole head shard is one contiguous range on
-        page_first_direct — the case cross-PP reuse needs."""
+    def test_whole_head_shard_chunks_are_one_range(self):
+        """A layer-range chunk over the rank's whole head shard is one
+        contiguous range of the natural page block — the cross-PP case, which
+        needs no permutation at all."""
         pool = self._pool(head_num=2)
-        self.assertTrue(pool.unified_zero_copy([(0, 2), (2, 6)], [(0, 2)]))
-
-    def test_head_subgroup_chunks_stage(self):
-        """Cutting the head axis is what forces the staging copy: it breaks
-        contiguity at the token axis on every host layout."""
-        pool = self._pool(head_num=2)
-        self.assertFalse(pool.unified_zero_copy([(0, 2)], [(0, 1), (1, 2)]))
-
-    def test_rejects_split_kv_pools(self):
-        import torch
-
-        pool = self._pool(head_num=2)
-        pool.kv_buffer = (pool.kv_buffer, pool.kv_buffer)
-        with self.assertRaisesRegex(NotImplementedError, "split K/V"):
-            pool.gather_unified_chunks(
-                torch.tensor([0, 1, 2, 3]), [(0, 2)], [(0, 2)], None
-            )
-
-
-class TestLayoutAdapterGatherScatter(CustomTestCase):
-    """The layout-neutrality property the adapter exists for: every
-    supported layout gathers byte-identical unified chunks ((layer, token,
-    head, dim) per K/V half), and the fetch + scatter path inverts them."""
-
-    _PS, _HEADS, _LAYERS, _DIM, _PAGES = 4, 4, 6, 8, 2
-
-    def _logical(self):
-        import torch
-
-        # L[kv, head, layer, token, dim] per page.
-        torch.manual_seed(0)
-        return [
-            torch.randn(
-                2,
-                self._HEADS,
-                self._LAYERS,
-                self._PS,
-                self._DIM,
-                dtype=torch.bfloat16,
-            )
-            for _ in range(self._PAGES)
-        ]
-
-    def _pool(self, layout, logical):
-        import torch
-
-        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
-
-        pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
-        pool.layout = layout
-        pool.page_size = self._PS
-        pool.head_num = self._HEADS
-        pool.head_dim = self._DIM
-        pool.layer_num = self._LAYERS
-        pool.dtype = torch.bfloat16
-        pool.size = self._PAGES * self._PS
-        if layout == "layer_first":
-            pool.kv_buffer = torch.zeros(
-                2,
-                self._LAYERS,
-                pool.size,
-                self._HEADS,
-                self._DIM,
-                dtype=pool.dtype,
-            )
-            for p, L in enumerate(logical):
-                pool.kv_buffer[:, :, p * self._PS : (p + 1) * self._PS] = L.permute(
-                    0, 2, 3, 1, 4
-                )
-        elif layout == "page_first":
-            pool.kv_buffer = torch.zeros(
-                2,
-                pool.size,
-                self._LAYERS,
-                self._HEADS,
-                self._DIM,
-                dtype=pool.dtype,
-            )
-            for p, L in enumerate(logical):
-                pool.kv_buffer[:, p * self._PS : (p + 1) * self._PS] = L.permute(
-                    0, 3, 2, 1, 4
-                )
-        elif layout == "page_first_direct":
-            pool.kv_buffer = torch.zeros(
-                2,
-                self._PAGES,
-                self._LAYERS,
-                self._PS,
-                self._HEADS,
-                self._DIM,
-                dtype=pool.dtype,
-            )
-            for p, L in enumerate(logical):
-                pool.kv_buffer[:, p] = L.permute(0, 2, 3, 1, 4)
-        elif layout == "page_head":
-            pool.kv_buffer = torch.zeros(
-                2,
-                self._PAGES,
-                self._HEADS,
-                self._PS,
-                self._LAYERS,
-                self._DIM,
-                dtype=pool.dtype,
-            )
-            for p, L in enumerate(logical):
-                pool.kv_buffer[:, p] = L.permute(0, 1, 3, 2, 4)
-        return pool
-
-    _LAYOUTS = ("page_first", "page_first_direct")
-
-    def _grid(self):
-        return [(0, 2), (2, 6)], [(0, 2), (2, 4)]  # layer ranges, head ranges
-
-    def test_all_layouts_gather_identical_unified_bytes(self):
-        import ctypes
-
-        import torch
-
-        logical = self._logical()
-        layer_ranges, head_ranges = self._grid()
-        indices = torch.arange(self._PAGES * self._PS)
-        # Unified-order bytes computed straight from the logical tensor:
-        # page-major, layer-range, head-range, K then V. The logical tensor is
-        # (kv, head, layer, token, dim); the stored order is
-        # (layer, token, head, dim), hence the permute.
-        expected = b"".join(
-            bytes(
-                L[kv, h0:h1, l0:l1]
-                .permute(1, 2, 0, 3)
-                .contiguous()
-                .view(torch.uint8)
-                .flatten()
-                .tolist()
-            )
-            for L in logical
-            for l0, l1 in layer_ranges
-            for h0, h1 in head_ranges
-            for kv in range(2)
-        )
-        for layout in self._LAYOUTS:
-            pool = self._pool(layout, logical)
-            staging = torch.zeros(
-                self._PAGES * pool.unified_bytes_per_page(layer_ranges, head_ranges),
-                dtype=torch.uint8,
-            )
-            ptrs, sizes = pool.gather_unified_chunks(
-                indices, layer_ranges, head_ranges, staging
-            )
-            got = b"".join(
-                ctypes.string_at(ptr, size) for ptr, size in zip(ptrs, sizes)
-            )
-            self.assertEqual(got, expected, layout)
-
-    def test_fetch_and_scatter_invert_gather_across_layouts(self):
-        import ctypes
-
-        import torch
-
-        logical = self._logical()
-        layer_ranges, head_ranges = self._grid()
-        indices = torch.arange(self._PAGES * self._PS)
-        writer = self._pool("page_first_direct", logical)
-        staging_w = torch.zeros(
-            self._PAGES * writer.unified_bytes_per_page(layer_ranges, head_ranges),
-            dtype=torch.uint8,
-        )
-        src_ptrs, src_sizes = writer.gather_unified_chunks(
-            indices, layer_ranges, head_ranges, staging_w
-        )
-
-        # Emulate a fetch into an EMPTY pool of a different layout, then
-        # scatter; the covered rectangles must reproduce the writer's values.
-        for layout in ("page_first",):
-            reader = self._pool(layout, [torch.zeros_like(l) for l in logical])
-            staging_r = torch.zeros_like(staging_w)
-            dst_ptrs, dst_sizes = reader.get_unified_chunk_meta(
-                indices, layer_ranges, head_ranges, staging_r
-            )
-            self.assertEqual(src_sizes, dst_sizes)
-            for dst, src, size in zip(dst_ptrs, src_ptrs, src_sizes):
-                ctypes.memmove(dst, src, size)
-            reader.scatter_unified_chunks(
-                indices, layer_ranges, head_ranges, staging_r, [True] * self._PAGES
-            )
-            for p, L in enumerate(logical):
-                got = reader._unified_page_view(p * self._PS)
-                want = L.permute(0, 2, 3, 1, 4)  # -> (kv, layer, token, head, dim)
-                for l0, l1 in layer_ranges:
-                    for h0, h1 in head_ranges:
-                        self.assertTrue(
-                            torch.equal(
-                                got[:, l0:l1, :, h0:h1], want[:, l0:l1, :, h0:h1]
-                            )
-                        )
-
-    def test_read_metas_assembles_h2d_component_arenas(self):
-        """Key-ordered gets land as K/V -> page -> head group -> layer.
-
-        The short final layer range makes this catch both required
-        permutations: K/V deinterleaving and layer/head transposition.
-        """
-        import ctypes
-
-        import torch
-
-        logical = self._logical()
-        layer_ranges = [(0, 4), (4, 6)]
-        head_ranges = [(0, 2), (2, 4)]
-        indices = torch.arange(self._PAGES * self._PS)
-
-        writer = self._pool("page_first_direct", logical)
-        staging_w = torch.zeros(
-            self._PAGES * writer.unified_bytes_per_page(layer_ranges, head_ranges),
-            dtype=torch.uint8,
-        )
-        src_ptrs, src_sizes = writer.gather_unified_chunks(
-            indices, layer_ranges, head_ranges, staging_w
-        )
-
-        reader = self._pool("page_first", [torch.zeros_like(page) for page in logical])
-        staging_r = torch.zeros_like(staging_w)
-        dst_ptrs, dst_sizes = reader.get_unified_chunk_meta(
-            indices, layer_ranges, head_ranges, staging_r
-        )
-        self.assertEqual(src_sizes, dst_sizes)
+        ranges, heads = [(0, 2), (2, 6)], [(0, 2)]
+        layout = pool.build_unified_layout(ranges, heads)
+        self.assertEqual(layout.head_group_num, 1)
+        self.assertFalse(layout.permuted)
+        itemsize = pool.dtype.itemsize
+        row = pool.page_size * pool.head_num * pool.head_dim * itemsize  # per layer
         self.assertEqual(
-            dst_sizes,
-            [512, 512, 512, 512, 256, 256, 256, 256] * self._PAGES,
-        )
-
-        base = staging_r.data_ptr()
-        self.assertEqual(
-            reader.build_unified_layout(
-                layer_ranges, head_ranges
-            ).read_component_regions(indices),
-            {"k": (0, 3072), "v": (3072, 3072)},
-        )
-        self.assertEqual(
-            [ptr - base for ptr in dst_ptrs],
+            [(s.component, s.byte_offset, s.nbytes) for s in layout.slabs],
             [
-                0,
-                3072,
-                768,
-                3840,
-                512,
-                3584,
-                1280,
-                4352,
-                1536,
-                4608,
-                2304,
-                5376,
-                2048,
-                5120,
-                2816,
-                5888,
+                ("k", 0, 2 * row),
+                ("v", 0, 2 * row),
+                ("k", 2 * row, 4 * row),
+                ("v", 2 * row, 4 * row),
             ],
         )
 
-        for dst, src, size in zip(dst_ptrs, src_ptrs, src_sizes):
+    def test_head_subgroup_chunks_are_one_range_each(self):
+        """Cutting the head axis used to force a staging copy. It no longer
+        does: the page block is stored head-group-major, so a chunk is still
+        ONE contiguous range per (layer range, head group, component) at
+        offset (g * L + l0) * page_size * heads_per_group * head_dim."""
+        pool = self._pool(head_num=2)
+        ranges, heads = [(0, 2), (2, 6)], [(0, 1), (1, 2)]
+        layout = pool.build_unified_layout(ranges, heads)
+        self.assertEqual(layout.head_group_num, 2)
+        self.assertTrue(layout.permuted)
+        itemsize = pool.dtype.itemsize
+        hg = 1
+        layer_stride = pool.page_size * hg * pool.head_dim * itemsize  # 64 B
+        group_stride = pool.layer_num * layer_stride  # 384 B
+        self.assertEqual((layer_stride, group_stride), (64, 384))
+        self.assertEqual(
+            [(s.component, s.byte_offset, s.nbytes) for s in layout.slabs],
+            [
+                # layer window [0,2)
+                ("k", 0, 2 * layer_stride),
+                ("v", 0, 2 * layer_stride),
+                ("k", group_stride, 2 * layer_stride),
+                ("v", group_stride, 2 * layer_stride),
+                # layer window [2,6)
+                ("k", 2 * layer_stride, 4 * layer_stride),
+                ("v", 2 * layer_stride, 4 * layer_stride),
+                ("k", group_stride + 2 * layer_stride, 4 * layer_stride),
+                ("v", group_stride + 2 * layer_stride, 4 * layer_stride),
+            ],
+        )
+        # ...and together they tile each component's whole page block.
+        block = pool.layer_num * pool.page_size * pool.head_num * pool.head_dim
+        self.assertEqual(layout.bytes_per_page, 2 * block * itemsize)
+
+    def test_rejects_split_kv_pools(self):
+        pool = self._pool(head_num=2)
+        pool.kv_buffer = (pool.kv_buffer, pool.kv_buffer)
+        with self.assertRaisesRegex(NotImplementedError, "split K/V"):
+            pool.get_unified_chunk_meta(torch.tensor([0, 1, 2, 3]), [(0, 6)], [(0, 2)])
+
+    def test_rejects_page_first(self):
+        pool = self._pool(head_num=2)
+        pool.layout = "page_first"
+        pool.kv_buffer = torch.zeros(
+            2, pool.size, pool.layer_num, pool.head_num, pool.head_dim, dtype=pool.dtype
+        )
+        with self.assertRaisesRegex(ValueError, "page_first_direct"):
+            pool.get_unified_chunk_meta(torch.tensor([0, 1, 2, 3]), [(0, 6)], [(0, 2)])
+
+    def test_head_ranges_must_tile_the_pools_heads(self):
+        pool = self._pool(head_num=4)
+        with self.assertRaisesRegex(ValueError, "tile"):
+            pool.build_unified_layout([(0, 6)], [(0, 2)])
+        with self.assertRaisesRegex(ValueError, "uniform"):
+            pool.build_unified_layout([(0, 6)], [(0, 1), (1, 4)])
+
+
+class TestUnifiedChunkBytes(CustomTestCase):
+    """What the unified layout must actually guarantee: the bytes named by
+    ``chunk_metas`` ARE the logical chunk (layer range x head group x
+    component), and copying just those bytes into another pool reproduces it.
+
+    The reference is built by plain indexing of a naturally-ordered
+    ``(kv, layer, token, head, dim)`` page tensor, never by re-deriving the
+    offset formula.
+    """
+
+    _PS, _HEADS, _LAYERS, _DIM, _PAGES = 4, 4, 6, 8, 2
+
+    def _logical(self, heads=None, pages=None, seed=0):
+        """``logical[p]`` is (kv, layer, token, head, dim): the natural page
+        block, independent of any head grid."""
+        torch.manual_seed(seed)
+        return [
+            torch.randn(
+                2,
+                self._LAYERS,
+                self._PS,
+                heads or self._HEADS,
+                self._DIM,
+                dtype=torch.bfloat16,
+            )
+            for _ in range(pages or self._PAGES)
+        ]
+
+    def _pool(self, logical, head_groups=1, layout="page_first_direct"):
+        """A page_first_direct pool whose page blocks are stored
+        head-group-major for ``head_groups`` groups (== the natural order when
+        that is 1). This models what the pfdhg transfer kernels write."""
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+        pages, heads = len(logical), logical[0].shape[3]
+        pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        pool.layout = layout
+        pool.page_size = self._PS
+        pool.head_num = heads
+        pool.head_dim = self._DIM
+        pool.layer_num = self._LAYERS
+        pool.dtype = torch.bfloat16
+        pool.size = pages * self._PS
+        pool.slot_used = torch.zeros(pool.size, dtype=torch.bool)
+        if layout == "page_first":
+            pool.kv_buffer = torch.zeros(
+                2, pool.size, self._LAYERS, heads, self._DIM, dtype=pool.dtype
+            )
+            return pool
+        pool.kv_buffer = torch.zeros(
+            2, pages, self._LAYERS, self._PS, heads, self._DIM, dtype=pool.dtype
+        )
+        per_group = heads // head_groups
+        for p, page in enumerate(logical):
+            block = pool.kv_buffer[:, p]
+            permuted = (
+                page.view(2, self._LAYERS, self._PS, head_groups, per_group, self._DIM)
+                .permute(0, 3, 1, 2, 4, 5)  # (kv, group, layer, token, head, dim)
+                .contiguous()
+            )
+            block.copy_(permuted.view(block.shape))
+        return pool
+
+    @staticmethod
+    def _reference(logical, layer_ranges, head_ranges):
+        """The chunk contents, by plain indexing, in chunk_keys order."""
+        return [
+            _tobytes(page[kv, l0:l1, :, h0:h1, :])
+            for page in logical
+            for l0, l1 in layer_ranges
+            for h0, h1 in head_ranges
+            for kv in range(2)
+        ]
+
+    _GRIDS = (
+        # (label, layer_ranges, head_ranges)
+        ("no cut", [(0, 2), (2, 6)], [(0, 4)]),
+        ("head cut x2", [(0, 2), (2, 6)], [(0, 2), (2, 4)]),
+        ("head cut x4, one layer window", [(0, 6)], [(i, i + 1) for i in range(4)]),
+    )
+
+    def test_chunk_bytes_are_the_logical_chunk_contents(self):
+        logical = self._logical()
+        indices = torch.arange(self._PAGES * self._PS)
+        for label, layer_ranges, head_ranges in self._GRIDS:
+            pool = self._pool(logical, head_groups=len(head_ranges))
+            ptrs, sizes = pool.get_unified_chunk_meta(
+                indices, layer_ranges, head_ranges
+            )
+            got = [ctypes.string_at(ptr, size) for ptr, size in zip(ptrs, sizes)]
+            _assert_chunk_bytes(
+                self, got, self._reference(logical, layer_ranges, head_ranges), label
+            )
+            # One chunk per (layer range, head group, component), and together
+            # they tile the whole page: nothing staged, nothing left over.
+            self.assertEqual(
+                len(sizes),
+                self._PAGES * len(layer_ranges) * len(head_ranges) * 2,
+                label,
+            )
+            self.assertEqual(
+                sum(sizes),
+                pool.kv_buffer.numel() * pool.dtype.itemsize,
+                label,
+            )
+
+    def test_chunk_ranges_are_disjoint_and_inside_the_pool(self):
+        logical = self._logical()
+        layer_ranges, head_ranges = [(0, 2), (2, 6)], [(0, 2), (2, 4)]
+        pool = self._pool(logical, head_groups=2)
+        base = pool.kv_buffer.data_ptr()
+        span = pool.kv_buffer.numel() * pool.dtype.itemsize
+        ptrs, sizes = pool.get_unified_chunk_meta(
+            torch.arange(self._PAGES * self._PS), layer_ranges, head_ranges
+        )
+        covered = sorted(zip(ptrs, sizes))
+        cursor = base
+        for ptr, size in covered:
+            self.assertGreaterEqual(ptr, cursor)
+            self.assertLessEqual(ptr + size, base + span)
+            cursor = ptr + size
+        self.assertEqual(cursor, base + span)
+
+    def test_direct_get_reproduces_the_writers_chunks(self):
+        """A put reads the writer's pool, a get writes the reader's pool: the
+        two are the same byte ranges. Page 1's chunks are dropped to show a
+        failed page is simply left untouched (nothing is published from a
+        staging buffer)."""
+        logical = self._logical()
+        layer_ranges, head_ranges = [(0, 2), (2, 6)], [(0, 2), (2, 4)]
+        writer = self._pool(logical, head_groups=2)
+        reader = self._pool([torch.zeros_like(page) for page in logical], head_groups=2)
+        indices = torch.arange(self._PAGES * self._PS)
+        src_ptrs, src_sizes = writer.get_unified_chunk_meta(
+            indices, layer_ranges, head_ranges
+        )
+        dst_ptrs, dst_sizes = reader.get_unified_chunk_meta(
+            indices, layer_ranges, head_ranges
+        )
+        self.assertEqual(src_sizes, dst_sizes)
+        per_page = len(layer_ranges) * len(head_ranges) * 2
+        for i, (dst, src, size) in enumerate(zip(dst_ptrs, src_ptrs, src_sizes)):
+            if i // per_page == 1:
+                continue
             ctypes.memmove(dst, src, size)
-
-        component_bytes = staging_r.numel() // 2
-        arena_shape = (
-            self._PAGES,
-            len(head_ranges),
-            self._LAYERS,
-            self._PS,
-            self._HEADS // len(head_ranges),
-            self._DIM,
+        got = [ctypes.string_at(ptr, size) for ptr, size in zip(dst_ptrs, dst_sizes)]
+        want = self._reference(logical, layer_ranges, head_ranges)
+        _assert_chunk_bytes(self, got[:per_page], want[:per_page], "page 0")
+        self.assertTrue(
+            torch.equal(
+                reader.kv_buffer[:, 1], torch.zeros_like(reader.kv_buffer[:, 1])
+            )
         )
-        got_k = staging_r[:component_bytes].view(torch.bfloat16).view(arena_shape)
-        got_v = staging_r[component_bytes:].view(torch.bfloat16).view(arena_shape)
-        want_k = torch.stack(
-            [
-                page[0]
-                .view(len(head_ranges), -1, self._LAYERS, self._PS, self._DIM)
-                .permute(0, 2, 3, 1, 4)
-                for page in logical
-            ]
+
+    def test_cross_tp_pools_name_the_same_chunk_bytes(self):
+        """The payoff. A TP2 rank (4 kv heads, head_group=2) owns chunks H0/H1;
+        a TP4 rank (2 kv heads, head_group=2 == its whole shard) owns one. The
+        head-group-major block makes the TP4 rank's single chunk byte-identical
+        to the TP2 rank's H1 chunk, so cross-TP reuse is pure key selection."""
+        layer_ranges = [(0, 2), (2, 6)]
+        wide = self._logical()  # 4 kv heads
+        narrow = [page[:, :, :, 2:4, :].contiguous() for page in wide]
+        tp2 = self._pool(wide, head_groups=2)
+        tp4 = self._pool(narrow, head_groups=1)
+        indices = torch.arange(self._PAGES * self._PS)
+        wide_ptrs, wide_sizes = tp2.get_unified_chunk_meta(
+            indices, layer_ranges, [(0, 2), (2, 4)]
         )
-        want_v = torch.stack(
-            [
-                page[1]
-                .view(len(head_ranges), -1, self._LAYERS, self._PS, self._DIM)
-                .permute(0, 2, 3, 1, 4)
-                for page in logical
-            ]
+        narrow_ptrs, narrow_sizes = tp4.get_unified_chunk_meta(
+            indices, layer_ranges, [(0, 2)]
         )
-        self.assertTrue(torch.equal(got_k, want_k))
-        self.assertTrue(torch.equal(got_v, want_v))
-
-        # The production path still CPU-scatters today; it must use the same
-        # placement map and must not publish a failed page from staging.
-        reader.scatter_unified_chunks(
-            indices, layer_ranges, head_ranges, staging_r, [True, False]
+        # chunk_keys order is page-major, layer-major, head-minor, K then V:
+        # the TP4 rank's chunks are the odd head group of the TP2 rank's.
+        wide_h1 = [
+            (ptr, size)
+            for i, (ptr, size) in enumerate(zip(wide_ptrs, wide_sizes))
+            if (i // 2) % 2 == 1
+        ]
+        self.assertEqual([s for _, s in wide_h1], narrow_sizes)
+        _assert_chunk_bytes(
+            self,
+            [ctypes.string_at(p, s) for p, s in wide_h1],
+            [ctypes.string_at(p, s) for p, s in zip(narrow_ptrs, narrow_sizes)],
+            "TP2 H1 vs TP4 whole shard",
         )
-        got_page0 = reader._unified_page_view(0)
-        want_page0 = logical[0].permute(0, 2, 3, 1, 4)
-        self.assertTrue(torch.equal(got_page0, want_page0))
-        self.assertEqual(reader._unified_page_view(self._PS).abs().sum().item(), 0)
+
+    def test_page_first_pools_are_rejected(self):
+        pool = self._pool(self._logical(), layout="page_first")
+        with self.assertRaisesRegex(ValueError, "page_first_direct"):
+            pool.get_unified_chunk_meta(
+                torch.arange(self._PS), [(0, 6)], [(0, 2), (2, 4)]
+            )
 
 
-class TestLayoutAdapterStaging(CustomTestCase):
-    """Backend-neutral KVCacheLayoutAdapter: key fan-out, staging-sized
-    sub-batching, and the pointer round trip a backend performs — no store
-    involved."""
-
-    class _UnpinnedLayoutAdapter(KVCacheLayoutAdapter):
-        # CPU-only test hosts cannot pin memory.
-        def _alloc_staging(self, numel):
-            import torch
-
-            return torch.empty(numel, dtype=torch.uint8)
+class TestLayoutAdapterChunks(CustomTestCase):
+    """Backend-neutral KVCacheLayoutAdapter: key fan-out, the slab plan, and
+    the pointer round trip a backend performs — no store involved. The adapter
+    owns no buffers: both directions address the host pool."""
 
     def _config(self, suffixes, layer_ranges, head_ranges, extra=None):
         return HiCacheStorageConfig(
@@ -1371,8 +1444,9 @@ class TestLayoutAdapterStaging(CustomTestCase):
             unified_head_ranges=head_ranges,
         )
 
-    def test_all_direct_pool_allocates_no_staging(self):
-        # MLA on page_first_direct: every slab pool-contiguous.
+    def test_mla_adapter_owns_no_buffers(self):
+        # MLA on page_first_direct: every chunk is pool-contiguous, so the
+        # adapter allocates nothing and registers nothing.
         mla = TestMlaLayoutAdapter()
         pool = mla._pool("page_first_direct", mla._logical())
         registered = []
@@ -1381,38 +1455,46 @@ class TestLayoutAdapterStaging(CustomTestCase):
             self._config(["ns_L0-2", "ns_L2-6"], [(0, 2), (2, 6)], None),
             register_buffer=registered.append,
         )
-        self.assertIsNone(adapter.staging_set)
-        self.assertIsNone(adapter.staging_get)
         self.assertEqual(registered, [])
+        for gone in (
+            "staging_set",
+            "staging_get",
+            "staging_pages",
+            "gather",
+            "scatter",
+        ):
+            self.assertFalse(hasattr(adapter, gone), gone)
         self.assertEqual(adapter.keys_per_page, 2)
         self.assertEqual(
             adapter.chunk_keys(["h1", "h2"]),
             ["h1_ns_L0-2_k", "h1_ns_L2-6_k", "h2_ns_L0-2_k", "h2_ns_L2-6_k"],
         )
+        indices = torch.arange(mla._PAGES * mla._PS)
+        self.assertEqual(
+            adapter.chunk_metas(indices),
+            pool.get_unified_chunk_meta(indices, [(0, 2), (2, 6)], None),
+        )
+        # MLA has no head axis to cut, so its pages keep the natural order.
+        self.assertEqual(pool.unified_head_groups, 1)
 
-    def test_staged_round_trip_with_single_page_sub_batches(self):
-        import ctypes
+    def _mha(self):
+        return TestUnifiedChunkBytes()
 
-        import torch
-
-        gs = TestLayoutAdapterGatherScatter()
+    def test_head_fan_out_round_trip_through_a_keyed_byte_store(self):
+        """One chunk per key, straight out of and back into pool memory."""
+        gs = self._mha()
         logical = gs._logical()
-        layer_ranges, head_ranges = gs._grid()
+        layer_ranges, head_ranges = [(0, 2), (2, 6)], [(0, 2), (2, 4)]
         suffixes = [
             f"ns_L{l0}-{l1}_H{j}"
             for l0, l1 in layer_ranges
             for j in range(len(head_ranges))
         ]
-        # staging_buffer_mb=0 floors the staging at ONE page's chunks,
-        # forcing a sub-batch per page and buffer reuse across sub-batches.
-        config = self._config(
-            suffixes, layer_ranges, head_ranges, extra={"staging_buffer_mb": 0}
-        )
-        writer = self._UnpinnedLayoutAdapter(
-            gs._pool("page_first_direct", logical), config
-        )
-        self.assertEqual(writer.staging_pages, 1)
+        config = self._config(suffixes, layer_ranges, head_ranges)
+        writer = KVCacheLayoutAdapter(gs._pool(logical, head_groups=2), config)
         self.assertEqual(writer.keys_per_page, 8)
+        # Declaring the grid is what puts the pool in head-group-major order.
+        self.assertEqual(writer.pool.unified_head_groups, 2)
         self.assertEqual(
             writer.chunk_keys(["h0"]),
             [
@@ -1426,71 +1508,75 @@ class TestLayoutAdapterStaging(CustomTestCase):
                 "h0_ns_L2-6_H1_v",
             ],
         )
+        itemsize = writer.pool.dtype.itemsize
+        layer_stride = gs._PS * 2 * gs._DIM * itemsize
+        group_stride = gs._LAYERS * layer_stride
         self.assertEqual(
+            [(s.component, s.byte_offset, s.nbytes) for s in writer.layout.slabs],
             [
-                (
-                    slab.component,
-                    slab.selection[1].start,
-                    slab.selection[1].stop,
-                    slab.selection[3].start,
-                    slab.selection[3].stop,
-                )
-                for slab in writer.layout.slabs
-            ],
-            [
-                ("k", 0, 2, 0, 2),
-                ("v", 0, 2, 0, 2),
-                ("k", 0, 2, 2, 4),
-                ("v", 0, 2, 2, 4),
-                ("k", 2, 6, 0, 2),
-                ("v", 2, 6, 0, 2),
-                ("k", 2, 6, 2, 4),
-                ("v", 2, 6, 2, 4),
+                ("k", 0, 2 * layer_stride),
+                ("v", 0, 2 * layer_stride),
+                ("k", group_stride, 2 * layer_stride),
+                ("v", group_stride, 2 * layer_stride),
+                ("k", 2 * layer_stride, 4 * layer_stride),
+                ("v", 2 * layer_stride, 4 * layer_stride),
+                ("k", group_stride + 2 * layer_stride, 4 * layer_stride),
+                ("v", group_stride + 2 * layer_stride, 4 * layer_stride),
             ],
         )
 
         page_keys = [f"h{p}" for p in range(gs._PAGES)]
         indices = torch.arange(gs._PAGES * gs._PS)
         store = {}
-        for sub_keys, sub_indices in writer.sub_batches(page_keys, indices):
-            self.assertEqual(len(sub_keys), 1)
-            ptrs, sizes = writer.gather(sub_indices)
-            for key, ptr, size in zip(writer.chunk_keys(sub_keys), ptrs, sizes):
-                store[key] = ctypes.string_at(ptr, size)
+        ptrs, sizes = writer.chunk_metas(indices)
+        for key, ptr, size in zip(writer.chunk_keys(page_keys), ptrs, sizes):
+            store[key] = ctypes.string_at(ptr, size)
         self.assertEqual(len(store), gs._PAGES * 8)
 
-        registered = []
-        reader = self._UnpinnedLayoutAdapter(
-            gs._pool("page_first", [torch.zeros_like(l) for l in logical]),
+        reader = KVCacheLayoutAdapter(
+            gs._pool([torch.zeros_like(page) for page in logical], head_groups=2),
             config,
-            register_buffer=registered.append,
         )
-        self.assertEqual(len(registered), 2)
-        for sub_keys, sub_indices in reader.sub_batches(page_keys, indices):
-            ptrs, sizes = reader.read_metas(sub_indices)
-            self.assertTrue(
-                torch.equal(
-                    reader.read_source_indices(sub_indices),
-                    torch.arange(gs._PS, dtype=torch.int64),
-                )
+        ptrs, sizes = reader.chunk_metas(indices)
+        for key, ptr, size in zip(reader.chunk_keys(page_keys), ptrs, sizes):
+            ctypes.memmove(ptr, store[key], size)
+        # The reader's pool now holds the writer's logical content.
+        got = [ctypes.string_at(ptr, size) for ptr, size in zip(ptrs, sizes)]
+        _assert_chunk_bytes(
+            self, got, gs._reference(logical, layer_ranges, head_ranges)
+        )
+        self.assertTrue(torch.equal(reader.pool.kv_buffer, writer.pool.kv_buffer))
+
+    def test_head_group_order_cannot_change_under_live_pages(self):
+        """The pool has no per-page provenance, so switching the byte order
+        while pages are resident would leave two orders in one pool."""
+        gs = self._mha()
+        logical = gs._logical()
+        pool = gs._pool(logical, head_groups=2)
+        pool.slot_used[:2] = True
+        layer_ranges, head_ranges = [(0, 6)], [(0, 2), (2, 4)]
+        config = self._config(
+            [f"ns_L0-6_H{j}" for j in range(2)], layer_ranges, head_ranges
+        )
+        with self.assertRaisesRegex(RuntimeError, "resident"):
+            KVCacheLayoutAdapter(pool, config)
+        # An unchanged order is always fine, live pages or not.
+        pool.unified_head_groups = 2
+        KVCacheLayoutAdapter(pool, config)
+
+    def test_suffix_count_must_match_the_slab_plan(self):
+        gs = self._mha()
+        pool = gs._pool(gs._logical(), head_groups=2)
+        with self.assertRaisesRegex(ValueError, "suffix count"):
+            KVCacheLayoutAdapter(
+                pool, self._config(["ns_L0-6_H0"], [(0, 6)], [(0, 2), (2, 4)])
             )
-            component_views = reader.read_component_views(sub_indices)
-            self.assertEqual(set(component_views), {"k", "v"})
-            self.assertEqual(
-                component_views["k"].numel() + component_views["v"].numel(),
-                sum(sizes),
-            )
-            for key, ptr, size in zip(reader.chunk_keys(sub_keys), ptrs, sizes):
-                ctypes.memmove(ptr, store[key], size)
-            reader.scatter(sub_indices, [True] * len(sub_keys))
-        for p, L in enumerate(logical):
-            got = reader.pool._unified_page_view(p * gs._PS)
-            want = L.permute(0, 2, 3, 1, 4)  # -> (kv, layer, token, head, dim)
-            for l0, l1 in layer_ranges:
-                for h0, h1 in head_ranges:
-                    self.assertTrue(
-                        torch.equal(got[:, l0:l1, :, h0:h1], want[:, l0:l1, :, h0:h1])
-                    )
+
+    def test_adapter_requires_a_grid(self):
+        mla = TestMlaLayoutAdapter()
+        pool = mla._pool("page_first_direct", mla._logical())
+        with self.assertRaisesRegex(ValueError, "chunk suffixes"):
+            KVCacheLayoutAdapter(pool, self._config("ns_L0-6", None, None))
 
 
 if __name__ == "__main__":
