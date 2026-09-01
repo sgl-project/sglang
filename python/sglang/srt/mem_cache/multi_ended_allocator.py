@@ -264,6 +264,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         is_id_owner: bool,
         page_size: int = 1,
+        shards_under_dcp: bool = False,
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
@@ -271,7 +272,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     ):
         spec = unified_buffer.spec(sub_pool_name)
         max_slots = unified_buffer.max_slots(sub_pool_name)
-        dcp_size = get_parallel().attn_dcp_size
+        # DCP shards KV tokens only. Mamba state and the SWA rows are
+        # replicated, so they stay slot-granular whatever the process width is.
+        self.shards_under_dcp = shards_under_dcp
+        dcp_size = get_parallel().attn_dcp_size if shards_under_dcp else 1
         super().__init__(
             size=max_slots * dcp_size,
             page_size=page_size * dcp_size,
@@ -1112,13 +1116,12 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         skips. Identity with `translate_kv_loc_for_kernel` at dcp_size == 1.
         """
         parallel = get_parallel()
-        if parallel.attn_dcp_size == 1:
+        dcp_size = parallel.attn_dcp_size if self.shards_under_dcp else 1
+        if dcp_size == 1:
             return self.translate_kv_loc_for_kernel(widened_loc, out=out)
         with record_function("MultiEndedAlloc.translate_write_loc_for_kernel"):
-            owned = (widened_loc % parallel.attn_dcp_size) == parallel.attn_dcp_rank
-            dense = self.translate_kv_loc_for_kernel(
-                widened_loc // parallel.attn_dcp_size
-            )
+            owned = (widened_loc % dcp_size) == parallel.attn_dcp_rank
+            dense = self.translate_kv_loc_for_kernel(widened_loc // dcp_size)
             dense = torch.where(owned, dense, torch.zeros_like(dense))
             if out is not None:
                 out.copy_(dense)
@@ -1623,7 +1626,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # `oclv` is a WIDENED virtual id under DCP; collapse to the id space
             # translate speaks. The write set is a page set, and a widened page
             # covers exactly the same page, so the non-owned ids fold in harmlessly.
-            dcp_size = get_parallel().attn_dcp_size
+            dcp_size = get_parallel().attn_dcp_size if self.shards_under_dcp else 1
             if dcp_size > 1:
                 oclv = oclv // dcp_size
             phys_tokens = self.translate_kv_loc(oclv)
@@ -2780,8 +2783,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.lazy_compaction = lazy_compaction
 
         # FULL is page-aware; MAMBA stays page_size=1 (state is per-request,
-        # orthogonal to the full side's per-token paging). DCP shards KV tokens
-        # only, so the mamba side keeps dcp_size=1: its state is replicated.
+        # orthogonal to the full side's per-token paging), and only FULL shards
+        # under DCP: mamba state is replicated on every rank.
         self.full_attn_allocator = MultiEndedAllocator(
             kvcache=kvcache.full_kv_pool,
             unified_buffer=unified_buffer,
@@ -2789,6 +2792,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             device=device,
             is_id_owner=True,
             page_size=page_size,
+            shards_under_dcp=True,
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,

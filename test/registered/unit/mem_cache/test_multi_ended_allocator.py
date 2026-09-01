@@ -3316,7 +3316,8 @@ class TestDcpWidening(unittest.TestCase):
         ):
             yield
 
-    def _build(self, *, page_size, n_full_slots=64):
+    def _build_pair(self, *, page_size, n_full_slots=64):
+        """(full, mamba) as the composite wires them: only full shards."""
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
         pool = UnifiedKVPool(
@@ -3333,17 +3334,32 @@ class TestDcpWidening(unittest.TestCase):
             device=_DEV,
             is_id_owner=True,
             page_size=page_size,
+            shards_under_dcp=True,
         )
-        alloc.bind_peer(
-            MultiEndedAllocator(
-                kvcache=_FakeKVCache(pool.max_slots("mamba")),
-                unified_buffer=pool,
-                sub_pool_name="mamba",
-                device=_DEV,
-                is_id_owner=True,
-            )
+        # The peer stays slot-granular: mamba state is replicated, not sharded.
+        mamba = MultiEndedAllocator(
+            kvcache=_FakeKVCache(pool.max_slots("mamba")),
+            unified_buffer=pool,
+            sub_pool_name="mamba",
+            device=_DEV,
+            is_id_owner=True,
         )
-        return alloc
+        alloc.bind_peer(mamba)
+        return alloc, mamba
+
+    def _build(self, *, page_size, n_full_slots=64):
+        return self._build_pair(page_size=page_size, n_full_slots=n_full_slots)[0]
+
+    def test_replicated_peer_stays_slot_granular_under_dcp(self):
+        """BUG REGRESSION. Widening every sub-allocator off the process DCP
+        width, rather than only the sharding one, makes the Mamba page size
+        dcp_size; state is allocated one slot per request, so the first request
+        fails the page-multiple check."""
+        with self._dcp(4):
+            _, mamba = self._build_pair(page_size=2)
+            self.assertEqual(mamba.page_size, 1)
+            self.assertEqual(mamba.page_size, mamba.pool_page_size)
+            self.assertIsNotNone(mamba.alloc(1))
 
     def test_capacity_scales_but_physical_pages_do_not(self):
         for page_size in (1, 8):
