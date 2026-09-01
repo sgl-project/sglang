@@ -354,6 +354,23 @@ if _wo_a_aiter_batched_gemm_enabled:
 # instead of re-raising (and re-logging) on every layer/token.
 _wo_a_aiter_batched_gemm_disabled = False
 
+# ROCm fp8 wo_a. The CUDA fp8 path below is built on DeepGEMM's fp8_einsum, so
+# gfx950 runs the equivalent aiter e8m0 block-scale batched GEMM instead. Both
+# the kernel availability and the weight-scale converter resolve once at import;
+# ``None`` here means the platform keeps the bf16 absorb GEMM.
+_wo_a_fp8_mxscale = None
+_wo_a_weight_scale_to_e8m0 = None
+if _is_hip:
+    from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
+        apply_wo_a_fp8_mxscale,
+        is_wo_a_fp8_mxscale_supported,
+        wo_a_weight_scale_to_e8m0,
+    )
+
+    if is_wo_a_fp8_mxscale_supported():
+        _wo_a_fp8_mxscale = apply_wo_a_fp8_mxscale
+        _wo_a_weight_scale_to_e8m0 = wo_a_weight_scale_to_e8m0
+
 
 def _apply_wo_a_bf16_matmul(
     o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool
@@ -1704,7 +1721,17 @@ class MQALayer(MqaAttentionBase):
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
-        if _FP8_WO_A_GEMM:
+        if _FP8_WO_A_GEMM and _wo_a_fp8_mxscale is not None:
+            # ROCm gfx950: same fp8 absorb GEMM as the DeepGEMM path below, but
+            # through aiter's e8m0 block-scale batched GEMM. The activation is
+            # quantized per token-group inside the helper.
+            T, G, D = o.shape
+            o = _wo_a_fp8_mxscale(
+                o,
+                self.wo_a.weight.view(G, self.o_lora_rank, D),
+                self.wo_a.weight_scale_inv.data,
+            )
+        elif _FP8_WO_A_GEMM:
             import deep_gemm
 
             from sglang.srt.layers import deep_gemm_wrapper
@@ -3388,6 +3415,21 @@ class DeepseekV4ForCausalLM(nn.Module):
             G = attn.n_local_groups
             R = attn.o_lora_rank
             D = attn.wo_a.weight.shape[1]
+
+            if _wo_a_weight_scale_to_e8m0 is not None:
+                # ROCm: aiter's mxscale GEMM reads uint8 e8m0 block scales, and
+                # requantizes the weight when the checkpoint's scales are not
+                # already powers of two.
+                weight, scale = _wo_a_weight_scale_to_e8m0(
+                    attn.wo_a.weight.data,
+                    attn.wo_a.weight_scale_inv.data,
+                    G,
+                    R,
+                )
+                attn.wo_a.weight.data = weight.view(G * R, D)
+                attn.wo_a.weight_scale_inv.data = scale
+                attn.wo_a.weight_scale_inv.format_ue8m0 = True
+                continue
 
             raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // 128, D // 128)
             if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
