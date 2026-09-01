@@ -104,7 +104,7 @@ class TestSpargeAttentionBackend(unittest.TestCase):
             ndim=4,
         )
 
-        expected = op.return_value
+        expected = op.return_value.contiguous.return_value
         self.assertIs(impl.forward(qkv, qkv, qkv, None), expected)
         op.assert_called_once_with(
             qkv,
@@ -115,6 +115,7 @@ class TestSpargeAttentionBackend(unittest.TestCase):
             tensor_layout="NHD",
             topk=0.75,
         )
+        op.return_value.contiguous.assert_called_once_with()
 
     def test_short_sequence_falls_back_to_dense_attention(self):
         impl, op = self._make_impl()

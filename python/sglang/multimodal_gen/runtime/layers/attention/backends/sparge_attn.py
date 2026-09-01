@@ -36,14 +36,18 @@ def _dense_attention(
     softmax_scale: float,
     causal: bool,
 ) -> torch.Tensor:
-    return torch.nn.functional.scaled_dot_product_attention(
-        query.transpose(1, 2),
-        key.transpose(1, 2),
-        value.transpose(1, 2),
-        dropout_p=0.0,
-        is_causal=causal,
-        scale=softmax_scale,
-    ).transpose(1, 2)
+    return (
+        torch.nn.functional.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            dropout_p=0.0,
+            is_causal=causal,
+            scale=softmax_scale,
+        )
+        .transpose(1, 2)
+        .contiguous()
+    )
 
 
 class SpargeAttentionBackend(AttentionBackend):
@@ -140,7 +144,7 @@ class SpargeAttentionImpl(AttentionImpl):
                 causal=self.causal,
             )
 
-        return self._attention_op(
+        output = self._attention_op(
             query,
             key,
             value,
@@ -149,3 +153,4 @@ class SpargeAttentionImpl(AttentionImpl):
             tensor_layout="NHD",
             topk=self.topk,
         )
+        return output.contiguous()
