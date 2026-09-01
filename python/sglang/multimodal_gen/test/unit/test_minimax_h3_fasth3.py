@@ -157,10 +157,8 @@ def test_fasth3_lora_bundle_is_rejected_loudly() -> None:
     with pytest.raises(ValueError) as excinfo:
         MiniMaxH3DiTModel.prepare_lora_adapter(model, bundle)
     message = str(excinfo.value)
-    assert "not a plain LoRA" in message
+    assert "3 non-LoRA tensors" in message
     assert "set_weight" in message
-    assert "FastVideo-FastH3-4-step-Preview-v1-LoRA" in message
-    assert "FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree" in message
 
 
 @pytest.mark.parametrize("quant_name", ["fp8", "kitchen_int8"])

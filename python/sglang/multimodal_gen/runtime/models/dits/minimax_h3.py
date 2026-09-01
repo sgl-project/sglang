@@ -90,19 +90,12 @@ _NON_LORA_DELTA_SUFFIXES = (".diff", ".diff_b", ".set_weight")
 
 def _reject_non_lora_delta_tensors(adapter: dict[str, torch.Tensor]) -> None:
     offending = sorted(key for key in adapter if key.endswith(_NON_LORA_DELTA_SUFFIXES))
-    if not offending:
-        return
-    preview = ", ".join(offending[:4])
-    if len(offending) > 4:
-        preview += f", ... ({len(offending)} tensors)"
-    raise ValueError(
-        "This adapter is not a plain LoRA: it carries full-rank .diff/.diff_b "
-        "deltas and/or to_gate_compress.set_weight tensors that no MiniMax-H3 "
-        f"LoRA mapping rule can apply ({preview}). This is the layout of the "
-        "FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA bundles; SGLang "
-        "does not fuse them at load. Serve the merged checkpoint "
-        "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree instead."
-    )
+    if offending:
+        raise ValueError(
+            f"LoRA adapter carries {len(offending)} non-LoRA tensors "
+            f"(.diff/.diff_b/.set_weight, e.g. {offending[0]}) that no MiniMax-H3 "
+            "LoRA mapping rule applies; serve a checkpoint with them merged instead."
+        )
 
 
 def _diffusers_h3_checkpoint(
@@ -640,19 +633,10 @@ def _minimax_h3_attention_core_impl(
         )
 
     if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
-        if ring_active:
-            raise NotImplementedError(
-                "VSA-H3 does not support --ring-degree > 1; use Ulysses "
-                "sequence parallelism (each rank sees the full packed "
-                "sequence with a head shard)."
-            )
         from sglang.multimodal_gen.runtime.managers.forward_context import (
             get_forward_context,
         )
 
-        # Only main DiT blocks carry step metadata; the token refiner (and any
-        # other non-packed caller) runs outside a forward context and takes
-        # the impl's dense fallback.
         attn_metadata = (
             get_forward_context().attn_metadata
             if attention.prefix.startswith("blocks.")
@@ -813,10 +797,7 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
-        # VSA compression-branch gate, head-sharded like Q/K/V. Kept bf16 and
-        # unquantized: 50 gates are ~3.7 GB total and every quant path must
-        # preserve their exact values (zero gate == pure sparse). Only the
-        # main DiT blocks carry gates; the token refiner never runs VSA.
+        # VSA compression gate; stays bf16 and unquantized (zero gate == pure sparse).
         self.to_gate_compress: ColumnParallelLinear | None = None
         if arch.has_gate_compress and prefix.startswith("blocks."):
             self.to_gate_compress = ColumnParallelLinear(
@@ -828,8 +809,6 @@ class MiniMaxH3Attention(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.to_gate_compress",
             )
-            # Base H3 checkpoints have no gates; zeros reproduce upstream's
-            # zero-init (pure-sparse VSA) exactly.
             self.to_gate_compress.weight.missing_param_init = "zeros"
 
     def _set_attention_backend(self, backend) -> None:
