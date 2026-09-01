@@ -51,8 +51,11 @@ from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
     is_float4_e2m1fn_x2,
+    is_hip,
     spec_decode_alloc_len_per_request,
 )
+
+_is_hip = is_hip()
 
 
 @dataclass
@@ -775,9 +778,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
+        # HIP takes the FP4-accurate byte count here. The NVIDIA FP4 path
+        # keeps the FP8 estimate.
         self.indexer_bytes_per_token = get_dsv4_indexer_bytes_per_token(
             self.indexer_head_dim,
-            kvc.server_args.enable_deepseek_v4_fp4_indexer,
+            _is_hip and kvc.server_args.enable_deepseek_v4_fp4_indexer,
         )
         self.context_len = kvc.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
