@@ -1461,7 +1461,10 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
         if quant_name != "quark":
             return super()._resolve_nextn_quant_config(config, quant_config)
 
-        layer_prefix = f"model.layers.{config.num_hidden_layers}"
+        nextn_layer_id = (
+            0 if config.num_hidden_layers == 1 else config.num_hidden_layers
+        )
+        layer_prefix = f"model.layers.{nextn_layer_id}"
 
         # Quark's per-module scheme selection (e.g. MTP self_attn in PTPC-FP8
         # while MTP MoE is MXFP4) is keyed by "layer_quant_config" patterns

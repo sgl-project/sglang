@@ -57,8 +57,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
+    ModelOptNvFp4FusedMoEMethod,
+)
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models.bailing_moe_nextn import (
     BailingMoeForCausalLMNextN,
     BailingMoEModelNextN,
@@ -76,6 +83,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def _mock_linear():
+    return object.__new__(ReplicatedLinear)
+
+
+def _mock_fused_moe():
+    return object.__new__(FusedMoE)
 
 
 class _FakeQuarkConfig(QuantizationConfig):
@@ -362,7 +377,8 @@ class TestDeepseekNextNModelOptQuantResolution(CustomTestCase):
 
     def test_loader_mapper_before_resolver_single_expert_excluded(self):
         """When exclude_modules=["model.layers.61.mlp.experts.0"], mapper turns it into
-        "model.decoder.mlp.experts.0". Resolver must add coarse "model.decoder.mlp.experts"."""
+        "model.decoder.mlp.experts.0". Resolver must add coarse "model.decoder.mlp.experts".
+        """
         model = self._make_model()
         config = SimpleNamespace(num_hidden_layers=61)
         quant_cfg = ModelOptFp4Config(
@@ -455,6 +471,110 @@ class TestDeepseekNextNModelOptQuantResolution(CustomTestCase):
         self.assertFalse(res.is_layer_excluded("model.decoder.mlp.experts"))
         self.assertFalse(res.is_layer_excluded("model.eh_proj"))
         self.assertTrue(res.is_layer_excluded("lm_head"))
+
+    def test_modelopt_fp4_wildcard_no_dot_before_mapper(self):
+        """Production wildcard spelling 'model.layers.61*' before mapper."""
+        model = self._make_model()
+        config = SimpleNamespace(num_hidden_layers=61)
+        quant_cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.61*", "lm_head"],
+        )
+
+        res = model._resolve_nextn_quant_config(config, quant_cfg)
+
+        self.assertIsNotNone(res)
+        self.assertTrue(res.is_layer_excluded("model.decoder.self_attn.q_a_proj"))
+        self.assertTrue(res.is_layer_excluded("model.decoder.mlp.experts"))
+        self.assertTrue(res.is_layer_excluded("model.eh_proj"))
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "model.decoder.self_attn.q_a_proj"),
+            UnquantizedLinearMethod,
+        )
+        self.assertIsNone(
+            res.get_quant_method(_mock_fused_moe(), "model.decoder.mlp.experts")
+        )
+
+    def test_modelopt_fp4_wildcard_no_dot_after_mapper(self):
+        """Production wildcard spelling 'model.layers.61*' after mapper transforms it into 'model.decoder*'."""
+        model = self._make_model()
+        config = SimpleNamespace(num_hidden_layers=61)
+        quant_cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.61*", "lm_head"],
+        )
+
+        quant_cfg.apply_weight_name_mapper(
+            DeepseekV3ForCausalLMNextN.hf_to_sglang_mapper
+        )
+        self.assertIn("model.decoder*", quant_cfg.exclude_modules)
+
+        res = model._resolve_nextn_quant_config(config, quant_cfg)
+
+        self.assertIsNotNone(res)
+        self.assertTrue(res.is_layer_excluded("model.decoder.self_attn.q_a_proj"))
+        self.assertTrue(res.is_layer_excluded("model.decoder.mlp.experts"))
+        self.assertTrue(res.is_layer_excluded("model.eh_proj"))
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "model.decoder.self_attn.q_a_proj"),
+            UnquantizedLinearMethod,
+        )
+        self.assertIsNone(
+            res.get_quant_method(_mock_fused_moe(), "model.decoder.mlp.experts")
+        )
+
+    def test_modelopt_fp4_legacy_layer0_num_hidden_layers_1(self):
+        """Legacy checkpoint with num_hidden_layers == 1 uses canonical NextN layer index 0."""
+        model = self._make_model()
+        config = SimpleNamespace(num_hidden_layers=1)
+        quant_cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.0.*", "lm_head"],
+        )
+
+        res = model._resolve_nextn_quant_config(config, quant_cfg)
+
+        self.assertIsNotNone(res)
+        self.assertTrue(res.is_layer_excluded("model.decoder.self_attn.q_a_proj"))
+        self.assertTrue(res.is_layer_excluded("model.decoder.mlp.experts"))
+        self.assertTrue(res.is_layer_excluded("model.eh_proj"))
+
+    def test_quark_legacy_layer0_num_hidden_layers_1(self):
+        """Quark exclusion with num_hidden_layers == 1 correctly targets layer 0."""
+        model = self._make_model()
+        config = SimpleNamespace(num_hidden_layers=1)
+        quark_cfg = _FakeQuarkConfig(exclude_layers=["model.layers.0"])
+
+        res = model._resolve_nextn_quant_config(config, quark_cfg)
+        self.assertIsNone(res)
+
+    def test_modelopt_fp4_consumer_get_quant_method_semantics(self):
+        """Verify get_quant_method consumer semantics directly on Linear and FusedMoE."""
+        model = self._make_model()
+        config = SimpleNamespace(num_hidden_layers=61)
+        quant_cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.61.*", "lm_head"],
+        )
+
+        res = model._resolve_nextn_quant_config(config, quant_cfg)
+
+        self.assertIsNotNone(res)
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "model.decoder.self_attn.q_a_proj"),
+            UnquantizedLinearMethod,
+        )
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "model.eh_proj"),
+            UnquantizedLinearMethod,
+        )
+        self.assertIsNone(
+            res.get_quant_method(_mock_fused_moe(), "model.decoder.mlp.experts")
+        )
 
     def test_quark_quant_config_excluded_returns_none(self):
         model = self._make_model()
@@ -687,6 +807,170 @@ class TestBailingMoeNextNModelOptQuantResolution(CustomTestCase):
         self.assertFalse(res.is_layer_excluded("model.final_layernorm"))
         self.assertTrue(res.is_layer_excluded("lm_head"))
 
+    def test_bailing_wildcard_no_dot(self):
+        """Production wildcard spelling 'model.layers.30*' and 'layers.30*'."""
+        model = self._make_model()
+        config = SimpleNamespace(num_hidden_layers=30)
+        quant_cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.30*", "lm_head"],
+        )
+
+        res = model._resolve_nextn_quant_config(config, quant_cfg)
+
+        self.assertIsNotNone(res)
+        self.assertTrue(res.is_layer_excluded("model.decoder.self_attn.q_a_proj"))
+        self.assertTrue(res.is_layer_excluded("model.decoder.mlp.experts"))
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "model.layers.30.eh_proj"),
+            UnquantizedLinearMethod,
+        )
+        self.assertIsNone(
+            res.get_quant_method(_mock_fused_moe(), "model.layers.30.experts")
+        )
+
+    def test_bailing_legacy_layer0_num_hidden_layers_1(self):
+        """Legacy Bailing config with num_hidden_layers == 1 uses canonical NextN layer index 0."""
+        model = self._make_model()
+        config = SimpleNamespace(num_hidden_layers=1)
+        quant_cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.0.*", "lm_head"],
+        )
+
+        res = model._resolve_nextn_quant_config(config, quant_cfg)
+
+        self.assertIsNotNone(res)
+        self.assertTrue(res.is_layer_excluded("model.decoder.self_attn.q_a_proj"))
+        self.assertTrue(res.is_layer_excluded("model.decoder.mlp.experts"))
+        self.assertTrue(res.is_layer_excluded("model.final_layernorm"))
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "model.layers.0.eh_proj"),
+            UnquantizedLinearMethod,
+        )
+        self.assertIsNone(
+            res.get_quant_method(_mock_fused_moe(), "model.layers.0.experts")
+        )
+
+    def test_bailing_quark_legacy_layer0_num_hidden_layers_1(self):
+        model = self._make_model()
+        config = SimpleNamespace(num_hidden_layers=1)
+        quark_cfg = _FakeQuarkConfig(exclude_layers=["model.layers.0"])
+
+        res = model._resolve_nextn_quant_config(config, quark_cfg)
+        self.assertIsNone(res)
+
+    def test_bailing_hybrid_runtime_prefixes_consumer_get_quant_method(self):
+        """Bailing hybrid/V3 layout uses model.layers.<N> for decoder/FusedMoE and layers.<N> for eh_proj.
+        Verify with ModelOptFp4Config get_quant_method consumers that all runtime forms are unquantized.
+        """
+        model = self._make_model()
+        config = SimpleNamespace(num_hidden_layers=30)
+        quant_cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.30.*", "lm_head"],
+        )
+
+        res = model._resolve_nextn_quant_config(config, quant_cfg)
+
+        self.assertIsNotNone(res)
+        # Bailing hybrid runtime linear layers (eh_proj, attention projections):
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "model.layers.30.eh_proj"),
+            UnquantizedLinearMethod,
+        )
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "layers.30.eh_proj"),
+            UnquantizedLinearMethod,
+        )
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "model.layers.30.attention.q_b_proj"),
+            UnquantizedLinearMethod,
+        )
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "layers.30.attention.q_b_proj"),
+            UnquantizedLinearMethod,
+        )
+        # Bailing hybrid runtime FusedMoE layers (both model.layers.<N>.experts and model.layers.<N>.mlp.experts):
+        self.assertIsNone(
+            res.get_quant_method(_mock_fused_moe(), "model.layers.30.experts")
+        )
+        self.assertIsNone(
+            res.get_quant_method(_mock_fused_moe(), "model.layers.30.mlp.experts")
+        )
+        self.assertIsNone(res.get_quant_method(_mock_fused_moe(), "layers.30.experts"))
+        self.assertIsNone(
+            res.get_quant_method(_mock_fused_moe(), "layers.30.mlp.experts")
+        )
+        # Standard decoder layout forms also retained:
+        self.assertIsNone(
+            res.get_quant_method(_mock_fused_moe(), "model.decoder.mlp.experts")
+        )
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "model.decoder.self_attn.q_a_proj"),
+            UnquantizedLinearMethod,
+        )
+
+    def test_bailing_hybrid_quantized_mtp_consumer_get_quant_method(self):
+        """When MTP is not excluded, Bailing hybrid runtime layers retain ModelOpt FP4 methods."""
+        model = self._make_model()
+        config = SimpleNamespace(num_hidden_layers=30)
+        quant_cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["lm_head"],
+        )
+
+        res = model._resolve_nextn_quant_config(config, quant_cfg)
+
+        self.assertIsNotNone(res)
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "model.layers.30.eh_proj"),
+            ModelOptFp4LinearMethod,
+        )
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "model.layers.30.attention.q_b_proj"),
+            ModelOptFp4LinearMethod,
+        )
+        self.assertIsInstance(
+            res.get_quant_method(_mock_fused_moe(), "model.layers.30.experts"),
+            ModelOptNvFp4FusedMoEMethod,
+        )
+        self.assertIsInstance(
+            res.get_quant_method(_mock_fused_moe(), "model.decoder.mlp.experts"),
+            ModelOptNvFp4FusedMoEMethod,
+        )
+
+    def test_bailing_hybrid_moe_only_excluded_consumer_get_quant_method(self):
+        """When only MTP MoE is excluded, FusedMoE is unquantized while attention remains quantized."""
+        model = self._make_model()
+        config = SimpleNamespace(num_hidden_layers=30)
+        quant_cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.30.mlp.experts.*"],
+        )
+
+        res = model._resolve_nextn_quant_config(config, quant_cfg)
+
+        self.assertIsNotNone(res)
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "model.layers.30.attention.q_b_proj"),
+            ModelOptFp4LinearMethod,
+        )
+        self.assertIsNone(
+            res.get_quant_method(_mock_fused_moe(), "model.layers.30.experts")
+        )
+        self.assertIsNone(
+            res.get_quant_method(_mock_fused_moe(), "model.layers.30.mlp.experts")
+        )
+        self.assertIsNone(
+            res.get_quant_method(_mock_fused_moe(), "model.decoder.mlp.experts")
+        )
+
 
 class TestGlmMoeDsaNextNModelOptQuantResolution(CustomTestCase):
     def _make_model(self):
@@ -791,6 +1075,91 @@ class TestGlmMoeDsaNextNModelOptQuantResolution(CustomTestCase):
 
         self.assertIsNot(res, quant_cfg)
         self.assertEqual(quant_cfg.exclude_modules, orig_exclude)
+
+    def test_glm_moe_dsa_wildcard_no_dot(self):
+        """Production wildcard spelling 'model.layers.46*'."""
+        model = self._make_model()
+        config = SimpleNamespace(num_hidden_layers=46)
+        quant_cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.46*", "lm_head"],
+        )
+
+        res = model._resolve_nextn_quant_config(config, quant_cfg)
+
+        self.assertIsNotNone(res)
+        self.assertTrue(res.is_layer_excluded("model.decoder.self_attn.q_a_proj"))
+        self.assertTrue(res.is_layer_excluded("model.decoder.mlp.experts"))
+        self.assertTrue(res.is_layer_excluded("model.eh_proj"))
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "model.decoder.self_attn.q_a_proj"),
+            UnquantizedLinearMethod,
+        )
+        self.assertIsNone(
+            res.get_quant_method(_mock_fused_moe(), "model.decoder.mlp.experts")
+        )
+
+    def test_glm_moe_dsa_legacy_layer0_num_hidden_layers_1(self):
+        """Legacy GLM config with num_hidden_layers == 1 uses canonical NextN layer index 0."""
+        model = self._make_model()
+        config = SimpleNamespace(num_hidden_layers=1)
+        quant_cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.0.*", "lm_head"],
+        )
+
+        res = model._resolve_nextn_quant_config(config, quant_cfg)
+
+        self.assertIsNotNone(res)
+        self.assertTrue(res.is_layer_excluded("model.decoder.self_attn.q_a_proj"))
+        self.assertTrue(res.is_layer_excluded("model.decoder.mlp.experts"))
+        self.assertTrue(res.is_layer_excluded("model.eh_proj"))
+
+    def test_glm_moe_dsa_quark_legacy_layer0_num_hidden_layers_1(self):
+        """Quark resolution with num_hidden_layers == 1 correctly targets layer 0."""
+        model = self._make_model()
+        config = SimpleNamespace(num_hidden_layers=1)
+        quark_cfg = _FakeQuarkConfig(
+            exclude_layers=["model.layers.0.mlp.experts.0"],
+            layer_quant_config={"model.layers.0.self_attn.q_a_proj": {"scheme": "fp8"}},
+        )
+
+        res = model._resolve_nextn_quant_config(config, quark_cfg)
+
+        self.assertIsNot(res, quark_cfg)
+        self.assertIn("model.decoder.mlp.experts.0", res.exclude_layers)
+        self.assertIn("model.decoder.mlp.experts", res.exclude_layers)
+        self.assertIn(
+            "model.decoder.self_attn.q_a_proj",
+            res.quant_config["layer_quant_config"],
+        )
+
+    def test_glm_moe_dsa_consumer_get_quant_method_semantics(self):
+        """Verify get_quant_method consumer semantics directly on Linear and FusedMoE."""
+        model = self._make_model()
+        config = SimpleNamespace(num_hidden_layers=46)
+        quant_cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.46.*", "lm_head"],
+        )
+
+        res = model._resolve_nextn_quant_config(config, quant_cfg)
+
+        self.assertIsNotNone(res)
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "model.decoder.self_attn.q_a_proj"),
+            UnquantizedLinearMethod,
+        )
+        self.assertIsInstance(
+            res.get_quant_method(_mock_linear(), "model.eh_proj"),
+            UnquantizedLinearMethod,
+        )
+        self.assertIsNone(
+            res.get_quant_method(_mock_fused_moe(), "model.decoder.mlp.experts")
+        )
 
 
 class TestNextNModelQuantConfigRetention(CustomTestCase):

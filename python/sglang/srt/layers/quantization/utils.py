@@ -70,8 +70,10 @@ _FALLBACK_FUSED_SHARDS: Mapping[str, List[str]] = {
 def is_layer_skipped(
     prefix: str,
     ignored_layers: List[str],
-    fused_mapping: Mapping[str, List[str]] = MappingProxyType({}),
+    fused_mapping: Optional[Mapping[str, List[str]]] = None,
 ) -> bool:
+    if fused_mapping is None:
+        fused_mapping = MappingProxyType({})
     # prefix: model.layers.0.self_attn.q_proj
     # proj_name: q_proj
     proj_name = prefix.split(".")[-1]

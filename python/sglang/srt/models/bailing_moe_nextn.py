@@ -89,12 +89,15 @@ class BailingMoEModelNextN(nn.Module):
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        nextn_layer_id = (
+            0 if config.num_hidden_layers == 1 else config.num_hidden_layers
+        )
         self.eh_proj = ReplicatedLinear(
             2 * config.hidden_size,
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix(f"layers.{config.num_hidden_layers}.eh_proj", prefix),
+            prefix=add_prefix(f"layers.{nextn_layer_id}.eh_proj", prefix),
         )
 
         self.is_hybrid = (
@@ -107,7 +110,7 @@ class BailingMoEModelNextN(nn.Module):
                 "quant_config": quant_config,
                 "layer_id": 0,
                 "is_nextn": True,
-                "prefix": add_prefix(f"layers.{config.num_hidden_layers}", prefix),
+                "prefix": add_prefix(f"layers.{nextn_layer_id}", prefix),
             }
             if _is_bailing_moe_v3_config(config):
                 decoder_layer_cls = BailingMoeV3DecoderLayer
@@ -219,7 +222,12 @@ class BailingMoeForCausalLMNextN(nn.Module):
             ):
                 return True
         for spec in cls._NEXTN_SPEC_WEIGHT_NAMES:
-            if name == f"model.{spec}" or name.startswith(f"model.{spec}."):
+            if (
+                name == spec
+                or name.startswith(f"{spec}.")
+                or name == f"model.{spec}"
+                or name.startswith(f"model.{spec}.")
+            ):
                 return True
         return False
 
@@ -249,10 +257,14 @@ class BailingMoeForCausalLMNextN(nn.Module):
             quant_config.get_name() if hasattr(quant_config, "get_name") else None
         )
 
+        nextn_layer_id = (
+            0 if config.num_hidden_layers == 1 else config.num_hidden_layers
+        )
+
         if quant_name == "quark":
             from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
 
-            ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
+            ckpt_prefix = f"model.layers.{nextn_layer_id}"
             mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
             if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
                 return None
@@ -265,13 +277,14 @@ class BailingMoeForCausalLMNextN(nn.Module):
             # Supported Checkpoint Contract:
             # 1. If an MTP draft layer/module is explicitly listed in `exclude_modules`
             #    (using checkpoint prefixes like `model.layers.<N>.*`, `layers.<N>.*`,
-            #    or already-remapped runtime names like `model.decoder.*`), the draft
+            #    `model.layers.<N>*`, or already-remapped runtime names like
+            #    `model.decoder.*`, `model.decoder*`, `model.decoder`), the draft
             #    decoder modules (linear and/or FusedMoE) will be excluded from quantization.
             # 2. If no MTP layer/module exclusion is present in `exclude_modules`, the MTP
             #    draft layer is treated as quantized (ModelOpt FP4), retaining `quant_config`
             #    for models with quantized draft weights (e.g. GLM-5.3-Flash / GLM NextN).
-            layer_prefix = f"model.layers.{config.num_hidden_layers}"
-            short_layer_prefix = f"layers.{config.num_hidden_layers}"
+            layer_prefix = f"model.layers.{nextn_layer_id}"
+            short_layer_prefix = f"layers.{nextn_layer_id}"
             whole_layer_prefixes = (
                 layer_prefix,
                 short_layer_prefix,
@@ -301,17 +314,43 @@ class BailingMoeForCausalLMNextN(nn.Module):
                         has_whole_mtp_excluded = True
                         break
 
-                if ".mlp.experts" in name or ".mlp.experts" in mapped:
+                if (
+                    ".mlp.experts" in name
+                    or ".mlp.experts" in mapped
+                    or ".experts" in name
+                    or ".experts" in mapped
+                ):
                     has_expert_excluded = True
 
             if has_whole_mtp_excluded:
                 names.add("model.decoder")
                 names.add("model.decoder.*")
+                names.add("model.decoder*")
                 names.add("model.decoder.mlp.experts")
+                names.add("decoder")
+                names.add("decoder.*")
+                names.add("decoder*")
+                names.add(layer_prefix)
+                names.add(f"{layer_prefix}.*")
+                names.add(f"{layer_prefix}*")
+                names.add(f"{layer_prefix}.experts")
+                names.add(f"{layer_prefix}.mlp.experts")
+                names.add(short_layer_prefix)
+                names.add(f"{short_layer_prefix}.*")
+                names.add(f"{short_layer_prefix}*")
+                names.add(f"{short_layer_prefix}.experts")
+                names.add(f"{short_layer_prefix}.mlp.experts")
+                names.add(f"{layer_prefix}.eh_proj")
+                names.add(f"{short_layer_prefix}.eh_proj")
                 for spec in self._NEXTN_SPEC_WEIGHT_NAMES:
                     names.add(f"model.{spec}")
+                    names.add(spec)
             elif has_expert_excluded:
                 names.add("model.decoder.mlp.experts")
+                names.add(f"{layer_prefix}.experts")
+                names.add(f"{layer_prefix}.mlp.experts")
+                names.add(f"{short_layer_prefix}.experts")
+                names.add(f"{short_layer_prefix}.mlp.experts")
 
             quant_config = copy.copy(quant_config)
             quant_config.exclude_modules = list(names)
