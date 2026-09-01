@@ -17,17 +17,19 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import (
     BaseModelLoader,
     _initialize_model,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
+    compute_config_digest,
     compute_env_stamp,
     get_quant_method_name,
     get_socket_path,
@@ -459,7 +461,13 @@ class IpcModelLoader(BaseModelLoader):
 
         if self.socket_path is None:
             device_uuid = current_platform.get_device_uuid(int(device_config.gpu_id))
-            self.socket_path = get_socket_path(device_uuid)
+            ps = get_parallel()
+            config_digest = compute_config_digest(
+                resolving_view(get_server_args()),
+                tp_rank=ps.tp_rank,
+                pp_rank=ps.pp_rank,
+            )
+            self.socket_path = get_socket_path(device_uuid, config_digest)
 
         # Only connect to a real socket node owned by us: reject a symlink, a
         # plain file, or another user's socket planted at this /tmp path. An
