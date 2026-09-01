@@ -749,6 +749,12 @@ class TokenizerControlMixin:
             assert (
                 get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            if ":" in obj.lora_name:
+                raise ValueError(
+                    f"LoRA adapter name '{obj.lora_name}' must not contain ':': the "
+                    "character separates the adapter name from the tensor key in "
+                    "streamed weight updates."
+                )
             async with self.lora_update_lock:
                 self._validate_lora_upsert_supported()
                 new_adapter, reused = await self.lora_registry.register_or_reuse(

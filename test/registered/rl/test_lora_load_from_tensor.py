@@ -116,6 +116,17 @@ class TestLoRALoadFromTensor(CustomTestCase):
         )
         self.assertTrue(result.success, f"Upsert at cap failed: {result.error_message}")
 
+    def test_register_rejects_name_holding_the_separator(self):
+        """A name holding ':' could never be matched by its own streamed tensors,
+        since the first ':' is what splits adapter from tensor key."""
+        result = self.engine.register_lora_adapter(
+            lora_name="team:alice",
+            config_dict=self.lora_config_dict,
+        )
+        self.assertFalse(result.success, "':' in an adapter name must be rejected")
+        self.assertIn("must not contain ':'", result.error_message)
+        self.assertNotIn("team:alice", loaded_adapter_names(self.engine))
+
     def test_lora_e2e_load_from_tensor_params(self):
         print("[Test]Testing LoRA load from tensor params...")
 
