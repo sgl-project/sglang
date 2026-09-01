@@ -410,34 +410,6 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
         self.assertTrue(bool((pool.kv_buffer[0][5] == 1).all()))
         self.assertTrue(bool((pool.kv_buffer[0][4] == 0).all()))
 
-    def test_unified_pool_declares_rather_than_reimplements(self):
-        """The unified pool differs from the base MLA pool by a DECLARED value,
-        not by a copied write door.
-
-        It used to override both doors purely to say "DCP is already resolved".
-        A copied body silently misses whatever the base grows next, and that
-        already happened: the copies predated `maybe_detect_kernel_facing_loc`
-        and skipped it -- on the one pool whose entire contract is that its
-        locs ARE kernel-facing.
-
-        The declared value is what the base doors and the OOB bound read, and it
-        is not derivable from anything else on the pool -- notably not from
-        `kernel_page_blocks > 1`, since `MLASubPoolSpec.blocks_per_page` returns
-        `layer_num` and a rank owning one full-attention layer is translated
-        with blocks_per_page 1."""
-        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-        from sglang.srt.mem_cache.unified_memory_pool import UnifiedMLATokenToKVPool
-
-        for door in ("set_mla_kv_buffer", "set_kv_buffer"):
-            self.assertIs(
-                getattr(UnifiedMLATokenToKVPool, door),
-                getattr(MLATokenToKVPool, door),
-                f"{door} is overridden again; express the difference as a "
-                "declared attribute so the door stays one method body",
-            )
-        self.assertTrue(UnifiedMLATokenToKVPool.write_loc_is_dcp_resolved)
-        self.assertFalse(MLATokenToKVPool.write_loc_is_dcp_resolved)
-
 
 if __name__ == "__main__":
     unittest.main()

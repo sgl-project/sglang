@@ -4082,7 +4082,9 @@ class MLATokenToKVPool(KVCache):
 
     # Has the WRITE loc arriving here already had the DCP owner rule resolved?
     # False: this pool takes a WIDENED loc. The unified pool resolves it in
-    # `KVIndexTranslator.rebind_write_loc` and flips this.
+    # `KVIndexTranslator.rebind_write_loc` and flips this. Not derivable from
+    # `kernel_page_blocks`: that is `layer_num`, so a rank owning one
+    # full-attention layer is translated with blocks_per_page 1.
     write_loc_is_dcp_resolved = False
 
     @property
