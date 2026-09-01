@@ -192,6 +192,13 @@ sgl-eval run mmmu_pro \\
     // (sgl-project/sglang#37253) — until it does, the variant needs this
     // preview build on every hardware.
     "flash-vision|fp4": "lmsysorg/sglang:dev-dsv4-flash-vision",
+    // NVFP4 checkpoints crash at weight load on v0.5.18 (the MXFP4-packed MTP
+    // layer's FP8 delegate needs the #36275 guard, merged 2026-08-26) — route
+    // every NVFP4 cell to the nightly until a release contains that fix.
+    "b200|nvfp4":  "lmsysorg/sglang:dev",
+    "b300|nvfp4":  "lmsysorg/sglang:dev",
+    "gb200|nvfp4": "lmsysorg/sglang:dev",
+    "gb300|nvfp4": "lmsysorg/sglang:dev",
     h100:  "lmsysorg/sglang:latest",
     h200:  "lmsysorg/sglang:latest",
     b200:  "lmsysorg/sglang:latest",
@@ -855,11 +862,12 @@ sgl-eval run mmmu_pro \\
     // B200 + NVFP4 — Official (0731 / 0813)
     // Mirrors the Flash/Pro NVFP4 cells; the official checkpoints bundle a
     // DSpark draft head, so low-latency uses `--speculative-algorithm DSPARK`
-    // instead of the EAGLE shape flags. NOT yet run end-to-end on this hardware.
+    // instead of the EAGLE shape flags. Verified on 8xB200 (GSM8K + AIME25,
+    // sgl-eval; see the benchmarks entries).
     // ====================================================================
     {
       match: { hw: "b200", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -875,7 +883,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "b200", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -941,7 +949,7 @@ sgl-eval run mmmu_pro \\
     // ====================================================================
     {
       match: { hw: "b300", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -957,7 +965,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "b300", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1207,7 +1215,7 @@ sgl-eval run mmmu_pro \\
     // ====================================================================
     {
       match: { hw: "gb200", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1223,7 +1231,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb200", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
-      verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1893,7 +1901,7 @@ sgl-eval run mmmu_pro \\
     // ====================================================================
     {
       match: { hw: "gb300", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1909,7 +1917,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb300", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
