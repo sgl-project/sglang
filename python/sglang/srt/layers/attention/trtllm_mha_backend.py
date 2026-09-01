@@ -45,13 +45,17 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer, get_spec
+from sglang.srt.runtime_context import (
+    get_buffer,
+    get_parallel,
+    get_platform,
+    get_spec,
+)
 from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -194,8 +198,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # separate index spaces; SWA layers need a translated page_table.
         self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
         # Raw full->swa index mapping tensor for the fused cuda-graph
-        # metadata kernel (gather + // page_size happen on device).
-        if self._swa_kv_pool is not None:
+        # metadata kernel (gather + // page_size happen on device). The unified
+        # pool has no token-level mapping, so this is a static-pool mechanism.
+        if (
+            self._swa_kv_pool is not None
+            and not self.kv_index_translator.is_translating
+        ):
             self._swa_full_to_swa_mapping = self._swa_kv_pool.full_to_swa_index_mapping
             assert self._swa_full_to_swa_mapping is not None, (
                 "SWA pool must register full_to_swa_index_mapping before "
@@ -222,10 +230,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # TRTLLM-GEN:
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
-        self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+        self.is_xqa_impl = get_platform().is_sm90 or get_platform().is_sm120
 
         # fmha_v2 prefill kernel supports SM90 and SM120
-        self.use_fmha_v2 = is_sm90_supported() or is_sm120_supported()
+        self.use_fmha_v2 = get_platform().is_sm90 or get_platform().is_sm120
 
         # trtllm-gen serves page_size >= 128 only through its dynamic
         # tokens-per-page kernels, which exist solely for GQA with equal QK/V
@@ -234,7 +242,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # "Missing TRTLLM-GEN kernel" error during CUDA-graph capture.
         # XQA (SM90/SM120 decode) has native page-128 kernels; no check needed.
         if self.page_size >= 128 and not self.is_xqa_impl:
-            from sglang.srt.runtime_context import get_parallel
 
             attn_tp_size = get_parallel().attn_tp_size
             num_q_heads = config.num_attention_heads // attn_tp_size
@@ -462,6 +469,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """Initialize CUDA graph state for TRTLLM MHA."""
+        self.kv_read_tables = self.kv_index_translator.make_capture_tables(
+            max_bs=max_bs, max_context_len=self.max_context_len
+        )
         max_num_pages = self.max_num_pages
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
@@ -763,25 +773,27 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # bounds real KV reads by cache_seqlens, so this is a fixed loop
         # bound only — never a host max / seq_lens_cpu D2H sync.
         max_seq_pages = self.max_num_pages
+        unified = self.kv_index_translator.is_translating
         update_trtllm_mha_graph_metadata(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             req_to_token=self.req_to_token,
             cache_seqlens=metadata.cache_seqlens_int32,
             cu_seqlens_k=metadata.cu_seqlens_k,
-            page_table=metadata.page_table,
+            page_table=None if unified else metadata.page_table,
             bs=bs,
             seqlen_offset=seqlen_offset,
             max_seq_pages=max_seq_pages,
             page_size=self.page_size,
             swa_mapping=self._swa_full_to_swa_mapping,
-            swa_page_table=metadata.swa_page_table,
+            swa_page_table=None if unified else metadata.swa_page_table,
             out_cache_loc=out_cache_loc,
-            swa_out_cache_loc=metadata.swa_out_cache_loc,
+            swa_out_cache_loc=None if unified else metadata.swa_out_cache_loc,
             cu_seqlens_q=cu_seqlens_q,
             qlens=qlens,
             q_stride=q_stride,
             q_mode=q_mode,
+            skip_page_table=unified,
         )
 
         if self._needs_encoder_only_expand(forward_mode, metadata):
@@ -884,6 +896,39 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
             )
+
+        if self.kv_index_translator.is_translating:
+            # Unified pool: refresh the capture-stable read table (this runs
+            # out-of-graph on BOTH capture and every replay-prep; the recorded
+            # fused kernel skips its page-table writes so the graph reads the
+            # refreshed content through pointers baked at capture).
+            kv_view = self.kv_index_translator.build_index_table(
+                req_pool_indices=forward_batch.req_pool_indices[:bs],
+                seq_lens=forward_batch.seq_lens[:bs],
+                into=self.kv_read_tables,
+            )
+            metadata = self.forward_metadata
+            if in_capture:
+                # Bind ONCE: the attention kernels bake these pointers at capture.
+                metadata.page_table = kv_view.ids[:bs]
+                if kv_view.sliding_window_ids is not None:
+                    metadata.swa_page_table = kv_view.sliding_window_ids[:bs]
+            # A capture batch carries no prepared write loc; zeros are the
+            # page-0 sink.
+            if (
+                self.use_sliding_window_kv_pool
+                and forward_batch.out_cache_loc is not None
+            ):
+                n = forward_batch.out_cache_loc.shape[0]
+                self.cuda_graph_swa_out_cache_loc[n:].zero_()
+                if in_capture and self.kv_index_translator.is_translating:
+                    self.cuda_graph_swa_out_cache_loc[:n].zero_()
+                else:
+                    self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                        self.kv_index_translator.sliding_window_write_loc_for(
+                            forward_batch.out_cache_loc
+                        )
+                    )
 
     def _assert_ragged_verify_supported(self) -> None:
         if self.is_xqa_impl:
@@ -1032,20 +1077,27 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
-        has_swa = self._swa_kv_pool is not None
-        metadata.page_table = torch.empty(
-            (batch_size, self.max_num_pages), dtype=torch.int32, device=device
-        )
-        metadata.swa_page_table = (
-            torch.empty(
+        kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
+        if kv_view.is_translated:
+            # No fill kernel: the kernels take the tensor's own width/stride
+            # and bound their reads by cache_seqlens.
+            metadata.page_table = kv_view.ids
+            metadata.swa_page_table = kv_view.sliding_window_ids
+        else:
+            has_swa = self._swa_kv_pool is not None
+            metadata.page_table = torch.empty(
                 (batch_size, self.max_num_pages), dtype=torch.int32, device=device
             )
-            if has_swa
-            else None
-        )
-        self._fill_page_table_device(
-            metadata, forward_batch.req_pool_indices, metadata.cache_seqlens_int32
-        )
+            metadata.swa_page_table = (
+                torch.empty(
+                    (batch_size, self.max_num_pages), dtype=torch.int32, device=device
+                )
+                if has_swa
+                else None
+            )
+            self._fill_page_table_device(
+                metadata, forward_batch.req_pool_indices, metadata.cache_seqlens_int32
+            )
         self._maybe_build_cp_zigzag_page_tables(metadata, forward_batch)
 
         if self._needs_encoder_only_expand(forward_batch.forward_mode, metadata):
@@ -1060,7 +1112,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # int64 scatter index (unlike the int32 read page table above).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             metadata.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                self.kv_index_translator.sliding_window_write_loc_for(
                     forward_batch.out_cache_loc
                 )
             )

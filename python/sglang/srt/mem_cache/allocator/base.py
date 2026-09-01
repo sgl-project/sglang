@@ -44,12 +44,45 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
         self.free_pages = None
         self.release_pages = None
-        self.is_not_in_free_group = True
-        self.free_group = []
+        # None: free right away. A list: hold frees until free_group_end().
+        self.free_group: list[torch.Tensor] | None = None
 
     @property
     def size_full(self):
         return self.size
+
+    # -- scheduler-facing capacity hooks --
+    # The scheduler calls these UNCONDITIONALLY (zero feature branches on its
+    # side); the defaults reproduce the historical token behavior exactly, and
+    # unified composites override them with byte-denominated logic.
+
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
+        """Ask the prefix cache to evict unlocked entries until this allocator
+        can serve ``num_tokens`` (or nothing evictable remains). Default = the
+        shared token-count eviction; joint-byte composites override (evicting
+        one multi-lifetime tree node frees bytes on several sides at once).
+        """
+        from sglang.srt.mem_cache.common import evict_from_tree_cache
+
+        evict_from_tree_cache(tree_cache, num_tokens)
+
+    def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
+        """Whether the NEXT decode step's ``num_tokens`` allocation fits,
+        evicting reclaimable cache first. The retract loop converges on this
+        same check, so allocator-side shortfalls retract gracefully instead of
+        tripping fail-loud alloc errors. Default reproduces the historical
+        ``ScheduleBatch.check_decode_mem`` body; unified composites override
+        with byte gates + per-step reservations of their own.
+        """
+        self.evict_to_free_tokens(tree_cache, num_tokens)
+        return self.available_size() >= num_tokens
+
+    def verify_byte_accounting(self) -> list:
+        """Idle-time conservation diagnostic: recompute this allocator's
+        byte/slot accounting and return human-readable violation strings
+        (empty == healthy). Default: static pools have no byte model.
+        """
+        return []
 
     def debug_print(self) -> str:
         return ""
@@ -61,13 +94,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return self._kvcache
 
     def free_group_begin(self):
-        self.is_not_in_free_group = False
         self.free_group = []
 
     def free_group_end(self):
-        self.is_not_in_free_group = True
-        if self.free_group:
-            self.free(torch.cat(self.free_group))
+        pending, self.free_group = self.free_group, None
+        if pending:
+            self.free(torch.cat(pending))
 
     @staticmethod
     def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
@@ -123,6 +155,14 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
     def free(self, free_index: torch.Tensor):
         raise NotImplementedError()
+
+    def free_full(self, free_index: torch.Tensor):
+        """Free slots whose SWA peers the caller already released.
+
+        A hybrid SWA allocator pairs each full-attention slot with an SWA slot
+        that can die first; this releases the full side alone. A single pool has
+        no peer, so it is a plain free()."""
+        self.free(free_index)
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """Free ``kv_row[start_pos : start_pos + n]`` of one request (or a

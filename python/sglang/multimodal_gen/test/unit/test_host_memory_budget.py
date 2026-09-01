@@ -6,35 +6,52 @@ import torch.nn as nn
 from sglang.multimodal_gen.runtime.managers.memory_managers import host_memory_budget
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     GIB_BYTES,
+    HOST_COPY_RESERVE_BYTES,
     HostPinBudget,
     cgroup_memory_limit_bytes,
+    host_copies_would_not_fit,
     host_memory_available_bytes,
     module_weight_bytes,
     pin_benefit_bytes,
 )
 
+_V2_FILES = ("memory.max", "memory.current")
+_V1_FILES = ("memory.limit_in_bytes", "memory.usage_in_bytes")
 
-def _point_at(monkeypatch, tmp_path, *, v2=None, v1=None):
-    """Redirect the cgroup lookups at files under tmp_path."""
 
-    def write(name, value):
-        path = tmp_path / name
-        path.write_text(str(value))
-        return str(path)
+def _write_cgroup(directory, files, values):
+    """Lay out one cgroup directory's limit and usage files."""
+    directory.mkdir(parents=True, exist_ok=True)
+    if values is not None:
+        for name, value in zip(files, values):
+            (directory / name).write_text(str(value))
+    return directory
 
-    missing = str(tmp_path / "absent")
-    v2_paths = (
-        (write("memory.max", v2[0]), write("memory.current", v2[1]))
-        if v2
-        else (missing, missing)
+
+def _point_at(monkeypatch, tmp_path, *, v2=None, v1=None, own_path="", nested=None):
+    """Redirect the cgroup lookups at directories under tmp_path.
+
+    `own_path` is what /proc would report, and `nested` is the (limit, usage) of
+    the cgroup at that path -- together they stand in for a process held below
+    its mount root.
+    """
+    roots = {}
+    for key, files, values in (("v2", _V2_FILES, v2), ("v1", _V1_FILES, v1)):
+        roots[key] = _write_cgroup(tmp_path / key, files, values)
+    if nested is not None:
+        leaf = roots["v1"]
+        for part in [part for part in own_path.split("/") if part]:
+            leaf = leaf / part
+        _write_cgroup(leaf, _V1_FILES, nested)
+
+    monkeypatch.setattr(
+        host_memory_budget,
+        "_CGROUP_MOUNTS",
+        ((str(roots["v2"]),) + _V2_FILES, (str(roots["v1"]),) + _V1_FILES),
     )
-    v1_paths = (
-        (write("limit_in_bytes", v1[0]), write("usage_in_bytes", v1[1]))
-        if v1
-        else (missing, missing)
-    )
-    monkeypatch.setattr(host_memory_budget, "_CGROUP_V2", v2_paths)
-    monkeypatch.setattr(host_memory_budget, "_CGROUP_V1", v1_paths)
+    proc = tmp_path / "proc_self_cgroup"
+    proc.write_text(f"11:memory:{own_path}\n" if own_path else "")
+    monkeypatch.setattr(host_memory_budget, "_PROC_SELF_CGROUP", str(proc))
 
 
 class TestCgroupLimit:
@@ -83,6 +100,100 @@ class TestCgroupLimit:
         assert host_memory_available_bytes() == 12 * GIB_BYTES
 
 
+def _host_has(monkeypatch, tmp_path, available_bytes):
+    _point_at(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        host_memory_budget.psutil,
+        "virtual_memory",
+        lambda: type("VM", (), {"available": available_bytes})(),
+    )
+
+
+class TestHostCopiesWouldNotFit:
+    def test_a_checkpoint_larger_than_the_host_does_not_fit(
+        self, monkeypatch, tmp_path
+    ):
+        # the measured H3 case: a 62 GiB encoder against a 32 GiB host
+        _host_has(monkeypatch, tmp_path, 32 * GIB_BYTES)
+        assert host_copies_would_not_fit(62 * GIB_BYTES)
+
+    def test_a_checkpoint_well_under_the_host_fits(self, monkeypatch, tmp_path):
+        _host_has(monkeypatch, tmp_path, 128 * GIB_BYTES)
+        assert not host_copies_would_not_fit(20 * GIB_BYTES)
+
+    def test_the_reserve_is_not_available_to_the_copy(self, monkeypatch, tmp_path):
+        # a copy that fits only by eating the reserve is treated as not fitting
+        _host_has(monkeypatch, tmp_path, 40 * GIB_BYTES)
+        spendable = 40 * GIB_BYTES - HOST_COPY_RESERVE_BYTES
+        assert host_copies_would_not_fit(spendable)
+        assert not host_copies_would_not_fit(spendable - 1)
+
+    def test_nothing_to_copy_always_fits(self, monkeypatch, tmp_path):
+        _host_has(monkeypatch, tmp_path, 0)
+        assert not host_copies_would_not_fit(0)
+
+    def test_the_cgroup_cap_decides_and_not_the_machine(self, monkeypatch, tmp_path):
+        # psutil sees the whole box; only the cap makes the copy impossible
+        _point_at(monkeypatch, tmp_path, v2=(32 * GIB_BYTES, 0))
+        monkeypatch.setattr(
+            host_memory_budget.psutil,
+            "virtual_memory",
+            lambda: type("VM", (), {"available": 900 * GIB_BYTES})(),
+        )
+        assert host_copies_would_not_fit(62 * GIB_BYTES)
+
+
+class TestNestedCgroup:
+    def test_a_tighter_nested_cap_wins_over_the_root(self, monkeypatch, tmp_path):
+        # a systemd scope with MemoryMax, or --cgroup-parent: planning against
+        # the root would commit memory this process cannot have
+        _point_at(
+            monkeypatch,
+            tmp_path,
+            v1=(1117 * GIB_BYTES, 0),
+            own_path="/h3",
+            nested=(32 * GIB_BYTES, 0),
+        )
+        assert cgroup_memory_limit_bytes() == (32 * GIB_BYTES, 0)
+
+    def test_a_looser_nested_cap_loses_to_the_root(self, monkeypatch, tmp_path):
+        _point_at(
+            monkeypatch,
+            tmp_path,
+            v1=(32 * GIB_BYTES, 0),
+            own_path="/wide",
+            nested=(900 * GIB_BYTES, 0),
+        )
+        assert cgroup_memory_limit_bytes() == (32 * GIB_BYTES, 0)
+
+    def test_a_container_path_that_does_not_exist_falls_back_to_the_mount(
+        self, monkeypatch, tmp_path
+    ):
+        # the measured Docker case: /proc says /docker/8e10..., and the mount is
+        # already that cgroup, so nothing joins
+        _point_at(
+            monkeypatch,
+            tmp_path,
+            v1=(1117 * GIB_BYTES, 488 * GIB_BYTES),
+            own_path="/docker/8e1010720ccd",
+        )
+        assert cgroup_memory_limit_bytes() == (1117 * GIB_BYTES, 488 * GIB_BYTES)
+
+    def test_a_suffix_of_the_reported_path_is_found_under_the_mount(
+        self, monkeypatch, tmp_path
+    ):
+        # /proc says /docker/<id>/h3 while the mount is the container's own
+        # cgroup, so only the trailing "h3" resolves
+        _point_at(
+            monkeypatch,
+            tmp_path,
+            v1=(1117 * GIB_BYTES, 0),
+            own_path="/docker/8e1010720ccd/h3",
+        )
+        _write_cgroup(tmp_path / "v1" / "h3", _V1_FILES, (32 * GIB_BYTES, 0))
+        assert cgroup_memory_limit_bytes() == (32 * GIB_BYTES, 0)
+
+
 class TestHostPinBudget:
     def test_a_component_that_fits_is_granted(self):
         budget = HostPinBudget(available_bytes=40 * GIB_BYTES)
@@ -128,6 +239,26 @@ class TestModuleWeightBytes:
         module.register_buffer("b", backing[512:])
         assert module_weight_bytes(module) == 4096
 
+    def test_invalid_storage_is_skipped(self):
+        """Offloaded models may expose a tensor whose storage cannot be queried."""
+
+        class InvalidStorage:
+            def data_ptr(self):
+                raise RuntimeError("invalid python storage")
+
+        class InvalidStorageTensor:
+            def untyped_storage(self):
+                return InvalidStorage()
+
+        class ModuleWithInvalidStorage:
+            def parameters(self):
+                return iter((torch.ones(4), InvalidStorageTensor()))
+
+            def buffers(self):
+                return iter(())
+
+        assert module_weight_bytes(ModuleWithInvalidStorage()) == 4 * 4
+
 
 class TestPinBenefit:
     def test_a_stepped_component_counts_every_step(self):
@@ -154,3 +285,17 @@ class TestPinBenefit:
 
     def test_missing_step_count_is_treated_as_one_use(self):
         assert pin_benefit_bytes(weight_bytes=1000, uses_per_request=0) == 1000
+
+
+def test_the_forced_host_size_behaves_like_a_machine_of_that_size(monkeypatch):
+    monkeypatch.setenv("SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB", "32")
+    available = host_memory_budget.host_memory_available_bytes()
+    # available is the pretend total minus this process's own anonymous
+    # memory, so it must sit strictly inside the pretend machine
+    assert 0 < available <= 32 * 1024**3
+    # and a larger pretend machine reports more room, same process
+    monkeypatch.setenv("SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB", "64")
+    larger = host_memory_budget.host_memory_available_bytes()
+    assert (
+        abs((larger - available) - 32 * 1024**3) < 512 * 1024**2
+    ), "the same process on a machine twice the size has one machine more room"

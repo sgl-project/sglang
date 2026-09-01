@@ -38,6 +38,9 @@ CustomParamValue = Union[
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
+MAX_STOP_COUNT = 32
+MAX_STOP_REGEX_LEN = 256
+MAX_STOP_REGEX_COUNT = 32
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +71,9 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     repetition_penalty: float = 1.0
     min_new_tokens: int = 0
     n: int = 1
+    # beam_width > 1 turns the request into a beam search request; n then means
+    # "number of returned sequences" rather than parallel samples (n <= beam_width).
+    beam_width: Optional[int] = None
     json_schema: Optional[str] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
@@ -149,6 +155,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
+        if self.beam_width is not None and self.beam_width < 1:
+            raise ValueError(f"beam_width must be at least 1, got {self.beam_width}.")
         if not math.isfinite(self.temperature) or self.temperature < 0.0:
             raise ValueError(
                 f"temperature must be a non-negative finite number, got {self.temperature}."
@@ -217,6 +225,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         else:
             if isinstance(self.stop_strs, str):
                 self.stop_strs = [self.stop_strs]
+            if len(self.stop_strs) > MAX_STOP_COUNT:
+                raise ValueError(
+                    f"at most {MAX_STOP_COUNT} stop strings are allowed, "
+                    f"got {len(self.stop_strs)}"
+                )
 
             stop_str_max_len = 0
             for stop_str in self.stop_strs:
@@ -234,9 +247,20 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         else:
             if isinstance(self.stop_regex_strs, str):
                 self.stop_regex_strs = [self.stop_regex_strs]
+            if len(self.stop_regex_strs) > MAX_STOP_REGEX_COUNT:
+                raise ValueError(
+                    f"at most {MAX_STOP_REGEX_COUNT} stop_regex patterns are allowed, "
+                    f"got {len(self.stop_regex_strs)}"
+                )
 
             stop_regex_max_len = 0
             for stop_regex in self.stop_regex_strs:
+                stop_regex_len = len(stop_regex.encode("utf-8"))
+                if stop_regex_len > MAX_STOP_REGEX_LEN:
+                    raise ValueError(
+                        f"stop_regex is {stop_regex_len} bytes, over the "
+                        f"{MAX_STOP_REGEX_LEN}-byte limit"
+                    )
                 stop_regex_max_len = max(
                     stop_regex_max_len, get_max_seq_length(stop_regex)
                 )

@@ -178,6 +178,35 @@ class ComponentResidencyManager:
         self._ordered_uses = tuple(
             use for uses in self._stage_uses_by_index for use in uses
         )
+        self._validate_explicit_nonresident_components()
+
+    def _validate_explicit_nonresident_components(self) -> None:
+        """Reject explicit offload selectors with no request-time use site.
+
+        Component placement is enacted by the request timeline, not merely by
+        choosing an initial load device. An explicit non-resident module with
+        no declared ``ComponentUse`` would otherwise be accepted but never
+        moved to the device before a forward pass.
+        """
+        if not isinstance(self.server_args, ServerArgs):
+            return
+
+        declared_components = {use.component_name for use in self._ordered_uses}
+        unmanaged_components = sorted(
+            component_name
+            for component_name, module in self.pipeline.modules.items()
+            if isinstance(module, nn.Module)
+            and self.server_args.explicit_residency_mode(component_name)
+            in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD)
+            and component_name not in declared_components
+        )
+        if unmanaged_components:
+            names = ", ".join(repr(name) for name in unmanaged_components)
+            raise ComponentResidencyError(
+                "Explicit component residency requires "
+                f"{names} to have a request-time ComponentUse declaration; "
+                "none appears in this pipeline"
+            )
 
     @staticmethod
     def _is_warmup_batch(batch: ResidencyBatch | list[ResidencyBatch]) -> bool:
@@ -478,9 +507,11 @@ class ComponentResidencyManager:
             if should_keep:
                 return
         strategy = self.strategy_for(use.component_name, module)
-        was_on_cuda = self._module_on_cuda(module)
+        was_on_supported_device = self._module_on_supported_device(module)
         strategy.finish_use(module, use, self.state)
-        self._empty_cache_after_large_release(use, strategy, module, was_on_cuda)
+        self._empty_cache_after_large_release(
+            use, strategy, module, was_on_supported_device
+        )
 
     def finish_request(self) -> None:
         self.finish_active_use(prefetch_next=False)
@@ -503,9 +534,11 @@ class ComponentResidencyManager:
                 not self._is_single_dit_component(component_name) or keep_single_dit
             )
             strategy = self.strategy_for(component_name, module)
-            was_on_cuda = self._module_on_cuda(module)
+            was_on_supported_device = self._module_on_supported_device(module)
             strategy.finish_request(module, use, self.state, preferred=preferred)
-            self._empty_cache_after_large_release(use, strategy, module, was_on_cuda)
+            self._empty_cache_after_large_release(
+                use, strategy, module, was_on_supported_device
+            )
 
     def stage_name(self, stage: ComponentResidencyStage) -> str:
         return self._stage_names_by_id.get(id(stage), stage.__class__.__name__)
@@ -634,21 +667,33 @@ class ComponentResidencyManager:
         buffer = next(module.buffers(), None)
         return buffer.device.type if buffer is not None else None
 
-    def _module_on_cuda(self, module: nn.Module | None) -> bool:
-        return self._module_device(module) == "cuda"
+    def _module_on_supported_device(self, module: nn.Module | None) -> bool:
+        is_supported_platform = (
+            current_platform.is_cuda()
+            or current_platform.is_rocm()
+            or current_platform.is_npu()
+        )
+        return is_supported_platform and current_platform.is_device_type(
+            self._module_device(module)
+        )
 
     def _empty_cache_after_large_release(
         self,
         use: ComponentUse,
         strategy: ComponentResidencyStrategy,
         module: nn.Module,
-        was_on_cuda: bool,
+        was_on_supported_device: bool,
     ) -> None:
         if not use.memory_intensive:
             return
-        released_cuda_storage = was_on_cuda and not self._module_on_cuda(module)
+        released_device_storage = (
+            was_on_supported_device and not self._module_on_supported_device(module)
+        )
         released_layerwise_storage = isinstance(strategy, LayerwiseOffloadStrategy)
-        if not (released_cuda_storage or released_layerwise_storage):
+        should_empty_component_cache = (
+            released_device_storage and not current_platform.is_npu()
+        )
+        if not (should_empty_component_cache or released_layerwise_storage):
             return
         if not torch.get_device_module().is_available():
             return
