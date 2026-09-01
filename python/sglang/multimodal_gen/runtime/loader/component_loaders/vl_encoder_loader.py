@@ -22,9 +22,9 @@ class VisionLanguageEncoderLoader(ComponentLoader):
         self,
         component_model_path: str,
         server_args: ServerArgs,
-        transformers_or_diffusers: str = "vision_language_encoder",
+        component_name: str = "vision_language_encoder",
     ) -> Any:
-        if transformers_or_diffusers == "vision_language_encoder":
+        if self.structural_component_type(component_name) == "vision_language_encoder":
 
             if server_args.srt_encoder_url is not None:
                 health_url = server_args.srt_encoder_url.rstrip("/") + "/health"
@@ -59,7 +59,7 @@ class VisionLanguageEncoderLoader(ComponentLoader):
                 revision=server_args.revision,
             )
             target_device = self.target_device(
-                server_args.should_start_component_on_cpu("vision_language_encoder")
+                server_args.should_start_component_on_cpu(component_name)
             )
             model = GlmImageForConditionalGeneration.from_pretrained(
                 component_model_path,
@@ -70,5 +70,6 @@ class VisionLanguageEncoderLoader(ComponentLoader):
             return model
         else:
             raise ValueError(
-                f"Unsupported library for VisionLanguageEncoder: {transformers_or_diffusers}"
+                f"Unsupported component type for VisionLanguageEncoder: "
+                f"{self.structural_component_type(component_name)}"
             )

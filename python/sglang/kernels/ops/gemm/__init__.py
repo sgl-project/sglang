@@ -63,11 +63,10 @@ def _prefer_torch_rowwise_fp8(
     ):
         return False
 
-    # Tuned on H100 over MiniMax-H3's complete dense shape set: four
-    # production sequence lengths and TP1/2/4/8 (64 shapes). This selector
-    # chose the measured winner for every shape while retaining the AOT kernel
-    # for the smaller-K projections where NVJet loses.
-    return (k >= 5376 and n >= 3584) or (k >= 3584 and m >= 8192)
+    # SM90 benchmarks show repeatable NVJet wins only for large prefill M with
+    # either a wide output or a broad down projection. Keep decode, narrow TP8
+    # projections, and shapes outside that measured envelope on the AOT kernel.
+    return m >= 8192 and ((k >= 4096 and n >= 6144) or (k >= 7168 and n >= 5376))
 
 
 class Fp8ScaledMMOp(BaseFusedOp):

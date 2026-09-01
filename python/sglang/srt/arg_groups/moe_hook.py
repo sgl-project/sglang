@@ -25,7 +25,8 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.utils.common import is_npu, parse_connector_type
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.common import parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +244,7 @@ def handle_a2a_moe(server_args: Any):
     # The resolving view, not the field: `_a2a_backend_overrides` may have
     # moved this already (waterfill forces `deepep`).
     a2a_now = resolved_view(server_args).moe_a2a_backend
-    if (a2a_now == "none" and is_npu()) or a2a_now == "ascend_tp":
+    if (a2a_now == "none" and get_platform().is_npu) or a2a_now == "ascend_tp":
         # FIXME (OrangeRedeng): for some reasons if pass "ascend_tp" accuracy drops to zero
         declare_resolution(
             server_args,
@@ -258,7 +259,17 @@ def handle_a2a_moe(server_args: Any):
         ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
         if cfg.deepep_mode != "auto":
             logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
-        if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
+        use_cutedsl_w4a16 = (
+            resolved_view(server_args).moe_runner_backend == "flashinfer_cutedsl"
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        )
+        if use_cutedsl_w4a16:
+            if envs.SGLANG_MOE_NVFP4_DISPATCH.get():
+                raise ValueError(
+                    "CuTe DSL NVFP4 W4A16 requires BF16 FlashInfer MoE "
+                    "dispatch; unset SGLANG_MOE_NVFP4_DISPATCH."
+                )
+        elif not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
             resolved_view(server_args).quantization == "modelopt_fp4"
             or model_config_of(server_args).nvfp4_moe_meta is not None
         ):
