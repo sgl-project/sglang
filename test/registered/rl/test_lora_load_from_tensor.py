@@ -368,8 +368,8 @@ class TestLoRALoadFromTensor(CustomTestCase):
         self.engine.update_weights_from_tensor(
             named_tensors=[serialized], load_format="flattened_bucket"
         )
-        result = self.engine.end_weight_update()
-        self.assertTrue(result.success, f"Failed: {result.error_message}")
+        success, message = self.engine.end_weight_update()
+        self.assertTrue(success, f"Failed: {message}")
 
         output = self.engine.generate(
             prompt=[TEST_PROMPT],
