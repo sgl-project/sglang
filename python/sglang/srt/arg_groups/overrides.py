@@ -35,160 +35,50 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-import inspect
 import json
 import logging
+import math
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from sglang.srt.arg_groups import model_override_base
 from sglang.srt.arg_groups.arg_utils import field_names, resolvable_fields
-from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.mlx.runtime import use_mlx
-from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.utils.common import (
-    cpu_has_amx_support,
-    get_device_capability,
-    get_device_name,
-    get_device_sm,
-    get_nvidia_driver_version,
-    get_quantization_config,
-    is_blackwell_supported,
-    is_cpu,
-    is_cuda,
-    is_flashinfer_available,
-    is_gfx95_supported,
-    is_hip,
-    is_mnnvl_fabric_device,
-    is_mps,
-    is_musa,
-    is_npu,
-    is_sm90_supported,
-    is_sm100_supported,
-    is_sm120_supported,
-    is_triton_kernels_available,
-    is_xpu,
-    xpu_has_xmx_support,
+
+# Re-exported for the callers that already import these names from here; the
+# declarations under ``model_overrides/`` import them from the base directly.
+from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
+    _MODEL_OVERRIDE_FNS,
+    _PREDICATE_OVERRIDE_FNS,
+    MODEL_OVERRIDES,
+    ResolvedView,
+    ResolvingConfig,
+    _declaration_overlay,
+    _invoke_provider,
+    _register_for,
+    attention_backends_of,
+    get_default_attn_backend,
+    is_attention_backend_not_set,
+    mamba_extra_buffer_of,
+    model_config_of,
+    record_of,
+    register_model_override,
+    register_model_override_predicate,
+    resolved_view,
+    resolving_view,
+    use_mla_backend,
 )
 
 logger = logging.getLogger(__name__)
-
-# Constant per-architecture overrides (populated by the migration sweeps).
-MODEL_OVERRIDES: Dict[str, Dict[str, Any]] = {
-    # These models run in bfloat16 regardless of the requested dtype
-    # (faithful port of the legacy unconditional arch branch).
-    "MistralLarge3ForCausalLM": {"dtype": "bfloat16"},
-    "PixtralForConditionalGeneration": {"dtype": "bfloat16"},
-}
-
-# Derived per-architecture override providers, in registration order.
-_MODEL_OVERRIDE_FNS: Dict[str, List[Callable[..., dict]]] = {}
-
-# Predicate-keyed providers, in registration order — for legacy branches
-# matched by substring/predicate on the architecture string rather than an
-# exact name (e.g. '"Step3p5ForCausalLM" in model_arch').
-_PREDICATE_OVERRIDE_FNS: List[Tuple[Callable[[str], bool], Callable[..., dict]]] = []
-
-
-def register_model_override(architecture: str):
-    """Register a derived-override provider for ``architecture``.
-
-    The decorated callable receives ``(server_args, hf_config)``, must not
-    mutate either, and returns a ``{field: resolved_value}`` dict (possibly
-    empty when nothing applies). Providers needing derived model data beyond
-    the HF config go through ``server_args.get_model_config()`` (cached,
-    read-only) — never anything mutating.
-    """
-
-    def decorator(fn: Callable[..., dict]) -> Callable[..., dict]:
-        _MODEL_OVERRIDE_FNS.setdefault(architecture, []).append(fn)
-        return fn
-
-    return decorator
-
-
-def register_model_override_predicate(predicate: Callable[[str], bool]):
-    """Register a derived-override provider keyed by an architecture
-    predicate. Same callable contract as ``register_model_override``."""
-
-    def decorator(fn: Callable[..., dict]) -> Callable[..., dict]:
-        _PREDICATE_OVERRIDE_FNS.append((predicate, fn))
-        return fn
-
-    return decorator
-
-
-def _invoke_provider(
-    fn: Callable[..., dict], server_args: Any, hf_config: Any
-) -> Dict[str, Any]:
-    declared = fn(server_args, hf_config)
-    if not isinstance(declared, dict):
-        raise TypeError(
-            f"model override provider {fn.__qualname__} must return a dict, "
-            f"got {type(declared).__name__}"
-        )
-    return declared
-
-
-class ResolvedView:
-    """Read-only view of the resolving configuration handed to post-process
-    passes: the accumulated declarations overlaid on the pristine
-    ``server_args`` (residual imperative writes of non-resolved fields show
-    through the fallthrough) — exactly the state the legacy handler at the
-    same slot observed. Writes are rejected: passes return declarations.
-    """
-
-    __slots__ = ("_server_args", "_overlay")
-
-    def __init__(self, server_args: Any, overlay: Optional[Dict[str, Any]] = None):
-        object.__setattr__(self, "_server_args", server_args)
-        object.__setattr__(self, "_overlay", overlay or {})
-
-    def __getattr__(self, name: str) -> Any:
-        overlay = object.__getattribute__(self, "_overlay")
-        if name in overlay:
-            return overlay[name]
-        return getattr(object.__getattribute__(self, "_server_args"), name)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        raise AttributeError(
-            "ResolvedView is read-only; post-process passes return declarations"
-        )
-
-
-class ResolvingConfig:
-    """Live read view of the resolution result: the declaration stash over the
-    record's fields, looked up per read.
-
-    ``ResolvedView`` snapshots the overlay when it is built, which is what a
-    post-process pass wants -- it reads the state at its slot. A resolver that
-    reads *after* declaring, or after calling something that declares, needs the
-    current answer instead, so this one walks the stash on every read. It falls
-    through to the field, which is where the raw input lives.
-    """
-
-    __slots__ = ("_server_args",)
-
-    def __init__(self, server_args: Any):
-        object.__setattr__(self, "_server_args", server_args)
-
-    def __getattr__(self, name: str) -> Any:
-        server_args = object.__getattribute__(self, "_server_args")
-        for _source, declared in reversed(
-            getattr(server_args, "_resolved_overrides", None) or ()
-        ):
-            if name in declared:
-                return declared[name]
-        return getattr(server_args, name)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        raise AttributeError(
-            "ResolvingConfig is read-only; resolution writes through declarations"
-        )
-
-
-def resolving_view(server_args: Any) -> ResolvingConfig:
-    """A live read view of what resolution has decided so far."""
-    return ResolvingConfig(server_args)
-
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.runtime_context import (
+    get_context,
+    get_platform,
+)
+from sglang.srt.utils.common import (
+    get_quantization_config,
+    is_gfx95_supported,
+    xpu_has_xmx_support,
+)
 
 # Registered post-process passes. This is a registry, not an execution order:
 # each pass is invoked from its own slot via run_post_process_pass.
@@ -205,17 +95,6 @@ def register_post_process(fn: Callable[..., dict]) -> Callable[..., dict]:
     return fn
 
 
-def _declaration_overlay(server_args: Any) -> Dict[str, Any]:
-    """What the declarations say so far, last writer wins.
-
-    Nothing writes the fields, so a mid-resolution reader needs this to see a
-    decision at all; the fields keep what the caller supplied."""
-    overlay: Dict[str, Any] = {}
-    for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
-        overlay.update(declared)
-    return overlay
-
-
 def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
     """Invoke one pass at its legacy handler slot.
 
@@ -227,23 +106,17 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
     A slot that runs after resolution -- ``check_server_args`` hosts one -- lands
     in the same stash, which publish projects from later, so it needs no field
     write either. After *publish* there is no such later projection: the stash
-    would grow an entry nothing reads. So, like ``declare_late_resolution``,
-    this refuses the published record -- post-publish changes go to the bags
-    through ``get_context().override(...)``.
-    """
-    from sglang.srt.runtime_context import get_context
+    would grow an entry nothing reads.
 
-    try:
-        published = get_context().server_args
-    except ValueError:
-        published = None
-    if published is server_args:
-        raise ValueError(
-            f"run_post_process_pass({fn.__qualname__!r}) called on the published "
-            "config; the stash is projected at publish and never again, so a "
-            "declaration made here would be a silent no-op -- post-publish "
-            "changes go to the bags via get_context().override(...)"
-        )
+    So what is refused is the *declaration*, not the record. A pass that returns
+    an empty dict is a validation, and it may run on the published instance --
+    it has to, because ``Engine(server_args=sa)`` after ``Engine.shutdown()``
+    re-runs ``check_server_args`` on the very instance the context still holds.
+    A pass that returns a non-empty dict there is refused, as
+    ``declare_late_resolution`` is -- post-publish changes go to the bags through
+    ``get_context().override(...)``.
+    """
+
     declared = fn(ResolvedView(server_args, overlay=_declaration_overlay(server_args)))
     if not isinstance(declared, dict):
         raise TypeError(
@@ -251,6 +124,23 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
             f"got {type(declared).__name__}"
         )
     if declared:
+        # Refused only once there is something to record. A pass that declares
+        # nothing is a validation, and `check_server_args` runs those again on
+        # a rebuild: `Engine(server_args=sa)` after `Engine.shutdown()` hands
+        # back the same instance while the context still holds it, and
+        # refusing on identity alone would fail that launch.
+        try:
+            published = get_context().server_args
+        except ValueError:
+            published = None
+        if published is server_args:
+            raise ValueError(
+                f"run_post_process_pass({fn.__qualname__!r}) declared "
+                f"{sorted(declared)} on the published config; the stash is "
+                "projected at publish and never again, so this would be a "
+                "silent no-op -- post-publish changes go to the bags via "
+                "get_context().override(...)"
+            )
         entry = (fn.__qualname__, dict(declared))
         stash = getattr(server_args, "_resolved_overrides", None)
         if stash is None:
@@ -264,24 +154,13 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
         validate_declarations(server_args, [entry])
 
 
-def _apply_fields(server_args: Any, fields: Dict[str, Any]) -> None:
-    """Write fields on behalf of the pipeline (bypasses the strict bare-
-    assignment guard that protects post-resolution mutation)."""
-    object.__setattr__(server_args, "_internal_write", True)
-    try:
-        for field, value in fields.items():
-            setattr(server_args, field, value)
-    finally:
-        object.__setattr__(server_args, "_internal_write", False)
-
-
 def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
     """Record a resolution write in the declaration stash.
 
     The stash *is* the resolution result: the bags are projected from it,
     `resolution_result` answers from it, and no field is written. A resolver
     reading a field another resolver may have decided must read `resolving_view`
-    (or `ServerArgs._resolved()`), which
+    (or `resolved_view(server_args)`), which
     `test_resolution_reads_the_declarations` pins.
 
     For resolvers inside ``__post_init__``; launcher-stage resolution goes
@@ -315,7 +194,6 @@ def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> Non
     field write would desync them, which is what ``get_context().override`` is
     for.
     """
-    from sglang.srt.runtime_context import get_context
 
     try:
         published = get_context().server_args
@@ -443,51 +321,66 @@ def _plain(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
-def resolved_view(server_args: Any) -> ResolvedView:
-    """Read-only view of the resolving configuration: the declarations
-    overlaid on the fields, snapshotted per call.
+def pre_capture_activation_reserve_mb_of(cfg: Any, gpu_mem: Optional[float]) -> float:
+    """The activation working-set reserve held back before cuda-graph capture.
 
-    For mid-resolution code that is not a pass (``__post_init__`` handlers and
-    hooks), and for the record's own members that must answer with what
-    resolution decided -- a declaration-only resolver (a model-specific
-    override, a registry entry) never writes the field, so a field read there
-    answers with the raw input."""
-    return ResolvedView(server_args, overlay=_declaration_overlay(server_args))
+    The config-shaped half of the pair; `runtime_context` carries the
+    published-bag half, and `TestDerivedPredicatesAgreeAcrossTiers` pins the
+    two equal.
+    """
+    if cfg.disaggregation_mode == "decode":
+        running_requests = (
+            cfg.max_running_requests or cfg.cuda_graph_config.decode.max_bs or 1
+        )
+        activation_tokens = max(
+            running_requests * (cfg.speculative_num_draft_tokens or 1), 2048
+        )
+    elif cfg.chunked_prefill_size > 0:
+        activation_tokens = max(cfg.chunked_prefill_size, 2048)
+    else:
+        activation_tokens = max(cfg.max_prefill_tokens, 2048)
+    reserved_mem = 512 + activation_tokens * 1.5 + cfg.tp_size * cfg.pp_size / 8 * 1024
+    if gpu_mem is not None and gpu_mem > 60 * 1024:
+        reserved_mem = max(reserved_mem, 10 * 1024)
+    return reserved_mem
 
 
-def attention_backends_of(cfg: Any) -> tuple:
-    """(prefill, decode) attention backends of a config-shaped object (a
-    ResolvedView mid-resolution, or pristine server_args at dispatch time):
-    split fields fall back to the base backend."""
-    prefill = (
-        cfg.prefill_attention_backend
-        if cfg.prefill_attention_backend
-        else cfg.attention_backend
-    )
-    decode = (
-        cfg.decode_attention_backend
-        if cfg.decode_attention_backend
-        else cfg.attention_backend
-    )
-    return prefill, decode
+def kv_event_block_size_of(cfg: Any) -> int:
+    """Width KV events are emitted at.
+
+    Under DCP the radix tree pages at ``page_size * dcp_size``
+    (`mem_cache/kv_cache_builder.py`), and subscribers key on this.
+    """
+    return cfg.page_size * cfg.dcp_size
+
+
+def modelexpress_config_of(cfg: Any) -> dict:
+    """``modelexpress_config`` parsed.
+
+    It is a JSON string (or an already-parsed dict) rather than a leaf of its
+    own, so everything that wants a key out of it goes through here -- one parse,
+    for every reader.
+    """
+    raw = cfg.modelexpress_config
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        return json.loads(raw)
+    return raw
+
+
+def modelexpress_url_of(cfg: Any) -> Optional[str]:
+    """The modelexpress endpoint a config-shaped object points at."""
+    return modelexpress_config_of(cfg).get("url")
 
 
 def modelexpress_transport_of(cfg: Any) -> str:
     """The modelexpress transport a config-shaped object asks for.
 
-    ``modelexpress_config`` is a JSON string (or an already-parsed dict) rather
-    than a leaf of its own; this is the shared parse for the transfer-engine
-    gate (`remote_instance_transfer_engine_of`) and any future bag reader.
-    ``ServerArgs.modelexpress_transport`` keeps its own instance-cached parse
-    (`_parsed_modelexpress_config`) -- same rule, cached seed-side."""
-    raw = cfg.modelexpress_config
-    if raw is None:
-        parsed = {}
-    elif isinstance(raw, str):
-        parsed = json.loads(raw)
-    else:
-        parsed = raw
-    return parsed.get("transport", "nixl")
+    The shared parse for the transfer-engine gate
+    (`remote_instance_transfer_engine_of`) and any bag reader.
+    """
+    return modelexpress_config_of(cfg).get("transport", "nixl")
 
 
 def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> bool:
@@ -505,19 +398,6 @@ def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> boo
     return backend == "transfer_engine" or (
         backend == "modelexpress"
         and modelexpress_transport_of(cfg) == "transfer_engine"
-    )
-
-
-def mamba_extra_buffer_of(cfg: Any) -> bool:
-    """Mid-resolution equivalent of runtime_context.mamba_extra_buffer_enabled:
-    reads the (possibly overlaid) strategy from a config-shaped object.
-
-    This is the one definition of the predicate: ``ServerArgs`` delegates its
-    member to it, and the runtime_context accessor is its post-publish sibling
-    (which cannot reuse it, because the two leaves land in different bags)."""
-    return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
-        "extra_buffer",
-        "extra_buffer_lazy",
     )
 
 
@@ -539,15 +419,17 @@ def collect_model_override_declarations(
     registration order, then matching predicate-keyed callables in
     registration order. Empty declarations are dropped.
     """
+    # Off the module, not through the imported names: the registrars append to
+    # the base's objects, and a copied name here would be a second binding.
     declarations: List[Tuple[str, Dict[str, Any]]] = []
-    const = MODEL_OVERRIDES.get(architecture)
+    const = model_override_base.MODEL_OVERRIDES.get(architecture)
     if const:
         declarations.append((f"MODEL_OVERRIDES[{architecture!r}]", dict(const)))
-    for fn in _MODEL_OVERRIDE_FNS.get(architecture, ()):
+    for fn in model_override_base._MODEL_OVERRIDE_FNS.get(architecture, ()):
         declared = _invoke_provider(fn, server_args, hf_config)
         if declared:
             declarations.append((fn.__qualname__, dict(declared)))
-    for predicate, fn in _PREDICATE_OVERRIDE_FNS:
+    for predicate, fn in model_override_base._PREDICATE_OVERRIDE_FNS:
         if predicate(architecture):
             declared = _invoke_provider(fn, server_args, hf_config)
             if declared:
@@ -562,1169 +444,8 @@ def collect_model_override_declarations(
 # ---------------------------------------------------------------------------
 
 
-def _register_for(*architectures: str):
-    """Register one provider for several architectures (family lists)."""
-
-    def decorator(fn: Callable[..., dict]) -> Callable[..., dict]:
-        for architecture in architectures:
-            register_model_override(architecture)(fn)
-        return fn
-
-    return decorator
-
-
-def _dspark_verify_on_decode_backend(
-    backend: Optional[str], q_len: int, kv_cache_dtype: Optional[str]
-) -> bool:
-    """Whether the MLA decode backend can serve a q_len-wide target verify."""
-    if backend == "trtllm_mla":
-        return True
-    if backend == "tokenspeed_mla":
-        return kv_cache_dtype == "fp8_e4m3" and q_len <= 8
-    if backend == "cutedsl_mla":
-        # cute-dsl monolithic MLA decode folds the verify tokens into the head
-        # dim (fold_sq), so it serves any DSPARK verify width. Needs flashinfer
-        # >= 0.6.15 (older builds reject q_len >= 5).
-        return True
-    return False
-
-
-def _require_kimi_k3_cutedsl_dcp_support() -> None:
-    try:
-        from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
-
-        parameters = inspect.signature(trtllm_batch_decode_with_kv_cache_mla).parameters
-    except (ImportError, TypeError, ValueError) as exc:
-        raise RuntimeError(
-            "Kimi-K3 DCP with decode_attention_backend='cutedsl_mla' requires "
-            "FlashInfer 0.6.17 or newer with "
-            "trtllm_batch_decode_with_kv_cache_mla exposing enable_dcp."
-        ) from exc
-
-    if "enable_dcp" not in parameters:
-        raise RuntimeError(
-            "Kimi-K3 DCP with decode_attention_backend='cutedsl_mla' requires "
-            "enable_dcp in the signature of "
-            "flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla; upgrade "
-            "to FlashInfer 0.6.17 or newer."
-        )
-
-
-@_register_for("KimiK3ForConditionalGeneration")
-def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    if cfg.dcp_size > 1:
-        overrides = {}
-        if cfg.enable_symm_mem:
-            logger.warning(
-                "Kimi-K3 DCP disables --enable-symm-mem due to decode CUDA "
-                "graph correctness issues."
-            )
-            overrides["enable_symm_mem"] = False
-
-        if cfg.speculative_algorithm == "DSPARK":
-            from sglang.srt.speculative.ragged_verify import (
-                RaggedVerifyMode,
-                read_ragged_verify_mode,
-            )
-
-            ragged_mode = read_ragged_verify_mode()
-            if ragged_mode is not RaggedVerifyMode.STATIC:
-                raise ValueError(
-                    "Kimi-K3 DCP + DSPARK currently requires "
-                    "SGLANG_RAGGED_VERIFY_MODE=static; compact/cap-accept are "
-                    f"not validated under DCP (got {ragged_mode.value!r})."
-                )
-
-            # DSPARK target-verify + draft-extend must run on the decode
-            # (cutedsl_mla) backend, whose _run_decode_kernel implements the DCP
-            # signature (causal_seqs / cp_world / cp_rank). The default
-            # "prefill" routes verify to trtllm_mla, whose base _run_decode_kernel
-            # lacks that DCP path (TypeError: unexpected kwarg 'causal_seqs').
-            overrides["speculative_attention_mode"] = "decode"
-
-        prefill_backend, decode_backend = attention_backends_of(cfg)
-        if decode_backend == "cutedsl_mla" or decode_backend is None:
-            _require_kimi_k3_cutedsl_dcp_support()
-            logger.info(
-                "Kimi-K3 DCP keeps decode attention backend 'cutedsl_mla' "
-                f"(prefill={prefill_backend!r} -> 'trtllm_mla')."
-            )
-            overrides.update(
-                prefill_attention_backend="trtllm_mla",
-                decode_attention_backend="cutedsl_mla",
-            )
-        elif decode_backend == "tokenspeed_mla":
-            logger.info(
-                "Kimi-K3 DCP overrides attention backends: "
-                f"prefill={prefill_backend!r}, decode={decode_backend!r} -> "
-                "'tokenspeed_mla'."
-            )
-            logger.info(
-                "Kimi-K3 DCP with tokenspeed mla backend overrides KV cache dtype: "
-                f"{cfg.kv_cache_dtype!r} -> 'fp8_e4m3'."
-            )
-            overrides.update(
-                prefill_attention_backend="tokenspeed_mla",
-                decode_attention_backend="tokenspeed_mla",
-                kv_cache_dtype="fp8_e4m3",
-            )
-        else:
-            raise AssertionError(
-                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'tokenspeed_mla', got {decode_backend!r}."
-            )
-
-        if cfg.dcp_replicate_q_proj is None:
-            logger.info("Kimi-K3 DCP enables replicated Q projection by default.")
-            overrides["dcp_replicate_q_proj"] = True
-
-        device_name = get_device_name()
-        dcp_comm_backend = "fi_a2a" if is_mnnvl_fabric_device() else "a2a"
-        logger.info(
-            "Kimi-K3 DCP selects communication backend on "
-            f"{device_name!r}: {cfg.dcp_comm_backend!r} -> "
-            f"{dcp_comm_backend!r}."
-        )
-        overrides["dcp_comm_backend"] = dcp_comm_backend
-        return overrides
-
-    if not (is_sm100_supported() and get_device_sm() in (100, 103)):
-        return {}
-    backends_unset = server_args.is_attention_backend_not_set()
-    if cfg.speculative_algorithm != "DSPARK":
-        if not backends_unset:
-            return {}
-        logger.info(
-            "Use trtllm_mla as the default prefill and decode attention "
-            "backend for Kimi-K3 on SM100/SM103."
-        )
-        return {
-            "decode_attention_backend": "trtllm_mla",
-            "prefill_attention_backend": "trtllm_mla",
-        }
-    # DSPARK: verify runs on the decode backend (mode=decode below), so this
-    # picks the verify kernel -- mode=prefill routes it to flashinfer, which is
-    # slow and syncs, while plain decode is cold under dspark.
-    q_len = cfg.speculative_num_draft_tokens or (
-        cfg.speculative_dspark_block_size + 1
-        if cfg.speculative_dspark_block_size is not None
-        # Checkpoint auto-infer happens after overrides; K3 draft uses block 7.
-        else 8
-    )
-    overrides = {}
-    if backends_unset:
-        backend = "trtllm_mla"
-        overrides["decode_attention_backend"] = backend
-        overrides["prefill_attention_backend"] = "trtllm_mla"
-    else:
-        # Explicit backend knobs keep priority, but the mode is a separate knob
-        # that still needs declaring -- else verify stays on the prefill backend,
-        # whose host-side plan (flashinfer by default) forces a per-step D2H.
-        _, backend = attention_backends_of(cfg)
-    if _dspark_verify_on_decode_backend(backend, q_len, cfg.kv_cache_dtype):
-        overrides["speculative_attention_mode"] = "decode"
-        logger.info(
-            "Kimi-K3 DSPARK on SM100/SM103: decode/verify attention backend "
-            f"{backend} (speculative_attention_mode=decode)."
-        )
-    else:
-        logger.warning(
-            f"Kimi-K3 DSPARK: decode attention backend {backend!r} cannot serve "
-            f"target verify at q_len={q_len}, so verify runs on the prefill "
-            "backend (speculative_attention_mode=prefill). A host-plan prefill "
-            "backend costs a per-step seq_lens D2H sync; leave the attention "
-            "backend knobs unset for the sync-free default."
-        )
-    return overrides
-
-
-def _is_mxfp4_pack_quantized(hf_config: Any) -> bool:
-    qc = getattr(
-        getattr(hf_config, "text_config", hf_config), "quantization_config", None
-    )
-    if not isinstance(qc, dict):
-        return False
-    groups = qc.get("config_groups") or {}
-    return any(
-        "mxfp4" in str(g.get("format", ""))
-        for g in groups.values()
-        if isinstance(g, dict)
-    )
-
-
-@_register_for("KimiK3ForConditionalGeneration")
-def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
-    # MoE runner default, independent of the attention-backend gate above.
-    # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode
-    # (M=bs) and the target-verify (M=bs*(gamma+1)) regimes on SM100/SM103.
-    # SM107 uses the same packed-MXFP4 runner; leaving auto unresolved falls
-    # back to BF16 weight materialization during model loading.
-    cfg = resolving_view(server_args)
-    if cfg.moe_runner_backend != "auto":
-        return {}
-    if not (is_sm100_supported() and get_device_sm() in (100, 103, 107)):
-        return {}
-    if not _is_mxfp4_pack_quantized(hf_config):
-        return {}
-    logger.info(
-        "Kimi-K3 on SM100/SM103/SM107: moe_runner_backend=flashinfer_mxfp4 "
-        "(FlashInfer SiTU kernels)."
-    )
-    return {"moe_runner_backend": "flashinfer_mxfp4"}
-
-
-@_register_for(
-    "DeepseekV3ForCausalLM",
-    "DeepseekV32ForCausalLM",
-    "KimiK25ForConditionalGeneration",
-    "MistralLarge3ForCausalLM",
-    "PixtralForConditionalGeneration",
-    "GlmMoeDsaForCausalLM",
-    "LongcatFlashForCausalLM",
-    "LongcatFlashForCausalLMNextN",
-    "Dots3NoteForCausalLM",
-)
-def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
-    """Order-safe declarations of the DeepSeek/DSA branch. The CP parallel
-    writes (enable_dp_attention/ep_size/moe_a2a_backend have post-monolith
-    writers), the kv-cache/split-backend defaults, the quant/moe block (read
-    before it by _set_default_dsa_kv_cache_dtype) and the env writes stay in
-    the branch."""
-    cfg = resolving_view(server_args)
-    from sglang.srt.configs.model_config import is_deepseek_dsa
-
-    overrides: Dict[str, Any] = {}
-
-    if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
-        # Set attention backend for DeepSeek
-        if server_args.is_attention_backend_not_set():
-            overrides["attention_backend"] = "dsa"
-            logger.info("Use dsa attention backend for DeepSeek with DSA.")
-        if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
-            if cfg.enable_prefill_cp:
-                logger.warning(
-                    "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
-                )
-                overrides["enable_dp_attention"] = True
-                overrides["moe_dense_tp_size"] = 1
-                if cfg.cp_strategy == "zigzag":
-                    overrides["moe_a2a_backend"] = "deepep"
-                    overrides["ep_size"] = cfg.tp_size
-                    logger.warning(
-                        "zigzag DSA CP requires moe_dense_tp_size=1, "
-                        "moe_a2a_backend=deepep, ep_size=tp_size, batch_size=1."
-                    )
-                else:
-                    assert (
-                        cfg.dp_size == 1
-                    ), "interleave DSA CP does not support DP attention."
-                assert (
-                    cfg.tp_size <= 8
-                ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
-                # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
-                # DSACPLayerCommunicator does not all-reduce attention-TP
-                # partial o_proj outputs before replicated dense FFNs.
-                attn_cp_size = cfg.tp_size // cfg.dp_size
-                overrides["attn_cp_size"] = attn_cp_size
-                logger.warning(
-                    "Enabled DSA context parallel: "
-                    f"strategy={cfg.cp_strategy}, dp_size={cfg.dp_size}, "
-                    f"moe_dense_tp_size={overrides['moe_dense_tp_size']}, "
-                    f"ep_size={overrides.get('ep_size', cfg.ep_size)}, tp_size={cfg.tp_size}, "
-                    f"attn_cp_size={attn_cp_size}, "
-                    f"kv_cache_dtype={cfg.kv_cache_dtype}, "
-                    f"moe_a2a_backend={overrides.get('moe_a2a_backend', cfg.moe_a2a_backend)}, "
-                    f"cuda_graph_config[prefill].backend=disabled"
-                )
-
-            # Deferred import to avoid a circular import at module-load
-            # time (dsa.utils imports the runtime-context accessors).
-            from sglang.srt.layers.attention.dsa.utils import (
-                aiter_can_use_preshuffle_paged_mqa,
-            )
-
-            if is_hip() and not aiter_can_use_preshuffle_paged_mqa():
-                # Legacy ROCm DSA path: aiter's gluon paged-MQA kernel is
-                # unavailable (Triton<3.5 and AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS
-                # not set, or SGLANG_DSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).
-                overrides["page_size"] = 1
-                logger.warning(
-                    "Setting page size to 1 for DeepSeek DSA on ROCm "
-                    "(aiter preshuffle paged-MQA path unavailable: "
-                    "needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1)."
-                )
-            else:
-                overrides["page_size"] = 64
-                logger.warning("Setting page size to 64 for DeepSeek DSA.")
-    else:
-        # DeepSeek V3/R1/V3.1
-        if is_sm100_supported():
-            if (
-                cfg.attention_backend is None
-                and cfg.prefill_attention_backend is None
-                and cfg.decode_attention_backend is None
-            ):
-                overrides["attention_backend"] = "trtllm_mla"
-                logger.info(
-                    "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
-                )
-        # MLA prefill CP auto-config. Mirrors the NSA CP block above
-        # (minus the in-seq/round-robin mode split, which MLA CP does not support)
-        if cfg.enable_prefill_cp and server_args.use_mla_backend():
-            logger.warning(
-                "MLA prefill context parallel is still experimental. "
-                "Verified on Hopper with the fa3 backend."
-            )
-            overrides["enable_dp_attention"] = True
-            # TODO(kpham-sgl) Supports moe_dense_tp_size != 1.
-            overrides["moe_dense_tp_size"] = 1
-            overrides["moe_a2a_backend"] = "deepep"
-            overrides["ep_size"] = cfg.tp_size
-            logger.warning(
-                "For MLA CP, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
-            )
-            # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
-            # DSACPLayerCommunicator does not all-reduce attention-TP
-            # partial o_proj outputs before replicated dense FFNs.
-            attn_cp_size = cfg.tp_size // cfg.dp_size
-            overrides["attn_cp_size"] = attn_cp_size
-            logger.warning(
-                f"Enable Context Parallel opt for MLA, "
-                f"Setting dp_size == {cfg.dp_size} and "
-                f"attn_cp_size == {attn_cp_size}, "
-                f"moe_dense_tp_size == {overrides['moe_dense_tp_size']}, "
-                f"ep_size == {overrides['ep_size']}, "
-                f"tp_size == {cfg.tp_size}, "
-                f"moe_a2a_backend {overrides['moe_a2a_backend']}, "
-                f"cuda_graph_config[prefill].backend=disabled"
-            )
-    return overrides
-
-
-# Keep in sync with MIMO_V2_MODEL_ARCHS (server_args.py / configs/hf_config.py).
-@_register_for("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
-def _mimo_v2_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    overrides: Dict[str, Any] = {}
-    if cfg.speculative_algorithm == "EAGLE":
-        logger.info("Enable multi-layer EAGLE speculative decoding for MiMoV2 model.")
-        overrides["enable_multi_layer_eagle"] = True
-
-    # On Blackwell "auto" falls through to the triton fused-MoE runner, ~12%
-    # slower at bs=1 decode. FP4 checkpoints use flashinfer_mxfp4 instead.
-    if (
-        is_sm100_supported()
-        and cfg.moe_runner_backend == "auto"
-        and get_quantization_config(hf_config) == "fp8"
-    ):
-        overrides["moe_runner_backend"] = "flashinfer_trtllm"
-        logger.info("MiMoV2 FP8 on SM100: moe_runner_backend=flashinfer_trtllm.")
-    return overrides
-
-
-@_register_for("MiniMaxM2ForCausalLM")
-def _minimax_m2_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    overrides = {"enable_tf32_matmul": True}
-    logger.info(
-        "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
-    )
-    if (
-        is_sm100_supported()
-        and cfg.moe_runner_backend == "auto"
-        and server_args.get_model_config().quantization == "modelopt_fp4"
-    ):
-        overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
-        logger.info(
-            "Use flashinfer_trtllm_routed as MoE runner backend on SM10X "
-            "for MiniMaxM2ForCausalLM with modelopt_fp4."
-        )
-    return overrides
-
-
-@_register_for("MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration")
-def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
-
-    cfg = resolving_view(server_args)
-    overrides: Dict[str, Any] = {}
-
-    quant_method = get_quantization_config(hf_config)
-    quant_resolved = cfg.quantization
-    if (
-        quant_resolved is None
-        and not server_args._quantization_explicitly_unset
-        and quant_method is not None
-    ):
-        overrides["quantization"] = quant_method
-        quant_resolved = quant_method
-
-    if is_hip():
-        if server_args.is_attention_backend_not_set():
-            overrides["attention_backend"] = "triton"
-        if cfg.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
-            overrides["moe_runner_backend"] = "triton"
-        if not envs.USE_ROCM_AITER_ROPE_BACKEND.is_set():
-            envs.USE_ROCM_AITER_ROPE_BACKEND.set("0")
-        aiter_fusion_resolved = cfg.enable_aiter_allreduce_fusion
-        if cfg.ep_size > 1 and cfg.moe_a2a_backend == "none" and aiter_fusion_resolved:
-            logger.warning(
-                "Disable --enable-aiter-allreduce-fusion for MiniMax-M3 "
-                "standard EP on ROCm because the deferred fused all-reduce "
-                "corrupts sparse MoE partial outputs."
-            )
-            overrides["enable_aiter_allreduce_fusion"] = False
-            aiter_fusion_resolved = False
-        # By default MiniMax-M3 on ROCm keeps NCCL all-reduce (custom AR off)
-        # whenever aiter all-reduce fusion is not used. Opting in via
-        # SGLANG_M3_ALLOW_CUSTOM_AR keeps custom all-reduce enabled so the
-        # quick-reduce path (ROCM_QUICK_REDUCE_QUANTIZATION=INT4/INT6/INT8) can
-        # accelerate the large prefill all-reduce.
-        if not aiter_fusion_resolved and not envs.SGLANG_M3_ALLOW_CUSTOM_AR.get():
-            overrides["disable_custom_all_reduce"] = True
-    elif is_sm100_supported():
-        if server_args.is_attention_backend_not_set():
-            if (
-                cfg.kv_cache_dtype == "fp8_e4m3"
-                and not envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get()
-            ):
-                # fp8 attention GEMMs activate whenever possible
-                # (m3_fp8_attn_gemm_enabled); only trtllm_mha serves the dense
-                # fp8-q path, so prefer it over fa4 for fp8 KV. The
-                # SGLANG_DISABLE_M3_FP8_ATTN_GEMM kill switch keeps the fa4
-                # default (pre-fp8 behavior).
-                overrides["attention_backend"] = "trtllm_mha"
-            else:
-                overrides["attention_backend"] = "fa4"
-        backend_resolved = overrides.get("attention_backend", cfg.attention_backend)
-        page_resolved = cfg.page_size
-        # fa4 (fmha_sm100) and trtllm_mha both allow the page_size == 128
-        # sparse block MSA needs (trtllm_mha via trtllm-gen's dynamic
-        # tokens-per-page kernels).
-        if page_resolved is None and backend_resolved in ("fa4", "trtllm_mha"):
-            overrides["page_size"] = 128
-            page_resolved = 128
-        if cfg.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
-            overrides["moe_runner_backend"] = "deep_gemm"
-        elif cfg.moe_runner_backend == "auto" and quant_resolved == "modelopt_mixed":
-            overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
-        logger.info(
-            "MiniMax-M3 on SM100: attention_backend="
-            f"{overrides.get('attention_backend', cfg.attention_backend)}, page_size={page_resolved}, "
-            f"moe_runner_backend={overrides.get('moe_runner_backend', cfg.moe_runner_backend)}."
-        )
-    elif is_sm90_supported():
-        if server_args.is_attention_backend_not_set():
-            overrides["attention_backend"] = "fa3"
-        page_resolved = cfg.page_size
-        if (
-            page_resolved is None
-            and overrides.get("attention_backend", cfg.attention_backend) == "fa3"
-        ):
-            overrides["page_size"] = 128
-            page_resolved = 128
-        logger.info(
-            "MiniMax-M3 on Hopper: attention_backend="
-            f"{overrides.get('attention_backend', cfg.attention_backend)}, page_size={page_resolved} "
-            "(MSA is SM100-only; sparse attention runs on the Triton path)."
-        )
-
-    # fp8 attention GEMMs have no opt-in flag: m3_fp8_attn_gemm_enabled
-    # (server_args.py) derives the mode from kv_cache_dtype (fp8_e4m3) +
-    # attention_backend (trtllm_mha) + SM100 at runtime. Surface the
-    # resolution here: warn on fp8_e5m2 (fmha_sm100's variant lookup would
-    # silently dispatch the e4m3 kernel, so e5m2 stays on the widening Triton
-    # path), log when the fp8 GEMM mode is active, and log when the
-    # SGLANG_DISABLE_M3_FP8_ATTN_GEMM kill switch suppresses it.
-    if cfg.kv_cache_dtype == "fp8_e5m2":
-        logger.warning(
-            "MiniMax-M3 with kv_cache_dtype fp8_e5m2: fp8 attention GEMMs stay "
-            "DISABLED (fmha_sm100's variant lookup would silently dispatch the "
-            "e4m3 kernel for e5m2); sparse attention runs on the widening "
-            "Triton path. Use --kv-cache-dtype fp8_e4m3 for fp8 attention GEMMs."
-        )
-    elif (
-        cfg.kv_cache_dtype == "fp8_e4m3"
-        and overrides.get("attention_backend", cfg.attention_backend) == "trtllm_mha"
-        and is_sm100_supported()
-    ):
-        if envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get():
-            logger.info(
-                "MiniMax-M3 fp8 attention GEMMs DISABLED by "
-                "SGLANG_DISABLE_M3_FP8_ATTN_GEMM: bf16 indexer + widening "
-                "Triton sparse path, bf16 q; dense layers keep trtllm_mha's "
-                "fp8 KV cache."
-            )
-        else:
-            logger.info(
-                "MiniMax-M3 fp8 attention GEMMs active (kv_cache_dtype fp8_e4m3 + "
-                "trtllm_mha on SM100): fp8 main/index KV, fp8-cast q, fp8 "
-                "sparse/MSA kernels. Set SGLANG_DISABLE_M3_FP8_ATTN_GEMM=1 to "
-                "force the pre-fp8 numerics."
-            )
-
-    moe_runner_resolved = overrides.get("moe_runner_backend", cfg.moe_runner_backend)
-    if quant_resolved is None and moe_runner_resolved in ("auto", "deep_gemm"):
-        if moe_runner_resolved == "deep_gemm":
-            logger.warning(
-                "MiniMax-M3: the deep_gemm MoE runner produces corrupted output "
-                "on bf16 full weights; overriding --moe-runner-backend to 'triton'."
-            )
-        overrides["moe_runner_backend"] = "triton"
-
-    return overrides
-
-
-@_register_for(
-    "Gemma2ForCausalLM",
-    "Gemma3ForCausalLM",
-    "Gemma3ForConditionalGeneration",
-    "Gemma3nForCausalLM",
-    "Gemma3nForConditionalGeneration",
-)
-def _gemma2_gemma3_overrides(server_args: Any, hf_config: Any) -> dict:
-    # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
-    # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
-    logger.warning(
-        f"Disable hybrid SWA memory for {hf_config.architectures[0]} as it is not yet supported."
-    )
-    return {"disable_hybrid_swa_memory": True}
-
-
-@_register_for("Exaone4ForCausalLM", "ExaoneMoEForCausalLM")
-def _exaone_overrides(server_args: Any, hf_config: Any) -> dict:
-    if hf_config.sliding_window_pattern is not None:
-        logger.warning(
-            f"Disabling hybrid SWA memory for {hf_config.architectures[0]} as it is not yet supported."
-        )
-        return {"disable_hybrid_swa_memory": True}
-    return {}
-
-
-@_register_for("GptOssForCausalLM")
-def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    overrides: Dict[str, Any] = {}
-    # Set attention backend for GPT-OSS
-    if server_args.is_attention_backend_not_set():
-        if is_sm100_supported():
-            overrides["attention_backend"] = "trtllm_mha"
-        elif is_sm90_supported():
-            overrides["attention_backend"] = "fa3"
-        elif is_cpu() and cpu_has_amx_support():
-            overrides["attention_backend"] = "intel_amx"
-        elif is_xpu():
-            overrides["attention_backend"] = "intel_xpu"
-        elif is_hip():
-            overrides["attention_backend"] = "aiter"
-        elif not (is_mps() and use_mlx()):
-            # Exempt MLX only -- it owns attention in its own runner.  macOS
-            # without MLX still falls through to triton and fails fast below,
-            # rather than landing on torch_native (no sliding window, no sinks).
-            overrides["attention_backend"] = "triton"
-    if is_xpu():
-        # Check for bf16 dtype on Intel XPU. Reads the pristine dtype request,
-        # which equals the legacy mid-branch read: dtype had no earlier writer
-        # for this arch.
-        if cfg.dtype == "auto":
-            logger.warning(
-                "GptOssForCausalLM on Intel XPU currently supports bfloat16 dtype only"
-            )
-        elif cfg.dtype not in ["bfloat16"]:
-            raise NotImplementedError(
-                f"GptOssForCausalLM on Intel XPU only supports bfloat16 dtype, "
-                f"but got '{cfg.dtype}'. Please use --dtype bfloat16 or remove --dtype to use auto."
-            )
-    quantization_config = getattr(hf_config, "quantization_config", None)
-    is_mxfp4_quant_format = (
-        quantization_config is not None
-        and quantization_config.get("quant_method") == "mxfp4"
-    )
-    if is_mxfp4_quant_format:
-        # use bf16 for mxfp4 triton kernels
-        overrides["dtype"] = "bfloat16"
-    if cfg.moe_runner_backend == "auto":
-
-        if is_sm100_supported() and is_mxfp4_quant_format:
-            overrides["moe_runner_backend"] = "flashinfer_mxfp4"
-            logger.warning(
-                "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
-            )
-        elif is_sm120_supported() and is_mxfp4_quant_format:
-            overrides["moe_runner_backend"] = "flashinfer_mxfp4"
-            logger.warning(
-                "Detected SM120 and MXFP4 quantization format for GPT-OSS model, "
-                "enabling FlashInfer CUTLASS MXFP4 MOE kernel."
-            )
-        elif (is_hip() and envs.SGLANG_USE_AITER.get()) and is_mxfp4_quant_format:
-            overrides["moe_runner_backend"] = "auto"
-            logger.warning(
-                "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
-            )
-            ## The AITER MXFP4 fused-MoE path for GPT-OSS expects the
-            ## SEPARATED gate/up tile layout (matches the
-            ## `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
-            ## Mxfp4MoEMethod weight shuffle). Other AITER MXFP4
-            ## callers default to INTERLEAVE; opt this path out
-            ## unless the user explicitly overrode it.
-            # envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)
-        elif is_hip() and envs.SGLANG_USE_AITER.get():
-            # For GPT-OSS bf16 on ROCm with aiter, use triton backend
-            # because aiter CK kernel doesn't support all GEMM dimensions
-            overrides["moe_runner_backend"] = "triton"
-            logger.warning(
-                "Detected ROCm with SGLANG_USE_AITER for GPT-OSS bf16 model, using triton MOE kernel."
-            )
-        elif is_musa() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
-            overrides["moe_runner_backend"] = "deep_gemm"
-            logger.warning(
-                "Detected MUSA with SGLANG_DEEPEP_BF16_DISPATCH for bf16 model, using deep_gemm kernel."
-            )
-        elif (
-            cfg.ep_size == 1
-            and is_triton_kernels_available()
-            and cfg.quantization is None
-            and not (is_cpu() and cpu_has_amx_support())
-        ):
-            # The triton_kernels package segfaults on Blackwell (B200)
-            # with NVIDIA driver >= 595. Fall back to triton backend.
-            if is_blackwell_supported() and get_nvidia_driver_version() >= (595,):
-                overrides["moe_runner_backend"] = "triton"
-                logger.warning(
-                    "Detected GPT-OSS model on Blackwell with driver >= 595, "
-                    "using triton MOE kernel to avoid triton_kernels SIGSEGV."
-                )
-            else:
-                overrides["moe_runner_backend"] = "triton_kernel"
-                logger.warning(
-                    "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
-                )
-    return overrides
-
-
-# Keep in sync with LLAMA4_MODEL_ARCHS (server_args.py).
-@_register_for("Llama4ForConditionalGeneration", "Llama4ForCausalLM")
-def _llama4_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    if cfg.device == "cpu":
-        return {}
-    overrides: Dict[str, Any] = {}
-    # Auto-select attention backend for Llama4 if not specified
-    if cfg.attention_backend is None:
-        if is_sm100_supported():
-            backend, platform = "trtllm_mha", "sm100"
-        elif is_sm90_supported():
-            backend, platform = "fa3", "sm90"
-        elif is_hip():
-            backend, platform = "aiter", "hip"
-        elif cfg.device == "xpu":
-            backend, platform = "intel_xpu", "xpu"
-        else:
-            backend, platform = "triton", "other platforms"
-        logger.warning(
-            f"Use {backend} as attention backend on {platform} for Llama4 model"
-        )
-        overrides["attention_backend"] = backend
-    if is_sm100_supported() and cfg.moe_runner_backend == "auto":
-        if cfg.quantization in {"fp8", "modelopt_fp8"}:
-            overrides["moe_runner_backend"] = "flashinfer_trtllm"
-            logger.info(
-                "Use flashinfer_trtllm as MoE runner backend on SM100 for Llama4"
-            )
-    return overrides
-
-
-@_register_for(
-    "Gemma4ForConditionalGeneration",
-    "Gemma4ForCausalLM",
-    "Gemma4UnifiedForConditionalGeneration",
-)
-def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    overrides: Dict[str, Any] = {}
-    default_attention_backend = "trtllm_mha" if is_sm100_supported() else "triton"
-    if server_args.is_attention_backend_not_set():
-        logger.info(
-            f"Use {default_attention_backend} as default attention backend for Gemma4"
-        )
-        overrides["attention_backend"] = default_attention_backend
-    # If only one split backend is set, keep the other side on a
-    # Gemma4-compatible fallback instead of letting generic backend selection
-    # choose an unsupported backend later.
-    elif cfg.attention_backend is None:
-        overrides["attention_backend"] = default_attention_backend
-    if is_sm100_supported() and cfg.moe_runner_backend == "auto":
-        if server_args.get_model_config().quantization == "modelopt_fp4":
-            overrides["quantization"] = "modelopt_fp4"
-            overrides["moe_runner_backend"] = "flashinfer_trtllm"
-            logger.info(
-                "Use flashinfer_trtllm as MoE runner backend on "
-                "SM100 for Gemma-4 (modelopt_fp4)"
-            )
-    return overrides
-
-
-@_register_for("MossVLForConditionalGeneration")
-def _moss_vl_overrides(server_args: Any, hf_config: Any) -> dict:
-    overrides: Dict[str, Any] = {}
-    if server_args.is_attention_backend_not_set():
-        overrides["prefill_attention_backend"] = "flashinfer"
-        logger.info("Use flashinfer as default prefill attention backend for Moss-VL")
-    prefill_backend = (
-        overrides.get("prefill_attention_backend")
-        or server_args.get_attention_backends()[0]
-    )
-    assert prefill_backend == "flashinfer", (
-        "MossVLForConditionalGeneration requires flashinfer prefill "
-        "attention backend for cross-attention custom mask support."
-    )
-    return overrides
-
-
-@_register_for("MiniCPMForCausalLM", "MiniCPMSALAForCausalLM")
-def _minicpm_sala_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    if cfg.enable_dp_attention:
-        raise ValueError("MiniCPM does not support DP attention")
-    has_sparse_attention = getattr(hf_config, "has_minicpm_sparse_attention", False)
-    has_hybrid_attention = has_sparse_attention or getattr(
-        hf_config, "has_lightning_layers", False
-    )
-    overrides: Dict[str, Any] = {}
-    if has_hybrid_attention:
-        if cfg.enable_hierarchical_cache:
-            raise ValueError("MiniCPM SALA does not support hierarchical cache")
-        overrides["disable_radix_cache"] = True
-    if envs.SGLANG_MINICPM_FORCE_DENSE.get():
-        dense_backends = {
-            "minicpm_flashattn": ("fa4" if is_blackwell_supported() else "fa3"),
-            "minicpm_flashinfer": "flashinfer",
-        }
-        # Literal keys keep the written-field set statically derivable; a loop
-        # variable hides it from the census in test_chain_read_ratchet.py.
-        dense_attention = dense_backends.get(cfg.attention_backend)
-        if dense_attention is not None:
-            overrides["attention_backend"] = dense_attention
-        dense_prefill = dense_backends.get(cfg.prefill_attention_backend)
-        if dense_prefill is not None:
-            overrides["prefill_attention_backend"] = dense_prefill
-        dense_decode = dense_backends.get(cfg.decode_attention_backend)
-        if dense_decode is not None:
-            overrides["decode_attention_backend"] = dense_decode
-    elif has_sparse_attention:
-        uses_sparse_backend = cfg.is_attention_backend_not_set() or any(
-            backend in ("minicpm_flashattn", "minicpm_flashinfer")
-            for backend in (
-                cfg.attention_backend,
-                cfg.prefill_attention_backend,
-                cfg.decode_attention_backend,
-            )
-        )
-        if uses_sparse_backend and cfg.disaggregation_mode != "null":
-            raise ValueError(
-                "MiniCPM sparse attention does not support PD disaggregation"
-            )
-        if cfg.is_attention_backend_not_set():
-            overrides["attention_backend"] = (
-                "minicpm_flashinfer"
-                if is_blackwell_supported()
-                else "minicpm_flashattn"
-            )
-    return overrides
-
-
-@_register_for("MiniCPMV4_6ForConditionalGeneration")
-def _minicpm_v4_6_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    if is_sm100_supported() and cfg.attention_backend is None:
-        return {"attention_backend": "triton"}
-    return {}
-
-
-@_register_for(
-    "FalconH1ForCausalLM", "JetNemotronForCausalLM", "JetVLMForConditionalGeneration"
-)
-def _falcon_h1_jet_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    if is_sm100_supported() and cfg.attention_backend is None:
-        return {"attention_backend": "triton"}
-    return {}
-
-
-@_register_for("GraniteMoeHybridForCausalLM")
-def _granite_moe_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    has_mamba = any(
-        layer_type == "mamba" for layer_type in getattr(hf_config, "layer_types", [])
-    )
-    if has_mamba and is_sm100_supported() and cfg.attention_backend is None:
-        return {"attention_backend": "flashinfer"}
-    return {}
-
-
-@_register_for("Lfm2ForCausalLM", "Lfm2MoeForCausalLM")
-def _lfm2_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    if is_sm100_supported() and cfg.attention_backend is None:
-        return {"attention_backend": "flashinfer"}
-    return {}
-
-
-@_register_for("DeepseekV4ForCausalLM")
-def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
-    """DeepSeek V4 attention/page/window/MoE-runner defaults (from
-    arg_groups/deepseek_v4_hook.py). The kv-cache dtype and NPU split-backend
-    writes, the max_running_requests fill and the validations stay in the
-    hook at its legacy slot."""
-    cfg = resolving_view(server_args)
-    from sglang.srt.server_args import ServerArgs
-
-    model_arch = hf_config.architectures[0]
-    overrides: Dict[str, Any] = {"attention_backend": "dsv4"}
-
-    page_size = 256
-    if cfg.device == "npu":
-        # NPU keeps the device-aware "dsv4" backend (the registry routes it to
-        # the Ascend V4 subclass); only the pool geometry / dtype differ.
-        # set_default_server_args() pins all three backends to "ascend" for
-        # generic NPU models; override that here so V4 stays consistently on
-        # dsv4.
-        page_size = 128
-        overrides["prefill_attention_backend"] = "dsv4"
-        overrides["decode_attention_backend"] = "dsv4"
-    overrides["page_size"] = page_size
-    logger.info(
-        f"Use dsv4 attention backend for {model_arch}, setting page_size to {page_size}."
-    )
-
-    if cfg.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
-        overrides["swa_full_tokens_ratio"] = 0.1
-        logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
-
-    if cfg.moe_runner_backend == "auto":
-        model_config = server_args.get_model_config()
-        # nvidia/DeepSeek-V4-Pro-NVFP4 uses the routed TRT-LLM runner.
-        if model_config.nvfp4_moe_meta is not None:
-            overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
-            logger.info(
-                "Use flashinfer_trtllm_routed as MoE runner backend for "
-                f"{model_arch} hybrid FP8+NVFP4 checkpoint."
-            )
-        elif (
-            cfg.device == "cuda"
-            and not is_hip()
-            and cfg.moe_a2a_backend == "none"
-            and not envs.SGLANG_DSV4_FP4_DEQUANT.get()
-            and model_config.is_fp4_experts
-            and (is_sm90_supported() or is_sm100_supported() or is_sm120_supported())
-        ):
-            overrides["moe_runner_backend"] = "flashinfer_mxfp4"
-            logger.info(
-                "Use flashinfer_mxfp4 as MoE runner backend for " f"{model_arch}."
-            )
-    return overrides
-
-
-@_register_for(
-    "InklingForConditionalGeneration",
-    "InklingForConditionalGenerationMTP",
-)
-def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
-    """Inkling architecture defaults: SWA / mamba KV-pool ratios tuned for the
-    hybrid-SWA layout, the extra-buffer mamba strategy, and the unified radix
-    tree (which Inkling requires — models/inkling.py asserts it). The full-graph
-    prefill default is set separately (inline, before cuda-graph resolution) —
-    see ServerArgs.__post_init__ / _apply_inkling_prefill_cuda_graph_default. The
-    server-arg defaults each yield to an explicit user value (compared against
-    the ServerArgs class default); the prefill declaration is materialized
-    before _parse_cuda_graph_config folds cuda_graph_backend_prefill into
-    prefill.backend, and an explicit --cuda-graph-backend-prefill /
-    --disable-prefill-cuda-graph still wins. The unified-radix env write follows
-    the MiniMax-M3 handler precedent (env is not a resolvable server-arg)."""
-    cfg = resolving_view(server_args)
-    from sglang.srt.server_args import ServerArgs
-
-    overrides: Dict[str, Any] = {}
-    # NOTE: the full-graph prefill default is NOT set here. cuda-graph config is
-    # resolved in __post_init__ before declarations are materialized, so a
-    # cuda_graph_backend_prefill declared here lands too late (the breakable
-    # default would already have been auto-disabled for this multimodal arch).
-    # It is set inline before _handle_cuda_graph_config instead.
-    if cfg.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
-        overrides["swa_full_tokens_ratio"] = 0.1
-    if cfg.mamba_full_memory_ratio == ServerArgs.mamba_full_memory_ratio:
-        overrides["mamba_full_memory_ratio"] = 0.1
-    # Inkling requires the extra-buffer mamba strategy (inkling.py asserts
-    # enable_mamba_extra_buffer()); the generic "auto" resolution does not cover
-    # Inkling, so pin it here. Yields to an explicit --mamba-scheduler-strategy.
-    if cfg.mamba_radix_cache_strategy == ServerArgs.mamba_radix_cache_strategy:
-        overrides["mamba_radix_cache_strategy"] = "extra_buffer"
-    # Inkling attention runs only on the fa4 (Blackwell) or triton backends --
-    # models/inkling_common/attn.py asserts attention_backend in {fa4, triton}.
-    # The generic resolver would otherwise pick trtllm_mha (SM100) / fa3
-    # (Hopper), so a bare launch fails on the first attention forward. Pin a
-    # supported default when the user left every attention-backend flag unset
-    # (mirrors the MiniMax-M3 SM100 fa4-default above); an explicit
-    # --attention-backend / --prefill/decode-attention-backend still wins.
-    if server_args.is_attention_backend_not_set():
-        inkling_attn_backend = "fa4" if is_sm100_supported() else "triton"
-        overrides["attention_backend"] = inkling_attn_backend
-        logger.info(
-            f"Use {inkling_attn_backend} as the attention backend for Inkling "
-            "(requires fa4 or triton)."
-        )
-    envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.set(True)
-    return overrides
-
-
-@_register_for("NemotronHForCausalLM", "NemotronHPuzzleForCausalLM")
-def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
-    """NemotronH quantization / MoE runner / attention backend defaults
-    (absorbed from the retired arg_groups/nemotron_h_hook.py; the mamba radix
-    cache handling and the triton-backend assert stay in the arch branch)."""
-    cfg = resolving_view(server_args)
-    model_arch = hf_config.architectures[0]
-    model_config = server_args.get_model_config()
-    overrides: Dict[str, Any] = {}
-
-    is_modelopt = model_config.quantization in [
-        "modelopt",
-        "modelopt_fp8",
-        "modelopt_fp4",
-        "modelopt_mixed",
-    ]
-    quantization = cfg.quantization
-    if is_modelopt:
-        assert model_config.hf_config.mlp_hidden_act == "relu2"
-        if model_config.quantization == "modelopt":
-            quant_algo = model_config.hf_config.quantization_config["quant_algo"]
-            if quant_algo == "MIXED_PRECISION":
-                quantization = "modelopt_mixed"
-            else:
-                quantization = (
-                    "modelopt_fp4" if quant_algo == "NVFP4" else "modelopt_fp8"
-                )
-        else:
-            quantization = model_config.quantization
-        overrides["quantization"] = quantization
-
-    has_w4a16_moe_layers = False
-    if is_modelopt and quantization == "modelopt_mixed":
-        has_w4a16_moe_layers = any(
-            info.get("quant_algo") == "W4A16_NVFP4" and ".experts." in name
-            for name, info in hf_config.quantization_config.get(
-                "quantized_layers", {}
-            ).items()
-        )
-
-    if has_w4a16_moe_layers:
-        if cfg.moe_a2a_backend != "none":
-            raise ValueError("W4A16_NVFP4 MoE layers require --moe-a2a-backend=none.")
-        if cfg.moe_runner_backend not in ("auto", "marlin"):
-            raise ValueError(
-                "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin."
-            )
-        if cfg.moe_runner_backend == "auto":
-            overrides["moe_runner_backend"] = "marlin"
-            logger.info(
-                "Use marlin as MoE runner backend for "
-                f"{model_arch} with W4A16_NVFP4 MoE layers"
-            )
-    elif (is_modelopt or model_config.quantization is None) and (
-        cfg.moe_runner_backend == "auto"
-    ):
-        if is_sm100_supported() and cfg.moe_a2a_backend == "none":
-            overrides["moe_runner_backend"] = "flashinfer_trtllm"
-            logger.info(
-                f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
-            )
-        elif (
-            (
-                model_config.quantization in ("modelopt_fp4", "modelopt_mixed")
-                or quantization == "modelopt_fp4"
-            )
-            and is_cuda()
-            and (8, 0) <= get_device_capability() < (10, 0)
-        ):
-            overrides["moe_runner_backend"] = "marlin"
-            logger.info(
-                "Use marlin as MoE runner backend on SM80-SM90 for "
-                f"{model_arch} {model_config.quantization}"
-            )
-        else:
-            overrides["moe_runner_backend"] = "flashinfer_cutlass"
-
-    if is_blackwell_supported() and cfg.is_attention_backend_not_set():
-        if cfg.speculative_algorithm is not None:
-            speculative_algorithm = cfg.speculative_algorithm.upper()
-            if is_sm100_supported() and cfg.speculative_eagle_topk in (
-                None,
-                1,
-            ):
-                overrides["attention_backend"] = "trtllm_mha"
-                if cfg.page_size is None:
-                    overrides["page_size"] = 64
-                if cfg.mamba_radix_cache_strategy == "auto":
-                    overrides["mamba_radix_cache_strategy"] = "extra_buffer"
-                if (
-                    cfg.speculative_draft_attention_backend is None
-                    and speculative_algorithm in ("EAGLE", "NEXTN", "DSPARK")
-                ):
-                    overrides["speculative_draft_attention_backend"] = "trtllm_mha"
-            else:
-                overrides["attention_backend"] = "triton"
-                if (
-                    cfg.speculative_draft_attention_backend is None
-                    and speculative_algorithm in ("EAGLE", "NEXTN", "DFLASH", "DSPARK")
-                ):
-                    overrides["speculative_draft_attention_backend"] = "flashinfer"
-        elif is_sm100_supported():
-            overrides["attention_backend"] = "trtllm_mha"
-    return overrides
-
-
-@_register_for(
-    "Qwen3NextForCausalLM",
-    "Qwen3_5MoeForConditionalGeneration",
-    "InternS2PreviewForConditionalGeneration",
-    "InternS2MobiusForConditionalGeneration",
-    "Qwen3_5ForConditionalGeneration",
-)
-def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    if not is_sm100_supported() or cfg.attention_backend is not None:
-        return {}
-    sm100_default_attn_backend = "triton"
-    # trtllm_mha requires speculative_eagle_topk == 1 and page_size > 1.
-    # _get_default_attn_backend handles the eagle_topk check.
-    # There is only one case where page_size=1 is required,
-    # which is when radix cache is enabled and both extra_buffer
-    # and spec decoding are disabled.
-    default_attn_backend = server_args._get_default_attn_backend(
-        use_mla_backend=server_args.use_mla_backend(),
-        model_config=server_args.get_model_config(),
-    )
-    # The mamba radix-cache pass runs before this dispatch: read the
-    # declared strategy through the view (the legacy branch observed the
-    # already-written field here).
-    if default_attn_backend == "trtllm_mha" and not (
-        not mamba_extra_buffer_of(resolved_view(server_args))
-        and not cfg.disable_radix_cache
-        and cfg.speculative_algorithm is None
-    ):
-        sm100_default_attn_backend = "trtllm_mha"
-    return {
-        "attention_backend": sm100_default_attn_backend,
-        "page_size": 64 if sm100_default_attn_backend == "trtllm_mha" else 1,
-    }
-
-
-@_register_for("InternS2MobiusForConditionalGeneration")
-def _interns2_mobius_baseline_overrides(server_args: Any, hf_config: Any) -> dict:
-    """Select the only MoE runner validated for the 2,560-expert baseline."""
-    cfg = resolving_view(server_args)
-    if cfg.moe_runner_backend == "auto":
-        return {"moe_runner_backend": "triton_kernel"}
-    return {}
-
-
-@_register_for("Qwen3VLForConditionalGeneration")
-def _qwen3vl_overrides(server_args: Any, hf_config: Any) -> dict:
-
-    cfg = resolving_view(server_args)
-    if is_hip() and envs.SGLANG_USE_AITER_UNIFIED_ATTN.get() and cfg.page_size is None:
-        logger.info(
-            "Setting page_size=16 for aiter unified attention on Qwen3VLForConditionalGeneration."
-        )
-        return {"page_size": 16}
-    return {}
-
-
-@_register_for(
-    "Qwen3MoeForCausalLM",
-    "Qwen3VLMoeForConditionalGeneration",
-    "Qwen3NextForCausalLM",
-    "Qwen3_5MoeForConditionalGeneration",
-    "InternS2PreviewForConditionalGeneration",
-    "Qwen3_5ForConditionalGeneration",
-)
-def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    overrides: Dict[str, Any] = {}
-    if is_sm100_supported():
-        quant_method = get_quantization_config(hf_config)
-        quantization = cfg.quantization
-        if (
-            quantization is None
-            and not server_args._quantization_explicitly_unset
-            and quant_method is not None
-        ):
-            overrides["quantization"] = quant_method
-            quantization = quant_method
-        if (
-            (quantization in ("fp8", "modelopt_fp4") or quantization is None)
-            and cfg.moe_a2a_backend == "none"
-            and cfg.moe_runner_backend == "auto"
-        ):
-            overrides["moe_runner_backend"] = "flashinfer_trtllm"
-            logger.info(
-                "Use flashinfer_trtllm as MoE runner backend on sm100 for "
-                f"{hf_config.architectures[0]}"
-            )
-    return overrides
-
-
-@_register_for("Glm4MoeForCausalLM")
-def _glm4_moe_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    overrides: Dict[str, Any] = {}
-    if is_sm100_supported():
-        quantization_config = getattr(hf_config, "quantization_config", None)
-        quant_method = (
-            quantization_config.get("quant_method")
-            if quantization_config is not None
-            else None
-        )
-        quantization = cfg.quantization
-        if (
-            quantization is None
-            and not server_args._quantization_explicitly_unset
-            and quant_method is not None
-        ):
-            overrides["quantization"] = quant_method
-            quantization = quant_method
-        if (
-            quantization in {"modelopt_fp4", None}
-            and cfg.moe_a2a_backend == "none"
-            and cfg.moe_runner_backend == "auto"
-        ):
-            overrides["moe_runner_backend"] = "flashinfer_trtllm"
-            logger.info(
-                "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
-            )
-    logger.info(
-        "Enable TF32 matmul for Glm4MoeForCausalLM model to improve gate gemm performance."
-    )
-    overrides["enable_tf32_matmul"] = True
-    return overrides
-
-
-@_register_for("Olmo2ForCausalLM")
-def _olmo2_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    overrides: Dict[str, Any] = {}
-    # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
-    logger.warning(
-        f"Disabling hybrid SWA memory for {hf_config.architectures[0]} as it is not yet supported."
-    )
-    overrides["disable_hybrid_swa_memory"] = True
-    if cfg.attention_backend is None:
-        if is_cuda() and is_sm100_supported():
-            overrides["attention_backend"] = "trtllm_mha"
-        elif is_cuda() and get_device_sm() >= 80:
-            overrides["attention_backend"] = "fa3"
-        else:
-            overrides["attention_backend"] = "triton"
-    return overrides
+# Importing the package is what registers the per-model declarations.
+import sglang.srt.arg_groups.model_overrides  # noqa: F401
 
 
 @register_model_override_predicate(
@@ -1734,11 +455,11 @@ def _olmo2_overrides(server_args: Any, hf_config: Any) -> dict:
 def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     overrides: Dict[str, Any] = {}
-    if server_args.is_attention_backend_not_set():
-        if is_blackwell_supported():
+    if is_attention_backend_not_set(cfg):
+        if get_platform().is_blackwell:
             logger.info("Auto-select fa4 attention backend for Step3p7 on Blackwell.")
             overrides["attention_backend"] = "fa4"
-        elif is_sm90_supported():
+        elif get_platform().is_sm90:
             logger.info("Auto-select fa3 attention backend for Step3p7 on Hopper.")
             overrides["attention_backend"] = "fa3"
     if cfg.speculative_algorithm == "EAGLE":
@@ -1794,8 +515,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
 )
 
 # Architectures that support the extra_buffer mamba radix cache strategy.
-# Single source of truth: ServerArgs._support_mamba_cache_extra_buffer
-# delegates here.
+# The single source of truth; `supports_mamba_cache_extra_buffer` reads it.
 _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
@@ -1845,7 +565,7 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
         get_linear_attn_spec_by_arch,
     )
 
-    hf_config = view.get_model_config().hf_config
+    hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
 
     in_branch = model_arch in _MAMBA_RADIX_CACHE_ARCHS
@@ -1883,12 +603,12 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     PRISTINE dsa split backends (their resolution runs after this pass)."""
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
-    hf_config = view.get_model_config().hf_config
+    hf_config = model_config_of(view).hf_config
     if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
         return {}
     if not is_deepseek_dsa(hf_config):
         return {}
-    if is_npu() or is_xpu():
+    if get_platform().is_npu or get_platform().is_xpu:
         return {}
 
     import torch
@@ -1953,12 +673,12 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     capability. The hisparse arm takes precedence under --enable-hisparse."""
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
-    hf_config = view.get_model_config().hf_config
+    hf_config = model_config_of(view).hf_config
     if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
         return {}
     if not is_deepseek_dsa(hf_config):
         return {}
-    if is_npu() or is_xpu():
+    if get_platform().is_npu or get_platform().is_xpu:
         return {}
 
     import torch
@@ -1973,7 +693,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         model_arch == "GlmMoeDsaForCausalLM"
         and major == 12
         and kv_cache_dtype == "fp8_e4m3"
-        and not is_hip()
+        and not get_platform().is_hip
     )
 
     if is_glm_sm12_fp8:
@@ -2004,7 +724,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         )
         return declared
 
-    if not user_set_prefill and not user_set_decode and is_hip():
+    if not user_set_prefill and not user_set_decode and get_platform().is_hip:
         declared["dsa_prefill_backend"] = "tilelang"
         declared["dsa_decode_backend"] = "tilelang"
     elif kv_cache_dtype == "fp8_e4m3":
@@ -2023,7 +743,9 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
-    _check_tilelang_dsa_fp8_kv(kv_cache_dtype, prefill, decode, hip=is_hip())
+    _check_tilelang_dsa_fp8_kv(
+        kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+    )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
         f"prefill={prefill}, decode={decode}."
@@ -2053,12 +775,12 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
     backend for DeepSeek"), NOT a dispatch-time declaration: the DSA
     kv-cache-dtype default earlier in the branch must read the PRISTINE
     quantization, so this resolution has to stay at its legacy slot."""
-    hf_config = view.get_model_config().hf_config
+    hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
     if model_arch not in _DEEPSEEK_FAMILY_ARCHS:
         return {}
     overrides: Dict[str, Any] = {}
-    if is_sm100_supported():
+    if get_platform().is_sm100:
         quant_method = get_quantization_config(hf_config)
         quant_cfg = getattr(hf_config, "quantization_config", None) or {}
         config_groups = quant_cfg.get("config_groups", {})
@@ -2140,11 +862,11 @@ def _deepseek_spec_moe_resolution(view: Any) -> dict:
     quantization (after _deepseek_moe_quant_resolution) and the pre-a2a
     ep_size, exactly like the legacy in-branch writes."""
 
-    hf_config = view.get_model_config().hf_config
+    hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
     if model_arch not in _DEEPSEEK_FAMILY_ARCHS:
         return {}
-    if not is_hip():
+    if not get_platform().is_hip:
         return {}
     if not (
         view.quantization == "modelopt_fp4"
@@ -2186,7 +908,7 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
     """Slot pass in the DeepSeek V4 hook: default the kv-cache dtype to FP8
     (bfloat16 on NPU, where the pool geometry differs) and validate the
     result. The NPU split-backend writes stay in the hook."""
-    hf_config = view.get_model_config().hf_config
+    hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
     if model_arch != "DeepseekV4ForCausalLM":
         return {}
@@ -2203,15 +925,6 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
     ], f"{kv_cache_dtype} is not supported for {model_arch}"
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
-    return {}
-
-
-@_register_for("MuseGlimmerForConditionalGeneration", "MuseGlimmerForCausalLM")
-def _muse_glimmer_fp4_gemm_runner_overrides(server_args: Any, hf_config: Any) -> dict:
-    cfg = resolving_view(server_args)
-    if is_sm120_supported() and cfg.fp4_gemm_runner_backend == "auto":
-        logger.info("Use marlin as FP4 GEMM runner backend on SM120 for Muse Glimmer")
-        return {"fp4_gemm_runner_backend": "marlin"}
     return {}
 
 
@@ -2259,14 +972,28 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     single-node systems. Reads the mid-resolution enable_dp_attention /
     moe_a2a_backend (after the DeepSeek CP and a2a declarations), exactly
     like the legacy tail block."""
-    model_arch = view.get_model_config().hf_config.architectures[0]
+    model_arch = model_config_of(view).hf_config.architectures[0]
+    if envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get() and model_arch in {
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    }:
+        # The Qwen backend owns one workspace for ordinary AR and MoE finalize;
+        # do not allocate or fall back to the legacy TRTLLM/MNNVL workspace.
+        if view.flashinfer_allreduce_fusion_backend is not None:
+            logger.warning(
+                "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION owns both Qwen3.5 "
+                "AllReduce fusion patterns; suppressing the separately configured "
+                "--flashinfer-allreduce-fusion-backend=%s",
+                view.flashinfer_allreduce_fusion_backend,
+            )
+        return {"flashinfer_allreduce_fusion_backend": None}
     if (
         view.flashinfer_allreduce_fusion_backend is None
         and model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS
-        and (is_sm90_supported() or is_sm100_supported())
+        and (get_platform().is_sm90 or get_platform().is_sm100)
         and view.tp_size > 1
         and not view.enable_dp_attention
-        and (view.nnodes == 1 or is_sm100_supported())
+        and (view.nnodes == 1 or get_platform().is_sm100)
         and view.moe_a2a_backend == "none"
     ):
         logger.info(
@@ -2294,7 +1021,7 @@ def _sampling_backend_default(view: Any) -> dict:
     if view.sampling_backend is None:
         return {
             "sampling_backend": (
-                "flashinfer" if is_flashinfer_available() else "pytorch"
+                "flashinfer" if get_platform().has_flashinfer else "pytorch"
             )
         }
     return {}
@@ -2319,7 +1046,7 @@ def _deterministic_is_deepseek_model(view: Any) -> bool:
     if parse_connector_type(view.model_path) == ConnectorType.INSTANCE:
         return False
     try:
-        hf_config = view.get_model_config().hf_config
+        hf_config = model_config_of(view).hf_config
         return hf_config.architectures[0] in [
             "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
@@ -2354,7 +1081,7 @@ def _deterministic_attention_backend(view: Any) -> dict:
 
     if view.attention_backend is None:
         # User didn't specify attention backend, fallback based on GPU architecture
-        if is_sm100_supported() or is_sm120_supported():
+        if get_platform().is_sm100 or get_platform().is_sm120:
             # Blackwell and newer architectures
             if _deterministic_is_deepseek_model(view):
                 # fallback to triton for DeepSeek models because flashinfer
@@ -2387,8 +1114,8 @@ def _attention_backend_default(view: Any) -> dict:
     ):  # override the default attention backend
         return {"attention_backend": view.prefill_attention_backend}
     if view.attention_backend is None:
-        backend = view._get_default_attn_backend(
-            view.use_mla_backend(), view.get_model_config()
+        backend = get_default_attn_backend(
+            view, use_mla_backend(view), model_config_of(view)
         )
         logger.info(
             f"Attention backend not specified. Use {backend} backend by default."
@@ -2487,7 +1214,7 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"
     ):
-        if not is_blackwell_supported():
+        if not get_platform().is_blackwell:
             raise ValueError(
                 "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
             )
@@ -2499,7 +1226,7 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
         view.attention_backend == "tokenspeed_mla"
         or view.decode_attention_backend == "tokenspeed_mla"
     ):
-        if not is_blackwell_supported():
+        if not get_platform().is_blackwell:
             raise ValueError(
                 "tokenspeed_mla backend is only supported on Blackwell GPUs (SM100/SM12x)."
             )
@@ -2537,7 +1264,7 @@ def _cutedsl_prefill_backend_fill(view: Any) -> dict:
     assert (
         view.prefill_attention_backend != "cutedsl_mla"
     ), "CuteDSL MLA only supports decoding for now"
-    if not is_sm100_supported():
+    if not get_platform().is_sm100:
         raise ValueError(
             "CuteDSL MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
         )
@@ -2574,8 +1301,8 @@ def _fa4_page_constraint(view: Any) -> dict:
             or view.decode_attention_backend == "fa4"
             or view.prefill_attention_backend == "fa4"
         )
-        and not view.use_mla_backend()
-        and is_sm100_supported()
+        and not use_mla_backend(view)
+        and get_platform().is_sm100
         # EAGLE topk>1 spec runs the two-pass page-tree cascade, which the FA4
         # CUTLASS kernel aborts on at page_size>1. That path only works at
         # page_size==1, so skip the 128 auto-force for it and keep the default.
@@ -2593,7 +1320,7 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
     if (
         view.attention_backend == "intel_amx"
         and view.device == "cpu"
-        and not cpu_has_amx_support()
+        and not get_platform().has_amx
     ):
         logger.warning(
             "The current platform does not support Intel AMX, will fallback to torch_native backend."
@@ -2615,7 +1342,7 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
 def _intel_xpu_page_constraint(view: Any) -> dict:
     _, decode_backend = attention_backends_of(view)
     if decode_backend == "intel_xpu":
-        if view.use_mla_backend():
+        if use_mla_backend(view):
             supported_page_sizes = [16, 32, 64, 128]
             msg = "Intel XPU attention backend for MLA Decode"
         else:
@@ -2632,7 +1359,7 @@ def _intel_xpu_page_constraint(view: Any) -> dict:
 @register_post_process
 def _attention_backend_dual_chunk(view: Any) -> dict:
     if (
-        getattr(view.get_model_config().hf_config, "dual_chunk_attention_config", None)
+        getattr(model_config_of(view).hf_config, "dual_chunk_attention_config", None)
         is not None
     ):
         if view.attention_backend is None:
@@ -2658,13 +1385,16 @@ def _page_size_default(view: Any) -> dict:
     # ROCm AITER backend, so the auto-bump is gated on HIP; on other
     # platforms the SHUFFLE 5D pool has no consumer kernels and the
     # env var is silently ignored (see MHATokenToKVPool).
-    if is_hip() and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d":
+    if (
+        get_platform().is_hip
+        and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+    ):
         logger.info(
             "Setting page_size=64 as default for "
             "SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d."
         )
         return {"page_size": 64}
-    if not is_musa():
+    if not get_platform().is_musa:
         return {"page_size": 1}
     return {"page_size": 64}
 
@@ -2735,7 +1465,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     field) stay in the handler."""
     moe_runner_backend = view.moe_runner_backend
     if view.quantization == "nvfp4_online":
-        if not is_sm100_supported():
+        if not get_platform().is_sm100:
             raise ValueError(
                 "--quantization nvfp4_online is supported only on "
                 "NVIDIA Blackwell SM100/SM103 GPUs."
@@ -2758,10 +1488,10 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     # 128-alignment round-up off flashinfer_trtllm, so the experts would silently
     # load with gate and up exchanged. Leave the backend at "auto" and let
     # create_moe_runner resolve it to ASCEND.
-    if view.quantization == "mxfp8" and not is_npu():
+    if view.quantization == "mxfp8" and not get_platform().is_npu:
         from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
-        is_gfx95_mxfp8 = is_hip() and is_gfx95_supported()
+        is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
         if is_gfx95_mxfp8:
             allowed.append("triton")
@@ -2778,7 +1508,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     if (
         moe_runner_backend == "auto"
         and view.quantization == "modelopt_fp4"
-        and is_sm120_supported()
+        and get_platform().is_sm120
     ):
         moe_runner_backend = "flashinfer_cutlass"
         logger.info(
@@ -2850,6 +1580,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "flashinfer",
         "mori",
         "pplx",
+        "deepep_v2",
     }
 )
 
@@ -2915,13 +1646,13 @@ def _gguf_quantization(view: Any) -> dict:
 def _dllm_attention_backend(view: Any) -> dict:
     if view.dllm_algorithm is None:
         return {}
-    if is_hip():
+    if get_platform().is_hip:
         if view.attention_backend not in ["triton", "aiter"]:
             logger.warning(
                 "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
             )
             return {"attention_backend": "triton"}
-    elif is_npu():
+    elif get_platform().is_npu:
         if view.attention_backend != "ascend":
             logger.warning(
                 "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
@@ -3009,3 +1740,161 @@ def _hrm_text_attention_force(view: Any) -> dict:
             "attention."
         )
     return {"attention_backend": "triton"}
+
+
+def should_report_expert_balancedness(server_args: Any) -> bool:
+    cfg = resolving_view(server_args)
+    return cfg.expert_balancedness_report_mode != "off"
+
+
+def post_capture_kv_sizing_planned(server_args: Any) -> bool:
+    """Whether the mem_fraction heuristic may skip the graph reserve; must be
+    False for any config the runtime won't post-capture-size, else it gets an
+    under-reserved fraction."""
+    cfg = resolving_view(server_args)
+    mla_enabled = use_mla_backend(server_args)
+    if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
+        return False
+    if cfg.device != "cuda":
+        return False
+    if cfg.dcp_size != 1:
+        return False
+    if mla_enabled:
+        return False
+    if cfg.kv_cache_dtype == "fp4_e2m1":
+        return False
+    if cfg.prefill_only_disable_kv_cache:
+        return False
+    if cfg.enable_memory_saver:
+        return False
+    if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
+        return False
+
+    if (
+        cfg.disaggregation_mode != "prefill"
+        and cfg.cuda_graph_config.decode.backend == Backend.DISABLED
+    ):
+        return False
+
+    if cfg.disaggregation_mode != "decode":
+        prefill_cfg = cfg.cuda_graph_config.prefill
+        # We can only skip eager activation headroom when the largest
+        # prefill forward batch size is already graph-captured. Otherwise,
+        # an eager forward will need more memory and lead to OOM.
+        if (
+            prefill_cfg.backend == Backend.DISABLED
+            or cfg.chunked_prefill_size <= 0
+            or max_prefill_buffer_tokens(server_args) > max(prefill_cfg.bs or (0,))
+        ):
+            return False
+
+    from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
+
+    hf_config = model_config_of(server_args).hf_config
+    if is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config):
+        return False
+
+    return True
+
+
+def cutedsl_moe_max_num_tokens(server_args: Any) -> int:
+    """Largest number of tokens a single forward routes through a CuteDSL
+    MoE layer on one (DP) rank. Single source of truth for both the
+    standard-allgather wrapper buffers and the FlashInfer A2A dispatcher
+    budget. Max over the prefill (max_prefill_tokens), piecewise-prefill
+    capture, and decode/verify bounds; num_tokens_per_req is
+    speculative_num_draft_tokens under speculative decoding, else 1.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.speculative_algorithm:
+        num_tokens_per_req = cfg.speculative_num_draft_tokens or 1
+    else:
+        num_tokens_per_req = 1
+    prefill_tokens = cfg.max_prefill_tokens
+    cg_config = cfg.cuda_graph_config
+    if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
+        prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
+    decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
+    decode_tokens = decode_max_bs * num_tokens_per_req
+    return max(prefill_tokens, decode_tokens)
+
+
+def max_prefill_buffer_tokens(server_args: Any) -> int:
+    """Prefill-buffer ceiling: chunked_prefill_size, except PP dynamic
+    chunking can grow chunks toward max_prefill_tokens and probe at 1.25x."""
+    cfg = resolving_view(server_args)
+    chunked = (
+        cfg.chunked_prefill_size
+        if cfg.chunked_prefill_size and cfg.chunked_prefill_size > 0
+        else 0
+    )
+    tokens = chunked
+    if cfg.enable_dynamic_chunking and cfg.pp_size > 1 and chunked:
+        tokens = max(tokens, cfg.max_prefill_tokens or 0, math.ceil(chunked * 1.25))
+    return tokens
+
+
+def mamba_cache_chunk_size(server_args: Any) -> int:
+    # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE
+    # (or mamba_chunk_size if it is defined in the model's config) and page_size.
+    # It is used to determine the caching point in a sequence during prefill.
+    # A pre-seeded `_mamba_cache_chunk_size` (fixtures supply one so a dummy
+    # model never loads an HF config) is honored as-is; otherwise the memo
+    # is only kept once the record is resolved, because `page_size` below
+    # is resolution-written.
+    from sglang.srt.arg_groups.overrides import model_config_of
+
+    if not hasattr(server_args, "_mamba_cache_chunk_size"):
+
+        try:
+            from sglang.kernels.ops.attention.fla.chunk_delta_h import (
+                CHUNK_SIZE as FLA_CHUNK_SIZE,
+            )
+        except ImportError:
+            # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE
+            FLA_CHUNK_SIZE = 64
+
+        hf_config = model_config_of(server_args).hf_config
+        chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
+        page_size = resolved_view(server_args).page_size
+        assert (
+            max(chunk_size, page_size) % min(chunk_size, page_size) == 0
+        ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
+        if not getattr(server_args, "_resolution_finished", False):
+            return max(chunk_size, page_size)
+        server_args._mamba_cache_chunk_size = max(chunk_size, page_size)
+    return server_args._mamba_cache_chunk_size
+
+
+def max_speculative_num_draft_tokens(server_args: Any) -> Optional[int]:
+    """Return the maximum draft-token count speculative decoding may use.
+
+    Memoized only once the record is resolved: an answer computed off a raw
+    record describes inputs resolution is about to rewrite (auto speculative
+    sizing fills `speculative_num_draft_tokens` in), and a cache filled that
+    early would keep answering with it.
+    """
+    cfg = resolving_view(server_args)
+
+    memo = server_args.__dict__.get("_max_speculative_num_draft_tokens")
+    if memo is not None:
+        return memo
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    result = SpeculativeAlgorithm.from_string(
+        cfg.speculative_algorithm
+    ).resolve_max_speculative_num_draft_tokens(server_args)
+    if (
+        result is not None
+        and cfg.speculative_num_draft_tokens is not None
+        and result < cfg.speculative_num_draft_tokens
+    ):
+        raise ValueError(
+            "The speculative algorithm declared "
+            f"max_speculative_num_draft_tokens={result}, below the configured "
+            "speculative_num_draft_tokens="
+            f"{cfg.speculative_num_draft_tokens}."
+        )
+    if getattr(server_args, "_resolution_finished", False):
+        server_args._max_speculative_num_draft_tokens = result
+    return result

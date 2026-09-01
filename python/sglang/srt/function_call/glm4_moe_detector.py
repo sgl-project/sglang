@@ -12,6 +12,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import (
+    get_schema_properties,
     infer_type_from_json_schema,
     safe_literal_eval,
 )
@@ -54,9 +55,7 @@ def get_argument_type(
     if func_name not in name2tool:
         return None
     tool = name2tool[func_name]
-    properties = (tool.function.parameters or {}).get("properties", {})
-    if not isinstance(properties, dict):
-        properties = {}
+    properties = get_schema_properties(tool.function.parameters)
     if arg_key not in properties:
         return None
 
@@ -572,7 +571,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                             self.streamed_args_for_tool[
                                 self.current_tool_id
                             ] += empty_object
-                        elif not self._last_arguments.endswith("}"):
+                        else:
+                            # The streamed outer `{` is only closed here; a
+                            # trailing "}" may belong to a nested object value.
                             closing_brace = "}"
                             calls.append(
                                 ToolCallItem(
