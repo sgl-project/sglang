@@ -904,6 +904,13 @@ class CudaVmmPackedTensorTransportProxy(CudaVmmTensorTransportProxy):
             "Packed CUDA VMM features must be reconstructed before release"
         )
 
+    def release_without_reconstruction(self, consumer_count: int | None = None) -> None:
+        """Release the shared packed allocation when its request is abandoned."""
+        if self._consumer_acknowledged:
+            return
+        self._packed_owner.acknowledge_consumption(consumer_count)
+        self._consumer_acknowledged = True
+
     def reconstruct_on_target_device(
         self, rebuild_device_idx, consumer_count: int | None = None
     ):

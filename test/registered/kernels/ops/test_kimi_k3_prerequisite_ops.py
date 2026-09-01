@@ -24,10 +24,7 @@ from sglang.kernels.ops.attention.vision_rope import (
     prepare_fused_qk_complex_rope_inplace,
 )
 from sglang.kernels.ops.elementwise import add3
-from sglang.kernels.ops.gemm.tiny_gemm import (
-    tiny_k_gemm_bf16,
-    tiny_n_gemm_bf16,
-)
+from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 from sglang.kernels.ops.kvcache.set_mla_kv_buffer import set_mla_kv_buffer
 from sglang.kernels.ops.mm.process.image import (
     _normalize_and_patchify_torch,
@@ -379,17 +376,19 @@ class TestKimiK3PrerequisiteOps(CustomTestCase):
                             )
 
     def test_tiny_gemm_variants(self):
+        """Both K3 gate-projection shapes, one per kernel variant: N=144 is the
+        tiny dimension for the first, K=128 for the second."""
         torch.manual_seed(2)
         x = torch.randn(2, 7168, device="cuda", dtype=torch.bfloat16) / 8
         weight = torch.randn(144, 7168, device="cuda", dtype=torch.bfloat16) / 8
-        actual = tiny_n_gemm_bf16(x, weight, out_dtype=torch.float32)
+        actual = tiny_gemm_bf16(x, weight, out_dtype=torch.float32)
         torch.testing.assert_close(
             actual.double(), x.double() @ weight.double().t(), rtol=1e-3, atol=1e-3
         )
 
         x = torch.randn(7, 128, device="cuda", dtype=torch.bfloat16) / 4
         weight = torch.randn(1536, 128, device="cuda", dtype=torch.bfloat16) / 4
-        actual = tiny_k_gemm_bf16(x, weight)
+        actual = tiny_gemm_bf16(x, weight)
         torch.testing.assert_close(
             actual.double(), x.double() @ weight.double().t(), rtol=2e-2, atol=2e-2
         )
