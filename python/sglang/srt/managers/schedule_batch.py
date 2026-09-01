@@ -2972,16 +2972,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Also stale residue; None keeps the prefill result path from
         # re-reporting old prefill stats for what is decode work.
         self.prefill_stats = None
-        for req in self.reqs:
+        # seq_lens already counts the token this step decodes. output_ids lags it
+        # by one only while the previous step's result is unprocessed, and a step
+        # that ran prefill instead of decode drains that lag, so the number of
+        # output tokens is not a fixed offset from the row length here.
+        seq_lens = [int(s) for s in self.seq_lens_cpu.tolist()]
+        for req, seq_len in zip(self.reqs, seq_lens):
             req._refresh_fill_ids()
-            full_len = len(req.full_untruncated_fill_ids)
-            req.set_extend_range(full_len - 1, full_len)
+            req.set_extend_range(seq_len - 1, seq_len)
 
-        # Same one-step output_ids delay handling as mix_with_running.
-        delta = 0 if self.enable_overlap else -1
-        self.prefix_lens = [
-            len(r.origin_input_ids) + len(r.output_ids) + delta for r in self.reqs
-        ]
+        self.prefix_lens = [seq_len - 1 for seq_len in seq_lens]
         self.extend_lens = [1] * bs
         self.extend_num_tokens = bs
         self.extend_logprob_start_lens = [0] * bs
