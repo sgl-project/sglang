@@ -1336,9 +1336,7 @@ def init_unified_mamba_pools(
         max_size=req_to_token_pool._shared_mamba_size,
         device=device,
     )
-    # Inert today: the only reader is `get_cpu_copy`/`load_cpu_copy`, which this
-    # composite allocator does not implement, so the retraction backup fails loud
-    # upstream rather than reaching a virtual mamba id.
+    # Inert: this allocator implements neither reader (see HybridLinearKVPool).
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
     # No full-KV translate hook is wired: both MLA doors now receive

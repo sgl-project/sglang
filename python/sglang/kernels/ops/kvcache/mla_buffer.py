@@ -189,11 +189,8 @@ def set_mla_kv_buffer_triton(
     *,
     reserved_skip_index: int = 0,
 ):
-    """Scatter at locs that already address this rank's rows.
-
-    A DCP-widened loc reaches the wrong row here; that case is
-    `set_mla_kv_buffer_dcp_sharded_triton`.
-    """
+    """Scatter at locs already addressing this rank's rows (widened ->
+    `set_mla_kv_buffer_dcp_sharded_triton`)."""
     _set_mla_kv_buffer_impl(
         kv_buffer,
         loc,

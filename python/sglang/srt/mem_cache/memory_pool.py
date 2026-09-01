@@ -3658,10 +3658,9 @@ class HybridLinearKVPool(KVCache):
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
-        # Mamba-slot translate for `get_cpu_copy` / `load_cpu_copy`, whose only
-        # caller is the cpu_tensor retraction backup. Identity: a static pool's
-        # slot ids are already physical, and the unified composite allocator
-        # implements neither method, so its virtual ids never arrive here.
+        # Identity even though the unified pool holds VIRTUAL mamba ids: its
+        # composite allocator implements neither `get_cpu_copy` nor
+        # `load_cpu_copy`, the only readers, so those ids never arrive here.
         self._mamba_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
@@ -4081,9 +4080,9 @@ class MLATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
-    # Has the WRITE loc reaching this pool already had the DCP owner rule
-    # resolved? False here: `set_mla_kv_buffer` takes a WIDENED loc. The unified
-    # pool resolves it in `KVIndexTranslator.rebind_write_loc` and flips this.
+    # Has the WRITE loc arriving here already had the DCP owner rule resolved?
+    # False: this pool takes a WIDENED loc. The unified pool resolves it in
+    # `KVIndexTranslator.rebind_write_loc` and flips this.
     write_loc_is_dcp_resolved = False
 
     @property
@@ -4098,7 +4097,6 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        """Scatter through the entry point matching this pool's write-loc space."""
         if self.write_loc_is_dcp_resolved:
             set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
         else:
@@ -4123,10 +4121,8 @@ class MLATokenToKVPool(KVCache):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         assert not self.dsa_kv_cache_store_fp8
-        # An unresolved write loc cannot be made DCP-aware here: the two
-        # backends that reach this door disagree on the loc space --
-        # flashinfer-MLA's `k_rope is None` branch passes a WIDENED loc, the
-        # Triton backend one it already collapsed.
+        # No DCP-aware variant is possible: the two backends reaching this door
+        # disagree on the loc space (flashinfer-MLA widened, Triton collapsed).
         assert self.write_loc_is_dcp_resolved or not get_parallel().dcp_enabled, (
             "MLATokenToKVPool.set_kv_buffer has no DCP-aware write path. Under "
             "--dcp-size > 1 the MLA write must go through set_mla_kv_buffer, "
@@ -4195,8 +4191,7 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
         layer_id_override: Optional[int] = None,
     ):
-        # Unless the pool declares otherwise, loc is widened under DCP and the
-        # kernel divides by the world size itself.
+        # loc is widened under DCP unless the pool declares it resolved.
         maybe_detect_oob(
             loc,
             0,
