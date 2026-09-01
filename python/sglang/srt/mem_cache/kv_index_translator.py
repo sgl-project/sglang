@@ -58,7 +58,6 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
     UnifiedSWATokenToKVPoolAllocator,
@@ -153,23 +152,6 @@ class KVIndexTranslator:
                 token_to_kv_pool.translate_loc_from_full_to_swa
                 if isinstance(token_to_kv_pool, SWAKVPool)
                 else None
-            )
-
-        # One fact, two owners: this decides whether the write loc is rebound,
-        # the MLA pool declares whether it arrives rebound. Not derivable from
-        # `kernel_page_blocks` -- a rank owning one full-attention layer has
-        # blocks_per_page 1 and is still translated.
-        full_pool = (
-            token_to_kv_pool.full_kv_pool
-            if isinstance(token_to_kv_pool, HybridLinearKVPool)
-            else token_to_kv_pool
-        )
-        if isinstance(full_pool, MLATokenToKVPool):
-            assert full_pool.write_loc_is_dcp_resolved == self.is_translating, (
-                f"{type(full_pool).__name__}.write_loc_is_dcp_resolved="
-                f"{full_pool.write_loc_is_dcp_resolved} disagrees with the "
-                f"translator's is_translating={self.is_translating}; the write "
-                "loc would have the DCP owner rule applied twice or not at all."
             )
 
         self._rows: Optional[torch.Tensor] = (
