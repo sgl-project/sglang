@@ -191,20 +191,6 @@ fi
 source "$(dirname "${BASH_SOURCE[0]}")/../utils/sgl_eval_ref.sh"
 install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "$SGL_EVAL_SPEC"
 
-# MMLU's prepared dataset lives under ~/.cache/sgl_eval rather than HF_HOME.
-# On persistent AMD runners, generate it once under a fleet-wide lock, publish
-# it atomically, and link only the MMLU subdirectory into this job's container.
-if docker exec ci_sglang mountpoint -q /sgl-data; then
-  if ! docker exec -w /sglang-checkout ci_sglang python3 \
-      scripts/ci/amd/prepare_mmlu_cache.py \
-      --cache-root /sgl-data/sgl-eval-cache \
-      --sgl-eval-ref "$SGL_EVAL_REF"; then
-    echo "Warning: shared MMLU cache preparation failed; using the container-local fallback." >&2
-  fi
-else
-  echo "Persistent /sgl-data is unavailable; using the container-local sgl-eval cache."
-fi
-
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
 else
