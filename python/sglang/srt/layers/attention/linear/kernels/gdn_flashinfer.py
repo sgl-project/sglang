@@ -37,6 +37,8 @@ class FlashInferGDNExtendPrep(msgspec.Struct, frozen=True, eq=False):
 
     ssm_cache_indices: torch.Tensor
     cu_seqlens: torch.Tensor
+
+
 _FLASHINFER_GDN_ALIGNMENT = 32
 
 
