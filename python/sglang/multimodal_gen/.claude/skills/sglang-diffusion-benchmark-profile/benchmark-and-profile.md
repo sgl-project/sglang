@@ -144,7 +144,8 @@ Run one explicit quality or BCG comparator with `--quality lossless|high` and
 exclusive in this helper. A high+BCG command is only a compatibility probe:
 it is invalid if request-scoped DiT fusions mount after the lossless warmup
 graphs were captured. When a preset has explicit width and height, the helper
-declares that same `--warmup-resolutions` value automatically:
+declares that same `--warmup-resolutions` value automatically. Video presets
+with an explicit frame count also declare the matching `--warmup-num-frames`:
 
 ```bash
 PYTHONPATH=python python3 "$BENCH_PY" \
@@ -160,10 +161,10 @@ Eager/BCG/BCG/Eager at `lossless`, then the same sequence at `high`, while
 holding one GPU set and one isolated checkpoint cache. The high+BCG cells test
 whether the combination is actually supported; do not average them when the
 runtime rejects the combination or the helper detects a late quality-fusion
-mount. The helper also hashes every generated artifact, first requires the two
-Eager rows at each quality to agree, then rejects any BCG row whose hash differs
-from that Eager reference. Cleanup occurs only after all eight runs, including
-on failure or interruption:
+mount. The helper hashes every generated image, video, audio, or 3D mesh
+artifact. It first requires the two Eager rows at each quality to agree, then
+rejects any BCG row whose hash differs from that Eager reference. Cleanup occurs
+only after all eight runs, including on failure or interruption:
 
 ```bash
 MODEL_CACHE_ROOT=/path/to/task-owned/model-caches
@@ -183,13 +184,11 @@ disable, capture failure, `serving signature MISSED`, a message that no graph
 will be captured, or a request-scoped high-quality DiT fusion mounted after
 capture. Do not average rejected rows with valid results.
 
-BCG signatures include more than width and height. The public
-`--warmup-resolutions` flag declares only `WxH`; synthetic warmup still uses
-the model's own frame-count and conditioning defaults. A short video preset
-can therefore capture a default temporal shape and miss the actual request
-even at the same resolution. The helper marks that row invalid. Use a request
-whose complete temporal/conditioning contract matches warmup, or fix the
-model's BCG warmup/padding contract before claiming a speedup.
+BCG signatures include more than width and height. The helper maps an explicit
+video request frame count to `--warmup-num-frames`, while
+`--warmup-resolutions` declares `WxH`. Other temporal or conditioning inputs
+can still differ from the captured signature. The helper marks such a row
+invalid; fix the model's BCG warmup/padding contract before claiming a speedup.
 
 The helper sets `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1` for accurate stage
 attribution. Set it to `0` explicitly only when collecting an e2e-only run and
@@ -320,7 +319,7 @@ Use the preset categories this way:
 | `qwen-edit-base` | `Qwen/Qwen-Image-Edit` | No | Covers the original native `QwenImageEditPipelineConfig`, which is distinct from the 2509/2511 edit-plus paths; public SGLang edit fixture, 1024x1024. |
 | `qwen-image-layered` | `Qwen/Qwen-Image-Layered` | No | Native layered-image path using the same public reference image and four-frame request as the GPU server case, at the registered 640x640 canvas. |
 | `stable-diffusion-3.5-medium` | `stabilityai/stable-diffusion-3.5-medium-diffusers` | No | Representative native `StableDiffusion3PipelineConfig` path at 1024x1024. The repository is gated, so export `HF_TOKEN`; an unauthenticated run is a recorded access blocker, not model evidence. |
-| `sana-video` | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | No | CI-sized eager T2V baseline: 832x480, 17 frames, 8 steps, guidance 6.0. Compare `quality=lossless` and `quality=high`; high enables the BF16-input first linear-attention GEMM while retaining FP32 output and the FP32 second GEMM. |
+| `sana-video` | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | No | CI-sized T2V baseline: 832x480, 17 frames, 8 steps, guidance 6.0. The BCG comparator declares the same 17-frame warmup shape. Compare `quality=lossless` and `quality=high`; high enables the BF16-input first linear-attention GEMM while retaining FP32 output and the FP32 second GEMM. |
 | `sana-wm-bidirectional` | `Efficient-Large-Model/SANA-WM_bidirectional` | No | Dense two-stage TI2V baseline at the native 1280x704 shape, 49 frames, 16 fps, 20 steps, guidance 4.5, and a 48-frame forward/left action program. Uses the shared cat fixture. |
 | `sana-wm-streaming` | `Efficient-Large-Model/SANA-WM_streaming` | No | Matching offline chunk-causal two-stage baseline with the streaming DiT and chunked refiner enabled; uses the same shape, fixture, seed, and camera action for comparison. |
 | `lingbot-video-moe` | `robbyant/lingbot-video-moe-30b-a3b` | No | One-GPU eager baseline using the CI structured-JSON caption, 384x640, 17 frames, 12 steps, and text-encoder CPU offload. |

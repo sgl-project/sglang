@@ -121,7 +121,16 @@ MODEL_WEIGHT_SUFFIXES = {
     ".pth",
     ".safetensors",
 }
-GENERATED_OUTPUT_SUFFIXES = {".jpeg", ".jpg", ".mp4", ".png", ".wav", ".webp"}
+GENERATED_OUTPUT_SUFFIXES = {
+    ".glb",
+    ".jpeg",
+    ".jpg",
+    ".mp4",
+    ".obj",
+    ".png",
+    ".wav",
+    ".webp",
+}
 NIGHTLY_PRESET_ORDER = (
     "flux",
     "flux2",
@@ -1724,6 +1733,8 @@ def build_sglang_cmd(
             if warmup_resolutions:
                 cmd.append("--warmup-resolutions")
                 cmd.extend(warmup_resolutions)
+        if "warmup-num-frames" not in parsed_args and "num-frames" in parsed_args:
+            cmd.extend(["--warmup-num-frames", str(parsed_args["num-frames"])])
         if bcg_text_buckets is not None:
             cmd.append("--bcg-text-buckets")
             cmd.extend(str(bucket) for bucket in bcg_text_buckets)

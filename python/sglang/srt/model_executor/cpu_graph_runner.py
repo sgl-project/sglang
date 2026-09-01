@@ -609,9 +609,9 @@ class CPUGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
-        self.tp_size = get_parallel().config.tp_size
-        self.dp_size = get_parallel().config.dp_size
-        self.pp_size = get_parallel().config.pp_size
+        self.tp_size = get_parallel().tp_size
+        self.dp_size = get_parallel().dp_size
+        self.pp_size = get_parallel().pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = self.return_hidden_states_mode

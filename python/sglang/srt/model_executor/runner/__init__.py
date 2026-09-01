@@ -12,7 +12,8 @@ Public API:
   - BaseCudaGraphRunner — abstract cuda-graph base; bucket padding +
     capture-loop scaffolding on top of BaseRunner.
   - DecodeCudaGraphRunner — concrete decode-phase runner.
-  - PrefillCudaGraphRunner — concrete prefill-phase runner.
+  - PrefillCudaGraphRunner — concrete prefill-phase runner (extend family;
+    MIXED batches replay the EXTEND-captured graphs).
   - EagerRunner — no-cuda-graph runner; runs model.forward live (the
     eager dual of the cuda-graph runners), mode-dispatched over decode +
     extend + idle.
