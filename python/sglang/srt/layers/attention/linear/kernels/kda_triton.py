@@ -27,6 +27,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
     # non-packed Triton decode() path (fused_sigmoid_gating_delta_rule_update),
     # the same fallback CPU/NPU use. Batched decode is handled via query_start_loc.
     supports_packed_decode: bool = not is_cpu() and not is_npu() and not is_xpu()
+    supports_track_state_snapshot: bool = True
 
     def packed_decode(
         self,
@@ -244,4 +245,6 @@ class TritonKDAKernel(LinearAttnKernelBase):
             dt_bias=dt_bias,
             lower_bound=lower_bound,
             output_intermediate_states=return_intermediate_states,
+            track_state=kwargs.get("track_state"),
+            track_chunk_idx=kwargs.get("track_chunk_idx"),
         )
