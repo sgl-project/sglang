@@ -426,7 +426,11 @@ class TestLoadWeightsFromRemoteInstance(CustomTestCase):
                 checking_parameters,
                 "127.0.0.1",
                 DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000,
-                60000,
+                # Below the kernel's ephemeral range (commonly 32768-60999) and
+                # clear of the 10000-30000 band DEFAULT_PORT_FOR_SRT_TEST_RUNNER
+                # spans: the seed listens on these, so an ephemeral port would
+                # race an outbound connection and is rejected at startup.
+                9000,
                 remote_instance_loader_backend,
             )
 
