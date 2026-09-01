@@ -11,6 +11,99 @@ use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 
+/// Whether a raw upstream SSE chunk carries an actual content token — used to
+/// time `sgl_router_ttft_seconds` to the first GENERATED token rather than the
+/// first byte off the wire.
+///
+/// SGLang's OpenAI-compatible stream opens with a role-prelude frame
+/// (`{"choices":[{"delta":{"role":"assistant"}}]}`) and may interleave
+/// empty-delta / finish-reason-only frames, the `data: [DONE]` sentinel, and
+/// SSE comment / keepalive lines — none of which is a generated token. This
+/// scans every `data:` line in the chunk and returns `true` on the first whose
+/// JSON `choices[].delta` carries a non-empty `content` / `reasoning_content`
+/// string OR a non-empty `tool_calls` array — Dynamo's "any generated token"
+/// semantic. A tool-calling-first response emits `delta.tool_calls` with no
+/// `content` / `reasoning_content`, so omitting it would record ZERO TTFT for
+/// that whole (common) request class. Mirrors Dynamo's `adapter.rs` gate
+/// ("Token-less chunks — SGLang's bootstrap handshake — don't count").
+///
+/// A single `bytes_stream()` chunk may pack several SSE events (TCP framing is
+/// arbitrary) or split one mid-line. The scan is STATELESS and best-effort: it
+/// never buffers across chunks — a non-JSON / partial `data:` payload simply
+/// doesn't count (it never panics), and the next chunk gets a fresh look. So a
+/// content frame split mid-JSON across two chunks does not fire on either half;
+/// the hook fires on the next WHOLE content frame instead (TTFT clocks one
+/// frame late — a sub-ms skew not worth cross-chunk buffering on the hot path).
+/// If the only content frame is split and no later whole frame arrives, no
+/// TTFT is recorded. This is the only place the router inspects SSE chunk
+/// content; the bytes are still forwarded to the client unchanged.
+fn sse_chunk_has_content_token(chunk: &[u8]) -> bool {
+    // SSE events are newline-delimited; `data:` carries the JSON payload.
+    for line in chunk.split(|&b| b == b'\n') {
+        let line = trim_ascii_ws(line);
+        let Some(payload) = line.strip_prefix(b"data:") else {
+            continue; // comment (`:`), `event:`/`id:` fields, blank separators
+        };
+        let payload = trim_ascii_ws(payload);
+        if payload == b"[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+            continue; // partial / non-JSON frame — wait for a later chunk
+        };
+        let has_token = value
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    choice.get("delta").is_some_and(|delta| {
+                        nonempty_str_field(delta, "content")
+                            || nonempty_str_field(delta, "reasoning_content")
+                            || delta
+                                .get("tool_calls")
+                                .and_then(|v| v.as_array())
+                                .is_some_and(|a| !a.is_empty())
+                    })
+                })
+            });
+        if has_token {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `value[key]` is a non-empty JSON string. Null / empty-string /
+/// missing / non-string all return `false` — an empty `content` delta is not a
+/// generated token.
+fn nonempty_str_field(value: &serde_json::Value, key: &str) -> bool {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+}
+
+/// Trim leading/trailing ASCII whitespace (`u8::is_ascii_whitespace`) from a
+/// byte slice. `[u8]::trim_ascii` is stable only on newer toolchains, so this
+/// keeps the MSRV unconstrained.
+fn trim_ascii_ws(mut s: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = s {
+        if first.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    while let [rest @ .., last] = s {
+        if last.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    s
+}
+
 /// Bridge a byte stream into an axum Body that streams chunks unchanged.
 ///
 /// Spawns one tokio task per stream so the handler can return immediately.
@@ -56,17 +149,25 @@ use tokio_stream::wrappers::ReceiverStream;
 /// 2xx headers and then drops the stream mid-flight would stay credited
 /// as healthy.
 ///
-/// # First-byte hook
-/// When `on_first_byte` is `Some`, the closure runs exactly once, the moment
-/// the first `Ok` chunk is read from the upstream stream — i.e. time to first
-/// token. It does NOT fire if the stream ends or errors before any `Ok` chunk
-/// arrives. `forward_streaming_to` passes a closure that records
-/// `sgl_router_ttft_seconds` for successful streaming responses.
+/// # First-token hook
+/// When `on_first_token` is `Some`, the closure runs exactly once, the moment
+/// the first upstream chunk carrying an actual content token is read — i.e.
+/// time to first token. A chunk counts only when its parsed SSE `data:`
+/// payload has a non-empty `content` (or `reasoning_content`) delta; the
+/// role-prelude / empty-delta / `[DONE]` / keepalive frames SGLang emits
+/// before the first generated token are skipped (see
+/// [`sse_chunk_has_content_token`]). The hook does NOT fire if the stream ends
+/// or errors before any content token arrives (client abort / drop before the
+/// first token), so such requests record no TTFT sample.
+/// `forward_streaming_to` passes a closure that records
+/// `sgl_router_ttft_seconds` for successful streaming responses. This mirrors
+/// Dynamo's `request_guard` (`observe_tokens` records TTFT only when
+/// `new_tokens > 0`).
 pub fn bytes_stream_to_body<S, E>(
     stream: S,
     stream_guards: Option<Box<dyn Send + 'static>>,
     on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>>,
-    on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+    on_first_token: Option<Box<dyn FnOnce() + Send + 'static>>,
 ) -> Body
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
@@ -86,7 +187,7 @@ where
             // underscore suppresses the "unused variable" lint while
             // keeping intent explicit.
             let _hold = stream_guards;
-            let mut on_first_byte = on_first_byte;
+            let mut on_first_token = on_first_token;
             let mut s = stream;
             while let Some(chunk) = s.next().await {
                 let item: Result<Bytes, std::io::Error> = chunk.map_err(|e| {
@@ -95,13 +196,20 @@ where
                     std::io::Error::other(msg)
                 });
                 let is_err_chunk = item.is_err();
-                // Fire the time-to-first-token hook on the first successful
-                // chunk from upstream. `take()` makes it fire at most once;
-                // an error-first stream never produced a token, so it's left
-                // unfired (and dropped on task end).
-                if !is_err_chunk {
-                    if let Some(hook) = on_first_byte.take() {
-                        hook();
+                // Fire the time-to-first-token hook on the first upstream chunk
+                // that carries an actual content token — NOT merely the first
+                // `Ok` chunk. SGLang's stream opens with a role-prelude frame
+                // (and may emit empty-delta / keepalive frames) that carry no
+                // generated token; timing TTFT to those would under-report by
+                // one engine round-trip. `take()` makes it fire at most once;
+                // a stream that errors or ends before any content frame leaves
+                // it unfired (and dropped on task end) → no TTFT sample, which
+                // is correct for a client abort / drop before the first token.
+                if let Ok(bytes) = &item {
+                    if on_first_token.is_some() && sse_chunk_has_content_token(bytes) {
+                        if let Some(hook) = on_first_token.take() {
+                            hook();
+                        }
                     }
                 }
                 if is_err_chunk {
@@ -166,15 +274,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn on_first_byte_fires_once_on_first_ok_chunk() {
+    async fn on_first_token_fires_once_on_first_content_chunk() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
         let fired = Arc::new(AtomicUsize::new(0));
         let fired_c = Arc::clone(&fired);
+        // A real SGLang stream: a role-prelude frame carrying no content
+        // token, then the first content frame, then a second content frame.
+        // The hook must fire exactly once, timed to the FIRST content frame.
         let chunks = vec![
-            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"a")),
-            Ok(Bytes::from_static(b"b")),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n",
+            )),
         ];
         let s = stream::iter(chunks);
         let body = bytes_stream_to_body(
@@ -189,12 +307,12 @@ mod tests {
         assert_eq!(
             fired.load(Ordering::SeqCst),
             1,
-            "first-byte hook must fire exactly once across the whole stream",
+            "first-token hook must fire exactly once, on the first content frame",
         );
     }
 
     #[tokio::test]
-    async fn on_first_byte_not_fired_when_stream_errors_first() {
+    async fn on_first_token_not_fired_when_stream_errors_first() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
@@ -216,7 +334,247 @@ mod tests {
         assert_eq!(
             fired.load(Ordering::SeqCst),
             0,
-            "first-byte hook must not fire when no Ok chunk is ever produced",
+            "first-token hook must not fire when no Ok chunk is ever produced",
+        );
+    }
+
+    #[tokio::test]
+    async fn on_first_token_not_fired_when_no_content_chunk() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let fired_c = Arc::clone(&fired);
+        // A stream that produces ONLY a role-prelude frame and then the
+        // terminal `[DONE]` — no content token ever (client aborted / the
+        // request dropped before the first generated token). TTFT must NOT
+        // be recorded for such a request.
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let s = stream::iter(chunks);
+        let body = bytes_stream_to_body(
+            s,
+            None,
+            None,
+            Some(Box::new(move || {
+                fired_c.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+        let _ = body.collect().await.unwrap();
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "first-token hook must not fire for a stream that carries no content token",
+        );
+    }
+
+    #[test]
+    fn sse_chunk_has_content_token_detects_content_delta() {
+        // The first generated token: a non-empty `content` delta.
+        assert!(sse_chunk_has_content_token(
+            br#"data: {"choices":[{"delta":{"content":"Hello"}}]}"#
+        ));
+        // `reasoning_content` (SGLang thinking models) also counts as a token.
+        assert!(sse_chunk_has_content_token(
+            br#"data: {"choices":[{"delta":{"reasoning_content":"Let me think"}}]}"#
+        ));
+        // A tool-calling-first response emits `delta.tool_calls` with NO
+        // content/reasoning_content — it IS a generated token (Dynamo's "any
+        // generated token" semantic). Without this the router would record
+        // ZERO TTFT for the entire pure-tool-call request class.
+        assert!(sse_chunk_has_content_token(
+            br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"get_weather"}}]}}]}"#
+        ));
+        // A chunk that bundles a role prelude and the first content token in
+        // one TCP read still counts (scan all `data:` lines).
+        assert!(sse_chunk_has_content_token(
+            b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+        ));
+    }
+
+    #[test]
+    fn sse_chunk_has_content_token_skips_non_content_frames() {
+        // Role-prelude frame — no token yet.
+        assert!(!sse_chunk_has_content_token(
+            br#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#
+        ));
+        // Empty-string content (some engines emit a leading empty delta).
+        assert!(!sse_chunk_has_content_token(
+            br#"data: {"choices":[{"delta":{"content":""}}]}"#
+        ));
+        // Null content.
+        assert!(!sse_chunk_has_content_token(
+            br#"data: {"choices":[{"delta":{"content":null}}]}"#
+        ));
+        // Terminal sentinel.
+        assert!(!sse_chunk_has_content_token(b"data: [DONE]"));
+        // SSE comment / keepalive line.
+        assert!(!sse_chunk_has_content_token(b": keepalive"));
+        // Finish-reason-only frame (no content delta).
+        assert!(!sse_chunk_has_content_token(
+            br#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#
+        ));
+        // Empty `tool_calls` array — not a generated token (some engines emit
+        // an empty array on the prelude frame).
+        assert!(!sse_chunk_has_content_token(
+            br#"data: {"choices":[{"delta":{"tool_calls":[]}}]}"#
+        ));
+        // Non-JSON / partial frame must not panic and must not count.
+        assert!(!sse_chunk_has_content_token(b"data: {not json"));
+        assert!(!sse_chunk_has_content_token(b""));
+    }
+
+    /// End-to-end wiring: drive the pump with a REAL `MetricsRegistry`-backed
+    /// hook and assert the rendered `sgl_router_ttft_seconds_count` series. This
+    /// is the exact seam a sibling-gateway bug hid in — both the detector and
+    /// the pump were individually green while the integrated path recorded the
+    /// wrong count. A role-prelude + content stream must record EXACTLY ONE
+    /// sample.
+    #[tokio::test]
+    async fn ttft_recorded_once_end_to_end_for_content_stream() {
+        use crate::server::metrics::MetricsRegistry;
+
+        let reg = MetricsRegistry::new();
+        let reg_hook = Arc::clone(&reg);
+        let start = std::time::Instant::now();
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let s = stream::iter(chunks);
+        let body = bytes_stream_to_body(
+            s,
+            None,
+            None,
+            Some(Box::new(move || {
+                reg_hook.observe_ttft("m", start.elapsed().as_secs_f64());
+            })),
+        );
+        let _ = body.collect().await.unwrap();
+        let out = reg.render();
+        assert!(
+            out.contains(r#"sgl_router_ttft_seconds_count{model_id="m"} 1"#),
+            "expected exactly one TTFT sample recorded end-to-end; got:\n{out}",
+        );
+    }
+
+    /// End-to-end wiring: a stream that opens with a role prelude and then ends
+    /// at `[DONE]` with no content token (client abort / drop before the first
+    /// token) must record NO TTFT sample — there is no `_count` series for the
+    /// model at all.
+    #[tokio::test]
+    async fn ttft_not_recorded_end_to_end_when_no_content() {
+        use crate::server::metrics::MetricsRegistry;
+
+        let reg = MetricsRegistry::new();
+        let reg_hook = Arc::clone(&reg);
+        let start = std::time::Instant::now();
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let s = stream::iter(chunks);
+        let body = bytes_stream_to_body(
+            s,
+            None,
+            None,
+            Some(Box::new(move || {
+                reg_hook.observe_ttft("m", start.elapsed().as_secs_f64());
+            })),
+        );
+        let _ = body.collect().await.unwrap();
+        let out = reg.render();
+        assert!(
+            !out.contains(r#"sgl_router_ttft_seconds_count{model_id="m"}"#),
+            "a content-less stream must record no TTFT series; got:\n{out}",
+        );
+    }
+
+    /// Frame-split-across-chunks contract (item 3). `sse_chunk_has_content_token`
+    /// is intentionally STATELESS — it never buffers across chunks (the sub-ms
+    /// skew isn't worth hot-path buffering complexity). When the first content
+    /// frame is split mid-JSON across two `bytes` chunks, the split halves are
+    /// each non-JSON and do NOT fire the hook. This pins the "re-look the next
+    /// chunk" contract so a future refactor can't silently make it never-fire:
+    /// a LATER whole content frame still fires it (clocks one frame late).
+    #[tokio::test]
+    async fn split_first_content_frame_fires_on_next_whole_frame() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let fired_c = Arc::clone(&fired);
+        // First content frame split mid-JSON across two chunks (neither half
+        // parses), then a SECOND whole content frame arrives.
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"con",
+            )),
+            Ok(Bytes::from_static(b"tent\":\"Hi\"}}]}\n\n")),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n",
+            )),
+        ];
+        let s = stream::iter(chunks);
+        let body = bytes_stream_to_body(
+            s,
+            None,
+            None,
+            Some(Box::new(move || {
+                fired_c.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+        let _ = body.collect().await.unwrap();
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "split frame must not fire; the next whole content frame fires exactly once",
+        );
+    }
+
+    /// Companion to the split-frame test: when the ONLY content frame is split
+    /// across chunks and no later whole content frame arrives, the stateless
+    /// detector never sees a parseable content frame, so the hook does NOT fire
+    /// (0 samples). Documents the best-effort edge — acceptable because the
+    /// alternative (cross-chunk buffering) costs hot-path complexity for a
+    /// sub-ms timing gain on a rare framing split.
+    #[tokio::test]
+    async fn split_only_content_frame_does_not_fire() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let fired_c = Arc::clone(&fired);
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"con",
+            )),
+            Ok(Bytes::from_static(b"tent\":\"Hi\"}}]}\n\n")),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let s = stream::iter(chunks);
+        let body = bytes_stream_to_body(
+            s,
+            None,
+            None,
+            Some(Box::new(move || {
+                fired_c.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+        let _ = body.collect().await.unwrap();
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "a single content frame split across chunks is best-effort: no whole frame, no fire",
         );
     }
 
