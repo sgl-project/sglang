@@ -10,9 +10,6 @@ from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
-# Sub-ranges of the pool, keyed by the attribute they end up backing. The
-# scales are named apart from the parameters because what lives here is the
-# post-transform runtime layout, not the checkpoint layout the loader fills.
 W13_WEIGHT = "w13_weight"
 W2_WEIGHT = "w2_weight"
 W13_SCALE = "w13_weight_scale_runtime"
@@ -34,9 +31,6 @@ class MoonEPWeightPool:
         group,
         specs: dict[str, tuple[tuple[int, ...], torch.dtype]],
     ):
-        # Checked before the import, because on upstream MoonEP the symbol is
-        # simply absent and an ImportError naming it says nothing about which
-        # build to install.
         _require_moonep_local_first()
 
         from moonep.buffer import create_nvl_dist_tensor, local_first_chunk_index
@@ -68,10 +62,6 @@ class MoonEPWeightPool:
                 ep_rank,
                 ep_size,
                 group=group,
-                # Rotated so this rank's chunk is at the base of the mapping.
-                # DeepGEMM's tvm_ffi bindings resolve a tensor's device from
-                # its base pointer, and the unrotated base is always rank 0's
-                # memory -- every other rank then fails the device check.
                 local_first=True,
             )
             for kind, (trailing, dtype) in specs.items()
@@ -88,10 +78,6 @@ class MoonEPWeightPool:
         )
 
     def layer_offset(self, layer_id: int) -> int:
-        """Rows before this layer's block. Layers are numbered by the order
-        they ask for storage, not by ``layer_id``: with pipeline parallelism a
-        rank holds an arbitrary slice of the model's layer ids, and the pool is
-        sized for what this rank actually builds."""
         index = self._layers.get(layer_id)
         if index is None:
             index = len(self._layers)
@@ -106,17 +92,13 @@ class MoonEPWeightPool:
         return index * self.block_rows
 
     def chunk_start(self, owner_rank: int) -> int:
-        """First row of ``owner_rank``'s chunk in this rank's mapping."""
         return self._chunk_index[owner_rank] * self.chunk_rows
 
     def local_view(self, kind: str, layer_id: int) -> torch.Tensor:
-        """This rank's ``[num_local_experts, ...]`` slice: what the loader
-        writes and what the parameter is bound to."""
         start = self.chunk_start(self.ep_rank) + self.layer_offset(layer_id)
         return self.ranges[kind][start : start + self.num_local_experts]
 
     def slot_view(self, kind: str, layer_id: int) -> torch.Tensor:
-        """This layer's ``[num_prefetch_slots, ...]`` copy destinations."""
         start = (
             self.chunk_start(self.ep_rank)
             + self.layer_offset(layer_id)
@@ -125,7 +107,6 @@ class MoonEPWeightPool:
         return self.ranges[kind][start : start + self.num_prefetch_slots]
 
 
-# The branch carrying the local-first mapping until it lands upstream.
 _MOONEP_LOCAL_FIRST_BRANCH = (
     "https://github.com/bytedance-iaas/MoonEP/tree/"
     "jxp/update_prefetch_api_and_support_local_first"
@@ -133,19 +114,6 @@ _MOONEP_LOCAL_FIRST_BRANCH = (
 
 
 def _require_moonep_local_first() -> None:
-    """Refuse the pool unless the installed MoonEP maps local-first.
-
-    ``create_nvl_dist_tensor(local_first=...)`` and
-    ``local_first_chunk_index()`` are an in-flight MoonEP change, not in
-    ``MoonshotAI/MoonEP``. They cannot be worked around from sglang: the
-    rotation happens while the memory handles are mapped, so a tensor the
-    published mapper has already returned cannot be re-ordered. Without it the
-    range's base address is rank 0's memory on every rank, which is the device
-    DeepGEMM's tvm_ffi bindings infer.
-
-    Declared by the operator rather than probed, so a MoonEP that grows the
-    keyword without the semantics cannot silently opt itself in.
-    """
     if envs.SGLANG_ENABLE_MOONEP_LOCAL_FIRST.get():
         return
     raise RuntimeError(
@@ -161,17 +129,8 @@ def _require_moonep_local_first() -> None:
 def _check_prefetch_tiling(
     specs: dict[str, tuple[tuple[int, ...], torch.dtype]],
 ) -> None:
-    """Reject shapes MoonEP's prefetch copy cannot tile.
-
-    ``retile_for_prefetch`` views each expert as ``[128, X]`` uint8 and asserts
-    the per-expert byte count divides its tile evenly. Its own message names
-    only the byte counts, which is impossible to connect back to a model
-    dimension, and it fires on the first forward -- long after the weights are
-    loaded. Checking here fails at allocation with the dimension named.
-    """
     from moonep.prefetch import prefetch_retile_nbytes
 
-    # Rounding one byte up lands on the tile size itself.
     tile = prefetch_retile_nbytes(1)
     for kind, (trailing, dtype) in specs.items():
         per_expert = math.prod(trailing) * torch.empty(0, dtype=dtype).element_size()
@@ -187,7 +146,6 @@ def _check_prefetch_tiling(
 
 
 def _minimum_aligned_rows(trailing_shape, dtype: torch.dtype) -> int:
-    """Smallest row count whose bytes land on a VMM granularity boundary."""
     from moonep.buffer import pad_dim0_for_alignment
 
     return pad_dim0_for_alignment([1, *trailing_shape], dtype)
@@ -196,14 +154,6 @@ def _minimum_aligned_rows(trailing_shape, dtype: torch.dtype) -> int:
 def _resolve_chunk_rows(
     specs: dict[str, tuple[tuple[int, ...], torch.dtype]], rows_in_use: int
 ) -> int:
-    """One row count that is granularity-aligned for every range at once.
-
-    A weight and its scale must share a row indexing, so they cannot each pick
-    their own padding. A row count works for a tensor when
-    ``rows * bytes_per_row`` is a multiple of the VMM granularity, so the
-    common answer is the least common multiple of each one's minimum, rounded
-    up past the rows actually in use.
-    """
     step = 1
     for trailing, dtype in specs.values():
         step = math.lcm(step, _minimum_aligned_rows(trailing, dtype))
@@ -211,15 +161,6 @@ def _resolve_chunk_rows(
 
 
 def _num_moe_layers() -> int:
-    """How many layers *this rank* will ask the pool for storage.
-
-    Counted from the config rather than tracked dynamically because the ranges
-    are fixed-size VMM mappings that cannot grow. Only this rank's pipeline
-    stage is counted: with PP a rank builds an arbitrary slice of the model,
-    and a pool sized for the whole model would waste the rest. ``layer_offset``
-    raises if the count turns out to be too small, so an over-count costs
-    memory and an under-count is loud.
-    """
     from sglang.srt.distributed import get_pp_group
     from sglang.srt.distributed.utils import get_pp_indices
     from sglang.srt.runtime_context import process_model_config
@@ -252,13 +193,6 @@ def alloc_expert_tensors(
     layer: torch.nn.Module,
     specs: dict[str, tuple[tuple[int, ...], torch.dtype]],
 ) -> dict[str, torch.Tensor]:
-    """Per-layer views of the symmetric pool, creating it on the first call.
-
-    ``specs`` maps a sub-range name to ``(trailing_shape, dtype)`` for a single
-    expert row. Every layer must pass the same specs -- they share one
-    allocation. Collective over the EP group, so all ranks have to build their
-    layers in the same order.
-    """
     global _pool
 
     from sglang.srt.distributed import get_tp_group
@@ -291,13 +225,8 @@ def alloc_expert_tensors(
 
 
 def expert_rows(layer_id: int, expert_ids: torch.Tensor) -> torch.Tensor:
-    """Global expert ids -> rows of the symmetric range. Negative ids (unused
-    prefetch slots) pass through so DeepGEMM still skips them."""
     assert _pool is not None, "MoonEP expert pool was never created"
     epn = _pool.num_local_experts
-    # The mapping is local-first, so an owner's chunk index is relative to this
-    # rank -- row numbers differ per rank, which is fine because every consumer
-    # of them (m_indices, experts_to_copy) is computed locally.
     owner = expert_ids // epn
     chunk = (owner - _pool.ep_rank) % _pool.ep_size
     rows = chunk * _pool.chunk_rows + _pool.layer_offset(layer_id) + expert_ids % epn
@@ -307,13 +236,6 @@ def expert_rows(layer_id: int, expert_ids: torch.Tensor) -> torch.Tensor:
 def group_rows(
     layer_id: int, expert_ids: torch.Tensor, num_global_experts: int
 ) -> torch.Tensor:
-    """MoonEP's per-VM-group expert ids -> rows of the symmetric range.
-
-    The first ``num_global_experts`` groups are experts addressed by global id;
-    the groups after them are this rank's prefetch slots, whose ids name the
-    *source* expert but whose tokens must read the slot the copy landed in.
-    Empty and unfilled groups keep their -1 and stay skipped.
-    """
     assert _pool is not None, "MoonEP expert pool was never created"
     rows = expert_rows(layer_id, expert_ids)
     tail = expert_ids[num_global_experts:]
@@ -333,18 +255,6 @@ def group_rows(
 
 
 def prefetch_experts(layer_id: int, source_rows: torch.Tensor, num_sms: int) -> None:
-    """Copy the planned remote experts into this layer's prefetch slots.
-
-    ``Buffer.prefetch_weight`` does this for BF16, but it takes each source as
-    one ``[E+B, ...]`` block and slices the slots off the end. A symmetric
-    range cannot present that block -- ``create_nvl_dist_tensor`` pads every
-    rank's chunk up to allocation granularity, so an expert's rows and this
-    rank's slots are never adjacent. ``launch_prefetch`` takes source and
-    destination separately and is what ``prefetch_weight`` calls anyway.
-
-    ``source_rows`` are rows of the symmetric range (:func:`expert_rows`), not
-    global expert ids -- the other thing the block API assumes.
-    """
     from moonep.prefetch import launch_prefetch, retile_for_prefetch
 
     assert _pool is not None, "MoonEP expert pool was never created"
@@ -367,12 +277,6 @@ def prefetch_experts(layer_id: int, source_rows: torch.Tensor, num_sms: int) -> 
 
 
 def assert_resident(layer: torch.nn.Module, kind: str, tensor: torch.Tensor) -> None:
-    """Fail loudly if a post-load step swapped a pooled tensor for a private one.
-
-    SGLang's quant methods routinely rebind weights after loading, and a
-    rebind that lands outside the pool silently costs MoonEP its remote
-    readability -- prefetch would then copy from memory no peer can see.
-    """
     assert _pool is not None, "MoonEP expert pool was never created"
     full = _pool.ranges[kind]
     start = full.data_ptr()

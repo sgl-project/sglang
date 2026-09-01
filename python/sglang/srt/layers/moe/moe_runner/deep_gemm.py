@@ -1250,16 +1250,6 @@ def _moonep_m_indices(
     all_tokens: int,
 ) -> torch.Tensor:
     """Expand MoonEP's per-group segment ends into DeepGEMM's per-row group ids.
-
-    ``cu_seqlens[g]`` is the *end* offset of group ``g`` (no leading zero), so
-    ``searchsorted(..., right=True)`` maps a row to the group that owns it and
-    naturally skips empty groups. Two kinds of rows get ``-1``, which DeepGEMM
-    skips entirely: rows past the last segment (MoonEP pads the receive buffer
-    to a static ``NvS``) and rows whose group is an unfilled prefetch slot
-    (``expert_ids`` already carries ``-1`` there).
-
-    ``expert_ids`` -- not the group index -- is the value DeepGEMM wants: it
-    indexes the leading dimension of the expert weight tensor.
     """
     num_groups = expert_ids.numel()
     rows = torch.arange(all_tokens, device=cu_seqlens.device, dtype=cu_seqlens.dtype)
@@ -1283,10 +1273,6 @@ def _moonep_finalize_rows_kernel(
     offs = h_ptr + row * H + col
 
     if tl.load(m_ptr + row) < 0:
-        # DeepGEMM never wrote this row, so it still holds allocator garbage
-        # that may decode to NaN. It has to be *stored over*, not scaled --
-        # 0 * NaN is NaN. Nothing is read here, which is most of the saving:
-        # at decode these rows are the large majority of the buffer.
         tl.store(offs, tl.zeros([BLOCK], dtype=h_ptr.dtype.element_ty), mask=mask)
     elif HAS_WEIGHTS:
         x = tl.load(offs, mask=mask).to(tl.float32) * tl.load(w_ptr + row)
@@ -1299,11 +1285,6 @@ def _moonep_finalize_rows(
     route_weights_nvs: Optional[torch.Tensor],
 ) -> None:
     """Zero the rows DeepGEMM skipped and scale the rest by their route weight.
-
-    One pass instead of ``masked_fill_`` followed by ``mul_``. Both of those
-    walk the whole ``[NvS, H]`` buffer, and MoonEP's ``NvS`` is a static
-    worst case -- at K3/EP16 decode it is 22416 rows against a couple of
-    hundred live ones, which made this pair 16% of the whole decode step.
     """
     rows, hidden_size = hidden_states.shape
     BLOCK = 1024
@@ -1326,12 +1307,6 @@ def pre_permute_moonep_to_deep_gemm(
     running_state: dict,
 ) -> DeepGemmRunnerInput:
     """MoonEP dispatch output -> DeepGEMM m-grouped contiguous input.
-
-    Unlike the deepep/standard pre-permutes there is no scatter here: MoonEP's
-    ``dispatch`` already returns rows grouped by expert and padded to
-    ``token_padding``, which matches DeepGEMM's
-    ``get_mk_alignment_for_contiguous_layout()``. All that is left is deriving
-    ``m_indices`` and, for quantized experts, quantizing the activations.
     """
     hidden_states = dispatch_output.hidden_states
     if hidden_states.ndim != 2:
@@ -1344,8 +1319,6 @@ def pre_permute_moonep_to_deep_gemm(
     running_state["hidden_states_shape"] = hidden_states.shape
     running_state["hidden_states_dtype"] = hidden_states.dtype
     running_state["hidden_states_device"] = hidden_states.device
-    # Carried through because MoonEP's combine reconstructs from the plan and
-    # does not apply route weights itself -- the post-permute must.
     running_state["route_weights_nvs"] = dispatch_output.route_weights_nvs
     running_state["plan"] = dispatch_output.plan
     running_state["num_tokens"] = dispatch_output.num_tokens
@@ -1353,17 +1326,8 @@ def pre_permute_moonep_to_deep_gemm(
     from sglang.srt.layers.moe.token_dispatcher import moonep_weights
 
     expert_ids = dispatch_output.expert_ids
-    # Keyed on the pool, not on the weight dtype: the pool is what makes a row
-    # id meaningful. BF16 experts are replicated on every rank and need no
-    # remapping, and FusedMoE rejects at init the quant methods that would
-    # arrive here with quantized weights but no pool behind them.
     pool = moonep_weights.get_pool()
     if pool is not None:
-        # Quantized experts live in MoonEP's symmetric pool, so the duplicated
-        # ones have to be pulled in before the GEMM reads them, and the plan's
-        # global expert ids have to become pool rows. This runs here rather
-        # than in DeepEPMoE.run_moe_core because MXFP4 on DeepGEMM sets
-        # deprecate_flag, which delegates past that method entirely.
         from sglang.srt.layers.moe.token_dispatcher.moonep import get_moonep_num_sms
 
         layer_id = runner_config.layer_id
@@ -1376,10 +1340,6 @@ def pre_permute_moonep_to_deep_gemm(
             ),
             num_sms=get_moonep_num_sms(),
         )
-        # The parameters are this rank's slice of the pool, but m_indices
-        # addresses the whole symmetric range -- a duplicated expert's rows
-        # live in another rank's chunk. Point the GEMM at the full ranges, of
-        # which the parameters are a sub-view.
         quant_info.w13_weight = pool.ranges[moonep_weights.W13_WEIGHT].view(torch.int8)
         quant_info.w2_weight = pool.ranges[moonep_weights.W2_WEIGHT].view(torch.int8)
         quant_info.w13_scale = pool.ranges[moonep_weights.W13_SCALE].permute(0, 2, 1)
@@ -1395,7 +1355,6 @@ def pre_permute_moonep_to_deep_gemm(
     if quant_info.w13_weight.dtype == torch.bfloat16:
         return DeepGemmRunnerInput(
             hidden_states=hidden_states,
-            # Unused by the BF16 contiguous GEMM, but the field is non-optional.
             hidden_states_scale=torch.empty(
                 (all_tokens, 1), device=hidden_states.device, dtype=torch.float32
             ),
@@ -1432,14 +1391,6 @@ def post_permute_deep_gemm_to_moonep(
     running_state: dict,
 ) -> MoonEPCombineInput:
     """DeepGEMM output -> MoonEP combine input, still in dispatched row order.
-
-    No gather: MoonEP's ``combine`` consumes the ``[NvS, H]`` layout directly.
-
-    Rows DeepGEMM skipped (``m_indices == -1``) were never written, so they
-    still hold whatever ``torch.empty`` left behind and have to be stored over
-    before combine reduces them. MoonEP's ``combine`` takes
-    ``route_weights_nvs`` but only gathers it back to token-major, so the
-    multiply is ours to do; both happen in one pass over the buffer.
     """
     from sglang.srt.layers.moe.token_dispatcher.moonep import MoonEPCombineInput
 

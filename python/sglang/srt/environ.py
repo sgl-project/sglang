@@ -977,18 +977,13 @@ class Envs:
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
-    # <= 0 resolves to min(4, E / EP). MoonEP's own default is E / EP, which
-    # is a training rule and does not fit at inference scale.
+    # <= 0 resolves to min(4, E / EP).
     SGLANG_MOONEP_NUM_PREFETCH_SLOTS = EnvInt(-1)
     SGLANG_MOONEP_TOKEN_PADDING = EnvInt(128)
     # Decode-phase token capacity; <= 0 derives it from max_running_requests.
     SGLANG_MOONEP_DECODE_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(-1)
     SGLANG_MOONEP_NUM_SMS = EnvInt(32)
-    # MoonEP's static shapes should be capturable; off until that is shown.
     SGLANG_ENABLE_MOONEP_CUDA_GRAPH = EnvBool(False)
-    # Quantized experts need MoonEP's local-first VMM mapping, which upstream
-    # MoonEP does not carry yet. Off until it lands; setting it asserts that
-    # the installed MoonEP is a build that has it. BF16 does not use the pool.
     SGLANG_ENABLE_MOONEP_LOCAL_FIRST = EnvBool(False)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)

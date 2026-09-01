@@ -20,12 +20,6 @@ from sglang.srt.layers.moe.utils import DeepEPMode
 
 _DECODE_TOKENS_PER_REQUEST_HEADROOM = 8
 
-# MoonEP's own default is B = E / EP, which makes every expert a group GEMM
-# touches local. That is a training rule: at K3/EP16 it is 56 slots and a
-# 182 GB expert pool per rank, which does not fit. Inference only needs enough
-# slots to cover the hot experts, and overflowing B stays *correct* -- the GEMM
-# reads the owner's rows through the symmetric mapping, just slower -- so a
-# small number is safe. MoonEP's README recommends 3-4.
 _DEFAULT_PREFETCH_SLOTS = 4
 
 _MOONEP_UNSUPPORTED_MESSAGE = (
@@ -163,8 +157,6 @@ class MoonEPBuffer:
             num_prefetch_slots = envs.SGLANG_MOONEP_NUM_PREFETCH_SLOTS.get()
         num_prefetch_slots = int(num_prefetch_slots)
         if num_prefetch_slots <= 0:
-            # Never more than MoonEP's own rule -- a model with fewer local
-            # experts than the default would otherwise get useless slots.
             return min(_DEFAULT_PREFETCH_SLOTS, num_experts // num_ep_ranks)
         return MoonEPBuffer._require_positive_int(
             "num_prefetch_slots", num_prefetch_slots
@@ -510,12 +502,6 @@ def run_moonep_bf16_expert(
 
 def _resolve_decode_capacity(prefill_capacity: int) -> int | None:
     """Token capacity for decode batches, or None to reuse the prefill one.
-
-    Decode is bounded by the number of running requests, which is orders of
-    magnitude below a prefill chunk, so giving it its own smaller buffer is
-    what keeps a decode step from running the MoE over a full chunk's worth of
-    padding. Both capacities are config-derived, so every rank picks the same
-    one without communicating.
     """
     override = envs.SGLANG_MOONEP_DECODE_MAX_DISPATCH_TOKENS_PER_RANK.get()
     if override > 0:
@@ -523,11 +509,9 @@ def _resolve_decode_capacity(prefill_capacity: int) -> int | None:
     else:
         from sglang.srt.server_args import get_global_server_args
 
-        # None until the scheduler resolves it; fall back to one capacity then.
         max_running = get_global_server_args().max_running_requests
         if max_running is None:
             return None
-        # Speculative decoding submits several tokens per request per step.
         capacity = int(max_running) * _DECODE_TOKENS_PER_REQUEST_HEADROOM
 
     token_padding = envs.SGLANG_MOONEP_TOKEN_PADDING.get()
@@ -576,18 +560,6 @@ class MoonEPDispatcher(BaseDispatcher):
         raise NotImplementedError(_MOONEP_UNSUPPORTED_MESSAGE)
 
     def _phase_capacity(self) -> int:
-        """Static token capacity for the current phase.
-
-        MoonEP's buffers are statically shaped and ``dispatch`` asserts an
-        exact ``S x K`` input, so every batch is padded up to the capacity. One
-        capacity sized for prefill makes decode pay for it: at K3 a batch of 8
-        tokens would run the MoE over 16384, a ~2000x inflation.
-
-        The two capacities come from server args rather than the batch, because
-        the buffer is created collectively -- picking from a runtime token
-        count would let ranks disagree and deadlock. The phase flag is uniform
-        across the group for the same reason.
-        """
         if self.decode_max_dispatch_tokens_per_rank is None:
             return self.num_max_dispatch_tokens_per_rank
 
@@ -653,13 +625,6 @@ class MoonEPDispatcher(BaseDispatcher):
         )
 
     def _tokens_per_expert(self, topk_ids: torch.Tensor) -> torch.Tensor:
-        """Local token count per expert.
-
-        ``torch.bincount`` would be the obvious call, but on CUDA it reads the
-        input's max back to the host to size its output, and a device-to-host
-        copy is illegal under CUDA graph capture. Scattering into a
-        fixed-length buffer keeps the whole thing on device.
-        """
         assert self.num_experts is not None
         flat = topk_ids.reshape(-1).to(dtype=torch.int64)
         counts = torch.zeros(
@@ -673,14 +638,6 @@ class MoonEPDispatcher(BaseDispatcher):
         cu_seqlens: torch.Tensor,
         plan: Any,
     ) -> torch.Tensor:
-        """Which expert each VM group carries: its own id for the first
-        ``num_experts`` groups, the duplicated expert's id for the prefetch
-        slots after them, and -1 for groups that received no tokens.
-
-        Stays on device. The obvious loop costs one ``.item()`` per group --
-        896 host syncs per layer, ~82k per forward at K3's depth, which
-        dominates decode.
-        """
         assert self.num_experts is not None
         num_experts = int(self.num_experts)
         num_groups = int(cu_seqlens.numel())
@@ -701,8 +658,6 @@ class MoonEPDispatcher(BaseDispatcher):
                 experts_to_copy[:num_slots].to(dtype=cu_seqlens.dtype),
             ]
         )
-        # cu_seqlens holds segment *ends*, so a group is live when its end
-        # moved past the previous one's.
         starts = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens[:-1]])
         return torch.where(cu_seqlens > starts, ids, torch.full_like(ids, -1))
 
@@ -722,8 +677,6 @@ class MoonEPDispatcher(BaseDispatcher):
         if self.num_experts is None:
             raise ValueError("MoonEPDispatcher requires num_experts.")
 
-        # One capacity for both the padding and the buffer: MoonEP asserts the
-        # dispatch input matches the buffer's static S exactly.
         capacity = self._phase_capacity()
         hidden_states, topk_ids, topk_weights, num_tokens = self._pad_to_capacity(
             hidden_states,
@@ -790,13 +743,6 @@ class MoonEPDispatcher(BaseDispatcher):
         plan: Any,
         weight_layout: MoonEPExpertWeightLayout,
     ) -> None:
-        """Fill this rank's prefetch slots with the duplicated experts.
-
-        BF16 only: ``weight_layout`` is one contiguous ``[E+B]`` block per
-        projection, indexed by global expert id. Quantized experts live in the
-        symmetric pool and are prefetched from ``pre_permute`` instead, which
-        is where the plan's expert ids get remapped to pool rows.
-        """
         self._get_buffer().prefetch_weight(
             plan=plan,
             async_finish=False,

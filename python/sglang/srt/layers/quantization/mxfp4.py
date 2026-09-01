@@ -333,14 +333,6 @@ def _maybe_alloc_moonep_expert_pool(
     mxfp4_block: int,
     use_deep_gemm: bool,
 ) -> Optional[dict]:
-    """This layer's slice of MoonEP's symmetric expert pool, or None.
-
-    The scale entries describe DeepGEMM's *runtime* layout in storage order:
-    ``transform_sf_into_required_layout`` returns ``[E, MN, K/128]`` int32 with
-    stride ``(.., 1, MN)``, whose contiguous bytes are the transpose. Four
-    e8m0 exponents pack into one int32, so the byte count matches the
-    ``[E, MN, K/32]`` uint8 the checkpoint carries.
-    """
     from sglang.srt.layers.moe.token_dispatcher import moonep_weights
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 
@@ -524,10 +516,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.token_dispatcher import moonep_weights
 
-        # MoonEP needs every expert row readable by its peers, so the weights
-        # come from a symmetric VMM pool instead of a private allocation. The
-        # scales are pooled in their post-transform runtime layout, which
-        # process_weights_after_loading copies into rather than replacing.
         self.moonep_pooled = _maybe_alloc_moonep_expert_pool(
             layer,
             intermediate_size=intermediate_size_per_partition_after_pad,
@@ -625,8 +613,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def _expert_storage(
         self, kind: str, shape: tuple[int, ...], dtype: torch.dtype
     ) -> torch.Tensor:
-        """Zeroed storage for an expert tensor, from MoonEP's symmetric pool
-        when that backend is active and a private allocation otherwise."""
         if self.moonep_pooled is None:
             return torch.zeros(*shape, dtype=dtype)
 
@@ -672,8 +658,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.token_dispatcher import moonep_weights
 
             # Packed fp4 (e2m1 x2 per byte) weights: DeepGEMM expects int8.
-            # A re-view keeps the storage, which is what lets MoonEP's pooled
-            # weights survive this step.
             layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
             layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
             if self.moonep_pooled is not None:
@@ -705,10 +689,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 if self.moonep_pooled is None:
                     scale.data = transformed
                     continue
-                # The checkpoint-layout buffer the loader filled is private
-                # memory; the runtime layout has to end up in the pool instead,
-                # so copy rather than rebind. The pooled range is stored
-                # transposed, matching the MN-major result's real byte order.
                 pooled = self.moonep_pooled[pool_kind].permute(0, 2, 1)
                 scale.data = pooled.copy_(transformed)
                 moonep_weights.assert_resident(layer, pool_kind, scale.data)

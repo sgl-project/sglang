@@ -398,10 +398,6 @@ class FusedMoE(torch.nn.Module):
                 f"quant_method={type(self.quant_method).__name__})."
             )
 
-        # BF16 experts are stored globally -- every rank holds all E rows, so a
-        # peer's rows are simply local. Quantized experts are too many bytes for
-        # that, so they keep the normal EP shard and are relocated into a
-        # symmetric VMM range after loading (see `moonep_weights`).
         moonep_global_weight_storage = (
             get_moe_a2a_backend().is_moonep() and quant_config is None
         )
@@ -413,11 +409,6 @@ class FusedMoE(torch.nn.Module):
             if quant_config is not None and not isinstance(
                 self.quant_method, Mxfp4MoEMethod
             ):
-                # Only Mxfp4MoEMethod.create_weights allocates the symmetric
-                # pool. Any other quant method would load its experts into
-                # private memory and then be routed through the same
-                # pool-reading pre-permute, failing deep inside the runner
-                # instead of here.
                 raise NotImplementedError(
                     "MoonEP supports BF16 or MXFP4 experts, got "
                     f"{type(self.quant_method).__name__}."

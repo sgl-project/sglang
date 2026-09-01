@@ -134,8 +134,6 @@ class TestMoonEPBuffer(unittest.TestCase):
         self.assertEqual(buffer.kwargs["S"], 384)
         self.assertEqual(buffer.kwargs["token_padding"], 32)
         self.assertEqual(buffer.kwargs["num_sms"], 18)
-        # Not E/EP (16). That is MoonEP's training rule and does not fit at
-        # inference scale; overflowing the slots stays correct, just slower.
         self.assertEqual(buffer.kwargs["B"], 4)
 
     def test_prefetch_slots_never_exceed_the_local_expert_count(self):
