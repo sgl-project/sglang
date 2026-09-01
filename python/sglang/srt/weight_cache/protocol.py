@@ -20,6 +20,9 @@ from sglang.srt.utils.common import safe_pickle_loads
 
 logger = logging.getLogger(__name__)
 
+# Linux sockaddr_un.sun_path is 108 bytes including the terminating NUL.
+_LINUX_AF_UNIX_PATH_MAX_BYTES = 107
+
 
 class CacheConfig(msgspec.Struct):
     """Fingerprint of the cached weights. Used to validate compatibility
@@ -297,6 +300,47 @@ def compute_local_gpu_id(
     )
 
 
+def compute_config_digest(cfg: Any, *, tp_rank: int, pp_rank: int) -> str:
+    """Return the config digest used in generated daemon paths."""
+    # Inputs that affect cached weight identity; CacheConfig validates after connect.
+    payload = {
+        "model_path": cfg.model_path,
+        "revision": cfg.revision,
+        "dtype": cfg.dtype,
+        "quantization": cfg.quantization,
+        "load_format": cfg.load_format,
+        "model_loader_extra_config": cfg.model_loader_extra_config,
+        "trust_remote_code": cfg.trust_remote_code,
+        "tp_size": cfg.tp_size,
+        "tp_rank": tp_rank,
+        "pp_size": cfg.pp_size,
+        "pp_rank": pp_rank,
+        "dp_size": cfg.dp_size,
+        "ep_size": cfg.ep_size,
+        "moe_dp_size": cfg.moe_dp_size,
+        "enable_dp_attention": cfg.enable_dp_attention,
+        "enable_dp_lm_head": cfg.enable_dp_lm_head,
+        "attn_cp_size": cfg.attn_cp_size,
+        "moe_dense_tp_size": cfg.moe_dense_tp_size,
+        "moe_a2a_backend": cfg.moe_a2a_backend,
+        "moe_runner_backend": cfg.moe_runner_backend,
+        "enable_eplb": cfg.enable_eplb,
+        "ep_num_redundant_experts": cfg.ep_num_redundant_experts,
+        "init_expert_location": cfg.init_expert_location,
+        "eplb_algorithm": cfg.eplb_algorithm,
+        "nnodes": cfg.nnodes,
+    }
+    try:
+        serialized = json.dumps(payload, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Weight cache configuration cannot be deterministically serialized "
+            "for daemon discovery"
+        ) from exc
+    # Keep generated AF_UNIX paths short.
+    return hashlib.sha256(serialized.encode()).hexdigest()[:20]
+
+
 def _format_daemon_path(env_field, device_uuid: str) -> str:
     """Fill in a daemon path template, rejecting one that drops the GPU identity.
 
@@ -315,14 +359,36 @@ def _format_daemon_path(env_field, device_uuid: str) -> str:
     return template.format(device_uuid=device_uuid)
 
 
-def get_socket_path(device_uuid: str) -> str:
-    """Get the Unix socket path for a weight cache daemon's physical GPU."""
-    return _format_daemon_path(envs.SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE, device_uuid)
+def _append_config_digest(path: str, config_digest: str) -> str:
+    """Append the digest after template formatting, before the final extension."""
+    root, ext = os.path.splitext(path)
+    return f"{root}-{config_digest}{ext}"
 
 
-def get_ready_path(device_uuid: str) -> str:
-    """Get the ready-file path for a weight cache daemon's physical GPU."""
-    return _format_daemon_path(envs.SGLANG_WEIGHT_CACHE_READY_TEMPLATE, device_uuid)
+def get_socket_path(device_uuid: str, config_digest: str) -> str:
+    """Get the Unix socket path for one GPU and config digest."""
+    path = _append_config_digest(
+        _format_daemon_path(envs.SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE, device_uuid),
+        config_digest,
+    )
+    # Checked here, not at bind(): bind() runs only after the model is loaded.
+    n = len(os.fsencode(path))
+    if n > _LINUX_AF_UNIX_PATH_MAX_BYTES:
+        raise ValueError(
+            f"Weight cache socket path is {n} bytes after appending the config "
+            f"digest, over the {_LINUX_AF_UNIX_PATH_MAX_BYTES}-byte AF_UNIX "
+            f"limit. Shorten {envs.SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE.name}: "
+            f"{path!r}"
+        )
+    return path
+
+
+def get_ready_path(device_uuid: str, config_digest: str) -> str:
+    """Get the ready-file path for one GPU and config digest."""
+    return _append_config_digest(
+        _format_daemon_path(envs.SGLANG_WEIGHT_CACHE_READY_TEMPLATE, device_uuid),
+        config_digest,
+    )
 
 
 def _read_ready_pid(ready_path: str) -> Optional[int]:
@@ -348,8 +414,10 @@ def _is_pid_alive(pid: int) -> bool:
         return True
 
 
-def cleanup_stale_daemon_files(device_uuid: str, *, force: bool = False) -> None:
-    """Validate and clean up .ready/.sock files for a daemon's physical GPU.
+def cleanup_stale_daemon_files(
+    device_uuid: str, config_digest: str, *, force: bool = False
+) -> None:
+    """Validate and clean up .ready/.sock files for one GPU and config digest.
 
     If the .ready file exists and the recorded PID is still alive, the daemon
     is still running — raise RuntimeError so the caller doesn't clobber it,
@@ -358,8 +426,8 @@ def cleanup_stale_daemon_files(device_uuid: str, *, force: bool = False) -> None
     If the PID is dead (or unreadable), the files are stale leftovers from a
     crashed/killed daemon and are safe to remove.
     """
-    ready_path = get_ready_path(device_uuid)
-    socket_path = get_socket_path(device_uuid)
+    ready_path = get_ready_path(device_uuid, config_digest)
+    socket_path = get_socket_path(device_uuid, config_digest)
 
     if not os.path.exists(ready_path) and not os.path.exists(socket_path):
         return
@@ -369,10 +437,10 @@ def cleanup_stale_daemon_files(device_uuid: str, *, force: bool = False) -> None
     if pid is not None and _is_pid_alive(pid):
         if not force:
             raise RuntimeError(
-                f"Weight cache daemon for GPU {device_uuid} is already running "
-                f"(pid={pid}, ready={ready_path}). Stop the existing daemon before "
-                f"launching a new one, or pass force=True (--force) to kill it and "
-                f"take over."
+                f"Weight cache daemon for this config on GPU {device_uuid} is "
+                f"already running (pid={pid}, ready={ready_path}). Stop the "
+                f"existing daemon before launching a new one, or pass force=True "
+                f"(--force) to kill it and take over."
             )
         logger.warning(
             f"[weight_cache] force takeover: killing existing daemon pid={pid} "

@@ -1669,9 +1669,10 @@ class Envs:
     # Weight Cache Daemon
     # ===================================================================
     # Paths the daemon and the engine ranks it serves must agree on. Both are
-    # format templates and must keep the {device_uuid} placeholder: each daemon
-    # is keyed by the physical GPU it runs on, so a GPU-independent path would
-    # let one job's client discover another job's daemon.
+    # format templates and must keep the {device_uuid} placeholder: a daemon is
+    # keyed by the GPU it runs on plus a config digest appended to the formatted
+    # path, so a GPU-independent path would let one job's client discover
+    # another job's daemon.
     SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE = EnvStr(
         "/tmp/sglang_weight_cache_{device_uuid}.sock"
     )
