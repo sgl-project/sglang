@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import pickle
 import sys
 import threading
@@ -15,6 +16,7 @@ import zmq.asyncio
 from fastapi import HTTPException
 from PIL import Image
 
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.disaggregation.encoder.preprocessor import (
     EncoderPreprocessor,
     EncoderPreprocessResult,
@@ -26,7 +28,7 @@ from sglang.srt.disaggregation.encoder.receiver import (
     _encoder_media_item,
     _select_mm_processor_prompt,
 )
-from sglang.srt.disaggregation.encoder.server import MMEncoder
+from sglang.srt.disaggregation.encoder.server import BadRequestError, MMEncoder
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.managers.tokenizer_manager import (
     _reject_missing_dispatched_encoder_embedding,
@@ -103,8 +105,8 @@ def test_epd_rejection_reads_the_resolved_transfer_backend():
 
     The record is produced by actual resolution -- a language-only Kimi-K3
     launch at TP2, whose `encoder_transfer_backend` starts at the argument
-    default `"auto"` (`ENCODER_TRANSFER_BACKEND_CHOICES[0]`) and is filled in
-    by `resolve_encoder_transfer_backend` to `"zmq_to_tokenizer"`. The guard
+    default `"auto"` and is filled in by `resolve_encoder_transfer_backend` to
+    `"zmq_to_tokenizer"`. The guard
     reads that resolved value out of the published bags, so the rejection
     survives the record going raw: what a reader must never do is go back to
     the record for this field.
@@ -195,7 +197,7 @@ def test_epd_rejection_reads_the_resolved_transfer_backend():
     finally:
         shutil.rmtree(config_dir, ignore_errors=True)
 
-    assert resolved.encoder_transfer_backend == "zmq_to_tokenizer"
+    assert resolution_result(resolved, "encoder_transfer_backend") == "zmq_to_tokenizer"
     # Publish that record: the guard reads the resolved value out of the bags,
     # so a raw record does not silently disable the rejection.
     publish(resolved, role="tokenizer")
@@ -501,6 +503,17 @@ def test_kimi_k3_epd_selects_matching_jpeg_decode_mode(
 
     assert output is expected
     load.assert_called_once_with(b"jpeg", expected_decode_mode)
+
+
+def test_kimi_k3_epd_rejects_lazy_pil_decode_failure():
+    malformed_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJSwAAAABJRU5ErkJggg=="
+    )
+    encoder = _encoder()
+    encoder.preprocessor.use_image_processor_gpu = False
+
+    with pytest.raises(BadRequestError, match="Could not decode image"):
+        encoder.preprocessor._load_single_item(malformed_png, Modality.IMAGE)
 
 
 def test_kimi_k3_epd_verifies_content_hash_before_decode():

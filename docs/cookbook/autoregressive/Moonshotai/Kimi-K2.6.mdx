@@ -621,32 +621,25 @@ python tool_calls_eval.py tool-calls/samples.jsonl \
 #### 5.1.2 AIME 2025
 
 - Dataset: [AIME 2025](https://huggingface.co/datasets/nvidia/aime25) (30 problems)
-- Evaluation Tool: [NVIDIA NeMo-Skills](https://github.com/NVIDIA/NeMo-Skills)
+- Evaluation Tool: [sgl-eval](https://github.com/sgl-project/sgl-eval)
 - Prompt: `eval/matharena/aime` (MathArena format with `\boxed{}` answers)
-- Settings: temperature=1.0, top_p=0.95, max_tokens=131,072, 32 seeds
+- Settings: temperature=1.0, top_p=0.95, max_tokens=131,072, 32 repeats
 
 **Evaluation Command:**
 
 ```shell Command
-# Prepare dataset
-python3 nemo_skills/dataset/aime25/prepare.py
+pip install git+https://github.com/sgl-project/sgl-eval.git
 
-# Run 32 seeds in parallel
-for RS in $(seq 0 31); do
-  python3 nemo_skills/inference/generate.py \
-    input_file=nemo_skills/dataset/aime25/test.jsonl \
-    output_file=results/kimi-k26/aime25/output-rs${RS}.jsonl \
-    prompt_config=eval/matharena/aime \
-    prompt_format=openai \
-    +server.server_type=openai \
-    +server.model=moonshotai/Kimi-K2.6 \
-    +server.base_url=http://localhost:30000/v1 \
-    ++inference.temperature=1.0 \
-    ++inference.top_p=0.95 \
-    ++inference.tokens_to_generate=131072 \
-    ++inference.random_seed=${RS} \
-    max_concurrent_requests=512 &
-done
+# The dataset ships with sgl-eval; --n-repeats runs all 32 samples per problem.
+sgl-eval run aime25 \
+  --base-url http://localhost:30000/v1 \
+  --model moonshotai/Kimi-K2.6 \
+  --n-repeats 32 \
+  --temperature 1.0 \
+  --top-p 0.95 \
+  --max-tokens 131072 \
+  --prompt matharena-aime \
+  --num-threads 512
 ```
 
 **Results:**

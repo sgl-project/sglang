@@ -47,6 +47,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     eps: float,
     group_size: int = 128,
     emit_bf16: bool = False,
+    transpose_scale: bool = False,
 ) -> Optional[Tuple[torch.Tensor, ...]]:
     """Fused TP all-reduce + RMSNorm + per-group FP8 quant (ROCm/aiter).
 
@@ -57,9 +58,19 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     service the request (non-AMD, custom AR disabled, shape unsupported).
     Callers MUST handle ``None`` by falling back to the separate
     fused-AR-RMSNorm + per-group-quant path.
+
+    ``transpose_scale=True`` asks the kernel to emit the per-group scale in the
+    column-major layout the gfx95 bpreshuffle GEMM consumes, so callers can skip
+    the post-kernel ``materialize_bpreshuffle_fp8_scale`` transpose.
     """
     return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
-        input_, residual_inp_, weight_, eps, group_size, emit_bf16=emit_bf16
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        group_size,
+        emit_bf16=emit_bf16,
+        transpose_scale=transpose_scale,
     )
 
 

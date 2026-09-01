@@ -97,7 +97,7 @@ class NPUCompressStatePool(CompressStatePool):
             128,
         ), f"NPUCompressStatePool only supports ratio in (4, 128); got {ratio}"
         assert dtype == torch.float32, (
-            "Atlas A3 custom.compressor requires FP32 state_cache, "
+            "Atlas A3 npu.compressor requires FP32 state_cache, "
             f"but NPUCompressStatePool got {dtype}."
         )
         assert ring_size > 0, f"ring_size must be positive, got {ring_size}"
@@ -404,7 +404,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
         """FP32 ``[block_num, ring_size, 2*coff*D]`` view of this layer's
         kv+score buffer — the fused compressor op
-        (``torch.ops.custom.compressor``)'s ``state_cache`` argument."""
+        (``torch.ops.npu.compressor``)'s ``state_cache`` argument."""
         return self._get_state_pool(layer_id, from_indexer).state_cache_3d
 
     # ------------------------------------------------------------------
