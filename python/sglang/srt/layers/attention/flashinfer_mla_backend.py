@@ -1101,8 +1101,10 @@ class FlashInferMLAIndicesUpdaterDecode:
                 ENTRY_PAGE_SIZE=kv_view.entry_page_size,
             )
 
+            # The table above is deliberately VIRTUAL under DCP.
+            n_kernel_ids = paged_kernel_lens_sum
             if get_parallel().dcp_enabled:
-                plan_dcp_decode_metadata(
+                n_kernel_ids = plan_dcp_decode_metadata(
                     kv_lens,
                     kv_indptr,
                     kv_indices,
@@ -1110,6 +1112,18 @@ class FlashInferMLAIndicesUpdaterDecode:
                     fast_decode_kwargs,
                     bs,
                 )
+            # Written back IN PLACE: on cuda-graph replay `kv_indices` IS the
+            # capture-stable buffer the captured wrapper reads, so rebinding the
+            # local name would leave the graph on virtual ids. Only the prefix
+            # just filled is translated; the stale tail never indexes v2p.
+            translator = self.attn_backend.kv_index_translator
+            if (
+                not kv_view.is_translated
+                and n_kernel_ids > 0
+                and translator.needs_read_translate
+            ):
+                valid = kv_indices[:n_kernel_ids]
+                valid.copy_(translator.translate_dcp_read_ids(valid))
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
