@@ -43,11 +43,11 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
         "overlay_revision": "62c6840871ecc3559189047513ba0670e1bf62e7",
     },
     # FastH3 ships a flat native-Diffusers repo without model_index.json; the
-    # bundled overlay materializes it into the base-H3 partition layout
+    # overlay materializes it into the base-H3 partition layout
     # (vae/ -> video_vae/) and declares the t2va-only release contract.
     "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree": {
-        "overlay_repo_id": "bundled",
-        "bundled_overlay_subdir": "fasth3_4step_preview_v1_vsa_datafree",
+        "overlay_repo_id": "kevin-mi/FastH3-4step-Preview-overlay",
+        "overlay_revision": "ef32ab0cb005b38412ef13b5e811d53d8ba0e42f",
     },
 }
 

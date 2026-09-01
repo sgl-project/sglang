@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """FastH3 (4-step DMD2-distilled MiniMax-H3) registration and admission
 contracts: t2va-only task coverage, five-point schedule defaults, trained
-VSA gate module, and the bundled overlay release metadata."""
+VSA gate module, and the pinned overlay registry entry."""
 
 from __future__ import annotations
 
-import json
-import os
 import re
 
 import pytest
@@ -24,16 +22,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 
 FASTH3_MODEL_ID = "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree"
-
-_OVERLAY_DIR = os.path.abspath(
-    os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "..",
-        "model_overlays",
-        "fasth3_4step_preview_v1_vsa_datafree",
-    )
-)
 
 
 def test_registry_resolves_fasth3_configs() -> None:
@@ -101,30 +89,36 @@ def test_fasth3_gate_param_mapping() -> None:
     assert targets == ["blocks.7.attn.to_gate_compress.weight"]
 
 
-def test_fasth3_bundled_overlay_release_metadata() -> None:
-    with open(os.path.join(_OVERLAY_DIR, "model_index.json"), encoding="utf-8") as f:
-        model_index = json.load(f)
-    metadata = MiniMaxH3ReleaseMetadata.from_model_index(model_index)
+def test_fasth3_overlay_registry_entry_is_pinned() -> None:
+    """The overlay repo carries FastH3's model_index/manifest/materializer;
+    the registry entry must stay revision-pinned so materialization is
+    reproducible (same contract as the other overlay entries)."""
+    from sglang.multimodal_gen.runtime.utils.model_overlay import (
+        resolve_model_overlay,
+    )
+
+    spec = resolve_model_overlay(FASTH3_MODEL_ID)
+    assert spec is not None
+    assert spec["overlay_repo_id"] == "kevin-mi/FastH3-4step-Preview-overlay"
+    assert re.fullmatch(r"[0-9a-f]{40}", spec["overlay_revision"])
+
+
+def test_fasth3_release_metadata_contract() -> None:
+    """The t2va-only release block the overlay's model_index must declare."""
+    metadata = MiniMaxH3ReleaseMetadata.from_model_index(
+        {
+            "_minimax_h3": {
+                "schema_version": 1,
+                "partition": "fl2va",
+                "tasks": ["t2va"],
+                "task_aliases": {},
+                "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+            }
+        }
+    )
     assert metadata.partition == "fl2va"
     assert metadata.tasks == ("t2va",)
     assert metadata.sigma_shift_scales == {"video": 12.0, "audio": 3.0}
-
-    with open(
-        os.path.join(_OVERLAY_DIR, "_overlay", "overlay_manifest.json"),
-        encoding="utf-8",
-    ) as f:
-        manifest = json.load(f)
-    assert manifest["source_model_id"] == FASTH3_MODEL_ID
-    assert manifest["custom_materializer"] == "_overlay/materialize.py"
-    trees = {
-        m["src"]: m["dst_dir"]
-        for m in manifest["file_mappings"]
-        if m.get("type") == "tree"
-    }
-    assert trees["transformer"] == "transformer"
-    # The video VAE is re-serialized (source form) and both VAE configs are
-    # class-name-patched by the materializer, so no vae/ mapping exists.
-    assert "vae" not in trees
 
 
 def test_fasth3_distilled_schedule_is_uniform_five_points() -> None:
