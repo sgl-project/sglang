@@ -8,13 +8,13 @@ for the plain (init-routing) path and for the DeepEP dispatch path.
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from sgl_kernel_npu.activation.swiglu_mxfp8_quant import swiglu_quant
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _get_float4_e2m1fn_x2_dtype,
     _get_float8_e8m0fnu_dtype,
 )
-from sglang.srt.hardware_backend.npu.swiglu_quant import swiglu_quant
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import set_weight_attrs

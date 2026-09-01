@@ -7,7 +7,6 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
@@ -25,6 +24,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_triton,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import (
@@ -47,9 +47,6 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_xpu,
-    is_sm90_supported,
-    is_sm100_supported,
-    is_sm120_supported,
     offloader,
 )
 from sglang.srt.utils.common import torch_release
