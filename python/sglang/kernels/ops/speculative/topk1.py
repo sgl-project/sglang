@@ -68,6 +68,8 @@ def _draft_topk1_finalize_kernel(
     if WRITE_DRAFT_TOKEN:
         tl.store(draft_tokens + row * draft_tokens_stride + draft_token_column, index)
 
+    # Draft-forward advances positions; draft-extend only selects the next token.
+    # This constexpr removes the load/store entirely from the latter kernel.
     if ADVANCE_POSITIONS:
         position = tl.load(positions + row)
         tl.store(positions + row, position + 1)
@@ -83,6 +85,9 @@ def draft_topk1_postprocess(
 
     The split reduction masks vocabulary-tail lanes and treats NaNs as
     ``-1e30``, so every returned index is within the real vocabulary.
+    ``positions`` is required by draft-forward and advanced in the finalize
+    kernel. Draft-extend passes ``None`` because its position bookkeeping is
+    already complete and only argmax output is needed.
     """
     assert next_token_logits.ndim == 2
     assert next_token_logits.stride(1) == 1
