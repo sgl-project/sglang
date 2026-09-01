@@ -23,9 +23,10 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 def _load_hybrid_cache_class():
     """Load the wrapper without requiring the optional FlexKV package."""
     module_name = "_flexkv_hybrid_radix_cache_under_test"
-    connector_name = "sglang.srt.mem_cache.storage.flexkv.flexkv_connector"
+    connector_name = "flexkv.integration.sglang.connector"
     connector_stub = ModuleType(connector_name)
     connector_stub.FlexKVConnector = object
+    connector_stub.FlexKVHostReleaseShim = object
 
     module_path = (
         Path(__file__).resolve().parents[4]
@@ -296,7 +297,7 @@ def test_prefill_boundary_is_stored_with_an_independent_tracking_key():
     inner.is_eagle = False
     inner.root_node = object()
     node = object()
-    indices = torch.tensor([10, 11, 12, 13], dtype=torch.int64)
+    indices = torch.tensor([8, 9, 10, 11], dtype=torch.int64)
     inner.match_prefix.return_value = SimpleNamespace(
         last_device_node=node,
         device_indices=indices,
@@ -333,6 +334,49 @@ def test_prefill_boundary_is_stored_with_an_independent_tracking_key():
     assert cache._inflight_store_nodes == {
         "request:flexkv-store:0": (node, dec_params),
         "request:flexkv-store:1": (node, dec_params),
+    }
+
+
+def test_deferred_hybrid_store_launches_from_scheduler_hook():
+    inner = MagicMock()
+    inner.is_eagle = False
+    inner.root_node = object()
+    node = object()
+    indices = torch.tensor([8, 9, 10, 11], dtype=torch.int64)
+    inner.match_prefix.return_value = SimpleNamespace(
+        last_device_node=node,
+        device_indices=indices,
+    )
+    dec_params = object()
+    inner.inc_lock_ref.return_value = SimpleNamespace(to_dec_params=lambda: dec_params)
+
+    connector = MagicMock()
+    connector.check_completed_stores.return_value = []
+    cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
+    cache._inner_cache = inner
+    cache.flexkv_connector = connector
+    cache.page_size = 4
+    cache._node_lock = threading.Lock()
+    cache._store_generation = 0
+    cache._inflight_store_nodes = {}
+    cache._pending_store_launches = {}
+    cache._pending_store_copies = {}
+    cache._defer_store_launch = True
+    cache._async_store_slot_mapping = False
+    cache._launch_store = MagicMock(return_value=17)
+
+    req = SimpleNamespace(rid="request", extra_key=None)
+    cache._store_prefix(req, [1, 2, 3, 4])
+
+    cache._launch_store.assert_not_called()
+    assert list(cache._pending_store_launches) == ["request:flexkv-store:0"]
+
+    cache.check_hicache_events()
+
+    cache._launch_store.assert_called_once()
+    assert cache._pending_store_launches == {}
+    assert cache._inflight_store_nodes == {
+        "request:flexkv-store:0": (node, dec_params),
     }
 
 
