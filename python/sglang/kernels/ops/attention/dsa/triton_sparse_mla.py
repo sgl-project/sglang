@@ -23,6 +23,9 @@ _IS_FNUZ = is_fp8_fnuz()
 _FP8_MAX = 240.0 if _IS_FNUZ else 448.0
 _LOG2E = 1.4426950408889634
 _G = tl.constexpr(128)
+_PREFERRED_BLOCK_K = 64
+_MIN_BLOCK_K = 16
+_INDEX_ELEMENT_SIZE = 4
 
 _SUPPORTED_INPUT_DTYPES = (
     torch.bfloat16,
@@ -108,6 +111,49 @@ def _cu_count() -> int:
     ).multi_processor_count
 
 
+@functools.lru_cache(maxsize=None)
+def _max_shared_memory(device: int) -> int | None:
+    """Return Triton's per-workgroup shared-memory limit for ``device``."""
+    try:
+        properties = triton.runtime.driver.active.utils.get_device_properties(device)
+        return int(properties["max_shared_mem"])
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _block_k_for_shared_memory(
+    kv_dim: int,
+    element_size: int,
+    max_shared_memory: int | None,
+) -> int:
+    """Choose the largest supported KV tile that fits in shared memory.
+
+    Triton's AMD async-copy path stages one KV row plus its int32 page index
+    for every BLOCK_K entry. A 64x576 BF16 tile therefore needs 73,984 bytes,
+    which exceeds the 64 KiB workgroup limit on gfx942. FP8 needs only 37,120
+    bytes, while devices with a larger limit can retain the preferred tile.
+    """
+    block_k = _PREFERRED_BLOCK_K
+    if max_shared_memory is None:
+        # Prefer a conservative BF16 tile when the backend cannot report its
+        # limit. One-byte FP8 inputs fit the common 64 KiB minimum at D=576.
+        return block_k if element_size == 1 else block_k // 2
+
+    bytes_per_entry = kv_dim * element_size + _INDEX_ELEMENT_SIZE
+    while block_k > _MIN_BLOCK_K and block_k * bytes_per_entry > max_shared_memory:
+        block_k //= 2
+    return block_k
+
+
+def _sparse_mla_block_k(kv: torch.Tensor) -> int:
+    device = kv.device.index
+    if device is None:
+        device = torch.cuda.current_device()
+    return _block_k_for_shared_memory(
+        kv.shape[-1], kv.element_size(), _max_shared_memory(device)
+    )
+
+
 def _kv_splits_heuristic(
     T: int,
     H: int,
@@ -145,6 +191,7 @@ def _row_strides(x: torch.Tensor) -> tuple[torch.Tensor, int, int]:
 def _prune_configs(configs, named_args, **kwargs):
     """Drop wasteful configs and retain the established FP8 search space."""
     topk = named_args["topk"]
+    max_block_n = _sparse_mla_block_k(named_args["kv_ptr"])
     candidates = configs
     if kwargs["IS_FP8"]:
         candidates = [
@@ -152,7 +199,11 @@ def _prune_configs(configs, named_args, **kwargs):
             for c in candidates
             if c.kwargs["BLOCK_N"] in (32, 64) and c.num_stages in (1, 2)
         ]
-    keep = [c for c in candidates if c.kwargs["BLOCK_N"] <= topk]
+    keep = [
+        c
+        for c in candidates
+        if c.kwargs["BLOCK_N"] <= topk and c.kwargs["BLOCK_N"] <= max_block_n
+    ]
     return keep or [candidates[0]]
 
 
@@ -534,7 +585,9 @@ def _sparse_mla_fused_kernel(
         page = tl.where(valid, slot, 0).to(tl.int64)
 
         kv_base = kv_ptr + page[:, None] * KV_DIM
-        kv0 = tl.load(kv_base + g[None, :], mask=valid[:, None], other=0.0).to(input_type)
+        kv0 = tl.load(kv_base + g[None, :], mask=valid[:, None], other=0.0).to(
+            input_type
+        )
         if NUM_GROUPS >= 2:
             kv1 = tl.load(
                 kv_base + (_G + g)[None, :], mask=valid[:, None], other=0.0
@@ -719,7 +772,9 @@ def _sparse_mla_split_k_kernel(
         page = tl.where(valid, slot, 0).to(tl.int64)
 
         kv_base = kv_ptr + page[:, None] * KV_DIM
-        kv0 = tl.load(kv_base + g[None, :], mask=valid[:, None], other=0.0).to(input_type)
+        kv0 = tl.load(kv_base + g[None, :], mask=valid[:, None], other=0.0).to(
+            input_type
+        )
         if NUM_GROUPS >= 2:
             kv1 = tl.load(
                 kv_base + (_G + g)[None, :], mask=valid[:, None], other=0.0
@@ -897,7 +952,7 @@ def _triton_sparse_mla_fwd_splitk(
     q_rope, stride_qr_t, stride_qr_h = _row_strides(q_rope)
 
     BLOCK_H = 16
-    BLOCK_K = 64
+    BLOCK_K = _sparse_mla_block_k(kv)
     n_head_blocks = (H + BLOCK_H - 1) // BLOCK_H
     h_padded = n_head_blocks * BLOCK_H
 
@@ -907,7 +962,10 @@ def _triton_sparse_mla_fwd_splitk(
     ), f"Triton sparse MLA supports d_v up to 512 (4 groups), got d_v={d_v}"
     qk_scale = float(sm_scale) * _LOG2E
 
-    max_kv_splits = max(1, topk // BLOCK_K)
+    # Preserve the established split cap when a smaller BLOCK_K is required
+    # for shared-memory capacity; otherwise BF16 on a 64 KiB device would
+    # double its partial-buffer traffic merely because each tile is smaller.
+    max_kv_splits = max(1, topk // _PREFERRED_BLOCK_K)
     kv_splits = min(kv_splits, max_kv_splits)
 
     out = torch.empty(seq, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
@@ -1020,9 +1078,9 @@ def triton_sparse_mla_fwd(
     H = q_nope.shape[1]
     num_cu = _cu_count()
     BLOCK_H = 16
-    BLOCK_K = 64
+    BLOCK_K = _sparse_mla_block_k(kv)
     topk = indices.shape[-1]
-    max_kv_splits = max(1, topk // BLOCK_K)
+    max_kv_splits = max(1, topk // _PREFERRED_BLOCK_K)
     head_blocks = max(1, (H + BLOCK_H - 1) // BLOCK_H)
     base_ctas = seq * head_blocks
     if base_ctas > num_cu:

@@ -18,8 +18,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+    _PREFERRED_BLOCK_K,
     _no_async_copy,
     _row_strides,
+    _sparse_mla_block_k,
     _validate_input_dtypes,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
@@ -601,14 +603,16 @@ def triton_sparse_mla_decode_splitk(
     q_rope, stride_qr_t, stride_qr_h = _row_strides(q_rope)
 
     BLOCK_H = 16
-    BLOCK_K = 64
+    BLOCK_K = _sparse_mla_block_k(kv)
     n_head_blocks = (H + BLOCK_H - 1) // BLOCK_H
     h_padded = n_head_blocks * BLOCK_H
 
     assert d_v % 128 == 0, f"d_v must be divisible by 128, got {d_v}"
     num_groups = d_v // 128
 
-    max_kv_splits = max(1, topk // BLOCK_K)
+    # Keep the number of split partials independent of a smaller LDS-safe
+    # BLOCK_K. This retains the existing reduction cost on 64 KiB devices.
+    max_kv_splits = max(1, topk // _PREFERRED_BLOCK_K)
     if kv_splits is None:
         num_cu = _cu_count()
         base_ctas = max(1, bs * n_head_blocks)
