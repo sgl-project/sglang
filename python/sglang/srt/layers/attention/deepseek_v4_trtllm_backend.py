@@ -628,9 +628,9 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         Treating every query token as a batch entry makes each query length
         exactly one. This changes the kernel-visible shape from
         ``(request_batch, max_q_len)`` to ``(sum_q, 1)`` and avoids the empty
-        rectangular work of a highly ragged VarSeq launch. On B200 this layout
-        is materially faster for mixed-length prefill; the cumulative pointer
-        itself is only a small cost in same-shape uniform controls.
+        rectangular work of a highly ragged VarSeq launch. B200 kernel and
+        end-to-end measurements both favor this representation for generic
+        mixed/chunked prefill.
 
         The sparse table has one row per query token: the token's own causal
         SWA window in columns ``[0:128)`` and its compressed tier after.

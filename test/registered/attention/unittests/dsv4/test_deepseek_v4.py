@@ -665,6 +665,67 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertTrue(torch.all(output[:6] == 7))
         self.assertTrue(torch.all(output[6:] == 0))
 
+    def test_trtllm_prefill_slices_padding_in_dense_token_layout(self):
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            DeepseekV4TrtllmAttnBackend,
+        )
+
+        core = SimpleNamespace(
+            trtllm_prefill_qmeta=None,
+            seq_lens_casual=torch.tensor(
+                [6, 7, 8, 14, 15, 16, 0, 0], dtype=torch.int64
+            ),
+            trtllm_prefill_swa_indices=torch.zeros((6, 128), dtype=torch.int32),
+            trtllm_prefill_swa_lens=torch.full((6,), 128, dtype=torch.int32),
+            trtllm_prefill_c4_indices=None,
+            trtllm_prefill_c4_lens=None,
+            trtllm_prefill_c128=None,
+        )
+        backend = object.__new__(DeepseekV4TrtllmAttnBackend)
+        backend.device = torch.device("cpu")
+        backend.forward_metadata = SimpleNamespace(core_attn_metadata=core)
+        backend.trtllm_workspace_buffer = torch.empty(1, dtype=torch.int8)
+        backend.trtllm_graph_output_buffer = torch.full((8, 2, 512), 7.0)
+        backend.trtllm_eager_output_buffer = None
+        backend._trtllm_kv_cache_views = lambda _layer_id, _ratio: (
+            torch.empty(1),
+            torch.empty(1),
+        )
+        backend._get_trtllm_bmm_scales = lambda _layer: (1.0, 1.0)
+
+        captured = {}
+
+        def fake_attention(**kwargs):
+            captured.update(kwargs)
+            return kwargs["out"]
+
+        forward_batch = SimpleNamespace(
+            extend_seq_lens_cpu=[3, 3],
+        )
+        q = torch.empty((8, 2, 512), dtype=torch.float8_e4m3fn)
+
+        with mock.patch(
+            "flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4",
+            side_effect=fake_attention,
+        ):
+            output = backend._forward_trtllm_prefill(
+                q=q,
+                layer=SimpleNamespace(layer_id=0),
+                compress_ratio=0,
+                forward_batch=forward_batch,
+                attn_sink=torch.zeros(2, dtype=torch.float32),
+                extra_indices=None,
+            )
+
+        self.assertEqual(captured["query"].shape, (6, 1, 2, 512))
+        self.assertNotIn("cum_seq_lens_q", captured)
+        self.assertNotIn("max_q_len", captured)
+        self.assertEqual(captured["seq_lens"].tolist(), [6, 7, 8, 14, 15, 16])
+        self.assertEqual(captured["sparse_indices"].shape, (6, 128))
+        self.assertEqual(captured["out"].shape, (6, 1, 2, 512))
+        self.assertEqual(output.shape, (8, 2, 512))
+        self.assertTrue(torch.all(output[6:] == 0))
+
     def test_sparse_prefill_c4_uses_live_extent(self):
         page_table = torch.zeros((2, 4096), dtype=torch.int32)
         for max_seq_len in (3, 4, 255, 256, 259, 260):

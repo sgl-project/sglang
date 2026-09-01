@@ -81,7 +81,7 @@ COMPARE_MIN_MEAN_SIMILARITY = 0.6
 # Long multi-k-token prompts that exercise the trtllm-gen dense per-token
 # prefill: real c4 indexer top-k selection needs >~2k tokens of context and
 # the c128 far tier needs whole 128-token pages. The mixed lengths guard
-# against regressing to the unsafe rectangular varlen launch, and the longest
+# against regressing to the slower rectangular VarSeq launch, and the longest
 # exceeds --chunked-prefill-size (4096) so it prefills in multiple chunks.
 _FILLER_SENTENCES = [
     "The expedition recorded water temperature, salinity, and current speed "
