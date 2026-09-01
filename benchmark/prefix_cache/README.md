@@ -26,6 +26,41 @@ Check that the KV pool can hold the shared prefixes plus the active suffix/outpu
 working set. If it cannot, the benchmark measures eviction pressure rather than the
 requested cache-hit rate.
 
+## Run one controlled point
+
+Use `bench_serving` directly when you need one workload point rather than a matrix:
+
+```bash
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model MODEL_PATH \
+  --dataset-name generated-shared-prefix \
+  --gsp-num-groups 8 \
+  --gsp-prompts-per-group 8 \
+  --gsp-system-prompt-len 7168 \
+  --gsp-question-len 1024 \
+  --gsp-output-len 256 \
+  --warmup-requests 1 \
+  --flush-cache \
+  --gsp-prewarm-prefixes \
+  --gsp-prewarm-concurrency 1 \
+  --cache-report \
+  --output-details
+```
+
+- `--gsp-prewarm-prefixes` primes every generated prefix group after cache flushing and
+  before measured traffic. Priming requests are excluded from benchmark metrics.
+- `--gsp-prewarm-concurrency` limits concurrent priming requests; its default is `1`.
+
+The example targets an approximately 87.5% shared prefix before cache-page rounding.
+Use `cache_report.cache_hit_rate_pct` as the achieved rate and
+`prefix_cache_config.expected_hit_rate_pct` as the generated expectation. When a legacy
+on-disk GSP dataset lacks prefix metadata, the benchmark regenerates it automatically.
+Explicit prewarming requires accurate, single-turn requests and is incompatible with
+`--gsp-fast-prepare` and `--gsp-num-turns` greater than one.
+
 ## Run a matrix
 
 ```bash
