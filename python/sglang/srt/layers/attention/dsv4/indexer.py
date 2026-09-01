@@ -404,11 +404,44 @@ def topk_transform_512_flashinfer_unfused(
     )
 
 
+def topk_transform_512_flashinfer_fused(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    import flashinfer
+
+    from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+        _flashinfer_tie_break_value,
+    )
+
+    flashinfer.top_k_page_table_transform(
+        scores,
+        page_tables.contiguous(),
+        seq_lens.contiguous(),
+        out_page_indices.shape[1],
+        deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+        tie_break=_flashinfer_tie_break_value(),
+        dsa_graph_safe=True,
+        page_size=page_size,
+        out=out_page_indices,
+        out_raw_indices=out_raw_indices,
+    )
+
+
 class C4IndexerBackendMixin:
     def __init__(self):
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
+        self.flashinfer_topk_transform: Callable[..., None] = (
+            topk_transform_512_flashinfer_fused
+            if envs.SGLANG_DSA_FUSE_TOPK.get()
+            else topk_transform_512_flashinfer_unfused
+        )
 
     def _forward_prepare_multi_stream(
         self,
@@ -829,7 +862,7 @@ class C4IndexerBackendMixin:
                 raw_indices,
             )
         elif self.dsa_topk_backend.is_flashinfer():
-            topk_transform_512_flashinfer_unfused(
+            self.flashinfer_topk_transform(
                 logits,
                 c4_seq_lens,
                 page_table,
@@ -837,7 +870,7 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        elif self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None:
             topk_transform_512_v2(
                 logits,
                 c4_seq_lens,
