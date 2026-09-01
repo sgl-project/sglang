@@ -250,27 +250,20 @@ class DecodeKVCacheOffloadManager:
         # Prefill-aligned slots are freed only here, at request finish; freeing
         # them mid-decode races with concurrent admission over live slots.
         prefill_len = self._prefill_offloaded_len(req)
+        ranges = []
         if prefill_len > 0:
-            prefill_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, :prefill_len
-            ]
-            self.token_to_kv_pool_allocator.free(prefill_indices)
-        start = prefill_len
-        end = kv_committed_len
-        # Free the incremental part of the request (DSA-aware)
-        kv_indices = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, start:end]
-        self.token_to_kv_pool_allocator.free(kv_indices)
+            ranges.append((0, prefill_len))
+        # The incremental part of the request (DSA-aware)
+        ranges.append((prefill_len, kv_committed_len))
 
-        # Free over-allocated KV cache slots (e.g. from speculative decoding v2).
-        # Without spec v2, start_p == end_p so this is a no-op.
+        # Over-allocated KV cache slots (e.g. from speculative decoding v2).
+        # Without spec v2, start_p == end_p so this contributes nothing.
         start_p, end_p = kv_committed_len, req.kv.kv_allocated_len
         if self.page_size > 1:
             start_p = ceil_align(start_p, self.page_size)
         if start_p < end_p:
-            overalloc_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, start_p:end_p
-            ]
-            self.token_to_kv_pool_allocator.free(overalloc_indices)
+            ranges.append((start_p, end_p))
+        self.tree_cache.free_kv_row(req.kv, ranges)
 
         self.req_to_token_pool.free(req)
         req.kv.mark_kv_released()
