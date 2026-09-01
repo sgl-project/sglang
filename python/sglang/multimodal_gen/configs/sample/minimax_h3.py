@@ -304,8 +304,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
 
 @dataclass
 class FastH3SamplingParams(MiniMaxH3SamplingParams):
-    """FastH3 preview: trained for exactly five sigma grid points (four DiT
-    forwards on the t=1000,750,500,250 -> 0 schedule)."""
+    """FastH3: five sigma grid points, i.e. the four distilled DiT forwards."""
 
     num_inference_steps: int = 5
 

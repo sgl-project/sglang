@@ -977,8 +977,6 @@ def _register_configs():
             in model_id.lower().replace("-", "").replace("_", "")
         ],
     )
-    # FastH3: 4-step DMD2-distilled MiniMax-H3 (t2va only). The detector also
-    # matches the materialized overlay directory name.
     register_configs(
         sampling_param_cls=FastH3SamplingParams,
         pipeline_config_cls=FastH3PipelineConfig,

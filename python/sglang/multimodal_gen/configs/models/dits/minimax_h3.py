@@ -100,9 +100,6 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     final_norm_eps: float = 1e-5
     checkpoint_uses_diffusers_layout: bool = False
     adaln_affine_input_dim: int | None = None
-    # VSA-distilled students (FastH3) ship trained per-head compression gates;
-    # base H3 has no such module. Zero gates mean pure-sparse VSA, so loading
-    # gate-less base weights into a gated model stays exact.
     has_gate_compress: bool = False
 
     def __post_init__(self) -> None:

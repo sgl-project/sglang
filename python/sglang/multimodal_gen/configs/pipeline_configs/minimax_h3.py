@@ -296,13 +296,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
 
 @dataclass
 class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
-    """FastVideo FastH3: 4-step DMD2 distillation of MiniMax-H3, t2va only.
-
-    Architecture and schedule machinery are identical to base H3 (the
-    distilled grid is the standard shift-12/shift-3 schedule at five sigma
-    points); the checkpoint deltas are trained VSA compression gates and a
-    flat single-partition native-Diffusers repo layout.
-    """
+    """FastH3: 4-step VSA-distilled MiniMax-H3, t2va only."""
 
     def __post_init__(self) -> None:
         self.dit_config.arch_config.has_gate_compress = True

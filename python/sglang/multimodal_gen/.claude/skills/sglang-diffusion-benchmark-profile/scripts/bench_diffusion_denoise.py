@@ -425,8 +425,7 @@ MODELS = {
             "num-inference-steps",
         },
     },
-    # FastH3 (4-step distilled H3) on its trained VSA-H3 backend; H3 rejects a
-    # 1-step warmup request, hence --warmup-steps=2.
+    # H3 rejects a 1-step warmup request, hence --warmup-steps=2.
     "fasth3-t2va-vsa": {
         "path": "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
         "prompt": (
