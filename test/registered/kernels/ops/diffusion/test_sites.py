@@ -28,6 +28,7 @@ import torch.nn.functional as F
 import sglang.kernels.ops.diffusion.sites.fused_gate_rmsnorm_site as gate_rmsnorm
 import sglang.kernels.ops.diffusion.sites.fused_linear_gelu_site as linear_gelu
 import sglang.kernels.ops.diffusion.sites.lingbot_video_rmsnorm_site as lingbot_video_rmsnorm
+import sglang.kernels.ops.diffusion.sites.qwen_image_added_qkv_site as qwen_image_added_qkv
 import sglang.kernels.ops.diffusion.sites.sana_video_linear_attention_site as sana_video_linear_attention
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
@@ -105,6 +106,20 @@ def test_flux2_nvfp4_swiglu_quant_is_disabled_until_quality_gate_mounts():
     assert flux2_nvfp4_swiglu_quant_active(site)
     unmount_flux2_nvfp4_swiglu_quant(root)
     assert not flux2_nvfp4_swiglu_quant_active(site)
+
+
+def test_qwen_image_added_qkv_site_is_request_scoped():
+    site = nn.Module()
+    site.to_added_qkv = nn.Module()
+    site.to_added_qkv.quant_config = None
+    site.to_added_qkv.output_partition_sizes = [8, 8, 8]
+    qwen_image_added_qkv.mark_qwen_image_added_qkv_site(site)
+
+    assert not qwen_image_added_qkv.qwen_image_added_qkv_active(site)
+    assert qwen_image_added_qkv.mount_qwen_image_added_qkv(site)
+    assert qwen_image_added_qkv.qwen_image_added_qkv_active(site)
+    qwen_image_added_qkv.unmount_qwen_image_added_qkv(site)
+    assert not qwen_image_added_qkv.qwen_image_added_qkv_active(site)
 
 
 # -------------------------------------------------------------------------

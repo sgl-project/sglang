@@ -409,6 +409,14 @@ class Envs:
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
 
     # ===================================================================
+    # CI reporting: per-model metrics jsonl for nightly XPU dashboard
+    # ===================================================================
+    # When set, XPU nightly tests append one JSON record per model to this file
+    # so xpu-ci-job-monitor.yml can render per-model ref/actual/status/duration
+    # tables. Unset (the default) is a full no-op — pre-existing CI unaffected.
+    SGLANG_TEST_METRICS_FILE = EnvStr(None)
+
+    # ===================================================================
     # PD and scripted-runtime tests
     # ===================================================================
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -945,6 +953,8 @@ class Envs:
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
     # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+    # Use BF16 activations with FlashInfer CuTe DSL NVFP4 dense and MoE weights.
+    SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
