@@ -288,7 +288,9 @@ def _ensure_flashinfer_megamoe_layer(
     )
 
     mega = MoEEpMegaLayer(
-        bootstrap=BootstrapConfig(world_size=world_size, rank=rank),
+        bootstrap=BootstrapConfig(
+            world_size=world_size, rank=rank, device=torch.cuda.current_device()
+        ),
         fleet_params=FleetParams(
             num_experts=layer.num_experts,
             max_tokens_per_rank=max_tokens_per_rank,
