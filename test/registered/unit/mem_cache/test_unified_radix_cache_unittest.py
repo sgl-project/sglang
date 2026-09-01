@@ -1129,6 +1129,43 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertEqual(stored_b[0].metadata.session_id, "session-b")
         self.assertEqual(self._event_hashes(stored_a), self._event_hashes(stored_b))
 
+    def test_shared_prefix_hit_is_quiet_and_divergent_tails_are_attributed(self):
+        cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+        cache.take_events()
+
+        shared_prefix = [1, 2, 3, 4]
+        self._insert(cache, allocator, shared_prefix, session_id="session-a")
+        initial = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(initial), 1)
+        shared_parent = initial[0].block_hashes[-1]
+
+        self._insert(cache, allocator, shared_prefix, session_id="session-b")
+        self.assertEqual(self._stored_events(cache, StorageMedium.GPU), [])
+
+        self._insert(
+            cache,
+            allocator,
+            shared_prefix + [5, 6],
+            session_id="session-a",
+        )
+        session_a_tail = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(session_a_tail), 1)
+        self.assertEqual(session_a_tail[0].parent_block_hash, shared_parent)
+        self.assertEqual(list(session_a_tail[0].token_ids), [5, 6])
+        self.assertEqual(session_a_tail[0].metadata.session_id, "session-a")
+
+        self._insert(
+            cache,
+            allocator,
+            shared_prefix + [7, 8],
+            session_id="session-b",
+        )
+        session_b_tail = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(session_b_tail), 1)
+        self.assertEqual(session_b_tail[0].parent_block_hash, shared_parent)
+        self.assertEqual(list(session_b_tail[0].token_ids), [7, 8])
+        self.assertEqual(session_b_tail[0].metadata.session_id, "session-b")
+
     def test_session_id_and_cache_salt_are_both_attributed(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
         cache.take_events()
