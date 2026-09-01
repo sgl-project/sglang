@@ -261,7 +261,7 @@ def alloc_req_slots(
                 tree_cache.evict_for_alloc(
                     EvictParams(num_tokens=0, mamba_num=mamba_num)
                 )
-    newly_allocated = [req.req_pool_idx is None for req in reqs]
+    newly_allocated = [req.kv.req_pool_idx is None for req in reqs]
     req_pool_indices = req_to_token_pool.alloc(reqs)
     if req_pool_indices is None:
         raise RuntimeError(

@@ -3016,9 +3016,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             active_slots = len(
                 {
-                    int(r.req_pool_idx)
+                    int(r.kv.req_pool_idx)
                     for r in reqs
-                    if getattr(r, "req_pool_idx", None) is not None
+                    if r.kv.req_pool_idx is not None
                 }
             )
             unified = getattr(allocator.get_kvcache(), "unified_kv_pool", None)

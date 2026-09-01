@@ -1772,7 +1772,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
-        is_new_req_slot = req.req_pool_idx is None
+        is_new_req_slot = req.kv.req_pool_idx is None
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
         assert (
