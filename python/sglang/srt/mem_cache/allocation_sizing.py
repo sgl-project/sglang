@@ -33,6 +33,11 @@ def get_alloc_len_per_decode() -> int:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     spec_algo = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
+    if spec_algo.is_uno():
+        if spec_tokens is None:
+            raise RuntimeError("UNO requires speculative_num_draft_tokens")
+        # UNO retains an additional clean-root position beside Q/F draft slots.
+        return spec_tokens + 1
     if page_size == 1 or spec_topk == 1 or not spec_algo.has_draft_kv():
         return max(spec_steps * spec_topk, spec_tokens)
     else:

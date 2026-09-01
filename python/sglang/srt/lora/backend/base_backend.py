@@ -23,6 +23,9 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         device: the device where the backend runs.
     """
 
+    supports_lora_a_overlap = False
+    skip_inactive_lora_batches = False
+
     # Supporting backends implement init_prefill_cuda_graph_batch_info() and
     # honor use_prefill_cuda_graph in prepare_lora_batch().
     supports_prefill_cuda_graph: bool = False
@@ -350,6 +353,20 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         static decode / prefill CUDA graph batch info respectively.
         """
         pass
+
+    def prepare_lora_token_segments(
+        self,
+        *,
+        segment_lens: list[int],
+        weight_indices: list[int],
+        lora_ranks: list[int],
+        scalings: list[float],
+    ) -> None:
+        """Prepare explicit eager token-row LoRA segments."""
+        raise NotImplementedError(
+            f"LoRA backend {type(self).__name__} does not support explicit "
+            "token segments."
+        )
 
 
 @triton.jit

@@ -22,7 +22,7 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,12 @@ class GenerationBatchResult:
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
+    # Padded row width in flattened speculative output. Existing algorithms
+    # default to speculative_num_draft_tokens; linear UNO emits F + 1 columns.
+    speculative_output_stride: Optional[int] = None
+    # Valid output tokens that are not accepted draft proposals. Existing
+    # algorithms have one bonus token; UNO also emits its clean root.
+    num_non_draft_tokens_per_req: int = 1
 
     # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
     # these once — eagerly via the scheduler's grammar barrier inside verify(), or
@@ -91,7 +97,7 @@ class GenerationBatchResult:
     new_seq_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
-    next_draft_input: Optional[EagleDraftInput] = None
+    next_draft_input: Optional[SpecInput] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
