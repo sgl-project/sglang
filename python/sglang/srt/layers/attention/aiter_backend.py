@@ -2424,12 +2424,18 @@ class AiterAttnBackend(AttentionBackend):
                 )
         else:
             if forward_batch.forward_mode.is_target_verify():
-                if layer.qk_head_dim != layer.v_head_dim:
-                    o = q.new_empty(
-                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-                    )
-                else:
-                    o = torch.empty_like(q)
+                o = getattr(forward_batch, "_attn_output", None)
+                if (
+                    o is None
+                    or o.dtype != q.dtype
+                    or o.numel() != q.shape[0] * layer.tp_q_head_num * layer.v_head_dim
+                ):
+                    if layer.qk_head_dim != layer.v_head_dim:
+                        o = q.new_empty(
+                            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                        )
+                    else:
+                        o = torch.empty_like(q)
 
                 # target_verify goes through unified_attention when topk == 1
                 # (the linear draft chain gives a pure causal mask). MLA and
@@ -2575,12 +2581,18 @@ class AiterAttnBackend(AttentionBackend):
                 and envs.SGLANG_AITER_UNIFIED_DRAFT_EXTEND.get()
             ):
                 bs = forward_batch.batch_size
-                if layer.qk_head_dim != layer.v_head_dim:
-                    o = q.new_empty(
-                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-                    )
-                else:
-                    o = torch.empty_like(q)
+                o = getattr(forward_batch, "_attn_output", None)
+                if (
+                    o is None
+                    or o.dtype != q.dtype
+                    or o.numel() != q.shape[0] * layer.tp_q_head_num * layer.v_head_dim
+                ):
+                    if layer.qk_head_dim != layer.v_head_dim:
+                        o = q.new_empty(
+                            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                        )
+                    else:
+                        o = torch.empty_like(q)
                 k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
                 page_table, swa_page_table = self._build_unified_page_table_from_spec(
                     self.forward_metadata, bs
@@ -2786,12 +2798,18 @@ class AiterAttnBackend(AttentionBackend):
                 v_full = v_flat.index_select(0, gather_idx)
                 cu_q = self.qo_indptr[:bs0].to(torch.int32)
                 cu_k = torch.tensor(cu_k_list, device=q.device, dtype=torch.int32)
-                if layer.qk_head_dim != layer.v_head_dim:
-                    o = q.new_empty(
-                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-                    )
-                else:
-                    o = torch.empty_like(q)
+                o = getattr(forward_batch, "_attn_output", None)
+                if (
+                    o is None
+                    or o.dtype != q.dtype
+                    or o.numel() != q.shape[0] * layer.tp_q_head_num * layer.v_head_dim
+                ):
+                    if layer.qk_head_dim != layer.v_head_dim:
+                        o = q.new_empty(
+                            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                        )
+                    else:
+                        o = torch.empty_like(q)
                 flash_attn_varlen_func(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k_full,
@@ -2815,12 +2833,18 @@ class AiterAttnBackend(AttentionBackend):
                 and self.kv_cache_dtype != fp8_dtype
             ):
                 k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-                if layer.qk_head_dim != layer.v_head_dim:
-                    o = q.new_empty(
-                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-                    )
-                else:
-                    o = torch.empty_like(q)
+                o = getattr(forward_batch, "_attn_output", None)
+                if (
+                    o is None
+                    or o.dtype != q.dtype
+                    or o.numel() != q.shape[0] * layer.tp_q_head_num * layer.v_head_dim
+                ):
+                    if layer.qk_head_dim != layer.v_head_dim:
+                        o = q.new_empty(
+                            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                        )
+                    else:
+                        o = torch.empty_like(q)
                 unified_window = (-1, -1)
                 if (
                     layer.sliding_window_size is not None
