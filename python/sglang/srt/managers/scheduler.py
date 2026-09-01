@@ -2087,6 +2087,9 @@ class Scheduler(
         # Park the idle loop on the request ring within the rank-0 rust-server
         self.idle_sleeper = RustServerIdleSleeper(rust_server)
 
+    def rust_server_tokenizer_path(self) -> str:
+        return self.server_args.tokenizer_path
+
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.recv_from_tokenizer,
