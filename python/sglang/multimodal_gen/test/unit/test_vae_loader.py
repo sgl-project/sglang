@@ -62,9 +62,6 @@ class _FakeServerArgs:
     def should_start_component_on_cpu(self, _component_name):
         return False
 
-    def should_use_fsdp_for_component(self, _component_name):
-        return False
-
     def should_configure_layerwise_offload_for_lazy_component(self, component_name):
         return component_name in self.layerwise_components
 

@@ -1,8 +1,11 @@
 """Pure-CPU unit tests for ``ServerArgs.stat_loggers`` DI plumbing.
 
-These tests cover the behavioral pieces of the ``stat_loggers`` dependency
-injection feature:
+These tests cover the small, in-process pieces of the ``stat_loggers``
+dependency injection feature:
 
+* The four DI hook class attributes (``_counter_cls``/``_gauge_cls``/
+  ``_histogram_cls``/``_summary_cls``) default to ``None`` on every
+  collector, so the existing prometheus_client backend is used unchanged.
 * ``resolve_collector_class()`` returns the registered subclass when a role
   is present in ``stat_loggers`` and falls back to the default otherwise.
 * Without any subclass override, collectors instantiate the real
@@ -29,12 +32,40 @@ from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_SCHEDULER,
     STAT_LOGGER_ROLE_STORAGE,
     STAT_LOGGER_ROLE_TOKENIZER,
+    ExpertDispatchCollector,
     RadixCacheMetricsCollector,
     SchedulerMetricsCollector,
+    StorageMetricsCollector,
     TokenizerMetricsCollector,
     resolve_collector_class,
 )
 from sglang.srt.runtime_context import get_context, reset_context
+
+
+class TestCollectorClassAttrs(unittest.TestCase):
+    """All five collectors expose four DI hook class attrs, all defaulting to
+    None so the existing prometheus_client backend is used unchanged."""
+
+    def test_scheduler_collector_attrs_default_none(self):
+        self.assertIsNone(SchedulerMetricsCollector._counter_cls)
+        self.assertIsNone(SchedulerMetricsCollector._gauge_cls)
+        self.assertIsNone(SchedulerMetricsCollector._histogram_cls)
+        self.assertIsNone(SchedulerMetricsCollector._summary_cls)
+
+    def test_tokenizer_collector_attrs_default_none(self):
+        self.assertIsNone(TokenizerMetricsCollector._counter_cls)
+        self.assertIsNone(TokenizerMetricsCollector._histogram_cls)
+
+    def test_storage_collector_attrs_default_none(self):
+        self.assertIsNone(StorageMetricsCollector._counter_cls)
+        self.assertIsNone(StorageMetricsCollector._histogram_cls)
+
+    def test_expert_dispatch_collector_attrs_default_none(self):
+        self.assertIsNone(ExpertDispatchCollector._histogram_cls)
+
+    def test_radix_cache_collector_attrs_default_none(self):
+        self.assertIsNone(RadixCacheMetricsCollector._counter_cls)
+        self.assertIsNone(RadixCacheMetricsCollector._histogram_cls)
 
 
 class TestResolveCollectorClass(unittest.TestCase):
