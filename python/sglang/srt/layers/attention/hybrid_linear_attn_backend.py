@@ -51,6 +51,9 @@ _validate_mamba_replay_state_indices = (
 
 
 class MambaAttnBackendBase(AttentionBackend):
+    # Recurrent backends must explicitly opt in after their graph metadata
+    # loader is proven independent of live conv/SSM state.
+    supports_overlap_plan_stream_graph_load: bool = False
     # Per-slot accept lengths for the KDA fused-accept spec path; allocated only
     # by KDAAttnBackend where `_can_fuse_accept_state` holds. None everywhere
     # else — update_mamba_state_after_mtp_verify keys the fused branch on it.
@@ -96,6 +99,9 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
+        # Constant (== 1) for mamba-like backends; hoisted so the replay path
+        # skips the per-cycle method dispatch.
+        self._graph_seq_len_fill_value = self.get_cuda_graph_seq_len_fill_value()
 
     @property
     def mamba_chunk_size(self) -> int:
@@ -207,9 +213,13 @@ class MambaAttnBackendBase(AttentionBackend):
                     new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
                     write_pos_buf[uniq_slots] = new_vals
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-            if forward_batch.forward_mode.is_draft_extend_v2():
-                # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model;
-                # skip mamba metadata.
+            has_extend_meta = (
+                forward_batch.extend_start_loc is not None
+                and forward_batch.extend_seq_lens is not None
+            )
+            if forward_batch.forward_mode.is_draft_extend_v2() and not has_extend_meta:
+                # Draft-extend-v2 may omit linear metadata when the draft runs only
+                # full-attention layers.
                 query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
                 ragged_layout = forward_batch.spec_info.ragged_verify_layout
@@ -589,8 +599,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 num_padding = 0
             else:
                 num_padding = torch.count_nonzero(
-                    seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+                    seq_lens_cpu == self._graph_seq_len_fill_value
                 )
+        num_padding = int(num_padding)
         if self._fused_state_indices_ok and self.replayssm_write_pos_list is None:
             # Single-launch fast path: mapping gather + padding sentinel + store
             # into the static buffer, plus zeroing padded req_pool_indices rows —
@@ -697,6 +708,7 @@ class MambaAttnBackendBase(AttentionBackend):
                         )
                         new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
                         write_pos_buf[uniq_slots] = new_vals
+        is_target_verify = forward_mode.is_target_verify()
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
@@ -735,8 +747,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
+        qsl_buf = self.query_start_loc_list[bs - 1]
 
-        if forward_mode.is_target_verify() and self.topk > 1:
+        if is_target_verify and self.topk > 1:
             if (
                 spec_info is not None
                 and getattr(spec_info, "retrieve_next_token", None) is not None
@@ -749,7 +762,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     spec_info.retrieve_next_sibling
                 )
             return ForwardMetadata(
-                query_start_loc=self.query_start_loc_list[bs - 1],
+                query_start_loc=qsl_buf,
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_track_indices=track_buf,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
@@ -760,7 +773,7 @@ class MambaAttnBackendBase(AttentionBackend):
             )
         else:
             return ForwardMetadata(
-                query_start_loc=self.query_start_loc_list[bs - 1],
+                query_start_loc=qsl_buf,
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_track_indices=track_buf,
                 replayssm_write_pos=replayssm_write_pos,
@@ -985,6 +998,8 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
+    supports_overlap_plan_stream_graph_load: bool = False
+
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
@@ -1005,6 +1020,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
+        self.supports_overlap_plan_stream_graph_load = bool(
+            linear_attn_backend.supports_overlap_plan_stream_graph_load
+        )
 
     @property
     def data_type(self):
@@ -1021,8 +1039,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
     @property
+    def use_mha(self) -> bool:
+        return getattr(self.full_attn_backend, "use_mha", False)
+
+    @property
     def kv_cache_dtype(self):
-        return self.full_attn_backend.kv_cache_dtype
+        # Expose the full-attention backend's cache dtype because fused DSA/NSA RoPE
+        # reads it from this wrapper.
+        return getattr(self.full_attn_backend, "kv_cache_dtype", None)
 
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
@@ -1088,6 +1112,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         init = getattr(self.full_attn_backend, "init_mha_chunk_metadata", None)
         if init is not None:
             init(forward_batch, disable_flashinfer_ragged)
+
+    def get_indexer_metadata(self, layer_id, forward_batch):
+        return self.full_attn_backend.get_indexer_metadata(layer_id, forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
