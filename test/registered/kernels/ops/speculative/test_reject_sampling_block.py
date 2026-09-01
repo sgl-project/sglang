@@ -2,12 +2,10 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 
-"""Tests for speculative_sampling_block_kernel (arXiv:2403.10444).
+"""Tests for speculative_sampling_block_kernel (block verification).
 
-Covers the kernel against a vectorized torch reference of the paper's
-Algorithm 2, plus the one-hot closed-form shortcut, losslessness on the
-paper's toy model, matched-coins dominance vs the classic kernel, and
-degenerate draft rows.
+Paper: https://arxiv.org/abs/2403.10444, Algorithm 2:
+h_i = Z_{i+1} / (Z_{i+1} + 1 - p_i), tau = argmax_i {coin_i <= h_i}.
 """
 
 import unittest

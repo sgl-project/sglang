@@ -2246,10 +2246,9 @@ class ServerArgs:
     ] = False
     speculative_use_block_verification: A[
         bool,
-        "Use block verification (arXiv:2403.10444) instead of token-level "
-        "verification in speculative decoding rejection sampling. For "
-        "EAGLE/EAGLE3 it requires --speculative-use-rejection-sampling; for "
-        "DSPARK it swaps the internal sampling-accept kernel.",
+        "Use block verification (arXiv:2403.10444) for speculative decoding "
+        "rejection sampling (requires --speculative-use-rejection-sampling "
+        "for EAGLE/EAGLE3).",
         NS("spec"),
     ] = False
     speculative_token_map: A[
