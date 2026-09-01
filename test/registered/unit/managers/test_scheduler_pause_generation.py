@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -27,7 +27,7 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 
-class TestSchedulerPauseGeneration(unittest.TestCase):
+class TestSchedulerPauseGeneration(CustomTestCase):
     def setUp(self):
         # The scheduler runs after its process publishes; retraction reads the
         # disaggregation and schedule bags rather than the record it is handed.
@@ -142,6 +142,24 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertIs(scheduler.last_batch, original_last_batch)
         self.assertIs(scheduler.cur_batch_for_debug, original_cur_batch)
         self.assertIs(scheduler.chunked_req, original_chunked_req)
+
+    def test_paused_engine_accounting_uses_current_scheduler_state(self):
+        scheduler = self._new_scheduler()
+        scheduler.is_fully_idle = MagicMock()
+
+        for is_idle in (True, False):
+            with self.subTest(is_idle=is_idle):
+                scheduler.is_fully_idle.return_value = is_idle
+                scheduler.metrics_reporter.reset_mock()
+
+                scheduler._record_scheduler_state_for_paused_engine()
+
+                if is_idle:
+                    scheduler.metrics_reporter.record_scheduler_idle.assert_called_once_with()
+                    scheduler.metrics_reporter.record_scheduler_active.assert_not_called()
+                else:
+                    scheduler.metrics_reporter.record_scheduler_active.assert_called_once_with()
+                    scheduler.metrics_reporter.record_scheduler_idle.assert_not_called()
 
     def test_inplace_does_not_drain_overlap_queue(self):
         """in_place should not process the overlap result_queue."""
