@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from torch import nn
 
@@ -11,6 +12,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConf
 from sglang.multimodal_gen.runtime.models.vlas.pi05_core import (
     Pi05CoreModel,
     Pi05SiglipVisionModel,
+    create_sinusoidal_pos_embedding,
+    make_att_2d_masks,
 )
 from sglang.multimodal_gen.runtime.models.vlas.pi05_policy import (
     Pi05CheckpointManifest,
@@ -22,12 +25,21 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.p
 )
 from sglang.multimodal_gen.runtime.vla.cuda_graph import (
     VLADenoiseGraphRunner,
+    VLADenoiseGraphSignature,
+    VLAPrefixGraphRunner,
+    _BoundedCaptureCache,
     _CapturedDenoiseGraph,
 )
+from sglang.multimodal_gen.runtime.vla.observation import VLAObservationBatch
 from sglang.multimodal_gen.runtime.vla.parallel import VLASplitGroup
 from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     PrefixContext,
     VLADensePrefixCache,
+)
+from sglang.multimodal_gen.runtime.vla.prompt_bucketing import (
+    bucket_prompt_tokens,
+    effective_token_length,
+    select_prompt_token_bucket,
 )
 from sglang.srt.models.siglip import SiglipVisionModel
 from sglang.srt.runtime_context import get_context
@@ -97,10 +109,330 @@ def test_denoise_graph_copies_mutable_prefix_graph_output():
     )
     current_context = _prefix_context(2.0, None)
     current_context.layout["mutable_graph_output"] = True
+    current_context.prefix_pad_masks[:, -1] = False
 
     runner._sync_context_if_needed(captured, current_context)
 
     assert captured.static_prefix_context.past_key_values[0][0].eq(2.0).all()
+    assert torch.equal(
+        captured.static_prefix_context.prefix_pad_masks,
+        current_context.prefix_pad_masks,
+    )
+
+
+def _denoise_signature(prefix_len: int) -> VLADenoiseGraphSignature:
+    return VLADenoiseGraphSignature(
+        batch_size=1,
+        prefix_len=prefix_len,
+        prefix_full_attention=False,
+        action_horizon=2,
+        action_dim=4,
+        dtype="float32",
+        parallel_layout="single",
+    )
+
+
+def test_denoise_graph_capacity_falls_back_without_capturing_new_signature():
+    runner = VLADenoiseGraphRunner(enabled=True, max_entries=1)
+    runner._cache.entries[_denoise_signature(32)] = object()
+    fake_cuda_tensor = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+
+    result = runner.capture_or_run(
+        _denoise_signature(64),
+        lambda *_args: "eager",
+        _prefix_context(1.0, None),
+        fake_cuda_tensor,
+        object(),
+    )
+
+    assert result == "eager"
+    assert list(runner._cache.entries) == [_denoise_signature(32)]
+
+
+def test_zero_denoise_graph_capacity_disables_runner():
+    runner = VLADenoiseGraphRunner(enabled=True, max_entries=0)
+
+    assert not runner.enabled
+
+
+class _FakeGraph:
+    def __init__(self):
+        self.reset_calls = 0
+
+    def reset(self):
+        self.reset_calls += 1
+
+
+def _fake_capture():
+    return SimpleNamespace(graph=_FakeGraph())
+
+
+def test_graph_cache_evicts_lru_and_releases_graph():
+    cache = _BoundedCaptureCache("test", max_entries=2, evict_on_miss=True)
+    first = _fake_capture()
+    second = _fake_capture()
+    third = _fake_capture()
+    cache.put("first", first)
+    cache.put("second", second)
+
+    assert cache.get("first") is first
+    cache.put("third", third)
+
+    assert tuple(cache.entries) == ("first", "third")
+    assert second.graph.reset_calls == 1
+    assert cache.info().evictions == 1
+
+    cache.clear()
+    assert first.graph.reset_calls == 1
+    assert third.graph.reset_calls == 1
+
+
+def test_graph_cache_releases_lru_before_new_capture():
+    cache = _BoundedCaptureCache("test", max_entries=1, evict_on_miss=True)
+    first = _fake_capture()
+    cache.put("first", first)
+
+    cache.prepare_admission("second")
+
+    assert not cache.entries
+    assert first.graph.reset_calls == 1
+    assert cache.info().evictions == 1
+
+
+def test_non_evicting_graph_cache_rejects_new_signature_at_capacity():
+    cache = _BoundedCaptureCache("test", max_entries=1, evict_on_miss=False)
+    first = _fake_capture()
+    rejected = _fake_capture()
+    cache.put("first", first)
+
+    assert not cache.put("second", rejected)
+    assert tuple(cache.entries) == ("first",)
+    assert first.graph.reset_calls == 0
+    assert rejected.graph.reset_calls == 1
+
+
+def test_graph_cache_info_tracks_hits_misses_and_failures():
+    cache = _BoundedCaptureCache("test", max_entries=1, evict_on_miss=False)
+    cache.put("first", _fake_capture())
+
+    assert cache.get("first") is not None
+    assert cache.get("missing") is None
+    cache.mark_failure()
+
+    info = cache.info()
+    assert info.hits == 1
+    assert info.misses == 1
+    assert info.captures == 1
+    assert info.failures == 1
+
+
+def test_zero_graph_capacity_disables_both_runners():
+    assert not VLAPrefixGraphRunner(enabled=True, max_entries=0).enabled
+    assert not VLADenoiseGraphRunner(enabled=True, max_entries=0).enabled
+
+
+def test_prefix_prompt_bucket_preserves_tokens_and_masks():
+    tokens = torch.arange(40).view(1, 40)
+    token_masks = torch.ones_like(tokens, dtype=torch.bool)
+
+    bucketed_tokens, bucketed_masks, logical_length, bucket = bucket_prompt_tokens(
+        tokens,
+        token_masks,
+        (32, 64, 128, 200),
+    )
+
+    assert logical_length == 40
+    assert bucket == 64
+    assert bucketed_tokens.shape == (1, 64)
+    assert torch.equal(bucketed_tokens[:, :40], tokens)
+    assert bucketed_tokens[:, 40:].eq(0).all()
+    assert bucketed_masks[:, :40].all()
+    assert not bucketed_masks[:, 40:].any()
+
+
+def test_prefix_prompt_bucket_preserves_mask_holes():
+    tokens = torch.arange(6).view(1, 6)
+    token_masks = torch.tensor([[True, False, True, False, False, False]])
+
+    bucketed_tokens, bucketed_masks, logical_length, bucket = bucket_prompt_tokens(
+        tokens,
+        token_masks,
+        (4, 8),
+    )
+
+    assert logical_length == 3
+    assert bucket == 4
+    assert torch.equal(bucketed_tokens, tokens[:, :4])
+    assert torch.equal(bucketed_masks, token_masks[:, :4])
+
+
+def test_prompt_bucket_selection_and_exact_tail():
+    assert select_prompt_token_bucket(33, (32, 64, 128)) == 64
+    assert select_prompt_token_bucket(129, (32, 64, 128)) is None
+
+    tokens = torch.arange(140).view(1, 140)
+    token_masks = torch.arange(140).view(1, 140) < 129
+    exact_tokens, exact_masks, logical_length, bucket = bucket_prompt_tokens(
+        tokens,
+        token_masks,
+        (32, 64, 128),
+    )
+
+    assert logical_length == 129
+    assert bucket is None
+    assert exact_tokens.shape == (1, 129)
+    assert exact_masks.all()
+
+
+def test_effective_token_length_uses_last_visible_position():
+    masks = torch.tensor(
+        [
+            [True, False, False, True, False],
+            [True, True, False, False, False],
+        ]
+    )
+
+    assert effective_token_length(masks) == 4
+
+
+def test_pi05_graph_config_validation():
+    config = Pi05PipelineConfig()
+    config.update_pipeline_config(
+        {
+            "prompt_token_buckets": [16, 48, 96],
+            "action_cuda_graph_max_entries": 3,
+        }
+    )
+    assert config.prompt_token_buckets == [16, 48, 96]
+    assert config.action_cuda_graph_max_entries == 3
+
+    invalid_configs = (
+        ({"prompt_token_buckets": [32, 32]}, "strictly increasing"),
+        ({"prompt_token_buckets": [64, 32]}, "strictly increasing"),
+        ({"prompt_token_buckets": [0, 32]}, "positive"),
+        ({"prompt_token_buckets": [32, 256]}, "max_token_len"),
+        ({"prefix_cuda_graph_max_entries": -1}, "prefix_cuda_graph"),
+        ({"action_cuda_graph_max_entries": -1}, "action_cuda_graph"),
+    )
+    for overrides, match in invalid_configs:
+        with pytest.raises(ValueError, match=match):
+            Pi05PipelineConfig(**overrides)
+
+
+def test_prefix_cache_key_distinguishes_bucket_layouts_and_mask_holes():
+    model = Pi05PolicyModel.__new__(Pi05PolicyModel)
+    model.config = Pi05PipelineConfig(prompt_token_buckets=[32, 64])
+    model.dtype = torch.bfloat16
+    model.model_path = "lerobot/pi05_base"
+    model._prompt_token_bucketing_enabled = lambda: True
+    common = dict(
+        metadata={"camera_order": ("front",)},
+        images={"front": torch.zeros(1, 3, 2, 2)},
+        image_masks={"front": torch.tensor(True)},
+        token_masks=torch.tensor([[True, False, False, True, False]]),
+    )
+    first = SimpleNamespace(tokens=torch.tensor([[1, 2, 3, 4, 0]]), **common)
+    second = SimpleNamespace(tokens=torch.tensor([[1, 2, 3, 9, 0]]), **common)
+
+    exact = model.build_prefix_cache_key(first)
+    bucketed = model.build_prefix_cache_key(first, bucket_prompt=True)
+
+    assert exact != bucketed
+    assert model.build_prefix_cache_key(first) != model.build_prefix_cache_key(second)
+
+
+def test_bucket_miss_keeps_action_denoise_eager():
+    model = Pi05PolicyModel.__new__(Pi05PolicyModel)
+    nn.Module.__init__(model)
+    model.action_expert = lambda _context, x_t, _timestep, **_kwargs: x_t + 1
+    model.graph_runner = SimpleNamespace(
+        capture_or_run=lambda *_args, **_kwargs: pytest.fail(
+            "bucket misses must not capture action graphs"
+        )
+    )
+    context = SimpleNamespace(
+        layout={"cuda_graph_eligible": False},
+        prefix_len=900,
+    )
+    x_t = torch.zeros(1, 50, 32)
+
+    output = model.denoise_step(
+        context,
+        x_t,
+        torch.ones(1),
+        use_cuda_graph=True,
+    )
+
+    torch.testing.assert_close(output, torch.ones_like(x_t))
+
+
+def _observation_with_token_len(token_len: int) -> VLAObservationBatch:
+    tokens = torch.arange(200).view(1, 200)
+    token_masks = torch.arange(200).view(1, 200) < token_len
+    return VLAObservationBatch(
+        prompt=["prompt"],
+        images={"camera": torch.zeros(1, 3, 4, 4)},
+        image_masks={"camera": torch.ones(1, dtype=torch.bool)},
+        state=None,
+        noise=None,
+        tokens=tokens,
+        token_masks=token_masks,
+        batch_size=1,
+        metadata={"camera_order": ("camera",)},
+    )
+
+
+class _RecordingPrefixRunner:
+    enabled = True
+
+    def __init__(self):
+        self.calls = []
+
+    def capture_or_run(self, signature, _step_fn, inputs):
+        self.calls.append((signature, inputs))
+        return signature
+
+
+def _recording_policy(config: Pi05PipelineConfig) -> Pi05PolicyModel:
+    model = Pi05PolicyModel.__new__(Pi05PolicyModel)
+    nn.Module.__init__(model)
+    model.config = config
+    model.device = torch.device("cpu")
+    model.prefix_graph_runner = _RecordingPrefixRunner()
+    model._prompt_token_bucketing_enabled = lambda: bool(config.prompt_token_buckets)
+    return model
+
+
+def test_default_prefix_graph_keeps_exact_prompt_signatures():
+    model = _recording_policy(Pi05PipelineConfig())
+
+    signature_33 = model.encode_prefix(_observation_with_token_len(33))
+    signature_64 = model.encode_prefix(_observation_with_token_len(64))
+
+    assert signature_33 != signature_64
+    assert model.prefix_graph_runner.calls[0][1][-2].shape == (1, 33)
+    assert model.prefix_graph_runner.calls[1][1][-2].shape == (1, 64)
+
+
+def test_prefix_prompt_lengths_share_bucket_graph_signature():
+    model = _recording_policy(
+        Pi05PipelineConfig(
+            prompt_token_buckets=[32, 64, 128, 200],
+        )
+    )
+
+    signature_33 = model.encode_prefix(_observation_with_token_len(33))
+    signature_64 = model.encode_prefix(_observation_with_token_len(64))
+
+    assert signature_33 == signature_64
+    for (_, inputs), expected_token_len in zip(
+        model.prefix_graph_runner.calls,
+        (33, 64),
+        strict=True,
+    ):
+        assert inputs[-2].shape == (1, 64)
+        assert inputs[-1].shape == (1, 64)
+        assert inputs[-1].sum().item() == expected_token_len
 
 
 def test_prefix_graph_rejects_tensor_parallel_prefix():
@@ -109,6 +441,18 @@ def test_prefix_graph_rejects_tensor_parallel_prefix():
     model.device = torch.device("cuda")
     model.runtime_role = "all"
     model._prefix_language_model = lambda: SimpleNamespace(tensor_parallel=True)
+
+    assert not model._prefix_cuda_graph_enabled()
+
+
+def test_prefix_graph_rejects_partial_language_offload():
+    model = Pi05PolicyModel.__new__(Pi05PolicyModel)
+    model.config = Pi05PipelineConfig(
+        offload_prefix_language_layer_count_after_prefix=1
+    )
+    model.device = torch.device("cuda")
+    model.runtime_role = "all"
+    model._prefix_tensor_parallel_enabled = lambda: False
 
     assert not model._prefix_cuda_graph_enabled()
 
@@ -266,6 +610,133 @@ def test_prefix_language_embedding_matches_openpi_scale():
         embeddings[:, 2:],
         language_embedding * (language_embedding.shape[-1] ** 0.5),
     )
+
+
+def test_cached_pi05_sinusoidal_scaling_is_bit_exact():
+    time = torch.tensor([0.125, 0.75], dtype=torch.float32)
+    dimension = 32
+    min_period = 4e-3
+    max_period = 4.0
+    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=torch.float64)
+    period = min_period * (max_period / min_period) ** fraction
+    scaling = 1.0 / period * 2 * torch.pi
+
+    expected = create_sinusoidal_pos_embedding(
+        time,
+        dimension,
+        min_period,
+        max_period,
+    )
+    actual = create_sinusoidal_pos_embedding(
+        time,
+        dimension,
+        min_period,
+        max_period,
+        scaling=scaling,
+    )
+
+    assert torch.equal(actual, expected)
+
+
+def test_prepare_denoise_layout_matches_per_step_construction():
+    model = Pi05CoreModel.__new__(Pi05CoreModel)
+    nn.Module.__init__(model)
+    prefix_pad_masks = torch.tensor(
+        [[True, True, False], [True, False, False]], dtype=torch.bool
+    )
+    x_t = torch.zeros(2, 4, 7)
+
+    attention_mask, position_ids = model.prepare_denoise_layout(
+        prefix_pad_masks,
+        x_t,
+        action_position_offset=3,
+    )
+
+    suffix_pad_masks = torch.ones(2, 4, dtype=torch.bool)
+    suffix_att_masks = torch.zeros(2, 4)
+    suffix_att_masks[:, 0] = 1
+    expected_2d_mask = torch.cat(
+        [
+            prefix_pad_masks[:, None, :].expand(2, 4, 3),
+            make_att_2d_masks(suffix_pad_masks, suffix_att_masks),
+        ],
+        dim=2,
+    )
+    expected_mask = model.prepare_attention_masks_4d(expected_2d_mask)
+    expected_positions = torch.tensor([[5, 6, 7, 8], [4, 5, 6, 7]])
+
+    assert torch.equal(attention_mask, expected_mask)
+    assert torch.equal(position_ids, expected_positions)
+    full_attention_mask, full_attention_positions = model.prepare_denoise_layout(
+        prefix_pad_masks,
+        x_t,
+        prefix_full_attention=True,
+        action_position_offset=3,
+    )
+    assert full_attention_mask is None
+    assert torch.equal(full_attention_positions, expected_positions)
+
+
+def test_sample_actions_only_hoists_denoise_layout_for_eager():
+    model = Pi05PolicyModel.__new__(Pi05PolicyModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(action_horizon=2, action_dim=3)
+    model.device = torch.device("cpu")
+    model.graph_runner = SimpleNamespace(enabled=True)
+    model._offload_action_expert_between_requests = lambda: False
+    model._can_use_action_sequence_parallel = lambda *_args: False
+    model.denoise_step = lambda _ctx, x_t, _t, **_kwargs: torch.zeros_like(x_t)
+    layout_calls = []
+    model.core_model = SimpleNamespace(
+        prepare_denoise_layout=lambda *args, **kwargs: layout_calls.append(
+            (args, kwargs)
+        )
+        or (None, torch.zeros(1, 2, dtype=torch.long))
+    )
+    observation = SimpleNamespace(batch_size=1)
+    prefix_context = _prefix_context(1.0, "prompt")
+    prefix_context.layout["full_attention"] = True
+    noise = torch.zeros(1, 2, 3)
+
+    model.sample_actions(
+        observation,
+        prefix_context,
+        noise=noise,
+        num_steps=2,
+        use_cuda_graph=True,
+    )
+    assert not layout_calls
+
+    prefix_context.layout["full_attention"] = False
+    model.sample_actions(
+        observation,
+        prefix_context,
+        noise=noise,
+        num_steps=2,
+        use_cuda_graph=True,
+    )
+    assert not layout_calls
+
+    prefix_context.layout["cuda_graph_eligible"] = False
+    model.sample_actions(
+        observation,
+        prefix_context,
+        noise=noise,
+        num_steps=2,
+        use_cuda_graph=True,
+    )
+    assert len(layout_calls) == 1
+
+    layout_calls.clear()
+    prefix_context.layout["cuda_graph_eligible"] = True
+    model.sample_actions(
+        observation,
+        prefix_context,
+        noise=noise,
+        num_steps=2,
+        use_cuda_graph=False,
+    )
+    assert len(layout_calls) == 1
 
 
 def test_uint8_resize_rounds_before_normalization():

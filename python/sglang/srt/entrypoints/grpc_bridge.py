@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.runtime_context import (
+    describe_kv_events_publisher,
     get_lora,
     get_serving,
 )
@@ -425,8 +426,8 @@ class RuntimeHandle:
     def get_server_info(self) -> str:
         result: Dict[str, Any] = self.tokenizer_manager.server_args.resolved_dict()
         result.update(self.scheduler_info)
-        result["kv_events"] = (
-            self.tokenizer_manager.server_args.describe_kv_events_publisher()
+        result["kv_events"] = describe_kv_events_publisher(
+            self.tokenizer_manager.server_args
         )
         return json.dumps(msgspec_to_builtins(result), default=str)
 

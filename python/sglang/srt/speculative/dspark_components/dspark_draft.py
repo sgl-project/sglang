@@ -27,6 +27,7 @@ from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     spec_scale_global_num_tokens,
 )
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
@@ -134,6 +135,7 @@ def sample_draft_block(
     sampling_info,
     markov_head,
     device: torch.device,
+    tp_sync: SpecTpSync,
 ) -> DraftBlockResult:
     bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
@@ -151,7 +153,9 @@ def sample_draft_block(
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
-            return torch.argmax(step_logits, dim=-1)
+            return tp_sync.sync(
+                SpecTpSyncSite.DSPARK_DRAFT_GREEDY, torch.argmax(step_logits, dim=-1)
+            )
 
     else:
 
@@ -161,11 +165,14 @@ def sample_draft_block(
                 exp_noise = torch.empty(
                     step_logits.shape, dtype=torch.float32, device=step_logits.device
                 ).exponential_(1)
-                return SampleStepTokens.execute(
-                    step_logits=step_logits,
-                    temperatures=temperatures,
-                    greedy_mask=greedy_mask,
-                    exp_noise=exp_noise,
+                return tp_sync.sync(
+                    SpecTpSyncSite.DSPARK_DRAFT_SAMPLE,
+                    SampleStepTokens.execute(
+                        step_logits=step_logits,
+                        temperatures=temperatures,
+                        greedy_mask=greedy_mask,
+                        exp_noise=exp_noise,
+                    ),
                 )
             else:
                 probs = torch.softmax(
@@ -174,7 +181,10 @@ def sample_draft_block(
                 probs = expect(_DRAFT_PROBS, probs)
                 argmax_tokens = torch.argmax(step_logits, dim=-1)
                 sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-                return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
+                return tp_sync.sync(
+                    SpecTpSyncSite.DSPARK_DRAFT_MULTINOMIAL,
+                    torch.where(greedy_mask, argmax_tokens, sampled_tokens),
+                )
 
     draft_tokens, corrected_logits = markov_head.sample_block(
         base_logits,
@@ -199,6 +209,7 @@ class DraftBlockProposer:
         gamma: int,
         mask_token_id: int,
         draft_block_spec_info,
+        tp_sync: SpecTpSync,
         dp_moe_sync: bool = False,
     ) -> None:
         self.draft_model = draft_model
@@ -208,6 +219,7 @@ class DraftBlockProposer:
         self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         self._mask_token_id = mask_token_id
         self._draft_block_spec_info = draft_block_spec_info
+        self._tp_sync = tp_sync
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
@@ -310,6 +322,7 @@ class DraftBlockProposer:
                 sampling_info=sampling_info,
                 markov_head=self.draft_model.markov_head,
                 device=device,
+                tp_sync=self._tp_sync,
             )
         proposal_block_ids = (
             draft_block_ids

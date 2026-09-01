@@ -9,13 +9,14 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.arg_groups.mamba_hook import validate_mamba_extra_buffer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import override_platform
 from sglang.srt.speculative import dflash_info
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
@@ -29,6 +30,9 @@ def _lazy_view(**overrides):
         mamba_track_interval=256,
         page_size=64,
         chunked_prefill_size=None,
+        # The cases name a supported arch, so the view states the backend
+        # rather than the answer.
+        linear_attn_backend="triton",
     )
     for key, value in overrides.items():
         setattr(view, key, value)
@@ -39,18 +43,13 @@ class TestValidateMambaExtraBufferLazyDflash(CustomTestCase):
     """The DFLASH rejection is gone; the neighboring invariants still hold."""
 
     def _validate(self, view):
-        fake_self = SimpleNamespace(mamba_cache_chunk_size=64)
-        with mock.patch(
-            "sglang.srt.arg_groups.overrides.supports_mamba_cache_extra_buffer",
-            return_value=True,
-        ), mock.patch(
-            # Keep the test runnable on CPU-only hosts: the platform assert is
-            # not what is under test here.
-            "sglang.srt.server_args.is_cuda",
-            return_value=True,
-        ):
-            ServerArgs._validate_mamba_extra_buffer(
-                fake_self, view, "Qwen3NextForCausalLM"
+        # Keep the test runnable on CPU-only hosts: the platform assert is
+        # not what is under test here.
+        with override_platform(is_cuda=True):
+            validate_mamba_extra_buffer(
+                view,
+                "Qwen3NextForCausalLM",
+                mamba_cache_chunk_size_of=lambda: 64,
             )
 
     def test_dflash_with_extra_buffer_lazy_is_accepted(self):
@@ -67,6 +66,24 @@ class TestValidateMambaExtraBufferLazyDflash(CustomTestCase):
         with self.assertRaises(AssertionError):
             self._validate(
                 _lazy_view(speculative_num_draft_tokens=512, mamba_track_interval=256)
+            )
+
+    def test_the_chunk_size_is_not_read_before_the_page_size_resolves(self):
+        """`mamba_cache_chunk_size` is derived from `page_size`, which the
+        pipeline writes *after* `_handle_model_specific_adjustments` runs this
+        validator. The read has to stay inside the `page_size is not None`
+        guard: evaluating it at the call site raises `TypeError` on the
+        unresolved `None` (hit by Qwen3-Next under PD disaggregation)."""
+        from sglang.srt.arg_groups.mamba_hook import validate_mamba_extra_buffer
+
+        def _must_not_be_read():
+            raise AssertionError("the chunk size was read before page_size resolved")
+
+        with override_platform(is_cuda=True):
+            validate_mamba_extra_buffer(
+                _lazy_view(page_size=None),
+                "Qwen3NextForCausalLM",
+                mamba_cache_chunk_size_of=_must_not_be_read,
             )
 
 

@@ -277,11 +277,24 @@ clean_site_packages() {
 }
 
 setup_cargo_cache() {
+    if [ "${SGLANG_BUILD_RUST_EXTS:-}" = "none" ]; then
+        echo "Using prebuilt Rust extensions; skipping Cargo target setup"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
     # actions/checkout's `git clean -ffdx` deletes the gitignored in-repo
     # rust/target, so every job recompiles the whole dependency graph. Move the
     # target dir out of the tree: setuptools-rust has no target-dir option of its
     # own and defers to CARGO_TARGET_DIR, which uv passes to the build backend.
     export CARGO_TARGET_DIR="${HOME}/.cache/sglang-cargo-target"
+    local cargo_target_lock="${HOME}/.cache/sglang-cargo-target.lock"
+    mkdir -p "${HOME}/.cache"
+    exec 9>"${cargo_target_lock}"
+    echo "Waiting for exclusive cargo target lock: ${cargo_target_lock}"
+    flock --exclusive 9
+    CARGO_TARGET_LOCK_HELD=1
+    echo "Acquired cargo target lock"
     mkdir -p "${CARGO_TARGET_DIR}"
 
     # Same disk-pressure guard as the uv cache in ci_cleanup_venv.sh (which
@@ -296,6 +309,15 @@ setup_cargo_cache() {
     fi
 
     mark_step_done "${FUNCNAME[0]}"
+}
+
+release_cargo_cache_lock() {
+    if [ "${CARGO_TARGET_LOCK_HELD:-0}" = "1" ]; then
+        flock --unlock 9
+        exec 9>&-
+        CARGO_TARGET_LOCK_HELD=0
+        echo "Released cargo target lock"
+    fi
 }
 
 setup_pip_toolchain() {
@@ -473,10 +495,19 @@ require_prebuilt_rust_exts() {
     for module in server grpc multimodal; do
         [ -f "python/sglang/srt/rust_extensions/_${module}${suffix}" ] || missing+=("${module}")
     done
+    [ -f "python/sglang/srt/mem_cache/rust_tree_core/mem_cache${suffix}" ] \
+        || missing+=("mem_cache")
+    [ -f "python/sglang/srt/mem_cache/rust_tree_core/mem_cache_inspection${suffix}" ] \
+        || missing+=("mem_cache_inspection")
     if [ ${#missing[@]} -gt 0 ]; then
         echo "::warning::no prebuilt Rust extension ${suffix} for: ${missing[*]}; building from source"
         ls -l python/sglang/srt/rust_extensions/_*.so 2>/dev/null || echo "(no extension modules at all)"
+        ls -l python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so 2>/dev/null || true
         export SGLANG_BUILD_RUST_EXTS=
+        export SGLANG_RUST_BUILD_MODE=auto
+        if [ -n "${GITHUB_ENV:-}" ]; then
+            echo "SGLANG_RUST_BUILD_MODE=auto" >> "${GITHUB_ENV}"
+        fi
         mark_step_done "${FUNCNAME[0]}"
         return
     fi
@@ -846,14 +877,15 @@ main() {
     install_apt_packages
     install_gdrcopy
     clean_site_packages
-    setup_cargo_cache
     require_prebuilt_rust_exts
     setup_pip_toolchain
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
     install_pytorch_stack
     install_cuda12_deepep_wheel
+    setup_cargo_cache
     install_sglang
+    release_cargo_cache_lock
     install_nccl
     # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
     # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.

@@ -1268,9 +1268,9 @@ ONE_GPU_XPU_CASES = _select_xpu_cases(ONE_GPU_XPU_CASE_IDS)
 
 
 # Nested unit/ tests verified to pass on AMD/ROCm as-is (no code change).
-# Enabled incrementally and AMD-only: the CUDA `multimodal-gen-unit-test`
-# lane keeps the flat glob below. Files that still need fixes/skips are added
-# in follow-up PRs. Paths are relative to the unit/ dir.
+# The CUDA lane runs the whole unit/ tree recursively; AMD enables nested
+# files incrementally as they are vetted, in follow-up PRs. Paths are
+# relative to the unit/ dir.
 _AMD_READY_NESTED_UNIT_TESTS = (
     "realtime/test_causal_denoising.py",
     "realtime/test_output_materialization.py",
@@ -1293,12 +1293,13 @@ def _discover_unit_tests() -> list[str]:
     unit_dir = Path(__file__).resolve().parent.parent / "unit"
     if not unit_dir.is_dir():
         return []
-    # Flat unit/ tests run on every lane (unchanged). This keeps the CUDA
-    # `multimodal-gen-unit-test` job byte-identical.
-    flat = [f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()]
     if not current_platform.is_hip():
-        return sorted(flat)
-    # AMD/ROCm additionally runs the vetted nested-subdir tests.
+        # pytest recurses into the directory: every unit test runs, nested
+        # subdirs included, and new files need no registry edit.
+        return ["../unit"]
+    # AMD/ROCm keeps the vetted set: the flat files plus the nested tests
+    # verified to pass on ROCm.
+    flat = [f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()]
     nested = [
         f"../unit/{rel}"
         for rel in _AMD_READY_NESTED_UNIT_TESTS
