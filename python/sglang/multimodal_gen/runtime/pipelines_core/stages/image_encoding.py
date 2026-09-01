@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     align_tensor_to_module_dtype,
     autocast_context,
     autocast_enabled,
+    resolve_component_precision_override,
     resolve_precision,
     temporary_module_dtype,
 )
@@ -156,9 +157,25 @@ class ImageEncodingStage(PipelineStage):
         stage_name = self._component_stage_name(stage_name)
         uses = []
         if self.image_encoder is not None:
-            uses.append(ComponentUse(stage_name, "image_encoder"))
+            uses.append(
+                ComponentUse(
+                    stage_name,
+                    "image_encoder",
+                    target_dtype=resolve_component_precision_override(
+                        server_args, "image_encoder"
+                    ),
+                )
+            )
         if self.text_encoder is not None:
-            uses.append(ComponentUse(stage_name, "text_encoder"))
+            uses.append(
+                ComponentUse(
+                    stage_name,
+                    "text_encoder",
+                    target_dtype=resolve_component_precision_override(
+                        server_args, "text_encoder"
+                    ),
+                )
+            )
         return uses
 
     def encoding_image_edit(self, outputs, image_inputs, pipeline_config):

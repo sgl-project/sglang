@@ -272,16 +272,6 @@ def _fused_residual_layernorm_scale_shift_gate_select01_kernel(
     tl.store(gate_row_ptr + cols, gate, mask=mask)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": 64}, num_warps=2),
-        triton.Config({"BLOCK_N": 128}, num_warps=4),
-        triton.Config({"BLOCK_N": 256}, num_warps=4),
-        triton.Config({"BLOCK_N": 512}, num_warps=4),
-        triton.Config({"BLOCK_N": 1024}, num_warps=8),
-    ],
-    key=["inner_dim"],
-)
 @triton.jit
 def _fused_scale_shift_4d_kernel(
     output_ptr,
@@ -416,9 +406,12 @@ def fuse_scale_shift_kernel(
         x_2d = x.view(rows, C)
         output_2d = output.view(rows, C)
 
-        def grid(meta):
-            return (rows, triton.cdiv(C, meta["BLOCK_N"]))
-
+        # Autotuning this bandwidth-bound kernel is much more expensive than
+        # the launch itself on causal video models.  A capped power-of-two
+        # tile is fastest or within noise across the production hidden sizes.
+        block_n = max(64, min(512, triton.next_power_of_2(C)))
+        num_warps = 2 if block_n == 64 else 4
+        grid = (rows, triton.cdiv(C, block_n))
         num_frames = scale.shape[1]
         assert (
             L % num_frames == 0
@@ -454,6 +447,8 @@ def fuse_scale_shift_kernel(
             L,
             num_frames,
             frame_seqlen,
+            BLOCK_N=block_n,
+            num_warps=num_warps,
         )
     else:
         # 2D: [B, C] or [1, C]  -> treat as [B, 1, C] and broadcast over L

@@ -813,7 +813,7 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198
 
 #### 5.2.4 AIME 2025 Benchmark
 
-Results on AIME 2025 (8×B200), evaluated with [NeMo-Skills](https://github.com/NVIDIA/NeMo-Skills.git):
+Results on AIME 2025 (8×B200), evaluated with [sgl-eval](https://github.com/sgl-project/sgl-eval):
 
 <table style={{width: "100%", borderCollapse: "collapse"}}>
   <thead>
@@ -846,25 +846,19 @@ Results on AIME 2025 (8×B200), evaluated with [NeMo-Skills](https://github.com/
   </tbody>
 </table>
 
-**Reproduction.** Install [NeMo-Skills](https://github.com/NVIDIA/NeMo-Skills), launch the server with the tool-call and reasoning parsers, then run `ns eval`:
+**Reproduction.** Install [sgl-eval](https://github.com/sgl-project/sgl-eval), launch the server with the tool-call and reasoning parsers, then run `sgl-eval run`. The AIME 2025 dataset ships with sgl-eval, and thinking is on by default for it:
 
 ```bash Command
-pip install git+https://github.com/NVIDIA/NeMo-Skills.git --ignore-installed blinker
+pip install git+https://github.com/sgl-project/sgl-eval.git
 
-export NEMO_SKILLS_DISABLE_UNCOMMITTED_CHANGES_CHECK=1
-ns prepare_data aime25
-
-ns eval \
-  --benchmarks=aime25:4 \
-  --server_type=sglang \
-  --model=deepseek-ai/DeepSeek-V3.2-Exp \
-  --server_address=http://localhost:30000/v1 \
-  --output_dir=nemo_skills_aime25_output \
-  ++chat_template_kwargs.thinking=true \
-  ++inference.temperature=1.0 \
-  ++inference.top_p=0.95 \
-  ++inference.tokens_to_generate=64000
-  # Use ++inference.tokens_to_generate=120000 for the DeepSeek-V3.2-Speciale model
+sgl-eval run aime25 \
+  --base-url http://localhost:30000/v1 \
+  --model deepseek-ai/DeepSeek-V3.2-Exp \
+  --n-repeats 4 \
+  --temperature 1.0 \
+  --top-p 0.95 \
+  --max-tokens 64000
+  # Use --max-tokens 120000 for the DeepSeek-V3.2-Speciale model
 ```
 
 ### 5.3 Speed Benchmark on Hopper

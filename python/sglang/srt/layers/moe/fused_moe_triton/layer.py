@@ -206,6 +206,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
+            moe_runner_config=moe_runner_config,
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
@@ -282,7 +283,10 @@ class FusedMoE(torch.nn.Module):
         params_dtype: Data type for the parameters.
         reduce_results: Whether to apply all_reduce on the output of the layer
         quant_config: Quantization configuration.
+        quant_method: Explicit quant method, overriding selection from quant_config.
         inplace: suggestion to compute inplace (modify input activation).
+        enable_qwen35_fp8_deferred_finalize: Whether this concrete Qwen3.5
+            layer may expose FlashInfer's block-FP8 deferred MoE output.
     """
 
     # True on shared-expert FusedMoE subclasses (e.g. Inkling's sink); lets
@@ -321,6 +325,8 @@ class FusedMoE(torch.nn.Module):
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
         gate_up_interleaved: bool = True,
+        enable_qwen35_fp8_deferred_finalize: bool = False,
+        quant_method: Optional[FusedMoEMethodBase] = None,
     ):
         super().__init__()
         if params_dtype is None:
@@ -354,10 +360,10 @@ class FusedMoE(torch.nn.Module):
 
         self._num_global_routed = num_experts - num_shared_slots
         if get_exec().moe.ep_join_mode == "scale":
-            storage_ep_size = get_parallel().config.elastic_ep_initial_size
+            storage_ep_size = get_parallel().elastic_ep_initial_size
             assert storage_ep_size is not None
             self._expert_storage_rank = (
-                get_parallel().config.ep_join_rank_offset + self.moe_ep_rank
+                get_parallel().ep_join_rank_offset + self.moe_ep_rank
             )
         else:
             storage_ep_size = self.moe_ep_size
@@ -426,17 +432,19 @@ class FusedMoE(torch.nn.Module):
             gate_up_interleaved=gate_up_interleaved,
         )
 
-        self.quant_method: Optional[FusedMoEMethodBase] = None
+        self.quant_method = quant_method
         server_args = get_server_args()
         kt_config = create_kt_config_from_server_args(server_args, layer_id)
         if kt_config is not None:
-            if quant_config is not None:
+            if self.quant_method is not None:
+                gpu_method = self.quant_method
+            elif quant_config is not None:
                 gpu_method = quant_config.get_quant_method(self, prefix)
             else:
                 gpu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
             self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
         else:
-            if quant_config is not None:
+            if self.quant_method is None and quant_config is not None:
                 self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method is None:
                 self.quant_method = UnquantizedFusedMoEMethod(
@@ -446,10 +454,17 @@ class FusedMoE(torch.nn.Module):
                 )
         _validate_hpc_ops_quant_method(self.quant_method)
         _validate_deepep_v2_quant_method(self.quant_method)
+        nvfp4_deferred = envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get() and isinstance(
+            self.quant_method, ModelOptNvFp4FusedMoEMethod
+        )
+        qwen35_fp8_deferred = (
+            enable_qwen35_fp8_deferred_finalize
+            and isinstance(self.quant_method, Fp8MoEMethod)
+            and self.quant_method.block_quant
+        )
         self.supports_deferred_finalize = (
-            envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
-            and get_moe_runner_backend().is_flashinfer_trtllm()
-            and isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            get_moe_runner_backend().is_flashinfer_trtllm()
+            and (nvfp4_deferred or qwen35_fp8_deferred)
         )
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:
@@ -514,8 +529,7 @@ class FusedMoE(torch.nn.Module):
 
         self._dwdp_bound = False
 
-        if self.quant_method is not None and hasattr(self.quant_method, "runner"):
-            self.runner = self.quant_method.runner
+        self.runner = self.quant_method.runner
 
     @property
     def num_global_routed_experts(self) -> int:
@@ -1674,7 +1688,7 @@ class FusedMoE(torch.nn.Module):
     def set_overlap_args(
         self, down_gemm_overlap_args: DownGemmOverlapArgs, meta_overlap_args: dict
     ):
-        if hasattr(self, "runner"):
+        if self.runner is not None:
             self.runner.set_overlap_args(down_gemm_overlap_args, meta_overlap_args)
         else:
             # TODO: remove this branch after MoE refactor
@@ -1682,7 +1696,7 @@ class FusedMoE(torch.nn.Module):
             self.meta_overlap_args = meta_overlap_args
 
     def clear_overlap_args(self) -> None:
-        if hasattr(self, "runner"):
+        if self.runner is not None:
             self.runner.clear_overlap_args()
         else:
             # TODO: remove this branch after MoE refactor

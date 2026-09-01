@@ -99,7 +99,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.require_attn_tp_gather = require_attn_tp_gather()
         self.tp_size = self.model_runner.ps.tp_size
         self.attn_dp_size = self.model_runner.ps.attn_dp_size
-        self.pp_size = get_parallel().config.pp_size
+        self.pp_size = get_parallel().pp_size
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = get_spec().speculative_eagle_topk
         self.draft_attn_backend = frozen_kv_mtp_worker.draft_attn_backend
