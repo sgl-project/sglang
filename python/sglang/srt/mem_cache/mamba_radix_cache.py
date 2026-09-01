@@ -561,7 +561,7 @@ class MambaRadixCache(BasePrefixCache):
 
         if is_insert:
             if self.enable_mamba_extra_buffer:
-                cache_len = req.mamba_last_track_seqlen
+                cache_len = req.kv.mamba_last_track_seqlen
             else:
                 cache_len = len(token_ids)
                 # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by
@@ -571,8 +571,8 @@ class MambaRadixCache(BasePrefixCache):
                 # with its key length. page_size is asserted == 1, so no realign.
                 write_pos_buf = self.req_to_token_pool.mamba_pool.replayssm_write_pos
                 if write_pos_buf is not None:
-                    cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
-                    write_pos_buf[req.mamba_pool_idx] = 0
+                    cache_len -= int(write_pos_buf[req.kv.mamba_pool_idx].item())
+                    write_pos_buf[req.kv.mamba_pool_idx] = 0
             if cache_len is None:
                 cache_len = 0
             if cache_len != len(token_ids):
@@ -602,16 +602,16 @@ class MambaRadixCache(BasePrefixCache):
                 mamba_ping_pong_track_buffer_to_keep = (
                     self.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
                 )
-                src_active = req.mamba_ping_pong_track_buffer[
+                src_active = req.kv.mamba_ping_pong_track_buffer[
                     mamba_ping_pong_track_buffer_to_keep
                 ].unsqueeze(-1)
                 if _MAMBA_DEBUG_ASSERTS:
                     # .item() forces a cudaStreamSynchronize; only pay it when debugging.
                     assert src_active.item() != -1, (
                         f"Cached mamba slot is -1: keep_idx={mamba_ping_pong_track_buffer_to_keep}, "
-                        f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
-                        f"next_track_idx={req.mamba_next_track_idx}, "
-                        f"last_track_seqlen={req.mamba_last_track_seqlen}, "
+                        f"buf={req.kv.mamba_ping_pong_track_buffer.tolist()}, "
+                        f"next_track_idx={req.kv.mamba_next_track_idx}, "
+                        f"last_track_seqlen={req.kv.mamba_last_track_seqlen}, "
                         f"rid={req.rid}"
                     )
                 if self.int8_ckpt_pool is not None:
@@ -623,10 +623,10 @@ class MambaRadixCache(BasePrefixCache):
             else:
                 if self.int8_ckpt_pool is not None:
                     mamba_value = self._commit_int8_checkpoint(
-                        req.mamba_pool_idx.unsqueeze(-1)
+                        req.kv.mamba_pool_idx.unsqueeze(-1)
                     )
                 else:
-                    mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
+                    mamba_value = req.kv.mamba_pool_idx.unsqueeze(-1).clone()
                 mamba_ping_pong_track_buffer_to_keep = None
 
             result = self.insert(
@@ -685,7 +685,7 @@ class MambaRadixCache(BasePrefixCache):
 
         token_ids = req.get_fill_ids()
         cache_len = (
-            req.mamba_last_track_seqlen
+            req.kv.mamba_last_track_seqlen
             if self.enable_mamba_extra_buffer
             else len(token_ids)
         )
@@ -726,7 +726,7 @@ class MambaRadixCache(BasePrefixCache):
                 self.req_to_token_pool.mamba_allocator.free(src_active)
             else:
                 mamba_value_donated = self._commit_int8_checkpoint(
-                    req.mamba_pool_idx.view(-1)
+                    req.kv.mamba_pool_idx.view(-1)
                 )
         elif self.enable_mamba_extra_buffer:
             new_slot = self._alloc_mamba_slot()
@@ -739,7 +739,7 @@ class MambaRadixCache(BasePrefixCache):
             # virtual->physical (identity for the non-unified memory pool) before the copy.
             translate = self.req_to_token_pool.translate_mamba_indices
             self.req_to_token_pool.mamba_pool.copy_from(
-                translate(req.mamba_pool_idx.unsqueeze(0)),
+                translate(req.kv.mamba_pool_idx.unsqueeze(0)),
                 translate(mamba_value_donated),
             )
 
@@ -799,7 +799,7 @@ class MambaRadixCache(BasePrefixCache):
             [new_indices, kv_indices_orig[len(new_indices) :]]
         )
         req.kv.cache_protected_len = len(new_indices)
-        req.mamba_last_track_seqlen = None
+        req.kv.mamba_last_track_seqlen = None
         req.last_node = new_last_node
 
     def pretty_print(self) -> None:
@@ -1179,7 +1179,7 @@ class MambaRadixCache(BasePrefixCache):
 
         # Defer COW to forward stream: record source index, allocate destination
         if cow_mamba and last_node.mamba_value is not None:
-            if req.mamba_pool_idx is None:
+            if not req.kv.holds_mamba:
                 dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
                 if dst_index is None:
                     self.inc_lock_ref(last_node)
@@ -1187,9 +1187,9 @@ class MambaRadixCache(BasePrefixCache):
                     dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
                     self.dec_lock_ref(last_node)
                     assert dst_index is not None, "Can not alloc mamba cache"
-                req.mamba_pool_idx = dst_index[0]
-            req.mamba_cow_src_index = last_node.mamba_value
-            req.mamba_needs_clear = False
+                req.kv.mamba_pool_idx = dst_index[0]
+            req.kv.mamba_cow_src_index = last_node.mamba_value
+            req.kv.mamba_needs_clear = False
 
         value = value[:best_value_len]
         if value:

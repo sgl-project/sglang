@@ -42,6 +42,13 @@ logger = init_logger(__name__)
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
+# Diffusion image tokens make the output of a TP row-parallel projection much
+# larger than the token batches typically seen by the SRT custom all-reduce.
+# Qwen-Image at 1024x1024, for example, reduces 24 MiB tensors. Keep those on
+# the tuned CUDA kernel instead of falling back to NCCL at the default 16 MiB
+# workspace limit.
+_DIFFUSION_CUSTOM_AR_MAX_SIZE = 32 * 1024 * 1024
+
 
 _group_name_counter: dict[str, int] = {}
 
@@ -239,14 +246,33 @@ class GroupCoordinator:
         self.use_custom_op_call = False
 
     def _init_srt_custom_allreduce(self) -> None:
-        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-            CustomAllreduce,
-        )
+        custom_allreduce_kwargs = {
+            "group": self.cpu_group,
+            "device": self.device,
+        }
+        if current_platform.is_cuda():
+            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                dispatch_custom_allreduce,
+            )
+            from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+                CustomAllReduceV2,
+            )
 
-        self.srt_custom_allreduce = CustomAllreduce(
-            group=self.cpu_group,
-            device=self.device,
-        )
+            custom_allreduce_cls = dispatch_custom_allreduce(
+                group=self.cpu_group,
+                device=self.device,
+            )
+            if custom_allreduce_cls is CustomAllReduceV2:
+                custom_allreduce_kwargs["max_size"] = _DIFFUSION_CUSTOM_AR_MAX_SIZE
+        else:
+            # Preserve the existing ROCm and MUSA implementation selection.
+            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                CustomAllreduce,
+            )
+
+            custom_allreduce_cls = CustomAllreduce
+
+        self.srt_custom_allreduce = custom_allreduce_cls(**custom_allreduce_kwargs)
 
     @property
     def first_rank(self):
@@ -374,9 +400,9 @@ class GroupCoordinator:
                 and not custom_ar.disabled
                 and custom_ar.should_custom_ar(input_)
             ):
-                if custom_ar._IS_CAPTURING:
-                    return custom_ar.custom_all_reduce(input_)
-                return custom_ar._all_reduce_impl(input_, registered=False)
+                output = custom_ar.custom_all_reduce(input_)
+                if output is not None:
+                    return output
             if (
                 current_platform.is_cpu()
                 and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
