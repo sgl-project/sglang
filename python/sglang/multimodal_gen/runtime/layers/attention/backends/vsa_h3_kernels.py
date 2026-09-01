@@ -32,7 +32,9 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 VSA_H3_KERNEL_BLOCK = 64
 
 _configs = [
-    triton.Config({}, num_stages=s, num_warps=w) for s in (2, 3, 4) for w in (4, 8)
+    triton.Config({}, num_stages=s, num_warps=w)
+    for s in (2, 3, 4, 5, 6, 7)
+    for w in (4, 8)
 ]
 
 
@@ -180,7 +182,7 @@ def _pack_tiles_kernel(
     valid = src >= 0
     src = tl.where(valid, src, 0).to(tl.int64)
     mask = valid[:, None]
-    inv_size = 1.0 / tl.load(variable_block_sizes + tile).to(tl.float32)
+    size = tl.load(variable_block_sizes + tile).to(tl.float32)
 
     tensor_stride = H.to(tl.int64) * S_PAD * HEAD_DIM
     out_off = (
@@ -194,7 +196,7 @@ def _pack_tiles_kernel(
         other=0.0,
     )
     tl.store(Tiled + out_off, x)
-    tl.store(Pooled + pool_off, tl.sum(x.to(tl.float32), 0) * inv_size)
+    tl.store(Pooled + pool_off, tl.sum(x.to(tl.float32), 0) / size)
 
     x = tl.load(
         K + src[:, None] * stride_k_row + h * stride_k_head + cols[None, :],
@@ -204,7 +206,7 @@ def _pack_tiles_kernel(
     tl.store(Tiled + tensor_stride + out_off, x)
     tl.store(
         Pooled + H * N_TILES * HEAD_DIM + pool_off,
-        tl.sum(x.to(tl.float32), 0) * inv_size,
+        tl.sum(x.to(tl.float32), 0) / size,
     )
 
     x = tl.load(
@@ -215,7 +217,7 @@ def _pack_tiles_kernel(
     tl.store(Tiled + 2 * tensor_stride + out_off, x)
     tl.store(
         Pooled + 2 * H * N_TILES * HEAD_DIM + pool_off,
-        tl.sum(x.to(tl.float32), 0) * inv_size,
+        tl.sum(x.to(tl.float32), 0) / size,
     )
 
     if HAS_GATE:
