@@ -5,7 +5,7 @@ import inspect
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Union
 
 import torch
 
@@ -20,7 +20,12 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, get_int_env_var
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_int_env_var,
+    is_gfx95_supported,
+    is_gfx1250_supported,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
@@ -354,6 +359,103 @@ def _is_mori_dispatch_output(dispatch_output: Any) -> bool:
     # MoriEP{Normal,LL}DispatchOutput carry the post-mori-permute origin_topk_*
     # tensors that the standard DeepEP outputs lack.
     return hasattr(dispatch_output, "origin_topk_ids")
+
+
+class AiterDispatchFormat(str, Enum):
+    """Activation format AITER's MoE will consume; what a dispatcher should send.
+    BF16 doubles as "unknown" -- the receive path always accepts it."""
+
+    MXFP8 = "mxfp8"  # fp8 + group-32 e8m0 scales (a8w4)
+    MXFP4 = "mxfp4"  # packed fp4x2 + group-32 e8m0 scales (a4w4)
+    BF16 = "bf16"  # unquantized
+
+
+class AiterDispatchChoice(NamedTuple):
+    format: AiterDispatchFormat
+    reason: str
+    # A fallback the caller can lift by changing config, and so worth a warning;
+    # the others follow from the hardware or model and would only be noise.
+    actionable: bool = False
+
+
+def resolve_aiter_dispatch_format(
+    weight_dtype: Optional[torch.dtype],
+    activation: str = "silu",
+    swiglu_limit: Optional[float] = None,
+    *,
+    is_gfx95: Optional[bool] = None,
+    is_gfx1250: Optional[bool] = None,
+) -> AiterDispatchChoice:
+    """Which activation format AITER's fused_moe wants for MXFP4 expert weights.
+
+    Mirrors the `q_dtype_a` decision in `aiter/fused_moe.py`, which also depends
+    on the activation, gate mode, arch and token count M. A dispatch format is
+    fixed when the all-to-all buffers are sized and cannot follow M, so this only
+    commits to a compressed format when the answer is M-independent; every other
+    branch answers BF16, which the receive path always accepts.
+
+    Mirroring is a stopgap -- better would be for AITER to expose the resolution.
+    """
+    if weight_dtype != torch.float4_e2m1fn_x2:
+        # Only MXFP4 weights are ambiguous; callers settle the rest themselves.
+        return AiterDispatchChoice(AiterDispatchFormat.BF16, "not MXFP4 weights")
+
+    if is_gfx95 is None:
+        is_gfx95 = is_gfx95_supported()
+
+    if is_gfx1250 is None:
+        is_gfx1250 = is_gfx1250_supported()
+
+    if is_gfx1250:
+        # AITER overrides q_dtype_a after the per_1x32 chain, for every quant
+        # type. fp4 would match, but MoRI EP is unverified on this arch.
+        return AiterDispatchChoice(
+            AiterDispatchFormat.BF16, "gfx1250 overrides the activation dtype"
+        )
+
+    # Mirrors AiterRunnerCore.run: only a clamped-SwiGLU layer sets gate_mode.
+    interleave = bool(swiglu_limit and swiglu_limit > 0) and get_bool_env_var(
+        "SGLANG_USE_AITER_MOE_GU_ITLV", "true"
+    )
+
+    if activation == "situ":
+        # AITER resolves this before the INTERLEAVE branch; never M-dependent.
+        if get_bool_env_var("AITER_SITUV2_A8W4", "false"):
+            return AiterDispatchChoice(AiterDispatchFormat.MXFP8, "SiTUv2 a8w4")
+        if get_bool_env_var("AITER_SITUV2_A4W4", "false"):
+            return AiterDispatchChoice(AiterDispatchFormat.MXFP4, "SiTUv2 a4w4")
+        return AiterDispatchChoice(AiterDispatchFormat.BF16, "SiTUv2 a16w4")
+
+    if activation == "swiglu" and not interleave:
+        # `bf16 if M < GPTOSS_SWIGLU_MXFP4_BF16_BOUND else fp4x2` -- M-dependent.
+        return AiterDispatchChoice(
+            AiterDispatchFormat.BF16, "SwiGLU on SEPARATED varies with batch size"
+        )
+
+    if activation == "swiglu" or interleave:
+        # `bf16 if gfx != gfx950 or M < AITER_BF16_FP8_MOE_BOUND else fp8`;
+        # only a bound of 0 or 1 removes the M dependency. AITER matches gfx950
+        # exactly while is_gfx95_supported() is a prefix test, so a future gfx95x
+        # that AITER has not adopted would be read as capable here.
+        bound = get_int_env_var("AITER_BF16_FP8_MOE_BOUND", 256)
+        if not is_gfx95:
+            return AiterDispatchChoice(
+                AiterDispatchFormat.BF16, "MoE takes bf16 activations off gfx95"
+            )
+        if bound > 1:
+            return AiterDispatchChoice(
+                AiterDispatchFormat.BF16,
+                "MoE activation dtype varies with batch size "
+                f"(AITER_BF16_FP8_MOE_BOUND={bound}); set it to 0 to pin fp8 and "
+                "allow mxfp8 dispatch",
+                actionable=True,
+            )
+        return AiterDispatchChoice(
+            AiterDispatchFormat.MXFP8, "MoE consumes mxfp8 (a8w4)"
+        )
+
+    # Plain activation + SEPARATED: AITER falls through to fp4x2 for any M.
+    return AiterDispatchChoice(AiterDispatchFormat.MXFP4, "MoE consumes fp4x2 (a4w4)")
 
 
 def _resolve_mori_quant_type(

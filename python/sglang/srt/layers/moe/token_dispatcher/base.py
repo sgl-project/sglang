@@ -408,3 +408,21 @@ class BaseDispatcher(ABC):
     def clear_overlap_args(self) -> None:
         self.overlap_args = None
         self.meta_overlap_args = None
+
+
+def build_dispatcher_quant_config(
+    layer: torch.nn.Module, weight_dtype: Optional[torch.dtype]
+) -> dict:
+    """Describe a MoE layer's numerics to its dispatcher.
+
+    For MXFP4 weights the wire format also depends on the activation and gate
+    mode, so ``weight_dtype`` alone is not enough. ``weight_dtype`` is semantic,
+    not storage: MXFP4 is stored as uint8 but reported as float4_e2m1fn_x2.
+    Consumers must tolerate the other two keys being absent.
+    """
+    runner_config = getattr(layer, "moe_runner_config", None)
+    return {
+        "weight_dtype": weight_dtype,
+        "activation": getattr(runner_config, "activation", "silu"),
+        "swiglu_limit": getattr(runner_config, "swiglu_limit", None),
+    }
