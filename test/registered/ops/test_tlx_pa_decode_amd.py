@@ -1,6 +1,9 @@
 """Correctness coverage for the TLX vectorized-5D decode adapter."""
 
 import os
+import subprocess
+import sys
+import textwrap
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -19,7 +22,16 @@ class TestTlxPagedDecodeAmd(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         try:
-            from triton.language.extra.tlx.ops.amd_pa_decode import build_inputs
+            try:
+                from fbtriton.language.extra.tlx.ops.amd_pa_decode import (
+                    build_inputs,
+                )
+            except ImportError:
+                # Compatibility with the current replacement-style fbtriton
+                # wheel, before namespaced coexistence wheels are published.
+                from triton.language.extra.tlx.ops.amd_pa_decode import (
+                    build_inputs,
+                )
 
             import sglang.srt.layers.attention.tlx_utils as tlx_utils
             from sglang.srt.layers.attention.aiter_utils import (
@@ -52,6 +64,21 @@ class TestTlxPagedDecodeAmd(unittest.TestCase):
             else:
                 os.environ["SGLANG_AITER_5D_DECODE_BACKEND"] = previous
 
+    def test_gluon_mode_does_not_import_fbtriton(self):
+        source = textwrap.dedent(
+            """
+            import sys
+            from sglang.srt.layers.attention import tlx_utils
+
+            assert "fbtriton" not in sys.modules
+            assert not tlx_utils.should_use_tlx_decode(
+                "gluon", None, None, None, None, None, None, None
+            )
+            assert "fbtriton" not in sys.modules
+            """
+        )
+        subprocess.run([sys.executable, "-c", source], check=True)
+
     def test_tlx_matches_gluon_and_supports_graph_capture(self):
         for page_size in (16, 64):
             with self.subTest(page_size=page_size):
@@ -71,8 +98,10 @@ class TestTlxPagedDecodeAmd(unittest.TestCase):
                     kv_cache_dtype=k_cache.dtype,
                     k_scale=None,
                     v_scale=None,
+                    page_size=page_size,
                     forward_metadata=SimpleNamespace(
                         kv_indices=block_tables,
+                        kv_indptr=None,
                         swa_page_table=None,
                         max_kv_len=context,
                     ),
@@ -100,9 +129,32 @@ class TestTlxPagedDecodeAmd(unittest.TestCase):
                 repeated = self._run_wrapper(
                     "tlx", backend, q, layer, forward_batch, k_cache, v_cache
                 )
-
                 torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
                 self.assertTrue(torch.equal(actual, repeated))
+
+                # Real non-unified SGLang decode supplies a flattened list of
+                # token slots.  Exercise the adapter's one-time conversion to
+                # the block-level page table consumed by TLX.
+                token_in_page = torch.arange(
+                    page_size, dtype=torch.int32, device=block_tables.device
+                )
+                flat_token_slots = (
+                    block_tables[..., None] * page_size + token_in_page
+                ).reshape(-1)
+                backend.forward_metadata = SimpleNamespace(
+                    kv_indices=flat_token_slots,
+                    kv_indptr=torch.tensor(
+                        [0, context], dtype=torch.int32, device=block_tables.device
+                    ),
+                    swa_page_table=None,
+                    max_kv_len=context,
+                )
+                flat_actual = self._run_wrapper(
+                    "tlx", backend, q, layer, forward_batch, k_cache, v_cache
+                )
+                torch.testing.assert_close(
+                    flat_actual, expected, rtol=2e-2, atol=2e-2
+                )
                 workspaces = list(backend._tlx_pa_decode_workspaces.values())
                 self.assertEqual(len(workspaces), 1)
                 self.assertEqual(workspaces[0][0].stride(-2), head_dim + 4)
