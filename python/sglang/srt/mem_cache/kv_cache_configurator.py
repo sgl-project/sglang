@@ -408,24 +408,12 @@ class KVCacheConfigurator:
         # from one byte buffer, then return. Gated to the target worker
         # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
         if get_memory().enable_unified_memory and req_to_token_pool is None:
-            pd_enabled = get_disagg().disaggregation_mode != "null"
             is_dsv4 = is_deepseek_v4(self.model_config.hf_config)
             # Order matters: an Inkling-class model is BOTH mambaish and
             # hybrid-SWA, and the mamba pair would store every SWA layer's KV at
             # FULL lifetime -- its branch reads the HF config's
             # full_attention_layer_ids, which for Inkling is ALL layers.
             if self.mambaish_config is not None and self.is_hybrid_swa and not is_dsv4:
-                if pd_enabled:
-                    # Same limitation as the 2-pool SWA branch below: the
-                    # tri-pool carries an SWA sub-pool, and there is no
-                    # whole-envelope transfer scheme for it.
-                    raise ValueError(
-                        "--enable-unified-memory with PD disaggregation does "
-                        "not support hybrid-SWA models yet (no whole-envelope "
-                        "transfer scheme for the SWA sub-pool); this model "
-                        "routes to the mamba+SWA tri-pool, which has one. Drop "
-                        "--enable-unified-memory or run without PD."
-                    )
                 bundle = self._init_unified_mamba_swa_pools(
                     max_num_reqs=sizes.max_running_requests,
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
@@ -773,6 +761,13 @@ class KVCacheConfigurator:
             unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
             # bs=1 feasibility floor input (context len is already passed).
             sliding_window_size=self.model_config.sliding_window_size,
+            # Decode nodes hand out request rows to PREALLOCATED transfers on
+            # top of the running set; the 2-pool mamba factory takes the same.
+            decode_pre_alloc_size=(
+                get_disagg().disaggregation_decode_extra_slots
+                if get_disagg().disaggregation_mode == "decode"
+                else 0
+            ),
         )
 
     def _init_unified_swa_pools(

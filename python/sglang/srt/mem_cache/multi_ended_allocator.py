@@ -3475,6 +3475,74 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
             return out_indices  # virtual TOKEN ids
 
+    def alloc_extend_swa_tail(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        swa_tail_len: int,
+    ) -> Optional[torch.Tensor]:
+        """Decode-node prealloc: full KV for the whole sequence, sliding-window
+        KV for the live window tail only.
+
+        The static composite allocates the two sides independently and records
+        a full->swa index mapping. That is not representable here: the two
+        sides SHARE one virtual id space (a virtual page names a full-physical
+        page and, if bound, a swa-physical one), which is why
+        `set_full_to_swa_mapping` is a no-op on this allocator and
+        `translate_loc_from_full_to_swa` derives the swa id from the virtual id
+        instead of a table. Running the static body would call `alloc_extend`
+        on the swa sub-allocator, which asserts it is not the id owner.
+
+        The tail is expressed by binding swa for the TAIL's virtual pages only.
+        A new page left unbound has no swa-physical page, which reads as the
+        sink and is skipped by `free`'s `swa_v2p_page > 0` mask -- exactly the
+        out-of-window state the ratchet produces via `free_swa`.
+
+        Admission is priced at the FULL side's page count, as plain
+        `alloc_extend` is: pessimistic when the tail is short, but it reuses
+        the composite's audited joint capacity path, and the bytes actually
+        held still follow the tail.
+        """
+        assert len(prefix_lens_cpu) == 1
+        assert 0 <= swa_tail_len <= extend_num_tokens
+        with record_function("UnifiedSWAAlloc.alloc_extend_swa_tail"):
+            ps = self.page_size
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu, page_size=ps, prefix_lens=prefix_lens_cpu
+            )
+            need_tokens = num_new_pages * ps
+            if need_tokens > self.available_size():
+                if not _relieve_for_alloc(self, need_tokens):
+                    return None
+
+            fa = self.full_attn_allocator
+            new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
+            out_indices = fa.alloc_extend(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+                num_new_pages=num_new_pages,
+            )
+            assert out_indices is not None, (
+                "UnifiedSWA.alloc_extend_swa_tail: full.alloc_extend returned "
+                "None after joint pre-check passed — internal-state inconsistency"
+            )
+            if swa_tail_len > 0 and new_virtual_pages.numel() > 0:
+                tail_pages = torch.unique(out_indices[-swa_tail_len:] // ps)
+                # Only NEW pages need binding; a tail page carried in from the
+                # prefix is already bound on the swa side.
+                to_bind = new_virtual_pages[torch.isin(new_virtual_pages, tail_pages)]
+                if to_bind.numel() > 0:
+                    self.swa_attn_allocator.alloc_with_virtual(to_bind)
+            return out_indices  # virtual TOKEN ids
+
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,
@@ -3899,6 +3967,17 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
             else:
                 hi_n = mid - 1
         return lo_n * self.page_size
+
+    def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
+        """Install the PD move gate on ALL THREE members.
+
+        The 2-pool override reaches full and swa only; the mamba end compacts
+        independently and its slot envelopes are transferred as
+        `StateType.MAMBA`, so leaving it ungated would let a conv/SSM slot
+        relocate under an in-flight state transfer.
+        """
+        super().set_disagg_move_gate(gate)
+        self.mamba_allocator.disagg_move_gate = gate
 
     def _flush_targets(self):
         """All three members, same reasoning as the 2-pool pair with one

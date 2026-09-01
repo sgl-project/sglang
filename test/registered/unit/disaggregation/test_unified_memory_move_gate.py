@@ -197,10 +197,16 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
     An AST-level check because instantiating these composites needs a GPU.
     """
 
+    # Composites that own the full-side virtual ids and so must define the
+    # transfer translate themselves.
     _COMPOSITES = (
         "UnifiedMambaTokenToKVPoolAllocator",
         "UnifiedSWATokenToKVPoolAllocator",
     )
+    # Every composite must define the gate setter, including the tri-pool,
+    # which inherits the SWA translates (same full side) but has a THIRD
+    # member the 2-pool setter does not reach.
+    _GATE_COMPOSITES = _COMPOSITES + ("UnifiedMambaSWATokenToKVPoolAllocator",)
 
     @staticmethod
     def _own_methods(cls_name: str) -> Set[str]:
@@ -230,7 +236,7 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 )
 
     def test_move_gate_setter_is_defined(self):
-        for name in self._COMPOSITES:
+        for name in self._GATE_COMPOSITES:
             with self.subTest(composite=name):
                 self.assertIn(
                     "set_disagg_move_gate",
