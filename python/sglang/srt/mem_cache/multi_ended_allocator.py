@@ -3776,7 +3776,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             assert len(seq_lens_cpu) == len(prefix_lens_cpu) == 1
             prefix_len = int(prefix_lens_cpu[0])
             seq_len = int(seq_lens_cpu[0])
-            assert seq_len - prefix_len == extend_num_tokens
             assert 0 <= swa_tail_len <= extend_num_tokens
             tail_start = seq_len - swa_tail_len
             assert prefix_len <= tail_start

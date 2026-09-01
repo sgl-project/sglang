@@ -203,11 +203,12 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "--enable-unified-memory with PD disaggregation does not support "
             "pipeline parallelism (--pp-size > 1)."
         )
-        # Constraints of the whole-envelope transfer; see
-        # UnifiedMLATokenToKVPool.get_contiguous_buf_infos.
-        assert cfg.disaggregation_transfer_backend == "mooncake", (
-            "--enable-unified-memory with PD disaggregation supports only "
-            "the mooncake transfer backend; got "
+        # Constraints of the whole-envelope transfer; see the unified MHA and
+        # MLA pool get_contiguous_buf_infos implementations.
+        supported_backends = server_args._unified_memory_pd_transfer_backends()
+        assert cfg.disaggregation_transfer_backend in supported_backends, (
+            "--enable-unified-memory with PD disaggregation supports only these "
+            f"transfer backends: {', '.join(sorted(supported_backends))}; got "
             f"{cfg.disaggregation_transfer_backend!r}."
         )
         assert not (

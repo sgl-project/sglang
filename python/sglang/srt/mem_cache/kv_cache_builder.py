@@ -150,10 +150,8 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             if tp_worker.is_hybrid_swa
             else None
         )
-        # Unified page-envelope host pools are enabled by a separate feature.
-        # Until then, keep decode retraction on the direct CPU-tensor backup.
-        # Host-pool retraction transfers full and sliding-window components
-        # only, so a model with recurrent state stays on cpu_tensor.
+        # Host-pool retraction does not address unified page envelopes or
+        # recurrent state, so those configurations stay on cpu_tensor.
         supports_host_pool = (
             not memory.enable_unified_memory
             and not uses_ssm_state(tp_worker.model_runner.model_config)

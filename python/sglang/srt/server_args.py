@@ -3779,6 +3779,9 @@ class ServerArgs:
     # _handle_page_major_kv_layout); the model-family gate is enforced at pool
     # construction in model_runner_kv_cache_mixin._init_pools.
 
+    def _unified_memory_pd_transfer_backends(self) -> set[str]:
+        return {"mooncake"}
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
