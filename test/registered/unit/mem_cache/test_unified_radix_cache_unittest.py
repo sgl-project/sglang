@@ -4955,9 +4955,7 @@ class UnifiedRadixCacheSuite:
     def _fill_full_kv(self, allocator, indices, marker):
         kv_pool = self._get_full_kv_pool(allocator)
         layer_id = kv_pool.start_layer
-        # Assign through __setitem__: `buf[indices]` is an advanced-index copy,
-        # so `.fill_()` on it leaves the pool untouched and every bytes-match
-        # assertion downstream compares zeros to zeros.
+        # `buf[indices]` is an advanced-index copy — assign, never `fill_()`.
         kv_pool.get_key_buffer(layer_id)[indices] = marker
         kv_pool.get_value_buffer(layer_id)[indices] = marker + 1
 
@@ -4974,7 +4972,6 @@ class UnifiedRadixCacheSuite:
             return
         mamba_indices = indices.reshape(-1)
         mamba_cache = req_to_token_pool.mamba_pool.mamba_cache
-        # See _fill_full_kv: assign, never fill_ an advanced-index copy.
         mamba_cache.temporal[:, mamba_indices] = marker
         for offset, conv_buf in enumerate(mamba_cache.conv, start=1):
             conv_buf[:, mamba_indices] = marker + offset
