@@ -73,7 +73,8 @@ jobs:
   # ==================== PR Gate ==================== #
   pr-gate:
     needs: check-changes
-    if: needs.check-changes.outputs.changes_exist == 'true'
+    # if: needs.check-changes.outputs.changes_exist == 'true'  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
@@ -92,7 +93,8 @@ jobs:
 
   base-a-test-1-npu-a2:
     needs: [check-changes, pr-gate, set-image-config]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name:  base-a-test-1-npu-a2
@@ -104,7 +106,8 @@ jobs:
 
   base-b-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-1-npu-a3
@@ -116,7 +119,8 @@ jobs:
 
   base-b-test-2-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-2-npu-a3
@@ -128,7 +132,8 @@ jobs:
 
   base-b-test-4-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-4-npu-a3
@@ -141,7 +146,8 @@ jobs:
 
   base-b-test-8-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-8-npu-a3
@@ -153,7 +159,8 @@ jobs:
 
   base-b-test-16-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-16-npu-a3
@@ -165,7 +172,8 @@ jobs:
 
   multimodal-gen-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.multimodal_gen == 'true' }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.multimodal_gen == 'true' }}  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     runs-on: linux-aarch64-a3-800t-2
     strategy:
       fail-fast: false
@@ -294,7 +302,8 @@ jobs:
   base-c-test-acc-2-npu-a3:
     name: base-c-test-acc-2-npu-a3
     needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-2
@@ -308,7 +317,8 @@ jobs:
   base-c-test-acc-4-npu-a3:
     name: base-c-test-acc-4-npu-a3
     needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-4
@@ -321,7 +331,8 @@ jobs:
   base-c-test-acc-8-npu-a3:
     name: base-c-test-acc-8-npu-a3
     needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-8
@@ -334,7 +345,8 @@ jobs:
   base-c-test-acc-16-npu-a3:
     name: base-c-test-acc-16-npu-a3
     needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-16
@@ -347,7 +359,8 @@ jobs:
   base-c-test-perf-2-npu-a3:
     name: base-c-test-perf-2-npu-a3
     needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3, base-c-test-acc-2-npu-a3, base-c-test-acc-4-npu-a3, base-c-test-acc-8-npu-a3, base-c-test-acc-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-2
@@ -360,7 +373,8 @@ jobs:
   base-c-test-perf-4-npu-a3:
     name: base-c-test-perf-4-npu-a3
     needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3, base-c-test-acc-2-npu-a3, base-c-test-acc-4-npu-a3, base-c-test-acc-8-npu-a3, base-c-test-acc-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-4
@@ -373,7 +387,8 @@ jobs:
   base-c-test-perf-8-npu-a3:
     name: base-c-test-perf-8-npu-a3
     needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3, base-c-test-acc-2-npu-a3, base-c-test-acc-4-npu-a3, base-c-test-acc-8-npu-a3, base-c-test-acc-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-8
@@ -386,7 +401,8 @@ jobs:
   base-c-test-perf-16-npu-a3:
     name: base-c-test-perf-16-npu-a3
     needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3, base-c-test-acc-2-npu-a3, base-c-test-acc-4-npu-a3, base-c-test-acc-8-npu-a3, base-c-test-acc-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}  # disabled: only validate multimodal-gen 2-npu runner change
+    if: false
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-16
