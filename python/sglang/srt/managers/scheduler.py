@@ -1549,6 +1549,11 @@ class Scheduler(
                 self.draft_worker.get_confidence_budget_prepare()
             )
 
+        # If enable async D2H copy when overlap is enabled
+        # Currently used by NVIDIA Confidential Computing (CC) only
+        self.enable_async_d2h_copy = False
+        self.async_d2h_worker = None
+
         if use_mlx():
             # MLX uses its own overlap loop and does not create CUDA streams,
             # but the normal non-overlap scheduler path still relays decode
@@ -1573,7 +1578,6 @@ class Scheduler(
         # forced synchronous and blocks the scheduler thread at issue, serializing the
         # overlap pipeline. Offload it to a worker thread (AsyncD2HCopyWorker).
         self.enable_async_d2h_copy = is_confidential_compute()
-        self.async_d2h_worker = None
         if self.enable_async_d2h_copy:
             from sglang.srt.managers.async_d2h_copy_worker import AsyncD2HCopyWorker
 
@@ -5505,7 +5509,7 @@ def run_scheduler_process(
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
             # Stop the async D2H copy worker thread if any.
-            if getattr(scheduler, "async_d2h_worker", None) is not None:
+            if scheduler.async_d2h_worker is not None:
                 scheduler.async_d2h_worker.shutdown()
                 scheduler.async_d2h_worker = None
             # Graceful path only: on the exception path the GPU may be wedged
