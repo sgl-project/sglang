@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Dense MLA views for the unified memory pool (MLA-hybrid-Mamba, Kimi K3).
+"""MLA views for the unified memory pool (MLA-hybrid-Mamba, Kimi K3).
 
 Covers, CPU-only (pure torch — no GPU / Triton kernels):
   - `MLASubPoolSpec` byte math;
@@ -23,7 +23,7 @@ Covers, CPU-only (pure torch — no GPU / Triton kernels):
     only, and the reserved sink floor covers the whole page-0 envelope;
   - `UnifiedMLATokenToKVPool`: buffer wiring, V-as-prefix-slice, and the
     page-envelope `move_kv_cache` (REAL physical token ids, page-major runs);
-  - `MultiEndedAllocator.translate_kv_loc_for_kernel`: dense = v2p-page * (ps*L) +
+  - `MultiEndedAllocator.translate_kv_loc_for_kernel`: kernel id = v2p-page * (ps*L) +
     offset, tombstone clamp to the sink, `out=` contract, multiplier-1
     fallback, and correctness across eager compaction.
 
@@ -129,7 +129,7 @@ class TestMLASubPoolSpec(unittest.TestCase):
             )
 
 
-class TestDenseMLAViews(unittest.TestCase):
+class TestMLAViews(unittest.TestCase):
     def _make_raw(self, ps, num_pages, pad_pages=1):
         page_bytes = ps * _L * _D * _ITEM
         raw = torch.zeros(
@@ -270,7 +270,7 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
             self.assertTrue(torch.all(env[dst_pages[0]] == 7), f"ps={ps}")
             self.assertTrue(torch.all(env[dst_pages[1]] == 9), f"ps={ps}")
 
-    def test_move_then_dense_readback(self):
+    def test_move_then_readback(self):
         ps = 4
         pool, kv_pool = self._make(ps=ps)
         num_pages = pool.max_slots("full") // ps
@@ -302,7 +302,7 @@ class _FakeKVCache:
         self.buf[dst_loc] = self.buf[src_loc].clone()
 
 
-class TestTranslateKvLocDense(unittest.TestCase):
+class TestTranslateKvLocForKernel(unittest.TestCase):
     def _build(self, ps=1, n_full_tokens=64, multiplier=_L):
         pool, full, mamba = _make_unified(page_size=ps, n_full_tokens=n_full_tokens)
         full_alloc = MultiEndedAllocator(
@@ -325,30 +325,30 @@ class TestTranslateKvLocDense(unittest.TestCase):
         mamba_alloc.bind_peer(full_alloc)
         return full_alloc
 
-    def test_dense_matches_formula_ps1(self):
+    def test_kernel_id_matches_formula_ps1(self):
         alloc = self._build(ps=1)
         v = alloc.alloc(8)
         self.assertIsNotNone(v)
         phys = alloc.translate_kv_loc(v)
-        dense = alloc.translate_kv_loc_for_kernel(v)
-        self.assertTrue(torch.all(dense == phys * _L))
+        kernel = alloc.translate_kv_loc_for_kernel(v)
+        self.assertTrue(torch.all(kernel == phys * _L))
 
-    def test_dense_matches_formula_paged(self):
+    def test_kernel_id_matches_formula_paged(self):
         ps = 4
         alloc = self._build(ps=ps)
         v = alloc.alloc(3 * ps)
         self.assertIsNotNone(v)
         phys = alloc.translate_kv_loc(v)
-        dense = alloc.translate_kv_loc_for_kernel(v)
+        kernel = alloc.translate_kv_loc_for_kernel(v)
         expected = (phys // ps) * (ps * _L) + phys % ps
-        self.assertTrue(torch.all(dense == expected))
+        self.assertTrue(torch.all(kernel == expected))
 
     def test_tombstone_clamps_to_sink(self):
         alloc = self._build(ps=1)
         # never-allocated virtual ids -> v2p == -1 -> kernel-facing id 0
         virt = torch.tensor([alloc.min_slot_index + 1], dtype=torch.int64)
-        dense = alloc.translate_kv_loc_for_kernel(virt)
-        self.assertTrue(torch.all(dense == 0))
+        kernel = alloc.translate_kv_loc_for_kernel(virt)
+        self.assertTrue(torch.all(kernel == 0))
 
     def test_out_matches_and_aliases(self):
         for ps in (1, 4):
@@ -373,7 +373,7 @@ class TestTranslateKvLocDense(unittest.TestCase):
             torch.all(alloc.translate_kv_loc_for_kernel(v) == alloc.translate_kv_loc(v))
         )
 
-    def test_dense_follows_compaction(self):
+    def test_kernel_id_follows_compaction(self):
         alloc = self._build(ps=1)
         a = alloc.alloc(4)
         b = alloc.alloc(4)

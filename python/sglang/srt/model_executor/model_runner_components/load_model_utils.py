@@ -236,16 +236,13 @@ def build_load_config(
 def maybe_enable_ipc_weight_cache(
     *,
     load_config: LoadConfig,
-    tp_size: int,
-    pp_rank: int,
-    tp_rank: int,
 ) -> None:
     """Switch ``load_config`` onto the IPC weight-cache path, in place.
 
     Overrides the load format to ``IPC_CACHE`` (remembering the original as the
-    disk fallback) and derives the per-rank daemon socket if unset. Idempotent:
-    the format swap is guarded on ``!= IPC_CACHE`` so a second call (e.g. a
-    weight reload) can't overwrite the captured fallback format.
+    disk fallback). Idempotent: the format swap is guarded on ``!= IPC_CACHE``
+    so a second call (e.g. a weight reload) can't overwrite the captured
+    fallback format.
     """
     if get_model().weight_cache_mode == "off":
         return
@@ -253,17 +250,6 @@ def maybe_enable_ipc_weight_cache(
     if load_config.load_format != LoadFormat.IPC_CACHE:
         load_config.fallback_load_format = load_config.load_format
         load_config.load_format = LoadFormat.IPC_CACHE
-
-    # Compute socket path using global rank (tp_size * pp_rank + tp_rank) so
-    # each daemon has a unique socket even across PP stages and nodes.
-    if load_config.weight_cache_socket is None:
-        from sglang.srt.weight_cache.protocol import (
-            compute_global_rank,
-            get_socket_path,
-        )
-
-        global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-        load_config.weight_cache_socket = get_socket_path(global_rank=global_rank)
 
 
 def load_model_with_memory_saver(
