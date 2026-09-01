@@ -4,8 +4,8 @@ import json
 import logging
 import threading
 import time
-import weakref
 from typing import TYPE_CHECKING
+from weakref import WeakKeyDictionary as WeakKeyDict
 
 import torch
 
@@ -96,12 +96,8 @@ class DecodeKVCacheOffloadManager:
         self.ongoing_backup = {}
         # Keyed by Req identity (rids can be reused while a D2H copy is still
         # in flight); weak keys so a dropped Req is never pinned here.
-        self.offloaded_state: weakref.WeakKeyDictionary[Req, OffloadedState] = (
-            weakref.WeakKeyDictionary()
-        )
-        self.offload_inflight: weakref.WeakKeyDictionary[Req, int] = (
-            weakref.WeakKeyDictionary()
-        )
+        self.offloaded_state: WeakKeyDict[Req, OffloadedState] = WeakKeyDict()
+        self.offload_inflight: WeakKeyDict[Req, int] = WeakKeyDict()
         logger.info("Enable offload kv cache for decode side")
 
     def release_host_resources(self) -> None:

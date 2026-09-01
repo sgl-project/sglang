@@ -9,8 +9,8 @@ Requires: torch, sglang (run in an environment with sglang installed)
 
 import gc
 import unittest
-import weakref
 from unittest.mock import MagicMock
+from weakref import WeakKeyDictionary as WeakKeyDict
 
 import torch
 
@@ -71,10 +71,10 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager.token_to_kv_pool_allocator = allocator
     manager.page_size = page_size
     manager.tree_cache = tree_cache
-    manager.offloaded_state = weakref.WeakKeyDictionary()
+    manager.offloaded_state = WeakKeyDict()
     manager.ongoing_offload = {}
     manager.ongoing_backup = {}
-    manager.offload_inflight = weakref.WeakKeyDictionary()
+    manager.offload_inflight = WeakKeyDict()
 
     return manager, freed_indices
 
