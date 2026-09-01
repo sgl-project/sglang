@@ -853,6 +853,7 @@ PERF_BASELINE_FILE_BY_PLATFORM = {
     "h100": "h100.json",
     "b200": "b200.json",
     "5090": "5090.json",
+    "xpu_b60": "xpu_b60.json",
 }
 PERF_BASELINE_PLATFORM_ALIASES = {
     "sm90": "h100",
@@ -864,6 +865,8 @@ PERF_BASELINE_PLATFORM_ALIASES = {
     "sm120": "5090",
     "rtx5090": "5090",
     "5090": "5090",
+    "xpu": "xpu_b60",
+    "bmg": "xpu_b60",
 }
 
 
@@ -883,6 +886,8 @@ def get_perf_baseline_platform() -> str:
     override = os.getenv(PERF_BASELINE_PLATFORM_ENV)
     if override:
         return _normalize_perf_baseline_platform(override)
+    if current_platform.is_xpu():
+        return "xpu_b60"
     if current_platform.is_sm120():
         return "5090"
     if current_platform.is_blackwell():
@@ -897,6 +902,14 @@ def get_perf_baseline_path(platform: str | None = None) -> Path:
         else get_perf_baseline_platform()
     )
     return PERF_BASELINE_DIR / PERF_BASELINE_FILE_BY_PLATFORM[baseline_platform]
+
+
+def get_perf_baseline_update_path() -> Path:
+    if current_platform.is_npu():
+        return Path(__file__).parent / "ascend" / "perf_baselines_npu.json"
+    if current_platform.is_musa():
+        return Path(__file__).parent / "musa" / "perf_baselines_musa.json"
+    return get_perf_baseline_path()
 
 
 def _make_modelopt_ci_case(

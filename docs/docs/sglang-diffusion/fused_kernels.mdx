@@ -66,6 +66,7 @@ These fusion families mount under `quality="high"`:
 | LTX-2 RMSNorm + modulate | `rms_norm(x) * (1 + scale) + shift` in one launch |
 | Gate RMSNorm (BF16-native) | `RMSNorm + tanh + mul + add` in one pass |
 | HunyuanVideo strided QK RMSNorm | Per-head QK RMSNorm over the packed QKV layout |
+| LingBot Video fused RMSNorm | Replaces the handwritten cast, square, mean, rsqrt, and multiply chain with existing Triton RMSNorm kernels |
 | SANA-Video BF16-input linear attention | Keeps the first linear-attention GEMM's inputs in BF16 with FP32 accumulation/output; the second GEMM remains FP32 |
 
 ## Kernel inventory
@@ -156,6 +157,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | LTX-2 | QK-norm + split RoPE, ada-values split, RMSNorm+modulate, modulate, residual-gate add, linear+GELU |
 | LTX-2.5 decoder | paired 3D RoPE with shared axis-table cache |
 | HunyuanVideo | QKV+RoPE pack, strided QK RMSNorm, linear+GELU |
+| LingBot Video MoE | Fused RMSNorm at `quality=high` |
 | Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
 | SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; LN+modulate, GLUMB bias+SiLU / bias+GLU, and residual-gate add during BCG; BF16-input linear attention at `quality=high` |
 | Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |

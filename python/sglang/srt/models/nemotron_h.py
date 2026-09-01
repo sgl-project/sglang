@@ -833,6 +833,7 @@ class NemotronHModel(nn.Module):
             self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         else:
             self.norm_f = PPMissingLayer(return_tuple=True)
+        self.layers_to_capture: set[int] = set()
 
     def forward(
         self,
@@ -853,7 +854,17 @@ class NemotronHModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                if residual is not None and getattr(
+                    hidden_states, "_sglang_needs_allreduce_fusion", False
+                ):
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                    hidden_states._sglang_needs_allreduce_fusion = False
+                aux_hidden_states.append(
+                    hidden_states if residual is None else hidden_states + residual
+                )
             layer = self.layers[i]
             if not isinstance(layer, Layers):
                 raise ValueError(f"Unknown layer type: {type(layer)}")
@@ -867,7 +878,18 @@ class NemotronHModel(nn.Module):
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
+        if self.end_layer in self.layers_to_capture:
+            if residual is not None and getattr(
+                hidden_states, "_sglang_needs_allreduce_fusion", False
+            ):
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states._sglang_needs_allreduce_fusion = False
+            aux_hidden_states.append(
+                hidden_states if residual is None else hidden_states + residual
+            )
         hidden_states, _ = self.norm_f(hidden_states, residual)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
@@ -962,6 +984,7 @@ class NemotronHForCausalLM(nn.Module):
                 self.lm_head.weight.copy_(emb_token_weight)
 
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     def _init_model(
         self,
@@ -1082,9 +1105,16 @@ class NemotronHForCausalLM(nn.Module):
         hidden_states = self.model.forward(
             input_ids, positions, forward_batch, pp_proxy_tensors, input_embeds
         )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
         if self.pp_group.is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
             )
         else:
             return hidden_states
@@ -1105,6 +1135,17 @@ class NemotronHForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = {layer_id + 1 for layer_id in layer_ids}
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
