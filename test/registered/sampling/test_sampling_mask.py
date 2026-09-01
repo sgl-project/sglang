@@ -9,7 +9,7 @@ import torch
 from sglang.srt.layers import sampler as sampler_module
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -41,6 +41,7 @@ class TestSamplingMaskCapture(CustomTestCase):
         self.sampler = Sampler.__new__(Sampler)
         torch.nn.Module.__init__(self.sampler)
 
+    @unittest.skipIf(is_hip(), "FlashInfer is not available on ROCm")
     def test_flashinfer_joint_cutoff_ties_match_capture(self):
         batch_size = 256
         top_k = 2
@@ -96,6 +97,7 @@ class TestSamplingMaskCapture(CustomTestCase):
             bool(actual_support.gather(1, sampled.view(-1, 1)).all().item())
         )
 
+    @unittest.skipIf(is_hip(), "FlashInfer is not available on ROCm")
     def test_flashinfer_capture_only_materializes_requested_rows(self):
         batch_size = 4
         top_k = 2
