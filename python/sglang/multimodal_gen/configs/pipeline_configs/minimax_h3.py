@@ -88,11 +88,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             speed_mode_enable_torch_compile_by_default=False,
-            # 61.73 GB of DiT weights. Every card that is not part of a
-            # 4xH200 set has to stream them, so the DiT has to be eligible for
-            # automatic layerwise offload -- the default here is an empty tuple,
-            # which makes the gate in _should_auto_enable_dit_layerwise_offload
-            # always false and leaves the DiT resident until it fails to load.
+            # Keep the 61.73 GB DiT eligible for automatic layerwise offload
+            # when the deployment does not meet the resident-memory threshold.
             dit_layerwise_offload_modes=("auto", "memory"),
             keep_resident_min_available_gb=120,
             keep_resident_components=("dit", "text_encoder", "vae"),
@@ -133,8 +130,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def validate_quality_deployment(
         self, server_args, *, task: str | None = None
     ) -> None:
-        """Fail closed unless the resident server matches the deployment
-        audited for quality="high"."""
+        """Fail closed unless the resident server matches the released
+        quality="high" deployment contract."""
 
         attention_backend = self._server_arg_value(server_args.attention_backend)
         attention_backend = (

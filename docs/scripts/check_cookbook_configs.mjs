@@ -297,6 +297,12 @@ for (const path of walk(CONFIGS)) {
           }
         }
       };
+      const checkH3Request = (label, extra, expected) => {
+        const resolved = validateResolved(selectionOf(extra), `H3 ${label}`);
+        if (resolved?.builder.verification?.request !== expected) {
+          fail(where, `H3 ${label} request verification=${resolved?.builder.verification?.request}, expected ${expected}`);
+        }
+      };
       checkH3("B200 1x8", { hw: "b200", nodes: 1, gpus_per_node: 8, placement: "resident" }, { tp_size: 1, ulysses_degree: 8, ring_degree: 1 });
       checkH3("H100 1x4", { hw: "h100", nodes: 1, gpus_per_node: 4, placement: "resident" }, { tp_size: 2, ulysses_degree: 2, ring_degree: 1 });
       checkH3("H200 2x8", { hw: "h200", nodes: 2, gpus_per_node: 8, placement: "resident" }, { tp_size: 1, ulysses_degree: 8, ring_degree: 2 });
@@ -305,7 +311,13 @@ for (const path of walk(CONFIGS)) {
           checkH3(`${hw} 1x${count}`, { hw, nodes: 1, gpus_per_node: count, placement: "resident" }, { tp_size: 1, ulysses_degree: count, ring_degree: 1 });
         }
       }
-      const custom = validateResolved(selectionOf({ hw: "b200", nodes: 1, gpus_per_node: 2, placement: "resident" }), "H3 legal custom");
+      checkH3Request("B200 1x2 FL2VA high smoke", { hw: "b200", nodes: 1, gpus_per_node: 2, placement: "resident", weights: "fl2va", mode: "fl2va", quality: "high" }, "verified");
+      checkH3Request("B200 1x4 FL2VA high pair", { hw: "b200", nodes: 1, gpus_per_node: 4, placement: "resident", weights: "fl2va", mode: "fl2va", quality: "high" }, "verified");
+      checkH3Request("B200 1x4 Ref2VA high pair", { hw: "b200", nodes: 1, gpus_per_node: 4, placement: "resident", weights: "ref2va", mode: "video_audio", quality: "high" }, "verified");
+      checkH3Request("B200 1x4 FP8 high rejected", { hw: "b200", nodes: 1, gpus_per_node: 4, placement: "resident", weights: "fl2va", mode: "fl2va", quality: "high", precision: "fp8" }, "unverified");
+      checkH3Request("H200 FL2VA high rejected", { hw: "h200", nodes: 1, gpus_per_node: 4, placement: "resident", weights: "fl2va", mode: "fl2va", quality: "high" }, "unverified");
+      checkH3Request("MI300X high rejected", { hw: "mi300x", nodes: 1, gpus_per_node: 4, placement: "resident", weights: "fl2va", mode: "t2va", quality: "high" }, "unverified");
+      const custom = validateResolved(selectionOf({ hw: "b200", nodes: 1, gpus_per_node: 1, placement: "resident" }), "H3 legal custom");
       if (custom?.builder.errors?.length || custom?.builder.verification?.serve !== "unverified") {
         fail(where, "H3 legal custom topology must be copyable and Unverified");
       }

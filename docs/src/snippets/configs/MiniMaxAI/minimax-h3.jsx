@@ -39,6 +39,54 @@ const CONSUMER_SINGLE = [
 ];
 const CONSUMER_VRAM_16_PLUS = [...CONSUMER_16G, ...CONSUMER_24G];
 const CONSUMER_AMPERE = ["rtx3060", "rtx3090"];
+const HIGH_QUALITY_SM90 = ["h100", "h200"];
+const HIGH_QUALITY_SM100 = ["b200", "b300"];
+
+function highQualityAdmission(s) {
+  const topology = s.topology_mode === "manual"
+    ? {
+        tp_size: Number(s.tp_size),
+        ulysses_degree: Number(s.ulysses_degree),
+        ring_degree: Number(s.ring_degree),
+      }
+    : config.commandBuilder.resource.autoTopology(s);
+  const world = Number(s.nodes) * Number(s.gpus_per_node);
+  const isSm100 = HIGH_QUALITY_SM100.includes(s.hw);
+  const taskAdmitted = (s.weights === "fl2va"
+    && (s.mode === "t2va"
+      || (isSm100 && ["i2va", "l2va", "fl2va"].includes(s.mode))))
+    || (s.weights === "ref2va" && s.mode === "video_audio");
+  return [...HIGH_QUALITY_SM90, ...HIGH_QUALITY_SM100].includes(s.hw)
+    && taskAdmitted
+    && ["auto", "resident"].includes(s.placement)
+    && topology.tp_size === 1
+    && topology.ulysses_degree === world
+    && topology.ring_degree === 1
+    && ["platform", "fa"].includes(s.attention)
+    && s.precision === "native"
+    && s.execution === "eager";
+}
+
+function highQualityEvidence(s) {
+  if (!highQualityAdmission(s)) return "rejected";
+  if (Number(s.nodes) !== 1 || !["auto", "resident"].includes(s.placement)) {
+    return "inherited";
+  }
+  const count = Number(s.gpus_per_node);
+  if (s.hw === "h200" && count === 4 && s.weights === "fl2va"
+    && s.mode === "t2va") return "paired";
+  if (s.hw !== "b200") return "inherited";
+  if ([4, 8].includes(count) && s.weights === "ref2va"
+    && s.mode === "video_audio") return "paired";
+  if ([4, 8].includes(count) && s.weights === "fl2va") {
+    if (s.mode === "fl2va") return "paired";
+    if (["i2va", "l2va"].includes(s.mode)) return "smoke";
+  }
+  if (count === 2 && s.weights === "fl2va" && s.mode === "fl2va") {
+    return "smoke";
+  }
+  return "inherited";
+}
 
 function consumerFlags(s) {
   if (UNIFIED_128G.includes(s.hw)) return unified128Flags();
@@ -500,12 +548,11 @@ return {
         {
           id: "high",
           label: "Audited high",
-          disabled: (s) => s.execution !== "eager",
-          disableReason: "BCG supersedes Cache-DiT, so the preset would have no effect — switch Execution to Eager to use it.",
-          soft: (s) => !(s.hw === "h200" && s.nodes === 1 && s.gpus_per_node === 4
-            && ["auto", "resident"].includes(s.placement)),
-          softReason: "The 1.40× / SSIM 0.931 audit covers the resident eager 4× H200 workload; elsewhere the preset runs but its quality figures are unaudited.",
-          description: "Measured 1.40× with SSIM 0.931 and PSNR 28.16 dB on the audited workload.",
+          disabled: (s) => !highQualityAdmission(s),
+          disableReason: "High requires an admitted SM90/SM100 task with resident native weights, automatic/FA attention, eager execution, TP1, Ring1, and full Ulysses.",
+          soft: (s) => highQualityEvidence(s) !== "paired",
+          softReason: "This admitted selection has no paired lossless/high quality result.",
+          description: "Paired B200 runs measured 1.439–1.946× speedups; 4× H200 T2VA measured 1.40×.",
         },
       ],
     },
@@ -540,6 +587,8 @@ return {
         gpus_per_node: { min: 1, max: 8 },
       },
       verifiedRecipes: [
+        { id: "b200-resident-2", hw: "b200", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 1, ulysses_degree: 2, ring_degree: 1, encoder: "auto" },
+        { id: "b200-resident-4", hw: "b200", nodes: 1, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto" },
         { id: "b200-resident-8", hw: "b200", nodes: 1, gpus_per_node: 8, placement: "resident", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto", default: true },
         { id: "b200-fsdp-4", hw: "b200", nodes: 1, gpus_per_node: 4, placement: "fsdp", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto" },
         { id: "b300-resident-8", hw: "b300", nodes: 1, gpus_per_node: 8, placement: "resident", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto", default: true },
@@ -643,12 +692,15 @@ return {
         || resolvedPlacement !== "resident" || s.nodes !== 1)) {
         coverageWarnings.push("Online FP8 outside resident single-node B200/B300 runs unverified.");
       }
-      const highAudited = s.hw === "h200" && s.nodes === 1
-        && s.gpus_per_node === 4 && resolvedPlacement === "resident";
+      const highEvidence = highQualityEvidence({ ...s, placement: resolvedPlacement });
       if (s.quality === "high" && s.execution !== "eager") {
         coverageWarnings.push("BCG supersedes Cache-DiT, so the high preset has no effect under this execution mode.");
-      } else if (s.quality === "high" && !highAudited) {
-        coverageWarnings.push("The high preset's 1.40× / SSIM 0.931 figures were audited on resident eager 4× H200; this workload is unaudited.");
+      } else if (s.quality === "high" && highEvidence === "rejected") {
+        coverageWarnings.push("This selection does not satisfy the quality=high deployment and request contract.");
+      } else if (s.quality === "high" && highEvidence === "smoke") {
+        coverageWarnings.push("This high request completed, but it has no paired lossless/high quality result.");
+      } else if (s.quality === "high" && highEvidence === "inherited") {
+        coverageWarnings.push("This combination is not directly measured; runtime admission is architecture-inherited.");
       }
 
       const recipe = resource.verifiedRecipes.find((entry) => entry.hw === s.hw
@@ -670,7 +722,8 @@ return {
       const serveVerified = topologyVerified && encoderVerified && attentionVerified
         && precisionVerified && executionVerified;
       const requestVerified = topologyVerified && (s.quality === "lossless"
-        || (s.quality === "high" && highAudited && s.execution === "eager"));
+        || (s.quality === "high" && s.execution === "eager"
+          && ["paired", "smoke"].includes(highEvidence)));
 
       const topologyParts = [];
       if (topology.tp_size > 1) topologyParts.push(`TP ${topology.tp_size}`);
