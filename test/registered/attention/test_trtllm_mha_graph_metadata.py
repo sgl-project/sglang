@@ -30,6 +30,8 @@ PAGE_SIZE = 128
 
 
 def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
+    from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
     backend.device = torch.device("cpu")
     backend.max_context_len = 1024
@@ -45,6 +47,15 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     backend.decode_cuda_graph_metadata = {}
     backend.target_verify_metadata = {}
     backend.draft_extend_metadata = {}
+    # Passthrough source (static pool): every unified-arm branch stays off,
+    # matching the real __init__'s parent binding.
+    backend.kv_index_translator = KVIndexTranslator(
+        req_to_token=backend.req_to_token,
+        token_to_kv_pool_allocator=SimpleNamespace(),
+        token_to_kv_pool=SimpleNamespace(),
+        page_size=PAGE_SIZE,
+        device="cpu",
+    )
     backend.init_cuda_graph_state(max_bs=4, max_num_tokens=16)
     return backend
 
@@ -541,6 +552,67 @@ def test_metadata_correctness(bs, seqlen_offset, q_mode, with_swa, static_width)
         translated = torch.where(loc >= 0, translated, torch.full_like(translated, -1))
         out_ref[:num_real] = translated
         torch.testing.assert_close(swa_out_cache_loc, out_ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("pass_tables", [False, True])
+def test_skip_page_table_updates_seqlens_only(pass_tables):
+    """The unified-memory arm: skip_page_table=True must still rebuild the
+    seqlen metadata in-graph but leave every page-table byte alone -- the bound
+    tables are capture-stable read tables the translator refreshes
+    out-of-graph, and an in-graph write would clobber them with virtual-derived
+    pages. Covers both call shapes: page_table=None (what the backend passes)
+    and a real sentinel-filled table (pins that the writes are compiled out,
+    not just unpassed)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    bs, seqlen_offset, seed = 5, 1, 4242
+    pool_size, max_num_pages = 64, 16
+    seq_max = (max_num_pages - 2) * PAGE_SIZE
+    (
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        _stride,
+        _cap,
+    ) = _build_inputs(bs, pool_size, max_num_pages, None, seq_max, seed)
+
+    cache_seqlens = torch.zeros(bs, dtype=torch.int32, device=DEVICE)
+    cu_seqlens_k = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+    sentinel_pt = None
+    sentinel_swa = None
+    if pass_tables:
+        sentinel_pt = torch.full(
+            (bs, max_num_pages), 777, dtype=torch.int32, device=DEVICE
+        )
+        sentinel_swa = torch.full(
+            (bs, max_num_pages), 888, dtype=torch.int32, device=DEVICE
+        )
+
+    update_trtllm_mha_graph_metadata(
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        req_to_token=req_to_token,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+        page_table=sentinel_pt,
+        bs=bs,
+        seqlen_offset=seqlen_offset,
+        max_seq_pages=max_num_pages,
+        page_size=PAGE_SIZE,
+        swa_page_table=sentinel_swa,
+        skip_page_table=True,
+    )
+    torch.cuda.synchronize()
+
+    cache_seqlens_ref = _ref_cache_seqlens(seq_lens, seqlen_offset)
+    torch.testing.assert_close(cache_seqlens, cache_seqlens_ref, rtol=0, atol=0)
+    cu_k_ref = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+    cu_k_ref[1:] = torch.cumsum(cache_seqlens_ref, dim=0, dtype=torch.int32)
+    torch.testing.assert_close(cu_seqlens_k, cu_k_ref, rtol=0, atol=0)
+    if pass_tables:
+        assert bool((sentinel_pt == 777).all()), "page_table written despite skip"
+        assert bool((sentinel_swa == 888).all()), "swa_page_table written despite skip"
 
 
 def test_bs_zero_noop():

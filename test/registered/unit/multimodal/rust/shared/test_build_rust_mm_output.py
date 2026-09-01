@@ -1,4 +1,4 @@
-"""``NativeMmHost.build_native_mm`` (managers/rust_server.py): the drain-time
+"""``RustMmProcessor.build_output``: the drain-time
 wrapping contracts — tensors are zero-copy views over the Rust-owned buffers, and
 pad values come from worker-precomputed hashes, since the scheduler loop must
 never hash features. Synthetic buffers, so this needs no Rust extension."""
@@ -15,15 +15,18 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.rust_server import NativeMmHost, NativeMmSpec  # noqa: E402
+from sglang.srt.rust_server.multimodal import (  # noqa: E402
+    RustMmProcessor,
+    RustMmSpec,
+)
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class TestBuildNativeMm(CustomTestCase):
+class TestBuildRustMmOutput(CustomTestCase):
     def setUp(self):
         # feature_dim == 3 * temporal_patch_size * patch_size**2 == 6.
-        self.spec = NativeMmSpec(
+        self.spec = RustMmSpec(
             family="qwen_vl",
             feature_shm=False,
             image_token_id=10,
@@ -50,7 +53,7 @@ class TestBuildNativeMm(CustomTestCase):
 
     def build(self):
         features = np.arange(30, dtype=np.float32)
-        output = NativeMmHost.build_native_mm(
+        output = RustMmProcessor.build_output(
             self.spec,
             SimpleNamespace(  # the shape of Rust's MmEncodeResult
                 grids=self.GRIDS,
@@ -99,7 +102,7 @@ class TestBuildNativeMm(CustomTestCase):
         )
 
 
-class TestBuildNativeMmShm(TestBuildNativeMm):
+class TestBuildRustMmOutputShm(TestBuildRustMmOutput):
     """The shm entry shape (TP>1): features arrive as named POSIX segments, and
     each item becomes a ``ShmPointerMMData`` stub whose ``materialize()`` yields
     that item's slice — and unlinks, taking the cleanup duty exactly once."""

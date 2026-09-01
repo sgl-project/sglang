@@ -17,6 +17,7 @@
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 
 #include <sgl_kernel/math.cuh>   // For device::math::rsqrt
+#include <sgl_kernel/type.cuh>   // For DTypeTrait
 #include <sgl_kernel/utils.cuh>  // For SGL_DEVICE, bf16_t, LaunchKernel
 #include <sgl_kernel/vec.cuh>    // For AlignedVector
 #include <sgl_kernel/warp.cuh>   // For warp::reduce_sum
@@ -39,12 +40,14 @@ static_assert(kWarps == 6);
 struct NormScaleShiftParams {
   void* y;
   void* res_out;
+  void* quantized;
   const void* x;
   const void* input_bias;
   const void* residual;
   const void* gate;
   const void* scale;
   const void* shift;
+  const void* input_scale;
   float eps;
 };
 
@@ -66,7 +69,16 @@ SGL_DEVICE float cta_reduce_sum(float v, int warp, int lane, float* scratch) {
   return scratch[kWarps];
 }
 
-template <bool kHasResidual, bool kHasInputBias = false>
+SGL_DEVICE float triton_scale_reciprocal(float scale) {
+  float reciprocal;
+  // Triton's static FP8 quantizer lowers `1.0 / scale` to div.full.f32.
+  // Match it exactly because a one-ULP difference at an E4M3 midpoint can
+  // change the quantized byte.
+  asm("div.full.f32 %0, %1, %2;" : "=f"(reciprocal) : "f"(1.0f), "f"(scale));
+  return reciprocal;
+}
+
+template <bool kHasResidual, bool kHasInputBias = false, bool kQuantizeFp8 = false>
 __global__ void norm_scale_shift_kernel(const NormScaleShiftParams __grid_constant__ params) {
   using namespace device;
   using Vec = AlignedVector<bf16_t, kVecElems>;
@@ -135,15 +147,31 @@ __global__ void norm_scale_shift_kernel(const NormScaleShiftParams __grid_consta
   Vec scv;
   Vec shv;
   Vec yv;
+  AlignedVector<fp8_e4m3_t, kVecElems> qv;
   scv.load(static_cast<const bf16_t*>(params.scale) + elem_offset);
   shv.load(static_cast<const bf16_t*>(params.shift) + elem_offset);
+
+  float input_scale_inv = 0.0f;
+  if constexpr (kQuantizeFp8) {
+    input_scale_inv = triton_scale_reciprocal(*static_cast<const float*>(params.input_scale));
+  }
 
 #pragma unroll
   for (int i = 0; i < kVecElems; ++i) {
     const float norm = static_cast<float>(static_cast<bf16_t>((v[i] - mean) * factor));
-    yv[i] = static_cast<bf16_t>(norm * (1.0f + static_cast<float>(scv[i])) + static_cast<float>(shv[i]));
+    const bf16_t rounded = static_cast<bf16_t>(norm * (1.0f + static_cast<float>(scv[i])) + static_cast<float>(shv[i]));
+    yv[i] = rounded;
+    if constexpr (kQuantizeFp8) {
+      const float scaled = static_cast<float>(rounded) * input_scale_inv;
+      const float clamped =
+          math::min(math::max(scaled, -DTypeTrait<fp8_e4m3_t>::kFloatMax), DTypeTrait<fp8_e4m3_t>::kFloatMax);
+      qv[i] = static_cast<fp8_e4m3_t>(clamped);
+    }
   }
   yv.store(static_cast<bf16_t*>(params.y) + row_offset + elem_offset);
+  if constexpr (kQuantizeFp8) {
+    qv.store(static_cast<fp8_e4m3_t*>(params.quantized) + row_offset + elem_offset);
+  }
 }
 
 __global__ void bias_mul_add_kernel(const NormScaleShiftParams __grid_constant__ params) {
@@ -197,12 +225,14 @@ struct NormScaleShiftKernel {
     const auto params = NormScaleShiftParams{
         .y = y.data_ptr(),
         .res_out = nullptr,
+        .quantized = nullptr,
         .x = x.data_ptr(),
         .input_bias = nullptr,
         .residual = nullptr,
         .gate = nullptr,
         .scale = scale.data_ptr(),
         .shift = shift.data_ptr(),
+        .input_scale = nullptr,
         .eps = static_cast<float>(eps),
     };
     LaunchKernel(grid, kThreads, device.unwrap())(norm_scale_shift_kernel<false>, params);
@@ -237,15 +267,102 @@ struct ScaleResidualNormScaleShiftKernel {
     const auto params = NormScaleShiftParams{
         .y = y.data_ptr(),
         .res_out = res_out.data_ptr(),
+        .quantized = nullptr,
         .x = x.data_ptr(),
         .input_bias = nullptr,
         .residual = residual.data_ptr(),
         .gate = gate.data_ptr(),
         .scale = scale.data_ptr(),
         .shift = shift.data_ptr(),
+        .input_scale = nullptr,
         .eps = static_cast<float>(eps),
     };
     LaunchKernel(grid, kThreads, device.unwrap())(norm_scale_shift_kernel<true>, params);
+  }
+};
+
+/** \brief Fuse Qwen LayerNorm/modulation with static E4M3 activation quantization. */
+struct NormScaleShiftFp8Kernel {
+  static void
+  run(tvm::ffi::TensorView y,
+      tvm::ffi::TensorView quantized,
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView scale,
+      tvm::ffi::TensorView shift,
+      tvm::ffi::TensorView input_scale,
+      double eps) {
+    using namespace host;
+    auto N = SymbolicSize{"num_rows"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({N, kHidden}).with_dtype<bf16_t>().with_device(device).verify(x).verify(y);
+    TensorMatcher({N, kHidden}).with_dtype<fp8_e4m3_t>().with_device(device).verify(quantized);
+    TensorMatcher({kHidden}).with_dtype<bf16_t>().with_device(device).verify(scale).verify(shift);
+    TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(input_scale);
+
+    const uint32_t grid = verify_nss_geometry(N);
+    const auto params = NormScaleShiftParams{
+        .y = y.data_ptr(),
+        .res_out = nullptr,
+        .quantized = quantized.data_ptr(),
+        .x = x.data_ptr(),
+        .input_bias = nullptr,
+        .residual = nullptr,
+        .gate = nullptr,
+        .scale = scale.data_ptr(),
+        .shift = shift.data_ptr(),
+        .input_scale = input_scale.data_ptr(),
+        .eps = static_cast<float>(eps),
+    };
+    LaunchKernel(grid, kThreads, device.unwrap())(norm_scale_shift_kernel<false, false, true>, params);
+  }
+};
+
+/** \brief Fuse Qwen residual LayerNorm/modulation with static E4M3 activation quantization. */
+struct ScaleResidualNormScaleShiftFp8Kernel {
+  static void
+  run(tvm::ffi::TensorView y,
+      tvm::ffi::TensorView quantized,
+      tvm::ffi::TensorView res_out,
+      tvm::ffi::TensorView residual,
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView gate,
+      tvm::ffi::TensorView scale,
+      tvm::ffi::TensorView shift,
+      tvm::ffi::TensorView input_scale,
+      double eps) {
+    using namespace host;
+    auto N = SymbolicSize{"num_rows"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({N, kHidden})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(x)
+        .verify(residual)
+        .verify(y)
+        .verify(res_out);
+    TensorMatcher({N, kHidden}).with_dtype<fp8_e4m3_t>().with_device(device).verify(quantized);
+    TensorMatcher({kHidden}).with_dtype<bf16_t>().with_device(device).verify(gate).verify(scale).verify(shift);
+    TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(input_scale);
+
+    const uint32_t grid = verify_nss_geometry(N);
+    const auto params = NormScaleShiftParams{
+        .y = y.data_ptr(),
+        .res_out = res_out.data_ptr(),
+        .quantized = quantized.data_ptr(),
+        .x = x.data_ptr(),
+        .input_bias = nullptr,
+        .residual = residual.data_ptr(),
+        .gate = gate.data_ptr(),
+        .scale = scale.data_ptr(),
+        .shift = shift.data_ptr(),
+        .input_scale = input_scale.data_ptr(),
+        .eps = static_cast<float>(eps),
+    };
+    LaunchKernel(grid, kThreads, device.unwrap())(norm_scale_shift_kernel<true, false, true>, params);
   }
 };
 
@@ -284,12 +401,14 @@ struct BiasScaleResidualNormScaleShiftKernel {
     const auto params = NormScaleShiftParams{
         .y = y.data_ptr(),
         .res_out = res_out.data_ptr(),
+        .quantized = nullptr,
         .x = x.data_ptr(),
         .input_bias = input_bias.data_ptr(),
         .residual = residual.data_ptr(),
         .gate = gate.data_ptr(),
         .scale = scale.data_ptr(),
         .shift = shift.data_ptr(),
+        .input_scale = nullptr,
         .eps = static_cast<float>(eps),
     };
     LaunchKernel(grid, kThreads, device.unwrap())(norm_scale_shift_kernel<true, true>, params);
@@ -315,12 +434,14 @@ struct BiasMulAddKernel {
     const auto params = NormScaleShiftParams{
         .y = y.data_ptr(),
         .res_out = nullptr,
+        .quantized = nullptr,
         .x = x.data_ptr(),
         .input_bias = input_bias.data_ptr(),
         .residual = residual.data_ptr(),
         .gate = gate.data_ptr(),
         .scale = nullptr,
         .shift = nullptr,
+        .input_scale = nullptr,
         .eps = 0.0f,
     };
     LaunchKernel(grid, kThreads, device.unwrap())(bias_mul_add_kernel, params);
