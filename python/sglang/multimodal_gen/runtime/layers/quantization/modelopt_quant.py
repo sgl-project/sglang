@@ -39,7 +39,6 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 )
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
-    is_layer_skipped,
     requantize_with_max_scale,
 )
 from sglang.srt.layers.utils.common import copy_or_rebind_param
@@ -123,10 +122,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):
-            if self.is_layer_excluded(prefix) or (
-                self.packed_modules_mapping
-                and is_layer_skipped(prefix, [], self.packed_modules_mapping)
-            ):
+            if self.is_layer_excluded(prefix) or self._is_packed_layer_excluded(prefix):
                 return UnquantizedLinearMethod()
             return Linear(self)
         return None
@@ -162,6 +158,24 @@ class ModelOptQuantConfig(QuantizationConfig):
             if re.fullmatch(regex_str, prefix):
                 return True
         return False
+
+    def _is_packed_layer_excluded(self, prefix: str) -> bool:
+        proj_name = prefix.rsplit(".", 1)[-1]
+        shard_names = self.packed_modules_mapping.get(proj_name)
+        if shard_names is None:
+            return False
+
+        base_prefix = prefix[: -len(proj_name)]
+        shard_exclusions = [
+            self.is_layer_excluded(base_prefix + shard_name)
+            for shard_name in shard_names
+        ]
+        if any(shard_exclusions) and not all(shard_exclusions):
+            raise ValueError(
+                f"Detected some but not all shards of {prefix} are quantized. "
+                "All shards of fused layers must have the same precision."
+            )
+        return all(shard_exclusions)
 
 
 class ModelOptFp8Config(ModelOptQuantConfig):
@@ -475,16 +489,36 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             if input_scale is not None:
                 copy_or_rebind_param(layer, "input_scale", input_scale)
 
-        max_w_scale, quantized_weight = requantize_with_max_scale(
-            weight, layer.weight_scale, layer.logical_widths
+        complete_shard_scales = (
+            self.cutlass_fp8_supported
+            and len(layer.logical_widths) > 1
+            and bool(
+                torch.all(
+                    layer.weight_scale > torch.finfo(torch.float8_e4m3fn).min
+                ).item()
+            )
         )
+        if complete_shard_scales:
+            # CUTLASS accepts a scale per output channel. Preserve each
+            # checkpoint shard's original FP8 values and scale instead of
+            # requantizing all packed shards to the largest scale.
+            quantized_weight = weight
+            processed_weight_scale = convert_to_channelwise(
+                layer.weight_scale, layer.logical_widths
+            )
+        else:
+            processed_weight_scale, quantized_weight = requantize_with_max_scale(
+                weight, layer.weight_scale, layer.logical_widths
+            )
+            if self.cutlass_fp8_supported:
+                processed_weight_scale = convert_to_channelwise(
+                    processed_weight_scale, layer.logical_widths
+                )
         # Preserve the parameter subclass metadata while rebinding to the
         # transposed FP8 view expected by the runtime.
         layer.weight.data = quantized_weight.t().detach()
         layer.weight.requires_grad_(False)
-        if self.cutlass_fp8_supported:
-            max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
-        copy_or_rebind_param(layer, "weight_scale", max_w_scale)
+        copy_or_rebind_param(layer, "weight_scale", processed_weight_scale)
         copy_or_rebind_param(layer, "input_scale", layer.input_scale.max())
 
     def apply(

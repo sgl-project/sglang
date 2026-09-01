@@ -7656,6 +7656,9 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         # the incoming full's stale mapping is cleared, then its slot freed (full-only)
         alloc.clear_full_to_swa_mapping.assert_called_once_with(incoming_full)
         alloc.free_full.assert_called_once_with(incoming_full)
+        # Never by indexing the tensor: the unified composite has no
+        # `full_to_swa_index_mapping` to index into.
+        alloc.full_to_swa_index_mapping.__setitem__.assert_not_called()
         # not the inner allocator (skips the free-group defer) and not both halves
         alloc.full_attn_allocator.free.assert_not_called()
         alloc.free.assert_not_called()
