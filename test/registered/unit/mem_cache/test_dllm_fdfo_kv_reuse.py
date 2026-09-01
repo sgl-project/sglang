@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.dllm.mixin.scheduler import DllmManager
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_context
@@ -63,7 +64,7 @@ def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
         prefix_indices=torch.tensor(prefix, dtype=torch.int32),
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
-        kv=SimpleNamespace(
+        kv=ReqKvInfo(
             req_pool_idx=req_pool_idx,
             kv_committed_len=len(prefix) if req_pool_idx is not None else 0,
             kv_allocated_len=(

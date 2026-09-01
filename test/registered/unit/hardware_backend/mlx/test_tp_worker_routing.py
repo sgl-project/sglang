@@ -38,6 +38,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
@@ -169,7 +170,7 @@ class _FakeReq:
         self.rid = rid
         self.prefix_indices = torch.empty(0, dtype=torch.long)
         self.fill_ids = [0]
-        self.kv = SimpleNamespace(req_pool_idx=req_pool_idx)
+        self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         # Mirrors Req's chunk-finality contract read by
         # MlxTpModelWorker._chunk_needs_logits: extend_range=None means
         # "not truncated" (final chunk / plain prefill).
