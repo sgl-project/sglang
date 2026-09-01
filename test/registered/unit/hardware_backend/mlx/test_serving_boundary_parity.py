@@ -23,7 +23,7 @@ import torch
 from sglang.srt.hardware_backend.mlx.export_validation import (
     ServingForwardExportWrapper,
 )
-from sglang.srt.hardware_backend.mlx.fx_backend import MlxFxLoweringRegistry
+from sglang.srt.hardware_backend.mlx.fx_lowering import MlxFxLoweringRegistry
 from sglang.srt.hardware_backend.mlx.region_runner import _PAD_SINK_SLOT
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention

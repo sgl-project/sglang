@@ -401,7 +401,7 @@ def export_serving_forward(
 ) -> ServingExportResult:
     """Export one real serving bucket and describe its state contract."""
     from sglang.srt.compilation.torch_compile_decoration import _to_torch
-    from sglang.srt.hardware_backend.mlx.fx_backend import (
+    from sglang.srt.hardware_backend.mlx.fx_lowering import (
         MlxFxLoweringRegistry,
         build_mlx_fx_plan,
     )
