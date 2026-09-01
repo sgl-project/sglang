@@ -306,6 +306,7 @@ async def async_request_openai_completions(
 
         generated_text = ""
         output_len = request_func_input.output_len
+        prompt_len = request_func_input.prompt_len
         ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
@@ -352,11 +353,14 @@ async def async_request_openai_completions(
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
-
+                                prompt_len = (data.get("usage") or {}).get(
+                                    "prompt_tokens", prompt_len
+                                )
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
                     output.output_len = output_len
+                    output.prompt_len = prompt_len
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -461,6 +465,7 @@ async def async_request_openai_chat_completions(
 
         generated_text = ""
         output_len = request_func_input.output_len
+        prompt_len = request_func_input.prompt_len
         ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
@@ -482,6 +487,9 @@ async def async_request_openai_chat_completions(
                         )  # For non-streaming, TTFT = total latency
                         output.output_len = response_json.get("usage", {}).get(
                             "completion_tokens", output_len
+                        )
+                        output.prompt_len = (response_json.get("usage") or {}).get(
+                            "prompt_tokens", prompt_len
                         )
                         _meta_info = response_json["choices"][0].get("meta_info") or {}
                         output.spec_accept_length = (
@@ -516,7 +524,9 @@ async def async_request_openai_chat_completions(
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
-
+                                prompt_len = (data.get("usage") or {}).get(
+                                    "prompt_tokens", prompt_len
+                                )
                                 if getattr(args, "cache_report", False):
                                     _extract_cache_from_sglext(data, output)
 
@@ -550,6 +560,7 @@ async def async_request_openai_chat_completions(
                         output.success = True
                         output.latency = latency
                         output.output_len = output_len
+                        output.prompt_len = prompt_len
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -598,6 +609,7 @@ async def async_request_truss(
         output = RequestFuncOutput.init_new(request_func_input)
 
         generated_text = ""
+        prompt_len = request_func_input.prompt_len
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
@@ -617,6 +629,10 @@ async def async_request_truss(
                             pass
                         else:
                             data = json.loads(chunk)
+
+                            prompt_len = (data.get("usage") or {}).get(
+                                "prompt_tokens", prompt_len
+                            )
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -639,6 +655,7 @@ async def async_request_truss(
                     output.success = True
                     output.latency = latency
                     output.output_len = request_func_input.output_len
+                    output.prompt_len = prompt_len
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -696,6 +713,7 @@ async def async_request_sglang_generate(
 
         generated_text = ""
         output_len = request_func_input.output_len
+        prompt_len = request_func_input.prompt_len
         ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
@@ -744,6 +762,9 @@ async def async_request_sglang_generate(
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
                                 output_len = data["meta_info"]["completion_tokens"]
+                                prompt_len = data["meta_info"].get(
+                                    "prompt_tokens", prompt_len
+                                )
 
                                 # First token
                                 if ttft == 0.0:
@@ -766,6 +787,7 @@ async def async_request_sglang_generate(
                     output.success = True
                     output.latency = latency
                     output.output_len = output_len
+                    output.prompt_len = prompt_len
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -1003,6 +1025,7 @@ class BenchmarkMetrics:
     total_input_text: int
     total_input_vision: int
     total_output: int
+    total_input_client: int
     total_output_retokenized: int
 
     # Throughput (req/s and tok/s)
@@ -1104,6 +1127,7 @@ def calculate_metrics(
     output_lens: List[int] = []
     retokenized_output_lens: List[int] = []
     total_input = 0
+    total_input_client = 0
     total_input_text = 0
     total_input_vision = 0
     completed = 0
@@ -1128,7 +1152,8 @@ def calculate_metrics(
             )
             retokenized_output_lens.append(retokenized_output_len)
             if input_requests is not None:
-                total_input += input_requests[i].prompt_len
+                total_input += outputs[i].prompt_len
+                total_input_client += input_requests[i].prompt_len
                 total_input_text += input_requests[i].text_prompt_len
                 total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
@@ -1228,6 +1253,7 @@ def calculate_metrics(
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
+        total_input_client=total_input_client,
         total_input_text=total_input_text,
         total_input_vision=total_input_vision,
         total_output=sum(output_lens),
@@ -1635,8 +1661,13 @@ async def benchmark(
     )
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
-    print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
-    print("{:<40} {:<10}".format("Total input text tokens:", metrics.total_input_text))
+
+    print(
+        "{:<40} {:<10}".format(
+            "Total input tokens (client):", metrics.total_input_client
+        )
+    )
+    print("{:<40} {:<10}".format("Total input tokens (server):", metrics.total_input))
     if args.dataset_name in ["image", "mmmu"]:
         print(
             "{:<40} {:<10}".format(

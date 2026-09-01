@@ -14,6 +14,7 @@ class OpenAIDataset(BaseDataset):
     dataset_path: str
     num_requests: int
     fixed_output_len: Optional[int]
+    context_len: Optional[int]
 
     @classmethod
     def from_args(cls, args: Namespace) -> "OpenAIDataset":
@@ -21,6 +22,7 @@ class OpenAIDataset(BaseDataset):
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
             fixed_output_len=args.sharegpt_output_len,
+            context_len=args.sharegpt_context_len,
         )
 
     def load(
@@ -31,6 +33,7 @@ class OpenAIDataset(BaseDataset):
             num_requests=self.num_requests,
             tokenizer=tokenizer,
             fixed_output_len=self.fixed_output_len,
+            context_len=self.context_len,
         )
 
 
@@ -39,6 +42,7 @@ def sample_openai_requests(
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int] = None,
+    context_len: Optional[int] = None,
 ) -> List[DatasetRow]:
     """
     Load OpenAI-compatible chat completion requests from a JSONL file.
@@ -75,8 +79,10 @@ def sample_openai_requests(
         if not messages:
             continue
 
+        max_tokens = data.get("max_tokens") or data.get("max_completion_tokens")
+
         # Use max_tokens from the request, or fall back to fixed_output_len
-        output_len = fixed_output_len or data.get("max_tokens", 256)
+        output_len = fixed_output_len or max_tokens or 256
 
         # Extract extra request body parameters (tools, temperature, top_p, etc.)
         extra_body = {k: v for k, v in data.items() if k not in EXCLUDED_FIELDS}
@@ -86,7 +92,7 @@ def sample_openai_requests(
         prompt_len = len(
             tokenizer.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=True
-            )
+            )["input_ids"]
         )
 
         # If tools are present, we need to add their token count
@@ -96,6 +102,10 @@ def sample_openai_requests(
             tools_str = json.dumps(extra_body["tools"])
             tools_tokens = len(tokenizer.encode(tools_str))
             prompt_len += tools_tokens
+
+        # Skip requests that exceed model's context length
+        if context_len is not None and prompt_len + output_len > context_len:
+            continue
 
         # Pass messages list directly - the serving benchmark handles List[Dict] prompts
         filtered_dataset.append(
