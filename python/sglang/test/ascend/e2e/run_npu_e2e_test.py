@@ -595,13 +595,6 @@ def run_npu_e2e_test_case(
 
     kube_config_map = f"sglang-configmap-{random_str}"
     final_kube_job_name = f"{kube_job_name_prefix}-{random_str}"
-    # Expose the run-scoped job name to the workflow so that the Post-test cleanup
-    # can target only this run's pods and avoid deleting pods of concurrent runs.
-    try:
-        with open("/tmp/kube_job_name.txt", "w") as f:
-            f.write(final_kube_job_name)
-    except Exception as e:
-        logger.warning(f"Failed to write /tmp/kube_job_name.txt: {e}")
     # run_label is injected into the pod as RUN_LABEL to build the pod log directory prefix.
     # nightly (>=4 segments after `output`): first two segments {branch}-{date}-{run_id}-{run_attempt}/{workflow}
     # PR legacy layout: fall back to the date segment to keep the original {date}/{tc_name}/{host} path.
