@@ -500,6 +500,16 @@ class TextEncoderLoader(ComponentLoader):
     expected_library = "transformers"
     supports_online_quantization_override = True
 
+    def component_load_precision(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        override = server_args.component_precisions.get(component_name)
+        if override is not None:
+            return override
+        return server_args.pipeline_config.text_encoder_precisions[
+            self._extract_encoder_index(component_name)
+        ]
+
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
@@ -734,7 +744,9 @@ class TextEncoderLoader(ComponentLoader):
         )
 
         # TODO(mick): had to throw an exception for different text-encoder arch
-        encoder_index = self._extract_encoder_index(component_name)
+        encoder_index = self._extract_encoder_index(
+            self.structural_component_name(component_name)
+        )
         assert encoder_index < len(
             server_args.pipeline_config.text_encoder_configs
         ) and encoder_index < len(server_args.pipeline_config.text_encoder_precisions)
@@ -781,9 +793,8 @@ class TextEncoderLoader(ComponentLoader):
             server_args.encoder_parallel,
             prefer_dp=prefer_dp,
         )
-        encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
-            encoder_index
-        ]
+        encoder_dtype = self.component_load_precision(server_args, component_name)
+        assert encoder_dtype is not None
         # TODO(will): add support for other dtypes
         try:
             return self.load_model(

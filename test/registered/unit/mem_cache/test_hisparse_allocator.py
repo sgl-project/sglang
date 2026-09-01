@@ -106,7 +106,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
             def alloc(self, reqs):
                 for item in reqs:
-                    item.req_pool_idx = 0
+                    item.kv.req_pool_idx = 0
                 return torch.tensor([0], dtype=torch.int64)
 
             def write(self, indices, values):
@@ -160,7 +160,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         regular_host_alloc.assert_called_once_with(
             coordinator.req_to_host_pool,
             coordinator.req_to_host_pool_allocated_len,
-            req.req_pool_idx,
+            req.kv.req_pool_idx,
             0,
             len(host_indices),
         )
