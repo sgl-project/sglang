@@ -43,6 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
 )
+from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import (
     get_device,
     get_parallel,
@@ -1024,9 +1025,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     topk=self.topk * self.speculative_num_steps,
                     capture_hidden_mode=capture_mode,
                 )
+            set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
             verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
+            set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
             batch.spec_info = verify_input
+            set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
