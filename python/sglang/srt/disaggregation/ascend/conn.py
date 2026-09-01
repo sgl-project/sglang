@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.utils import build_transfer_entry_pairs
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -145,11 +146,6 @@ class AscendKVManager(MooncakeKVManager):
         # decode peer registers all model layers. Pair only this layout by
         # global layer id; every other Ascend layout keeps the legacy path.
         if self.is_hybrid_mla_backend and self.pp_size > 1:
-            if not self.kv_args.kv_layer_ids or not dst_layer_ids:
-                raise RuntimeError(
-                    "Hybrid MLA with heterogeneous PP requires layer IDs "
-                    "from both peers"
-                )
             return self._send_kvcache_generic(
                 mooncake_session_id=mooncake_session_id,
                 src_data_ptrs=self.kv_args.kv_data_ptrs,
