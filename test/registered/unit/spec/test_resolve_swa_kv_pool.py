@@ -8,10 +8,11 @@ from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-large-amd")
 
 _RESOLVERS = (
     ("trtllm_mha", TRTLLMHAAttnBackend._resolve_swa_kv_pool, SWAKVPool),

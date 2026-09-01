@@ -389,16 +389,21 @@ class Gemma3nAttention(nn.Module):
                 self.head_dim,
                 rotary_dim=self.head_dim,
                 max_position=config.max_position_embeddings,
-                base=config.rope_local_base_freq,
+                base=config.rope_parameters.get("sliding_attention", {}).get(
+                    "rope_theta", 10000.0
+                ),
                 rope_scaling={"rope_type": "default"},
             )
         else:
+            full_attn_rope = config.rope_parameters.get("full_attention", {})
             self.rotary_emb = get_rope(
                 self.head_dim,
                 rotary_dim=self.head_dim,
                 max_position=config.max_position_embeddings,
-                base=config.rope_parameters["rope_theta"],
-                rope_scaling=config.rope_parameters,
+                base=full_attn_rope.get("rope_theta", 1000000.0),
+                rope_scaling=(
+                    full_attn_rope if full_attn_rope else {"rope_type": "default"}
+                ),
             )
 
         self.sliding_window = config.sliding_window if self.is_sliding else None

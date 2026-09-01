@@ -20,8 +20,8 @@ register_amd_ci(est_time=1100, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestTorchCompile(CustomTestCase, MMLUMixin):
-    mmlu_score_threshold = 0.65
-    mmlu_num_examples = 64
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
     mmlu_num_threads = 32
 
     @classmethod
@@ -32,7 +32,7 @@ class TestTorchCompile(CustomTestCase, MMLUMixin):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-torch-compile", "--cuda-graph-max-bs", "4"],
+            other_args=["--enable-torch-compile", "--cuda-graph-max-bs-decode", "4"],
         )
 
     @classmethod

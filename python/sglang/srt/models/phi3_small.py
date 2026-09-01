@@ -388,7 +388,7 @@ class Phi3SmallForCausalLM(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
         )
-        if self.config.tie_word_embeddings:
+        if getattr(self.config, "tie_word_embeddings", True):
             self.lm_head.weight = self.model.embed_tokens.weight
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -466,7 +466,10 @@ class Phi3SmallForCausalLM(nn.Module):
                 continue
             if name.endswith(".bias") and name not in params_dict:
                 continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+            if (
+                getattr(self.config, "tie_word_embeddings", True)
+                and "lm_head.weight" in name
+            ):
                 continue
 
             param = params_dict[name]

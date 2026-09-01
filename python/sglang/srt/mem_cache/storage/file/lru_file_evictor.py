@@ -28,7 +28,7 @@ import logging
 import os
 import threading
 from collections import OrderedDict
-from typing import Any, Optional, Set, Tuple
+from typing import Any, Callable, Optional, Set, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import human_readable_int
@@ -71,10 +71,12 @@ class LRUFileEvictor:
         tp_rank: int,
         is_mla_model: bool,
         extra_config: Optional[dict] = None,
+        on_evict: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.file_path = file_path
         self.config_suffix = config_suffix
         self._tp_rank = tp_rank
+        self._on_evict = on_evict
 
         # MLA ranks share the same physical files, so centralize LRU bookkeeping
         # on rank 0; non-MLA ranks each own their own files via the suffix.
@@ -342,8 +344,12 @@ class LRUFileEvictor:
         try:
             os.remove(tensor_path)
             freed = evict_size
+            if self._on_evict is not None:
+                self._on_evict(evict_stem)
         except FileNotFoundError:
             freed = 0  # file already gone; still drop the stale index entry
+            if self._on_evict is not None:
+                self._on_evict(evict_stem)
         except OSError as e:
             logger.warning(f"HiCacheFile eviction failed for {evict_stem}: {e}")
             self._lru[evict_stem] = evict_size

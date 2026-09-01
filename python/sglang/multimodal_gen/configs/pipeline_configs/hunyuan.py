@@ -20,6 +20,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
     TextConditioningOutput,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 
 PROMPT_TEMPLATE_ENCODE_VIDEO = (
     "<|start_header_id|>system<|end_header_id|>\n\nDescribe the video by detailing the following aspects: "
@@ -90,7 +93,9 @@ class HunyuanConfig(PipelineConfig):
     # DiT
     dit_config: DiTConfig = field(default_factory=HunyuanVideoConfig)
     # VAE
-    vae_config: VAEConfig = field(default_factory=HunyuanVAEConfig)
+    vae_config: VAEConfig = field(
+        default_factory=lambda: HunyuanVAEConfig(parallel_decode_mode="tiled")
+    )
     # Denoising stage
     embedded_cfg_scale: int = 6
     flow_shift: int = 7
@@ -158,3 +163,9 @@ class FastHunyuanConfig(HunyuanConfig):
 
     # No need to re-specify guidance_scale or embedded_cfg_scale as they
     # already have the desired values from HunyuanConfig
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            keep_resident_min_available_gb=60,
+            keep_resident_components=("dit", "vae"),
+        )

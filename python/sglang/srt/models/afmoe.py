@@ -45,7 +45,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.triton_utils import fused_moe
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -62,7 +62,7 @@ from sglang.srt.utils import add_prefix, is_npu
 _is_npu = is_npu()
 
 if _is_npu:
-    from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
         fused_moe_npu as fused_moe,
     )
 
@@ -233,9 +233,7 @@ class AfmoeMoE(nn.Module):
                 expert_bias=self.expert_bias,
             )
 
-        renormalize = (
-            self.route_norm if self.score_func == "sigmoid" and not _is_npu else False
-        )
+        renormalize = self.route_norm if self.score_func == "sigmoid" else False
         self.topk = TopK(
             top_k=self.top_k,
             renormalize=renormalize,
@@ -245,7 +243,14 @@ class AfmoeMoE(nn.Module):
             custom_routing_function=custom_routing_fn,
             correction_bias=correction_bias,
             routed_scaling_factor=self.route_scale,
-            **({"scoring_func": self.score_func} if _is_npu else {}),
+            **(
+                {
+                    "scoring_func": self.score_func,
+                    "apply_routed_scaling_factor_on_output": True,
+                }
+                if _is_npu
+                else {}
+            ),
         )
 
     def pack_params(self) -> None:

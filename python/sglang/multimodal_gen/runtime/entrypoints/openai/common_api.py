@@ -14,7 +14,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
-from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils.json_response import orjson_response
 
@@ -45,6 +45,28 @@ class DiffusionModelCard(ModelCard):
     pipeline_class: Optional[str] = None
 
 
+def _build_model_card(
+    server_args: ServerArgs, served_model_name: str
+) -> DiffusionModelCard:
+    model_info = get_model_info(
+        server_args.model_path,
+        backend=server_args.backend,
+        model_id=server_args.model_id,
+    )
+    card_kwargs: dict[str, Any] = {
+        "id": served_model_name,
+        "root": served_model_name,
+        "num_gpus": server_args.num_gpus,
+        "task_type": server_args.pipeline_config.task_type.name,
+        "dit_precision": server_args.pipeline_config.dit_precision,
+        "vae_precision": server_args.pipeline_config.vae_precision,
+    }
+    if model_info:
+        card_kwargs["pipeline_name"] = model_info.pipeline_cls.pipeline_name
+        card_kwargs["pipeline_class"] = model_info.pipeline_cls.__name__
+    return DiffusionModelCard(**card_kwargs)
+
+
 async def _handle_lora_request(req: Any, success_msg: str, failure_msg: str):
     try:
         output: OutputBatch = await async_scheduler_client.forward(req)
@@ -67,6 +89,7 @@ async def set_lora(
     target: Union[str, List[str]] = Body("all", embed=True),
     strength: Union[float, List[float]] = Body(1.0, embed=True),
     merge_mode: Optional[str] = Body(None, embed=True),
+    lora_alpha: Optional[Union[int, List[Optional[int]]]] = Body(None, embed=True),
 ):
     """
     Set LoRA adapter(s) for the specified transformer(s).
@@ -86,6 +109,7 @@ async def set_lora(
             If a list, must match the length of lora_nickname. Values < 1.0 reduce the effect,
             values > 1.0 amplify the effect.
         merge_mode: Optional LoRA merge mode: "auto", "merge", or "dynamic".
+        lora_alpha: Training alpha override for adapters that omit it from metadata.
     """
     req = SetLoraReq(
         lora_nickname=lora_nickname,
@@ -93,6 +117,7 @@ async def set_lora(
         target=target,
         strength=strength,
         merge_mode=merge_mode,
+        lora_alpha=lora_alpha,
     )
     nickname_str, target_str, strength_str = format_lora_message(
         lora_nickname, target, strength
@@ -183,27 +208,7 @@ async def available_models():
     if not server_args:
         raise HTTPException(status_code=500, detail="Server args not initialized")
 
-    model_info = get_model_info(
-        server_args.model_path,
-        backend=server_args.backend,
-        model_id=server_args.model_id,
-    )
-
-    card_kwargs = {
-        "id": server_args.model_path,
-        "root": server_args.model_path,
-        # Extended diffusion-specific fields
-        "num_gpus": server_args.num_gpus,
-        "task_type": server_args.pipeline_config.task_type.name,
-        "dit_precision": server_args.pipeline_config.dit_precision,
-        "vae_precision": server_args.pipeline_config.vae_precision,
-    }
-
-    if model_info:
-        card_kwargs["pipeline_name"] = model_info.pipeline_cls.pipeline_name
-        card_kwargs["pipeline_class"] = model_info.pipeline_cls.__name__
-
-    model_card = DiffusionModelCard(**card_kwargs)
+    model_card = _build_model_card(server_args, server_args.served_model_name)
 
     # Return dict directly to preserve extended fields (ModelList strips them)
     return {"object": "list", "data": [model_card.model_dump()]}
@@ -216,7 +221,7 @@ async def retrieve_model(model: str):
     if not server_args:
         raise HTTPException(status_code=500, detail="Server args not initialized")
 
-    if model != server_args.model_path:
+    if model != server_args.served_model_name:
         return orjson_response(
             {
                 "error": {
@@ -229,24 +234,5 @@ async def retrieve_model(model: str):
             status_code=404,
         )
 
-    model_info = get_model_info(
-        server_args.model_path,
-        backend=server_args.backend,
-        model_id=server_args.model_id,
-    )
-
-    card_kwargs = {
-        "id": model,
-        "root": model,
-        "num_gpus": server_args.num_gpus,
-        "task_type": server_args.pipeline_config.task_type.name,
-        "dit_precision": server_args.pipeline_config.dit_precision,
-        "vae_precision": server_args.pipeline_config.vae_precision,
-    }
-
-    if model_info:
-        card_kwargs["pipeline_name"] = model_info.pipeline_cls.pipeline_name
-        card_kwargs["pipeline_class"] = model_info.pipeline_cls.__name__
-
     # Return dict to preserve extended fields
-    return DiffusionModelCard(**card_kwargs).model_dump()
+    return _build_model_card(server_args, server_args.served_model_name).model_dump()

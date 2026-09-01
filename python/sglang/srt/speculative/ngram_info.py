@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import List, Optional
 
 import torch
 
-from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
+from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 
-class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
+class NgramVerifyInput(SpecInput):
     def __init__(
         self,
         draft_token: torch.Tensor = None,
@@ -20,7 +18,6 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
         retrieve_next_token: torch.Tensor = None,
         retrieve_next_sibling: torch.Tensor = None,
         draft_token_num: int = None,
-        grammar: BaseGrammarObject = None,
         future_indices: Optional[torch.Tensor] = None,
         new_seq_lens: Optional[torch.Tensor] = None,
         accept_tokens: Optional[torch.Tensor] = None,
@@ -34,7 +31,8 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
         self.retrieve_next_token = retrieve_next_token
         self.retrieve_next_sibling = retrieve_next_sibling
         self.draft_token_num = draft_token_num
-        self.grammar = grammar
+        self.num_tokens_per_req = draft_token_num
+        self.num_tokens_for_logprob_per_req = draft_token_num
 
         # Inputs for V2 overlap worker
         self.future_indices = future_indices
@@ -57,9 +55,6 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
     def tree_topk(self) -> int:
         # Irregular tree: per-level branching follows the corpus matches.
         return -1
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.draft_token_num, self.draft_token_num
 
     def generate_attn_arg_prefill(
         self,
@@ -118,9 +113,15 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
 
         return kv_indices, cum_kv_seq_len, self.qo_indptr, custom_mask
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        new_indices_cpu: Optional[List[int]] = None,
+    ):
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
+            return
+
         if self.new_seq_lens is not None:
             self.new_seq_lens = self.new_seq_lens[new_indices]
         self.accept_tokens = self.accept_tokens.reshape(-1, self.draft_token_num)[
@@ -135,6 +136,8 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
             self.future_indices = torch.cat(
                 (self.future_indices, spec_info.future_indices), dim=0
             )
+            return
+
         if self.new_seq_lens is not None:
             assert spec_info.new_seq_lens is not None
             self.new_seq_lens = torch.cat(

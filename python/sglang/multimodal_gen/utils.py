@@ -29,6 +29,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     SortedHelpFormatter,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.precision_types import (
+    PRECISION_TO_TYPE as PRECISION_TO_TYPE,
+)
 
 logger = init_logger(__name__)
 
@@ -51,14 +54,6 @@ def expand_path_fields(obj) -> None:
                 {k: eu(p) if isinstance(p, str) else p for k, p in v.items()},
             )
 
-
-# TODO(will): used to convert server_args.precision to torch.dtype. Find a
-# cleaner way to do this.
-PRECISION_TO_TYPE = {
-    "fp32": torch.float32,
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-}
 
 STR_BACKEND_ENV_VAR: str = "SGLANG_DIFFUSION_ATTENTION_BACKEND"
 STR_ATTN_CONFIG_ENV_VAR: str = "SGLANG_DIFFUSION_ATTENTION_CONFIG"
@@ -527,21 +522,24 @@ def shallow_asdict(obj) -> dict[str, Any]:
     return {f.name: getattr(obj, f.name) for f in fields(obj)}
 
 
-# TODO: validate that this is fine
 def kill_itself_when_parent_died() -> None:
-    # if sys.platform == "linux":
-    # sigkill this process when parent worker manager dies
-    PR_SET_PDEATHSIG = 1
-    import platform
+    if sys.platform != "linux":
+        return
 
-    if platform.system() == "Linux":
-        libc = ctypes.CDLL("libc.so.6")
-        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
-    # elif platform.system() == "Darwin":
-    #     libc = ctypes.CDLL("libc.dylib")
-    #     logger.warning("kill_itself_when_parent_died is only supported in linux.")
-    else:
-        logger.warning("kill_itself_when_parent_died is only supported in linux.")
+    # keep GPU workers tied to the CLI process even if the parent is SIGKILLed
+    PR_SET_PDEATHSIG = 1
+    # Capture parent before arming PDEATHSIG: if the parent already died in the
+    # fork->prctl window, PDEATHSIG won't fire, so detect the reparent explicitly.
+    parent_pid = os.getppid()
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    # getppid() changing means we were reparented (parent gone). Comparing to the
+    # captured pid instead of "== 1" avoids self-killing when PID 1 is the real
+    # parent (e.g. running as a container's init process).
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 def get_exception_traceback() -> str:

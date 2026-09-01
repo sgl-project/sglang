@@ -14,10 +14,11 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd")
 
 PAGE_SIZE = 2
 
@@ -110,14 +111,12 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
 
         cache.writing_check(write_back=True)
 
-        # Both split fragments must be published, with intact parentage.
+        # Both split fragments must be published as one parent-linked batch.
         stored_cpu = self._stored_cpu_events(cache)
-        self.assertEqual(
-            [list(e.token_ids) for e in stored_cpu],
-            [[1, 2], [3, 4]],
-        )
+        self.assertEqual(len(stored_cpu), 1)
+        self.assertEqual(list(stored_cpu[0].token_ids), [1, 2, 3, 4])
         self.assertIsNone(stored_cpu[0].parent_block_hash)
-        self.assertEqual(stored_cpu[1].parent_block_hash, stored_cpu[0].block_hashes[0])
+        self.assertEqual(len(stored_cpu[0].block_hashes), 2)
 
 
 if __name__ == "__main__":

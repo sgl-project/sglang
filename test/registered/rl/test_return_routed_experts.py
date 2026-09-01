@@ -66,7 +66,7 @@ class TestReturnRoutedExperts(CustomTestCase):
             "deepep",
             # Force normal-mode dispatch: deepep auto routes decode through
             # low_latency mode whose buffer (num_max_dispatch_tokens_per_rank)
-            # is undersized for cuda graph capture at default --cuda-graph-max-bs.
+            # is undersized for cuda graph capture at default --cuda-graph-max-bs-decode.
             "--deepep-mode",
             "normal",
         ]

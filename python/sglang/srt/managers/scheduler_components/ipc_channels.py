@@ -53,7 +53,8 @@ class SchedulerIpcChannels:
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
             if skip_tokenizer_init:
-                # Directly send to the TokenizerManager
+                # No decode work: send outputs straight to the tokenizer side
+                # (MultiTokenizerRouter fans out when tokenizer_worker_num > 1).
                 send_to_detokenizer_raw = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                 )

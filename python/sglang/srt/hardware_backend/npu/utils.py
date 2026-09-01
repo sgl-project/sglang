@@ -6,7 +6,13 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.utils import get_npu_memory_capacity, is_npu
 
 if TYPE_CHECKING:
@@ -22,11 +28,6 @@ class NPUACLFormat(IntEnum):
     ACL_FORMAT_UNDEFINED = -1
     ACL_FORMAT_ND = 2
     ACL_FORMAT_FRACTAL_NZ = 29
-
-
-class FusedMoEMode(IntEnum):
-    FUSED_DEEP_MOE = 1
-    DISPATCH_FFN_COMBINE = 2
 
 
 def _call_once(fn: Callable):
@@ -48,47 +49,120 @@ def set_default_server_args(args: "ServerArgs"):
     Set default server arguments for NPU backend.
     """
 
+    cfg = resolving_view(args)
+
     # NPU only works with "ascend" attention backend for now
-    args.attention_backend = "ascend"
-    args.prefill_attention_backend = "ascend"
-    args.decode_attention_backend = "ascend"
-    if args.page_size is None:
-        args.page_size = 128
+    declare_resolution(
+        args,
+        "set_default_server_args",
+        attention_backend="ascend",
+    )
+    declare_resolution(
+        args,
+        "set_default_server_args",
+        prefill_attention_backend="ascend",
+    )
+    declare_resolution(
+        args,
+        "set_default_server_args",
+        decode_attention_backend="ascend",
+    )
+    if cfg.page_size is None:
+        declare_resolution(
+            args,
+            "set_default_server_args",
+            page_size=128,
+        )
 
     # NPU memory settings
-    decode = args.cuda_graph_config.decode
     npu_mem = get_npu_memory_capacity()
     if npu_mem <= 32 * 1024:
         # Ascend 910B4,910B4_1
         # (chunked_prefill_size 4k, max_bs 16 if tp < 4 else 64)
-        if args.chunked_prefill_size is None:
-            args.chunked_prefill_size = 4 * 1024
-        if decode.max_bs is None:
-            if args.tp_size < 4:
-                decode.max_bs = 16
+        if cfg.chunked_prefill_size is None:
+            declare_resolution(
+                args,
+                "set_default_server_args",
+                chunked_prefill_size=4 * 1024,
+            )
+        if cfg.cuda_graph_config.decode.max_bs is None:
+            if cfg.tp_size < 4:
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=16,
+                    ),
+                )
             else:
-                decode.max_bs = 64
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=64,
+                    ),
+                )
     elif npu_mem <= 64 * 1024:
         # Ascend 910B1,910B2,910B2C,910B3,910_9391,910_9392,910_9381,910_9382,910_9372,910_9362
         # (chunked_prefill_size 8k, max_bs 64 if tp < 4 else 256)
-        if args.chunked_prefill_size is None:
-            args.chunked_prefill_size = 8 * 1024
-        if decode.max_bs is None:
-            if args.tp_size < 4:
-                decode.max_bs = 64
+        if cfg.chunked_prefill_size is None:
+            declare_resolution(
+                args,
+                "set_default_server_args",
+                chunked_prefill_size=8 * 1024,
+            )
+        if cfg.cuda_graph_config.decode.max_bs is None:
+            if cfg.tp_size < 4:
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=64,
+                    ),
+                )
             else:
-                decode.max_bs = 256
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=256,
+                    ),
+                )
 
     # NPU does not support CustomAllReduce
-    args.disable_custom_all_reduce = True
+    declare_resolution(
+        args,
+        "set_default_server_args",
+        disable_custom_all_reduce=True,
+    )
 
     # handles hierarchical cache configs
-    if args.enable_hierarchical_cache:
-        args.hicache_io_backend = "kernel_ascend"
-        if args.use_mla_backend():
-            args.hicache_mem_layout = "page_first_kv_split"
+    if cfg.enable_hierarchical_cache:
+        declare_resolution(
+            args,
+            "set_default_server_args",
+            hicache_io_backend="kernel_ascend",
+        )
+        if use_mla_backend(args):
+            declare_resolution(
+                args,
+                "set_default_server_args",
+                hicache_mem_layout="page_first_kv_split",
+            )
         else:
-            args.hicache_mem_layout = "page_first_direct"
+            declare_resolution(
+                args,
+                "set_default_server_args",
+                hicache_mem_layout="page_first_direct",
+            )
 
 
 @_call_once
@@ -106,30 +180,40 @@ def init_npu_backend():
         logger.warning("NPU custom kernel packages unavailable: %s", e)
 
     import torch_npu
-    from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
-    # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
-    torch.cuda.is_available = lambda: False
+    # These imports lead to unpredictable behavior in diffusion models
+    # and a significant reduction in performance.
+    if "sglang.multimodal_gen" not in sys.modules:
+        from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
-    torch_npu.npu.config.allow_internal_format = True
+        # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
+        torch.cuda.is_available = lambda: False
+        torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
 def _is_nz_aligned(tensor: torch.Tensor) -> bool:
     """Check whether the last two dims satisfy FRACTAL_NZ alignment rules.
 
-    Ascend FRACTAL_NZ requires:
-      BF16 / FP16 : both dims divisible by 16
-      INT8         : k % 16 == 0  and  n % 32 == 0
+    A fractal tile is 16 rows by 32 bytes (the C0_32 in the op's error strings),
+    so the row rule is always k % 16 and the column rule is 32 // itemsize:
+
+      BF16 / FP16  : k % 16 == 0  and  n % 16 == 0
+      INT8 / FP8   : k % 16 == 0  and  n % 32 == 0
       INT4         : k % 16 == 0  and  n % 64 == 0
-      FP4          : both dims divisible by 64
+
+    Unlisted dtypes fall through to True: this is a cheap pre-filter for known
+    bad combinations, not an authority — the op itself is.
     """
     if tensor.dim() < 2:
         return False
     k, n = tensor.shape[-2], tensor.shape[-1]
     if tensor.dtype in (torch.bfloat16, torch.float16):
         return k % 16 == 0 and n % 16 == 0
-    if tensor.dtype == torch.int8:
+    if tensor.dtype in (torch.int8, torch.float8_e4m3fn):
+        # e4m3 is single-byte like int8, so it shares the column rule. Reached
+        # only by the MXFP8 MoE weights; the packed-FP4 callers pass
+        # customize_dtype and return before this check.
         return k % 16 == 0 and n % 32 == 0
     if tensor.dtype in (torch.uint8, torch.int32):
         # INT4 is typically packed into uint8/int32; be conservative
@@ -140,6 +224,9 @@ def _is_nz_aligned(tensor: torch.Tensor) -> bool:
 def npu_format_cast(
     tensor: torch.Tensor,
     acl_format: NPUACLFormat = NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+    *,
+    customize_dtype=None,
+    input_dtype=None,
 ) -> torch.Tensor:
     """
     Cast a tensor to a specific NPU ACL format.
@@ -147,6 +234,12 @@ def npu_format_cast(
     Args:
         tensor (torch.Tensor): The input tensor.
         acl_format (NPUACLFormat): The target NPU ACL format.
+        customize_dtype / input_dtype: packed-FP4 unpack kwargs (e.g.
+            ``customize_dtype=torch.float8_e4m3fn``,
+            ``input_dtype=torch.float4_e2m1fn_x2``). When either is set the unpack
+            kwargs are forwarded to the op and the ``_is_nz_aligned`` ND fallback
+            is skipped: the FP4 matmul strictly requires FRACTAL_NZ, so a silent
+            ND fallback would corrupt results.
 
     Returns:
         torch.Tensor: The tensor cast to the specified NPU ACL format.
@@ -166,6 +259,21 @@ def npu_format_cast(
         )
         return tensor
 
+    # Skip format cast for meta tensors (used in offloader)
+    if tensor.device.type == "meta":
+        return tensor
+
+    # Packed-FP4 → FRACTAL_NZ: forward the unpack kwargs to the op, and skip the
+    # _is_nz_aligned ND fallback — the FP4 matmul strictly requires NZ, so a
+    # silent ND fallback would corrupt results.
+    if customize_dtype is not None or input_dtype is not None:
+        return torch.ops.npu.npu_format_cast(
+            tensor,
+            int(acl_format),
+            customize_dtype=customize_dtype,
+            input_dtype=input_dtype,
+        )
+
     if acl_format == NPUACLFormat.ACL_FORMAT_FRACTAL_NZ and not _is_nz_aligned(tensor):
         k, n = tensor.shape[-2], tensor.shape[-1]
         logger.warning_once(
@@ -176,10 +284,6 @@ def npu_format_cast(
             n,
             tensor.dtype,
         )
-        return tensor
-
-    # Skip format cast for meta tensors (used in offloader)
-    if tensor.device.type == "meta":
         return tensor
 
     return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
