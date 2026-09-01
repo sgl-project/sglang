@@ -186,6 +186,18 @@ export const benchmarks = [
           dataset: "random",
           isl: 1024,
           osl: 256,
+          max_concurrency: 1,
+          num_prompts: 8,
+        },
+        ttft_ms: 148.18,
+        tpot_ms: 3.84,
+        tokens_per_sec_per_gpu: 256.69,
+      },
+      {
+        workload: {
+          dataset: "random",
+          isl: 1024,
+          osl: 256,
           max_concurrency: 16,
           num_prompts: 80,
         },
@@ -196,7 +208,7 @@ export const benchmarks = [
     ],
     accuracy: { gsm8k_pct: 97.14, aime2026_pct: 92.45 },
     notes:
-      "RadixArk/GLM-5.3-Flash-NVFP4 — NVFP4 W4A4 post-training quantization of zai-org/GLM-5.3-Flash-BF16 with NVIDIA Model Optimizer 0.46.0 (abs-max scaling, group size 16): routed and shared experts plus the dense MLPs are FP4, while all attention (KDA, DSA indexer, MLA), the router, norms, the vision tower, the MTP layer, embeddings, and the LM head stay BF16. Measured on 4x GB300 with the lmsysorg/sglang:glm-5.3-flash image (PR #36507 head 033446bb05), adaptive MTP 5/1/6, BF16 KV + TileLang DSA, and the flashinfer_cutlass MoE runner. GSM8K 97.14% over the full 1,319-example split x 4 seeds (per-seed range 96.89-97.42%, stop rate 99.85-100%) and AIME 2026 92.45% (30 problems x 16 repeats x 4 seeds = 1,920 generations, per-seed range 91.67-93.54%), both at temperature 1.0 / top_p 0.95. The accuracy runs used the NEXTN spelling of --speculative-algorithm, which resolves to the same runtime path as the published EAGLE command on this tree. The speed row was measured on the unpatched docker tree with SGLANG_SIMULATE_ACC_LEN=3 pinning the accept length (confirmed 2.98): 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 818.09 aggregate output tok/s after two discarded warmups. Simulated accept length makes this a throughput-mechanism number; a same-pod A/B against the SwiGLU-fusion-disabled tree landed within ±3%, so the unpatched numbers are the published ones. The companion GSM8K gate on this stack scored 97.27% with a 99.92% stop rate over all 1,319 problems. The gap to the fp8 rows (~45%) is recipe-level, not kernel-isolated: flashinfer_cutlass + BF16 KV + TileLang DSA + TP4 without EP vs the fp8 cells' deep_gemm + FP8 KV + TRT-LLM DSA + EP4.",
+      "RadixArk/GLM-5.3-Flash-NVFP4 — NVFP4 W4A4 post-training quantization of zai-org/GLM-5.3-Flash-BF16 with NVIDIA Model Optimizer 0.46.0 (abs-max scaling, group size 16): routed and shared experts plus the dense MLPs are FP4, while all attention (KDA, DSA indexer, MLA), the router, norms, the vision tower, the MTP layer, embeddings, and the LM head stay BF16. Measured on 4x GB300 with the lmsysorg/sglang:glm-5.3-flash image (PR #36507 head 033446bb05), adaptive MTP 5/1/6, BF16 KV + TileLang DSA, and the flashinfer_cutlass MoE runner. GSM8K 97.14% over the full 1,319-example split x 4 seeds (per-seed range 96.89-97.42%, stop rate 99.85-100%) and AIME 2026 92.45% (30 problems x 16 repeats x 4 seeds = 1,920 generations, per-seed range 91.67-93.54%), both at temperature 1.0 / top_p 0.95. The accuracy runs used the NEXTN spelling of --speculative-algorithm, which resolves to the same runtime path as the published EAGLE command on this tree. The speed row was measured on the unpatched docker tree with SGLANG_SIMULATE_ACC_LEN=3 pinning the accept length (confirmed 2.98): 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 818.09 aggregate output tok/s after two discarded warmups. Simulated accept length makes this a throughput-mechanism number; a same-pod A/B against the SwiGLU-fusion-disabled tree landed within ±3%, so the unpatched numbers are the published ones. The companion GSM8K gate on this stack scored 97.27% with a 99.92% stop rate over all 1,319 problems. The gap to the fp8 rows (~45%) is recipe-level, not kernel-isolated: flashinfer_cutlass + BF16 KV + TileLang DSA + TP4 without EP vs the fp8 cells' deep_gemm + FP8 KV + TRT-LLM DSA + EP4. The concurrency-1 entry uses the same protocol (8 requests, simulated accept 3.00); the fp8-trtllm pairing is ~7% ahead on decode at c1, consistent with the c16 ranking.",
   },
   {
     match: { hw: "gb300", strategy: "high-throughput", quant: "nvfp4", kvDsaPair: "bf16-tilelang" },
@@ -254,6 +266,18 @@ export const benchmarks = [
           dataset: "random",
           isl: 1024,
           osl: 256,
+          max_concurrency: 1,
+          num_prompts: 8,
+        },
+        ttft_ms: 143.16,
+        tpot_ms: 3.55,
+        tokens_per_sec_per_gpu: 274.63,
+      },
+      {
+        workload: {
+          dataset: "random",
+          isl: 1024,
+          osl: 256,
           max_concurrency: 16,
           num_prompts: 80,
         },
@@ -263,7 +287,7 @@ export const benchmarks = [
       },
     ],
     notes:
-      "FP8 KV + TRT-LLM DSA pairing of the NVFP4 recipe on 4x B300 (SXM6), stock unpatched lmsysorg/sglang:glm-5.3-flash image (tree 033446bb05), TP4-only with the flashinfer_cutlass MoE runner, adaptive MTP 5/1/6 with SGLANG_SIMULATE_ACC_LEN=3: 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,139.83 aggregate output tok/s after two discarded warmups — 39% above the bf16-tilelang NVFP4 row on the otherwise identical recipe. Simulated accept length makes this a throughput-mechanism number (accept 2.98 confirms the simulation engaged; smoke output is N/A by design under simulated acceptance). EP is not available for this checkpoint on the stock image: --ep-size 4 crashes on the first forward pass (the shared-expert NVFP4 weight arrives 1-D under EP, ValueError in the modelopt_fp4 apply), so the NVFP4 cells are TP-only for now.",
+      "FP8 KV + TRT-LLM DSA pairing of the NVFP4 recipe on 4x B300 (SXM6), stock unpatched lmsysorg/sglang:glm-5.3-flash image (tree 033446bb05), TP4-only with the flashinfer_cutlass MoE runner, adaptive MTP 5/1/6 with SGLANG_SIMULATE_ACC_LEN=3: 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,139.83 aggregate output tok/s after two discarded warmups — 39% above the bf16-tilelang NVFP4 row on the otherwise identical recipe. Simulated accept length makes this a throughput-mechanism number (accept 2.98 confirms the simulation engaged; smoke output is N/A by design under simulated acceptance). EP is not available for this checkpoint on the stock image: --ep-size 4 crashes on the first forward pass (the shared-expert NVFP4 weight arrives 1-D under EP, ValueError in the modelopt_fp4 apply), so the NVFP4 cells are TP-only for now. The concurrency-1 entry uses the same protocol (8 requests, simulated accept 3.00); it stays ~7% ahead of bf16-tilelang on decode, consistent with the c16 ranking.",
   },
   {
     match: { hw: "gb300", strategy: "high-throughput", quant: "nvfp4", kvDsaPair: "fp8-trtllm" },
