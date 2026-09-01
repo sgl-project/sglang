@@ -89,10 +89,10 @@ def normalize_sm90_fp4_symm_buffer_views(buf):
     """Restore tensor views lost by mixed TVM-FFI/PyTorch DeepGEMM builds.
 
     The ring-buffer slicer in affected builds returns byte tensors through
-    DLPack, while the SM90 pre-dispatch and FP8xFP4 kernel require typed views
-    for all eight regions.  Re-viewing byte storage does not alter its address
-    or underlying allocation; four-byte views recover the logical last
-    dimension encoded by the slicer.
+    DLPack, and four-byte floating-point regions can arrive as integer tensors.
+    The SM90 pre-dispatch and FP8xFP4 kernel require typed views for all eight
+    regions. Reinterpreting a same-width integer wire view does not alter its
+    shape, strides, address, or underlying allocation.
     """
     num_ring_tokens = getattr(buf, "num_ring_tokens", None)
     if not isinstance(num_ring_tokens, int) or num_ring_tokens <= 0:
@@ -117,10 +117,15 @@ def normalize_sm90_fp4_symm_buffer_views(buf):
         if tensor.dtype == required_dtype:
             normalized[name] = tensor
             continue
-        if tensor.element_size() != 1:
+        allowed_wire_dtypes = (
+            (torch.int8, torch.uint8)
+            if required_dtype == torch.float8_e4m3fn
+            else (torch.int32, torch.uint32)
+        )
+        if tensor.dtype not in allowed_wire_dtypes:
             raise TypeError(
-                f"DeepGEMM SM90 FP4 buffer {name} must use one-byte storage, "
-                f"got {tensor.dtype}"
+                f"DeepGEMM SM90 FP4 buffer {name} cannot reinterpret "
+                f"{tensor.dtype} as {required_dtype}"
             )
         try:
             normalized[name] = tensor.view(required_dtype)

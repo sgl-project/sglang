@@ -595,13 +595,13 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
         ring_buffer = SimpleNamespace(
             num_ring_tokens=256,
             x=torch.zeros((2, 4), dtype=torch.uint8),
-            x_sf=torch.zeros((2, 4), dtype=torch.uint8),
-            topk_idx=torch.zeros((2, 4), dtype=torch.uint8),
-            topk_weights=torch.zeros((2, 4), dtype=torch.uint8),
+            x_sf=torch.zeros((2, 1), dtype=torch.int32),
+            topk_idx=torch.zeros((2, 1), dtype=torch.int32),
+            topk_weights=torch.zeros((2, 1), dtype=torch.int32),
             l1_acts=torch.zeros((2, 4), dtype=torch.uint8),
-            l1_acts_sf=torch.zeros((2, 4), dtype=torch.uint8),
+            l1_acts_sf=torch.zeros((2, 1), dtype=torch.int32),
             l2_acts=torch.zeros((2, 4), dtype=torch.uint8),
-            l2_acts_sf=torch.zeros((2, 4), dtype=torch.uint8),
+            l2_acts_sf=torch.zeros((2, 1), dtype=torch.int32),
         )
         ring_constructor = mock.Mock(return_value=ring_buffer)
         deep_gemm = SimpleNamespace(
@@ -655,7 +655,7 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
             l2_acts=torch.zeros((2, 4), dtype=torch.uint8),
             l2_acts_sf=torch.zeros((2, 1), dtype=torch.float32),
         )
-        with self.assertRaisesRegex(TypeError, "one-byte storage"):
+        with self.assertRaisesRegex(TypeError, "cannot reinterpret"):
             normalize_sm90_fp4_symm_buffer_views(buf)
 
     def test_fp4_buffer_views_fail_closed_without_partial_mutation(self):
@@ -663,15 +663,15 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
         buf = SimpleNamespace(
             num_ring_tokens=256,
             x=x,
-            x_sf=torch.zeros((2, 3), dtype=torch.uint8),
-            topk_idx=torch.zeros((2, 4), dtype=torch.uint8),
-            topk_weights=torch.zeros((2, 4), dtype=torch.uint8),
+            x_sf=torch.zeros((2, 1), dtype=torch.float16),
+            topk_idx=torch.zeros((2, 1), dtype=torch.int32),
+            topk_weights=torch.zeros((2, 1), dtype=torch.int32),
             l1_acts=torch.zeros((2, 4), dtype=torch.uint8),
-            l1_acts_sf=torch.zeros((2, 4), dtype=torch.uint8),
+            l1_acts_sf=torch.zeros((2, 1), dtype=torch.int32),
             l2_acts=torch.zeros((2, 4), dtype=torch.uint8),
-            l2_acts_sf=torch.zeros((2, 4), dtype=torch.uint8),
+            l2_acts_sf=torch.zeros((2, 1), dtype=torch.int32),
         )
-        with self.assertRaisesRegex(TypeError, "x_sf.*view-compatible"):
+        with self.assertRaisesRegex(TypeError, "x_sf.*cannot reinterpret"):
             normalize_sm90_fp4_symm_buffer_views(buf)
         self.assertIs(buf.x, x)
         self.assertEqual(buf.x.dtype, torch.uint8)
