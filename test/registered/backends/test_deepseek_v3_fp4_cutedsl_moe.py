@@ -1,6 +1,7 @@
 """CuteDSL MoE e2e with EP=TP=4 (moe_a2a=none): each GPU holds 1/4 of the
 experts at full intermediate width, partial results combined via all-reduce.
-Kept for the distributed-EP and end-to-end accuracy dimensions."""
+Kept for the distributed-EP dimension; single-GPU backend numerics live in
+unit/layers/quantization/test_nvfp4_moe_backends.py."""
 
 import unittest
 from types import SimpleNamespace

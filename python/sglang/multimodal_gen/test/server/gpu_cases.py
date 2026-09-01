@@ -1272,9 +1272,11 @@ ONE_GPU_XPU_CASES = _select_xpu_cases(ONE_GPU_XPU_CASE_IDS)
 # files incrementally as they are vetted, in follow-up PRs. Paths are
 # relative to the unit/ dir.
 _AMD_READY_NESTED_UNIT_TESTS = (
+    "realtime/test_causal_denoising.py",
     "realtime/test_output_materialization.py",
     "realtime/test_realtime_consistency_harness.py",
     "realtime/test_realtime_control_signals.py",
+    "realtime/test_realtime_output_transport.py",
     "realtime/test_realtime_vae.py",
     "sana_wm/test_streaming_cached.py",
     "sana_wm/test_streaming_stage.py",
@@ -1282,6 +1284,8 @@ _AMD_READY_NESTED_UNIT_TESTS = (
     # Enabled with small test-harness stub fixes (see this PR's test edits).
     "progressive_resolution/test_progressive.py",
     "sana_wm/test_streaming_realtime_path.py",
+    # Stub gap already fixed upstream; only needs enabling here.
+    "realtime/test_lingbot_causal_denoising.py",
 )
 
 

@@ -289,7 +289,7 @@ class RunSuiteVisitor(ast.NodeVisitor):
 
     Parses:
         STANDALONE_FILES = {
-            "1-gpu": ["test_example.py"],
+            "1-gpu": ["test_lora_format_adapter.py"],
             "2-gpu": [],
         }
     """

@@ -63,7 +63,8 @@ register_xpu_ci(est_time=60, suite="stage-b-test-1-gpu-xpu")
 
 
 def _make_req(rid, req_pool_idx, token_ids, tree):
-    """Fake Req with only the fields LMCRadixCache/RadixCache read."""
+    """Fake Req with the fields LMCRadixCache/RadixCache read (mirrors the
+    SimpleNamespace pattern in test_swa_eviction_boundary.py)."""
     req = SimpleNamespace(
         rid=rid,
         origin_input_ids=token_ids,

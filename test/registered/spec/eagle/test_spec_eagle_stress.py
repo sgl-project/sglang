@@ -2,7 +2,8 @@
 
 These need memory headroom / measure load behaviour, so they run on the large
 (Hopper) runner. The scheduler timeout paths carry no spec-specific state, so
-the cheap e2e in scheduler/test_scheduler_control.py owns that coverage.
+they live in unit/managers/test_scheduler_timeouts.py plus the cheap e2e in
+scheduler/test_scheduler_control.py.
 """
 
 import unittest

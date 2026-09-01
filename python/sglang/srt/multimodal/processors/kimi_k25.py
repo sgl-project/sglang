@@ -89,6 +89,7 @@ def _expand_image_token_ids(
 
     Same rebuild as ``BaseMultimodalProcessor._expand_input_ids``, but staying in
     the array domain skips a list round trip on the way to the output tensor.
+    test_kimi_k25.py pins the two together.
     """
     if isinstance(input_ids, torch.Tensor):
         input_ids = input_ids.detach().flatten().cpu().numpy()

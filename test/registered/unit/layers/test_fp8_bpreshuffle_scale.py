@@ -124,7 +124,8 @@ class TestBpreshuffleScaleFreshQuantNoCopy(CustomTestCase):
     instead of relaying it out with ``materialize_bpreshuffle_fp8_scale`` (a
     ``.t().contiguous().t()`` copy). These pin the PR's core claim: the reinterpret
     is bit-identical to the copy path for M>=2, and allocates nothing. The real
-    quant/GEMM equivalence stays in the AMD GPU integration lane."""
+    quant/GEMM equivalence is validated on gfx95 in
+    ``test_fp8_bpreshuffle_dense_linear_mi35x.py``."""
 
     def test_nocopy_matches_materialize(self):
         for m, g in ((3, 4), (2, 2), (8, 5), (16, 128)):
@@ -162,7 +163,9 @@ class TestBpreshuffleScaleFreshQuantNoCopy(CustomTestCase):
         ``.contiguous()`` copies nothing and the result keeps the natural
         ``(G, 1)`` stride (NOT the ``(1, M)`` column-major stride it produces for
         M >= 2) while sharing the input's storage. Values must survive intact; the
-        downstream bpreshuffle GEMM consumes the same bytes either way."""
+        downstream bpreshuffle GEMM consumes the same bytes either way. The actual
+        M==1 gating through aiter_w8a8_block_fp8_linear is exercised on gfx95 in
+        test_fp8_bpreshuffle_dense_linear_mi35x.py."""
         scale = torch.arange(4, dtype=torch.float32).reshape(1, 4)  # [M=1, G=4]
 
         materialized = materialize_bpreshuffle_fp8_scale(scale)
