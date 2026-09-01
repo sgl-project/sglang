@@ -3108,6 +3108,26 @@ class DeepseekV4Model(nn.Module):
         else:
             input_ids_global = input_ids
 
+        # Hoist the image-token mask + host flag for the bias_vl routing,
+        # computed from input_ids_global — the exact ids the MoE gate sees.
+        # (Computing from the local batch ids breaks under dp-attention: an
+        # idle/text-only rank would skip the check while the gathered global
+        # ids still contain a peer's mm pad sentinels, sending them into the
+        # fused hash_topk kernel for an illegal access.)
+        from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+
+        if not torch.cuda.is_current_stream_capturing():
+            image_mask = input_ids_global >= MM_PAD_SHIFT_VALUE
+            if image_mask.any():
+                forward_batch.dsv4_image_mask = image_mask
+                forward_batch.dsv4_has_image_tokens = True
+            else:
+                forward_batch.dsv4_image_mask = None
+                forward_batch.dsv4_has_image_tokens = False
+        else:
+            forward_batch.dsv4_image_mask = None
+            forward_batch.dsv4_has_image_tokens = False
+
         capture_dspark = self.dspark_layers_to_capture is not None
         dspark_aux_hidden_states: List[torch.Tensor] = []
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped

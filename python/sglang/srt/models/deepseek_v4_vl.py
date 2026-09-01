@@ -145,18 +145,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             # embed_mm_inputs clamps forward_batch.input_ids in place
             # (max=vocab_size-1) to embed the placeholder region. The MoE
             # gate's bias_vl routing keys on the mm pad sentinels in those
-            # ids, so keep a pre-clamp snapshot for it to read. Also hoist
-            # the image-token mask + host flag here: the routine nulls
-            # forward_batch.mm_inputs before the LM runs, so the mask must be
-            # computed now, and the flag lets MoE layers skip their per-layer
-            # GPU->CPU check on text-only batches.
-            from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
-
-            routing_ids = forward_batch.input_ids.clone()
-            forward_batch.dsv4_routing_input_ids = routing_ids
-            image_mask = routing_ids >= MM_PAD_SHIFT_VALUE
-            forward_batch.dsv4_image_mask = image_mask
-            forward_batch.dsv4_has_image_tokens = bool(image_mask.any())
+            # ids, so keep a pre-clamp snapshot for it to read. The
+            # image-token mask + host flag are hoisted later by
+            # DeepseekV4Model.forward from input_ids_global (the exact ids
+            # the gate sees — required for dp-attention).
+            forward_batch.dsv4_routing_input_ids = forward_batch.input_ids.clone()
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,

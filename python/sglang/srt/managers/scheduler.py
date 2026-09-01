@@ -5014,6 +5014,16 @@ class Scheduler(
         self.running_batch.reqs = []
         for req in retract_reqs:
             if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if req.multimodal_inputs is not None:
+                    # The rebootstrap payload only carries token ids (see
+                    # Req.build_rebootstrap_payload), so the prefill recompute
+                    # would silently rebuild the prefix KV without the image.
+                    # Abort instead of serving silently-wrong output.
+                    req.set_finish_with_abort(
+                        "Multimodal requests are not supported by PD "
+                        "rebootstrap (retraction + weight update)."
+                    )
+                    continue
                 if req.output_ids:
                     req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
                 req.pd_rebootstrap_in_progress = True
