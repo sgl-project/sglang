@@ -902,6 +902,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         )
 
+    def demoted_reqs(self) -> List[Req]:
+        return [entry.req for entry in self.demotion_queue]
+
+    def demotion_queue_cache_usage(self) -> float:
+        # Ratio of offloaded KV tokens to the GPU pool, comparable against
+        # proactive_safe_cpu_demote_cache_usage; may slightly overshoot it
+        # because the demotion loop checks the budget before debiting.
+        demoted_tokens = sum(entry.demoted_tokens for entry in self.demotion_queue)
+        return demoted_tokens / self.max_total_num_tokens
+
     def resume_demoted_reqs(self) -> List[Req]:
         """Restore demoted requests only after their recovery duration expires."""
         recovery_duration = (

@@ -352,6 +352,33 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         # Demotion records the output length the next wave must build on.
         self.assertEqual(fresh.last_demote_output_len, 30)
 
+    def test_demotion_queue_cache_usage_matches_budget_spend(self):
+        """demotion_queue_cache_usage must equal the budget debited by
+        add_demoted_req divided by the pool size, so the gauge tracks the
+        proactive_safe_cpu_demote_cache_usage cap without separate accounting."""
+        long = _make_demotion_candidate("long", 30, 20)
+        medium = _make_demotion_candidate("medium", 20, 12)
+        batch = _FakeBatch([long, medium])
+        initial_budget = 100
+        scheduler = _make_demotion_scheduler(batch, budget=initial_budget)
+        queue = scheduler.disagg_decode_prealloc_queue
+        queue.max_total_num_tokens = 500
+
+        self.assertEqual(queue.demotion_queue_cache_usage(), 0.0)
+        self.assertEqual(queue.demoted_reqs(), [])
+
+        self.assertTrue(
+            SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
+                scheduler
+            )
+        )
+
+        spent = initial_budget - scheduler.remain_cpu_demote_tokens
+        self.assertEqual(
+            queue.demotion_queue_cache_usage(), spent / queue.max_total_num_tokens
+        )
+        self.assertEqual(queue.demoted_reqs(), [long, medium])
+
 
 if __name__ == "__main__":
     unittest.main()
