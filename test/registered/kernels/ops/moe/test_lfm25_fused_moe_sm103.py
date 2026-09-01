@@ -12,7 +12,6 @@ from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-
 register_cuda_ci(est_time=90, stage="base-c", runner_config="4-gpu-gb300")
 
 
