@@ -75,6 +75,11 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    # Gated PP+spec relay flow. Class-level default so schedulers that never
+    # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
+    # init_pp_loop_state overwrites it per instance.
+    _pp_spec_relay: bool = False
+
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
         """
@@ -1041,7 +1046,7 @@ class SchedulerPPMixin:
             "next_token_ids": result.next_token_ids,
         }
 
-        if not batch.spec_algorithm.is_none() and result.accept_lens is not None:
+        if self._pp_spec_relay and result.accept_lens is not None:
             # PP+spec verify round: earlier stages need the accept results to
             # mirror seq_lens/KV bookkeeping and the bonus token to root the
             # next round's verify chain.
@@ -1212,8 +1217,7 @@ class SchedulerPPMixin:
                     logits_output = LogitsProcessorOutput(next_token_logits=None)
                 logits_output.auxiliary_device_output = auxiliary_output
 
-        is_spec = not batch.spec_algorithm.is_none()
-        if is_spec and "spec_accept_lens" in pp_outputs.tensors:
+        if self._pp_spec_relay and "spec_accept_lens" in pp_outputs.tensors:
             # PP+spec verify round. Relayed tensors align with the composition
             # that ran the forward (mb_metadata.fwd_batch snapshot); the live
             # mb object may have been merged/filtered in place since. Mirror
@@ -1279,7 +1283,7 @@ class SchedulerPPMixin:
             )
             batch.spec_info = next_draft_input
 
-        if is_spec and self._pp_spec_relay:
+        if self._pp_spec_relay:
             # Gated single-instance PP+spec: the sampled first token roots
             # round 1's tree. Only the chunk that finishes the prompt samples
             # a real token; a middle chunk's next_token_ids is a placeholder
