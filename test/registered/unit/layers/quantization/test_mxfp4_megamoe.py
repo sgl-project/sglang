@@ -54,6 +54,7 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
     _transform_weights_for_mega_moe_sm90_fp4_compat,
     build_sm90_fp4_mega_moe_experts_weights,
     is_sm90_fp4_mega_moe_available,
+    normalize_sm90_fp4_symm_buffer_views,
     run_sm90_mega_routed,
 )
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -591,7 +592,12 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
 
     def test_fp4_buffer_factory_calls_ring_buffer_abi(self):
         legacy_constructor = mock.Mock()
-        ring_buffer = SimpleNamespace(num_ring_tokens=256)
+        ring_buffer = SimpleNamespace(
+            num_ring_tokens=256,
+            x=torch.zeros((2, 4), dtype=torch.uint8),
+            l1_acts=torch.zeros((2, 4), dtype=torch.uint8),
+            l2_acts=torch.zeros((2, 4), dtype=torch.uint8),
+        )
         ring_constructor = mock.Mock(return_value=ring_buffer)
         deep_gemm = SimpleNamespace(
             get_symm_buffer_for_mega_moe=legacy_constructor,
@@ -608,6 +614,9 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
             )
 
         self.assertIs(result, ring_buffer)
+        self.assertEqual(result.x.dtype, torch.float8_e4m3fn)
+        self.assertEqual(result.l1_acts.dtype, torch.float8_e4m3fn)
+        self.assertEqual(result.l2_acts.dtype, torch.float8_e4m3fn)
         ring_constructor.assert_called_once_with(
             group,
             256,
@@ -620,6 +629,16 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
         )
         legacy_constructor.assert_not_called()
         _MEGA_MOE_SYMM_BUFFER.clear()
+
+    def test_fp4_buffer_views_fail_closed_on_non_byte_storage(self):
+        buf = SimpleNamespace(
+            num_ring_tokens=256,
+            x=torch.zeros((2, 4), dtype=torch.float32),
+            l1_acts=torch.zeros((2, 4), dtype=torch.uint8),
+            l2_acts=torch.zeros((2, 4), dtype=torch.uint8),
+        )
+        with self.assertRaisesRegex(TypeError, "one-byte storage"):
+            normalize_sm90_fp4_symm_buffer_views(buf)
 
     def test_native_transform_output_contract_is_checked(self):
         experts = self._experts()

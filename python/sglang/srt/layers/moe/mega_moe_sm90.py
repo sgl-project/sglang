@@ -85,6 +85,34 @@ def _resolve_sm90_fp4_symm_buffer_constructor(deep_gemm) -> Callable:
     return constructor
 
 
+def normalize_sm90_fp4_symm_buffer_views(buf):
+    """Restore FP8 views lost by mixed TVM-FFI/PyTorch DeepGEMM builds.
+
+    The ring-buffer slicer in affected builds returns byte tensors through
+    DLPack, while the SM90 pre-dispatch and FP8xFP4 kernel require the three
+    activation regions to be typed as E4M3.  Re-viewing one-byte storage does
+    not alter its shape, strides, address, or underlying allocation.
+    """
+    num_ring_tokens = getattr(buf, "num_ring_tokens", None)
+    if not isinstance(num_ring_tokens, int) or num_ring_tokens <= 0:
+        raise RuntimeError(
+            "DeepGEMM SM90 FP4 buffer is missing a positive num_ring_tokens"
+        )
+    for name in ("x", "l1_acts", "l2_acts"):
+        tensor = getattr(buf, name, None)
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"DeepGEMM SM90 FP4 buffer {name} must be a tensor")
+        if tensor.dtype == torch.float8_e4m3fn:
+            continue
+        if tensor.element_size() != 1:
+            raise TypeError(
+                f"DeepGEMM SM90 FP4 buffer {name} must use one-byte storage, "
+                f"got {tensor.dtype}"
+            )
+        setattr(buf, name, tensor.view(torch.float8_e4m3fn))
+    return buf
+
+
 def run_sm90_mega_routed(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,

@@ -30,6 +30,7 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
     _resolve_sm90_fp4_symm_buffer_constructor,
     is_sm90_fp4_mega_moe_available,
     is_sm90_fp8_mega_moe_available,
+    normalize_sm90_fp4_symm_buffer_views,
     run_sm90_mega_routed,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -88,6 +89,8 @@ def _get_mega_moe_symm_buffer(
             activation="swiglu",
             **constructor_kwargs,
         )
+        if use_sm90_fp4_ring_buffer:
+            buf = normalize_sm90_fp4_symm_buffer_views(buf)
         _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
 
