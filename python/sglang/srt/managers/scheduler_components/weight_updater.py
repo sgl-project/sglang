@@ -435,6 +435,8 @@ class SchedulerWeightUpdaterManager:
     ) -> Tuple[bool, str]:
         """Hand each streamed adapter to the LoRA manager's whole-adapter entry
         point (config from registration, upsert in place), then clear the stash."""
+        if expected_checksums is not None:
+            assert set(expected_checksums) == set(self._lora_stash)
         if not self._lora_stash:
             return True, "Success"
         # The attribute only exists when LoRA is enabled at server start.
@@ -445,8 +447,8 @@ class SchedulerWeightUpdaterManager:
             tensors = self._lora_stash[lora_name]
             names = frozenset(tensors)
             if expected_checksums is not None:
-                expected = expected_checksums.get(lora_name)
-                if expected is None or set(expected) != set(tensors):
+                expected = expected_checksums[lora_name]
+                if set(expected) != set(tensors):
                     return False, (
                         f"[LORA-CHECK] adapter {lora_name!r}: streamed tensor names "
                         f"do not match the expected manifest"
