@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import _release_overallocated_kv_indices
@@ -131,7 +132,7 @@ class TestFreeSegment(unittest.TestCase):
             token_to_kv_pool_allocator=alloc,
             req_to_token_pool=SimpleNamespace(req_to_token=row.unsqueeze(0)),
         )
-        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0))
+        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=0))
 
         before = len(alloc.free_pages)
         alloc.free_group_begin()
