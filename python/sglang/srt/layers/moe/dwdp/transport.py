@@ -11,7 +11,13 @@ import torch
 import torch.distributed as dist
 from cuda.bindings import driver as cuda
 
-from sglang.srt.cuda_vmm_utils import (
+from sglang.srt.layers.moe.dwdp.layout import (
+    DwdpExpertLayout,
+    LayerWeightSpecs,
+    MnnvlHandleSet,
+)
+from sglang.srt.platforms import current_platform
+from sglang.srt.utils.cuda_vmm_utils import (
     VmmReservation,
     align_down,
     align_up,
@@ -23,12 +29,6 @@ from sglang.srt.cuda_vmm_utils import (
     make_device_allocation_prop,
     tensor_from_pointer,
 )
-from sglang.srt.layers.moe.dwdp.layout import (
-    DwdpExpertLayout,
-    LayerWeightSpecs,
-    MnnvlHandleSet,
-)
-from sglang.srt.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 

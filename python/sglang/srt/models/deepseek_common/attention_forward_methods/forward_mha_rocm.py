@@ -22,12 +22,16 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
     forward_dsa_indexer_for_mha,
     resolve_attn_backend,
 )
 from sglang.srt.models.deepseek_common.utils import (
+    _is_block_scale_fp8,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
@@ -74,10 +78,7 @@ class DeepseekMHARocmForwardMixin:
                 # on gfx95, we can still use fused RMSNorm+FP8 quant, but MUST request
                 # the unquantized output for q_lora; otherwise q_lora becomes the (fp8,scale)
                 # tuple.
-                if (
-                    _use_aiter_gfx95
-                    and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
-                ):
+                if _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
                     q_quanted, q_lora, _, _ = fused_rms_fp8_group_quant(
                         q,
                         self.q_a_layernorm.weight,
@@ -121,7 +122,7 @@ class DeepseekMHARocmForwardMixin:
                     None,
                 )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
+            elif _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
                 q, _, _, _ = fused_rms_fp8_group_quant(
                     q,
                     self.q_a_layernorm.weight,
@@ -152,7 +153,7 @@ class DeepseekMHARocmForwardMixin:
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
 
-        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+        if _use_aiter_gfx95 and _is_block_scale_fp8(self.kv_b_proj):
             kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
                 kv_a,
                 self.kv_a_layernorm.weight,
@@ -243,7 +244,7 @@ class DeepseekMHARocmForwardMixin:
                 )
             )[0]
         else:
-            if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+            if _use_aiter_gfx95 and _is_block_scale_fp8(self.kv_b_proj):
                 kv = self.kv_b_proj(kv_a_quanted)[0]
             else:
                 kv = self.kv_b_proj(kv_a)[0]
@@ -308,6 +309,10 @@ class DeepseekMHARocmForwardMixin:
     ):
         if _use_aiter_gfx95:
             kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
+            # Read door: the pool never translates, so the production site does.
+            kv_indices = get_attn_backend().kv_index_translator.translate_dcp_read_ids(
+                kv_indices
+            )
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )

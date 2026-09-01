@@ -206,6 +206,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            registration_granularity_bytes=(
+                self.page_size * self.layout_dim
+                if self.layout in ("page_first", "page_first_direct")
+                else None
+            ),
         )
         return buffer
 
@@ -252,8 +257,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     ):
         if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
-        host_indices = self.dcp_kernel_indices(host_indices)
-        device_indices = self.dcp_kernel_indices(device_indices)
+        host_indices = self.maybe_dcp_kernel_indices(host_indices)
+        device_indices = self.maybe_dcp_kernel_indices(device_indices)
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
@@ -416,8 +421,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
-        host_indices = self.dcp_kernel_indices(host_indices)
-        device_indices = self.dcp_kernel_indices(device_indices)
+        host_indices = self.maybe_dcp_kernel_indices(host_indices)
+        device_indices = self.maybe_dcp_kernel_indices(device_indices)
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
@@ -436,9 +441,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             return
 
-        device_data_ptrs, device_kv_buffers = self._resolve_device_transfer_buffers(
-            device_pool
-        )
+        if io_backend == "kernel_ascend":
+            # NPU pools use contiguous multi-layer tensors and intentionally do
+            # not build the CUDA-style data_ptrs array.
+            device_data_ptrs, device_kv_buffers = None, None
+        else:
+            device_data_ptrs, device_kv_buffers = self._resolve_device_transfer_buffers(
+                device_pool
+            )
 
         if io_backend == "kernel":
             if self.layout == "layer_first":

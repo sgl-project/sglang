@@ -1,6 +1,6 @@
 ---
 title: Ling-3.0-tiny
-description: "Deploy Ling-3.0-tiny with SGLang — a compact ~7.9B total / ~1.2B active hybrid KDA + MLA MoE in BF16 or FP8, with thinking mode and tool calling."
+description: "Deploy Ling-3.0-tiny with SGLang — a compact ~7.9B total / ~1.2B active hybrid KDA + MLA MoE in BF16, FP8, or INT4, with thinking mode and tool calling."
 tag: NEW
 ---
 
@@ -46,6 +46,7 @@ It is a thinking model with chain-of-thought enabled by default, and it supports
 
 - **BF16**: [inclusionAI/Ling-3.0-tiny](https://huggingface.co/inclusionAI/Ling-3.0-tiny) — ~7.9B total / ~1.2B active
 - **FP8** (blockwise E4M3): [inclusionAI/Ling-3.0-tiny-fp8](https://huggingface.co/inclusionAI/Ling-3.0-tiny-fp8)
+- **INT4** (compressed-tensors W4A16): [inclusionAI/Ling-3.0-tiny-int4](https://huggingface.co/inclusionAI/Ling-3.0-tiny-int4)
 
 **License:** MIT
 
@@ -53,9 +54,10 @@ It is a thinking model with chain-of-thought enabled by default, and it supports
 
 ## 2. Configuration Tips
 
-- At ~7.9B total / 15.8 GB in BF16 (~7.9 GB in FP8), a single GPU is plenty on every supported card. Tensor parallelism is only useful to raise aggregate KV-cache capacity for many long-context concurrent requests — add `--tp 2`/`--tp 4` to a multi-GPU serve directly.
-- Use the dedicated `lmsysorg/sglang:dev-Ling-3.0-tiny` runtime image below; it carries the `bailing_hybrid` support Ling-3.0-tiny needs.
+- At ~7.9B total / 15.8 GB in BF16 (~7.9 GB in FP8 and ~5.8 GB in INT4), a single GPU is plenty on every supported card. Tensor parallelism is only useful to raise aggregate KV-cache capacity for many long-context concurrent requests — add `--tp 2`/`--tp 4` to a multi-GPU serve directly.
+- Use the dedicated `lmsysorg/sglang:dev-Ling-3.0-tiny` runtime image; it includes the compressed-tensors Hopper and Blackwell backends that INT4 needs.
 - The FP8 checkpoint uses blockwise (128×128) E4M3 weights with dynamic activations, quantized from the BF16 model with attention projections, the dense MoE gate, and the lm_head left in higher precision. SGLang detects the format from the checkpoint's `quantization_config`, so no explicit quantization flag is needed, and the same single-GPU recipe serves it.
+- The INT4 checkpoint uses symmetric group-32 W4A16 routed experts. SGLang selects Marlin on Hopper and Triton WNA16 on Blackwell automatically; no explicit quantization or MoE backend flag is needed.
 - Unlike Ling-3.0-flash (which pairs `--reasoning-parser ling3` / `--tool-call-parser ling3`), Ling-3.0-tiny uses `--reasoning-parser deepseek-r1` and `--tool-call-parser glm45` (its auto-detected template pairing) — the template wraps tool calls in `<tool_call>` blocks and emits an inline `...</think>` chain-of-thought. Toggle them in the **Parsers** card of the [Playground](#playground).
 - Only `--model-path`, `--host`, and `--port` are needed. SGLang auto-resolves the context length (native 128K from `max_position_embeddings`), the attention backend, and `--mem-fraction-static` from the GPU and the CUDA-graph runtime, so the recipes leave them unset.
 - The chat template defaults to thinking on. Turn it off per request with `"chat_template_kwargs": {"enable_thinking": false}` for direct answers without the `...</think>` block.

@@ -13,7 +13,7 @@ import multiprocessing as mp
 import os
 import time
 from contextlib import ExitStack
-from typing import Any, List, Union
+from typing import Any, List, Optional, Union
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -63,6 +63,39 @@ try:
 except RuntimeError:
     # The start method can only be set once per program execution.
     pass
+
+
+def _replace_sampling_params_for_prompt(
+    sampling_params_orig: SamplingParams,
+    prompt: str,
+    output_file_name: str | None,
+    image_path: str | list[str] | None,
+) -> SamplingParams:
+    """Clone per-prompt parameters without losing model-internal state."""
+    sampling_params = dataclasses.replace(
+        sampling_params_orig,
+        prompt=prompt,
+        output_file_name=output_file_name,
+        image_path=image_path,
+    )
+
+    # dataclasses.replace() resets fields declared with init=False. Preserve
+    # model-internal output geometry so GLM-Image can crop the aligned canvas
+    # back to the user's requested size.
+    for field_name in ("requested_width", "requested_height"):
+        if hasattr(sampling_params_orig, field_name):
+            setattr(
+                sampling_params,
+                field_name,
+                getattr(sampling_params_orig, field_name),
+            )
+
+    # dataclasses.replace() also drops non-field attributes. Keep the explicit
+    # user fields so InputValidationStage honors values such as width/height.
+    sampling_params._explicit_fields = getattr(
+        sampling_params_orig, "_explicit_fields", set()
+    ) | {"prompt", "output_file_name", "image_path"}
+    return sampling_params
 
 
 class DiffGenerator:
@@ -228,18 +261,12 @@ class DiffGenerator:
         )
 
         for i, p in enumerate(prompts):
-            sampling_params = dataclasses.replace(
+            sampling_params = _replace_sampling_params_for_prompt(
                 sampling_params_orig,
                 prompt=p,
                 output_file_name=user_output_file_name,
                 image_path=image_paths_per_prompt[i],
             )
-            # `dataclasses.replace` drops non-field attrs; restore
-            # `_explicit_fields` so InputValidationStage honors user-supplied
-            # width/height, and mark the keys overridden above as explicit.
-            sampling_params._explicit_fields = getattr(
-                sampling_params_orig, "_explicit_fields", set()
-            ) | {"prompt", "output_file_name", "image_path"}
             sampling_params._set_output_file_name()
             req = prepare_request(
                 server_args=self.server_args,
@@ -547,6 +574,7 @@ class DiffGenerator:
         target: Union[str, List[str]] = "all",
         strength: Union[float, List[float]] = 1.0,
         merge_mode: str | None = None,
+        lora_alpha: Optional[Union[int, List[Optional[int]]]] = None,
     ) -> None:
         """
         Set LoRA adapter(s) for the specified transformer(s).
@@ -563,6 +591,7 @@ class DiffGenerator:
                 - "critic": Apply only to the critic model
             strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
             merge_mode: Optional LoRA merge mode: "auto", "merge", or "dynamic".
+            lora_alpha: Training alpha override for adapters that omit it from metadata.
         """
         req = SetLoraReq(
             lora_nickname=lora_nickname,
@@ -570,6 +599,7 @@ class DiffGenerator:
             target=target,
             strength=strength,
             merge_mode=merge_mode,
+            lora_alpha=lora_alpha,
         )
         nickname_str, target_str, strength_str = format_lora_message(
             lora_nickname, target, strength

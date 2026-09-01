@@ -3,13 +3,13 @@ import unittest
 import sgl_kernel  # noqa: F401
 import torch
 import torch.nn.functional as F
-from utils import precision
 
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, organize_draft_results
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.cpu_test_utils import precision
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-b-test-cpu")
+register_cpu_ci(est_time=6, suite="base-b-test-cpu")
 
 
 def _topk1_chain_inputs(bs, num_steps):
@@ -1114,6 +1114,8 @@ class TestExtendAttentionTreeMask(CustomTestCase):
             o_extend,
             k_buffer,
             v_buffer,
+            1.0,  # k_buf_scale
+            1.0,  # v_buf_scale
             req_to_token,
             req_pool_indices,
             seq_lens,

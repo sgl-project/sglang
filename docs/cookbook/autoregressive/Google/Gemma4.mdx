@@ -531,7 +531,7 @@ Tool Call: get_weather
 
 ### 4.5 Audio Input
 
-The audio-capable Gemma 4 variants (`gemma-4-E2B-it`, `gemma-4-E4B-it`, `gemma-4-12B-it`) accept raw audio alongside text. Pass the waveform as a base64 `audio_url` data URI (16 kHz mono WAV works well):
+The audio-capable Gemma 4 variants (`gemma-4-E2B-it`, `gemma-4-E4B-it`, `gemma-4-12B-it`) accept raw audio alongside text. Pass the waveform as a base64 `audio_url` data URI (16 kHz mono WAV works well), or as OpenAI's `input_audio` part with the base64 bytes in `data` and a `format` of `wav`:
 
 ```python Example
 import base64

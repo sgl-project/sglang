@@ -10,6 +10,10 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from torch import nn
 
+from sglang.kernels.ops.diffusion import (
+    mark_lingbot_video_rmsnorm_site,
+    try_lingbot_video_rmsnorm,
+)
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
     LingBotVideoMoEConfig,
 )
@@ -60,6 +64,10 @@ LINGBOT_VIDEO_FP32_MODULES = (
 )
 
 
+def is_lingbot_block(name: str, _module: object) -> bool:
+    return "blocks" in name and name.split(".")[-1].isdigit()
+
+
 def should_keep_in_fp32(name: str) -> bool:
     return any(
         module_name in name.split(".") for module_name in LINGBOT_VIDEO_FP32_MODULES
@@ -71,8 +79,15 @@ class LingBotVideoRMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.variance_epsilon = eps
+        mark_lingbot_video_rmsnorm_site(self)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        fused = try_lingbot_video_rmsnorm(
+            self, hidden_states, self.weight, self.variance_epsilon
+        )
+        if fused is not None:
+            return fused
+
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -344,11 +359,8 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
     _no_split_modules = ("LingBotVideoBlock",)
     _keep_in_fp32_modules = tuple(LINGBOT_VIDEO_FP32_MODULES)
 
-    _fsdp_shard_conditions = LingBotVideoMoEConfig()._fsdp_shard_conditions
-    _compile_conditions = LingBotVideoMoEConfig()._compile_conditions
-    _supported_attention_backends = (
-        LingBotVideoMoEConfig()._supported_attention_backends
-    )
+    _fsdp_shard_conditions = [is_lingbot_block]
+    _compile_conditions = [is_lingbot_block]
     param_names_mapping = LingBotVideoMoEConfig().param_names_mapping
     reverse_param_names_mapping = LingBotVideoMoEConfig().reverse_param_names_mapping
     lora_param_names_mapping = LingBotVideoMoEConfig().lora_param_names_mapping

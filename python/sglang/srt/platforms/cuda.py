@@ -1,5 +1,8 @@
 """CUDA device operations for the SRT platform layer."""
 
+import logging
+import os
+from contextlib import contextmanager
 from typing import Optional
 
 import torch
@@ -10,6 +13,8 @@ from sglang.srt.platforms.device_mixin import (
     PlatformEnum,
 )
 from sglang.srt.platforms.interface import SRTPlatform
+
+logger = logging.getLogger(__name__)
 
 
 class CudaDeviceMixin(DeviceMixin):
@@ -56,6 +61,34 @@ class CudaDeviceMixin(DeviceMixin):
         if device is not None and str(device) == "cpu":
             return False
         return True
+
+    @contextmanager
+    def reindex_device_id(self, gpu_id: int):
+        if os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID":
+            logger.warning(
+                "`CUDA_DEVICE_ORDER` is not set to `PCI_BUS_ID`. Please set "
+                "`CUDA_DEVICE_ORDER=PCI_BUS_ID` to avoid unexpected behavior."
+            )
+
+        original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if original_cuda_visible_devices:
+            cuda_visible_devices = original_cuda_visible_devices.split(",")
+        else:
+            cuda_visible_devices = []
+
+        str_gpu_id = (
+            cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
+        )
+        os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
+
+        logger.debug(f"Set CUDA_VISIBLE_DEVICES to {str_gpu_id}")
+
+        yield 0
+
+        if original_cuda_visible_devices:
+            os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
+        else:
+            del os.environ["CUDA_VISIBLE_DEVICES"]
 
     def get_torch_distributed_backend_str(self) -> str:
         return "nccl"

@@ -363,7 +363,7 @@ class ReqTimeStatsBase:
                 state["trace_ctx"] = TraceNullContext()
 
         for key in state.keys():
-            if key.endswith("time"):
+            if key.endswith("time") and state[key]:
                 state[key] = convert_time_cross_thread(
                     state[key],
                     state["diff_realtime_monotonic"],
