@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,6 +42,52 @@ def _make_runtime_handle(responses):
     handle = RuntimeHandle.__new__(RuntimeHandle)
     handle.tokenizer_manager = _FakeTokenizerManager(responses)
     return handle
+
+
+class TestNativeGrpcPauseStatus(CustomTestCase):
+    def test_status_tracks_pause_and_continue(self):
+        async def run_test():
+            tokenizer_manager = TokenizerManager.__new__(TokenizerManager)
+            tokenizer_manager.is_pause = False
+            tokenizer_manager.is_pause_cond = asyncio.Condition()
+            dispatch_started = asyncio.Event()
+            finish_dispatch = asyncio.Event()
+
+            async def dispatch_to_scheduler(_obj):
+                dispatch_started.set()
+                await finish_dispatch.wait()
+
+            tokenizer_manager._async_dispatch_to_scheduler = dispatch_to_scheduler
+            handle = RuntimeHandle.__new__(RuntimeHandle)
+            handle.tokenizer_manager = tokenizer_manager
+
+            self.assertFalse(handle.get_pause_status())
+
+            pause_task = asyncio.create_task(
+                tokenizer_manager.pause_generation(SimpleNamespace(mode="in_place"))
+            )
+            await dispatch_started.wait()
+
+            self.assertTrue(handle.get_pause_status())
+
+            finish_dispatch.set()
+            await pause_task
+
+            dispatch_started.clear()
+            finish_dispatch.clear()
+            continue_task = asyncio.create_task(
+                tokenizer_manager.continue_generation(SimpleNamespace())
+            )
+            await dispatch_started.wait()
+
+            self.assertTrue(handle.get_pause_status())
+
+            finish_dispatch.set()
+            await continue_task
+
+            self.assertFalse(handle.get_pause_status())
+
+        asyncio.run(run_test())
 
 
 class TestNativeGrpcParallelResponses(CustomTestCase):

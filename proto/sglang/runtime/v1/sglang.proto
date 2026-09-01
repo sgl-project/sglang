@@ -11,6 +11,7 @@ service SglangService {
   rpc Tokenize(TokenizeRequest) returns (TokenizeResponse);
   rpc Detokenize(DetokenizeRequest) returns (DetokenizeResponse);
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc GetPauseStatus(GetPauseStatusRequest) returns (GetPauseStatusResponse);
   rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
@@ -172,6 +173,17 @@ message HealthCheckRequest {}
 
 message HealthCheckResponse {
   bool healthy = 1;
+}
+
+// ---- Pause status ----
+
+message GetPauseStatusRequest {}
+
+message GetPauseStatusResponse {
+  // True while new requests are blocked before engine dispatch.
+  bool is_pause = 1;
+  // Values are JSON-encoded, matching the existing meta_info convention.
+  map<string, string> metadata = 2;
 }
 
 // ---- Model info ----
