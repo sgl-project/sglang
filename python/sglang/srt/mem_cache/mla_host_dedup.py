@@ -9,12 +9,6 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.distributed import (
-    get_attn_tensor_model_parallel_rank,
-    get_attn_tensor_model_parallel_world_size,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.mem_cache.memory_pool import (
@@ -22,6 +16,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
@@ -38,15 +33,10 @@ def storage_supports_host_dedup(storage_backend: Optional[str]) -> bool:
 
 def mla_dedup_rank_and_size() -> tuple[int, int]:
     """Attn-TP rank/size when DP attention is enabled, model-TP otherwise."""
+    parallel = get_parallel()
     if is_dp_attention_enabled():
-        return (
-            get_attn_tensor_model_parallel_rank(),
-            get_attn_tensor_model_parallel_world_size(),
-        )
-    return (
-        get_tensor_model_parallel_rank(),
-        get_tensor_model_parallel_world_size(),
-    )
+        return parallel.attn_tp_rank, parallel.attn_tp_size
+    return parallel.tp_rank, parallel.tp_size
 
 
 def mla_host_dedup_eligible(kv_cache, storage_backend: Optional[str]) -> bool:
