@@ -56,4 +56,4 @@ def test_hc_combine_strided_pre():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+    sys.exit(pytest.main([__file__]))
