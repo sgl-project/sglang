@@ -84,6 +84,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     ),
     (
         "diffusion.scale_residual_norm_scale_shift",
+        KernelBackend.KDA,
+        "norm.norm_scale_shift_jit:kda_scale_residual_norm_scale_shift",
+        _CUDA_SM100_PLUS,
+        "KDA B200 native CUDA residual + LayerNorm + scale/shift (#27392).",
+    ),
+    (
+        "diffusion.scale_residual_norm_scale_shift",
         KernelBackend.TRITON,
         "norm.rmsnorm_scale_shift_bitexact:fused_scale_residual_rmsnorm_scale_shift_bitexact",
         _CUDA,
@@ -109,6 +116,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "norm.norm_scale_shift_jit:try_fused_scale_residual_norm_scale_shift_nvfp4",
         _CUDA,
         "Qwen residual LayerNorm/modulation + NVFP4 quantization.",
+    ),
+    (
+        "diffusion.norm_scale_shift",
+        KernelBackend.KDA,
+        "norm.norm_scale_shift_jit:kda_norm_scale_shift",
+        _CUDA_SM100_PLUS,
+        "KDA B200 native CUDA LayerNorm + scale/shift (#27392).",
     ),
     (
         "diffusion.norm_scale_shift",
@@ -168,10 +182,10 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     ),
     (
         "diffusion.residual_gate_add",
-        KernelBackend.JIT,
+        KernelBackend.KDA,
         "modulate.residual_gate_add_jit:residual_gate_add",
         _CUDA,
-        "Fused residual + gate * update.",
+        "KDA native CUDA residual + gate * update (#29361).",
     ),
     (
         "diffusion.timestep_embedding",
@@ -202,6 +216,27 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Fused in-place QK RMS-norm + RoPE.",
     ),
     (
+        "diffusion.flux2_layernorm_modulate_fp8_quant",
+        KernelBackend.KDA,
+        "norm.layernorm_modulate_triton:fused_layernorm_modulate_fp8_quant_raw",
+        _CUDA,
+        "KDA-generated FLUX.2 LayerNorm + adaLN modulation + static FP8 quantization.",
+    ),
+    (
+        "diffusion.flux2_qkv_epilogue",
+        KernelBackend.KDA,
+        "rope.flux2_qkv_epilogue_jit:try_fused_flux2_qkv_epilogue",
+        _CUDA,
+        "KDA-generated FLUX.2 QK RMS-norm + RoPE + joint QKV packing.",
+    ),
+    (
+        "diffusion.flux2_token_cat_fp8",
+        KernelBackend.KDA,
+        "layout.flux2_token_cat_fp8_triton:try_flux2_token_cat_fp8",
+        _CUDA,
+        "KDA-generated FLUX.2 token concatenation + static FP8 quantization.",
+    ),
+    (
         "diffusion.qwen_qkv_epilogue",
         KernelBackend.JIT,
         "rope.qwen_qkv_epilogue_jit:try_fused_qwen_qkv_epilogue",
@@ -210,10 +245,10 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     ),
     (
         "diffusion.ltx2_qknorm_split_rope",
-        KernelBackend.JIT,
+        KernelBackend.KDA,
         "rope.ltx2_qknorm_split_rope_jit:ltx2_qknorm_split_rope_cuda",
-        _CUDA,
-        "LTX-2 QK-norm + split RoPE.",
+        _CUDA_SM100_PLUS,
+        "KDA native CUDA LTX-2 QK-norm + split RoPE (#29708).",
     ),
     (
         "diffusion.ltx25_decoder_rope",
@@ -329,10 +364,10 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     ),
     (
         "diffusion.causal_conv3d_cat_pad",
-        KernelBackend.JIT,
+        KernelBackend.KDA,
         "layout.causal_conv3d_cat_pad_jit:fused_causal_conv3d_cat_pad_cuda",
         _CUDA,
-        "Causal Conv3d cat + pad.",
+        "KDA native CUDA causal Conv3d cat + pad (#29281).",
     ),
     (
         "diffusion.causal_conv3d_cat_pad",
@@ -398,6 +433,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_fused_layernorm_modulate": "norm.layernorm_modulate_triton",
     "can_use_fused_qk_head_layernorm": "norm.layernorm_modulate_triton",
     "fused_layernorm_modulate": "norm.layernorm_modulate_triton",
+    "fused_layernorm_modulate_fp8_quant_raw": "norm.layernorm_modulate_triton",
     "fused_layernorm_modulate_raw": "norm.layernorm_modulate_triton",
     "fused_qk_head_layernorm": "norm.layernorm_modulate_triton",
     "is_plain_layer_norm": "norm.layernorm_modulate_triton",
@@ -443,6 +479,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_fused_temb_table_slices": "modulate.wan_temb_table_slices_triton",
     "fused_temb_table_slices": "modulate.wan_temb_table_slices_triton",
     # Rotary embeddings and the QK-norm chains fused around them
+    "try_fused_flux2_qkv_epilogue": "rope.flux2_qkv_epilogue_jit",
     "hunyuan_qkv_rope_pack": "rope.hunyuan_qkv_pack_triton",
     "can_use_ltx2_qknorm_split_rope_cuda": "rope.ltx2_qknorm_split_rope_jit",
     "ltx2_qknorm_split_rope_cuda": "rope.ltx2_qknorm_split_rope_jit",
@@ -460,6 +497,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_helios_qk_rope": "rope.helios_qk_rope_jit",
     "fused_inplace_helios_qk_rope": "rope.helios_qk_rope_jit",
     "apply_rotary_embedding": "rope.rotary_triton",
+    # Tensor layout transformations fused with downstream quantization
+    "try_flux2_token_cat_fp8": "layout.flux2_token_cat_fp8_triton",
     # Activation-function fusions
     "can_use_fused_bias_glu": "activation.sana_conv_post_triton",
     "can_use_fused_bias_silu": "activation.sana_conv_post_triton",
