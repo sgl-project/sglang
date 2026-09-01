@@ -4330,16 +4330,27 @@ class PortArgs:
     instance_id: str = ""
 
     @staticmethod
+    def _rendezvous_port_exclusions(server_args: ServerArgs) -> List[int]:
+        ports = [server_args.port, server_args.engine_info_bootstrap_port]
+        if server_args.grpc_port is not None:
+            ports.append(server_args.grpc_port)
+        if server_args.smg_grpc_mode or server_args.grpc_mode:
+            ports.append(
+                server_args.smg_http_sidecar_port
+                if server_args.smg_http_sidecar_port is not None
+                else server_args.port + 1
+            )
+        return ports
+
+    @staticmethod
     def init_new(
         server_args: ServerArgs,
         dp_rank: Optional[int] = None,
         worker_ports: Optional[List[int]] = None,
     ) -> PortArgs:
         cfg = resolving_view(server_args)
-        if server_args.nccl_port is None:
-            nccl_port = get_free_rendezvous_port()
-        else:
-            nccl_port = server_args.nccl_port
+        nccl_port = server_args.nccl_port
+        rendezvous_port_exclusions = PortArgs._rendezvous_port_exclusions(server_args)
 
         if server_args.tokenizer_worker_num == 1:
             tokenizer_worker_ipc_name = None
@@ -4369,6 +4380,10 @@ class PortArgs:
             )
 
         if not cfg.enable_dp_attention:
+            if nccl_port is None:
+                nccl_port = get_free_rendezvous_port(
+                    exclude_ports=rendezvous_port_exclusions
+                )
             # Normal case, use IPC within a single node
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -4423,6 +4438,22 @@ class PortArgs:
             else:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
+
+            rendezvous_port_exclusions.extend(
+                [
+                    dist_init_port,
+                    port_base,
+                    detokenizer_port,
+                    rpc_port,
+                    metrics_port,
+                    load_collector_port,
+                    scheduler_input_port,
+                ]
+            )
+            if nccl_port is None:
+                nccl_port = get_free_rendezvous_port(
+                    exclude_ports=rendezvous_port_exclusions
+                )
 
             is_joiner = server_args.is_ep_joiner
             # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds

@@ -122,6 +122,12 @@ class TestSocketUtilities(CustomTestCase):
 
     def test_get_free_rendezvous_port_avoids_linux_ephemeral_range(self):
         """Rendezvous ports should avoid Linux ephemeral client ports."""
+        checked_ports = []
+
+        def mock_is_port_available(port):
+            checked_ports.append(port)
+            return port == 9999
+
         with (
             patch(
                 "sglang.srt.utils.network._read_linux_ephemeral_port_range",
@@ -129,10 +135,35 @@ class TestSocketUtilities(CustomTestCase):
             ),
             patch(
                 "sglang.srt.utils.network.is_port_available",
-                side_effect=lambda port: port == 9999,
+                side_effect=mock_is_port_available,
             ),
         ):
             self.assertEqual(get_free_rendezvous_port(), 9999)
+        self.assertTrue(all(port < 10000 or port > 61000 for port in checked_ports))
+
+    def test_get_free_rendezvous_port_uses_random_start(self):
+        """Avoid pinning every process to the same non-ephemeral candidate."""
+        with (
+            patch(
+                "sglang.srt.utils.network._read_linux_ephemeral_port_range",
+                return_value=(10000, 61000),
+            ),
+            patch("sglang.srt.utils.network.random.randrange", return_value=2),
+            patch("sglang.srt.utils.network.is_port_available", return_value=True),
+        ):
+            self.assertEqual(get_free_rendezvous_port(), 1026)
+
+    def test_get_free_rendezvous_port_excludes_reserved_ports(self):
+        """Do not reuse ports already planned for other listeners."""
+        with (
+            patch(
+                "sglang.srt.utils.network._read_linux_ephemeral_port_range",
+                return_value=(10000, 61000),
+            ),
+            patch("sglang.srt.utils.network.random.randrange", return_value=0),
+            patch("sglang.srt.utils.network.is_port_available", return_value=True),
+        ):
+            self.assertEqual(get_free_rendezvous_port(exclude_ports={1024}), 1025)
 
     def test_get_free_rendezvous_port_falls_back_without_candidate(self):
         """Use OS-assigned ports when no non-ephemeral TCP port is available."""
