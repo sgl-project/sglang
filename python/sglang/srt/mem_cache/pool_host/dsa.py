@@ -458,6 +458,26 @@ class DSAIndexerPoolHost(HostKVCache):
     def get_page_buffer_meta(self, indices):
         """Meta data for zero-copy storage I/O."""
         assert len(indices) % self.page_size == 0
+        if self.layout == "layer_first":
+            # One buffer per (page, layer); the storage backend packs them into
+            # a single multi-buffer object per page key. Ordering matches the
+            # MLA host pool convention: page-major outer, layer inner.
+            per_layer_bytes = (
+                self.indexer_page_stride_size * self.indexer_dtype.itemsize
+            )
+            layer_stride_bytes = self.indexer_page_num * per_layer_bytes
+            base_ptr = self.index_k_with_scale_buffer.data_ptr()
+            idx = indices.tolist()
+            ptr_list = []
+            for i in range(0, len(idx), self.page_size):
+                page_index = int(idx[i]) // self.page_size
+                for layer_id in range(self.layer_num):
+                    ptr_list.append(
+                        base_ptr
+                        + layer_id * layer_stride_bytes
+                        + page_index * per_layer_bytes
+                    )
+            return ptr_list, [per_layer_bytes] * len(ptr_list)
         if self.layout not in ["page_first", "page_first_direct"]:
             raise ValueError(f"Unsupported layout: {self.layout}")
         ptr_list = []

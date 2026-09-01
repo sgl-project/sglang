@@ -580,6 +580,34 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
 
+            # DSA cache layer split: each CP rank only holds a disjoint layer
+            # slice, so L3 objects must be sharded per rank. With a shared key
+            # ranks would overwrite each other (first-writer-wins) and a
+            # self-read would return another rank's slice. The rank suffix
+            # also keeps these objects out of the key space of non-sharded
+            # instances of the same model, whose page objects have a
+            # different intra-page byte layout.
+            if (
+                storage_config is not None
+                and storage_config.is_mla_model
+                and getattr(storage_config, "is_dsa_layer_split", False)
+                and self.attn_cp_size > 1
+            ):
+                self.mla_suffix = f"{self.mla_suffix}_ls{self.attn_cp_rank}"
+
+            # Optional cross-layout L3 fallback (experimental): let a
+            # layer-sharded instance serve misses from the canonical page
+            # objects written by a non-sharded instance of the same model,
+            # and vice versa. Opt-in via extra_config because it assumes
+            # both instances share one store and one model checkpoint.
+            _xcfg = extra_config or {}
+            self.cross_layout_fallback = bool(
+                _xcfg.get("enable_cross_layout_fallback", False)
+            )
+            self.cross_layout_shard_size = int(
+                _xcfg.get("cross_layout_shard_size", 0) or 0
+            )
+
             self.storage_config = storage_config
             self.should_split_heads = storage_config.should_split_heads
             self.split_factor = 0
@@ -850,6 +878,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             component_keys = self._tag_keys(component_keys)
             ex = self._batch_exist(component_keys)
+            ex = self._cross_layout_exists_fallback(component_keys, ex)
             if key_multiplier > 0:
                 page_exists = [
                     all(
@@ -899,7 +928,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             key_strs = self._tag_keys(key_strs)
             ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
-            if transfer.name == PoolName.DEEPSEEK_V4_C4:
+            # layer_first pools return one buffer per (page, layer); pack them
+            # into a single multi-buffer object per page key.
+            if transfer.name == PoolName.DEEPSEEK_V4_C4 or (
+                len(ptr_list) > len(key_strs)
+            ):
                 ptr_list, element_size_list = self._pack_multi_buffer_meta(
                     key_strs, ptr_list, element_size_list
                 )
@@ -925,6 +958,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 io_results = self._get_batch_zero_copy_impl(
                     key_strs, ptr_list, element_size_list
+                )
+                io_results = self._cross_layout_get_fallback(
+                    key_strs,
+                    ptr_list,
+                    element_size_list,
+                    io_results,
+                    token_major=False,
+                    full_layer_num=getattr(host_pool, "layer_num", 0),
                 )
             results[transfer.name] = self._batch_postprocess(
                 io_results, is_set_operate=is_set, key_multiplier=key_multiplier
@@ -1048,6 +1089,247 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for group in result_groups
         ]
 
+    def _cross_layout_active(self) -> bool:
+        if not getattr(self, "cross_layout_fallback", False):
+            return False
+        if not self.is_mla_backend:
+            return False
+        if "_ls" in (self.mla_suffix or ""):
+            return True  # sharded reader, canonical peer objects
+        return self.cross_layout_shard_size > 1  # canonical reader, shards
+
+    @staticmethod
+    def _cross_layout_key_tail(key: str) -> Optional[str]:
+        for tail in ("_k", "_indexer"):
+            if key.endswith(tail):
+                return tail
+        return None
+
+    def _cross_layout_get_batch(self, keys: List[str], chunk: int) -> List[bytes]:
+        """get_batch with per-key retry: large batches have been observed to
+        return empty payloads for a subset of keys, so refetch holes
+        individually before treating them as misses."""
+        blobs: List[bytes] = []
+        for c in range(0, len(keys), chunk):
+            part = keys[c : c + chunk]
+            try:
+                blobs.extend(self.store.get_batch(part))
+            except Exception:
+                blobs.extend([b""] * len(part))
+        for j, b in enumerate(blobs):
+            if b is None or len(b) == 0:
+                try:
+                    blobs[j] = self.store.get(keys[j])
+                except Exception:
+                    pass
+        return [bytes(b or b"") for b in blobs]
+
+    def _cross_layout_exists_fallback(self, query_keys, exist_result):
+        """Treat a page as present when the peer layout's object(s) exist."""
+        if not self._cross_layout_active():
+            return exist_result
+        fixed = list(exist_result)
+        sharded_self = "_ls" in (self.mla_suffix or "")
+        miss = [
+            i
+            for i, r in enumerate(fixed)
+            if r != 1 and self._cross_layout_key_tail(query_keys[i]) is not None
+        ]
+        if sharded_self:
+            miss = [i for i in miss if self.mla_suffix in query_keys[i]]
+            if not miss:
+                return fixed
+            plain = [
+                query_keys[i].replace(self.mla_suffix, "", 1) for i in miss
+            ]
+            pex = self._batch_exist(plain)
+            for i, pe in zip(miss, pex):
+                if pe == 1:
+                    fixed[i] = 1
+            return fixed
+        n = self.cross_layout_shard_size
+        miss = [i for i in miss if "_ls" not in query_keys[i]]
+        if not miss:
+            return fixed
+        probe = []
+        for i in miss:
+            tail = self._cross_layout_key_tail(query_keys[i])
+            probe.extend(
+                query_keys[i][: -len(tail)] + f"_ls{r}" + tail for r in range(n)
+            )
+        pex = self._batch_exist(probe)
+        for j, i in enumerate(miss):
+            if all(pex[j * n + r] == 1 for r in range(n)):
+                fixed[i] = 1
+        return fixed
+
+    def _cross_layout_get_fallback(
+        self,
+        key_strs,
+        ptr_list,
+        element_size_list,
+        io_results,
+        token_major: bool,
+        full_layer_num: int,
+    ):
+        """Serve get() misses from the peer layout's L3 objects.
+
+        Canonical MLA KV page objects are token-major
+        (page_size, layers, record); sidecar pools such as the DSA indexer
+        are layer-major (layers, page_stride). Layer shards written by a
+        layer-sharded instance are contiguous layer ranges of the same
+        per-layer page bytes (see get_layer_shard_range), so translating
+        between the two is a deterministic gather/scatter. Correctness was
+        validated byte-for-byte against real objects; deeper layers may
+        differ numerically between engines of different parallel topologies
+        (reduction order under fp8), which is semantically benign -- PD
+        disaggregation consumes cross-engine KV the same way.
+        """
+        if not self._cross_layout_active():
+            return io_results
+        import ctypes
+
+        import numpy as np
+
+        sharded_self = "_ls" in (self.mla_suffix or "")
+        page_tokens = getattr(self.mem_pool_host, "page_size", 64)
+        fixed = list(io_results)
+        todo = []
+        for i, res in enumerate(io_results):
+            if res > 0:
+                continue
+            key = key_strs[i]
+            tail = self._cross_layout_key_tail(key)
+            if tail is None:
+                continue
+            if sharded_self:
+                if self.mla_suffix not in key:
+                    continue
+                todo.append((i, key.replace(self.mla_suffix, "", 1), tail))
+            else:
+                if "_ls" in key:
+                    continue
+                todo.append((i, key, tail))
+        if not todo:
+            return fixed
+        t0 = time.perf_counter()
+        filled = 0
+        if sharded_self:
+            rank, size = self.attn_cp_rank, self.attn_cp_size
+            blobs = self._cross_layout_get_batch([pk for _, pk, _ in todo], 8)
+            for (i, pk, tail), obj in zip(todo, blobs):
+                if not obj:
+                    continue
+                ptrs = ptr_list[i]
+                sizes = element_size_list[i]
+                if not isinstance(ptrs, (list, tuple)):
+                    ptrs, sizes = [ptrs], [sizes]
+                block_bytes = int(sizes[0])
+                if block_bytes <= 0 or len(obj) % block_bytes:
+                    continue
+                total_layers = len(obj) // block_bytes
+                base, rem = total_layers // size, total_layers % size
+                start = rank * base + min(rank, rem)
+                own = base + (1 if rank < rem else 0)
+                ok = True
+                if token_major:
+                    rec = block_bytes // page_tokens
+                    arr = np.frombuffer(obj, dtype=np.uint8).reshape(
+                        page_tokens, total_layers, rec
+                    )
+                    for b in range(len(ptrs)):
+                        if b >= own:
+                            continue  # trailing padding blocks stay empty
+                        blk = np.ascontiguousarray(arr[:, start + b, :])
+                        if blk.nbytes != int(sizes[b]):
+                            ok = False
+                            break
+                        ctypes.memmove(int(ptrs[b]), blk.ctypes.data, blk.nbytes)
+                else:
+                    for b in range(len(ptrs)):
+                        if b >= own:
+                            continue
+                        off = (start + b) * block_bytes
+                        blk = obj[off : off + block_bytes]
+                        if len(blk) != int(sizes[b]):
+                            ok = False
+                            break
+                        ctypes.memmove(
+                            int(ptrs[b]),
+                            (ctypes.c_char * len(blk)).from_buffer_copy(blk),
+                            len(blk),
+                        )
+                if ok:
+                    fixed[i] = 1
+                    filled += 1
+        else:
+            n = self.cross_layout_shard_size
+            flat = []
+            for i, key, tail in todo:
+                flat.extend(
+                    key[: -len(tail)] + f"_ls{r}" + tail for r in range(n)
+                )
+            blobs = self._cross_layout_get_batch(flat, 48)
+            base, rem = full_layer_num // n, full_layer_num % n
+            for t, (i, key, tail) in enumerate(todo):
+                shards = blobs[t * n : (t + 1) * n]
+                if any(len(b) == 0 for b in shards):
+                    continue
+                ptrs = ptr_list[i]
+                sizes = element_size_list[i]
+                if isinstance(ptrs, (list, tuple)):
+                    if len(ptrs) != 1:
+                        continue
+                    ptrs, sizes = ptrs[0], sizes[0]
+                expected = int(sizes)
+                if full_layer_num <= 0 or expected % full_layer_num:
+                    continue
+                block_bytes = expected // full_layer_num
+                ok = True
+                if token_major:
+                    rec = block_bytes // page_tokens
+                    out = np.empty(
+                        (page_tokens, full_layer_num, rec), dtype=np.uint8
+                    )
+                    for r in range(n):
+                        own = base + (1 if r < rem else 0)
+                        start = r * base + min(r, rem)
+                        if len(shards[r]) < own * block_bytes:
+                            ok = False
+                            break
+                        arr = np.frombuffer(
+                            shards[r][: own * block_bytes], dtype=np.uint8
+                        ).reshape(own, page_tokens, rec)
+                        for b in range(own):
+                            out[:, start + b, :] = arr[b]
+                    blob = out.tobytes() if ok else b""
+                else:
+                    parts = []
+                    for r in range(n):
+                        own = base + (1 if r < rem else 0)
+                        if len(shards[r]) < own * block_bytes:
+                            ok = False
+                            break
+                        parts.append(shards[r][: own * block_bytes])
+                    blob = b"".join(parts) if ok else b""
+                if not ok or len(blob) != expected:
+                    continue
+                ctypes.memmove(
+                    int(ptrs),
+                    (ctypes.c_char * len(blob)).from_buffer_copy(blob),
+                    len(blob),
+                )
+                fixed[i] = 1
+                filled += 1
+        if filled:
+            logger.debug(
+                "cross-layout fallback filled %d/%d pages in %.2fs",
+                filled,
+                len(todo),
+                time.perf_counter() - t0,
+            )
+        return fixed
+
     def batch_get_v1(
         self,
         keys: List[str],
@@ -1066,6 +1348,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         start_time = time.perf_counter()
         get_results = self._get_batch_zero_copy_impl(
             key_strs, buffer_ptrs, buffer_sizes
+        )
+        get_results = self._cross_layout_get_fallback(
+            key_strs,
+            buffer_ptrs,
+            buffer_sizes,
+            get_results,
+            token_major=True,
+            full_layer_num=getattr(self.mem_pool_host, "layer_num", 0),
         )
         end_time = time.perf_counter()
 
@@ -1282,6 +1572,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_multiplier = 2
 
         exist_result = self._batch_exist(query_keys)
+        exist_result = self._cross_layout_exists_fallback(query_keys, exist_result)
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier

@@ -553,11 +553,15 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
-        # for MLA models, only one rank needs to backup the KV cache
+        # For MLA models the KV cache is rank-replicated, so only one rank
+        # needs to back it up -- except under DSA cache layer split, where
+        # each CP rank owns a disjoint layer slice and every rank must back
+        # up its own shard.
         self.backup_skip = (
             self.storage_config.is_mla_model
             # todo: load balancing
             and self.storage_config.tp_rank != 0
+            and not self.storage_config.is_dsa_layer_split
         )
 
         # Use storage backend factory for dynamic backend creation
@@ -725,6 +729,15 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
 
+        from sglang.srt.mem_cache.dsa_cache_layer_split import (
+            LayerSplitDSATokenToKVPool,
+        )
+
+        is_dsa_layer_split = (
+            isinstance(self.mem_pool_device, LayerSplitDSATokenToKVPool)
+            and attn_cp_size > 1
+        )
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -739,6 +752,7 @@ class HiCacheController:
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
+            is_dsa_layer_split=is_dsa_layer_split,
             extra_config=storage_backend_extra_config,
         )
 

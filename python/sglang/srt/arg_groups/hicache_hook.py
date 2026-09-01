@@ -145,6 +145,17 @@ def resolve_storage_layout_compatibility(server_args: Any):
     ):
         return
 
+    if getattr(cfg, "enable_dsa_cache_layer_split", False):
+        # DSA cache layer split shards the KV/indexer layers across CP ranks.
+        # Its direct-backend host<->device transfer only supports layer_first,
+        # while kernel+page_first requires the JIT one-layer kernel, which
+        # does not cover all element sizes (e.g. 656B for GLM DSA). Rewriting
+        # layer_first away here would leave layer-split deployments with no
+        # valid layout/backend combination at all. The Mooncake MLA path can
+        # serve layer_first pages through the multi-buffer interface (one key,
+        # per-layer buffers), so keep the requested layout.
+        return
+
     if cfg.hicache_io_backend == "direct":
         new_layout = "page_first_direct"
     elif cfg.hicache_io_backend == "kernel":
