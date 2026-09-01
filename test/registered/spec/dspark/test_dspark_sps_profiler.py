@@ -5,6 +5,7 @@ from sglang.benchmark.dspark_sps_profiler import (
     ServerContext,
     SpsRow,
     build_request_count_sweep,
+    build_fit_diagnostics,
     build_table_from_summaries,
     count_aligned_steps,
     postprocess_round,
@@ -221,6 +222,59 @@ class TestTableAssembly(CustomTestCase):
         )
         self.assertEqual(table.sample_batch_tokens, [32])
         self.assertAlmostEqual(table.sample_steps_per_sec[0], 50.0)
+
+    def test_additive_fit_diagnostics_flag_noisy_non_monotone_cells(self):
+        summaries = [
+            {
+                "batch_size": 16,
+                "batch_size_per_rank": 16,
+                "frac": frac,
+                "batch_tokens": batch_tokens,
+                "steps_per_sec": steps_per_sec,
+            }
+            for frac, batch_tokens, steps_per_sec in (
+                (0.25, 44, 6.6),
+                (0.50, 72, 2.5),
+                (0.75, 100, 2.8),
+                (1.00, 128, 6.7),
+            )
+        ]
+        table = build_table_from_summaries(
+            summaries=summaries, max_batch_tokens=None, offdiag=True
+        )
+        diagnostics = build_fit_diagnostics(
+            summaries=summaries, table=table, offdiag=True
+        )
+        self.assertTrue(diagnostics["suspect"])
+        self.assertIn(
+            "step_time_decreased_with_more_verify_tokens_by_more_than_10pct",
+            diagnostics["warnings"],
+        )
+        self.assertGreater(len(diagnostics["monotonic_step_time_violations"]), 0)
+
+    def test_diagonal_fit_diagnostics_pass_for_monotone_step_times(self):
+        summaries = [
+            {
+                "batch_size": batch_size,
+                "batch_size_per_rank": batch_size,
+                "frac": None,
+                "batch_tokens": batch_tokens,
+                "steps_per_sec": steps_per_sec,
+            }
+            for batch_size, batch_tokens, steps_per_sec in (
+                (1, 8, 100.0),
+                (2, 16, 80.0),
+                (4, 32, 50.0),
+            )
+        ]
+        table = build_table_from_summaries(
+            summaries=summaries, max_batch_tokens=None, offdiag=False
+        )
+        diagnostics = build_fit_diagnostics(
+            summaries=summaries, table=table, offdiag=False
+        )
+        self.assertFalse(diagnostics["suspect"])
+        self.assertEqual(diagnostics["warnings"], [])
 
 
 class TestSweepHelpers(CustomTestCase):
