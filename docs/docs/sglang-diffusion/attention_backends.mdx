@@ -144,6 +144,8 @@ allowlists for explicit requests. A backend selected with
 without first adding it to every model's set. It still fails closed when the
 platform cannot resolve it or when it lacks a required operation such as dense
 cross-attention, packed variable-length attention, or ring-attention LSE.
+Model paths that require one backend for correctness declare it as fixed; those
+layers keep that backend even when the surrounding component is overridden.
 
 ## Configuration
 
