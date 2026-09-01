@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=900, stage="base-b", runner_config="2-gpu-large")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 
@@ -75,6 +75,39 @@ class TestKimiLinearExtraBuffer(
         "extra_buffer",
         "--mamba-track-interval",
         "2",
+    ]
+
+
+class TestKimiLinearUnifiedMemory(
+    GSM8KMixin, PrefixCacheBranchingMixin, DefaultServerBase
+):
+    """BUG REGRESSION. The only per-PR cell that pairs the unified pool with an
+    MLA model, so it is the only one that reaches the MLA chunked-prefix /
+    MHA-one-shot path -- the producer that fetches its translator off
+    `get_attn_backend()` and skips translation when a wrapper backend drops it
+    (gsm8k 0.365 vs 0.895 measured on Kimi-Linear, flashinfer, TP2).
+
+    No `--attention-backend` is pinned on purpose: both defects found in review
+    on #32972 were reachable only under a resolved default, which a pinned test
+    hides by construction. CUDA graphs stay on -- graph-off did not reproduce.
+
+    `test_kimi_linear_unified_memory.py` runs this same configuration nightly.
+    The duplication is deliberate: that suite resolves a different default on
+    its H100 runner, and this one has to gate every PR.
+    """
+
+    model = KIMI_LINEAR_MODEL
+    cache_chunk_size = 64
+    # Same bar as the static-pool cell above: unified memory must not cost
+    # accuracy (measured 0.917 unified vs 0.915 static, 1 sigma ~= 0.015).
+    gsm8k_score_threshold = 0.88
+    other_args = [
+        "--trust-remote-code",
+        "--tp-size",
+        "2",
+        "--chunked-prefill-size",
+        "2048",
+        "--enable-unified-memory",
     ]
 
 
