@@ -48,6 +48,9 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+    _reduce_mxfp4_marlin,
+)
 from sglang.srt.layers.moe.mega_moe import (
     _MEGA_MOE_SYMM_BUFFER,
     _get_mega_moe_symm_buffer,
@@ -277,7 +280,7 @@ class TestMxfp4SchemeSelection(CustomTestCase):
 
 
 class TestMxfp4PackedLoaderContract(CustomTestCase):
-    def test_marlin_apply_does_not_scale_runner_output_twice(self):
+    def test_marlin_apply_returns_kernel_scaled_output(self):
         scheme = _scheme()
         scheme.hidden_size = 4
         scheme.moe_runner_config = MoeRunnerConfig(routed_scaling_factor=2.5)
@@ -311,6 +314,27 @@ class TestMxfp4PackedLoaderContract(CustomTestCase):
 
         self.assertIs(result.hidden_states, runner_output)
         scheme.runner.run.assert_called_once()
+
+    def test_mxfp4_marlin_fast_reduce_applies_routed_scaling_factor(self):
+        intermediate = torch.tensor(
+            [[[1.0] * 8, [3.0] * 8]], dtype=torch.bfloat16
+        )
+        output = torch.empty((1, 8), dtype=torch.bfloat16)
+
+        def fake_topk_sum(x, out):
+            return out.copy_(x.sum(dim=1))
+
+        with mock.patch(
+            "sglang.kernels.ops.moe.moe_topk_sum.moe_topk_sum",
+            side_effect=fake_topk_sum,
+        ) as topk_sum:
+            result = _reduce_mxfp4_marlin(
+                intermediate, output, routed_scaling_factor=2.5
+            )
+
+        self.assertIs(result, output)
+        torch.testing.assert_close(result, torch.full_like(output, 10.0))
+        topk_sum.assert_called_once_with(intermediate, output)
 
     def test_loader_mapping_hits_registered_gate_and_down_params(self):
         layer = torch.nn.Module()

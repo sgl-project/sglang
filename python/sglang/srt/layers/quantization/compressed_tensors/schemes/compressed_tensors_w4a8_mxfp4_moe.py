@@ -386,12 +386,8 @@ class CompressedTensorsW4A8Mxfp4MoE(CompressedTensorsMoEScheme):
                 dispatch_output._replace(hidden_states=hidden_states),
                 quant_info,
             )
-            # This quant method leaves
-            # ``should_fuse_routed_scaling_factor_in_topk`` false. The MXFP4
-            # Marlin path uses the unscaled top-k weights and its final reduce
-            # does not consume ``MoeRunnerConfig.routed_scaling_factor``; the
-            # GLM MoE block therefore owns the single post-MoE scale. Applying
-            # it here as well would scale every routed MoE block twice.
+            # ``fused_marlin_moe`` owns routed scaling for every Marlin weight
+            # format, including the optimized MXFP4 top-k reduction path.
             return StandardCombineInput(hidden_states=combine_input.hidden_states)
 
         # Reaching here means the mega-MoE path declined this batch (e.g. the

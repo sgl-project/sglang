@@ -131,6 +131,31 @@ def swiglu_gpt_oss_sigmoid_alpha_contiguous(
     output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
 
 
+def _reduce_mxfp4_marlin(
+    intermediate_cache3: torch.Tensor,
+    output: torch.Tensor,
+    routed_scaling_factor: Optional[float],
+) -> torch.Tensor:
+    """Reduce MXFP4 top-k outputs and honor the public scaling contract."""
+    if routed_scaling_factor is None:
+        routed_scaling_factor = 1.0
+
+    if (
+        intermediate_cache3.dtype == torch.bfloat16
+        and intermediate_cache3.is_contiguous()
+        and output.is_contiguous()
+        and intermediate_cache3.shape[-1] % 8 == 0
+    ):
+        from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
+
+        moe_topk_sum(intermediate_cache3, output)
+        if routed_scaling_factor != 1.0:
+            output.mul_(routed_scaling_factor)
+    else:
+        moe_sum_reduce(intermediate_cache3, output, routed_scaling_factor)
+    return output
+
+
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -399,23 +424,12 @@ def fused_marlin_moe(
         output = hidden_states if inplace else torch.empty_like(hidden_states)
 
     if is_mxfp4_marlin:
-        # Top-k weights (incl. routed scaling) are already applied above via
-        # mul_topk_weights, so this is a plain sum over the topk dim. The JIT
-        # vectorized pass (~1.5us at decode shapes) beats sgl_kernel's
-        # moe_sum_reduce_kernel_general (~5.7us) and the generic at::native
-        # reduce_kernel torch.sum dispatches to (~6.7us).
-        if (
-            intermediate_cache3.dtype == torch.bfloat16
-            and intermediate_cache3.is_contiguous()
-            and output.is_contiguous()
-            and intermediate_cache3.shape[-1] % 8 == 0
-        ):
-            from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
-
-            moe_topk_sum(intermediate_cache3, output)
-        else:
-            moe_sum_reduce(intermediate_cache3, output, 1.0)
-        return output
+        # Top-k routing weights are already applied above. The optimized JIT
+        # sum remains faster at decode shapes, but routed scaling is still part
+        # of fused_marlin_moe's public contract and must be applied once.
+        return _reduce_mxfp4_marlin(
+            intermediate_cache3, output, routed_scaling_factor
+        )
     else:
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
