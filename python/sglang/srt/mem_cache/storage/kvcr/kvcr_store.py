@@ -68,10 +68,10 @@ from kvcr.config import (
     FrameworkDramInput,
     KVCRBackendConfigs,
     KVCRConfig,
-    LocalDramInput,
+    LocalDramInfo,
     RemoteFWDramOptions,
 )
-from kvcr.peer_control_channel import ZmqPeerControlChannel
+from kvcr.control_channels import ZmqPeerControlChannel
 from kvcr.policy import (
     FIFOPolicy,
     G3FIFOPolicy,
@@ -719,7 +719,7 @@ class KVCRStore(HiCacheStorage):
 
     def _local_dram_region(
         self, mem_pool_host: HostKVCache
-    ) -> Optional[LocalDramInput]:
+    ) -> Optional[LocalDramInfo]:
         """Allocate KVCR's own local DRAM tier (the buffer-only L3 pool).
 
         One slot holds one page *segment* (a K or V run of a page), so slot_size
@@ -747,7 +747,7 @@ class KVCRStore(HiCacheStorage):
         # it is not garbage-collected while NIXL has it registered.
         self._local_dram_buffer = torch.empty(length, dtype=torch.uint8)
         address = self._local_dram_buffer.data_ptr()
-        return LocalDramInput(address=address, length=length, slot_count=slots)
+        return LocalDramInfo(address=address, length=length, slot_count=slots)
 
     def _probe_page_layout(
         self, mem_pool_host: HostKVCache

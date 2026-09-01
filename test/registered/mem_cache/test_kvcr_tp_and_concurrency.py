@@ -20,6 +20,7 @@ CPU-only: no mem_pool, so ``_build_kvcr`` never runs and the core is a fake.
 
 from __future__ import annotations
 
+import importlib.util
 import threading
 import time
 import unittest
@@ -44,20 +45,45 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-try:
-    from kvcr.types import OpEntryStatus, QueryStatus
+# ``kvcr`` absent is a legitimate tier configuration: the CPU suite runs without
+# the wheel. ``kvcr`` present but this adapter failing to import is not -- it
+# means the public API moved out from under us, and one guard covering both
+# reports every case below as skipped-green while running none of them. Split
+# the two conditions so only the first one skips.
+_KVCR_INSTALLED = importlib.util.find_spec("kvcr") is not None
+_KVCR_IMPORT_ERROR = None
 
-    from sglang.srt.mem_cache.storage.kvcr import kvcr_store
-    from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
+if _KVCR_INSTALLED:
+    try:
+        from kvcr.types import OpEntryStatus, QueryStatus
 
-    _HAS_KVCR = True
-except ImportError:  # pragma: no cover - wheel not installed on this tier
+        from sglang.srt.mem_cache.storage.kvcr import kvcr_store
+        from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
+
+        _HAS_KVCR = True
+    except ImportError as error:  # pragma: no cover - reported by the test below
+        _HAS_KVCR = False
+        _KVCR_IMPORT_ERROR = f"{type(error).__name__}: {error}"
+else:  # pragma: no cover - wheel not installed on this tier
     _HAS_KVCR = False
 
 # A module-level raise would be shorter, but SkipTest outside a test is an
 # uncaught exception: the CI runner invokes this file as a subprocess and reads
 # its exit code, so it would fail the whole CPU suite rather than skipping.
 _needs_kvcr = unittest.skipUnless(_HAS_KVCR, "nvidia-kvcr wheel not installed")
+
+
+class TestKVCRImports(unittest.TestCase):
+    """Fail loudly when an installed kvcr no longer satisfies this adapter."""
+
+    @unittest.skipUnless(_KVCR_INSTALLED, "nvidia-kvcr wheel not installed")
+    def test_adapter_imports_against_the_installed_kvcr(self):
+        self.assertIsNone(
+            _KVCR_IMPORT_ERROR,
+            "kvcr is installed but KVCRStore does not import against it, so "
+            "every real-backend case in this file silently skipped: "
+            f"{_KVCR_IMPORT_ERROR}",
+        )
 
 
 _BASE_CONTROL_PORT = 25000
