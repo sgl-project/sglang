@@ -488,6 +488,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_decode_cuda_graph = (
                 get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             )
+            if get_parallel().enable_dp_attention and capture_decode_cuda_graph:
+                # The dense DFLASH draft's collectives live inside the per-DP
+                # attn-TP group; idle DP ranks skip the draft step, so they
+                # cannot join a shared graph capture/replay. Keep the draft
+                # eager under dp attention (lossless, same as DSpark's dense
+                # draft guidance).
+                capture_decode_cuda_graph = False
+                if self.ps.tp_rank == 0:
+                    logger.warning(
+                        "Disable DFLASH draft cuda graph because dp attention "
+                        "is enabled (draft runs eager)."
+                    )
             if is_cuda() and capture_decode_cuda_graph:
                 available_mem = get_available_gpu_memory(self.device, self.gpu_id)
                 if available_mem < 1.0:
