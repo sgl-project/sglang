@@ -697,8 +697,6 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
             extras=[
                 "--attention-backend",
                 "video_sparse_attn_h3",
-                "--component-attention-backends",
-                "text_encoder=fa",
                 "--attention-backend-config",
                 '{"VSA_sparsity": 0.9, "vsa_mode": "exempt"}',
                 "--enable-torch-compile",

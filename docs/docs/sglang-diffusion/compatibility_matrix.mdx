@@ -726,7 +726,7 @@ Optimization columns are abbreviated to keep the matrix readable:
    `transformer/config.json` at load time. A single checkpoint serves T2V,
    I2V (`--image-path`), and T2I (`--num-frames 1`).
 6. FastH3's VSA column refers to the dedicated `video_sparse_attn_h3` (VSA-H3)
-   backend, which requires `--component-attention-backends text_encoder=fa`.
+   backend; auxiliary components fall back to their platform defaults.
    Dense backends that run on base MiniMax-H3 also run on the FastH3 weights.
    FastH3 serves `t2va` only and rejects `--model-variant` and
    `quality: "high"`.

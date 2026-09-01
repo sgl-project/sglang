@@ -82,7 +82,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`video_sparse_attn_h3`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`VIDEO_SPARSE_ATTN_H3`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Video Sparse Attention for MiniMax-H3 / FastH3 (VSA-H3). In-tree Triton block-sparse kernel (SM90 / SM100 / SM103, i.e. H100/H200, B200/GB200, B300/GB300); no external package. Requires <code>--component-attention-backends text_encoder=fa</code> when the DiT backend is not FA. Configure via <code>--attention-backend-config</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Video Sparse Attention for MiniMax-H3 / FastH3 (VSA-H3). In-tree Triton block-sparse kernel (SM90 / SM100 / SM103, i.e. H100/H200, B200/GB200, B300/GB300); no external package. Auxiliary components fall back to their platform defaults. Configure via <code>--attention-backend-config</code>.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`vmoba_attn`</td>
@@ -286,8 +286,10 @@ end-to-end latency on the target model and resolution before deployment.
 
 VSA-H3 constraints:
 
-- Requires `--component-attention-backends text_encoder=fa` when the DiT
-  backend is not FA; the token refiner always runs dense FA automatically.
+- Only the DiT runs sparse: the token refiner runs dense FA, and the text
+  encoder and VAEs fall back to their platform defaults (global backend
+  fallback). Do not pass `--component-attention-backends text_encoder=fa`; the
+  H3 text encoder has SDPA-only layers, so an explicit `fa` request is rejected.
 - Uses the checkpoint's trained `to_gate_compress` compression branch. Base
   MiniMax-H3 weights load zero gates and run pure sparse.
 - Ulysses sequence parallelism is supported (each rank attends the full packed
@@ -626,7 +628,7 @@ VSA-H3 constraints:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA-only (SM90 / SM100 / SM103: Hopper, B200/GB200, B300/GB300). In-tree Triton kernel, no external dependency. Requires <code>--component-attention-backends text_encoder=fa</code>. Configure via <code>--attention-backend-config</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA-only (SM90 / SM100 / SM103: Hopper, B200/GB200, B300/GB300). In-tree Triton kernel, no external dependency. Configure via <code>--attention-backend-config</code>.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>sla_attn</code></td>
