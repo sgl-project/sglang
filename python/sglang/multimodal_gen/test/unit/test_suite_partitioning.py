@@ -9,9 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from sglang.multimodal_gen.test import run_suite
 from sglang.multimodal_gen.test.partitioning import PartitionItem, assign_partition
-from sglang.multimodal_gen.test.run_suite import (
+from sglang.multimodal_gen.test.runner import diffusion_suite_runner as run_suite
+from sglang.multimodal_gen.test.runner.diffusion_suite_runner import (
     PartitionAssignment,
     build_local_partition_assignment,
 )
