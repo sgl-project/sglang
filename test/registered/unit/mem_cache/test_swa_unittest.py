@@ -669,13 +669,13 @@ class TestSWA(unittest.TestCase):
 
         # Case 1: is_insert=True should pass bigram key and use cache_protected_len.
         req = _DummyReq()
-        req.req_pool_idx = 0
+        req.kv.req_pool_idx = 0
         req.origin_input_ids = array("q", [1, 2, 3, 4, 5, 6])
         req.output_ids = array("q")
         req._kv_committed_len = len(req.origin_input_ids)
         kv_indices = allocator.alloc(req._kv_committed_len)
         req_to_token_pool.write(
-            (req.req_pool_idx, slice(0, req._kv_committed_len)), kv_indices
+            (req.kv.req_pool_idx, slice(0, req._kv_committed_len)), kv_indices
         )
         req.extra_key = None
         req.cache_salt = None
@@ -707,13 +707,13 @@ class TestSWA(unittest.TestCase):
         # Case 2: is_insert=False should free [cache_protected_len:page_aligned_len]
         # even when len(prefix_indices) is intentionally larger.
         req2 = _DummyReq()
-        req2.req_pool_idx = 1
+        req2.kv.req_pool_idx = 1
         req2.origin_input_ids = array("q", [11, 12, 13, 14, 15, 16])
         req2.output_ids = array("q")
         req2._kv_committed_len = len(req2.origin_input_ids)
         kv_indices2 = allocator.alloc(req2._kv_committed_len)
         req_to_token_pool.write(
-            (req2.req_pool_idx, slice(0, req2._kv_committed_len)), kv_indices2
+            (req2.kv.req_pool_idx, slice(0, req2._kv_committed_len)), kv_indices2
         )
         req2.extra_key = None
         req2.cache_salt = None
@@ -911,7 +911,7 @@ class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
 
         token_ids = array("q", range(1, num_tokens + 1))
         req = _DummyReq()
-        req.req_pool_idx = 0
+        req.kv.req_pool_idx = 0
         req.origin_input_ids = token_ids
         req.output_ids = array("q")
         req.get_fill_ids = lambda: token_ids
