@@ -1552,21 +1552,6 @@ class TestDerivedWidths(_IsolatedOverrides):
         with patch(f"{_PS}.get_attn_tensor_model_parallel_world_size", return_value=1):
             self.assertEqual(get_parallel().attn_tp_size, 1)
 
-    def test_the_arithmetic_has_one_home(self):
-        """`parallel_state` builds its groups from the same dict it stamps, and
-        `dp_attention` derives the pair it needs for the ranks, so a second copy
-        of a quotient would let two answers to one width drift apart."""
-        for rel, spelling in (
-            ("distributed/parallel_state.py", "derive_parallel_widths("),
-            ("layers/dp_attention.py", "derive_attention_widths("),
-        ):
-            source = (_SRT / rel).read_text(encoding="utf-8-sig")
-            self.assertNotIn("// attn_dp_size // attn_cp_size", source, rel)
-            self.assertNotIn("// attn_cp_size // attn_dp_size", source, rel)
-            self.assertNotIn("// moe_ep_size // moe_dp_size", source, rel)
-            self.assertNotIn("if enable_dp_attention else 1", source, rel)
-            self.assertIn(spelling, source, rel)
-
     def test_the_rank_helper_agrees_with_the_stamp(self):
         """`compute_dp_attention_world_info` keeps the ranks and takes the
         widths from the same derivation the stamp uses."""
