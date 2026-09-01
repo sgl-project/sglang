@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     NamedTuple,
     Optional,
     Protocol,
@@ -244,6 +245,42 @@ def zero_match_result(
     )
 
 
+def _dfs_weight_order(
+    root_node: Any,
+    node_handles: Sequence[Any],
+    resolve_node_handle: Callable[[Any], Any],
+) -> list[int]:
+    last_node_to_indices: dict[Any, list[int]] = {}
+    for index, node_handle in enumerate(node_handles):
+        node = resolve_node_handle(node_handle)
+        last_node_to_indices.setdefault(node, []).append(index)
+
+    node_to_weight: dict[Any, int] = {
+        node: len(indices) for node, indices in last_node_to_indices.items()
+    }
+
+    def calc_weight(node: Any) -> None:
+        for child in node.children.values():
+            calc_weight(child)
+            node_to_weight[node] = node_to_weight.get(node, 0) + node_to_weight.get(
+                child, 0
+            )
+
+    calc_weight(root_node)
+
+    order: list[int] = []
+
+    def append_dfs(node: Any) -> None:
+        children = list(node.children.values())
+        children.sort(key=lambda child: -node_to_weight.get(child, 0))
+        for child in children:
+            append_dfs(child)
+        order.extend(last_node_to_indices.get(node, ()))
+
+    append_dfs(root_node)
+    return order
+
+
 class BasePrefixCache(ABC, PrefixCacheTrait):
     """Cache can be indexed by either rid or key."""
 
@@ -288,6 +325,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_fast_match_prefix(self) -> bool:
         return False
+
+    def dfs_weight_order(self, node_handles: Sequence[Any]) -> list[int]:
+        """Return request indices in depth-first, subtree-weight order."""
+        return _dfs_weight_order(self.root_node, node_handles, self.resolve_node_handle)
 
     def resolve_node_handle(self, node_handle: Any) -> Any:
         """Map a node handle to its node -- e.g. UnifiedRadixCache looks up the
