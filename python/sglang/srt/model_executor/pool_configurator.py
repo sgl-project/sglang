@@ -44,6 +44,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils.common import (
     ceil_align,
@@ -69,6 +70,13 @@ class MemoryPoolConfig:
     c128_state_pool_size: int = 0
 
     mem_fraction_static: Optional[float] = None
+
+    # Unified pool only: the PROFILED byte budget for the token-granular
+    # sub-pools. Set, the factories size the buffer from it directly instead of
+    # re-summing ratio-derived token counts, which keeps the re-sum's floor
+    # losses out of the buffer; the token counts stay boot labels / conserve
+    # caps. None on the token-capped path -- a user token cap IS the budget.
+    unified_total_bytes: Optional[int] = None
 
     def __post_init__(self):
         if self.max_total_num_tokens <= 0:
@@ -169,7 +177,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self._zero_kv_max_tokens = (
             torch.iinfo(torch.int64).max
             if has_kv_on_another_pp_stage
-            else kvc.server_args.max_total_tokens or kvc.model_config.context_len
+            else get_schedule().max_total_tokens or kvc.model_config.context_len
         )
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
@@ -213,7 +221,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         self._cell_size * (1 + draft_num_layers / int(num_layers))
                     )
 
-        # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
+        # DFLASH/DSPARK: reserve the draft runner's *actual* per-token KV cost.
+        # The draft allocates its own KV pool at the target's
+        # max_total_num_tokens, whose per-token footprint can differ from the
+        # target's (e.g. an MLA-latent target paired with a full per-head K/V
+        # draft), so size from the draft config rather than the layer ratio.
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
@@ -259,7 +271,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim(
                     model_config=model_config,
                     kv_cache_dtype=kv_cache_dtype,
-                    server_args=kvc.server_args,
                 )
                 * effective_num_layers
                 * kv_size
@@ -369,7 +380,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if memory_config.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            indexer_ratio = parse_hisparse_config(kvc.server_args).host_to_device_ratio
+            indexer_ratio = parse_hisparse_config().host_to_device_ratio
 
         from sglang.srt.mem_cache.kv_cache_configurator import (
             _should_elide_dsa_index_k,
@@ -465,7 +476,6 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim(
                     model_config=model_config,
                     kv_cache_dtype=kv_cache_dtype,
-                    server_args=kvc.server_args,
                 )
                 * kv_size
             )
@@ -517,19 +527,16 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
             if draft_layers is not None and int(draft_layers) > 0:
                 draft_layers = int(draft_layers)
-                banded_depths = 0
-                if (
-                    model_config.hf_config.architectures[0]
-                    == "InklingForConditionalGeneration"
-                ):
-                    banded_depths = len(
-                        [
-                            i
-                            for i in model_config.hf_text_config.mtp_local_layer_ids
-                            if i < draft_layers
-                        ]
+                mtp_local_layer_ids = getattr(
+                    getattr(model_config, "hf_text_config", None),
+                    "mtp_local_layer_ids",
+                    None,
+                )
+                if mtp_local_layer_ids is not None:
+                    local_layer_ids = set(mtp_local_layer_ids)
+                    self._draft_swa_full_layers_num = sum(
+                        layer_id in local_layer_ids for layer_id in range(draft_layers)
                     )
-                    self._draft_swa_full_layers_num = banded_depths
                 else:
                     draft_swa_layers = kvc.spec_aux_config.eagle_draft_swa_num_layers
                     if draft_swa_layers is not None:
@@ -781,9 +788,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.swa_page_size = cfg.window_size
         self.swa_ratio = get_schedule().swa_full_tokens_ratio
         self.is_speculative = get_spec().speculative_algorithm is not None
-        self.online_c128_mtp_max_draft_tokens = (
-            kvc.server_args.max_speculative_num_draft_tokens or 0
-        )
+        self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
         self.requested_max_running_requests_per_worker = (
             get_schedule().max_running_requests // kvc.ps.attn_dp_size
             if get_schedule().max_running_requests is not None
@@ -793,12 +798,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.disaggregation_decode_extra_slots = (
             get_disagg().disaggregation_decode_extra_slots or 0
         )
-        if kvc.server_args.enable_hisparse:
+        if get_memory().enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            self.c4_shrink_factor = parse_hisparse_config(
-                kvc.server_args
-            ).host_to_device_ratio
+            self.c4_shrink_factor = parse_hisparse_config().host_to_device_ratio
         else:
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
@@ -815,7 +818,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.
             self._assert_ring_serves_draft_tokens(
-                kvc.server_args.max_speculative_num_draft_tokens or 0
+                max_speculative_num_draft_tokens() or 0
             )
 
         self.bytes_per_full_token = self._get_bytes_per_full_token()

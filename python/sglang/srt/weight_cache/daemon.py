@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, publish
@@ -101,7 +102,6 @@ class WeightCacheDaemonArgs:
     weight_heterogeneous_transfer_host: Optional[str] = None
     weight_heterogeneous_transfer_port: int = 31999
     weight_heterogeneous_transfer_registry_url: Optional[str] = None
-    weight_cache_socket_rank: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.weight_heterogeneous_transfer_mode not in (None, "source", "target"):
@@ -165,12 +165,6 @@ class WeightCacheDaemonArgs:
             default=None,
             help=argparse.SUPPRESS,
         )
-        parser.add_argument(
-            "--weight-cache-socket-rank",
-            type=int,
-            default=None,
-            help=argparse.SUPPRESS,
-        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "WeightCacheDaemonArgs":
@@ -193,7 +187,6 @@ class WeightCacheDaemonArgs:
             weight_heterogeneous_transfer_registry_url=(
                 args.weight_heterogeneous_transfer_registry_url
             ),
-            weight_cache_socket_rank=args.weight_cache_socket_rank,
         )
 
 
@@ -212,31 +205,32 @@ class WeightCacheDaemon:
         pp_rank: int,
         dist_init_method: Optional[str] = None,
         daemon_args: Optional[WeightCacheDaemonArgs] = None,
-        socket_rank: Optional[int] = None,
     ):
         self.server_args = server_args
         self.daemon_args = daemon_args or WeightCacheDaemonArgs()
-        self.model_path = server_args.model_path
+        cfg = resolving_view(server_args)
+        self.model_path = cfg.model_path
         self.gpu_id = gpu_id
-        self.tp_size = server_args.tp_size
+        self.nnodes = cfg.nnodes
+        self.tp_size = cfg.tp_size
         self.tp_rank = tp_rank
-        self.pp_size = server_args.pp_size
+        self.pp_size = cfg.pp_size
         self.pp_rank = pp_rank
-        self.dp_size = server_args.dp_size
-        self.ep_size = server_args.ep_size
-        self.moe_dp_size = server_args.moe_dp_size
-        self.enable_dp_attention = server_args.enable_dp_attention
-        self.enable_dp_lm_head = server_args.enable_dp_lm_head
-        self.attn_cp_size = server_args.attn_cp_size
-        self.moe_dense_tp_size = server_args.moe_dense_tp_size
-        self.moe_a2a_backend = server_args.moe_a2a_backend
-        self.deepep_mode = server_args.deepep_mode
-        self.load_format = server_args.load_format
-        self.dtype = server_args.dtype
-        self.quantization = server_args.quantization
-        self.model_loader_extra_config = server_args.model_loader_extra_config
-        self.trust_remote_code = server_args.trust_remote_code
-        self.revision = server_args.revision
+        self.dp_size = cfg.dp_size
+        self.ep_size = cfg.ep_size
+        self.moe_dp_size = cfg.moe_dp_size
+        self.enable_dp_attention = cfg.enable_dp_attention
+        self.enable_dp_lm_head = cfg.enable_dp_lm_head
+        self.attn_cp_size = cfg.attn_cp_size
+        self.moe_dense_tp_size = cfg.moe_dense_tp_size
+        self.moe_a2a_backend = cfg.moe_a2a_backend
+        self.deepep_mode = cfg.deepep_mode
+        self.load_format = cfg.load_format
+        self.dtype = cfg.dtype
+        self.quantization = cfg.quantization
+        self.model_loader_extra_config = cfg.model_loader_extra_config
+        self.trust_remote_code = cfg.trust_remote_code
+        self.revision = cfg.revision
         self.dist_init_method = dist_init_method
         self.weight_heterogeneous_transfer_mode = (
             self.daemon_args.weight_heterogeneous_transfer_mode
@@ -252,21 +246,15 @@ class WeightCacheDaemon:
                 "heterogeneous weight transfer requires a manifest registry URL"
             )
 
-        if socket_rank is None:
-            socket_rank = self.daemon_args.weight_cache_socket_rank
-        if socket_rank is None:
-            socket_rank = (
-                self.gpu_id
-                if self.weight_heterogeneous_transfer_mode is not None
-                else compute_global_rank(self.tp_size, pp_rank, tp_rank)
-            )
-        self.socket_path = get_socket_path(socket_rank)
-        self.ready_path = get_ready_path(socket_rank)
+        device_uuid = current_platform.get_device_uuid(gpu_id)
+        self.socket_path = get_socket_path(device_uuid)
+        self.ready_path = get_ready_path(device_uuid)
 
         self.model = None
         self.config: Optional[CacheConfig] = None
         # name -> transport-specific tensor entry metadata (shape/dtype/is_param + payload metadata)
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+        self.preloaded_weights_bytes = 0
         self.transport_backend = None
         self.weight_transfer_session: Optional[Any] = None
         self.weight_heterogeneous_transfer_stats: Optional[Dict[str, int]] = None
@@ -310,7 +298,7 @@ class WeightCacheDaemon:
                 distributed_init_method=self.dist_init_method,
                 local_rank=self.gpu_id,
                 backend=current_platform.get_torch_distributed_backend_str(),
-                moe_a2a_backend=server_args.moe_a2a_backend,
+                moe_a2a_backend=self.moe_a2a_backend,
             )
 
         initialize_model_parallel(
@@ -368,7 +356,7 @@ class WeightCacheDaemon:
 
         from sglang.srt.layers.moe import initialize_moe_config
 
-        initialize_moe_config(server_args)
+        initialize_moe_config()
 
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
@@ -407,7 +395,7 @@ class WeightCacheDaemon:
                 enable_dp_attention=self.enable_dp_attention,
                 moe_dp_size=self.moe_dp_size,
                 attn_cp_size=self.attn_cp_size,
-                nnodes=self.server_args.nnodes,
+                nnodes=self.nnodes,
                 quantization=self.quantization or model_config.quantization,
             )
 
@@ -418,6 +406,7 @@ class WeightCacheDaemon:
         # The initialized groups are the authority for rank identity. This
         # avoids maintaining a second copy of the model-parallel hierarchy.
         self._init_distributed(server_args, model_config)
+        self._initialize_eplb_expert_location_metadata(model_config)
         moe_dp_rank = get_parallel().moe_dp_rank
         moe_ep_rank = get_parallel().moe_ep_rank
         self.config = CacheConfig(
@@ -447,6 +436,9 @@ class WeightCacheDaemon:
             revision=self.revision or "",
             **compute_env_stamp(),
         )
+
+        current_platform.empty_cache()
+        memory_before_load = torch.cuda.memory_reserved(self.gpu_id)
 
         # Build load config
         load_config = LoadConfig(
@@ -510,6 +502,10 @@ class WeightCacheDaemon:
         # memory: clients map these tensors read-only via IPC and would otherwise
         # risk observing half-written weights.
         current_platform.synchronize()
+        current_platform.empty_cache()
+        self.preloaded_weights_bytes = max(
+            0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load
+        )
 
         if self.weight_heterogeneous_transfer_mode is not None:
             from .weight_heterogeneous_transfer import WeightTransferSession
@@ -688,6 +684,23 @@ class WeightCacheDaemon:
             f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
         )
 
+    def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
+        """Build the same initial physical expert layout as the engine."""
+        if not self.server_args.enable_eplb:
+            return
+
+        from sglang.srt.eplb.expert_location import (
+            compute_initial_expert_location_metadata,
+            set_global_expert_location_metadata,
+        )
+
+        set_global_expert_location_metadata(
+            compute_initial_expert_location_metadata(
+                model_config=model_config,
+                moe_ep_rank=get_parallel().moe_ep_rank,
+            )
+        )
+
     def serve(self):
         """Block and serve IPC handles over Unix socket."""
         # Do NOT unlink an existing socket here: stale-file cleanup is the launch
@@ -800,6 +813,7 @@ class WeightCacheDaemon:
                 # process dies while clients hold IPC mappings, their
                 # param.data (and any CUDA-graph-captured addresses) dangle.
                 pid=os.getpid(),
+                preloaded_weights_bytes=self.preloaded_weights_bytes,
             )
 
         elif req.get("type") == "ping":
@@ -836,7 +850,6 @@ def run_weight_cache_daemon(
     pp_rank: int,
     dist_init_method: Optional[str] = None,
     daemon_args: Optional[WeightCacheDaemonArgs] = None,
-    socket_rank: Optional[int] = None,
 ):
     """Entry point for running a weight cache daemon process."""
     logging.basicConfig(
@@ -859,7 +872,6 @@ def run_weight_cache_daemon(
         pp_rank=pp_rank,
         dist_init_method=dist_init_method,
         daemon_args=daemon_args,
-        socket_rank=socket_rank,
     )
 
     try:
@@ -877,13 +889,12 @@ def spawn_weight_cache_daemon(
     pp_rank: int,
     dist_init_method: str,
     daemon_args: Optional[WeightCacheDaemonArgs] = None,
-    socket_rank: Optional[int] = None,
 ):
     """Start one daemon from the complete resolved server configuration."""
     ctx = multiprocessing.get_context("spawn")
     process_args = (server_args, gpu_id, tp_rank, pp_rank, dist_init_method)
-    if daemon_args is not None or socket_rank is not None:
-        process_args += (daemon_args, socket_rank)
+    if daemon_args is not None:
+        process_args += (daemon_args,)
     proc = ctx.Process(
         target=run_weight_cache_daemon,
         args=process_args,
@@ -906,16 +917,17 @@ def _prepare_weight_heterogeneous_transfer(
         validate_weight_heterogeneous_transfer_configuration,
     )
 
+    cfg = resolving_view(server_args)
     validate_weight_heterogeneous_transfer_configuration(
-        tp_size=server_args.tp_size,
-        dp_size=server_args.dp_size,
-        ep_size=server_args.ep_size,
-        pp_size=server_args.pp_size,
-        enable_dp_attention=server_args.enable_dp_attention,
-        moe_dp_size=server_args.moe_dp_size,
-        attn_cp_size=server_args.attn_cp_size,
-        nnodes=server_args.nnodes,
-        quantization=server_args.quantization,
+        tp_size=cfg.tp_size,
+        dp_size=cfg.dp_size,
+        ep_size=cfg.ep_size,
+        pp_size=cfg.pp_size,
+        enable_dp_attention=cfg.enable_dp_attention,
+        moe_dp_size=cfg.moe_dp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        nnodes=cfg.nnodes,
+        quantization=cfg.quantization,
     )
 
     if daemon_args.weight_heterogeneous_transfer_registry_url:
@@ -1004,6 +1016,7 @@ def launch_weight_cache_daemons(
             --nnodes 2 --node-rank 1 \\
             --dist-init-method tcp://node0-ip:29500
     """
+    cfg = resolving_view(server_args)
     import socket as sock_mod
 
     daemon_args = daemon_args or WeightCacheDaemonArgs()
@@ -1011,26 +1024,26 @@ def launch_weight_cache_daemons(
         _prepare_weight_heterogeneous_transfer(
             server_args,
             daemon_args,
-            expected_rank_count=server_args.tp_size * server_args.pp_size,
+            expected_rank_count=cfg.tp_size * cfg.pp_size,
         )
     )
     procs = []
 
     # Replicate _calculate_rank_ranges logic from engine.py
-    pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
-    nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
+    pp_size_per_node = max(cfg.pp_size // cfg.nnodes, 1)
+    nnodes_per_pp_rank = max(cfg.nnodes // cfg.pp_size, 1)
     pp_rank_range = range(
-        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
-        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
+        pp_size_per_node * (cfg.node_rank // nnodes_per_pp_rank),
+        pp_size_per_node * (cfg.node_rank // nnodes_per_pp_rank + 1),
     )
     nnodes_per_tp_group = nnodes_per_pp_rank
-    tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+    tp_size_per_node = cfg.tp_size // nnodes_per_tp_group
     tp_rank_range = range(
-        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
-        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+        tp_size_per_node * (cfg.node_rank % nnodes_per_tp_group),
+        tp_size_per_node * (cfg.node_rank % nnodes_per_tp_group + 1),
     )
 
-    if server_args.nnodes > 1 and dist_init_method is None:
+    if cfg.nnodes > 1 and dist_init_method is None:
         _cleanup_weight_cache_daemon_launch(procs, weight_manifest_server)
         raise ValueError(
             "dist_init_method is required for multi-node weight cache daemons. "
@@ -1053,15 +1066,16 @@ def launch_weight_cache_daemons(
     try:
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
-                socket_rank = compute_local_gpu_id(
+                gpu_id = compute_local_gpu_id(
                     pp_rank,
                     tp_rank,
                     pp_size_per_node,
                     tp_size_per_node,
-                    base_gpu_id=server_args.base_gpu_id,
-                    gpu_id_step=server_args.gpu_id_step,
+                    base_gpu_id=cfg.base_gpu_id,
+                    gpu_id_step=cfg.gpu_id_step,
                 )
-                cleanup_stale_daemon_files(socket_rank, force=force)
+                device_uuid = current_platform.get_device_uuid(gpu_id)
+                cleanup_stale_daemon_files(device_uuid, force=force)
 
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
@@ -1070,15 +1084,14 @@ def launch_weight_cache_daemons(
                     tp_rank,
                     pp_size_per_node,
                     tp_size_per_node,
-                    base_gpu_id=server_args.base_gpu_id,
-                    gpu_id_step=server_args.gpu_id_step,
+                    base_gpu_id=cfg.base_gpu_id,
+                    gpu_id_step=cfg.gpu_id_step,
                 )
                 child_daemon_args = dataclasses.replace(
                     daemon_args,
                     weight_heterogeneous_transfer_registry_url=(
                         weight_manifest_registry_url
                     ),
-                    weight_cache_socket_rank=gpu_id,
                 )
                 proc = spawn_weight_cache_daemon(
                     server_args,
@@ -1087,7 +1100,6 @@ def launch_weight_cache_daemons(
                     pp_rank=pp_rank,
                     dist_init_method=dist_init_method,
                     daemon_args=child_daemon_args,
-                    socket_rank=gpu_id,
                 )
                 procs.append(proc)
                 logger.info(
@@ -1105,27 +1117,27 @@ def launch_weight_cache_daemons(
     try:
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
-                socket_rank = compute_local_gpu_id(
+                gpu_id = compute_local_gpu_id(
                     pp_rank,
                     tp_rank,
                     pp_size_per_node,
                     tp_size_per_node,
-                    base_gpu_id=server_args.base_gpu_id,
-                    gpu_id_step=server_args.gpu_id_step,
+                    base_gpu_id=cfg.base_gpu_id,
+                    gpu_id_step=cfg.gpu_id_step,
                 )
-                ready_path = get_ready_path(socket_rank)
+                device_uuid = current_platform.get_device_uuid(gpu_id)
+                ready_path = get_ready_path(device_uuid)
                 while not os.path.exists(ready_path):
                     time.sleep(check_interval)
                     if time.time() - start_time > timeout:
                         logger.error(
-                            f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
-                            f"did not become ready within {timeout}s"
+                            f"Weight cache daemon pp_rank={pp_rank} "
+                            f"tp_rank={tp_rank} did not become ready within {timeout}s"
                         )
                         raise TimeoutError(
-                            f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
-                            f"did not become ready within {timeout}s"
+                            f"Weight cache daemon pp_rank={pp_rank} "
+                            f"tp_rank={tp_rank} did not become ready within {timeout}s"
                         )
-                    # Check if any daemon exited prematurely
                     for proc in procs:
                         if not proc.is_alive():
                             logger.error(
@@ -1144,7 +1156,7 @@ def launch_weight_cache_daemons(
         raise
 
     logger.info(
-        f"All {num_daemons} weight cache daemons on node {server_args.node_rank} are ready "
+        f"All {num_daemons} weight cache daemons on node {cfg.node_rank} are ready "
         f"(pp_ranks={pp_rank_range.start}..{pp_rank_range.stop - 1}, "
         f"tp_ranks={tp_rank_range.start}..{tp_rank_range.stop - 1}, "
         f"dist_init_method={dist_init_method})"
@@ -1194,35 +1206,23 @@ if __name__ == "__main__":
                 expected_rank_count=1,
             )
         )
+        gpu_id = (
+            daemon_args.gpu_id
+            if daemon_args.gpu_id is not None
+            else daemon_args.tp_rank
+        )
+        tp_rank = (
+            daemon_args.tp_rank
+            if daemon_args.tp_rank is not None
+            else daemon_args.gpu_id
+        )
+        device_uuid = current_platform.get_device_uuid(gpu_id)
+        cleanup_stale_daemon_files(device_uuid, force=daemon_args.force)
+        child_daemon_args = dataclasses.replace(
+            daemon_args,
+            weight_heterogeneous_transfer_registry_url=registry_url,
+        )
         try:
-            gpu_id = (
-                daemon_args.gpu_id
-                if daemon_args.gpu_id is not None
-                else daemon_args.tp_rank
-            )
-            tp_rank = (
-                daemon_args.tp_rank
-                if daemon_args.tp_rank is not None
-                else daemon_args.gpu_id
-            )
-            socket_rank = daemon_args.weight_cache_socket_rank
-            if socket_rank is None:
-                socket_rank = (
-                    gpu_id
-                    if daemon_args.weight_heterogeneous_transfer_mode is not None
-                    else compute_global_rank(
-                        server_args.tp_size, daemon_args.pp_rank, tp_rank
-                    )
-                )
-            cleanup_stale_daemon_files(
-                socket_rank,
-                force=daemon_args.force,
-            )
-            child_daemon_args = dataclasses.replace(
-                daemon_args,
-                weight_heterogeneous_transfer_registry_url=registry_url,
-                weight_cache_socket_rank=socket_rank,
-            )
             run_weight_cache_daemon(
                 server_args,
                 gpu_id=gpu_id,
@@ -1230,7 +1230,6 @@ if __name__ == "__main__":
                 pp_rank=daemon_args.pp_rank,
                 dist_init_method=daemon_args.dist_init_method,
                 daemon_args=child_daemon_args,
-                socket_rank=socket_rank,
             )
         finally:
             if weight_manifest_server is not None:

@@ -143,7 +143,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
@@ -485,7 +485,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 self.cuda_graph_runner.execute(forward_batch)
             )
         else:
-            forward_batch.can_run_dp_cuda_graph = False
+            forward_batch.can_run_decode_cuda_graph = False
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
