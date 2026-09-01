@@ -86,10 +86,10 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             and self.num_bits in WNA16_SUPPORTED_BITS
         ):
             raise ValueError(
-                "For Fused MoE layers, only ",
-                f"{CompressionFormat.pack_quantized.value} ",
-                "is supported for the following bits: ",
-                f"{WNA16_SUPPORTED_BITS}",
+                "For Fused MoE layers, only "
+                f"{CompressionFormat.pack_quantized.value} "
+                "is supported for the following bits: "
+                f"{WNA16_SUPPORTED_BITS}"
             )
         self.num_gpu_experts = num_gpu_experts
 
