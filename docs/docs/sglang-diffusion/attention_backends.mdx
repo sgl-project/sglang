@@ -642,6 +642,10 @@ Use this override when the fallback must be pinned: unlike the global backend,
 an incompatible component override raises an error instead of selecting another
 backend. The one role-based exception is a sparse self-attention backend, which
 uses a compatible dense backend for cross-attention layers in the same component.
+The component must construct SGLang-selectable attention or explicitly defer
+selection until first use; components with fixed attention reject the override.
+Per-component overrides apply only to native pipelines. The Diffusers backend
+accepts the global `--attention-backend` passthrough instead.
 
 ### Per-request override (denoise loop)
 

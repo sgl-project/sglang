@@ -131,6 +131,7 @@ pipeline's registered module name:
 | --- | --- | --- | --- |
 | Replace a component | `--component-paths.<component> {MODEL}` | `--<component>-path {MODEL}` | Load the replacement component's configuration and weights |
 | Replace only its weights | `--component-weights-paths.<component> {WEIGHTS}` | `--<component>-weights-path {WEIGHTS}` | Retain the base component configuration and replace its weights |
+| Select component precision | `--component-precisions.<component> {DTYPE}` | — | Use a loader-supported exact parameter and execution dtype |
 | Direct-load an eligible component | `--component-direct-gpu-weight-loading.<component>` | None | Use that component's audited direct-GPU loader; it must stay resident |
 | Quantize an unquantized component online | `--component-quantizations.<component> {METHOD}` | `--<component>-quantization {METHOD}` | Apply a method supported by that component's native loader |
 | Keep selected component layers unquantized | `--component-quantization-ignored-layers.<component> {PATTERN...}` | None | Pass component-local ignored-layer patterns to its online quantizer |
@@ -166,6 +167,11 @@ for the current component matrix. A model cookbook is the source of truth for
 published, model-specific checkpoint examples; for example, all H3 sources and
 their exact overlays are kept in one
 [MiniMax-H3 compatibility table](/cookbook/diffusion/MiniMax/MiniMax-H3#checkpoint-and-adapter-formats).
+
+Exact precision overrides are capability-based. Native text and image encoders,
+standard VAE components, and native plain-state components support them;
+other component loaders reject the option instead of accepting a dtype that
+their execution stage would not honor.
 
 Direct-GPU loading is also capability-based. The existing
 `--direct-gpu-weight-loading` remains the primary DiT path. The component form
@@ -423,7 +429,7 @@ sglang generate \
   --component-attention-backends text_encoder=torch_sdpa
 ```
 
-The component key must match a pipeline module key such as `text_encoder`, `text_encoder_2`, `transformer`, `transformer_2`, or `connectors`. Component overrides take precedence over the global `--attention-backend` only while that component is being constructed and otherwise fail if the component cannot satisfy them. Sparse self-attention backends use a compatible dense backend for cross-attention layers. The global backend remains strict for DiT components, while auxiliary components may fall back to a compatible backend.
+The component key must match a pipeline module key such as `text_encoder`, `text_encoder_2`, `transformer`, `transformer_2`, or `connectors`. Component overrides take precedence over the global `--attention-backend` while that component is being constructed and fail if the component cannot satisfy them. A native component may explicitly defer backend selection until first use; components with fixed attention reject the override. Sparse self-attention backends use a compatible dense backend for cross-attention layers. The global backend remains strict for DiT components, while auxiliary components may fall back to a compatible backend. The Diffusers backend supports only the global backend passthrough.
 
 You can also pass dotted CLI entries:
 

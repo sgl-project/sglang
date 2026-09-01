@@ -11,29 +11,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""DENSE block table / kv_indices for the paged MLA backends under the unified
+"""Block table / kv_indices for the paged MLA backends under the unified
 memory pool (Kimi-Linear).
 
-`req_to_token` holds VIRTUAL token ids, while the per-layer MLA views are dense
-(`build_mla_views`). The paged MLA backends therefore need their page-level
-block table filled with kernel-facing page ids:
+`req_to_token` holds VIRTUAL token ids, while the per-layer MLA views are
+contiguous (`build_mla_views`). The paged MLA backends therefore need their
+page-level block table filled with kernel-facing page ids:
 
-    dense_page(virtual_page) = v2p[virtual_page] * layer_num
+    kernel_page(virtual_page) = v2p[virtual_page] * layer_num
 
-Three backend families reach that same formula by different routes:
-  - `create_flashmla_kv_indices_triton` in-kernel via `v2p_ptr` / `PAGE_MULT`
-    (trtllm_mla / cutedsl_mla / tokenspeed_mla);
-  - the flashinfer_mla updaters, post-gathering `translate_kv_loc_for_kernel` over the
-    token-level kv_indices;
-  - `normal_decode_set_metadata` in-kernel, for fa3's captured-decode page table.
+Since the read-path translator, ONE builder computes that formula for every
+family — `build_index_table` (the canonical) — and the backends only
+differ in how they consume it:
+  - trtllm_mla / cutedsl_mla / tokenspeed_mla / flashmla: rows filled straight
+    into their padded block tables (`KVIndexTranslator.fill_read_table`, prefix-only so
+    the backends' own -1 / stale tail sentinels survive);
+  - the flashinfer updaters: token ids reconstructed from the canonical by
+    `create_flashinfer_kv_indices_triton[ENTRY_PAGE_SIZE=ps]`;
+  - fa3's captured decode: `normal_decode_set_metadata` copies the canonical
+    rows' live prefixes (src_is_read_table=True).
 
 Covered here:
-  - kernel identity: `v2p_ptr=None, PAGE_MULT=1` is byte-identical to main;
-  - kernel dense mapping against the python reference, for several page sizes,
-    ragged sequence lengths and a non-identity v2p permutation;
-  - padded block-table lanes never index the v2p table out of bounds;
-  - the token-level kernel-facing translate the flashinfer updaters apply agrees with the
-    page-level block table the trtllm path builds;
+  - the static `create_flashmla_kv_indices_triton` (no id-space knowledge left)
+    still matches the plain token//ps reference;
+  - the canonical route against the python reference, for several page
+    sizes, ragged sequence lengths and a non-identity v2p permutation;
+  - lanes past a row's live prefix keep the backend's -1 sentinel (prefix-only
+    discipline — the trtllm/flashmla tail contract);
+  - the token-level kernel-facing translate the flashinfer updaters used to apply
+    agrees with the canonical page table (page-affinity of the id space);
   - fa3's fused metadata kernels agree with the same reference, on both the
     page_size == 1 fast path (which is what Kimi-Linear takes: fa3 imposes no
     page-size constraint) and the general path.
@@ -57,6 +63,28 @@ _LAYERS = 24  # K3 MLA full-attention layer count
 def _fill_block_table(
     req_to_token, req_pool_indices, seq_lens, page_size, *, v2p, mult
 ):
+    """The unified route: canonical builder into a -1-filled block table
+    (exactly what KVIndexTranslator.build_into does for trtllm_mla/flashmla)."""
+    from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
+
+    bs = req_pool_indices.shape[0]
+    max_blocks = (int(seq_lens.max().item()) + page_size - 1) // page_size
+    out = torch.full((bs, max_blocks), -1, dtype=torch.int32, device=_DEV)
+    build_kv_read_table(
+        req_to_token=req_to_token,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens.to(torch.int64),
+        v2p=v2p,
+        multiplier=mult,
+        page_size=page_size,
+        max_pages=max_blocks,
+        out=out,
+    )
+    return out
+
+
+def _fill_block_table_static(req_to_token, req_pool_indices, seq_lens, page_size):
+    """The static-pool route: the stripped flashmla kernel, token//ps verbatim."""
     from sglang.kernels.ops.kvcache.kv_indices import (
         create_flashmla_kv_indices_triton,
         get_num_kv_index_blocks_flashmla,
@@ -75,14 +103,12 @@ def _fill_block_table(
         req_to_token.stride(0),
         max_blocks,
         PAGED_SIZE=page_size,
-        v2p_ptr=v2p,
-        PAGE_MULT=mult,
     )
     return out
 
 
 def _reference(req_to_token, req_pool_indices, seq_lens, page_size, *, v2p, mult):
-    """Python reference: virtual token -> virtual page -> physical page -> dense."""
+    """Python reference: virtual token -> virtual page -> physical page -> kernel id."""
     bs = req_pool_indices.shape[0]
     max_blocks = (int(seq_lens.max().item()) + page_size - 1) // page_size
     ref = torch.full((bs, max_blocks), -1, dtype=torch.int64, device=_DEV)
@@ -96,7 +122,7 @@ def _reference(req_to_token, req_pool_indices, seq_lens, page_size, *, v2p, mult
 
 
 @unittest.skipUnless(_HAS_CUDA, "requires CUDA")
-class TestDenseBlockTable(unittest.TestCase):
+class TestBlockTable(unittest.TestCase):
     def _make_batch(self, page_size, bs=5, max_ctx=2048, n_pages=512):
         """Ragged batch with a non-identity virtual->physical page permutation."""
         g = torch.Generator(device="cpu").manual_seed(97 + page_size)
@@ -122,17 +148,18 @@ class TestDenseBlockTable(unittest.TestCase):
         v2p[0] = 0  # page 0 is the reserved sink
         return req_to_token, req_pool_indices, seq_lens, v2p
 
-    def test_identity_when_hooks_absent(self):
-        """v2p_ptr=None / PAGE_MULT=1 must reproduce the pre-change behaviour."""
+    def test_static_kernel_matches_reference(self):
+        """The stripped (id-space-free) flashmla kernel is byte-identical to the
+        plain token//ps reference -- guards the v2p-arg removal itself."""
         for page_size in (1, 32, 64):
             rt, rpi, sl, _ = self._make_batch(page_size)
-            got = _fill_block_table(rt, rpi, sl, page_size, v2p=None, mult=1)
+            got = _fill_block_table_static(rt, rpi, sl, page_size)
             want = _reference(rt, rpi, sl, page_size, v2p=None, mult=1)
             self.assertTrue(
                 torch.equal(got.long(), want), f"page_size={page_size}: {got} != {want}"
             )
 
-    def test_dense_block_table_matches_reference(self):
+    def test_block_table_matches_reference(self):
         for page_size in (1, 32, 64):
             rt, rpi, sl, v2p = self._make_batch(page_size)
             got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p, mult=_LAYERS)
@@ -166,8 +193,9 @@ class TestDenseBlockTable(unittest.TestCase):
             )
 
     def test_padded_lanes_stay_untouched(self):
-        """Lanes past a request's page count keep the -1 fill: the masked v2p load
-        must not write a translated value (nor read out of bounds)."""
+        """Lanes past a request's page count keep the -1 fill: the prefix-only
+        canonical build must never write a backend's tail sentinel (the
+        trtllm/flashmla block-table contract)."""
         page_size = 64
         rt, rpi, sl, v2p = self._make_batch(page_size)
         got = _fill_block_table(rt, rpi, sl, page_size, v2p=v2p, mult=_LAYERS)
@@ -178,10 +206,10 @@ class TestDenseBlockTable(unittest.TestCase):
                 f"row {r} padded lanes were written: {got[r]}",
             )
 
-    def test_agrees_with_token_level_dense_translate(self):
+    def test_agrees_with_token_level_translate(self):
         """The flashinfer updaters translate TOKEN ids with
         `translate_kv_loc_for_kernel`; the trtllm path builds PAGE ids in-kernel. Both
-        must address the same dense page block."""
+        must address the same kernel-facing page block."""
         page_size = 64
         rt, rpi, sl, v2p = self._make_batch(page_size)
         block_table = _fill_block_table(
@@ -191,13 +219,13 @@ class TestDenseBlockTable(unittest.TestCase):
             n = int(sl[r].item())
             virt_tokens = rt[r, :n].long()
             # translate_kv_loc_for_kernel's formula, applied to token ids.
-            dense_tokens = (
+            kernel_tokens = (
                 v2p[virt_tokens // page_size] * (page_size * _LAYERS)
                 + virt_tokens % page_size
             )
             # The block-table entry scaled by page_size must be the kernel-facing id of
             # each page's first token.
-            first_of_page = dense_tokens[::page_size]
+            first_of_page = kernel_tokens[::page_size]
             n_pages = (n + page_size - 1) // page_size
             self.assertTrue(
                 torch.equal(block_table[r, :n_pages] * page_size, first_of_page),
@@ -206,44 +234,78 @@ class TestDenseBlockTable(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAS_CUDA, "requires CUDA")
-class TestFa3MetadataDenseBlockTable(unittest.TestCase):
-    """fa3 folds the unified remap into `normal_decode_set_metadata`, the fused
-    gather that writes its captured-decode page table, so the kernel itself has
-    to get the mapping right. Two kernels back it: a page_size == 1 / no-SWA fast
-    path (what Kimi-Linear takes, since fa3 imposes no page-size constraint) and
-    a general one.
+class TestFa3MetadataBlockTable(unittest.TestCase):
+    """fa3's captured-decode page table is written by `normal_decode_set_metadata`
+    fed with the translator's read table kernel page table
+    (src_is_read_table=True): the fused kernel copies the canonical
+    rows' live prefixes into the capture-stable buffer. Pinned END-TO-END:
+    build_kv_read_table -> wrapper -> page_table must equal the python
+    reference of the kernel-facing formula, on both the page_size == 1 / no-SWA fast
+    path (what Kimi-Linear takes) and the general kernel. The static call
+    (no source flag) stays byte-identical to the pre-translator kernel.
     """
 
     def _run(self, page_size, *, v2p, mult, bs=5, max_ctx=2048):
         from sglang.kernels.ops.attention.metadata import normal_decode_set_metadata
+        from sglang.kernels.ops.kvcache.kv_read_table import (
+            build_kv_read_table,
+        )
 
-        maker = TestDenseBlockTable._make_batch
+        maker = TestBlockTable._make_batch
         rt, rpi, sl, v2p_full = maker(self, page_size, bs=bs, max_ctx=max_ctx)
-        v2p_arg = v2p_full if v2p else None
 
         max_pages = (max_ctx + page_size - 1) // page_size
         page_table = torch.zeros((bs, max_pages), dtype=torch.int32, device=_DEV)
         cache_seqlens = torch.zeros((bs,), dtype=torch.int32, device=_DEV)
         cu_seqlens_k = torch.zeros((bs + 1,), dtype=torch.int32, device=_DEV)
-        strided = torch.arange(0, max_ctx, page_size, device=_DEV)
         max_seq_pages = (int(sl.max().item()) + page_size - 1) // page_size
 
-        normal_decode_set_metadata(
-            cache_seqlens,
-            cu_seqlens_k,
-            page_table,
-            rt,
-            rpi,
-            strided,
-            max_seq_pages,
-            sl.to(torch.int64),
-            0,
-            page_size,
-            v2p_page_table=v2p_arg,
-            kernel_page_multiplier=mult,
-        )
+        if v2p:
+            # The translator's canonical, then the wrapper copies its rows.
+            canonical = torch.zeros((bs, max_pages), dtype=torch.int32, device=_DEV)
+            build_kv_read_table(
+                req_to_token=rt,
+                req_pool_indices=rpi,
+                seq_lens=sl.to(torch.int64),
+                v2p=v2p_full,
+                multiplier=mult,
+                page_size=page_size,
+                max_pages=max_pages,
+                out=canonical,
+            )
+            rows = torch.arange(bs, dtype=torch.int64, device=_DEV)
+            normal_decode_set_metadata(
+                cache_seqlens,
+                cu_seqlens_k,
+                page_table,
+                canonical,
+                rows,
+                max_seq_pages,
+                sl.to(torch.int64),
+                0,
+                page_size,
+                None,
+                None,
+                src_is_read_table=True,
+            )
+        else:
+            normal_decode_set_metadata(
+                cache_seqlens,
+                cu_seqlens_k,
+                page_table,
+                rt,
+                rpi,
+                max_seq_pages,
+                sl.to(torch.int64),
+                0,
+                page_size,
+                None,
+                None,
+            )
         torch.cuda.synchronize()
-        want = _reference(rt, rpi, sl, page_size, v2p=v2p_arg, mult=mult)
+        want = _reference(
+            rt, rpi, sl, page_size, v2p=(v2p_full if v2p else None), mult=mult
+        )
         return page_table, want, sl
 
     def _assert_live_prefix(self, got, want, sl, page_size):
@@ -263,11 +325,11 @@ class TestFa3MetadataDenseBlockTable(unittest.TestCase):
             got, want, sl = self._run(page_size, v2p=False, mult=1)
             self._assert_live_prefix(got, want, sl, page_size)
 
-    def test_dense_mapping_ps1_fast_path(self):
+    def test_translated_mapping_ps1_fast_path(self):
         got, want, sl = self._run(1, v2p=True, mult=_LAYERS)
         self._assert_live_prefix(got, want, sl, 1)
 
-    def test_dense_mapping_general_path(self):
+    def test_translated_mapping_general_path(self):
         got, want, sl = self._run(64, v2p=True, mult=_LAYERS)
         self._assert_live_prefix(got, want, sl, 64)
 
@@ -277,7 +339,7 @@ class TestFa3MetadataDenseBlockTable(unittest.TestCase):
             got, want, sl = self._run(page_size, v2p=True, mult=1)
             self._assert_live_prefix(got, want, sl, page_size)
             virtual = _reference(
-                *TestDenseBlockTable._make_batch(self, page_size)[:3],
+                *TestBlockTable._make_batch(self, page_size)[:3],
                 page_size,
                 v2p=None,
                 mult=1,
@@ -287,192 +349,9 @@ class TestFa3MetadataDenseBlockTable(unittest.TestCase):
                 "test batch degenerated: v2p is the identity on the pages used",
             )
 
-    def test_agrees_with_flashmla_block_table(self):
-        """fa3 and trtllm_mla build the same table two different ways; a
-        disagreement means one family is addressing the wrong pages."""
-        for page_size in (1, 64):
-            got, _, sl = self._run(page_size, v2p=True, mult=_LAYERS)
-            rt, rpi, sl2, v2p = TestDenseBlockTable._make_batch(self, page_size)
-            other = _fill_block_table(
-                rt, rpi, sl2, page_size, v2p=v2p, mult=_LAYERS
-            ).long()
-            for r in range(got.shape[0]):
-                n_pages = (int(sl[r].item()) + page_size - 1) // page_size
-                self.assertTrue(
-                    torch.equal(got[r, :n_pages].long(), other[r, :n_pages]),
-                    f"fa3 and flashmla block tables disagree (row {r}, ps={page_size})",
-                )
-
-
-class TestUnifiedMLAHookDetection(unittest.TestCase):
-    """`unified_mla_hooks` decides whether the paged MLA backends translate at
-    all. Getting the predicate wrong is silent: the block table and KV write loc
-    stay in virtual id space and address the wrong pages once virtual and
-    physical diverge (e.g. after compaction)."""
-
-    @staticmethod
-    def _probe(**attrs):
-        from sglang.srt.layers.attention.unified_mem_hooks import (
-            unified_mla_hooks,
-        )
-
-        class _Alloc:
-            pass
-
-        alloc = _Alloc()
-        for k, v in attrs.items():
-            setattr(alloc, k, v)
-        return unified_mla_hooks(alloc)
-
-    def test_static_pool_disables_every_hook(self):
-        """No v2p table -> statically-partitioned pool; req_to_token is already
-        physical, so all hooks must stay off (byte-identical to pre-change)."""
-        hooks = self._probe()
-        self.assertFalse(hooks.enabled)
-        self.assertIsNone(hooks.v2p_page_table)
-        self.assertIsNone(hooks.translate_kv_loc_for_kernel)
-        self.assertEqual(hooks.kernel_page_multiplier, 1)
-
-    def test_multi_layer_unified_pool(self):
-        table = torch.arange(8)
-        hooks = self._probe(
-            full_v2p_page_table=table,
-            translate_kv_loc_for_kernel=lambda x, **kw: x,
-            kernel_page_multiplier=_LAYERS,
-        )
-        self.assertTrue(hooks.enabled)
-        self.assertIs(hooks.v2p_page_table, table)
-        self.assertIsNotNone(hooks.translate_kv_loc_for_kernel)
-        self.assertEqual(hooks.kernel_page_multiplier, _LAYERS)
-
-    def test_single_full_attention_layer_pool_is_still_unified(self):
-        """REGRESSION: `kernel_page_multiplier == 1` does NOT mean static.
-
-        A hybrid MLA config with exactly one full-attention layer (e.g. a
-        pipeline-parallel rank owning a single MLA layer) has multiplier 1, yet
-        its locs are still virtual. Detecting on `multiplier > 1` would disable
-        the v2p gather here and corrupt reads/writes after compaction.
-        """
-        table = torch.arange(8)
-        hooks = self._probe(
-            full_v2p_page_table=table,
-            translate_kv_loc_for_kernel=lambda x, **kw: x,
-            kernel_page_multiplier=1,
-        )
-        self.assertTrue(hooks.enabled, "single-layer unified pool read as static")
-        self.assertIs(hooks.v2p_page_table, table)
-        self.assertIsNotNone(hooks.translate_kv_loc_for_kernel)
-        # Multiplier stays 1: kernel-facing id == physical id, so the v2p gather alone is
-        # the whole translation and PAGE_MULT must not scale it.
-        self.assertEqual(hooks.kernel_page_multiplier, 1)
-
-
-@unittest.skipUnless(_HAS_CUDA, "requires CUDA")
-class TestInPlaceKvIndicesTranslate(unittest.TestCase):
-    """The flashinfer decode updater must translate kv_indices IN PLACE.
-
-    Under cuda-graph replay the `kv_indices` it is handed IS the capture-stable
-    buffer the captured wrapper reads (`fast_decode_kwargs["kv_indices"]`), and
-    `fast_mla_decode_plan` ignores its `kv_indices` argument -- so rebinding the
-    local name to a fresh translated tensor leaves the graph reading VIRTUAL ids.
-    These pin the write-back contract that fix relies on.
-    """
-
-    def _allocator(self, page_size=1, n_full_tokens=4096):
-        from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
-        from sglang.srt.mem_cache.unified_memory_pool import (
-            MambaSubPoolSpec,
-            MLASubPoolSpec,
-            UnifiedKVPool,
-        )
-
-        full = MLASubPoolSpec(
-            name="full",
-            layer_num=_LAYERS,
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-            store_dtype=torch.bfloat16,
-            grow_direction="down",
-        )
-        mamba = MambaSubPoolSpec(
-            name="mamba",
-            layer_num=2,
-            conv_state_shapes=((8, 16),),
-            conv_dtype=torch.bfloat16,
-            temporal_state_shape=(4, 8, 8),
-            temporal_dtype=torch.float32,
-            grow_direction="up",
-        )
-        pool = UnifiedKVPool(
-            total_bytes=full.entry_bytes() * n_full_tokens + mamba.entry_bytes() * 16,
-            sub_pool_specs=[full, mamba],
-            device=_DEV,
-            enable_memory_saver=False,
-            page_size=page_size,
-        )
-
-        class _Stub:
-            def move_kv_cache(self, dst, src):
-                pass
-
-        full_alloc = MultiEndedAllocator(
-            kvcache=_Stub(),
-            unified_buffer=pool,
-            sub_pool_name="full",
-            device=_DEV,
-            is_id_owner=True,
-            page_size=page_size,
-            kernel_page_multiplier=_LAYERS,
-        )
-        mamba_alloc = MultiEndedAllocator(
-            kvcache=_Stub(),
-            unified_buffer=pool,
-            sub_pool_name="mamba",
-            device=_DEV,
-            is_id_owner=True,
-        )
-        full_alloc.bind_peer(mamba_alloc)
-        mamba_alloc.bind_peer(full_alloc)
-        return full_alloc
-
-    def test_int32_buffer_prefix_translated_tail_untouched(self):
-        """Mirrors the updater: an int32 capture-stable buffer holding VIRTUAL
-        ids in [:n] gets the kernel-facing ids written back in place, narrowed to int32,
-        with the stale tail left alone (it must never index the v2p table)."""
-        alloc = self._allocator()
-        virt = alloc.alloc(64)
-        self.assertIsNotNone(virt)
-        n = virt.numel()
-
-        # Capture-stable int32 buffer: [:n] freshly filled with virtual ids by
-        # create_flashinfer_kv_indices_triton, tail = stale junk from a bigger replay.
-        buf = torch.full((n * 3,), 2**30, dtype=torch.int32, device=_DEV)
-        buf[:n] = virt.to(torch.int32)
-        tail_before = buf[n:].clone()
-
-        valid = buf[:n]
-        valid.copy_(alloc.translate_kv_loc_for_kernel(valid))
-
-        expected = alloc.translate_kv_loc_for_kernel(virt)
-        self.assertEqual(buf.dtype, torch.int32)
-        self.assertTrue(
-            torch.equal(buf[:n].long(), expected),
-            "in-place translate did not land kernel-facing ids in the stable buffer",
-        )
-        self.assertTrue(
-            torch.equal(buf[n:], tail_before),
-            "stale tail was modified -- it can hold ids outside the v2p table",
-        )
-
-    def test_dense_ids_differ_from_virtual(self):
-        """Guard the guard: if dense == virtual the in-place test proves nothing."""
-        alloc = self._allocator()
-        virt = alloc.alloc(64)
-        self.assertIsNotNone(virt)
-        self.assertFalse(
-            torch.equal(alloc.translate_kv_loc_for_kernel(virt), virt),
-            "kernel-facing ids coincide with virtual ids; pick a different allocation",
-        )
+    # (The old fa3<->flashmla agreement case is gone: both families now
+    # consume the SAME canonical builder, so cross-family agreement holds by
+    # construction and the per-family cases above cover the two consumers.)
 
 
 if __name__ == "__main__":
