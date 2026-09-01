@@ -15,7 +15,11 @@ from sglang.srt.layers.attention.flashattention_backend import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_schedule,
+    get_spec,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -78,13 +82,7 @@ class XPUAttentionBackend(AttentionBackend):
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
             and model_runner.token_to_kv_pool.swa_layer_nums > 0
         )
-        if self.use_sliding_window_kv_pool:
-            self.token_to_kv_pool = model_runner.token_to_kv_pool
-        if self.is_hybrid_swa:
-            self.full_to_swa_index_mapping = (
-                model_runner.token_to_kv_pool.full_to_swa_index_mapping
-            )
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
@@ -101,6 +99,15 @@ class XPUAttentionBackend(AttentionBackend):
         self.sliding_window_size = model_runner.sliding_window_size
         self.has_swa = (
             self.sliding_window_size is not None and self.sliding_window_size > -1
+        )
+
+        # If num_splits == 0, the kernel uses a heuristic to automatically
+        # determine the number of splits. Split-KV reduces across a
+        # non-deterministic number of partitions, so we pin num_splits to 1
+        # when deterministic inference is enabled to keep attention reduction
+        # order fixed. This mirrors the flash-attention (fa3) backend.
+        self.num_splits = (
+            1 if get_exec().deterministic.enable_deterministic_inference else 0
         )
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
 
@@ -556,6 +563,10 @@ class XPUAttentionBackend(AttentionBackend):
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
+            # The MLA branch passes num_splits explicitly per call site, since the
+            # chunked-prefix varlen kernels there keep their own default.
+            kwargs["num_splits"] = self.num_splits
+
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
@@ -719,6 +730,7 @@ class XPUAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
+                    num_splits=self.num_splits,
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
@@ -740,6 +752,7 @@ class XPUAttentionBackend(AttentionBackend):
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
+                            num_splits=self.num_splits,
                         )
                     )
                     o, _ = merge_state_v2_wrapper(
@@ -845,6 +858,11 @@ class XPUAttentionBackend(AttentionBackend):
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if not self.use_mla:
             # Do multi-head attention
+
+            # Only the MHA kernels below take num_splits. The MLA path calls
+            # flash_mla_decode, whose own num_kv_splits already defaults to 1
+            # (no split-KV), so it needs no deterministic override here.
+            kwargs["num_splits"] = self.num_splits
 
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             key_cache = key_cache.view(
@@ -990,6 +1008,12 @@ class XPUAttentionBackend(AttentionBackend):
                 metadata.page_table,
                 self.workspace,
                 layer.scaling,
+                # flash_mla_decode's heuristic only kicks in when num_kv_splits
+                # < 1, and it derives the split count from batch * num_heads and
+                # seq_len_kv, which is not batch-invariant. Pin it to 1 (the
+                # kernel's current default) so the reduction order stays fixed
+                # regardless of upstream default changes.
+                num_kv_splits=1,
             )
 
         out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -1215,9 +1239,9 @@ class XPUAttentionBackend(AttentionBackend):
         cu_seqlens_q = metadata.cu_seqlens_q
         cache_seqlens_int32 = metadata.cache_seqlens_int32
         if self.is_hybrid_swa:
-            page_table = self.full_to_swa_index_mapping[metadata.page_table].to(
-                torch.int32
-            )
+            page_table = self.token_to_kv_pool.full_to_swa_index_mapping[
+                metadata.page_table
+            ].to(torch.int32)
         else:
             page_table = metadata.page_table
         if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
