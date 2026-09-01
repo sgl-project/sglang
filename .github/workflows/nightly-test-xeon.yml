@@ -6,6 +6,11 @@ name: Nightly Test (Xeon)
 # --continue-on-error so one failing model does not mask the rest.
 
 on:
+  # TEMPORARY (bring-up only): auto-run on every push to xeonnightly so the
+  # workflow can be validated before it lands on the default branch. REMOVE
+  # this push trigger before merge.
+  push:
+    branches: [ xeonnightly ]
   schedule:
     # 18:07 UTC daily (02:07 Beijing). Off-minute to avoid colliding with the
     # fleet of :00/:30 scheduled jobs; clear of the XPU nightly at 16:45 UTC.
