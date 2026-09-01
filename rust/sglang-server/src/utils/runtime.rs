@@ -51,7 +51,7 @@ pub struct Runtime {
     /// `skip_tokenizer_init`).
     pub tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>>,
     /// MM results parked between a worker's `MmEncoded` and the scheduler drain
-    /// (`Server.take_mm`).
+    /// (`Server.take_mm_result`).
     pub mm_sidecar: crate::multi_modality::sidecar::Sidecar,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
@@ -117,18 +117,19 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 
     // --- inter-stage channels ---
     let (tok_manager_tx, tok_manager_rx) =
-        flume::bounded::<TmEvent>(cfg.rust_server_args.channel_cap);
+        flume::bounded::<TmEvent>(cfg.rust_server_args.stage_channel_cap);
     let (tokenizer_tx, tokenizer_rx) =
-        flume::bounded::<crate::message::request::Request>(cfg.rust_server_args.channel_cap);
+        flume::bounded::<crate::message::request::Request>(cfg.rust_server_args.stage_channel_cap);
     // Encoding → MM worker pool. Bounded like the other stage edges so a slow
     // pool back-pressures instead of buffering unboundedly.
-    let (mm_worker_tx, mm_worker_rx) =
-        flume::bounded::<crate::message::request::MmRequest>(cfg.rust_server_args.channel_cap);
+    let (mm_worker_tx, mm_worker_rx) = flume::bounded::<crate::message::request::MmRequest>(
+        cfg.rust_server_args.stage_channel_cap,
+    );
     let detokenizer_worker_num = cfg.server_args.detokenizer_worker_num;
     let mut detokenizer_tx = Vec::with_capacity(detokenizer_worker_num);
     let mut detokenizer_rx = Vec::with_capacity(detokenizer_worker_num);
     for _ in 0..detokenizer_worker_num {
-        let (tx, rx) = flume::bounded::<DetokMsg>(cfg.rust_server_args.channel_cap);
+        let (tx, rx) = flume::bounded::<DetokMsg>(cfg.rust_server_args.stage_channel_cap);
         detokenizer_tx.push(tx);
         detokenizer_rx.push(rx);
     }
@@ -303,7 +304,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 rt.block_on(api_server::app::serve(
                     listener,
                     senders,
-                    cfg.rust_server_args.channel_cap,
+                    cfg.rust_server_args.stage_channel_cap,
                     cfg.server_args.clone(),
                     // Response heartbeat watched by `/health_generate`.
                     response_activity,
