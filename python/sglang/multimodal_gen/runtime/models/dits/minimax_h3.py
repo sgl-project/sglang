@@ -24,6 +24,7 @@ from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
 )
 from sglang.kernels.ops.diffusion import (
+    can_use_fused_inplace_qknorm_rope_cpu,
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
     indexed_gate_bf16,
@@ -738,14 +739,27 @@ class MiniMaxH3Attention(nn.Module):
         # cache width covers cos/sin for temporal, height, and width frequencies
         rope_dim = 6 * arch.rope_inv_freq_len
         self._use_fused_qknorm_rope = (
-            current_platform.is_cuda()
-            and can_use_fused_inplace_qknorm_rope(
-                arch.attention_head_dim,
-                rope_dim,
-                True,
-                _BF16_DTYPE,
-                cache_dtype=_BF16_DTYPE,
-                round_norm_before_rope=True,
+            (
+                current_platform.is_cuda()
+                and can_use_fused_inplace_qknorm_rope(
+                    arch.attention_head_dim,
+                    rope_dim,
+                    True,
+                    _BF16_DTYPE,
+                    cache_dtype=_BF16_DTYPE,
+                    round_norm_before_rope=True,
+                )
+            )
+            or (
+                current_platform.is_cpu()
+                and can_use_fused_inplace_qknorm_rope_cpu(
+                    arch.attention_head_dim,
+                    rope_dim,
+                    True,
+                    _BF16_DTYPE,
+                    cache_dtype=_BF16_DTYPE,
+                    round_norm_before_rope=True,
+                )
             )
         )
         self.out_proj = RowParallelLinear(

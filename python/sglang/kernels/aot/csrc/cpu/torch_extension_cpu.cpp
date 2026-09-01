@@ -30,6 +30,19 @@ at::Tensor gelu_and_mul_cpu(const at::Tensor& input);
 // fused_sigmoid_mul
 void fused_sigmoid_mul_cpu(at::Tensor& input, const at::Tensor& gate);
 
+void fused_inplace_qknorm_rope_cpu(
+    at::Tensor& q,
+    at::Tensor& k,
+    const at::Tensor& q_weight,
+    const at::Tensor& k_weight,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& positions,
+    double eps,
+    int64_t head_dim,
+    int64_t rope_dim,
+    bool is_neox,
+    bool round_norm_before_rope);
+
 // l2norm
 at::Tensor l2norm_cpu(at::Tensor& input, double eps);
 
@@ -582,6 +595,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gelu_and_mul_cpu", torch::kCPU, &gelu_and_mul_cpu);
   m.def("fused_sigmoid_mul_cpu(Tensor(a!) input, Tensor gate) -> ()");
   m.impl("fused_sigmoid_mul_cpu", torch::kCPU, &fused_sigmoid_mul_cpu);
+
+    m.def(
+            "fused_inplace_qknorm_rope_cpu(Tensor(a!) q, Tensor(a!) k, Tensor q_weight, Tensor k_weight, Tensor cos_sin_cache, Tensor positions, float eps, int head_dim, int rope_dim, bool is_neox, bool round_norm_before_rope) -> ()");
+    m.impl("fused_inplace_qknorm_rope_cpu", torch::kCPU, &fused_inplace_qknorm_rope_cpu);
 
   // norm
   m.def("rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");

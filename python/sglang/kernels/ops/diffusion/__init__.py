@@ -487,6 +487,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_ltx25_decoder_rope": "rope.ltx25_decoder_rope_jit",
     "fused_ltx25_decoder_rope": "rope.ltx25_decoder_rope_jit",
     "can_use_fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
+    "can_use_fused_inplace_qknorm_rope_cpu": "rope.qknorm_rope_jit",
     "fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
     "fused_qknorm_rope_pack_kv": "rope.qknorm_rope_jit",
     "try_fused_qwen_qkv_epilogue": "rope.qwen_qkv_epilogue_jit",
