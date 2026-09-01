@@ -20,9 +20,7 @@ logger = logging.getLogger(__name__)
 _HOPPER_QWEN3_VL_TYPES = {"qwen3_vl", "qwen3_vl_moe"}
 
 
-def large_hopper_qwen3_vl_model_type(
-    server_args: Any, gpu_mem=None
-) -> Optional[str]:
+def large_hopper_qwen3_vl_model_type(server_args: Any, gpu_mem=None) -> Optional[str]:
     """Return the HF model_type on large Hopper Qwen3-VL, else None."""
     cfg = resolving_view(server_args)
     if gpu_mem is None:

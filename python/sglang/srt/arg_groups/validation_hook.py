@@ -84,9 +84,19 @@ def check_server_args(server_args: Any):
 
     # Check speculative decoding
     if cfg.speculative_algorithm is not None:
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        # Running requests degrade to a plain 1-token decode inside a
+        # mixed step; only workers with a verified resume path allow it.
         assert (
             not cfg.enable_mixed_chunk
-        ), "enable_mixed_chunk is required for speculative decoding"
+            or SpeculativeAlgorithm.from_string(
+                cfg.speculative_algorithm
+            ).supports_mixed_chunk()
+        ), (
+            "enable_mixed_chunk is not supported with "
+            f"speculative_algorithm={cfg.speculative_algorithm}"
+        )
 
     # Check chunked prefill
     # Skip validation if chunked prefill is disabled (i.e., size <= 0).
