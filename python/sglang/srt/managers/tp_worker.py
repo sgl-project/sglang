@@ -178,15 +178,6 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
-    def _deserialize_own_rank(self, serialized_named_tensors):
-        """Each rank deserializes only its own payload (index ps.tp_rank);
-        deserializing another rank's copy would break producer-side CUDA-IPC
-        refcounting."""
-        monkey_patch_torch_reductions()
-        return MultiprocessingSerializer.deserialize(
-            serialized_named_tensors[self.ps.tp_rank]
-        )
-
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update weights from IPC for checkpoint-engine integration."""
         success, message = self.model_runner.weight_updater.update_weights_from_ipc(
