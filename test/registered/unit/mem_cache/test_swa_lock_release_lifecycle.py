@@ -89,9 +89,8 @@ def _swa_alloc(allocator, need_size):
     """Allocate from SWA allocator for any page_size.
 
     SWATokenToKVPoolAllocator.alloc() asserts page_size == 1; for page_size > 1
-    we drive the underlying paged allocators directly (mirrors the helper in
-    test_swa_eviction_boundary.py). Required: need_size is a multiple of
-    page_size when page_size > 1.
+    we drive the underlying paged allocators directly. Required: need_size is
+    a multiple of page_size when page_size > 1.
     """
     if allocator.page_size == 1:
         return allocator.alloc(need_size)

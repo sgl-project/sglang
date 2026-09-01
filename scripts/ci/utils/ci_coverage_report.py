@@ -92,11 +92,9 @@ _MM_GEN_SUBDIR_BACKENDS = {
 # pass on ROCm. The CUDA lane does not collect these nested files (see
 # gpu_cases._discover_unit_tests), so they are AMD-only here.
 _MM_GEN_FILE_BACKENDS = {
-    "unit/realtime/test_causal_denoising.py": ("AMD",),
     "unit/realtime/test_output_materialization.py": ("AMD",),
     "unit/realtime/test_realtime_consistency_harness.py": ("AMD",),
     "unit/realtime/test_realtime_control_signals.py": ("AMD",),
-    "unit/realtime/test_realtime_output_transport.py": ("AMD",),
     "unit/realtime/test_realtime_vae.py": ("AMD",),
     "unit/sana_wm/test_streaming_cached.py": ("AMD",),
     "unit/sana_wm/test_streaming_stage.py": ("AMD",),
@@ -104,8 +102,6 @@ _MM_GEN_FILE_BACKENDS = {
     # Enabled with small test-harness stub fixes.
     "unit/progressive_resolution/test_progressive.py": ("AMD",),
     "unit/sana_wm/test_streaming_realtime_path.py": ("AMD",),
-    # Stub gap already fixed upstream; only needs enabling here.
-    "unit/realtime/test_lingbot_causal_denoising.py": ("AMD",),
 }
 
 # Filenames that match `test_*.py` by convention but contain no real tests
