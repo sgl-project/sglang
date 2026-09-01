@@ -215,7 +215,7 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="gemm.kda_nvfp4_gemm",
-        backend=KernelBackend.CUTE_DSL,
+        backend=KernelBackend.KDA,
         target=("sglang.kernels.kda_kernels.qwen38_nvfp4_gemm_sm120:" "kda_nvfp4_gemm"),
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))}
@@ -326,7 +326,7 @@ def kda_nvfp4_gemm(
     out_features: int,
 ) -> torch.Tensor:
     """Run the Humanize2/KDA SM120 NVFP4 GEMM."""
-    return get_kernel("gemm.kda_nvfp4_gemm", KernelBackend.CUTE_DSL)(
+    return get_kernel("gemm.kda_nvfp4_gemm", KernelBackend.KDA)(
         input, weight, input_sf, weight_sf, alpha, out_dtype, out_features
     )
 
