@@ -287,7 +287,7 @@ export const benchmarks = [
       },
     ],
     notes:
-      "FP8 KV + TRT-LLM DSA pairing of the NVFP4 recipe on 4x B300 (SXM6), stock unpatched lmsysorg/sglang:glm-5.3-flash image (tree 033446bb05), TP4-only with the flashinfer_cutlass MoE runner, adaptive MTP 5/1/6 with SGLANG_SIMULATE_ACC_LEN=3: 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,139.83 aggregate output tok/s after two discarded warmups — 39% above the bf16-tilelang NVFP4 row on the otherwise identical recipe. Simulated accept length makes this a throughput-mechanism number (accept 2.98 confirms the simulation engaged; smoke output is N/A by design under simulated acceptance). EP is not available for this checkpoint on the stock image: --ep-size 4 crashes on the first forward pass (the shared-expert NVFP4 weight arrives 1-D under EP, ValueError in the modelopt_fp4 apply), so the NVFP4 cells are TP-only for now. The concurrency-1 entry uses the same protocol (8 requests, simulated accept 3.00); it stays ~7% ahead of bf16-tilelang on decode, consistent with the c16 ranking.",
+      "FP8 KV + TRT-LLM DSA pairing of the NVFP4 recipe on 4x B300 (SXM6), stock unpatched lmsysorg/sglang:glm-5.3-flash image (tree 033446bb05), TP4-only with the flashinfer_cutlass MoE runner, adaptive MTP 5/1/6 with SGLANG_SIMULATE_ACC_LEN=3: 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,139.83 aggregate output tok/s after two discarded warmups — 39% above the bf16-tilelang NVFP4 row on the otherwise identical recipe. Simulated accept length makes this a throughput-mechanism number (accept 2.98 confirms the simulation engaged; smoke output is N/A by design under simulated acceptance). The concurrency-1 entry uses the same protocol (8 requests, simulated accept 3.00); it stays ~7% ahead of bf16-tilelang on decode, consistent with the c16 ranking.",
   },
   {
     match: { hw: "gb300", strategy: "high-throughput", quant: "nvfp4", kvDsaPair: "fp8-trtllm" },
@@ -332,7 +332,7 @@ export const benchmarks = [
       },
     ],
     notes:
-      "FP8 KV + TRT-LLM DSA pairing of the NVFP4 recipe — same 4x B300 (SXM6), stock unpatched image (tree 033446bb05), TP4-only flashinfer_cutlass stack as the NVFP4 fp8-trtllm Low Latency row, speculative decoding off, after two discarded warmups per row: 863.82 / 1,599.05 / 3,000.69 aggregate output tok/s at concurrency 16 / 64 / 256 (80 / 320 / 1,280 random requests at 1,024 input / 256 output tokens), 37-52% above the bf16-tilelang NVFP4 rows on the otherwise identical recipe. EP is not available for this checkpoint on the stock image: --ep-size 4 crashes on the first forward pass (the shared-expert NVFP4 weight arrives 1-D under EP), so the NVFP4 cells are TP-only for now.",
+      "FP8 KV + TRT-LLM DSA pairing of the NVFP4 recipe — same 4x B300 (SXM6), stock unpatched image (tree 033446bb05), TP4-only flashinfer_cutlass stack as the NVFP4 fp8-trtllm Low Latency row, speculative decoding off, after two discarded warmups per row: 863.82 / 1,599.05 / 3,000.69 aggregate output tok/s at concurrency 16 / 64 / 256 (80 / 320 / 1,280 random requests at 1,024 input / 256 output tokens), 37-52% above the bf16-tilelang NVFP4 rows on the otherwise identical recipe.",
   },
   {
     match: { hw: "h100", strategy: "low-latency" },

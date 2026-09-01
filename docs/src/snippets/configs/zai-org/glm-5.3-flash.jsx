@@ -452,9 +452,7 @@ sgl-eval run gsm8k \\
     },
     // Same NVFP4 recipe on the remaining Blackwell platforms, at each fp8
     // cell's TP size (gb200 TP4, b200/b300 TP8). Not measured on this
-    // hardware, so every cell here reports unverified. All NVFP4 cells are
-    // TP-only: --ep-size crashes for this checkpoint on the stock image (the
-    // shared-expert NVFP4 weight arrives 1-D under EP).
+    // hardware, so every cell here reports unverified.
     {
       match: { hw: "gb200", strategy: "low-latency", quant: "nvfp4" },
       nnodes: 1,
