@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.kv_pool_request import KVPoolRequest
@@ -67,6 +68,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
+from sglang.srt.platforms.interface import require_out_of_tree_impl
 from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
@@ -1332,6 +1334,12 @@ class KVCacheConfigurator:
             enable_page_major = False
         return enable_page_major
 
+    def _page_major_applies(self, *, kind: str) -> bool:
+        """Whether the in-tree default for ``kind`` would be page-major."""
+        if kind != "mha" or self.kv_cache_dtype_str == "mxfp8":
+            return False
+        return self._page_major_enabled()
+
     def _make_kv_pool_request(
         self,
         *,
@@ -1340,6 +1348,7 @@ class KVCacheConfigurator:
         layer_num: int,
         start_layer: int,
         end_layer: int,
+        full_size: Optional[int] = None,
         swa_size: Optional[int] = None,
         is_full_attention_leaf: bool = False,
         post_capture_active: bool = False,
@@ -1366,7 +1375,6 @@ class KVCacheConfigurator:
                 mla_fields["kv_cache_dim"] = calculate_mla_kv_cache_dim(
                     model_config=self.model_config,
                     kv_cache_dtype=self.kv_cache_dtype,
-                    server_args=self.server_args,
                 )
         return KVPoolRequest(
             kind=kind,
@@ -1379,10 +1387,13 @@ class KVCacheConfigurator:
             end_layer=end_layer,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
-            layout="page_major" if self._page_major_enabled() else "contiguous",
-            kv_cache_dtype_str=self.kv_cache_dtype_str,
+            layout=(
+                "page_major" if self._page_major_applies(kind=kind) else "contiguous"
+            ),
+            kv_cache_dtype_str=self.kv_cache_dtype_str or "",
             attention_backend=get_exec().kernel.attention_backend,
             is_hybrid_swa=self.is_hybrid_swa,
+            full_size=full_size,
             swa_size=swa_size,
             is_full_attention_leaf=is_full_attention_leaf,
             post_capture_active=post_capture_active,
@@ -1409,8 +1420,12 @@ class KVCacheConfigurator:
             layer_num=self.layer_info.num_effective_layers,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            full_size=sizes.full_max_total_num_tokens,
             swa_size=sizes.swa_max_total_num_tokens,
-            post_capture_active=self.post_capture_kv_active,
+            post_capture_active=(
+                self.post_capture_kv_active
+                and not (kind == "mha" and is_float4_e2m1fn_x2(self.kv_cache_dtype))
+            ),
         )
         token_to_kv_pool = current_platform.build_kv_pool(request=request)
         if token_to_kv_pool is None and current_platform.is_out_of_tree():
@@ -1419,6 +1434,12 @@ class KVCacheConfigurator:
                 max_total_num_tokens=sizes.max_total_num_tokens,
                 is_dsa_model=is_dsa_model,
             )
+            if token_to_kv_pool is None:
+                require_out_of_tree_impl(
+                    current_platform,
+                    hook="build_kv_pool()",
+                    subsystem=f"{kind} KV pool",
+                )
         return token_to_kv_pool
 
     def _build_legacy_oot_kv_pool(
@@ -1967,6 +1988,11 @@ class KVCacheConfigurator:
 
                 leaf_cls = NPUMHATokenToKVPool
         if leaf_cls is None:
+            require_out_of_tree_impl(
+                current_platform,
+                hook="build_kv_pool()",
+                subsystem="full-attention KV pool for a hybrid-linear model",
+            )
             return None
 
         if self.use_mla_backend:
@@ -2056,6 +2082,29 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _platform_preempting_allocator_cls(
+        self, *, token_to_kv_pool: KVCache
+    ) -> Optional[type]:
+        """Legacy out-of-tree preemption of the whole allocator family.
+
+        A paged allocator class from an out-of-tree platform historically
+        wins over the in-tree selection, except over a platform pool that is
+        itself an SWA composite: that pair routes through
+        SWATokenToKVPoolAllocator, which consults the same hook per sub-pool.
+        """
+        if not current_platform.is_out_of_tree():
+            return None
+        if isinstance(token_to_kv_pool, BaseSWAKVPool):
+            return None
+        allocator_cls = current_platform.get_paged_allocator_cls()
+        if allocator_cls is None:
+            require_out_of_tree_impl(
+                current_platform,
+                hook="get_paged_allocator_cls()",
+                subsystem="token-to-KV-pool allocator",
+            )
+        return allocator_cls
+
     def _build_token_to_kv_pool_allocator(
         self,
         *,
@@ -2068,16 +2117,8 @@ class KVCacheConfigurator:
         # Initialize token_to_kv_pool_allocator
         need_sort = get_disagg().disaggregation_mode in ("decode", "prefill")
         if token_to_kv_pool_allocator is None:
-            # Legacy OOT preemption: for out-of-tree platforms a paged
-            # allocator class historically wins over the whole in-tree
-            # allocator family selection. In-tree platforms are served at
-            # the paged construction points instead (see allocator/swa.py),
-            # so an in-tree platform hook cannot preempt the SWA/DSV4
-            # composite allocators below.
-            PlatformAllocatorCls = (
-                current_platform.get_paged_allocator_cls()
-                if current_platform.is_out_of_tree()
-                else None
+            PlatformAllocatorCls = self._platform_preempting_allocator_cls(
+                token_to_kv_pool=token_to_kv_pool
             )
             if PlatformAllocatorCls is not None:
                 token_to_kv_pool_allocator = PlatformAllocatorCls(

@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 # Re-export for convenience
-__all__ = ["SRTPlatform", "PlatformEnum"]
+__all__ = ["SRTPlatform", "PlatformEnum", "require_out_of_tree_impl"]
 
 
 class SRTPlatform(DeviceMixin):
@@ -178,3 +178,17 @@ class SRTPlatform(DeviceMixin):
         this key take precedence over the method lookup.
         """
         return "native"
+
+
+def require_out_of_tree_impl(
+    platform: SRTPlatform, *, hook: str, subsystem: str
+) -> None:
+    """Reject "no platform opinion" from an out-of-tree platform; no-op in-tree."""
+    if not platform.is_out_of_tree():
+        return
+    raise NotImplementedError(
+        f"Out-of-tree platform {type(platform).__name__} (device "
+        f"{platform.device_name!r}) provides no {subsystem}. Override "
+        f"{hook} on your SRTPlatform subclass: the in-tree fallback is "
+        f"device-keyed and would hand this device the CUDA implementation."
+    )

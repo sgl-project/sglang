@@ -41,6 +41,7 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
+from sglang.srt.platforms.interface import require_out_of_tree_impl
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -558,6 +559,11 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     # (the "npu" entry moves into NpuSRTPlatform once it lands).
     GraphRunnerCls = current_platform.get_graph_runner_cls()
     if GraphRunnerCls is None:
+        require_out_of_tree_impl(
+            current_platform,
+            hook="get_graph_runner_cls()",
+            subsystem="CUDA graph runner",
+        )
         graph_runners = defaultdict(
             model_runner._decode_cuda_graph_runner_cls,
             {

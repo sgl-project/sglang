@@ -57,11 +57,15 @@ class KVPoolRequest(msgspec.Struct, frozen=True, kw_only=True):
     # Selection context: what the in-tree default selection would honor.
     # A platform that cannot express ``layout`` must either honor it or
     # raise; silently building another layout is how the old class-getter
-    # priority chain went wrong.
+    # priority chain went wrong. Only plain-MHA requests are ever
+    # "page_major"; MLA/DSA and mxfp8 have no page-major variant.
     layout: str = "contiguous"  # "contiguous" | "page_major"
     kv_cache_dtype_str: str = ""
     attention_backend: str = ""
+    # When is_hybrid_swa, size is the combined budget: the full-attention
+    # side takes full_size and the sliding side swa_size.
     is_hybrid_swa: bool = False
+    full_size: Optional[int] = None
     swa_size: Optional[int] = None
     # True when this pool backs the full-attention layers inside a
     # hybrid-linear composite (HybridLinearKVPool) rather than standing alone.
