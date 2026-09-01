@@ -16,9 +16,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_att
     _sm100_sparse_attention,
     _sm120_sparse_attention,
 )
-from sglang.multimodal_gen.runtime.platforms.cuda import (
-    _SubBlockSparseAttentionBackendResolver,
-)
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     _minimax_h3_attention_core_impl,
 )
@@ -39,6 +36,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
+)
+from sglang.multimodal_gen.runtime.platforms.cuda import (
+    _SubBlockSparseAttentionBackendResolver,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
