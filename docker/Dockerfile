@@ -3,6 +3,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
 ARG TARGETARCH
 ARG BUILD_TYPE=all
+ARG INSTALL_AI_DYNAMO=1
 ARG BRANCH_TYPE=remote
 ARG SGL_KERNEL_VERSION=0.4.6.post1
 ARG SGL_VERSION
@@ -429,6 +430,7 @@ ARG MSCCLPP_VERSION
 # Renamed from NCCL_VERSION: the nvidia/cuda base image sets ENV NCCL_VERSION
 # (Debian apt format, e.g. 2.28.3-1), which shadows a same-named ARG inside RUN.
 ARG SGL_NCCL_VERSION
+ARG INSTALL_AI_DYNAMO
 
 WORKDIR /sgl-workspace
 
@@ -571,8 +573,12 @@ elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
 fi
 
 # Install the latest available AI Dynamo prerelease from NVIDIA's package index.
+# Disaggregated SGLang deployments that use the native router can disable this
+# to keep the runtime image smaller and avoid pulling an unused dependency tree.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --pre --extra-index-url https://pypi.nvidia.com/ ai-dynamo
+    if [ "${INSTALL_AI_DYNAMO}" = "1" ]; then \
+        python3 -m pip install --pre --extra-index-url https://pypi.nvidia.com/ ai-dynamo; \
+    fi
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
