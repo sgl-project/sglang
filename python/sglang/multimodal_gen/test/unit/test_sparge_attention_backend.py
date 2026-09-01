@@ -26,7 +26,7 @@ _validate_topk = _backend_module._validate_topk
 
 class TestSpargeAttentionBackend(unittest.TestCase):
     def _make_impl(self, *, head_size: int = 128, topk: float = 0.5):
-        op = Mock(return_value=object())
+        op = Mock()
         with (
             patch.object(
                 _backend_module,
