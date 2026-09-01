@@ -14,11 +14,13 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-small")
 
-_DECODE_SHAPES = (
+_QWEN35_DECODE_SHAPES = (
     (2560, 18432),
     (9216, 2560),
     (4096, 24576),
     (12288, 4096),
+)
+_QWEN38_DECODE_SHAPES = (
     (5120, 34816),
     (17408, 5120),
     (5120, 248320),
@@ -54,7 +56,16 @@ class TestKdaNvfp4GemmSm120(CustomTestCase):
 
     def test_decode_matches_flashinfer(self):
         torch.manual_seed(0)
-        for k, n in _DECODE_SHAPES:
+        for k, n in _QWEN35_DECODE_SHAPES:
+            for m in (1, 2, 4, 8, 9):
+                args = _make_inputs(m, k, n)
+                expected = _reference(args)
+                actual = kda_nvfp4_gemm(*args, torch.bfloat16, n)
+                torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.02)
+                del args, expected, actual
+            torch.cuda.empty_cache()
+
+        for k, n in _QWEN38_DECODE_SHAPES:
             for m in (1, 9):
                 args = _make_inputs(m, k, n)
                 expected = _reference(args)
@@ -99,10 +110,16 @@ class TestKdaNvfp4GemmSm120(CustomTestCase):
             actual = fp4_gemm(*args, torch.bfloat16, 5120)
         torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.02)
 
-        for k, n in ((2560, 18432), (9216, 2560), (4096, 24576), (12288, 4096)):
-            qwen35_args = _make_inputs(1, k, n)
-            self.assertTrue(
-                can_dispatch_kda_nvfp4_gemm(*qwen35_args, torch.bfloat16, n)
+        for k, n in _QWEN35_DECODE_SHAPES:
+            for m in (1, 2, 4, 8):
+                qwen35_args = _make_inputs(m, k, n)
+                self.assertTrue(
+                    can_dispatch_kda_nvfp4_gemm(*qwen35_args, torch.bfloat16, n)
+                )
+            qwen35_m9_args = _make_inputs(9, k, n)
+            self.assertTrue(can_use_kda_nvfp4_gemm(*qwen35_m9_args, torch.bfloat16, n))
+            self.assertFalse(
+                can_dispatch_kda_nvfp4_gemm(*qwen35_m9_args, torch.bfloat16, n)
             )
 
         unsupported_prefill = _make_inputs(4369, 9216, 2560)

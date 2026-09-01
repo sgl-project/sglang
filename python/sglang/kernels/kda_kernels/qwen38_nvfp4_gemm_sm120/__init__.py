@@ -14,7 +14,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-_QWEN_DECODE_KN = frozenset(
+_QWEN35_DECODE_KN = frozenset(
     {
         # Qwen3.5-4B
         (2560, 18432),
@@ -22,7 +22,10 @@ _QWEN_DECODE_KN = frozenset(
         # Qwen3.5-9B
         (4096, 24576),
         (12288, 4096),
-        # Qwen3.6/3.8-27B
+    }
+)
+_QWEN38_DECODE_KN = frozenset(
+    {
         (5120, 34816),
         (17408, 5120),
         (5120, 248320),
@@ -35,15 +38,15 @@ _QWEN38_PREFILL_KN = frozenset(
         (5120, 248320),
     }
 )
+_QWEN35_DECODE_M = frozenset({1, 2, 4, 8, 9})
 # This is the only role that improved the full Qwen3.8-27B DSpark serving
 # benchmark without changing acceptance. Qwen3.5-4B/9B ordinary-decode shapes
 # are enabled only after their own SM120 multi-weight and E2E validation.
 _E2E_VALIDATED_MKN = frozenset(
+    (m, k, n) for m in (1, 2, 4, 8) for k, n in _QWEN35_DECODE_KN
+).union(
     {
-        (1, 2560, 18432),
-        (1, 9216, 2560),
-        (1, 4096, 24576),
-        (1, 12288, 4096),
+        # Qwen3.8-27B DSpark verification
         (9, 17408, 5120),
     }
 )
@@ -69,7 +72,8 @@ def can_use_kda_nvfp4_gemm(
     k = packed_k * 2
     n = int(out_features)
     if not (
-        (m in (1, 9) and (k, n) in _QWEN_DECODE_KN)
+        (m in _QWEN35_DECODE_M and (k, n) in _QWEN35_DECODE_KN)
+        or (m in (1, 9) and (k, n) in _QWEN38_DECODE_KN)
         or (m == 4369 and (k, n) in _QWEN38_PREFILL_KN)
     ):
         return False

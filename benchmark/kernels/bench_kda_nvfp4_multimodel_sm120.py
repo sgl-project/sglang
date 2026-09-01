@@ -144,7 +144,9 @@ def parse_args():
     parser.add_argument(
         "--models", nargs="+", choices=MODEL_SHAPES, default=list(MODEL_SHAPES)
     )
-    parser.add_argument("--rows", nargs="+", type=int, choices=(1, 9), default=[1, 9])
+    parser.add_argument(
+        "--rows", nargs="+", type=int, choices=(1, 2, 4, 8, 9), default=[1, 9]
+    )
     parser.add_argument("--weights", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=50)

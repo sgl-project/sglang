@@ -16,15 +16,16 @@ NVFP4 MLP shapes from Qwen3.5-4B and Qwen3.5-9B:
 - Qwen3.6/3.8-27B gate/up: K=5120, N=34816; down: K=17408, N=5120
 - Qwen3.8-27B lm_head: K=5120, N=248320
 
-Decode rows M in {1, 9} are available through the low-level API for all listed
-shapes. The captured Qwen3.8 shapes additionally support M=4369 prefill.
+Decode rows M in {1, 2, 4, 8, 9} are available through the low-level API for
+the Qwen3.5 shapes. The captured Qwen3.8 shapes support M in {1, 9} decode and
+M=4369 prefill.
 
 M=1 is normal decode, M=9 is DSpark verification with block size 8, and
 M=4369 is the captured 4K-prompt prefill after chat-template expansion. The
 opt-in ModelOpt dispatch is guarded by `SGLANG_ENABLE_KDA_NVFP4_GEMM=1` and is
 deliberately narrower than the low-level API: it enables the E2E-qualified
-Qwen3.5-4B/9B MLP shapes at M=1 and the Qwen3.8-27B down projection at M=9.
-Every other call falls back to FlashInfer.
+Qwen3.5-4B/9B MLP shapes at M in {1, 2, 4, 8} and the Qwen3.8-27B down
+projection at M=9. Every other call falls back to FlashInfer.
 
 The imported decode kernel was adapted for serving by streaming both FP4
 weights and weight scales through L2. The source task's isolated-GEMM policy
@@ -48,34 +49,48 @@ ModelOpt checkpoints were:
 The kernel benchmark rotates through eight distinct weights in a CUDA Graph,
 alternates FlashInfer and KDA timing order across five trials, and reports the
 median per-call latency. All twelve M=1/M=9 rows passed the FlashInfer
-correctness gate (`rtol=1e-2`, `atol=2e-2`).
+correctness gate (`rtol=1e-2`, `atol=2e-2`). The twelve added Qwen3.5
+M=2/M=4/M=8 rows passed the same gate.
 
 | Model shape | M | Gate/up speedup | Down speedup |
 |---|---:|---:|---:|
 | Qwen3.5-4B | 1 | 1.049x | 2.027x |
+| Qwen3.5-4B | 2 | 1.078x | 2.024x |
+| Qwen3.5-4B | 4 | 1.095x | 2.028x |
+| Qwen3.5-4B | 8 | 1.079x | 2.045x |
 | Qwen3.5-4B | 9 | 1.027x | 2.028x |
 | Qwen3.5-9B | 1 | 1.140x | 1.267x |
+| Qwen3.5-9B | 2 | 1.154x | 1.260x |
+| Qwen3.5-9B | 4 | 1.157x | 1.249x |
+| Qwen3.5-9B | 8 | 1.146x | 1.251x |
 | Qwen3.5-9B | 9 | 1.126x | 1.271x |
 | Qwen3.6/3.8-27B | 1 | 1.027x | 1.189x |
 | Qwen3.6/3.8-27B | 9 | 1.025x | 1.188x |
 
-The twelve-row geometric-mean kernel speedup is 1.243x.
+The geometric-mean speedup is 1.243x for the original twelve M=1/M=9 rows,
+1.336x for the twelve added M=2/M=4/M=8 rows, and 1.288x across all 24 rows.
 
-End-to-end serving used ten fixed-seed `random-ids` requests per round, 2048
-input tokens, 512 output tokens, concurrency 1, and a cache flush before every
-round. Each comparison ran three baseline rounds, three KDA rounds, then one
-adjacent baseline round. KDA was enabled only through
+End-to-end serving used 32 fixed-seed `random-ids` requests per round, 2048
+input tokens, 512 output tokens, concurrency in {1, 2, 4, 8}, and a cache flush
+before every round. Each concurrency ran three baseline rounds and three KDA
+rounds; one adjacent baseline round followed the candidate sweep. KDA was
+enabled only through
 `SGLANG_ENABLE_KDA_NVFP4_GEMM=1`.
 
-| Model | Metric | Baseline mean | KDA mean | Adjacent baseline | Improvement |
-|---|---|---:|---:|---:|---:|
-| Qwen3.5-4B | Output throughput (tok/s) | 271.407 | 286.381 | 270.667 | +5.52% |
-| Qwen3.5-4B | Mean TPOT (ms) | 3.552 | 3.361 | 3.560 | +5.40% |
-| Qwen3.5-4B | Mean TTFT (ms) | 69.396 | 68.989 | 70.720 | +0.59% |
-| Qwen3.5-9B | Output throughput (tok/s) | 183.691 | 189.035 | 183.383 | +2.91% |
-| Qwen3.5-9B | Mean TPOT (ms) | 5.294 | 5.139 | 5.299 | +2.93% |
-| Qwen3.5-9B | Mean TTFT (ms) | 80.180 | 80.763 | 82.556 | -0.73% |
+| Model | Concurrency | Baseline tok/s | KDA tok/s | Adjacent baseline | Throughput | TPOT | E2E latency |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Qwen3.5-4B | 1 | 274.666 | 288.600 | 273.721 | +5.07% | +4.99% | +4.83% |
+| Qwen3.5-4B | 2 | 534.445 | 555.677 | 534.087 | +3.97% | +3.98% | +3.82% |
+| Qwen3.5-4B | 4 | 983.987 | 1022.559 | 985.465 | +3.92% | +3.88% | +3.77% |
+| Qwen3.5-4B | 8 | 1464.628 | 1514.990 | 1464.872 | +3.44% | +3.62% | +3.29% |
+| Qwen3.5-9B | 1 | 184.059 | 189.442 | 183.922 | +2.93% | +2.95% | +2.84% |
+| Qwen3.5-9B | 2 | 358.935 | 368.827 | 358.679 | +2.76% | +2.82% | +2.68% |
+| Qwen3.5-9B | 4 | 679.397 | 696.907 | 679.012 | +2.58% | +2.67% | +2.51% |
+| Qwen3.5-9B | 8 | 1025.235 | 1050.054 | 1025.277 | +2.42% | +2.52% | +2.34% |
 
 The candidate server logs must contain the KDA fast-path message; the E2E
 runner treats a missing dispatch as a failure. The adjacent baselines reproduce
-the original throughput means within 0.3%, which bounds run-order drift.
+the original throughput means within 0.35%, which bounds run-order drift.
+Qwen3.5-9B TTFT changes by -0.81% to +1.46% across the sweep, while its TPOT
+and total E2E latency improve at every concurrency, consistent with a
+decode-focused kernel.
